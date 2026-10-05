@@ -1,0 +1,251 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
+
+/* iOS Safari: 100vh overshoots the visible area; let h-screen fill what is actually visible. */
+@supports (-webkit-touch-callout: none) {
+  .h-screen {
+    height: -webkit-fill-available;
+  }
+}
+
+html,
+body {
+  margin: 0;
+  background: #150826;
+  color: #fbf6ff;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* The playground: CodeMirror chrome, the syntax token palette shared by editors and static code
+ * blocks, and the unified-diff colours of the reference-solution viewer. */
+.leetbuild-playground {
+  --lb-bg: #150826;
+  --lb-panel: #1f0d38;
+  --lb-border: #3a1d68;
+  --lb-text: #fbf6ff;
+  --lb-muted: #b9a3dc;
+  --lb-pink: #ff3fa6;
+  --lb-pink-soft: #ff7ac8;
+  --lb-lavender: #c4b5fd;
+  --lb-selection: rgba(255, 63, 166, 0.28);
+
+  .cm-editor {
+    height: 100%;
+    background: var(--lb-panel);
+    color: var(--lb-text);
+    font-size: 13px;
+  }
+
+  .cm-editor.cm-focused {
+    outline: none;
+  }
+
+  .cm-scroller {
+    font-family: var(--font-code), ui-monospace, SFMono-Regular, Menlo, monospace;
+    line-height: 1.55;
+  }
+
+  .cm-content {
+    caret-color: var(--lb-pink);
+    padding: 8px 0;
+  }
+
+  .cm-cursor,
+  .cm-dropCursor {
+    border-left-color: var(--lb-pink);
+  }
+
+  .cm-gutters {
+    background: var(--lb-panel);
+    color: #6f579a;
+    border-right: 1px solid var(--lb-border);
+  }
+
+  .cm-activeLineGutter {
+    background: rgba(255, 63, 166, 0.08);
+    color: var(--lb-pink-soft);
+  }
+
+  .cm-activeLine {
+    background: rgba(255, 255, 255, 0.03);
+  }
+
+  .cm-selectionBackground,
+  .cm-editor.cm-focused .cm-selectionBackground,
+  .cm-content ::selection {
+    background: var(--lb-selection) !important;
+  }
+
+  .cm-selectionMatch {
+    background: rgba(196, 181, 253, 0.2);
+  }
+
+  .cm-matchingBracket,
+  .cm-editor.cm-focused .cm-matchingBracket {
+    background: rgba(255, 122, 200, 0.25);
+    outline: 1px solid rgba(255, 122, 200, 0.5);
+  }
+
+  .cm-lintRange-error {
+    background-image: none;
+    text-decoration: underline wavy #ff5c8a;
+    text-decoration-skip-ink: none;
+  }
+
+  .cm-lintRange-warning {
+    background-image: none;
+    text-decoration: underline wavy #ffc857;
+    text-decoration-skip-ink: none;
+  }
+
+  .cm-lintRange-info {
+    background-image: none;
+    text-decoration: underline dotted var(--lb-lavender);
+  }
+
+  .cm-lint-marker-error {
+    content: '';
+  }
+
+  .cm-tooltip {
+    background: #2b144d;
+    border: 1px solid var(--lb-border);
+    color: var(--lb-text);
+    border-radius: 8px;
+  }
+
+  .cm-tooltip.cm-tooltip-lint {
+    padding: 4px 0;
+  }
+
+  .cm-diagnostic {
+    border-left-width: 3px;
+    padding: 4px 10px;
+    font-family: var(--font-code), monospace;
+    font-size: 12px;
+  }
+
+  .cm-diagnostic-error {
+    border-left-color: #ff5c8a;
+  }
+
+  .cm-diagnostic-warning {
+    border-left-color: #ffc857;
+  }
+
+  .cm-panels {
+    background: #2b144d;
+    color: var(--lb-text);
+  }
+
+  /* Syntax tokens (classHighlighter) */
+  .tok-comment {
+    color: #8b6fae;
+    font-style: italic;
+  }
+
+  .tok-keyword,
+  .tok-controlKeyword,
+  .tok-operatorKeyword,
+  .tok-definitionKeyword,
+  .tok-moduleKeyword {
+    color: #ff5fb8;
+  }
+
+  .tok-typeName,
+  .tok-className,
+  .tok-namespace {
+    color: #c4b5fd;
+  }
+
+  .tok-modifier,
+  .tok-annotation,
+  .tok-meta {
+    color: #d8b4fe;
+  }
+
+  .tok-string,
+  .tok-string2,
+  .tok-character {
+    color: #ffb0dc;
+  }
+
+  .tok-number,
+  .tok-bool,
+  .tok-atom {
+    color: #ffd4ee;
+  }
+
+  .tok-variableName {
+    color: #fbf6ff;
+  }
+
+  .tok-variableName2,
+  .tok-propertyName {
+    color: #e9d5ff;
+  }
+
+  .tok-function,
+  .tok-definition {
+    color: #ffffff;
+    font-weight: 600;
+  }
+
+  .tok-labelName {
+    color: #ff9ad5;
+    font-weight: 600;
+  }
+
+  .tok-operator,
+  .tok-punctuation {
+    color: #b9a3dc;
+  }
+
+  .tok-processingInstruction,
+  .tok-macroName {
+    color: #ff8acb;
+  }
+
+  .tok-invalid {
+    color: #ff5c8a;
+    text-decoration: underline;
+  }
+
+  .tok-literal {
+    color: #ffd4ee;
+  }
+
+  /* The unified diff of the reference solution against the learner's code. */
+  .cm-changedLine {
+    background: rgba(52, 211, 153, 0.12);
+  }
+
+  .cm-deletedChunk {
+    background: rgba(251, 113, 133, 0.12);
+  }
+
+  .cm-changedText {
+    background: rgba(52, 211, 153, 0.28);
+  }
+
+  .cm-deletedChunk .cm-deletedText {
+    background: rgba(251, 113, 133, 0.3);
+  }
+
+  .cm-collapsedLines {
+    background: rgba(58, 29, 104, 0.6);
+    color: var(--lb-muted);
+  }
+}
