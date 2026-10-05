@@ -1,5 +1,7 @@
 import {type FC, memo, useCallback, useEffect, useMemo, useState} from 'react';
 
+import {danger, ink, iris, success} from '@/styles/palette';
+
 import WidgetFrame, {clamp, numParam} from './frame';
 import type {WidgetProps} from './index';
 import {BUTTON_CLASS} from './playback';
@@ -97,7 +99,7 @@ const TokenBucket: FC<WidgetProps> = memo(({params}) => {
   const readout = useMemo(
     () => (
       <>
-        <b className="text-cream">
+        <b className="text-ink-100">
           {tokens.toFixed(1)}/{burst} tokens
         </b>
         , refilling {rate}/s (one token every {Math.round(1000 / rate)} ms) up to a burst of {burst}.{' '}
@@ -121,14 +123,14 @@ const TokenBucket: FC<WidgetProps> = memo(({params}) => {
     <WidgetFrame controls={controls} readout={readout} title="token bucket rate limiter">
       <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${HEIGHT}`}>
         <title>A token bucket refilling at a fixed rate, with recent requests admitted or refused</title>
-        <text fill="#a78bfa" fontFamily={MONO} fontSize={9} x={BUCKET_X} y={13}>
+        <text fill={ink[300]} fontFamily={MONO} fontSize={9} x={BUCKET_X} y={13}>
           bucket · burst {burst}
         </text>
         <rect
-          fill="rgba(58,29,104,0.5)"
+          fill={ink[800]}
           height={BUCKET_H + 4}
           rx={6}
-          stroke="#a78bfa"
+          stroke={iris[300]}
           strokeWidth={0.75}
           width={BUCKET_W + 8}
           x={BUCKET_X - 4}
@@ -140,13 +142,13 @@ const TokenBucket: FC<WidgetProps> = memo(({params}) => {
           const partial = i === whole && fraction > 0;
           return (
             <g key={i}>
-              <rect fill="#2b144d" height={Math.max(1, cellH - 2)} rx={2} width={BUCKET_W} x={BUCKET_X} y={y + 1} />
+              <rect fill={ink[700]} height={Math.max(1, cellH - 2)} rx={2} width={BUCKET_W} x={BUCKET_X} y={y + 1} />
               {full ? (
-                <rect fill="#ff3fa6" height={Math.max(1, cellH - 2)} rx={2} width={BUCKET_W} x={BUCKET_X} y={y + 1} />
+                <rect fill={iris[400]} height={Math.max(1, cellH - 2)} rx={2} width={BUCKET_W} x={BUCKET_X} y={y + 1} />
               ) : null}
               {partial ? (
                 <rect
-                  fill="#ff7ac8"
+                  fill={iris[300]}
                   fillOpacity={0.7}
                   height={Math.max(0.5, (cellH - 2) * fraction)}
                   rx={2}
@@ -159,7 +161,7 @@ const TokenBucket: FC<WidgetProps> = memo(({params}) => {
           );
         })}
         <text
-          fill="#fbf6ff"
+          fill={ink[50]}
           fontFamily={MONO}
           fontSize={10}
           textAnchor="middle"
@@ -167,17 +169,23 @@ const TokenBucket: FC<WidgetProps> = memo(({params}) => {
           y={BUCKET_TOP + BUCKET_H + 16}>
           {tokens.toFixed(1)} tokens
         </text>
-        <text fill="#a78bfa" fontFamily={MONO} fontSize={9} textAnchor="end" x={BUCKET_X - 8} y={BUCKET_TOP + 8}>
+        <text fill={ink[300]} fontFamily={MONO} fontSize={9} textAnchor="end" x={BUCKET_X - 8} y={BUCKET_TOP + 8}>
           {burst}
         </text>
-        <text fill="#a78bfa" fontFamily={MONO} fontSize={9} textAnchor="end" x={BUCKET_X - 8} y={BUCKET_TOP + BUCKET_H}>
+        <text
+          fill={ink[300]}
+          fontFamily={MONO}
+          fontSize={9}
+          textAnchor="end"
+          x={BUCKET_X - 8}
+          y={BUCKET_TOP + BUCKET_H}>
           0
         </text>
         <g fontFamily={MONO} fontSize={9}>
-          <text fill="#a78bfa" x={LOG_X} y={13}>
+          <text fill={ink[300]} x={LOG_X} y={13}>
             refill +{rate}/s · t={seconds.toFixed(1)}s · {playing ? 'running' : 'paused'}
           </text>
-          <text fill="#a78bfa" x={LOG_X} y={BUCKET_TOP + 26}>
+          <text fill={ink[300]} x={LOG_X} y={BUCKET_TOP + 26}>
             last {LOG_LEN} requests →
           </text>
           {Array.from({length: LOG_LEN}, (_, i) => {
@@ -187,33 +195,33 @@ const TokenBucket: FC<WidgetProps> = memo(({params}) => {
             return (
               <g key={i}>
                 <rect
-                  fill={o === undefined ? 'rgba(58,29,104,0.5)' : o.code === 200 ? '#34d399' : '#fb7185'}
+                  fill={o === undefined ? ink[800] : o.code === 200 ? success[400] : danger[400]}
                   height={CELL}
                   rx={4}
-                  stroke={o !== undefined && i === log.length - 1 ? '#fbf6ff' : 'none'}
+                  stroke={o !== undefined && i === log.length - 1 ? ink[50] : 'none'}
                   strokeWidth={1}
                   width={CELL}
                   x={x}
                   y={y}
                 />
                 {o === undefined ? null : (
-                  <text fill="#d6c6f5" fontSize={8} textAnchor="middle" x={x + CELL / 2} y={y + CELL + 11}>
+                  <text fill={ink[200]} fontSize={8} textAnchor="middle" x={x + CELL / 2} y={y + CELL + 11}>
                     {o.code}
                   </text>
                 )}
               </g>
             );
           })}
-          <text fill="#d6c6f5" x={LOG_X} y={BUCKET_TOP + 96}>
+          <text fill={ink[200]} x={LOG_X} y={BUCKET_TOP + 96}>
             200 → one token consumed
           </text>
-          <text fill="#d6c6f5" x={LOG_X} y={BUCKET_TOP + 110}>
+          <text fill={ink[200]} x={LOG_X} y={BUCKET_TOP + 110}>
             429 → Retry-After: ceil((1 − tokens) / rate) s
           </text>
-          <text fill="#d6c6f5" x={LOG_X} y={BUCKET_TOP + 124}>
+          <text fill={ink[200]} x={LOG_X} y={BUCKET_TOP + 124}>
             RateLimit-Limit: {burst} · RateLimit-Remaining: {Math.floor(tokens)}
           </text>
-          <text fill="#a78bfa" x={LOG_X} y={BUCKET_TOP + 144}>
+          <text fill={ink[300]} x={LOG_X} y={BUCKET_TOP + 144}>
             steady state ≤ {rate} req/s; a burst may spend {burst} at once
           </text>
         </g>

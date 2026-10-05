@@ -25,12 +25,12 @@ const SplitGutter: FC<{
       title="drag to resize · double-click to reset">
       <div
         className={`absolute transition-colors ${x ? 'inset-y-0 left-1/2 w-px' : 'inset-x-0 top-1/2 h-px'} ${
-          dragging ? 'bg-candy-500' : 'bg-plum-600/70 group-hover:bg-candy-500/70'
+          dragging ? 'bg-iris-400' : 'bg-ink-700 group-hover:bg-iris-400/70'
         }`}
       />
       <div
         className={`relative rounded-full transition-colors ${x ? 'h-8 w-1' : 'h-1 w-8'} ${
-          dragging ? 'bg-candy-400' : 'bg-plum-400 group-hover:bg-candy-400'
+          dragging ? 'bg-iris-300' : 'bg-ink-500 group-hover:bg-iris-300'
         }`}
       />
     </div>

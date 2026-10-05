@@ -1,5 +1,7 @@
 import {type FC, memo, useCallback, useMemo, useState} from 'react';
 
+import {danger, ink, iris, success, warning} from '@/styles/palette';
+
 import WidgetFrame from './frame';
 import type {WidgetProps} from './index';
 import {BUTTON_CLASS} from './playback';
@@ -50,7 +52,7 @@ const CODE: Record<Outcome, string> = {
   'in-flight': '409 Conflict',
   replayed: '201 Created (replay)',
 };
-const COLOR: Record<Outcome, string> = {created: '#34d399', 'in-flight': '#fb7185', replayed: '#ffb0dc'};
+const COLOR: Record<Outcome, string> = {created: success[400], 'in-flight': danger[400], replayed: iris[300]};
 
 const MONO = 'var(--font-code), monospace';
 const WIDTH = 620;
@@ -129,19 +131,19 @@ const Idempotency: FC<WidgetProps> = memo(() => {
       <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${HEIGHT}`}>
         <title>Idempotency key store, processing timeline and the responses each duplicate request receives</title>
         <g fontFamily={MONO} fontSize={9}>
-          <text fill="#a78bfa" x={TABLE_X} y={12}>
+          <text fill={ink[300]} x={TABLE_X} y={12}>
             key store · idem:&#123;key&#125;
           </text>
-          <text fill="#a78bfa" x={TABLE_X + 4} y={TOP - 6}>
+          <text fill={ink[300]} x={TABLE_X + 4} y={TOP - 6}>
             key
           </text>
-          <text fill="#a78bfa" x={TABLE_X + 60} y={TOP - 6}>
+          <text fill={ink[300]} x={TABLE_X + 60} y={TOP - 6}>
             status
           </text>
-          <text fill="#a78bfa" x={TABLE_X + 150} y={TOP - 6}>
+          <text fill={ink[300]} x={TABLE_X + 150} y={TOP - 6}>
             stored response
           </text>
-          <text fill="#a78bfa" x={TL_X} y={12}>
+          <text fill={ink[300]} x={TL_X} y={12}>
             processing window · t={tick}
           </text>
         </g>
@@ -152,7 +154,7 @@ const Idempotency: FC<WidgetProps> = memo(() => {
           return (
             <g fontFamily={MONO} fontSize={10} key={i}>
               <rect
-                fill={e === undefined ? 'rgba(58,29,104,0.5)' : '#2b144d'}
+                fill={e === undefined ? ink[800] : ink[700]}
                 height={ROW_H - 3}
                 rx={4}
                 width={TABLE_W}
@@ -161,13 +163,13 @@ const Idempotency: FC<WidgetProps> = memo(() => {
               />
               {e === undefined ? null : (
                 <>
-                  <text fill="#fbf6ff" x={TABLE_X + 4} y={y + 12}>
+                  <text fill={ink[50]} x={TABLE_X + 4} y={y + 12}>
                     {e.key}
                   </text>
-                  <text fill={done ? '#34d399' : '#fbbf24'} x={TABLE_X + 60} y={y + 12}>
+                  <text fill={done ? success[400] : warning[400]} x={TABLE_X + 60} y={y + 12}>
                     {done ? 'done' : 'processing'}
                   </text>
-                  <text fill={done ? '#d6c6f5' : '#a78bfa'} x={TABLE_X + 150} y={y + 12}>
+                  <text fill={done ? ink[200] : ink[300]} x={TABLE_X + 150} y={y + 12}>
                     {done ? `201 {"id":"${e.orderId}"}` : '—'}
                   </text>
                 </>
@@ -177,12 +179,12 @@ const Idempotency: FC<WidgetProps> = memo(() => {
         })}
         <g fontFamily={MONO} fontSize={8}>
           {Array.from({length: span + 1}, (_, t) => (
-            <text fill={t === tick ? '#fbf6ff' : '#a78bfa'} key={t} textAnchor="middle" x={tickX(t)} y={TOP - 6}>
+            <text fill={t === tick ? ink[50] : ink[300]} key={t} textAnchor="middle" x={tickX(t)} y={TOP - 6}>
               {t}
             </text>
           ))}
           <line
-            stroke="#ff3fa6"
+            stroke={iris[400]}
             strokeDasharray="2 2"
             x1={tickX(tick)}
             x2={tickX(tick)}
@@ -194,14 +196,14 @@ const Idempotency: FC<WidgetProps> = memo(() => {
             const e = entries[i];
             return (
               <g key={i}>
-                <line stroke="rgba(58,29,104,0.9)" x1={TL_X + 40} x2={TL_X + TL_W - 8} y1={y + 9} y2={y + 9} />
+                <line stroke={ink[700]} x1={TL_X + 40} x2={TL_X + TL_W - 8} y1={y + 9} y2={y + 9} />
                 {e === undefined ? null : (
                   <>
-                    <text fill="#d6c6f5" x={TL_X + 8} y={y + 12}>
+                    <text fill={ink[200]} x={TL_X + 8} y={y + 12}>
                       {e.key}
                     </text>
                     <rect
-                      fill="#fbbf24"
+                      fill={warning[400]}
                       fillOpacity={0.8}
                       height={6}
                       rx={2}
@@ -211,7 +213,7 @@ const Idempotency: FC<WidgetProps> = memo(() => {
                     />
                     {tick > e.startedAt + PROCESS_TICKS ? (
                       <rect
-                        fill="#34d399"
+                        fill={success[400]}
                         fillOpacity={0.6}
                         height={6}
                         rx={2}
@@ -234,23 +236,23 @@ const Idempotency: FC<WidgetProps> = memo(() => {
                 fill={COLOR[l.outcome]}
                 key={`${l.tick}-${l.key}`}
                 r={3.5}
-                stroke="#2b144d"
+                stroke={ink[700]}
                 strokeWidth={1}
               />
             );
           })}
         </g>
         <g fontFamily={MONO} fontSize={9}>
-          <text fill="#a78bfa" x={TABLE_X} y={LOG_Y - 6}>
+          <text fill={ink[300]} x={TABLE_X} y={LOG_Y - 6}>
             responses (last {LOG_ROWS})
           </text>
           {recent.map((l, i) => (
             <text
-              fill={i === recent.length - 1 ? '#fbf6ff' : '#d6c6f5'}
+              fill={i === recent.length - 1 ? ink[50] : ink[200]}
               key={`${l.tick}-${l.key}`}
               x={TABLE_X}
               y={LOG_Y + 8 + i * 14}>
-              <tspan fill="#a78bfa">t={l.tick}</tspan>
+              <tspan fill={ink[300]}>t={l.tick}</tspan>
               {'  POST /orders  Idempotency-Key: '}
               {l.key}
               {'  → '}

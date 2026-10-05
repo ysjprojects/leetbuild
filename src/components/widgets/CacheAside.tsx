@@ -1,5 +1,7 @@
 import {type FC, type MouseEvent, memo, useCallback, useMemo, useState} from 'react';
 
+import {danger, ink, iris, success, warning} from '@/styles/palette';
+
 import WidgetFrame, {boolParam, tabClass} from './frame';
 import type {WidgetProps} from './index';
 import PlaybackControls, {usePlayback} from './playback';
@@ -35,12 +37,12 @@ const ARROW_Y = 112;
 const ARROW_GAP = 26;
 const CHIPS = 8;
 
-const TONE_FILL: Record<Tone, string> = {ok: '#34d399', bad: '#fb7185', warn: '#fbbf24', plain: '#ff7ac8'};
-const CHIP_IDLE = '#2b144d';
-const CHIP_WAIT = '#fbbf24';
-const CHIP_LEAD = '#ff3fa6';
-const CHIP_HIT = '#34d399';
-const CHIP_BAD = '#fb7185';
+const TONE_FILL: Record<Tone, string> = {ok: success[400], bad: danger[400], warn: warning[400], plain: iris[300]};
+const CHIP_IDLE = ink[700];
+const CHIP_WAIT = warning[400];
+const CHIP_LEAD = iris[400];
+const CHIP_HIT = success[400];
+const CHIP_BAD = danger[400];
 
 const same = (fill: string): string[] => Array.from({length: CHIPS}, () => fill);
 const leader = (rest: string): string[] => Array.from({length: CHIPS}, (_, i) => (i === 0 ? CHIP_LEAD : rest));
@@ -227,7 +229,7 @@ const CacheAside: FC<WidgetProps> = memo(({params}) => {
   const readout = useMemo(
     () => (
       <>
-        <b className="text-cream">{frame.title}.</b> {frame.note}
+        <b className="text-ink-100">{frame.title}.</b> {frame.note}
       </>
     ),
     [frame],
@@ -240,42 +242,34 @@ const CacheAside: FC<WidgetProps> = memo(({params}) => {
       <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${height}`}>
         <title>Requests between the application, Redis and the origin store</title>
         <g fontFamily={MONO} fontSize={11} fontWeight={600} textAnchor="middle">
-          <text fill="#fbf6ff" x={COL_X.app} y={14}>
+          <text fill={ink[50]} x={COL_X.app} y={14}>
             App
           </text>
-          <text fill="#fbf6ff" x={COL_X.redis} y={14}>
+          <text fill={ink[50]} x={COL_X.redis} y={14}>
             Redis
           </text>
-          <text fill="#fbf6ff" x={COL_X.origin} y={14}>
+          <text fill={ink[50]} x={COL_X.origin} y={14}>
             Origin
           </text>
         </g>
         {(['app', 'redis', 'origin'] as const).map(col => (
-          <line
-            key={col}
-            stroke="rgba(58,29,104,0.9)"
-            strokeWidth={2}
-            x1={COL_X[col]}
-            x2={COL_X[col]}
-            y1={20}
-            y2={height - 4}
-          />
+          <line key={col} stroke={ink[700]} strokeWidth={2} x1={COL_X[col]} x2={COL_X[col]} y1={20} y2={height - 4} />
         ))}
         <rect
-          fill={frame.ttl === null ? 'rgba(58,29,104,0.5)' : '#2b144d'}
+          fill={frame.ttl === null ? ink[800] : ink[700]}
           height={40}
           rx={4}
-          stroke={frame.ttl === null ? '#fb7185' : '#a78bfa'}
+          stroke={frame.ttl === null ? danger[400] : iris[300]}
           strokeDasharray={frame.ttl === null ? '3 2' : undefined}
           width={160}
           x={COL_X.redis - 80}
           y={CELL_Y}
         />
-        <text fill="#a78bfa" fontFamily={MONO} fontSize={9} x={COL_X.redis - 74} y={CELL_Y + 12}>
+        <text fill={ink[300]} fontFamily={MONO} fontSize={9} x={COL_X.redis - 74} y={CELL_Y + 12}>
           user:42
         </text>
         <text
-          fill={frame.ttl === null ? '#fb7185' : '#fbf6ff'}
+          fill={frame.ttl === null ? danger[400] : ink[50]}
           fontFamily={MONO}
           fontSize={9}
           textAnchor="end"
@@ -283,10 +277,10 @@ const CacheAside: FC<WidgetProps> = memo(({params}) => {
           y={CELL_Y + 12}>
           {frame.ttl === null ? 'absent' : VALUE}
         </text>
-        <rect fill="rgba(58,29,104,0.8)" height={6} rx={2} width={150} x={COL_X.redis - 75} y={CELL_Y + 20} />
+        <rect fill={ink[700]} height={6} rx={2} width={150} x={COL_X.redis - 75} y={CELL_Y + 20} />
         {frame.ttl === null ? null : (
           <rect
-            fill={frame.ttl <= 3 ? '#fbbf24' : '#34d399'}
+            fill={frame.ttl <= 3 ? warning[400] : success[400]}
             height={6}
             rx={2}
             width={Math.max(2, ttlW)}
@@ -294,7 +288,7 @@ const CacheAside: FC<WidgetProps> = memo(({params}) => {
             y={CELL_Y + 20}
           />
         )}
-        <text fill="#d6c6f5" fontFamily={MONO} fontSize={8} x={COL_X.redis - 74} y={CELL_Y + 35}>
+        <text fill={ink[200]} fontFamily={MONO} fontSize={8} x={COL_X.redis - 74} y={CELL_Y + 35}>
           {frame.ttl === null ? 'TTL —' : `TTL ${frame.ttl}s / ${TTL_MAX}s`}
         </text>
         {frame.chips === undefined ? null : (
@@ -305,14 +299,14 @@ const CacheAside: FC<WidgetProps> = memo(({params}) => {
                 height={10}
                 key={i}
                 rx={2}
-                stroke="#a78bfa"
+                stroke={iris[300]}
                 strokeWidth={fill === CHIP_IDLE ? 0.75 : 0}
                 width={14}
                 x={COL_X.app - 34 + (i % 4) * 17}
                 y={CELL_Y + Math.floor(i / 4) * 14}
               />
             ))}
-            <text fill="#a78bfa" fontFamily={MONO} fontSize={8} textAnchor="middle" x={COL_X.app} y={CELL_Y + 40}>
+            <text fill={ink[300]} fontFamily={MONO} fontSize={8} textAnchor="middle" x={COL_X.app} y={CELL_Y + 40}>
               8 requests
             </text>
           </g>

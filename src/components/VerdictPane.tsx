@@ -18,15 +18,15 @@ import {InlineMarkdown} from './Markdown';
 export const SHAPE_AFTER_WRONG = 2;
 
 const Fragment: FC<{text: string}> = memo(({text}) => (
-  <code className="rounded bg-plum-900/80 px-1.5 py-0.5 font-code text-[11px] text-candy-200">{text}</code>
+  <code className="bg-ink-800 font-code text-iris-200 rounded px-1.5 py-0.5 text-[11px]">{text}</code>
 ));
 Fragment.displayName = 'ShapeFragment';
 
 const ExpectedShape: FC<{check: StepCheck; language: Language}> = memo(({check, language}) => {
   const shape = useMemo(() => describeMatcher(check.match[language]), [check, language]);
   return (
-    <div className="mt-1.5 space-y-1 pl-6 text-[11.5px] text-plum-300">
-      <p className="font-bold uppercase tracking-wider text-plum-400">
+    <div className="text-ink-300 mt-1.5 space-y-1 pl-6 text-[11.5px]">
+      <p className="text-ink-400 font-bold uppercase tracking-wider">
         What the judge looks for in {LANGUAGE_LABEL[language]}
       </p>
       {shape.contains.map((text, i) => (
@@ -40,7 +40,7 @@ const ExpectedShape: FC<{check: StepCheck; language: Language}> = memo(({check, 
           <span>in this order</span>
           {shape.inOrder.map((text, i) => (
             <span className="flex items-center gap-1.5" key={`o${i}`}>
-              {i > 0 ? <span className="text-plum-400">→</span> : null}
+              {i > 0 ? <span className="text-ink-400">→</span> : null}
               <Fragment text={text} />
             </span>
           ))}
@@ -52,7 +52,7 @@ const ExpectedShape: FC<{check: StepCheck; language: Language}> = memo(({check, 
           <Fragment text={text} />
         </p>
       ))}
-      <p className="text-plum-400">
+      <p className="text-ink-400">
         Fragments are approximate: whitespace is flexible, <span className="font-code">…</span> stands for anything on
         the line, <span className="font-code">|</span> separates alternatives.
       </p>
@@ -74,26 +74,26 @@ const Submissions: FC<{history: readonly Submission[]}> = memo(({history}) => {
   const toggle = useCallback(() => setOpen(o => !o), []);
   if (history.length === 0) return null;
   return (
-    <div className="mt-3 rounded-lg border border-plum-600/60 bg-plum-950/40">
+    <div className="border-ink-700 bg-ink-850 mt-3 rounded-lg border">
       <button
-        className="flex w-full items-center justify-between px-3 py-1.5 text-left text-[11px] font-bold uppercase tracking-wider text-plum-300 hover:text-white"
+        className="text-ink-300 hover:text-ink-50 flex w-full items-center justify-between px-3 py-1.5 text-left text-[11px] font-bold uppercase tracking-wider"
         onClick={toggle}
         type="button">
         <span>Submissions ({history.length})</span>
         <span className="text-[10px]">{open ? '▼' : '▶'}</span>
       </button>
       {open ? (
-        <ul className="border-t border-plum-600/60 px-3 py-1.5 font-code text-[11px]">
+        <ul className="border-ink-700 font-code border-t px-3 py-1.5 text-[11px]">
           {[...history].reverse().map((s, i) => (
             <li className="flex items-center gap-3 py-0.5" key={`${s.at}-${i}`}>
-              <span className={s.accepted ? 'text-emerald-300' : 'text-rose-300'}>
+              <span className={s.accepted ? 'text-success-300' : 'text-danger-300'}>
                 {s.accepted ? 'Accepted' : 'Wrong Answer'}
               </span>
-              <span className="text-plum-300">
+              <span className="text-ink-300">
                 {s.passed}/{s.total}
               </span>
-              <span className="text-plum-400">{LANGUAGE_LABEL[s.language]}</span>
-              <span className="ml-auto text-plum-400">{formatTime(s.at)}</span>
+              <span className="text-ink-400">{LANGUAGE_LABEL[s.language]}</span>
+              <span className="text-ink-400 ml-auto">{formatTime(s.at)}</span>
             </li>
           ))}
         </ul>
@@ -118,41 +118,41 @@ const VerdictPane: FC<{
   const showShape = attempt.wrong >= SHAPE_AFTER_WRONG;
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-plum-600/60 px-3 py-1.5 text-[11px] text-plum-300">
-        <span className="font-bold uppercase tracking-wider text-candy-400">Checks</span>
+      <div className="border-ink-700 text-ink-300 flex shrink-0 flex-wrap items-center gap-2 border-b px-3 py-1.5 text-[11px]">
+        <span className="text-iris-400 font-bold uppercase tracking-wider">Checks</span>
         <span className="font-code">
           {step.checks.length} for this step · {attempt.wrong} wrong submission{attempt.wrong === 1 ? '' : 's'}
         </span>
         {stale && verdict !== null ? (
-          <span className="ml-auto text-amber-300">edited since the last submit</span>
+          <span className="text-warning-300 ml-auto">edited since the last submit</span>
         ) : null}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
         {verdict === null ? (
-          <p className="mb-2 text-[12px] text-plum-300">
+          <p className="text-ink-300 mb-2 text-[12px]">
             Submit (⌘/Ctrl + Enter) to run the checks. Each one is a property a correct implementation has; failures
             show what was expected.
           </p>
         ) : verdict.accepted ? (
-          <div className="mb-3 rounded-xl border border-emerald-400/70 bg-emerald-500/10 p-3 shadow-[0_0_24px_rgba(52,211,153,0.2)]">
-            <p className="text-[11px] font-bold uppercase tracking-wider text-emerald-300">Result</p>
-            <p className="mt-0.5 text-lg font-extrabold text-white">
+          <div className="border-success-400/60 bg-success-400/10 mb-3 rounded-xl border p-3">
+            <p className="text-success-300 text-[11px] font-bold uppercase tracking-wider">Result</p>
+            <p className="text-ink-50 mt-0.5 text-lg font-extrabold">
               Accepted
               {earned !== null ? (
-                <span className="ml-2 font-code text-[13px] font-semibold text-emerald-200">+{earned} pts</span>
+                <span className="font-code text-success-200 ml-2 text-[13px] font-semibold">+{earned} pts</span>
               ) : null}
             </p>
-            <p className="mt-0.5 text-[12px] text-emerald-100/80">
+            <p className="text-success-200 mt-0.5 text-[12px]">
               {verdict.passed}/{verdict.total} checks passed
               {attempt.status === 'revealed' ? ' · this step was revealed, so it scores 0' : ''}. Read the debrief on
               the left, then move to the next step.
             </p>
           </div>
         ) : (
-          <div className="mb-3 rounded-xl border border-rose-400/60 bg-rose-500/10 p-3">
-            <p className="text-[11px] font-bold uppercase tracking-wider text-rose-300">Result</p>
-            <p className="mt-0.5 text-lg font-extrabold text-white">Wrong Answer</p>
-            <p className="mt-0.5 text-[12px] text-rose-100/80">
+          <div className="border-danger-400/60 bg-danger-400/10 mb-3 rounded-xl border p-3">
+            <p className="text-danger-300 text-[11px] font-bold uppercase tracking-wider">Result</p>
+            <p className="text-ink-50 mt-0.5 text-lg font-extrabold">Wrong Answer</p>
+            <p className="text-danger-200 mt-0.5 text-[12px]">
               {verdict.passed}/{verdict.total} checks passed.{' '}
               {showShape
                 ? 'Failing checks now show the shape the judge expects.'
@@ -165,29 +165,29 @@ const VerdictPane: FC<{
             const result = verdict?.results[i] ?? null;
             const tone =
               result === null
-                ? 'border-plum-600/60 bg-plum-900/40'
+                ? 'border-ink-700 bg-ink-850'
                 : result.passed
-                ? 'border-emerald-400/40 bg-emerald-500/5'
-                : 'border-rose-400/50 bg-rose-500/5';
+                ? 'border-success-400/40 bg-success-400/5'
+                : 'border-danger-400/50 bg-danger-400/5';
             return (
               <li className={`rounded-lg border px-3 py-2 ${tone}`} key={check.id}>
-                <p className="flex items-center gap-2 text-[12.5px] text-cream">
+                <p className="text-ink-100 flex items-center gap-2 text-[12.5px]">
                   <span
-                    className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-full font-code text-[10px] ${
+                    className={`font-code flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] ${
                       result === null
-                        ? 'border border-plum-400 text-transparent'
+                        ? 'border-ink-500 border text-transparent'
                         : result.passed
-                        ? 'bg-emerald-400 text-plum-950'
-                        : 'bg-rose-400 text-plum-950'
+                        ? 'bg-success-400 text-ink-950'
+                        : 'bg-danger-400 text-ink-950'
                     }`}>
                     {result === null ? '·' : result.passed ? '✓' : '✗'}
                   </span>
-                  <span className="font-code text-[10px] text-plum-400">{i + 1}</span>
+                  <span className="font-code text-ink-400 text-[10px]">{i + 1}</span>
                   <span className="font-semibold">{check.title}</span>
                 </p>
                 {result !== null && !result.passed ? (
                   <>
-                    <p className="mt-1 pl-6 text-[12px] text-plum-200">
+                    <p className="text-ink-200 mt-1 pl-6 text-[12px]">
                       <InlineMarkdown source={check.detail} />
                     </p>
                     {showShape ? <ExpectedShape check={check} language={language} /> : null}

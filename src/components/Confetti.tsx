@@ -1,12 +1,14 @@
 import {type FC, memo, useEffect, useRef} from 'react';
 
+import {concept, ink, iris, resolve, success, warning} from '@/styles/palette';
+
 /**
  * A short confetti burst over the whole viewport when a step is accepted. Pure canvas, no
  * dependency; mounts, runs for `DURATION_MS`, then calls `onDone` so the parent unmounts it.
  */
 const DURATION_MS = 1800;
 const COUNT = 140;
-const COLORS = ['#ff3fa6', '#ff7ac8', '#ffb0dc', '#a78bfa', '#6ee7b7', '#fbbf24', '#fbf6ff'];
+const COLORS = [iris[300], iris[400], concept.grpc, success[300], warning[300], concept.kafka, ink[50]];
 
 interface Particle {
   x: number;
@@ -35,6 +37,8 @@ const Confetti: FC<{onDone: () => void}> = memo(({onDone}) => {
     el.width = width * dpr;
     el.height = height * dpr;
     ctx.scale(dpr, dpr);
+    // Canvas cannot read CSS variables: fix the colours of the active theme at mount.
+    const colors = COLORS.map(resolve);
     // Two bursts from the lower corners, like a stage cannon, so the editor stays readable.
     const particles: Particle[] = Array.from({length: COUNT}, (_, i) => {
       const fromLeft = i % 2 === 0;
@@ -46,7 +50,7 @@ const Confetti: FC<{onDone: () => void}> = memo(({onDone}) => {
         vx: Math.cos(angle) * speed,
         vy: Math.sin(angle) * speed,
         size: 5 + Math.random() * 6,
-        color: COLORS[i % COLORS.length],
+        color: colors[i % colors.length],
         rotation: Math.random() * Math.PI,
         spin: (Math.random() - 0.5) * 12,
       };

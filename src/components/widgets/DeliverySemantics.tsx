@@ -1,5 +1,7 @@
 import {type FC, type MouseEvent, memo, useCallback, useMemo, useState} from 'react';
 
+import {danger, ink, iris, success, warning} from '@/styles/palette';
+
 import WidgetFrame, {tabClass} from './frame';
 import type {WidgetProps} from './index';
 import PlaybackControls, {usePlayback} from './playback';
@@ -29,11 +31,11 @@ const ORDER: Record<Mode, string> = {
 };
 
 const COLOR: Record<Kind, string> = {
-  commit: '#a78bfa',
-  process: '#34d399',
-  crash: '#fb7185',
-  restart: '#fbbf24',
-  skip: '#d6c6f5',
+  commit: iris[300],
+  process: success[400],
+  crash: danger[400],
+  restart: warning[400],
+  skip: ink[300],
 };
 
 const LABEL: Record<Kind, (r: number) => string> = {
@@ -125,7 +127,7 @@ const DeliverySemantics: FC<WidgetProps> = memo(() => {
   const readout = useMemo(() => {
     const guarantee = (
       <>
-        <b className="text-cream">{mode}</b>: {ORDER[mode]}.{' '}
+        <b className="text-ink-100">{mode}</b>: {ORDER[mode]}.{' '}
       </>
     );
     if (!crash)
@@ -168,10 +170,10 @@ const DeliverySemantics: FC<WidgetProps> = memo(() => {
   const lost = (r: number): boolean => state.restarted && r < state.restartAt && state.processed[r] === 0;
   const cellFill = (r: number): string => {
     const n = state.processed[r];
-    if (n >= 2) return '#fbbf24';
-    if (n === 1) return '#34d399';
-    if (lost(r)) return '#fb7185';
-    return '#2b144d';
+    if (n >= 2) return warning[400];
+    if (n === 1) return success[400];
+    if (lost(r)) return danger[400];
+    return ink[700];
   };
   const cellNote = (r: number): string => {
     const n = state.processed[r];
@@ -189,7 +191,7 @@ const DeliverySemantics: FC<WidgetProps> = memo(() => {
       title="Delivery semantics: where the commit sits relative to processing">
       <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} 150`}>
         <title>{`${mode}: consumer events for records 0..${RECORDS - 1}${crash ? ' with a crash' : ''}`}</title>
-        <g fill="#a78bfa" fontFamily={MONO} fontSize={9}>
+        <g fill={ink[300]} fontFamily={MONO} fontSize={9}>
           <text x={EV_X} y={24}>
             partition
           </text>
@@ -206,7 +208,7 @@ const DeliverySemantics: FC<WidgetProps> = memo(() => {
             <g key={r}>
               <rect fill={cellFill(r)} height={24} rx={4} width={LOG_W} x={x} y={10} />
               <text
-                fill={cellFill(r) === '#2b144d' ? '#d6c6f5' : '#1a0b33'}
+                fill={cellFill(r) === ink[700] ? ink[200] : ink[950]}
                 fontFamily={MONO}
                 fontSize={9}
                 textAnchor="middle"
@@ -215,7 +217,7 @@ const DeliverySemantics: FC<WidgetProps> = memo(() => {
                 rec {r}
               </text>
               <text
-                fill={cellFill(r) === '#2b144d' ? '#a78bfa' : '#1a0b33'}
+                fill={cellFill(r) === ink[700] ? ink[300] : ink[950]}
                 fontFamily={MONO}
                 fontSize={7}
                 textAnchor="middle"
@@ -226,12 +228,12 @@ const DeliverySemantics: FC<WidgetProps> = memo(() => {
             </g>
           );
         })}
-        <path d={`M${LOG_X + state.committed * (LOG_W + 8) - 4} 44 l-4 -7 h8 z`} fill="#fbf6ff" />
-        <text fill="#d6c6f5" fontFamily={MONO} fontSize={8} x={LOG_X + state.committed * (LOG_W + 8) + 4} y={44}>
+        <path d={`M${LOG_X + state.committed * (LOG_W + 8) - 4} 44 l-4 -7 h8 z`} fill={ink[50]} />
+        <text fill={ink[200]} fontFamily={MONO} fontSize={8} x={LOG_X + state.committed * (LOG_W + 8) + 4} y={44}>
           committed offset = {state.committed}
         </text>
         <text
-          fill={state.crashed ? '#fb7185' : '#d6c6f5'}
+          fill={state.crashed ? danger[400] : ink[200]}
           fontFamily={MONO}
           fontSize={8}
           textAnchor="end"
@@ -253,14 +255,14 @@ const DeliverySemantics: FC<WidgetProps> = memo(() => {
                 fillOpacity={ev.kind === 'crash' ? 1 : 0.85}
                 height={22}
                 rx={3}
-                stroke={isNow ? '#fbf6ff' : 'none'}
+                stroke={isNow ? ink[50] : 'none'}
                 strokeWidth={1.5}
                 width={EV_W - 4}
                 x={x}
                 y={62}
               />
               <text
-                fill="#1a0b33"
+                fill={ink[950]}
                 fontFamily={MONO}
                 fontSize={7.5}
                 fontWeight={isNow ? 700 : 400}
@@ -272,13 +274,13 @@ const DeliverySemantics: FC<WidgetProps> = memo(() => {
             </g>
           );
         })}
-        <text fill="#fbf6ff" fontFamily={MONO} fontSize={9} x={LOG_X} y={128}>
+        <text fill={ink[50]} fontFamily={MONO} fontSize={9} x={LOG_X} y={128}>
           applied: [{effects.join(', ')}]
           {mode === 'effectively-once'
             ? `   dedupe store: {${state.processed.flatMap((n, r) => (n > 0 ? [r] : [])).join(', ')}}`
             : ''}
         </text>
-        <text fill="#a78bfa" fontFamily={MONO} fontSize={8} x={LOG_X} y={142}>
+        <text fill={ink[300]} fontFamily={MONO} fontSize={8} x={LOG_X} y={142}>
           {mode === 'at-most-once'
             ? 'a record is safe to drop: metrics, presence pings'
             : mode === 'at-least-once'

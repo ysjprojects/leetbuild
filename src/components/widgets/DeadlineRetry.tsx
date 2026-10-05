@@ -1,5 +1,7 @@
 import {type ChangeEvent, type FC, memo, useCallback, useMemo, useState} from 'react';
 
+import {danger, ink, success, warning} from '@/styles/palette';
+
 import WidgetFrame, {clamp, numParam, RANGE_CLASS} from './frame';
 import type {WidgetProps} from './index';
 
@@ -23,12 +25,17 @@ interface Attempt {
   outcome: Outcome;
 }
 
-const FILL: Record<Outcome, string> = {failed: '#fb7185', success: '#34d399', cut: '#fbbf24', skipped: '#a78bfa'};
+const FILL: Record<Outcome, string> = {
+  failed: danger[400],
+  success: success[400],
+  cut: warning[400],
+  skipped: ink[500],
+};
 const TONE_CLASS: Record<Outcome, string> = {
-  failed: 'text-rose-400',
-  success: 'text-emerald-400',
-  cut: 'text-amber-400',
-  skipped: 'text-violet-300',
+  failed: 'text-danger-400',
+  success: 'text-success-400',
+  cut: 'text-warning-400',
+  skipped: 'text-ink-400',
 };
 
 /** Attempt 1 fires immediately; retry r waits `base·2^(r-1)·jitter` after the previous failure. */
@@ -90,7 +97,7 @@ const DeadlineRetry: FC<WidgetProps> = memo(({params}) => {
     () => (
       <>
         <label className="flex items-center gap-1.5">
-          <span className="text-plum-300">base</span>
+          <span className="text-ink-300">base</span>
           <input
             aria-label="base delay in ms"
             className={RANGE_CLASS}
@@ -101,10 +108,10 @@ const DeadlineRetry: FC<WidgetProps> = memo(({params}) => {
             type="range"
             value={base}
           />
-          <span className="font-code tabular-nums text-cream">{base} ms</span>
+          <span className="font-code text-ink-100 tabular-nums">{base} ms</span>
         </label>
         <label className="flex items-center gap-1.5">
-          <span className="text-plum-300">deadline</span>
+          <span className="text-ink-300">deadline</span>
           <input
             aria-label="caller deadline in ms"
             className={RANGE_CLASS}
@@ -115,10 +122,10 @@ const DeadlineRetry: FC<WidgetProps> = memo(({params}) => {
             type="range"
             value={deadline}
           />
-          <span className="font-code tabular-nums text-cream">{deadline} ms</span>
+          <span className="font-code text-ink-100 tabular-nums">{deadline} ms</span>
         </label>
         <label className="flex items-center gap-1.5">
-          <span className="text-plum-300">attempt</span>
+          <span className="text-ink-300">attempt</span>
           <input
             aria-label="attempt duration in ms"
             className={RANGE_CLASS}
@@ -129,7 +136,7 @@ const DeadlineRetry: FC<WidgetProps> = memo(({params}) => {
             type="range"
             value={duration}
           />
-          <span className="font-code tabular-nums text-cream">{duration} ms</span>
+          <span className="font-code text-ink-100 tabular-nums">{duration} ms</span>
         </label>
       </>
     ),
@@ -139,14 +146,15 @@ const DeadlineRetry: FC<WidgetProps> = memo(({params}) => {
   const readout = useMemo(
     () => (
       <>
-        <b className="text-cream">
+        <b className="text-ink-100">
           {fit} of {attempts} attempts
         </b>{' '}
         fit in the {deadline} ms budget
         {success === undefined ? (
           <>
             {' '}
-            and <b className="text-rose-300">none can succeed</b>: the caller gets DEADLINE_EXCEEDED after {deadline} ms
+            and <b className="text-danger-300">none can succeed</b>: the caller gets DEADLINE_EXCEEDED after {deadline}{' '}
+            ms
           </>
         ) : (
           <>
@@ -176,17 +184,17 @@ const DeadlineRetry: FC<WidgetProps> = memo(({params}) => {
         <title>Retry attempts on a timeline against the caller deadline</title>
         {ticks.map(t => (
           <g key={t}>
-            <line stroke="rgba(58,29,104,0.5)" x1={x(t)} x2={x(t)} y1={TOP - 4} y2={height - 18} />
-            <text fill="#a78bfa" fontFamily={MONO} fontSize={8} textAnchor="middle" x={x(t)} y={height - 6}>
+            <line stroke={ink[800]} x1={x(t)} x2={x(t)} y1={TOP - 4} y2={height - 18} />
+            <text fill={ink[300]} fontFamily={MONO} fontSize={8} textAnchor="middle" x={x(t)} y={height - 6}>
               {Math.round(t)}
             </text>
           </g>
         ))}
-        <text fill="#a78bfa" fontFamily={MONO} fontSize={8} x={RIGHT - 14} y={height - 6}>
+        <text fill={ink[300]} fontFamily={MONO} fontSize={8} x={RIGHT - 14} y={height - 6}>
           ms
         </text>
         <line
-          stroke="#fb7185"
+          stroke={danger[400]}
           strokeDasharray="4 3"
           strokeWidth={1.5}
           x1={x(deadline)}
@@ -194,7 +202,7 @@ const DeadlineRetry: FC<WidgetProps> = memo(({params}) => {
           y1={TOP - 12}
           y2={height - 18}
         />
-        <text fill="#fb7185" fontFamily={MONO} fontSize={9} textAnchor="middle" x={x(deadline)} y={TOP - 15}>
+        <text fill={danger[400]} fontFamily={MONO} fontSize={9} textAnchor="middle" x={x(deadline)} y={TOP - 15}>
           deadline {deadline} ms
         </text>
         {plan.map((a, i) => {
@@ -211,12 +219,12 @@ const DeadlineRetry: FC<WidgetProps> = memo(({params}) => {
               : `${Math.round(a.start)}–${Math.round(a.end)} ms ${a.outcome === 'success' ? 'OK' : 'UNAVAILABLE'}`;
           return (
             <g key={a.n}>
-              <text fill="#d6c6f5" fontFamily={MONO} fontSize={9} x={4} y={y + 10}>
+              <text fill={ink[200]} fontFamily={MONO} fontSize={9} x={4} y={y + 10}>
                 attempt {a.n}
               </text>
               {a.wait > 0 && a.outcome !== 'skipped' ? (
                 <rect
-                  fill="rgba(58,29,104,0.5)"
+                  fill={ink[800]}
                   height={4}
                   width={x(a.start) - x(a.start - a.wait)}
                   x={x(a.start - a.wait)}
@@ -246,9 +254,9 @@ const DeadlineRetry: FC<WidgetProps> = memo(({params}) => {
           );
         })}
       </svg>
-      <table className="mt-2 w-full border-collapse font-code text-[10px] text-plum-200">
+      <table className="font-code text-ink-200 mt-2 w-full border-collapse text-[10px]">
         <thead>
-          <tr className="text-left text-plum-300">
+          <tr className="text-ink-300 text-left">
             <th className="py-0.5 pr-2 font-normal">status</th>
             <th className="py-0.5 pr-2 font-normal">retry?</th>
             <th className="py-0.5 font-normal">why</th>
@@ -256,8 +264,8 @@ const DeadlineRetry: FC<WidgetProps> = memo(({params}) => {
         </thead>
         <tbody>
           {STATUSES.map(st => (
-            <tr className="border-t border-plum-800" key={st.code}>
-              <td className="py-0.5 pr-2 text-cream">{st.code}</td>
+            <tr className="border-ink-700 border-t" key={st.code}>
+              <td className="text-ink-100 py-0.5 pr-2">{st.code}</td>
               <td className={`py-0.5 pr-2 font-semibold ${TONE_CLASS[st.tone]}`}>{st.retry}</td>
               <td className="py-0.5">{st.why}</td>
             </tr>

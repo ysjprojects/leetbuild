@@ -4,6 +4,8 @@
  * the checks, the starter, hints and the reference solution behind `<details>` spoilers, and the
  * debrief. Interactive widgets become a note with a link back to the live step.
  */
+import {night} from '@/styles/palette';
+
 import {
   type Diagram,
   type Language,
@@ -14,6 +16,7 @@ import {
   fileName,
   LANGUAGE_LABEL,
   LANGUAGE_STACK,
+  stepPath,
 } from './types';
 import {WIDGETS} from './widgets';
 
@@ -35,17 +38,6 @@ const SHAPE: Record<Diagram['nodes'][number]['kind'], [string, string]> = {
   external: ['{{', '}}'],
 };
 
-const FILL: Record<Diagram['nodes'][number]['kind'], string> = {
-  client: '#6ee7b7',
-  service: '#d6c6f5',
-  http: '#ff7ac8',
-  grpc: '#a78bfa',
-  kafka: '#fbbf24',
-  redis: '#fb7185',
-  db: '#60a5fa',
-  external: '#9ca3af',
-};
-
 const mermaidLabel = (text: string): string => text.replace(/"/g, '#quot;');
 
 /** Node ids must be identifiers; dashes are allowed by Mermaid but keep it plain. */
@@ -63,9 +55,11 @@ export function diagramToMermaid(diagram: Diagram): string {
     const label = edge.label === undefined ? '' : `|"${mermaidLabel(edge.label.replace(/\|/g, '/'))}"|`;
     lines.push(`  ${nodeId(edge.from)} ${arrow}${label} ${nodeId(edge.to)}`);
   }
+  // Literal hex: the file is rendered by GitHub or Obsidian in the reader's own theme, so the
+  // diagrams always wear Night's pastel fills with dark text, which read on light and dark alike.
   const kinds = Array.from(new Set(diagram.nodes.map(n => n.kind)));
   for (const kind of kinds) {
-    lines.push(`  classDef ${kind} fill:${FILL[kind]},stroke:#2b144d,color:#150826`);
+    lines.push(`  classDef ${kind} fill:${night.node[kind]},stroke:${night.ink[700]},color:${night.ink[950]}`);
     lines.push(
       `  class ${diagram.nodes
         .filter(n => n.kind === kind)
@@ -113,7 +107,9 @@ export function githubSlug(heading: string): string {
     .replace(/ /g, '-');
 }
 
-const stepUrl = (problem: Problem, step: Step): string => `${siteUrl()}?p=${problem.id}&s=${step.id}`;
+/** The live page of a problem; the share card and the exported Markdown link back to it. */
+export const problemUrl = (problem: Problem): string => `${siteUrl()}/${problem.id}`;
+const stepUrl = (problem: Problem, step: Step): string => `${siteUrl()}${stepPath(problem, step)}`;
 
 function stepToMarkdown(problem: Problem, step: Step, index: number, language: Language): string {
   const code = step.code[language];
@@ -184,14 +180,14 @@ export function problemToMarkdown(problem: Problem, language: Language): string 
   parts.push(
     `*LeetBuild · ${problem.difficulty} · ${problem.concepts.map(c => CONCEPT_LABEL[c]).join(', ')} · ~${
       problem.minutes
-    } min · ${LANGUAGE_LABEL[language]} edition · [live version](${siteUrl()}?p=${problem.id})*`,
+    } min · ${LANGUAGE_LABEL[language]} edition · [live version](${problemUrl(problem)})*`,
   );
   parts.push('');
   parts.push(problem.tagline);
   parts.push('');
   // The statement already starts with its own `# Title`; drop it and demote the rest under ours.
   const statement = problem.statement.replace(/^#\s+[^\n]*\n/, '');
-  parts.push(widgetsToNotes(shiftHeadings(statement, 1), `${siteUrl()}?p=${problem.id}`).trim());
+  parts.push(widgetsToNotes(shiftHeadings(statement, 1), problemUrl(problem)).trim());
   parts.push('');
   parts.push('## Architecture');
   parts.push('');

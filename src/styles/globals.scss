@@ -23,23 +23,21 @@
 html,
 body {
   margin: 0;
-  background: #150826;
-  color: #fbf6ff;
+  background: theme('colors.ink.900');
+  color: theme('colors.ink.100');
   -webkit-font-smoothing: antialiased;
 }
 
 /* The playground: CodeMirror chrome, the syntax token palette shared by editors and static code
  * blocks, and the unified-diff colours of the reference-solution viewer. */
 .leetbuild-playground {
-  --lb-bg: #150826;
-  --lb-panel: #1f0d38;
-  --lb-border: #3a1d68;
-  --lb-text: #fbf6ff;
-  --lb-muted: #b9a3dc;
-  --lb-pink: #ff3fa6;
-  --lb-pink-soft: #ff7ac8;
-  --lb-lavender: #c4b5fd;
-  --lb-selection: rgba(255, 63, 166, 0.28);
+  --lb-panel: theme('colors.ink.850');
+  --lb-border: theme('colors.ink.700');
+  --lb-text: theme('colors.ink.100');
+  --lb-muted: theme('colors.ink.300');
+  --lb-accent: theme('colors.iris.400');
+  --lb-accent-soft: theme('colors.iris.300');
+  --lb-selection: theme('colors.iris.400 / 22%');
 
   .cm-editor {
     height: 100%;
@@ -58,28 +56,28 @@ body {
   }
 
   .cm-content {
-    caret-color: var(--lb-pink);
+    caret-color: var(--lb-accent);
     padding: 8px 0;
   }
 
   .cm-cursor,
   .cm-dropCursor {
-    border-left-color: var(--lb-pink);
+    border-left-color: var(--lb-accent);
   }
 
   .cm-gutters {
     background: var(--lb-panel);
-    color: #6f579a;
+    color: theme('colors.ink.500');
     border-right: 1px solid var(--lb-border);
   }
 
   .cm-activeLineGutter {
-    background: rgba(255, 63, 166, 0.08);
-    color: var(--lb-pink-soft);
+    background: theme('colors.iris.400 / 8%');
+    color: var(--lb-accent-soft);
   }
 
   .cm-activeLine {
-    background: rgba(255, 255, 255, 0.03);
+    background: theme('colors.ink.50 / 3%');
   }
 
   .cm-selectionBackground,
@@ -89,30 +87,30 @@ body {
   }
 
   .cm-selectionMatch {
-    background: rgba(196, 181, 253, 0.2);
+    background: theme('colors.iris.200 / 18%');
   }
 
   .cm-matchingBracket,
   .cm-editor.cm-focused .cm-matchingBracket {
-    background: rgba(255, 122, 200, 0.25);
-    outline: 1px solid rgba(255, 122, 200, 0.5);
+    background: theme('colors.iris.300 / 22%');
+    outline: 1px solid theme('colors.iris.300 / 50%');
   }
 
   .cm-lintRange-error {
     background-image: none;
-    text-decoration: underline wavy #ff5c8a;
+    text-decoration: underline wavy theme('colors.danger.400');
     text-decoration-skip-ink: none;
   }
 
   .cm-lintRange-warning {
     background-image: none;
-    text-decoration: underline wavy #ffc857;
+    text-decoration: underline wavy theme('colors.warning.300');
     text-decoration-skip-ink: none;
   }
 
   .cm-lintRange-info {
     background-image: none;
-    text-decoration: underline dotted var(--lb-lavender);
+    text-decoration: underline dotted var(--lb-accent-soft);
   }
 
   .cm-lint-marker-error {
@@ -120,8 +118,8 @@ body {
   }
 
   .cm-tooltip {
-    background: #2b144d;
-    border: 1px solid var(--lb-border);
+    background: theme('colors.ink.800');
+    border: 1px solid theme('colors.ink.600');
     color: var(--lb-text);
     border-radius: 8px;
   }
@@ -138,21 +136,21 @@ body {
   }
 
   .cm-diagnostic-error {
-    border-left-color: #ff5c8a;
+    border-left-color: theme('colors.danger.400');
   }
 
   .cm-diagnostic-warning {
-    border-left-color: #ffc857;
+    border-left-color: theme('colors.warning.300');
   }
 
   .cm-panels {
-    background: #2b144d;
+    background: theme('colors.ink.800');
     color: var(--lb-text);
   }
 
   /* Syntax tokens (classHighlighter) */
   .tok-comment {
-    color: #8b6fae;
+    color: theme('colors.syntax.comment');
     font-style: italic;
   }
 
@@ -161,91 +159,88 @@ body {
   .tok-operatorKeyword,
   .tok-definitionKeyword,
   .tok-moduleKeyword {
-    color: #ff5fb8;
+    color: theme('colors.syntax.keyword');
   }
 
   .tok-typeName,
   .tok-className,
   .tok-namespace {
-    color: #c4b5fd;
+    color: theme('colors.syntax.type');
   }
 
   .tok-modifier,
   .tok-annotation,
   .tok-meta {
-    color: #d8b4fe;
+    color: theme('colors.syntax.meta');
   }
 
   .tok-string,
   .tok-string2,
   .tok-character {
-    color: #ffb0dc;
+    color: theme('colors.syntax.string');
   }
 
   .tok-number,
   .tok-bool,
-  .tok-atom {
-    color: #ffd4ee;
+  .tok-atom,
+  .tok-literal {
+    color: theme('colors.syntax.number');
   }
 
   .tok-variableName {
-    color: #fbf6ff;
+    color: theme('colors.syntax.variable');
   }
 
   .tok-variableName2,
   .tok-propertyName {
-    color: #e9d5ff;
+    color: theme('colors.syntax.property');
   }
 
   .tok-function,
   .tok-definition {
-    color: #ffffff;
+    color: theme('colors.syntax.function');
     font-weight: 600;
   }
 
   .tok-labelName {
-    color: #ff9ad5;
+    color: theme('colors.syntax.type');
     font-weight: 600;
   }
 
   .tok-operator,
   .tok-punctuation {
-    color: #b9a3dc;
+    color: theme('colors.syntax.operator');
   }
 
   .tok-processingInstruction,
   .tok-macroName {
-    color: #ff8acb;
+    color: theme('colors.syntax.meta');
   }
 
   .tok-invalid {
-    color: #ff5c8a;
+    color: theme('colors.syntax.invalid');
     text-decoration: underline;
-  }
-
-  .tok-literal {
-    color: #ffd4ee;
   }
 
   /* The unified diff of the reference solution against the learner's code. */
   .cm-changedLine {
-    background: rgba(52, 211, 153, 0.12);
+    background: theme('colors.success.400 / 12%');
   }
 
   .cm-deletedChunk {
-    background: rgba(251, 113, 133, 0.12);
+    background: theme('colors.danger.400 / 12%');
   }
 
   .cm-changedText {
-    background: rgba(52, 211, 153, 0.28);
+    background: theme('colors.success.400 / 28%');
   }
 
   .cm-deletedChunk .cm-deletedText {
-    background: rgba(251, 113, 133, 0.3);
+    background: theme('colors.danger.400 / 30%');
   }
 
   .cm-collapsedLines {
-    background: rgba(58, 29, 104, 0.6);
+    background: theme('colors.ink.800 / 60%');
     color: var(--lb-muted);
   }
 }

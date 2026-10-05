@@ -11,7 +11,7 @@ import {type Extension, Compartment, EditorState} from '@codemirror/state';
 import {EditorView, keymap} from '@codemirror/view';
 import {type MutableRefObject, memo, useEffect, useRef} from 'react';
 
-import {editorExtensions, editorLanguage,INDENT,viewerExtensions} from '@/lib/editor';
+import {editorExtensions, editorLanguage, INDENT, viewerExtensions} from '@/lib/editor';
 import type {Language} from '@/lib/types';
 
 interface Props {

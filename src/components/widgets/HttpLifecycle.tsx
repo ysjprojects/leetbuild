@@ -1,5 +1,7 @@
 import {type FC, type MouseEvent, memo, useCallback, useMemo, useState} from 'react';
 
+import {alpha, concept, ink, iris, success, warning} from '@/styles/palette';
+
 import WidgetFrame, {boolParam, tabClass} from './frame';
 import type {WidgetProps} from './index';
 import PlaybackControls, {usePlayback} from './playback';
@@ -118,13 +120,19 @@ const REUSE: Phase[] = [
 ];
 
 const MONO = 'var(--font-code), monospace';
+const NOW_TINT = alpha(iris[400], 0.18);
 const BROWSER_X = 96;
 const SERVER_X = 470;
 const TOP = 38;
 const ROW = 30;
 const WIDTH = 560;
 
-const GROUP_COLOR: Record<Group, string> = {TCP: '#a78bfa', TLS: '#fbbf24', HTTP: '#ff7ac8', 'keep-alive': '#34d399'};
+const GROUP_COLOR: Record<Group, string> = {
+  TCP: concept.grpc,
+  TLS: warning[300],
+  HTTP: concept.http,
+  'keep-alive': success[400],
+};
 
 const HttpLifecycle: FC<WidgetProps> = memo(({params}) => {
   const [tls, setTls] = useState(() => boolParam(params, 'tls', true));
@@ -156,8 +164,8 @@ const HttpLifecycle: FC<WidgetProps> = memo(({params}) => {
   const readout = useMemo(
     () => (
       <>
-        <b className="text-cream">{phase.group}</b> · {phase.readout}{' '}
-        <span className="text-plum-300">
+        <b className="text-ink-100">{phase.group}</b> · {phase.readout}{' '}
+        <span className="text-ink-300">
           ({roundTrips} round trip{roundTrips === 1 ? '' : 's'} so far)
         </span>
       </>
@@ -173,30 +181,23 @@ const HttpLifecycle: FC<WidgetProps> = memo(({params}) => {
           Sequence of TCP, TLS, request, routing, response and keep-alive reuse between a browser and a server
         </title>
         <g fontFamily={MONO} fontSize={11} textAnchor="middle">
-          <rect fill="#2b144d" height={20} rx={5} width={84} x={BROWSER_X - 42} y={6} />
-          <text fill="#fbf6ff" x={BROWSER_X} y={20}>
+          <rect fill={ink[700]} height={20} rx={5} width={84} x={BROWSER_X - 42} y={6} />
+          <text fill={ink[50]} x={BROWSER_X} y={20}>
             browser
           </text>
-          <rect fill="#2b144d" height={20} rx={5} width={84} x={SERVER_X - 42} y={6} />
-          <text fill="#fbf6ff" x={SERVER_X} y={20}>
+          <rect fill={ink[700]} height={20} rx={5} width={84} x={SERVER_X - 42} y={6} />
+          <text fill={ink[50]} x={SERVER_X} y={20}>
             server
           </text>
         </g>
-        <line
-          stroke="rgba(58,29,104,0.9)"
-          strokeDasharray="3 3"
-          x1={BROWSER_X}
-          x2={BROWSER_X}
-          y1={28}
-          y2={height - 4}
-        />
-        <line stroke="rgba(58,29,104,0.9)" strokeDasharray="3 3" x1={SERVER_X} x2={SERVER_X} y1={28} y2={height - 4} />
+        <line stroke={ink[700]} strokeDasharray="3 3" x1={BROWSER_X} x2={BROWSER_X} y1={28} y2={height - 4} />
+        <line stroke={ink[700]} strokeDasharray="3 3" x1={SERVER_X} x2={SERVER_X} y1={28} y2={height - 4} />
         {phases.map((p, i) => {
           const y = TOP + i * ROW + 14;
           const isNow = i === current;
           const shown = i <= current;
-          const color = isNow ? '#ff3fa6' : '#a78bfa';
-          const textColor = isNow ? '#fbf6ff' : '#d6c6f5';
+          const color = isNow ? iris[400] : iris[300];
+          const textColor = isNow ? ink[50] : ink[200];
           const groupStart = i === 0 || phases[i - 1].group !== p.group;
           return (
             <g key={`${p.group}-${p.label}`} opacity={shown ? (isNow ? 1 : 0.5) : 0}>
@@ -208,7 +209,7 @@ const HttpLifecycle: FC<WidgetProps> = memo(({params}) => {
               {p.dir === 'note' ? (
                 <>
                   <rect
-                    fill={isNow ? 'rgba(255,63,166,0.18)' : '#2b144d'}
+                    fill={isNow ? NOW_TINT : ink[700]}
                     height={18}
                     rx={4}
                     stroke={color}
@@ -250,7 +251,7 @@ const HttpLifecycle: FC<WidgetProps> = memo(({params}) => {
                   </text>
                   {p.sub === undefined ? null : (
                     <text
-                      fill={isNow ? '#ffb0dc' : '#a78bfa'}
+                      fill={isNow ? iris[200] : ink[300]}
                       fontFamily={MONO}
                       fontSize={8}
                       textAnchor="middle"

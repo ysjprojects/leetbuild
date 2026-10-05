@@ -1,6 +1,7 @@
 import {type FC, memo, useMemo} from 'react';
 
 import type {Sequence} from '@/lib/types';
+import {concept, ink, iris} from '@/styles/palette';
 
 /** The runtime interaction a step implements: participants as lifelines, messages as arrows in order. */
 
@@ -10,9 +11,9 @@ const ROW = 34;
 const MONO = 'var(--font-code), monospace';
 
 const KIND_STYLE = {
-  sync: {dash: undefined, color: '#ffb0dc', marker: 'url(#lb-seq-filled)'},
-  reply: {dash: '5 4', color: '#a78bfa', marker: 'url(#lb-seq-open)'},
-  async: {dash: '2 3', color: '#fbbf24', marker: 'url(#lb-seq-open)'},
+  sync: {dash: undefined, color: iris[300], marker: 'url(#lb-seq-filled)'},
+  reply: {dash: '5 4', color: ink[300], marker: 'url(#lb-seq-open)'},
+  async: {dash: '2 3', color: concept.kafka, marker: 'url(#lb-seq-open)'},
 } as const;
 
 const SequenceDiagram: FC<{sequence: Sequence}> = memo(({sequence}) => {
@@ -27,32 +28,32 @@ const SequenceDiagram: FC<{sequence: Sequence}> = memo(({sequence}) => {
   const height = TOP + 12 + sequence.messages.length * ROW + 10;
 
   return (
-    <div className="rounded-xl border border-plum-600/70 bg-plum-950/40 p-2">
+    <div className="border-ink-700 bg-ink-850 rounded-xl border p-2">
       <svg className="w-full" role="img" style={{maxHeight: 260}} viewBox={`0 0 ${width} ${height}`}>
         <title>Sequence of calls for this step</title>
         <defs>
           <marker id="lb-seq-filled" markerHeight={7} markerWidth={8} orient="auto" refX={8} refY={3.5}>
-            <path d="M0 0L8 3.5L0 7z" fill="#ffb0dc" />
+            <path d="M0 0L8 3.5L0 7z" fill={iris[300]} />
           </marker>
           <marker id="lb-seq-open" markerHeight={7} markerWidth={8} orient="auto" refX={8} refY={3.5}>
-            <path d="M0 0L8 3.5L0 7" fill="none" stroke="#d6c6f5" strokeWidth={1.4} />
+            <path d="M0 0L8 3.5L0 7" fill="none" stroke={ink[200]} strokeWidth={1.4} />
           </marker>
         </defs>
         {sequence.participants.map(p => {
           const x = columns[p];
           return (
             <g key={p}>
-              <line stroke="#3a1d68" strokeDasharray="3 3" strokeWidth={1} x1={x} x2={x} y1={TOP} y2={height - 4} />
+              <line stroke={ink[700]} strokeDasharray="3 3" strokeWidth={1} x1={x} x2={x} y1={TOP} y2={height - 4} />
               <rect
-                fill="#2b144d"
+                fill={ink[800]}
                 height={22}
                 rx={6}
-                stroke="#4f2a8c"
+                stroke={ink[600]}
                 width={COLUMN - 40}
                 x={x - (COLUMN - 40) / 2}
                 y={4}
               />
-              <text fill="#fbf6ff" fontSize={11.5} fontWeight={700} textAnchor="middle" x={x} y={19}>
+              <text fill={ink[50]} fontSize={11.5} fontWeight={700} textAnchor="middle" x={x} y={19}>
                 {p}
               </text>
             </g>
@@ -80,7 +81,7 @@ const SequenceDiagram: FC<{sequence: Sequence}> = memo(({sequence}) => {
                   strokeWidth={1.4}
                 />
                 <text
-                  fill="#d6c6f5"
+                  fill={ink[200]}
                   fontFamily={MONO}
                   fontSize={9.5}
                   textAnchor={left ? 'end' : 'start'}
@@ -107,18 +108,18 @@ const SequenceDiagram: FC<{sequence: Sequence}> = memo(({sequence}) => {
                 y1={y}
                 y2={y}
               />
-              <rect fill="#150826" height={13} rx={3} width={labelW} x={mid - labelW / 2} y={y - 15} />
-              <text fill="#d6c6f5" fontFamily={MONO} fontSize={9.5} textAnchor="middle" x={mid} y={y - 5}>
+              <rect fill={ink[850]} height={13} rx={3} width={labelW} x={mid - labelW / 2} y={y - 15} />
+              <text fill={ink[200]} fontFamily={MONO} fontSize={9.5} textAnchor="middle" x={mid} y={y - 5}>
                 {m.label}
               </text>
             </g>
           );
         })}
       </svg>
-      <div className="mt-1 flex flex-wrap gap-x-3 px-1 text-[10px] text-plum-300">
-        <span className="text-candy-200">— request</span>
-        <span className="text-plum-300">- - reply</span>
-        <span className="text-amber-300">· · fire-and-forget</span>
+      <div className="text-ink-300 mt-1 flex flex-wrap gap-x-3 px-1 text-[10px]">
+        <span className="text-iris-300">— request</span>
+        <span className="text-ink-300">- - reply</span>
+        <span className="text-concept-kafka">· · fire-and-forget</span>
       </div>
     </div>
   );

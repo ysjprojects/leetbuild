@@ -19,9 +19,7 @@ export interface Progress {
   /** Keyed by `problemId/stepId` (see `stepKey`). */
   attempts: Record<string, StepAttempt>;
   language: Language;
-  /** Problem to reopen on the next visit; null shows the problem list. */
-  lastProblem: string | null;
-  /** Step last open per problem id. */
+  /** Step last open per problem id; `/<problem>` reopens it. */
   lastStep: Record<string, string>;
   submissions: number;
   acceptedSubmissions: number;
@@ -56,7 +54,6 @@ const OPEN_TIMEOUT_MS = 4000;
 export const EMPTY_PROGRESS: Progress = {
   attempts: {},
   language: 'python',
-  lastProblem: null,
   lastStep: {},
   submissions: 0,
   acceptedSubmissions: 0,
@@ -182,7 +179,6 @@ function normalizeProgress(value: unknown): Progress {
   return {
     attempts: typeof p.attempts === 'object' && p.attempts !== null ? p.attempts : {},
     language: typeof p.language === 'string' && LANGUAGES.includes(p.language) ? p.language : 'python',
-    lastProblem: typeof p.lastProblem === 'string' ? p.lastProblem : null,
     lastStep: typeof p.lastStep === 'object' && p.lastStep !== null ? p.lastStep : {},
     submissions: typeof p.submissions === 'number' ? p.submissions : 0,
     acceptedSubmissions: typeof p.acceptedSubmissions === 'number' ? p.acceptedSubmissions : 0,

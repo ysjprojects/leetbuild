@@ -160,3 +160,18 @@ export interface Problem {
 export function stepKey(problemId: string, stepId: string): string {
   return `${problemId}/${stepId}`;
 }
+
+/** URL segment of a step, numbered like its source file: step 2 `cache-aside` → `2-cache-aside`. */
+export function stepSlug(problem: Problem, step: Step): string {
+  return `${problem.steps.indexOf(step) + 1}-${step.id}`;
+}
+
+/** The step whose slug this is, if any. */
+export function stepBySlug(problem: Problem, slug: string): Step | undefined {
+  return problem.steps.find((step, i) => slug === `${i + 1}-${step.id}`);
+}
+
+/** Site-relative address of a step: `/image-cache/2-cache-aside`. */
+export function stepPath(problem: Problem, step: Step): string {
+  return `/${problem.id}/${stepSlug(problem, step)}`;
+}

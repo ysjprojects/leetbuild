@@ -177,21 +177,21 @@ const renderInline = (text: string): ReactNode[] => {
   return parts.map((part, index) => {
     if (part.startsWith('**') && part.endsWith('**')) {
       return (
-        <strong className="font-semibold text-white" key={index}>
+        <strong className="text-ink-50 font-semibold" key={index}>
           {part.slice(2, -2)}
         </strong>
       );
     }
     if (part.startsWith('`') && part.endsWith('`')) {
       return (
-        <code className="rounded bg-plum-700/80 px-1.5 py-0.5 font-code text-[0.85em] text-candy-200" key={index}>
+        <code className="bg-ink-800 font-code text-iris-200 rounded px-1.5 py-0.5 text-[0.85em]" key={index}>
           {part.slice(1, -1)}
         </code>
       );
     }
     if (part.startsWith('*') && part.endsWith('*') && part.length > 2) {
       return (
-        <em className="text-plum-200" key={index}>
+        <em className="text-ink-200" key={index}>
           {part.slice(1, -1)}
         </em>
       );
@@ -200,7 +200,7 @@ const renderInline = (text: string): ReactNode[] => {
     if (link !== null) {
       return (
         <a
-          className="text-candy-400 underline decoration-candy-600/60 underline-offset-2 hover:text-candy-300"
+          className="text-iris-300 decoration-iris-400/50 hover:text-iris-200 underline underline-offset-2"
           href={link[2]}
           key={index}
           rel="noreferrer"
@@ -224,7 +224,7 @@ const CodeBlock: FC<{
   const onClick = useCallback(() => onTry?.(code), [code, onTry]);
   return (
     <div className="group relative my-3">
-      <pre className="overflow-x-auto rounded-lg border border-plum-600/70 bg-plum-900/80 p-3 font-code text-[12.5px] leading-relaxed text-cream">
+      <pre className="border-ink-700 bg-ink-950 font-code text-ink-100 overflow-x-auto rounded-lg border p-3 text-[12.5px] leading-relaxed">
         <code>
           {spans.map((span, index) =>
             span.className === '' ? (
@@ -239,7 +239,7 @@ const CodeBlock: FC<{
       </pre>
       {tryable && onTry ? (
         <button
-          className="absolute right-2 top-2 rounded-md bg-candy-500 px-2 py-0.5 text-[11px] font-semibold text-white shadow transition hover:bg-candy-400"
+          className="bg-iris-400 text-ink-950 hover:bg-iris-300 absolute right-2 top-2 rounded-md px-2 py-0.5 text-[11px] font-semibold shadow transition"
           onClick={onClick}
           type="button">
           Load into editor
@@ -266,24 +266,24 @@ export const PopQuiz: FC<{quiz: PopQuizSpec; onAnswered?: (correct: boolean) => 
   const answered = chosen !== null;
   const correct = chosen === quiz.answer;
   return (
-    <div className="my-4 rounded-xl border border-plum-500/70 bg-plum-950/50 p-3 shadow-[0_0_24px_rgba(122,79,199,0.15)]">
-      <p className="mb-2 flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider text-candy-400">
-        <span className="rounded-full bg-candy-500/20 px-2 py-0.5">Pop quiz</span>
+    <div className="border-ink-600 bg-ink-850 my-4 rounded-xl border p-3">
+      <p className="text-iris-400 mb-2 flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider">
+        <span className="bg-iris-400/15 rounded-full px-2 py-0.5">Pop quiz</span>
         {answered ? (
-          <span className={correct ? 'text-emerald-300' : 'text-rose-300'}>{correct ? 'Correct!' : 'Not quite'}</span>
+          <span className={correct ? 'text-success-300' : 'text-danger-300'}>{correct ? 'Correct!' : 'Not quite'}</span>
         ) : null}
       </p>
-      <p className="text-[14px] text-white">{renderInline(quiz.prompt)}</p>
+      <p className="text-ink-50 text-[14px]">{renderInline(quiz.prompt)}</p>
       <div className="mt-2 grid gap-1.5">
         {quiz.options.map((option, index) => {
           const isAnswer = index === quiz.answer;
           const tone = !answered
-            ? 'border-plum-600/70 bg-plum-900/60 text-plum-200 hover:border-candy-500/60 hover:text-white'
+            ? 'border-ink-600 bg-ink-800 text-ink-200 hover:border-iris-400/60 hover:text-ink-50'
             : isAnswer
-            ? 'border-emerald-400/70 bg-emerald-500/15 text-white'
+            ? 'border-success-400/70 bg-success-400/15 text-ink-50'
             : index === chosen
-            ? 'border-rose-400/70 bg-rose-500/15 text-rose-100'
-            : 'border-plum-700/60 bg-plum-900/40 text-plum-400';
+            ? 'border-danger-400/70 bg-danger-400/15 text-danger-200'
+            : 'border-ink-700 bg-ink-850 text-ink-400';
           return (
             <button
               className={`flex items-start gap-2 rounded-lg border px-2.5 py-1.5 text-left text-[13px] transition ${tone}`}
@@ -291,7 +291,7 @@ export const PopQuiz: FC<{quiz: PopQuizSpec; onAnswered?: (correct: boolean) => 
               key={index}
               onClick={() => onChoose(index)}
               type="button">
-              <span className="mt-0.5 shrink-0 rounded bg-plum-700/80 px-1.5 font-code text-[10px] text-candy-200">
+              <span className="bg-ink-700 font-code text-iris-200 mt-0.5 shrink-0 rounded px-1.5 text-[10px]">
                 {LETTERS[index]}
               </span>
               <span>{renderInline(option)}</span>
@@ -300,9 +300,9 @@ export const PopQuiz: FC<{quiz: PopQuizSpec; onAnswered?: (correct: boolean) => 
         })}
       </div>
       {answered ? (
-        <div className="mt-2 flex items-start justify-between gap-3 text-[13px] text-plum-200">
+        <div className="text-ink-200 mt-2 flex items-start justify-between gap-3 text-[13px]">
           <p>{renderInline(quiz.explanation)}</p>
-          <button className="shrink-0 text-[11px] text-candy-300 hover:text-white" onClick={onRetry} type="button">
+          <button className="text-iris-300 hover:text-ink-50 shrink-0 text-[11px]" onClick={onRetry} type="button">
             try again
           </button>
         </div>
@@ -316,15 +316,15 @@ const Details: FC<{title: string; children: ReactNode}> = memo(({title, children
   const [open, setOpen] = useState(false);
   const toggle = useCallback(() => setOpen(o => !o), []);
   return (
-    <div className="my-3 rounded-lg border border-plum-600/70 bg-plum-900/40">
+    <div className="border-ink-700 bg-ink-850 my-3 rounded-lg border">
       <button
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] font-semibold text-candy-300"
+        className="text-iris-300 flex w-full items-center gap-2 px-3 py-2 text-left text-[13px] font-semibold"
         onClick={toggle}
         type="button">
         <span className="text-[10px]">{open ? '▼' : '▶'}</span>
         {title}
       </button>
-      {open ? <div className="border-t border-plum-600/60 px-3 py-2">{children}</div> : null}
+      {open ? <div className="border-ink-700 border-t px-3 py-2">{children}</div> : null}
     </div>
   );
 });
@@ -358,15 +358,15 @@ const Blocks: FC<{
       switch (block.kind) {
         case 'heading':
           return block.level === 1 ? (
-            <h2 className="pt-2 text-xl font-bold text-white" key={index}>
+            <h2 className="text-ink-50 pt-2 text-xl font-bold" key={index}>
               {renderInline(block.text)}
             </h2>
           ) : block.level === 2 ? (
-            <h3 className="pt-2 text-base font-bold text-candy-300" key={index}>
+            <h3 className="text-iris-300 pt-2 text-base font-bold" key={index}>
               {renderInline(block.text)}
             </h3>
           ) : (
-            <h4 className="pt-1 text-sm font-semibold uppercase tracking-wide text-plum-300" key={index}>
+            <h4 className="text-ink-300 pt-1 text-sm font-semibold uppercase tracking-wide" key={index}>
               {renderInline(block.text)}
             </h4>
           );
@@ -375,20 +375,20 @@ const Blocks: FC<{
         case 'quote':
           return (
             <div
-              className="rounded-lg border border-candy-500/40 bg-candy-500/10 px-3 py-2 text-[13px] text-candy-200"
+              className="border-iris-400/40 bg-iris-400/10 text-iris-200 rounded-lg border px-3 py-2 text-[13px]"
               key={index}>
               {renderInline(block.text)}
             </div>
           );
         case 'list':
           return block.ordered ? (
-            <ol className="list-decimal space-y-1 pl-5 marker:text-candy-400" key={index}>
+            <ol className="marker:text-iris-400 list-decimal space-y-1 pl-5" key={index}>
               {block.items.map((item, j) => (
                 <li key={j}>{renderInline(item)}</li>
               ))}
             </ol>
           ) : (
-            <ul className="list-disc space-y-1 pl-5 marker:text-candy-400" key={index}>
+            <ul className="marker:text-iris-400 list-disc space-y-1 pl-5" key={index}>
               {block.items.map((item, j) => (
                 <li key={j}>{renderInline(item)}</li>
               ))}
@@ -407,9 +407,9 @@ const Blocks: FC<{
           );
         case 'table':
           return (
-            <div className="my-3 overflow-x-auto rounded-lg border border-plum-600/70" key={index}>
+            <div className="border-ink-700 my-3 overflow-x-auto rounded-lg border" key={index}>
               <table className="w-full border-collapse text-[13px]">
-                <thead className="bg-plum-800/70 text-left text-[11px] uppercase tracking-wide text-plum-300">
+                <thead className="bg-ink-800 text-ink-300 text-left text-[11px] uppercase tracking-wide">
                   <tr>
                     {block.header.map((cell, j) => (
                       <th className="px-3 py-1.5 font-semibold" key={j}>
@@ -420,9 +420,9 @@ const Blocks: FC<{
                 </thead>
                 <tbody>
                   {block.rows.map((row, r) => (
-                    <tr className="border-t border-plum-700/60 odd:bg-plum-900/30" key={r}>
+                    <tr className="border-ink-700 odd:bg-ink-850 border-t" key={r}>
                       {row.map((cell, c) => (
-                        <td className="text-plum-100 px-3 py-1.5 align-top" key={c}>
+                        <td className="text-ink-200 px-3 py-1.5 align-top" key={c}>
                           {renderInline(cell)}
                         </td>
                       ))}
@@ -433,7 +433,7 @@ const Blocks: FC<{
             </div>
           );
         case 'rule':
-          return <hr className="border-plum-600/60" key={index} />;
+          return <hr className="border-ink-700" key={index} />;
         case 'quiz':
           return <PopQuiz key={index} onAnswered={onQuiz} quiz={block.quiz} />;
         case 'widget':
@@ -442,7 +442,7 @@ const Blocks: FC<{
               {renderWidget ? (
                 renderWidget(block.name, block.params)
               ) : (
-                <div className="rounded-lg border border-dashed border-plum-500 p-3 text-[12px] text-plum-300">
+                <div className="border-ink-600 text-ink-300 rounded-lg border border-dashed p-3 text-[12px]">
                   widget: {block.name}
                 </div>
               )}
@@ -451,7 +451,7 @@ const Blocks: FC<{
         case 'details':
           return (
             <Details key={index} title={block.title}>
-              <div className="space-y-3 text-[14px] leading-relaxed text-plum-200">
+              <div className="text-ink-200 space-y-3 text-[14px] leading-relaxed">
                 <Blocks
                   blocks={block.body}
                   highlight={highlight}
@@ -471,7 +471,7 @@ Blocks.displayName = 'MarkdownBlocks';
 const Markdown: FC<Props> = memo(({source, onTry, renderWidget, onQuiz, highlight = leetbuildHighlighter}) => {
   const blocks = useMemo(() => parseBlocks(source), [source]);
   return (
-    <div className="space-y-3 text-[14px] leading-relaxed text-plum-200">
+    <div className="text-ink-200 space-y-3 text-[14px] leading-relaxed">
       <Blocks blocks={blocks} highlight={highlight} onQuiz={onQuiz} onTry={onTry} renderWidget={renderWidget} />
     </div>
   );

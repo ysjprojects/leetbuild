@@ -1,5 +1,7 @@
 import {type ChangeEvent, type FC, type FormEvent, type MouseEvent, memo, useCallback, useMemo, useState} from 'react';
 
+import {categorical, ink} from '@/styles/palette';
+
 import WidgetFrame, {clamp, numParam, tabClass} from './frame';
 import type {WidgetProps} from './index';
 import {BUTTON_CLASS} from './playback';
@@ -7,7 +9,6 @@ import {BUTTON_CLASS} from './playback';
 const MONO = 'var(--font-code), monospace';
 const SUGGESTED = ['cat', 'dog', 'AAPL', 'merchant-42'] as const;
 const SEED = ['cat', 'dog', 'cat', 'AAPL', 'merchant-42', 'cat'];
-const PALETTE = ['#ff3fa6', '#a78bfa', '#34d399', '#fbbf24', '#60a5fa', '#fb7185'];
 const LEFT = 36;
 const CELL_W = 46;
 const CELL_H = 26;
@@ -16,7 +17,7 @@ const MAX_CELLS = 12;
 const WIDTH = LEFT + MAX_CELLS * CELL_W + 8;
 
 const INPUT_CLASS =
-  'w-28 rounded-md border border-plum-600 bg-plum-900 px-2 py-0.5 font-code text-[11px] text-cream focus:border-candy-500 focus:ring-0 disabled:opacity-40';
+  'w-28 rounded-md border border-ink-600 bg-ink-900 px-2 py-0.5 font-code text-[11px] text-ink-100 focus:border-iris-400 focus:ring-0 disabled:opacity-40';
 
 /** 32-bit FNV-1a. Kafka's default partitioner uses murmur2; any stable hash gives the same per-key property. */
 const fnv1a = (s: string): number => {
@@ -123,10 +124,10 @@ const KafkaPartitions: FC<WidgetProps> = memo(({params}) => {
     const h = fnv1a(newest.key);
     return (
       <>
-        key <code className="font-code text-candy-200">&quot;{newest.key}&quot;</code> → hash {hex(h)} → {hex(h)} %{' '}
-        {partitions} = <b className="text-cream">partition {newest.partition}</b>, offset {newest.offset}. All messages
-        with key {newest.key} are on partition {newest.partition} in send order; there is no order across partitions.
-        (Kafka&apos;s default partitioner uses murmur2; FNV-1a here for brevity — same idea.)
+        key <code className="font-code text-iris-200">&quot;{newest.key}&quot;</code> → hash {hex(h)} → {hex(h)} %{' '}
+        {partitions} = <b className="text-ink-100">partition {newest.partition}</b>, offset {newest.offset}. All
+        messages with key {newest.key} are on partition {newest.partition} in send order; there is no order across
+        partitions. (Kafka&apos;s default partitioner uses murmur2; FNV-1a here for brevity — same idea.)
       </>
     );
   }, [newest, partitions]);
@@ -136,25 +137,25 @@ const KafkaPartitions: FC<WidgetProps> = memo(({params}) => {
     <WidgetFrame controls={controls} readout={readout} title="Kafka partitions: key → partition, append at next offset">
       <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${height}`}>
         <title>{`A topic with ${partitions} partitions; each row is one partition's append-only log`}</title>
-        <text fill="#a78bfa" fontFamily={MONO} fontSize={8} x={LEFT} y={9}>
+        <text fill={ink[300]} fontFamily={MONO} fontSize={8} x={LEFT} y={9}>
           offset →
         </text>
         {rows.map((row, p) => {
           const y = 14 + p * ROW;
           return (
             <g key={p}>
-              <text fill="#d6c6f5" fontFamily={MONO} fontSize={10} x={4} y={y + 17}>
+              <text fill={ink[200]} fontFamily={MONO} fontSize={10} x={4} y={y + 17}>
                 p{p}
               </text>
-              <rect fill="rgba(58,29,104,0.5)" height={CELL_H} rx={4} width={MAX_CELLS * CELL_W} x={LEFT} y={y} />
+              <rect fill={ink[800]} height={CELL_H} rx={4} width={MAX_CELLS * CELL_W} x={LEFT} y={y} />
               {row.hidden > 0 ? (
-                <text fill="#a78bfa" fontFamily={MONO} fontSize={7} x={LEFT + 3} y={y - 2}>
+                <text fill={ink[300]} fontFamily={MONO} fontSize={7} x={LEFT + 3} y={y - 2}>
                   … {row.hidden} older
                 </text>
               ) : null}
               {row.visible.map((m, i) => {
                 const isNew = m === newest;
-                const fill = m.key === null ? '#2b144d' : PALETTE[fnv1a(m.key) % PALETTE.length];
+                const fill = m.key === null ? ink[700] : categorical[fnv1a(m.key) % categorical.length];
                 const x = LEFT + i * CELL_W + 2;
                 return (
                   <g key={m.offset}>
@@ -162,14 +163,14 @@ const KafkaPartitions: FC<WidgetProps> = memo(({params}) => {
                       fill={fill}
                       height={CELL_H - 4}
                       rx={3}
-                      stroke={isNew ? '#fbf6ff' : m.key === null ? '#5b3a8c' : 'none'}
+                      stroke={isNew ? ink[50] : m.key === null ? ink[600] : 'none'}
                       strokeWidth={isNew ? 1.5 : 0.75}
                       width={CELL_W - 4}
                       x={x}
                       y={y + 2}
                     />
                     <text
-                      fill={m.key === null ? '#d6c6f5' : '#1a0b33'}
+                      fill={m.key === null ? ink[200] : ink[950]}
                       fontFamily={MONO}
                       fontSize={8}
                       fontWeight={isNew ? 700 : 400}
@@ -179,7 +180,7 @@ const KafkaPartitions: FC<WidgetProps> = memo(({params}) => {
                       {m.key === null ? '∅' : m.key.length > 7 ? `${m.key.slice(0, 6)}…` : m.key}
                     </text>
                     <text
-                      fill={m.key === null ? '#a78bfa' : '#1a0b33'}
+                      fill={m.key === null ? ink[300] : ink[950]}
                       fontFamily={MONO}
                       fontSize={7}
                       textAnchor="middle"

@@ -2,6 +2,7 @@ import {type FC, type MouseEvent, memo, useCallback, useEffect, useMemo, useRef}
 
 import {type PlacedNode, EDGE_FONT, LABEL_FONT, layoutDiagram, SUB_FONT} from '@/lib/layout';
 import type {Diagram, EdgeKind, NodeKind} from '@/lib/types';
+import {concept, ink, node as KIND_COLOR} from '@/styles/palette';
 
 /**
  * The problem's architecture as an SVG: boxes per component (coloured by kind) and labelled
@@ -16,16 +17,9 @@ const WIDE_ASPECT = 3;
 const MIN_READABLE_SCALE = 0.72;
 const NO_STEPS: number[] = [];
 
-const KIND_COLOR: Record<NodeKind, string> = {
-  client: '#6ee7b7',
-  service: '#d6c6f5',
-  http: '#ff7ac8',
-  grpc: '#a78bfa',
-  kafka: '#fbbf24',
-  redis: '#fb7185',
-  db: '#60a5fa',
-  external: '#9ca3af',
-};
+const NODE_FILL = ink[800];
+const LIT_NODE_FILL = ink[700];
+const LABEL_BACKDROP = ink[850];
 
 const KIND_LABEL: Record<NodeKind, string> = {
   client: 'client',
@@ -38,13 +32,7 @@ const KIND_LABEL: Record<NodeKind, string> = {
   external: 'external',
 };
 
-const EDGE_COLOR: Record<EdgeKind, string> = {
-  http: '#ff7ac8',
-  grpc: '#a78bfa',
-  kafka: '#fbbf24',
-  redis: '#fb7185',
-  plain: '#8b6fae',
-};
+const EDGE_COLOR: Record<EdgeKind, string> = {...concept, plain: ink[400]};
 
 /** 20×20 glyph per kind, drawn at the left of the box. */
 const Glyph: FC<{kind: NodeKind; color: string}> = memo(({kind, color}) => {
@@ -138,7 +126,7 @@ const Node: FC<{
           : `${node.label} — built in step ${steps.join(', ')}${clickable ? ' (click to open)' : ''}`}
       </title>
       <rect
-        fill={lit && dimming ? '#2b144d' : '#1f0d38'}
+        fill={lit && dimming ? LIT_NODE_FILL : NODE_FILL}
         filter={lit && dimming ? 'url(#lb-glow)' : undefined}
         height={node.h}
         rx={9}
@@ -151,11 +139,11 @@ const Node: FC<{
       <g transform={`translate(${x + 10}, ${node.cy - 10})`}>
         <Glyph color={color} kind={node.kind} />
       </g>
-      <text fill="#fbf6ff" fontSize={LABEL_FONT} fontWeight={700} x={x + 36} y={labelY}>
+      <text fill={ink[50]} fontSize={LABEL_FONT} fontWeight={700} x={x + 36} y={labelY}>
         {node.label}
       </text>
       {node.subLines.map((line, i) => (
-        <text fill="#b9a3dc" fontFamily={MONO} fontSize={SUB_FONT} key={i} x={x + 36} y={y + 34 + i * 11}>
+        <text fill={ink[300]} fontFamily={MONO} fontSize={SUB_FONT} key={i} x={x + 36} y={y + 34 + i * 11}>
           {line}
         </text>
       ))}
@@ -219,7 +207,7 @@ const SystemDiagram: FC<{
   }, [focus, layout]);
 
   return (
-    <div className="overflow-x-auto rounded-xl border border-plum-600/70 bg-plum-950/40 p-2" ref={scroller}>
+    <div className="border-ink-700 bg-ink-850 overflow-x-auto rounded-xl border p-2" ref={scroller}>
       <svg
         className="w-full"
         onClick={onClick}
@@ -263,7 +251,14 @@ const SystemDiagram: FC<{
               />
               {label !== null && edge.label !== undefined ? (
                 <g>
-                  <rect fill="#150826" height={14} rx={3} width={labelW} x={label.x - labelW / 2} y={label.y - 7} />
+                  <rect
+                    fill={LABEL_BACKDROP}
+                    height={14}
+                    rx={3}
+                    width={labelW}
+                    x={label.x - labelW / 2}
+                    y={label.y - 7}
+                  />
                   <text
                     fill={color}
                     fontFamily={MONO}
@@ -292,15 +287,15 @@ const SystemDiagram: FC<{
           );
         })}
       </svg>
-      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[10px] text-plum-300">
+      <div className="text-ink-300 mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[10px]">
         {legend.map(kind => (
           <span className="flex items-center gap-1" key={kind}>
             <span className="inline-block h-2 w-2 rounded-sm" style={{background: KIND_COLOR[kind]}} />
             {KIND_LABEL[kind]}
           </span>
         ))}
-        {wide ? <span className="text-plum-400">wide diagram · scroll sideways</span> : null}
-        {dimming ? <span className="ml-auto text-candy-300">highlighted: what this step builds</span> : null}
+        {wide ? <span className="text-ink-400">wide diagram · scroll sideways</span> : null}
+        {dimming ? <span className="text-iris-300 ml-auto">highlighted: what this step builds</span> : null}
       </div>
     </div>
   );

@@ -1,5 +1,7 @@
 import {type FC, type MouseEvent, memo, useCallback, useMemo, useState} from 'react';
 
+import {alpha, danger, ink, iris, success, warning} from '@/styles/palette';
+
 import WidgetFrame, {tabClass} from './frame';
 import type {WidgetProps} from './index';
 import PlaybackControls, {usePlayback} from './playback';
@@ -9,6 +11,8 @@ type Mode = (typeof MODES)[number];
 type Col = 'service' | 'db' | 'kafka';
 
 const MONO = 'var(--font-code), monospace';
+const UNCOMMITTED_TINT = alpha(iris[400], 0.25);
+const CRASHED_TINT = alpha(danger[400], 0.2);
 const WIDTH = 640;
 const HEIGHT = 186;
 const BOX_Y = 30;
@@ -256,50 +260,41 @@ const Outbox: FC<WidgetProps> = memo(() => {
   );
 
   const arrow = f.arrow === null ? null : arrowOf(f.arrow.from, f.arrow.to);
-  const rowFill = (present: boolean): string =>
-    present ? (f.txOpen ? 'rgba(255,63,166,0.25)' : '#ff3fa6') : '#2b144d';
+  const rowFill = (present: boolean): string => (present ? (f.txOpen ? UNCOMMITTED_TINT : iris[400]) : ink[700]);
   return (
     <WidgetFrame controls={controls} readout={f.note} title={`${mode}: service, database, kafka`}>
       <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${HEIGHT}`}>
         <title>{`${mode}${crash ? ' with a crash' : ''}: the service, its database and the Kafka topic`}</title>
         <defs>
           <marker id="outbox-arrow" markerHeight={5} markerWidth={5} orient="auto" refX={4} refY={2.5}>
-            <path d="M0,0 L5,2.5 L0,5 Z" fill="#ff7ac8" />
+            <path d="M0,0 L5,2.5 L0,5 Z" fill={iris[300]} />
           </marker>
         </defs>
         {(Object.keys(COLS) as Col[]).map(c => {
           const col = COLS[c];
           return (
             <g key={c}>
-              <rect
-                fill="rgba(58,29,104,0.5)"
-                height={BOX_H}
-                rx={6}
-                stroke="#5b3a8c"
-                width={col.w}
-                x={col.x}
-                y={BOX_Y}
-              />
-              <text fill="#a78bfa" fontFamily={MONO} fontSize={9} x={col.x + 8} y={BOX_Y + 14}>
+              <rect fill={ink[800]} height={BOX_H} rx={6} stroke={ink[600]} width={col.w} x={col.x} y={BOX_Y} />
+              <text fill={ink[300]} fontFamily={MONO} fontSize={9} x={col.x + 8} y={BOX_Y + 14}>
                 {col.title}
               </text>
             </g>
           );
         })}
         <rect
-          fill={f.crashed ? 'rgba(251,113,133,0.2)' : '#2b144d'}
+          fill={f.crashed ? CRASHED_TINT : ink[700]}
           height={40}
           rx={4}
-          stroke={f.crashed ? '#fb7185' : '#a78bfa'}
+          stroke={f.crashed ? danger[400] : iris[300]}
           width={COLS.service.w - 16}
           x={COLS.service.x + 8}
           y={BOX_Y + 24}
         />
-        <text fill="#fbf6ff" fontFamily={MONO} fontSize={9} x={COLS.service.x + 16} y={BOX_Y + 40}>
+        <text fill={ink[50]} fontFamily={MONO} fontSize={9} x={COLS.service.x + 16} y={BOX_Y + 40}>
           {f.actor}
         </text>
         <text
-          fill={f.crashed ? '#fb7185' : '#34d399'}
+          fill={f.crashed ? danger[400] : success[400]}
           fontFamily={MONO}
           fontSize={8}
           x={COLS.service.x + 16}
@@ -312,19 +307,19 @@ const Outbox: FC<WidgetProps> = memo(() => {
               fill="none"
               height={mode === 'dual write' ? 30 : 58}
               rx={5}
-              stroke="#ffb0dc"
+              stroke={iris[200]}
               strokeDasharray="4 3"
               width={COLS.db.w - 12}
               x={COLS.db.x + 6}
               y={BOX_Y + 22}
             />
-            <text fill="#ffb0dc" fontFamily={MONO} fontSize={7} x={COLS.db.x + 10} y={BOX_Y + 92}>
+            <text fill={iris[200]} fontFamily={MONO} fontSize={7} x={COLS.db.x + 10} y={BOX_Y + 92}>
               one transaction, uncommitted
             </text>
           </g>
         ) : null}
         <rect fill={rowFill(f.order)} height={20} rx={3} width={COLS.db.w - 24} x={COLS.db.x + 12} y={BOX_Y + 28} />
-        <text fill={f.order ? '#fbf6ff' : '#a78bfa'} fontFamily={MONO} fontSize={8} x={COLS.db.x + 18} y={BOX_Y + 41}>
+        <text fill={f.order ? ink[50] : ink[300]} fontFamily={MONO} fontSize={8} x={COLS.db.x + 18} y={BOX_Y + 41}>
           {f.order ? 'orders: #17 (alice, 3 items)' : 'orders: —'}
         </text>
         {mode === 'transactional outbox' ? (
@@ -338,7 +333,7 @@ const Outbox: FC<WidgetProps> = memo(() => {
               y={BOX_Y + 54}
             />
             <text
-              fill={f.outbox === 'none' ? '#a78bfa' : '#fbf6ff'}
+              fill={f.outbox === 'none' ? ink[300] : ink[50]}
               fontFamily={MONO}
               fontSize={8}
               x={COLS.db.x + 18}
@@ -347,34 +342,34 @@ const Outbox: FC<WidgetProps> = memo(() => {
             </text>
           </>
         ) : null}
-        <text fill="#a78bfa" fontFamily={MONO} fontSize={8} x={COLS.kafka.x + 8} y={BOX_Y + 34}>
+        <text fill={ink[300]} fontFamily={MONO} fontSize={8} x={COLS.kafka.x + 8} y={BOX_Y + 34}>
           topic orders.events
         </text>
         {Array.from({length: f.events}, (_, i) => (
           <g key={i}>
             <rect
-              fill={i === 0 ? '#ff3fa6' : '#fbbf24'}
+              fill={i === 0 ? iris[400] : warning[400]}
               height={20}
               rx={3}
               width={COLS.kafka.w - 24}
               x={COLS.kafka.x + 12}
               y={BOX_Y + 42 + i * 26}
             />
-            <text fill="#1a0b33" fontFamily={MONO} fontSize={8} x={COLS.kafka.x + 18} y={BOX_Y + 55 + i * 26}>
+            <text fill={ink[950]} fontFamily={MONO} fontSize={8} x={COLS.kafka.x + 18} y={BOX_Y + 55 + i * 26}>
               @{i} OrderCreated #17{i > 0 ? ' (dup)' : ''}
             </text>
           </g>
         ))}
         {f.arrow !== null && arrow !== null ? (
           <g>
-            <path d={arrow.d} fill="none" markerEnd="url(#outbox-arrow)" stroke="#ff7ac8" strokeWidth={1.5} />
-            <text fill="#fbf6ff" fontFamily={MONO} fontSize={8} textAnchor="middle" x={arrow.lx} y={arrow.ly}>
+            <path d={arrow.d} fill="none" markerEnd="url(#outbox-arrow)" stroke={iris[300]} strokeWidth={1.5} />
+            <text fill={ink[50]} fontFamily={MONO} fontSize={8} textAnchor="middle" x={arrow.lx} y={arrow.ly}>
               {f.arrow.label}
             </text>
           </g>
         ) : null}
         {f.crashed ? (
-          <text fill="#fb7185" fontFamily={MONO} fontSize={9} textAnchor="middle" x={WIDTH / 2} y={HEIGHT - 6}>
+          <text fill={danger[400]} fontFamily={MONO} fontSize={9} textAnchor="middle" x={WIDTH / 2} y={HEIGHT - 6}>
             ✕ process died here
           </text>
         ) : null}

@@ -39,13 +39,13 @@ export function usePlayback(steps: number, intervalMs: number, autoplay = false)
 }
 
 export const BUTTON_CLASS =
-  'rounded-md border border-plum-600 bg-plum-800/60 px-2 py-0.5 text-[11px] font-semibold text-plum-200 transition hover:border-candy-500/60 hover:text-white';
+  'rounded-md border border-ink-600 bg-ink-800 px-2 py-0.5 text-[11px] font-semibold text-ink-200 transition hover:border-iris-400/60 hover:text-ink-50';
 
 const PlaybackControls: FC<{label?: string; playback: Playback}> = memo(({label = 'step', playback}) => {
   const {step, steps, playing, setStep, toggle, next, prev, reset} = playback;
   const onSlide = useCallback((e: ChangeEvent<HTMLInputElement>) => setStep(Number(e.target.value)), [setStep]);
   return (
-    <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-plum-200">
+    <div className="text-ink-200 flex flex-wrap items-center gap-1.5 text-[11px]">
       <button aria-label={playing ? 'pause' : 'play'} className={BUTTON_CLASS} onClick={toggle} type="button">
         {playing ? '❚❚' : '▶'}
       </button>
@@ -59,7 +59,7 @@ const PlaybackControls: FC<{label?: string; playback: Playback}> = memo(({label 
         ↺
       </button>
       <label className="flex items-center gap-1.5">
-        <span className="text-plum-300">{label}</span>
+        <span className="text-ink-300">{label}</span>
         <input
           aria-label={label}
           className={RANGE_CLASS}
@@ -70,7 +70,7 @@ const PlaybackControls: FC<{label?: string; playback: Playback}> = memo(({label 
           type="range"
           value={step}
         />
-        <span className="font-code tabular-nums text-cream">
+        <span className="font-code text-ink-100 tabular-nums">
           {step + 1}/{steps}
         </span>
       </label>

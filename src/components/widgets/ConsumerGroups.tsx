@@ -1,11 +1,12 @@
 import {type ChangeEvent, type FC, memo, useCallback, useEffect, useMemo, useState} from 'react';
 
+import {categorical, ink, iris} from '@/styles/palette';
+
 import WidgetFrame, {clamp, numParam, RANGE_CLASS} from './frame';
 import type {WidgetProps} from './index';
 import {BUTTON_CLASS} from './playback';
 
 const MONO = 'var(--font-code), monospace';
-const PALETTE = ['#ff3fa6', '#a78bfa', '#34d399', '#fbbf24', '#60a5fa', '#fb7185', '#f472b6', '#2dd4bf'];
 const MAX_CONSUMERS = 8;
 const WIDTH = 640;
 const TOP = 22;
@@ -84,7 +85,7 @@ const ConsumerGroups: FC<WidgetProps> = memo(({params}) => {
     () => (
       <>
         <label className="flex items-center gap-1.5">
-          <span className="text-plum-300">consumers</span>
+          <span className="text-ink-300">consumers</span>
           <input
             aria-label="consumers in group A"
             className={RANGE_CLASS}
@@ -95,7 +96,7 @@ const ConsumerGroups: FC<WidgetProps> = memo(({params}) => {
             type="range"
             value={consumers}
           />
-          <span className="font-code tabular-nums text-cream">{consumers}</span>
+          <span className="font-code text-ink-100 tabular-nums">{consumers}</span>
         </label>
         <button className={BUTTON_CLASS} disabled={rebalancing} onClick={onRebalance} type="button">
           rebalance
@@ -131,7 +132,7 @@ const ConsumerGroups: FC<WidgetProps> = memo(({params}) => {
     <WidgetFrame controls={controls} readout={readout} title="Consumer groups: partitions → members, offsets per group">
       <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${groupBY + 44}`}>
         <title>{`${partitions} partitions assigned to ${consumers} consumers in group A; group B reads the same topic`}</title>
-        <g fill="#a78bfa" fontFamily={MONO} fontSize={9}>
+        <g fill={ink[300]} fontFamily={MONO} fontSize={9}>
           <text x={TRACK_X} y={12}>
             topic: {partitions} partitions · ▲ committed · │ latest
           </text>
@@ -141,13 +142,13 @@ const ConsumerGroups: FC<WidgetProps> = memo(({params}) => {
         </g>
         {owner.map((c, p) => {
           const y = TOP + p * ROW;
-          const color = c < 0 ? '#5b3a8c' : PALETTE[c % PALETTE.length];
+          const color = c < 0 ? ink[600] : categorical[c % categorical.length];
           return (
             <g key={p}>
-              <text fill="#d6c6f5" fontFamily={MONO} fontSize={10} x={4} y={y + 19}>
+              <text fill={ink[200]} fontFamily={MONO} fontSize={10} x={4} y={y + 19}>
                 p{p}
               </text>
-              <rect fill="rgba(58,29,104,0.5)" height={12} rx={3} width={TRACK_W} x={TRACK_X} y={y + 9} />
+              <rect fill={ink[800]} height={12} rx={3} width={TRACK_W} x={TRACK_X} y={y + 9} />
               <rect
                 fill={color}
                 fillOpacity={0.55}
@@ -157,9 +158,9 @@ const ConsumerGroups: FC<WidgetProps> = memo(({params}) => {
                 x={TRACK_X}
                 y={y + 9}
               />
-              <path d={`M${offsetX(COMMITTED_A[p])} ${y + 22} l-4 6 h8 z`} fill="#fbf6ff" />
+              <path d={`M${offsetX(COMMITTED_A[p])} ${y + 22} l-4 6 h8 z`} fill={ink[50]} />
               <text
-                fill="#d6c6f5"
+                fill={ink[200]}
                 fontFamily={MONO}
                 fontSize={7}
                 textAnchor="end"
@@ -168,14 +169,14 @@ const ConsumerGroups: FC<WidgetProps> = memo(({params}) => {
                 {COMMITTED_A[p]}
               </text>
               <line
-                stroke="#ffb0dc"
+                stroke={iris[200]}
                 strokeWidth={1.5}
                 x1={offsetX(LATEST[p])}
                 x2={offsetX(LATEST[p])}
                 y1={y + 6}
                 y2={y + 24}
               />
-              <text fill="#ffb0dc" fontFamily={MONO} fontSize={7} x={offsetX(LATEST[p]) + 3} y={y + 7}>
+              <text fill={iris[200]} fontFamily={MONO} fontSize={7} x={offsetX(LATEST[p]) + 3} y={y + 7}>
                 {LATEST[p]}
               </text>
               {c >= 0 ? (
@@ -196,26 +197,26 @@ const ConsumerGroups: FC<WidgetProps> = memo(({params}) => {
         {owned.map((n, c) => {
           const y = TOP + c * ROW;
           const isIdle = n === 0;
-          const color = PALETTE[c % PALETTE.length];
+          const color = categorical[c % categorical.length];
           return (
             <g className="transition-opacity duration-300" key={c} opacity={rebalancing ? 0.35 : isIdle ? 0.45 : 1}>
               <rect
-                fill={isIdle ? '#2b144d' : color}
+                fill={isIdle ? ink[700] : color}
                 fillOpacity={isIdle ? 1 : 0.25}
                 height={22}
                 rx={5}
-                stroke={isIdle ? '#5b3a8c' : color}
+                stroke={isIdle ? ink[600] : color}
                 strokeDasharray={isIdle ? '3 2' : undefined}
                 strokeWidth={1}
                 width={CONS_W}
                 x={CONS_X}
                 y={y + 4}
               />
-              <text fill={isIdle ? '#a78bfa' : '#fbf6ff'} fontFamily={MONO} fontSize={9} x={CONS_X + 8} y={y + 18}>
+              <text fill={isIdle ? ink[300] : ink[50]} fontFamily={MONO} fontSize={9} x={CONS_X + 8} y={y + 18}>
                 consumer {c + 1} · {memberId[c]}
               </text>
               <text
-                fill={isIdle ? '#a78bfa' : color}
+                fill={isIdle ? ink[300] : color}
                 fontFamily={MONO}
                 fontSize={8}
                 textAnchor="end"
@@ -226,7 +227,7 @@ const ConsumerGroups: FC<WidgetProps> = memo(({params}) => {
             </g>
           );
         })}
-        <text fill="#a78bfa" fontFamily={MONO} fontSize={9} x={TRACK_X} y={groupBY}>
+        <text fill={ink[300]} fontFamily={MONO} fontSize={9} x={TRACK_X} y={groupBY}>
           group B · 2 consumers · same topic, its own committed offsets
         </text>
         {LATEST.slice(0, partitions).map((latest, p) => {
@@ -236,12 +237,12 @@ const ConsumerGroups: FC<WidgetProps> = memo(({params}) => {
           const head = x0 + (latest / MAX_OFFSET) * w;
           return (
             <g key={p}>
-              <text fill="#d6c6f5" fontFamily={MONO} fontSize={8} x={x0} y={groupBY + 14}>
+              <text fill={ink[200]} fontFamily={MONO} fontSize={8} x={x0} y={groupBY + 14}>
                 p{p} @{COMMITTED_B[p]}
               </text>
-              <rect fill="rgba(58,29,104,0.5)" height={8} rx={2} width={w} x={x0} y={groupBY + 19} />
+              <rect fill={ink[800]} height={8} rx={2} width={w} x={x0} y={groupBY + 19} />
               <rect
-                fill="#ff3fa6"
+                fill={iris[400]}
                 fillOpacity={0.55}
                 height={8}
                 rx={2}
@@ -249,8 +250,8 @@ const ConsumerGroups: FC<WidgetProps> = memo(({params}) => {
                 x={x0}
                 y={groupBY + 19}
               />
-              <path d={`M${committed} ${groupBY + 28} l-3 5 h6 z`} fill="#fbf6ff" />
-              <line stroke="#ffb0dc" strokeWidth={1.5} x1={head} x2={head} y1={groupBY + 17} y2={groupBY + 29} />
+              <path d={`M${committed} ${groupBY + 28} l-3 5 h6 z`} fill={ink[50]} />
+              <line stroke={iris[200]} strokeWidth={1.5} x1={head} x2={head} y1={groupBY + 17} y2={groupBY + 29} />
             </g>
           );
         })}

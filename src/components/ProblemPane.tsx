@@ -4,6 +4,7 @@ import {leetbuildHighlighter} from '@/lib/highlight';
 import {type StepAttempt, HINT_COST, potentialScore, problemScore, STEP_POINTS} from '@/lib/scoring';
 import {type Language, type Problem, type Step, CONCEPT_LABEL, fileName, LANGUAGE_LABEL, stepKey} from '@/lib/types';
 
+import {useDialog} from './Dialog';
 import Markdown from './Markdown';
 import {ConceptChip, DifficultyChip, ghostButtonClass, linkClass, primaryButtonClass} from './paneShared';
 import SequenceDiagram from './SequenceDiagram';
@@ -33,14 +34,14 @@ const StepChip: FC<{
     <button
       className={`flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition disabled:cursor-not-allowed ${
         active
-          ? 'border-candy-400 bg-candy-500/20 text-white'
+          ? 'border-iris-400 bg-iris-400/15 text-ink-50'
           : status === 'accepted'
-          ? 'border-emerald-400/60 bg-emerald-500/10 text-emerald-200 hover:text-white'
+          ? 'border-success-400/60 bg-success-400/10 text-success-200 hover:text-ink-50'
           : status === 'revealed'
-          ? 'border-amber-400/60 bg-amber-500/10 text-amber-200 hover:text-white'
+          ? 'border-warning-400/60 bg-warning-400/10 text-warning-200 hover:text-ink-50'
           : locked
-          ? 'border-plum-700 text-plum-500'
-          : 'border-plum-600 text-plum-200 hover:border-candy-500/60 hover:text-white'
+          ? 'border-ink-700 text-ink-500'
+          : 'border-ink-600 text-ink-200 hover:border-iris-400/60 hover:text-ink-50'
       }`}
       disabled={locked}
       onClick={onClick}
@@ -66,17 +67,17 @@ const Hints: FC<{
   const onNext = useCallback(() => onReveal(attempt.hints + 1), [attempt.hints, onReveal]);
   const onFree = useCallback(() => setFreeAll(true), []);
   return (
-    <section className="mt-5 rounded-xl border border-plum-600/70 bg-plum-950/40 p-3">
-      <p className="flex items-center justify-between text-[11px] font-bold uppercase tracking-wider text-candy-400">
+    <section className="border-ink-700 bg-ink-850 mt-5 rounded-xl border p-3">
+      <p className="text-iris-400 flex items-center justify-between text-[11px] font-bold uppercase tracking-wider">
         <span>Hints</span>
-        <span className="font-code normal-case tracking-normal text-plum-300">
+        <span className="font-code text-ink-300 normal-case tracking-normal">
           {attempt.hints}/{hints.length} used · each −{Math.round(HINT_COST * 100)}%
         </span>
       </p>
       <ol className="mt-2 space-y-2">
         {hints.slice(0, visible).map((hint, i) => (
-          <li className="flex gap-2 text-[13px] text-plum-200" key={i}>
-            <span className="mt-0.5 shrink-0 rounded bg-plum-700/80 px-1.5 font-code text-[10px] text-candy-200">
+          <li className="text-ink-200 flex gap-2 text-[13px]" key={i}>
+            <span className="bg-ink-700 font-code text-iris-200 mt-0.5 shrink-0 rounded px-1.5 text-[10px]">
               {i + 1}
             </span>
             <span>{hint}</span>
@@ -114,21 +115,23 @@ const Solution: FC<{
   const onHide = useCallback(() => setShown(false), []);
   const toggleDiff = useCallback(() => setDiff(d => !d), []);
   const onLoadClick = useCallback(() => onLoad(solution), [onLoad, solution]);
+  const [dialog, openDialog] = useDialog();
   const onRevealClick = useCallback(() => {
-    if (
-      window.confirm(
-        'Reveal the reference solution? This step will count as done but score 0 points. You can still study and load it.',
-      )
-    ) {
+    void openDialog({
+      title: 'Reveal the reference solution?',
+      body: 'This step will count as done but score 0 points. You can still study the solution and load it into the editor.',
+      confirm: 'Reveal',
+    }).then(ok => {
+      if (!ok) return;
       onReveal();
       setShown(true);
-    }
-  }, [onReveal]);
+    });
+  }, [openDialog, onReveal]);
   const open = attempt.status === 'open';
   return (
-    <section className="mt-4 rounded-xl border border-plum-600/70 bg-plum-950/40 p-3">
+    <section className="border-ink-700 bg-ink-850 mt-4 rounded-xl border p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <p className="text-[11px] font-bold uppercase tracking-wider text-candy-400">Reference solution</p>
+        <p className="text-iris-400 text-[11px] font-bold uppercase tracking-wider">Reference solution</p>
         {open ? (
           <button className={`${linkClass} text-[12px]`} onClick={onRevealClick} type="button">
             Reveal (this step scores 0)
@@ -151,7 +154,7 @@ const Solution: FC<{
       {!open && shown ? (
         <>
           <StepEditor
-            className="mt-2 h-[46vh] overflow-hidden rounded-lg border border-plum-600/70"
+            className="border-ink-700 mt-2 h-[46vh] overflow-hidden rounded-lg border"
             language={language}
             original={diff ? userCode : null}
             readOnly
@@ -161,10 +164,11 @@ const Solution: FC<{
             <button className={primaryButtonClass} onClick={onLoadClick} type="button">
               Load solution into editor
             </button>
-            <span className="text-[11px] text-plum-300">{fileName(step.file, language)}</span>
+            <span className="text-ink-300 text-[11px]">{fileName(step.file, language)}</span>
           </div>
         </>
       ) : null}
+      {dialog}
     </section>
   );
 });
@@ -246,25 +250,40 @@ const ProblemPane: FC<{
     );
     return (
       <div className="flex h-full min-h-0 flex-col">
-        <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-plum-600/60 px-4 py-2">
+        <div className="border-ink-700 flex shrink-0 flex-wrap items-center gap-x-2 gap-y-1 border-b px-4 py-2">
           <button className={`${ghostButtonClass} -ml-2`} onClick={onBack} type="button">
             ← problems
           </button>
-          <span className="min-w-0 flex-1 truncate text-[13px] font-bold text-white">{problem.title}</span>
-          <DifficultyChip difficulty={problem.difficulty} />
-          <span className="font-code text-[11px] text-plum-300">
-            {score.score}/{score.max} pts
+          {/* On phones the actions crowd the title out of the first row, so it takes the second. */}
+          <span className="order-last flex min-w-0 basis-full items-center gap-2 sm:order-none sm:flex-1 sm:basis-0">
+            <span className="text-ink-50 min-w-0 truncate text-[13px] font-bold">{problem.title}</span>
+            <DifficultyChip difficulty={problem.difficulty} />
+            <span className="font-code text-ink-300 shrink-0 text-[11px]">
+              {score.score}/{score.max} pts
+            </span>
           </span>
           <button
-            className="rounded-md border border-plum-600 bg-plum-900/70 px-2 py-0.5 text-[11px] text-plum-200 transition hover:border-candy-500/60 hover:text-white"
+            aria-label="download this course as Markdown"
+            className="border-ink-600 bg-ink-800 text-ink-200 hover:border-iris-400/60 hover:text-ink-50 ml-auto flex h-6 w-6 items-center justify-center rounded-md border transition sm:ml-0"
             onClick={onDownload}
             title={`download this course as a Markdown file (${LANGUAGE_LABEL[language]}): statement, diagrams, every step with its starter, hints and solution`}
             type="button">
-            ⤓ download .md
+            <svg
+              aria-hidden
+              fill="none"
+              height={13}
+              stroke="currentColor"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={1.8}
+              viewBox="0 0 16 16"
+              width={13}>
+              <path d="M8 2v8m0 0 3-3m-3 3L5 7M2.5 11.5v1a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-1" />
+            </svg>
           </button>
           {score.done > 0 ? (
             <button
-              className="rounded-md px-1.5 py-0.5 text-[11px] text-plum-400 transition hover:text-white"
+              className="text-ink-400 hover:text-ink-50 rounded-md px-1.5 py-0.5 text-[11px] transition"
               onClick={onShareClick}
               title="copy a result card for this problem to the clipboard"
               type="button">
@@ -273,7 +292,7 @@ const ProblemPane: FC<{
           ) : null}
           {problem.steps.some(s => attempts[stepKey(problem.id, s.id)] !== undefined) ? (
             <button
-              className="rounded-md px-1.5 py-0.5 text-[11px] text-plum-400 transition hover:text-rose-200"
+              className="text-ink-400 hover:text-danger-200 rounded-md px-1.5 py-0.5 text-[11px] transition"
               onClick={onResetProblem}
               title="clear this problem's results and code and start over"
               type="button">
@@ -302,10 +321,10 @@ const ProblemPane: FC<{
               />
             ))}
           </div>
-          <div className="mt-3 flex items-center gap-1 border-b border-plum-600/60">
+          <div className="border-ink-700 mt-3 flex items-center gap-1 border-b">
             <button
               className={`border-b-2 px-2.5 py-1.5 text-[12px] font-semibold transition ${
-                tab === 'problem' ? 'border-candy-500 text-white' : 'border-transparent text-plum-200 hover:text-white'
+                tab === 'problem' ? 'border-iris-400 text-ink-50' : 'text-ink-200 hover:text-ink-50 border-transparent'
               }`}
               onClick={onProblemTab}
               type="button">
@@ -313,7 +332,7 @@ const ProblemPane: FC<{
             </button>
             <button
               className={`border-b-2 px-2.5 py-1.5 text-[12px] font-semibold transition ${
-                tab === 'step' ? 'border-candy-500 text-white' : 'border-transparent text-plum-200 hover:text-white'
+                tab === 'step' ? 'border-iris-400 text-ink-50' : 'text-ink-200 hover:text-ink-50 border-transparent'
               }`}
               onClick={onStepTab}
               type="button">
@@ -323,7 +342,7 @@ const ProblemPane: FC<{
 
           {tab === 'problem' ? (
             <div className="mt-3">
-              <div className="mb-3 flex flex-wrap items-center gap-2 text-[11px] text-plum-300">
+              <div className="text-ink-300 mb-3 flex flex-wrap items-center gap-2 text-[11px]">
                 {problem.concepts.map(c => (
                   <ConceptChip concept={c} key={c} />
                 ))}
@@ -336,18 +355,18 @@ const ProblemPane: FC<{
             </div>
           ) : (
             <div className="mt-3">
-              <p className="flex flex-wrap items-center gap-2 text-[11px] font-bold uppercase tracking-wider text-candy-400">
+              <p className="text-iris-400 flex flex-wrap items-center gap-2 text-[11px] font-bold uppercase tracking-wider">
                 <span>
                   step {stepIndex + 1} · {CONCEPT_LABEL[step.concept]}
                 </span>
                 <ConceptChip concept={step.concept} />
                 <span
-                  className={`rounded-full border px-1.5 py-0.5 font-code text-[9.5px] normal-case tracking-normal ${
+                  className={`font-code rounded-full border px-1.5 py-0.5 text-[9.5px] normal-case tracking-normal ${
                     attempt.status === 'accepted'
-                      ? 'border-emerald-400/60 text-emerald-300'
+                      ? 'border-success-400/60 text-success-300'
                       : attempt.status === 'revealed'
-                      ? 'border-amber-400/60 text-amber-300'
-                      : 'border-plum-400/60 text-plum-300'
+                      ? 'border-warning-400/60 text-warning-300'
+                      : 'border-ink-500 text-ink-300'
                   }`}>
                   {attempt.status === 'accepted'
                     ? `accepted · ${potential} pts`
@@ -356,10 +375,10 @@ const ProblemPane: FC<{
                     : `worth ${potential} of ${points} pts`}
                 </span>
               </p>
-              <h1 className="mt-1 text-xl font-extrabold leading-tight text-white">{step.title}</h1>
-              <p className="mt-1 text-[12px] text-plum-300">
-                Edit <code className="font-code text-candy-200">{fileName(step.file, language)}</code> on the right,
-                then submit. Checks are static: they read the shape of your code, nothing is executed.
+              <h1 className="text-ink-50 mt-1 text-xl font-extrabold leading-tight">{step.title}</h1>
+              <p className="text-ink-300 mt-1 text-[12px]">
+                Edit <code className="font-code text-iris-200">{fileName(step.file, language)}</code> on the right, then
+                submit. Checks are static: they read the shape of your code, nothing is executed.
               </p>
               {step.sequence !== undefined ? (
                 <div className="mt-3">
@@ -385,8 +404,8 @@ const ProblemPane: FC<{
                 userCode={userCode}
               />
               {done ? (
-                <section className="mt-4 rounded-xl border border-emerald-400/40 bg-emerald-500/5 p-3">
-                  <p className="text-[11px] font-bold uppercase tracking-wider text-emerald-300">Debrief</p>
+                <section className="border-success-400/40 bg-success-400/5 mt-4 rounded-xl border p-3">
+                  <p className="text-success-300 text-[11px] font-bold uppercase tracking-wider">Debrief</p>
                   <div className="mt-1">
                     <Markdown highlight={leetbuildHighlighter} source={step.debrief} />
                   </div>
@@ -395,11 +414,11 @@ const ProblemPane: FC<{
             </div>
           )}
         </div>
-        <div className="flex shrink-0 items-center gap-2 border-t border-plum-600/60 px-4 py-2">
+        <div className="border-ink-700 flex shrink-0 items-center gap-2 border-t px-4 py-2">
           <button className={ghostButtonClass} disabled={stepIndex <= 0} onClick={onPrevStep} type="button">
             ← previous
           </button>
-          <span className="flex-1 text-center text-[11px] text-plum-300">
+          <span className="text-ink-300 flex-1 text-center text-[11px]">
             {score.done}/{score.total} steps done
           </span>
           <button className={primaryButtonClass} disabled={!done || !hasNext} onClick={onNextStep} type="button">

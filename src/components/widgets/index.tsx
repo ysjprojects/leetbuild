@@ -39,7 +39,7 @@ export const renderWidget: WidgetRenderer = (name, params) => {
   const Component = WIDGET_COMPONENTS[name];
   if (Component === undefined) {
     return (
-      <div className="rounded-lg border border-dashed border-rose-400/60 p-3 text-[12px] text-rose-200">
+      <div className="border-danger-400/60 text-danger-200 rounded-lg border border-dashed p-3 text-[12px]">
         unknown widget: {name}
       </div>
     );

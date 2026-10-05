@@ -1,5 +1,7 @@
 import {type FC, type MouseEvent, memo, useCallback, useMemo, useState} from 'react';
 
+import {alpha, danger, ink, iris, success, warning} from '@/styles/palette';
+
 import WidgetFrame from './frame';
 import type {WidgetProps} from './index';
 
@@ -22,7 +24,7 @@ interface Family {
 const FAMILIES: Family[] = [
   {
     label: '2xx · success',
-    color: '#34d399',
+    color: success[400],
     codes: [
       {
         code: 200,
@@ -63,7 +65,7 @@ const FAMILIES: Family[] = [
   },
   {
     label: '4xx · the client is wrong',
-    color: '#fbbf24',
+    color: warning[400],
     codes: [
       {
         code: 400,
@@ -118,7 +120,7 @@ const FAMILIES: Family[] = [
   },
   {
     label: '5xx · the server is wrong',
-    color: '#fb7185',
+    color: danger[400],
     codes: [
       {
         code: 500,
@@ -168,6 +170,7 @@ const RETRY_SHORT: Record<Retry, string> = {
 };
 
 const MONO = 'var(--font-code), monospace';
+const SELECTED_FILL = alpha(iris[400], 0.18);
 const COL_W = 216;
 const COL_GAP = 12;
 const CELL_H = 24;
@@ -207,10 +210,10 @@ const StatusCodes: FC<WidgetProps> = memo(() => {
         'Pick the family first (success, client error, server error), then the most specific code in it: clients branch on the family, humans and logs branch on the code. Hover or click a code.'
       ) : (
         <>
-          <b className="text-cream">
+          <b className="text-ink-100">
             {active.code} {active.name}
           </b>{' '}
-          — {active.when}. Example: <code className="font-code text-candy-200">{active.example}</code>.{' '}
+          — {active.when}. Example: <code className="font-code text-iris-200">{active.example}</code>.{' '}
           {RETRY_TEXT[active.retry]}
         </>
       ),
@@ -238,12 +241,12 @@ const StatusCodes: FC<WidgetProps> = memo(() => {
                       aria-label={`${s.code} ${s.name}`}
                       className="cursor-pointer"
                       data-code={s.code}
-                      fill={on ? 'rgba(255,63,166,0.18)' : '#2b144d'}
+                      fill={on ? SELECTED_FILL : ink[700]}
                       height={CELL_H}
                       onClick={onClick}
                       role="button"
                       rx={5}
-                      stroke={on ? '#ff3fa6' : isPinned ? '#ffb0dc' : 'none'}
+                      stroke={on ? iris[400] : isPinned ? iris[200] : 'none'}
                       strokeWidth={0.75}
                       width={COL_W}
                       x={x}
@@ -260,7 +263,7 @@ const StatusCodes: FC<WidgetProps> = memo(() => {
                       y={y + 4}
                     />
                     <text
-                      fill={on ? '#fbf6ff' : '#d6c6f5'}
+                      fill={on ? ink[50] : ink[200]}
                       fontFamily={MONO}
                       fontSize={11}
                       pointerEvents="none"
@@ -269,7 +272,7 @@ const StatusCodes: FC<WidgetProps> = memo(() => {
                       {s.code}
                     </text>
                     <text
-                      fill={on ? '#ffb0dc' : '#a78bfa'}
+                      fill={on ? iris[200] : ink[300]}
                       fontFamily={MONO}
                       fontSize={9}
                       pointerEvents="none"
@@ -279,7 +282,7 @@ const StatusCodes: FC<WidgetProps> = memo(() => {
                     </text>
                     {s.retry === 'n/a' ? null : (
                       <text
-                        fill={s.retry === 'never' ? '#fb7185' : '#34d399'}
+                        fill={s.retry === 'never' ? danger[400] : success[400]}
                         fontFamily={MONO}
                         fontSize={8}
                         pointerEvents="none"

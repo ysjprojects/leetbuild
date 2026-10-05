@@ -1,5 +1,7 @@
 import {type ChangeEvent, type FC, type ReactElement, memo, useCallback, useMemo, useState} from 'react';
 
+import {danger, ink, success} from '@/styles/palette';
+
 import WidgetFrame, {RANGE_CLASS, SELECT_CLASS} from './frame';
 import type {WidgetProps} from './index';
 import {BUTTON_CLASS} from './playback';
@@ -147,7 +149,7 @@ const OrderBook: FC<WidgetProps> = memo(() => {
           <option value="sell">sell</option>
         </select>
         <label className="flex items-center gap-1.5">
-          <span className="text-plum-300">price</span>
+          <span className="text-ink-300">price</span>
           <input
             aria-label="limit price"
             className={RANGE_CLASS}
@@ -158,10 +160,10 @@ const OrderBook: FC<WidgetProps> = memo(() => {
             type="range"
             value={price}
           />
-          <span className="font-code tabular-nums text-cream">{fmt(price)}</span>
+          <span className="font-code text-ink-100 tabular-nums">{fmt(price)}</span>
         </label>
         <label className="flex items-center gap-1.5">
-          <span className="text-plum-300">qty</span>
+          <span className="text-ink-300">qty</span>
           <input
             aria-label="quantity"
             className={RANGE_CLASS}
@@ -172,7 +174,7 @@ const OrderBook: FC<WidgetProps> = memo(() => {
             type="range"
             value={qty}
           />
-          <span className="font-code tabular-nums text-cream">{qty}</span>
+          <span className="font-code text-ink-100 tabular-nums">{qty}</span>
         </label>
         <button className={BUTTON_CLASS} onClick={onAdd} type="button">
           Add order
@@ -197,7 +199,7 @@ const OrderBook: FC<WidgetProps> = memo(() => {
       return (
         <g key={lvl.price}>
           <text
-            fill={highlight ? '#fbf6ff' : '#d6c6f5'}
+            fill={highlight ? ink[50] : ink[200]}
             fontFamily={MONO}
             fontSize={11}
             fontWeight={highlight ? 700 : 400}
@@ -208,7 +210,7 @@ const OrderBook: FC<WidgetProps> = memo(() => {
           {lvl.orders.slice(0, MAX_CHIPS).map((o, j) => (
             <g key={o.id}>
               <rect
-                fill={highlight && j === 0 ? tone : '#2b144d'}
+                fill={highlight && j === 0 ? tone : ink[700]}
                 height={18}
                 rx={3}
                 stroke={tone}
@@ -218,7 +220,7 @@ const OrderBook: FC<WidgetProps> = memo(() => {
                 y={y + 3}
               />
               <text
-                fill={highlight && j === 0 ? '#2b144d' : '#d6c6f5'}
+                fill={highlight && j === 0 ? ink[950] : ink[200]}
                 fontFamily={MONO}
                 fontSize={9}
                 textAnchor="middle"
@@ -229,7 +231,7 @@ const OrderBook: FC<WidgetProps> = memo(() => {
             </g>
           ))}
           {lvl.orders.length > MAX_CHIPS ? (
-            <text fill="#a78bfa" fontFamily={MONO} fontSize={9} x={x0 + 44 + MAX_CHIPS * CHIP_W} y={y + 15}>
+            <text fill={ink[300]} fontFamily={MONO} fontSize={9} x={x0 + 44 + MAX_CHIPS * CHIP_W} y={y + 15}>
               +{lvl.orders.length - MAX_CHIPS}
             </text>
           ) : null}
@@ -242,7 +244,7 @@ const OrderBook: FC<WidgetProps> = memo(() => {
       <>
         {book.event}{' '}
         {crosses ? (
-          <span className="text-candy-200">
+          <span className="text-iris-200">
             Your next {side} at {fmt(price)} crosses the {side === 'buy' ? 'best ask' : 'best bid'} and will fill.
           </span>
         ) : null}
@@ -255,37 +257,37 @@ const OrderBook: FC<WidgetProps> = memo(() => {
     <WidgetFrame controls={controls} readout={readout} title="limit order book: price-time priority">
       <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${height}`}>
         <title>Bids and asks by price level, each level a FIFO queue of orders</title>
-        <text fill="#34d399" fontFamily={MONO} fontSize={9} x={8} y={12}>
+        <text fill={success[400]} fontFamily={MONO} fontSize={9} x={8} y={12}>
           BIDS (buy, best first) — price · qty #arrival
         </text>
-        <text fill="#fb7185" fontFamily={MONO} fontSize={9} x={HALF + 8} y={12}>
+        <text fill={danger[400]} fontFamily={MONO} fontSize={9} x={HALF + 8} y={12}>
           ASKS (sell, best first)
         </text>
-        <line stroke="rgba(58,29,104,0.9)" strokeDasharray="2 3" x1={HALF} x2={HALF} y1={4} y2={height - 2} />
-        {renderSide(bids, 8, '#34d399')}
-        {renderSide(asks, HALF + 8, '#fb7185')}
+        <line stroke={ink[700]} strokeDasharray="2 3" x1={HALF} x2={HALF} y1={4} y2={height - 2} />
+        {renderSide(bids, 8, success[400])}
+        {renderSide(asks, HALF + 8, danger[400])}
         {bids.length === 0 ? (
-          <text fill="#a78bfa" fontFamily={MONO} fontSize={9} x={8} y={TOP + 16}>
+          <text fill={ink[300]} fontFamily={MONO} fontSize={9} x={8} y={TOP + 16}>
             no bids
           </text>
         ) : null}
         {asks.length === 0 ? (
-          <text fill="#a78bfa" fontFamily={MONO} fontSize={9} x={HALF + 8} y={TOP + 16}>
+          <text fill={ink[300]} fontFamily={MONO} fontSize={9} x={HALF + 8} y={TOP + 16}>
             no asks
           </text>
         ) : null}
       </svg>
-      <div className="mt-2 font-code text-[10px] text-plum-200">
-        <div className="text-plum-300">fills (newest first)</div>
+      <div className="font-code text-ink-200 mt-2 text-[10px]">
+        <div className="text-ink-300">fills (newest first)</div>
         {book.fills.length === 0 ? (
-          <div className="text-plum-400">
+          <div className="text-ink-400">
             none yet — add a buy at or above the best ask, or a sell at or below the best bid
           </div>
         ) : (
           book.fills.slice(0, 6).map((f, i) => (
             <div key={`${f.takerId}-${f.makerId}-${i}`}>
-              <span className="text-cream">{f.qty}</span> @ <span className="text-cream">{fmt(f.price)}</span> · taker #
-              {f.takerId} vs maker #{f.makerId}
+              <span className="text-ink-100">{f.qty}</span> @ <span className="text-ink-100">{fmt(f.price)}</span> ·
+              taker #{f.takerId} vs maker #{f.makerId}
             </div>
           ))
         )}
