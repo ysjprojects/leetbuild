@@ -3,18 +3,50 @@ import {type FC, memo, useMemo} from 'react';
 import type {Sequence} from '@/lib/types';
 import {concept, ink, iris} from '@/styles/palette';
 
-/** The runtime interaction a step implements: participants as lifelines, messages as arrows in order. */
+/**
+ * The runtime interaction a step implements: participants as lifelines, messages as arrows in
+ * order. Labels wrap inside their column (a row grows by one line each) so a long Redis command
+ * never spills over the neighbouring lifelines.
+ */
 
 const COLUMN = 170;
 const TOP = 34;
-const ROW = 34;
 const MONO = 'var(--font-code), monospace';
+const FONT = 9.5;
+/** Advance of one monospace glyph at FONT, and the line pitch of a wrapped label. */
+const GLYPH = 5.8;
+const LINE = 11;
+/** Vertical room a message takes: the arrow plus its label lines. */
+const ROW_BASE = 19;
+/** Widest label that fits between two lifelines with a little air; a self-message label sits beside its loop. */
+const MAX_CHARS = Math.floor((COLUMN - 16) / GLYPH);
+const MAX_CHARS_SELF = Math.floor((COLUMN - 34 - 14) / GLYPH);
 
 const KIND_STYLE = {
   sync: {dash: undefined, color: iris[300], marker: 'url(#lb-seq-filled)'},
   reply: {dash: '5 4', color: ink[300], marker: 'url(#lb-seq-open)'},
   async: {dash: '2 3', color: concept.kafka, marker: 'url(#lb-seq-open)'},
 } as const;
+
+/** Greedy word wrap to `max` glyphs per line; a single over-long token is cut rather than overflow. */
+const wrap = (label: string, max: number): string[] => {
+  const lines: string[] = [];
+  let line = '';
+  for (const word of label.split(' ')) {
+    if (line.length === 0) line = word;
+    else if (line.length + 1 + word.length <= max) line += ` ${word}`;
+    else {
+      lines.push(line);
+      line = word;
+    }
+    while (line.length > max) {
+      lines.push(line.slice(0, max - 1) + '…');
+      line = line.slice(max - 1);
+    }
+  }
+  if (line.length > 0) lines.push(line);
+  return lines;
+};
 
 const SequenceDiagram: FC<{sequence: Sequence}> = memo(({sequence}) => {
   const columns = useMemo(() => {
@@ -25,11 +57,20 @@ const SequenceDiagram: FC<{sequence: Sequence}> = memo(({sequence}) => {
     return map;
   }, [sequence.participants]);
   const width = sequence.participants.length * COLUMN;
-  const height = TOP + 12 + sequence.messages.length * ROW + 10;
+  // Wrapped labels and the arrow baseline of every message, laid out top to bottom.
+  const rows = useMemo(() => {
+    let y = TOP + 12;
+    return sequence.messages.map(m => {
+      const lines = wrap(m.label, m.from === m.to ? MAX_CHARS_SELF : MAX_CHARS);
+      y += ROW_BASE + LINE * lines.length;
+      return {lines, y: y - 8};
+    });
+  }, [sequence.messages]);
+  const height = (rows.length === 0 ? TOP + 12 : rows[rows.length - 1].y + 8) + 10;
 
   return (
     <div className="border-ink-700 bg-ink-850 rounded-xl border p-2">
-      <svg className="w-full" role="img" style={{maxHeight: 260}} viewBox={`0 0 ${width} ${height}`}>
+      <svg className="w-full" role="img" style={{maxHeight: 340}} viewBox={`0 0 ${width} ${height}`}>
         <title>Sequence of calls for this step</title>
         <defs>
           <marker id="lb-seq-filled" markerHeight={7} markerWidth={8} orient="auto" refX={8} refY={3.5}>
@@ -60,13 +101,14 @@ const SequenceDiagram: FC<{sequence: Sequence}> = memo(({sequence}) => {
           );
         })}
         {sequence.messages.map((m, i) => {
-          const y = TOP + 22 + i * ROW;
+          const {lines, y} = rows[i];
           const from = columns[m.from];
           const to = columns[m.to];
           const style = KIND_STYLE[m.kind ?? 'sync'];
-          const labelW = m.label.length * 5.8 + 8;
+          const labelW = Math.max(...lines.map(l => l.length)) * GLYPH + 8;
+          const labelH = LINE * lines.length;
           if (from === to) {
-            // Self message: a small loop beside the lifeline, on the side with room for the label.
+            // Self message: a small loop beside the lifeline, the label on the side with room for it.
             const left = from + 34 + labelW > width;
             const s = left ? -1 : 1;
             const tx = left ? from - 34 : from + 34;
@@ -83,11 +125,15 @@ const SequenceDiagram: FC<{sequence: Sequence}> = memo(({sequence}) => {
                 <text
                   fill={ink[200]}
                   fontFamily={MONO}
-                  fontSize={9.5}
+                  fontSize={FONT}
                   textAnchor={left ? 'end' : 'start'}
                   x={tx}
-                  y={y + 2}>
-                  {m.label}
+                  y={y + 2 - (labelH - LINE) / 2}>
+                  {lines.map((line, k) => (
+                    <tspan dy={k === 0 ? 0 : LINE} key={k} x={tx}>
+                      {line}
+                    </tspan>
+                  ))}
                 </text>
               </g>
             );
@@ -108,9 +154,19 @@ const SequenceDiagram: FC<{sequence: Sequence}> = memo(({sequence}) => {
                 y1={y}
                 y2={y}
               />
-              <rect fill={ink[850]} height={13} rx={3} width={labelW} x={mid - labelW / 2} y={y - 15} />
-              <text fill={ink[200]} fontFamily={MONO} fontSize={9.5} textAnchor="middle" x={mid} y={y - 5}>
-                {m.label}
+              <rect fill={ink[850]} height={labelH + 2} rx={3} width={labelW} x={mid - labelW / 2} y={y - 4 - labelH} />
+              <text
+                fill={ink[200]}
+                fontFamily={MONO}
+                fontSize={FONT}
+                textAnchor="middle"
+                x={mid}
+                y={y - 5 - (labelH - LINE)}>
+                {lines.map((line, k) => (
+                  <tspan dy={k === 0 ? 0 : LINE} key={k} x={mid}>
+                    {line}
+                  </tspan>
+                ))}
               </text>
             </g>
           );

@@ -33,8 +33,11 @@ presence functions the chat server calls:
       {from: 'chat-server', to: 'Redis', label: 'SADD room:room-7:members ana', kind: 'sync'},
       {from: 'Client', to: 'chat-server', label: 'heartbeat (every 10 s)', kind: 'async'},
       {from: 'chat-server', to: 'Redis', label: 'SET presence:ana srv-a EX 30', kind: 'sync'},
-      {from: 'chat-server', to: 'Redis', label: 'SMEMBERS · MGET presence:ana presence:bo …', kind: 'sync'},
+      {from: 'chat-server', to: 'Redis', label: 'SMEMBERS room:room-7:members', kind: 'sync'},
+      {from: 'Redis', to: 'chat-server', label: '[ana, bo, cy]', kind: 'reply'},
+      {from: 'chat-server', to: 'Redis', label: 'MGET presence:ana presence:bo presence:cy', kind: 'sync'},
       {from: 'Redis', to: 'chat-server', label: '[srv-a, nil, srv-b]', kind: 'reply'},
+      {from: 'chat-server', to: 'Client', label: 'online: ana, cy (bo is away)', kind: 'reply'},
     ],
   },
   hints: [
