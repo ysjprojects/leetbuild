@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package thumbs;
+
+// The internal resizer step 4 calls: one unary RPC with a deadline.
+service Resizer {
+  rpc Resize(ResizeRequest) returns (ResizeReply);
+}
+
+message ResizeRequest {
+  string image_id = 1;
+  uint32 width = 2;
+}
+
+message ResizeReply {
+  bytes jpeg = 1;
+}

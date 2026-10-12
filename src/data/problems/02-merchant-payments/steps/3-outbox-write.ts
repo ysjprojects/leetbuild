@@ -142,13 +142,13 @@ from datetime import datetime, timezone
 
 from confluent_kafka import Producer
 
-from payments.db import db  # with db.transaction() as cur: begins, runs the block, commits (rolls back on exception)
+from payments.db import db  # async with db.transaction() as cur: begins, runs the block, commits (rolls back on exception)
 
 TOPIC = "payments"
 producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "all", "enable.idempotence": True})
 
 
-def record_capture(order: dict, capture: dict) -> str:
+async def record_capture(order: dict, capture: dict) -> str:
     """Persist the order and publish payment.captured; returns the event id the ledger dedupes on."""
     event_id = ""  # TODO: str(uuid.uuid4()), used as the outbox row id and as event_id in the payload
     event = {
@@ -161,8 +161,8 @@ def record_capture(order: dict, capture: dict) -> str:
         "captured_at": datetime.now(timezone.utc).isoformat(),
     }
     payload = json.dumps(event)
-    with db.transaction() as cur:
-        cur.execute(
+    async with db.transaction() as cur:
+        await cur.execute(
             "INSERT INTO orders (id, merchant_id, amount_cents, currency, status) VALUES (%s, %s, %s, %s, 'captured')",
             (order["id"], order["merchant_id"], capture["amount_cents"], capture["currency"]),
         )
@@ -176,12 +176,12 @@ def record_capture(order: dict, capture: dict) -> str:
 import uuid
 from datetime import datetime, timezone
 
-from payments.db import db  # with db.transaction() as cur: begins, runs the block, commits (rolls back on exception)
+from payments.db import db  # async with db.transaction() as cur: begins, runs the block, commits (rolls back on exception)
 
 TOPIC = "payments"
 
 
-def record_capture(order: dict, capture: dict) -> str:
+async def record_capture(order: dict, capture: dict) -> str:
     """Persist the order and the payment.captured event atomically; returns the event id the ledger dedupes on."""
     event_id = str(uuid.uuid4())
     event = {
@@ -194,12 +194,12 @@ def record_capture(order: dict, capture: dict) -> str:
         "captured_at": datetime.now(timezone.utc).isoformat(),
     }
     payload = json.dumps(event)
-    with db.transaction() as cur:
-        cur.execute(
+    async with db.transaction() as cur:
+        await cur.execute(
             "INSERT INTO orders (id, merchant_id, amount_cents, currency, status) VALUES (%s, %s, %s, %s, 'captured')",
             (order["id"], order["merchant_id"], capture["amount_cents"], capture["currency"]),
         )
-        cur.execute(
+        await cur.execute(
             "INSERT INTO outbox (id, topic, key, payload) VALUES (%s, %s, %s, %s)",
             (event_id, TOPIC, order["merchant_id"], payload),
         )
@@ -485,6 +485,109 @@ std::string record_capture(const Order& order, const Capture& capture) {
 }
 `,
     },
+  },
+  harness: {
+    python: `import json
+import uuid
+
+SCHEMA = """
+CREATE TABLE orders (
+    id text PRIMARY KEY,
+    merchant_id text NOT NULL,
+    amount_cents bigint NOT NULL,
+    currency text NOT NULL,
+    status text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE outbox (
+    id text PRIMARY KEY,
+    topic text NOT NULL,
+    key text NOT NULL CHECK (key <> 'm-broken'),
+    payload text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    sent_at timestamptz
+);
+"""
+
+ORDER = {"id": "o-1", "merchant_id": "m-42"}
+CAPTURE = {"amount_cents": 4999, "currency": "EUR"}
+
+
+async def _module(ctx):
+    await ctx.db.reset(SCHEMA)
+    return ctx.load("outbox_writer")
+
+
+async def _rows(ctx, table):
+    return await ctx.db.execute(f"SELECT * FROM {table} ORDER BY created_at, id")
+
+
+async def check_atomic(ctx):
+    m = await _module(ctx)
+    await m.record_capture(ORDER, CAPTURE)
+    orders, outbox = await _rows(ctx, "orders"), await _rows(ctx, "outbox")
+    assert len(orders) == 1, f"expected one orders row, found {len(orders)}"
+    assert len(outbox) == 1, f"expected one outbox row next to the order, found {len(outbox)}"
+    assert ctx.db.events == ["BEGIN", "COMMIT"], f"both rows must be written in one transaction; the database saw {ctx.db.events}"
+    # The outbox insert for merchant m-broken violates a constraint: the order must roll back with it.
+    try:
+        await m.record_capture({"id": "o-2", "merchant_id": "m-broken"}, CAPTURE)
+        raise AssertionError("a failed outbox insert must propagate (the transaction rolls back), not be swallowed")
+    except AssertionError:
+        raise
+    except Exception:
+        pass
+    orders = await _rows(ctx, "orders")
+    assert [o["id"] for o in orders] == ["o-1"], "the outbox insert failed but the orders row o-2 was committed: the two writes are not in one transaction"
+    assert ctx.db.events[-1] == "ROLLBACK", f"the failed transaction must roll back, the database saw {ctx.db.events}"
+
+
+async def check_outbox_row(ctx):
+    m = await _module(ctx)
+    event_id = await m.record_capture(ORDER, CAPTURE)
+    outbox = await _rows(ctx, "outbox")
+    assert len(outbox) == 1, f"expected one outbox row, found {len(outbox)}"
+    row = outbox[0]
+    assert row["topic"] == "payments", f"outbox.topic is {row['topic']!r}, expected 'payments'"
+    assert row["key"] == "m-42", f"outbox.key is {row['key']!r}, expected the merchant id 'm-42'"
+    assert row["sent_at"] is None, "a fresh outbox row is unsent"
+    try:
+        event = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        raise AssertionError(f"outbox.payload must be the event as JSON, got {row['payload']!r}")
+    expected = {"type": "payment.captured", "merchant_id": "m-42", "order_id": "o-1", "amount_cents": 4999, "currency": "EUR"}
+    for field, value in expected.items():
+        assert event.get(field) == value, f"payload.{field} is {event.get(field)!r}, expected {value!r}"
+    assert event.get("event_id") == row["id"], f"payload.event_id {event.get('event_id')!r} must equal the row id {row['id']!r}"
+    assert event_id == row["id"], f"record_capture returned {event_id!r}, expected the outbox row id {row['id']!r}"
+
+
+async def check_no_dual_write(ctx):
+    m = await _module(ctx)
+    await m.record_capture(ORDER, CAPTURE)
+    assert not any(e[0] == "producer" for e in ctx.kafka.events), "this file must not create a Kafka producer: the relay publishes committed outbox rows"
+    assert ctx.kafka.records("payments") == [], f"record_capture produced {len(ctx.kafka.records('payments'))} record(s) to Kafka from the request path"
+    assert ctx.kafka.flushes == 0, "record_capture must not flush a producer"
+    assert len(await _rows(ctx, "outbox")) == 1, "the event must be an outbox row instead"
+
+
+async def check_event_id(ctx):
+    m = await _module(ctx)
+    first = await m.record_capture(ORDER, CAPTURE)
+    second = await m.record_capture({"id": "o-2", "merchant_id": "m-42"}, CAPTURE)
+    for event_id in (first, second):
+        try:
+            parsed = uuid.UUID(str(event_id))
+        except ValueError:
+            raise AssertionError(f"the event id must be a UUID, got {event_id!r}")
+        assert parsed.version == 4, f"the event id must be a random (version 4) UUID, got {event_id!r}"
+    assert first != second, "every event needs its own UUID"
+    outbox = await _rows(ctx, "outbox")
+    ids = {row["id"] for row in outbox}
+    assert ids == {first, second}, f"outbox row ids {ids} must be the returned event ids"
+    for row in outbox:
+        assert json.loads(row["payload"]).get("event_id") == row["id"], "payload.event_id must be the same UUID as the row id"
+`,
   },
   debrief: `A dual write has no atomicity: two systems, two failure points, and no way to make the second write conditional on the first surviving. The outbox borrows the database's transaction so the event is committed exactly when the order is; publishing becomes a separate, retryable job. Real systems either poll the table like the relay you build next or tail the write-ahead log with change data capture (Debezium), and they garbage-collect sent rows so the table does not grow forever.`,
 };

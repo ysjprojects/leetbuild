@@ -646,5 +646,101 @@ int main() {
 `,
     },
   },
+  harness: {
+    python: `PICKUP = {"lat": 48.85, "lng": 2.35}
+DROPOFF = {"lat": 48.86, "lng": 2.34}
+
+
+def _body(pickup=PICKUP, dropoff=DROPOFF):
+    return {"rider_id": "u-1", "pickup": pickup, "dropoff": dropoff}
+
+
+def _api(ctx):
+    m = ctx.load("ride_api")
+    import dispatch  # the provided hand-off the learner's module just imported: records rides, queues matching
+
+    return m, dispatch
+
+
+async def check_validate(ctx):
+    m, dispatch = _api(ctx)
+    async with ctx.client(m.app) as c:
+        headers = {"Idempotency-Key": "k-valid"}
+        bad = [
+            ("pickup lat 90.5", _body(pickup={"lat": 90.5, "lng": 2.35})),
+            ("pickup lat -91", _body(pickup={"lat": -91, "lng": 2.35})),
+            ("dropoff lng 180.5", _body(dropoff={"lat": 48.86, "lng": 180.5})),
+            ("dropoff lng -181", _body(dropoff={"lat": 48.86, "lng": -181})),
+        ]
+        for what, body in bad:
+            r = await c.post("/rides", json=body, headers=headers)
+            assert r.status_code == 400, f"POST /rides with {what} answered {r.status_code}, expected 400"
+        assert ctx.redis.keys("idem:*") == [], "a rejected request must not touch Redis: validation comes first"
+        assert dispatch.matching == [], "a rejected request must not reach start_matching"
+        r = await c.post("/rides", json=_body(pickup={"lat": 90, "lng": -180}), headers=headers)
+    assert r.status_code == 202, f"lat 90 / lng -180 are the bounds and valid, got {r.status_code}"
+
+
+async def check_idempotency_key(ctx):
+    m, dispatch = _api(ctx)
+    async with ctx.client(m.app) as c:
+        r = await c.post("/rides", json=_body())
+        assert r.status_code == 400, f"POST /rides without Idempotency-Key answered {r.status_code}, expected 400"
+        assert dispatch.matching == [], "a request without Idempotency-Key must not start matching"
+        r = await c.post("/rides", json=_body(), headers={"Idempotency-Key": "k-1"})
+    assert r.status_code == 202, f"POST /rides with Idempotency-Key answered {r.status_code}, expected 202"
+
+
+async def check_dedupe_nx(ctx):
+    m, dispatch = _api(ctx)
+    ctx.redis.set("idem:k-old", "r-existing", ex=3600)
+    async with ctx.client(m.app) as c:
+        r = await c.post("/rides", json=_body(), headers={"Idempotency-Key": "k-new"})
+        assert r.status_code == 202, f"a fresh key answered {r.status_code}, expected 202"
+        ride_id = r.json().get("ride_id")
+        stored = ctx.redis.get("idem:k-new")
+        assert stored is not None, "idem:k-new was not written: SET idem:{key} <ride_id> NX EX 3600"
+        assert stored == ride_id, f"idem:k-new holds {stored!r}, not the ride id {ride_id!r} the response carries"
+        ttl = ctx.redis.ttl("idem:k-new")
+        assert 3500 < ttl <= 3600, f"idem:k-new has TTL {ttl}, expected EX 3600"
+        r = await c.post("/rides", json=_body(), headers={"Idempotency-Key": "k-old"})
+    assert ctx.redis.get("idem:k-old") == "r-existing", "an existing idem key was overwritten: the SET must be NX"
+    assert r.status_code == 200, f"a key that already exists answered {r.status_code}, expected 200"
+    assert r.json().get("ride_id") == "r-existing", f"the replay must carry the stored ride id, got {r.json()}"
+    assert dispatch.matching == [ride_id], f"start_matching ran for {dispatch.matching}, expected only the new ride {ride_id!r}"
+
+
+async def check_replay_or_accept(ctx):
+    m, dispatch = _api(ctx)
+    async with ctx.client(m.app) as c:
+        first = await c.post("/rides", json=_body(), headers={"Idempotency-Key": "k-1"})
+        assert first.status_code == 202, f"a new ride answered {first.status_code}, expected 202 (accepted, not matched)"
+        body = first.json()
+        assert body.get("ride_id"), f"the 202 body must carry ride_id, got {body}"
+        assert body.get("status") == "matching", f"the 202 body must say status matching, got {body}"
+        assert dispatch.matching == [body["ride_id"]], "start_matching must run exactly once for a new ride"
+        again = await c.post("/rides", json=_body(), headers={"Idempotency-Key": "k-1"})
+    assert again.status_code == 200, f"the retry answered {again.status_code}, expected 200 (replayed)"
+    assert again.json().get("ride_id") == body["ride_id"], f"the retry must return the same ride id {body['ride_id']!r}, got {again.json()}"
+    assert dispatch.matching == [body["ride_id"]], "the retry must not start matching a second ride"
+
+
+async def check_not_found(ctx):
+    m, dispatch = _api(ctx)
+    async with ctx.client(m.app) as c:
+        r = await c.get("/rides/nope")
+        assert r.status_code == 404, f"GET /rides/nope answered {r.status_code}, expected 404"
+        created = await c.post("/rides", json=_body(), headers={"Idempotency-Key": "k-1"})
+        ride_id = created.json().get("ride_id")
+        r = await c.get(f"/rides/{ride_id}")
+        assert r.status_code == 200, f"GET /rides/{ride_id} answered {r.status_code}, expected 200"
+        assert r.json().get("status") == "matching", f"expected status matching, got {r.json()}"
+        assert "driver_id" not in r.json() or not r.json()["driver_id"], "no driver yet: driver_id must be absent"
+        dispatch.rides.set_driver(ride_id, "d-7")
+        r = await c.get(f"/rides/{ride_id}")
+    assert r.status_code == 200
+    assert r.json().get("driver_id") == "d-7", f"once matched the body must carry driver_id, got {r.json()}"
+`,
+  },
   debrief: `Validation, then the idempotency claim, then the expensive work: the handler never pays for a request it will refuse, and a retry is answered from the key instead of creating a second ride. The \`202\` is honest — the ride is accepted, not matched — and the client learns the rest from \`GET /rides/{id}\`. Real APIs store the whole first response under the key (so a replay is byte-identical), answer \`409\` while the first request is still in flight, and scope keys per rider so two users cannot collide on the same string.`,
 };

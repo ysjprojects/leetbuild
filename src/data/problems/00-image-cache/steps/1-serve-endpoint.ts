@@ -430,4 +430,73 @@ int main() {
     },
   },
   debrief: `Validation, then lookup, then representation: the handler never does expensive work for a request it will reject, and every byte it sends is cacheable by the browser (\`max-age\`) and revalidatable (\`ETag\` → \`304\`). Real services add \`Vary: Accept\` for format negotiation, \`Content-Length\`, and range requests, but the order of the checks stays the same.`,
+  harness: {
+    python: `def _server(ctx):
+    m = ctx.load("thumb_server")
+    m.calls = []
+
+    def get_thumb(image_id, width):
+        m.calls.append((image_id, width))
+        return b"JPEG-" + image_id.encode() + b"-" + str(width).encode() if image_id == "cat" else None
+
+    m.get_thumb = get_thumb
+    return m
+
+
+async def check_route(ctx):
+    m = _server(ctx)
+    async with ctx.client(m.app) as c:
+        r = await c.get("/img/cat?w=256")
+    assert r.status_code == 200, f"GET /img/cat?w=256 answered {r.status_code}"
+    assert r.content == b"JPEG-cat-256", "the body must be exactly the bytes get_thumb returned"
+    assert r.headers.get("content-type", "").startswith("image/jpeg"), f"Content-Type was {r.headers.get('content-type')!r}, not image/jpeg"
+    assert m.calls == [("cat", 256)], f"get_thumb was called with {m.calls}, expected ('cat', 256)"
+
+
+async def check_validate(ctx):
+    m = _server(ctx)
+    async with ctx.client(m.app) as c:
+        assert (await c.get("/img/cat?w=8")).status_code == 400, "w=8 is below 16: expected 400"
+        assert (await c.get("/img/cat?w=4096")).status_code == 400, "w=4096 is above 2048: expected 400"
+        assert m.calls == [], "a rejected width must not reach get_thumb"
+        assert (await c.get("/img/cat?w=16")).status_code == 200, "w=16 is the lower bound and valid"
+        assert (await c.get("/img/cat")).status_code == 200, "without w the default width (256) applies"
+    assert ("cat", 256) in m.calls, "the default width is 256"
+
+
+async def check_not_found(ctx):
+    m = _server(ctx)
+    async with ctx.client(m.app) as c:
+        r = await c.get("/img/ghost?w=256")
+    assert r.status_code == 404, f"an image get_thumb does not know answered {r.status_code}, not 404"
+
+
+async def check_cache_headers(ctx):
+    m = _server(ctx)
+    async with ctx.client(m.app) as c:
+        r1 = await c.get("/img/cat?w=256")
+        r2 = await c.get("/img/cat?w=256")
+        r3 = await c.get("/img/cat?w=128")
+    cache_control = r1.headers.get("cache-control", "")
+    assert "public" in cache_control and "max-age=86400" in cache_control, f"Cache-Control was {cache_control!r}"
+    etag = r1.headers.get("etag")
+    assert etag, "the 200 response carries no ETag"
+    assert r2.headers.get("etag") == etag, "the same bytes must get the same ETag"
+    assert r3.headers.get("etag") != etag, "different bytes must get a different ETag"
+
+
+async def check_not_modified(ctx):
+    m = _server(ctx)
+    async with ctx.client(m.app) as c:
+        first = await c.get("/img/cat?w=256")
+        etag = first.headers.get("etag")
+        assert etag, "no ETag to revalidate against"
+        same = await c.get("/img/cat?w=256", headers={"If-None-Match": etag})
+        other = await c.get("/img/cat?w=256", headers={"If-None-Match": '"stale"'})
+    assert same.status_code == 304, f"If-None-Match with the current ETag answered {same.status_code}, not 304"
+    assert same.content == b"", "a 304 must carry no body"
+    assert same.headers.get("etag") == etag, "the 304 repeats the ETag so the client keeps its copy"
+    assert other.status_code == 200, "a stale If-None-Match must get the full 200"
+`,
+  },
 };

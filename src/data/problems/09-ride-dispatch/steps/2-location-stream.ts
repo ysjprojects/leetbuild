@@ -158,7 +158,8 @@ async def serve() -> None:
     await server.wait_for_termination()
 
 
-asyncio.run(serve())
+if __name__ == "__main__":
+    asyncio.run(serve())
 `,
       solution: `import asyncio
 import logging
@@ -199,7 +200,8 @@ async def serve() -> None:
     await server.wait_for_termination()
 
 
-asyncio.run(serve())
+if __name__ == "__main__":
+    asyncio.run(serve())
 `,
     },
     go: {
@@ -453,6 +455,153 @@ int main() {
 }
 `,
     },
+  },
+  harness: {
+    python: `import asyncio
+import logging
+
+import grpc
+
+import locations_pb2
+import locations_pb2_grpc
+
+
+def _update(driver_id, lat, lng, ts, city="paris"):
+    return locations_pb2.LocationUpdate(driver_id=driver_id, city=city, lat=lat, lng=lng, ts=ts)
+
+
+async def _serve(ctx):
+    m = ctx.load("location_service")
+    asyncio.create_task(m.serve())
+    await asyncio.sleep(0)
+    stub = locations_pb2_grpc.LocationsStub(grpc.aio.insecure_channel("location:9000"))
+    return m, stub
+
+
+async def _push(stub, updates):
+    """One client stream: write every update, half-close, await the single Ack."""
+    call = stub.UpdateLocations()
+    for u in updates:
+        await call.write(u)
+    await call.done_writing()
+    return await call
+
+
+def _count_round_trips(m):
+    """Count Redis round trips on the learner's client: direct commands vs executed pipelines."""
+    trips = {"direct": 0, "pipelines": 0}
+    real_execute = m.r.execute_command
+    real_pipeline = m.r.pipeline
+
+    async def execute_command(*args, **kwargs):
+        trips["direct"] += 1
+        return await real_execute(*args, **kwargs)
+
+    def pipeline(*args, **kwargs):
+        pipe = real_pipeline(*args, **kwargs)
+        real_pipe_execute = pipe.execute
+
+        async def execute(*a, **k):
+            trips["pipelines"] += 1
+            return await real_pipe_execute(*a, **k)
+
+        pipe.execute = execute
+        return pipe
+
+    m.r.execute_command = execute_command
+    m.r.pipeline = pipeline
+    return trips
+
+
+def _pos(ctx, city, driver_id):
+    found = ctx.redis.geopos(f"drivers:{city}", driver_id)
+    return found[0] if found and found[0] is not None else None
+
+
+async def check_geoadd_lng_lat(ctx):
+    m, stub = await _serve(ctx)
+    await _push(stub, [_update("d-7", 48.85, 2.35, 1000), _update("d-2", 48.86, 2.30, 1000), _update("d-l", 45.76, 4.84, 1000, city="lyon")])
+    pos = _pos(ctx, "paris", "d-7")
+    assert pos is not None, f"drivers:paris has no member d-7 after an update (members: {ctx.redis.zrange('drivers:paris', 0, -1)})"
+    lng, lat = pos
+    assert abs(lng - 2.35) < 1e-3 and abs(lat - 48.85) < 1e-3, f"d-7 is stored at lng={lng:.4f} lat={lat:.4f}, expected lng=2.35 lat=48.85 (GEOADD takes longitude first)"
+    lng, lat = _pos(ctx, "paris", "d-2")
+    assert abs(lng - 2.30) < 1e-3 and abs(lat - 48.86) < 1e-3, f"d-2 is stored at lng={lng:.4f} lat={lat:.4f}, expected lng=2.30 lat=48.86"
+    assert _pos(ctx, "lyon", "d-l") is not None, "an update for city lyon must land in drivers:lyon"
+    assert _pos(ctx, "paris", "d-l") is None, "a lyon driver must not be added to drivers:paris: the GEO key is per city"
+
+
+async def check_presence_ttl(ctx):
+    m, stub = await _serve(ctx)
+    await _push(stub, [_update("d-7", 48.85, 2.35, 1000)])
+    seen = ctx.redis.get("driver:d-7:seen")
+    assert seen is not None, "driver:d-7:seen was not written"
+    assert seen == "1000", f"driver:d-7:seen holds {seen!r}, expected the update's ts 1000"
+    ttl = ctx.redis.ttl("driver:d-7:seen")
+    assert 0 < ttl <= 30, f"driver:d-7:seen has TTL {ttl}, expected EX 30"
+    ctx.clock.advance(20)
+    await _push(stub, [_update("d-7", 48.851, 2.351, 1020)])
+    ttl = ctx.redis.ttl("driver:d-7:seen")
+    assert ttl > 25, f"a new update must refresh the presence key: TTL is {ttl} after the second update"
+    assert ctx.redis.get("driver:d-7:seen") == "1020", "the presence value must be the latest ts"
+    ctx.clock.advance(31)
+    assert ctx.redis.get("driver:d-7:seen") is None, "31 s after the last update the presence key must have expired"
+    assert _pos(ctx, "paris", "d-7") is not None, "the GEO member stays (only the presence key expires)"
+
+
+async def check_pipelined(ctx):
+    m, stub = await _serve(ctx)
+    trips = _count_round_trips(m)
+    updates = [_update("d-7", 48.85, 2.35, 1000), _update("d-2", 48.86, 2.30, 1001), _update("d-9", 48.84, 2.37, 1002)]
+    await _push(stub, updates)
+    for u in updates:
+        assert _pos(ctx, "paris", u.driver_id) is not None, f"{u.driver_id} was not GEOADDed (was the pipeline executed?)"
+        assert ctx.redis.get(f"driver:{u.driver_id}:seen") == str(u.ts), f"driver:{u.driver_id}:seen is {ctx.redis.get(f'driver:{u.driver_id}:seen')!r}"
+    assert trips["direct"] == 0, f"{trips['direct']} commands were sent outside a pipeline: GEOADD and SET must travel together in one round trip"
+    assert 1 <= trips["pipelines"] <= len(updates), f"{trips['pipelines']} pipelines executed for {len(updates)} updates; expected one per update (or per small batch)"
+
+
+async def check_ack_count(ctx):
+    m, stub = await _serve(ctx)
+    ack = await _push(stub, [_update(f"d-{i}", 48.85 + i / 1000, 2.35, 1000 + i) for i in range(4)])
+    assert isinstance(ack, locations_pb2.Ack), f"the stream must end with an Ack, got {type(ack).__name__}"
+    assert ack.count == 4, f"Ack.count is {ack.count} after 4 updates, expected 4"
+    ack = await _push(stub, [_update("d-7", 48.85, 2.35, 2000), _update("d-7", 48.851, 2.35, 2004)])
+    assert ack.count == 2, f"a second stream of 2 updates was acknowledged with count {ack.count}: the count is per stream"
+    ack = await _push(stub, [])
+    assert ack.count == 0, f"a stream that sent nothing must be acknowledged with count 0, got {ack.count}"
+
+
+async def check_cancel(ctx):
+    m, stub = await _serve(ctx)
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    root = logging.getLogger()
+    level = root.level
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+    try:
+        call = stub.UpdateLocations()
+        await call.write(_update("d-7", 48.85, 2.35, 1000))
+        await call.write(_update("d-2", 48.86, 2.30, 1001))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert _pos(ctx, "paris", "d-2") is not None, "updates must be applied as they arrive, not only when the stream ends"
+        call.cancel()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        code = await call.code()
+        assert code == grpc.StatusCode.CANCELLED, f"after a client cancel the call ended with {code}, expected CANCELLED (no Ack)"
+        assert ctx.redis.zcard("drivers:paris") == 2, "the two updates before the cancel stay applied"
+        logged = [r.getMessage() for r in records]
+        assert any("2" in msg for msg in logged), f"a cancelled stream must log how many updates were applied (2); logged: {logged}"
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(level)
+    ack = await _push(stub, [_update("d-9", 48.84, 2.37, 1002)])
+    assert ack.count == 1, "the server must keep serving new streams after a cancel"
+`,
   },
   debrief: `A client stream turns thousands of tiny unary calls into one long-lived HTTP/2 stream per driver: no per-message connection setup, back-pressure for free, and one place to notice the driver went away. The write path is deliberately two keys — a GEO set for *where* and a TTL key for *still here* — because a sorted set cannot expire its members. Real location services batch updates per pipeline, shard GEO sets per city cell to spread the write load, map-match the raw GPS onto roads before indexing, and keep a short history per driver to estimate heading and speed.`,
 };

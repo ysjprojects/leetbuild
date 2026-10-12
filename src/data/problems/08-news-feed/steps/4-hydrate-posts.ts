@@ -481,5 +481,138 @@ std::vector<feed::Post> hydrate(const std::vector<std::string>& ids) {
 `,
     },
   },
+  harness: {
+    python: `import json
+
+import grpc
+
+import post_pb2
+import post_pb2_grpc
+
+
+def _post(pid):
+    return {"id": pid, "author": "ann", "text": f"post {pid}", "media_ids": [f"m-{pid}"], "created_at": 1700000000000 + ord(pid)}
+
+
+class FakePostService(post_pb2_grpc.PostServiceServicer):
+    def __init__(self, served):
+        self.posts = {pid: _post(pid) for pid in served}
+        self.events = []  # ("rpc", ids) from here; ("direct", command) and ("pipeline", size) from the Redis spy
+
+    def GetPosts(self, request, context):
+        self.events.append(("rpc", list(request.ids)))
+        found = [post_pb2.Post(**self.posts[pid]) for pid in request.ids if pid in self.posts]
+        return post_pb2.GetPostsReply(posts=found)
+
+    @property
+    def calls(self):
+        return [ids for kind, ids in self.events if kind == "rpc"]
+
+
+def _hydrator(ctx, *served):
+    peer = FakePostService(served)
+    ctx.grpc.serve(post_pb2_grpc.add_PostServiceServicer_to_server, peer)
+    m = ctx.load("post_hydrator")
+    _spy(m.r, peer.events)
+    return m, peer
+
+
+def _cache(ctx, *ids):
+    for pid in ids:
+        ctx.redis.set(f"post:{pid}", json.dumps(_post(pid)))
+
+
+def _spy(r, events):
+    """Logs the learner's Redis round trips: direct command names and the size of every executed pipeline."""
+    real_pipeline, real_execute = r.pipeline, r.execute_command
+
+    def pipeline(*args, **kwargs):
+        pipe = real_pipeline(*args, **kwargs)
+        real_pipe_execute = pipe.execute
+
+        def execute(*a, **k):
+            events.append(("pipeline", len(pipe.command_stack)))
+            return real_pipe_execute(*a, **k)
+
+        pipe.execute = execute
+        return pipe
+
+    def execute_command(*args, **kwargs):
+        events.append(("direct", str(args[0]).lower()))
+        return real_execute(*args, **kwargs)
+
+    r.pipeline = pipeline
+    r.execute_command = execute_command
+
+
+def _direct(peer, *names):
+    return [c for kind, c in peer.events if kind == "direct" and c in names]
+
+
+def check_mget_first(ctx):
+    m, peer = _hydrator(ctx, "a", "b")
+    _cache(ctx, "a")
+    posts = m.hydrate(["a", "b"])
+    assert posts == [_post("a"), _post("b")], f"hydrate must return the cached post a and the fetched post b, got {posts}"
+    assert peer.calls == [["b"]], f"the cached post a must not be requested from the post service: GetPosts was asked for {peer.calls}"
+    kinds = [(kind, c) for kind, c in peer.events if kind == "rpc" or c == "mget"]
+    assert kinds and kinds[0][0] == "direct", "the cache must be read with one MGET before GetPosts is called"
+    assert not _direct(peer, "get"), f"read the cache with one MGET, not {len(_direct(peer, 'get'))} GETs"
+    posts = m.hydrate(["a"])
+    assert posts == [_post("a")] and len(peer.calls) == 1, "when every id is cached GetPosts must not be called at all"
+
+
+def check_single_rpc(ctx):
+    m, peer = _hydrator(ctx, "b", "c", "d")
+    posts = m.hydrate(["b", "c", "d"])
+    assert posts == [_post("b"), _post("c"), _post("d")], f"unexpected posts {posts}"
+    calls = ctx.grpc.calls_to("GetPosts")
+    assert len(calls) == 1, f"3 cache misses must be fetched with one GetPosts call, observed {len(calls)}"
+    assert list(calls[0].request.ids) == ["b", "c", "d"], f"the request must carry every missed id, got {list(calls[0].request.ids)}"
+
+
+def check_deadline(ctx):
+    m, peer = _hydrator(ctx, "b", "c")
+    assert m.hydrate(["b"]) == [_post("b")]
+    call = ctx.grpc.calls_to("GetPosts")[-1]
+    assert call.timeout is not None, "the RPC carries no deadline"
+    assert 0.5 <= call.timeout <= 1.0, f"the deadline must be about 800 ms, got {call.timeout} s"
+    ctx.grpc.set_latency("GetPosts", 3.0)
+    try:
+        m.hydrate(["c"])
+        raise AssertionError("a post service slower than the deadline must surface DEADLINE_EXCEEDED")
+    except grpc.RpcError as e:
+        assert e.code() == grpc.StatusCode.DEADLINE_EXCEEDED, f"a slow post service raised {e.code()}, expected DEADLINE_EXCEEDED"
+
+
+def check_write_back(ctx):
+    m, peer = _hydrator(ctx, "b", "c")
+    m.hydrate(["b", "c"])
+    for pid in ("b", "c"):
+        raw = ctx.redis.get(f"post:{pid}")
+        assert raw is not None, f"post:{pid} must be cached after it was fetched"
+        assert json.loads(raw) == _post(pid), f"post:{pid} must hold the post as JSON, got {raw!r}"
+        ttl = ctx.redis.ttl(f"post:{pid}")
+        assert 3000 < ttl <= 3600, f"post:{pid} must expire after an hour (EX 3600), its TTL is {ttl}"
+    sets = _direct(peer, "set", "setex")
+    assert not sets, f"{len(sets)} SET(s) were sent one by one: write the fetched posts back through one pipeline"
+    sizes = [n for kind, n in peer.events if kind == "pipeline"]
+    assert sizes == [2], f"expected one pipeline carrying the 2 SETs, observed pipeline command counts {sizes}"
+    m.hydrate(["b", "c"])
+    assert len(peer.calls) == 1, "once written back, the next hydration of the same ids must not call GetPosts"
+    ctx.clock.advance(3601)
+    assert ctx.redis.get("post:b") is None, "the cache entry must be gone an hour later"
+
+
+def check_order_kept(ctx):
+    m, peer = _hydrator(ctx, "b")
+    _cache(ctx, "a", "c")
+    posts = m.hydrate(["d", "c", "b", "a"])
+    ids = [p.get("id") for p in posts]
+    assert ids == ["c", "b", "a"], f"posts must come back in the input order with the deleted post d skipped, got {ids}"
+    assert m.hydrate(["d"]) == [], "a page of only deleted posts is an empty list, not an error"
+    assert m.hydrate([]) == [] and len(peer.calls) == 2, "an empty id list must not call the post service"
+`,
+  },
   debrief: `Hydration is where a feed's latency budget is really spent, and two decisions keep it flat: the cache is read with one \`MGET\` instead of N \`GET\`s, and the misses are fetched with one RPC instead of N. The write-back makes the cache fill itself from the long tail of pages, and the TTL bounds memory for posts nobody will ask for again. Returning in input order with missing ids skipped is what lets the timeline keep ids of deleted posts for a while without the client ever seeing a hole. Real hydrators add a per-request dedupe (the same id on two pages), negative caching for ids that keep missing, and a hedge: if the RPC exceeds a soft deadline, serve the page with the cached posts only.`,
 };

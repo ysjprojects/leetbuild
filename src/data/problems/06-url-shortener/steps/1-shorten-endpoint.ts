@@ -583,5 +583,102 @@ int main() {
 `,
     },
   },
+  harness: {
+    python: `class FakeStore:
+    """The links table: remembers what was saved and which names are taken."""
+
+    def __init__(self, taken=()):
+        self.taken = set(taken)
+        self.saved = []
+        self.exists_calls = []
+
+    def exists(self, code):
+        self.exists_calls.append(code)
+        return code in self.taken
+
+    def save(self, code, url):
+        self.saved.append((code, url))
+        self.taken.add(code)
+
+
+def _api(ctx, taken=()):
+    m = ctx.load("shorten_api")
+    m.store = FakeStore(taken)
+    m.codes = []
+
+    def next_code():
+        m.codes.append("g9Xc")
+        return "g9Xc"
+
+    m.next_code = next_code
+    return m
+
+
+URL = "https://example.com/launch"
+
+
+async def check_route(ctx):
+    m = _api(ctx)
+    async with ctx.client(m.app) as c:
+        r = await c.post("/shorten", json={"url": URL})
+    assert r.status_code not in (404, 405), f"POST /shorten answered {r.status_code}: no handler is registered for it"
+    assert r.status_code == 201, f"POST /shorten with a valid url answered {r.status_code}, expected 201"
+
+
+async def check_validate_url(ctx):
+    m = _api(ctx)
+    async with ctx.client(m.app) as c:
+        for bad in ("ftp://example.com/file", "example.com/no-scheme", "javascript:alert(1)", ""):
+            r = await c.post("/shorten", json={"url": bad})
+            assert r.status_code == 400, f"url {bad!r} is not http(s): expected 400, got {r.status_code}"
+        too_long = "https://example.com/" + "a" * (2049 - len("https://example.com/"))
+        r = await c.post("/shorten", json={"url": too_long})
+        assert r.status_code == 400, f"a {len(too_long)}-character url is over MAX_URL_LEN: expected 400, got {r.status_code}"
+        assert m.store.saved == [] and m.codes == [], "a rejected url must be refused before any code is taken or anything is saved"
+        limit = "https://example.com/" + "a" * (2048 - len("https://example.com/"))
+        r = await c.post("/shorten", json={"url": limit})
+        assert r.status_code == 201, f"a url of exactly 2048 characters is allowed: expected 201, got {r.status_code}"
+        r = await c.post("/shorten", json={"url": "http://example.com/plain"})
+        assert r.status_code == 201, f"plain http is allowed: expected 201, got {r.status_code}"
+
+
+async def check_alias_format(ctx):
+    m = _api(ctx)
+    async with ctx.client(m.app) as c:
+        for bad in ("abc", "has space", "a" * 33, "dots.are.out", "sl/ash"):
+            r = await c.post("/shorten", json={"url": URL, "alias": bad})
+            assert r.status_code == 400, f"alias {bad!r} does not match ALIAS_RE: expected 400, got {r.status_code}"
+        assert m.store.exists_calls == [], "a malformed alias is rejected before the store is asked whether it exists"
+        assert m.store.saved == [], "a malformed alias must not be saved"
+        r = await c.post("/shorten", json={"url": URL, "alias": "launch_2026-v1"})
+        assert r.status_code == 201, f"alias 'launch_2026-v1' is valid: expected 201, got {r.status_code}"
+        assert r.json().get("code") == "launch_2026-v1", f"the custom alias must become the code, got {r.json()}"
+
+
+async def check_alias_taken(ctx):
+    m = _api(ctx, taken=["launch"])
+    async with ctx.client(m.app) as c:
+        r = await c.post("/shorten", json={"url": URL, "alias": "launch"})
+        assert r.status_code == 409, f"alias 'launch' already exists: expected 409, got {r.status_code}"
+        assert m.store.saved == [], "a taken alias must not be overwritten"
+        assert m.codes == [], "a taken alias is a client error: no code from next_code() is spent on it"
+        r = await c.post("/shorten", json={"url": URL, "alias": "launch2"})
+        assert r.status_code == 201, f"a free alias must be accepted: expected 201, got {r.status_code}"
+        assert ("launch2", URL) in m.store.saved, f"expected ('launch2', url) to be saved, saved: {m.store.saved}"
+
+
+async def check_created(ctx):
+    m = _api(ctx)
+    async with ctx.client(m.app) as c:
+        r = await c.post("/shorten", json={"url": URL})
+    assert r.status_code == 201, f"expected 201 Created, got {r.status_code}"
+    assert m.codes == ["g9Xc"], "without an alias the code must come from next_code()"
+    assert m.store.saved == [("g9Xc", URL)], f"expected store.save('g9Xc', url), saved: {m.store.saved}"
+    body = r.json()
+    assert body.get("code") == "g9Xc", f"the body must carry the code, got {body}"
+    assert body.get("short_url") == m.BASE_URL + "g9Xc", f"short_url must be BASE_URL + code, got {body.get('short_url')!r}"
+    assert r.headers.get("location") == body["short_url"], f"Location must point at the short url, got {r.headers.get('location')!r}"
+`,
+  },
   debrief: `The endpoint is a funnel: free checks first (scheme, length, alias format), then one store lookup, then — only for the requests that earned it — a code and a write. The two alias failures get different codes because the client can act on them differently: a 400 means "never send that", a 409 means "pick another". Real shorteners add authentication and per-user quotas, screen the target against malware lists before saving, and return the same short link for the same URL from the same user instead of minting a new one.`,
 };

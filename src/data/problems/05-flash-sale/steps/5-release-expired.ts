@@ -536,5 +536,109 @@ void sweep() {
 `,
     },
   },
+  harness: {
+    python: `import time
+
+SKU = "shoe-42"
+STOCK = "stock:shoe-42"
+
+
+def _hold(ctx, order_id, qty=2, expires_in=600, sku=SKU):
+    member = f"{order_id}:{sku}:{qty}"
+    ctx.redis.set(f"hold:{order_id}", member, ex=2 * 600)
+    ctx.redis.zadd("holds", {member: int(time.time()) + expires_in})
+    return member
+
+
+def check_expired_batch(ctx):
+    ctx.redis.set(STOCK, 0)
+    expired = {_hold(ctx, f"e{i}", qty=1, expires_in=-10) for i in range(150)}
+    future = _hold(ctx, "later", expires_in=600)
+    m = ctx.load("hold_sweeper")
+    seen = []
+
+    def release_hold(member):
+        seen.append((ctx.clock.sleeps, member))
+        ctx.redis.zrem("holds", member)
+        return True
+
+    m.release_hold = release_hold
+    ctx.clock.sleep_limit = 1
+    ctx.drain(m.sweep)
+    assert seen, "sweep() released nothing: 150 holds are past their expiry"
+    first_tick = [member for tick, member in seen if tick == 0]
+    assert len(first_tick) <= 100, f"the first tick released {len(first_tick)} holds; at most BATCH = 100 per tick"
+    assert len(first_tick) == 100, f"the first tick released {len(first_tick)} holds, expected the full batch of 100"
+    assert ctx.clock.sleeps == 2, f"the loop slept {ctx.clock.sleeps} times across two ticks, expected one sleep per tick"
+    assert 0.9 <= ctx.clock.offset <= 1.1, f"the loop slept {ctx.clock.offset:.2f} s between ticks, expected SWEEP_INTERVAL_S = 1 s"
+    members = [member for _, member in seen]
+    assert future not in members, "a hold that expires in 600 s must not be released: only members with a score up to now"
+    assert set(members) == expired, f"after two ticks {len(set(members))} distinct expired holds were released, expected all 150"
+    assert len(members) == 150, f"release_hold was called {len(members)} times for 150 expired holds: a released member must not be read again"
+
+
+def check_atomic_release(ctx):
+    ctx.redis.set(STOCK, 3)
+    member = _hold(ctx, "o1", qty=2, expires_in=-5)
+    m = ctx.load("hold_sweeper")
+    assert m.release_hold(member) is True, "releasing an existing hold must return True"
+    assert ctx.redis.get(STOCK) == "5", f"stock is {ctx.redis.get(STOCK)!r} after releasing a hold of 2 on 3, expected 5"
+    assert ctx.redis.exists("hold:o1") == 0, "hold:o1 must be deleted by the release"
+    assert ctx.redis.zscore("holds", member) is None, "the member must be removed from holds by the release"
+    assert m.release_hold(member) is False, "releasing the same hold again must return False"
+    assert ctx.redis.get(STOCK) == "5", f"stock is {ctx.redis.get(STOCK)!r} after a second release, expected still 5: units go back exactly once"
+
+    ctx.redis.set(STOCK, 0)
+    a = _hold(ctx, "a", qty=2, expires_in=600)
+    b = _hold(ctx, "b", qty=3, expires_in=600)
+    c = _hold(ctx, "c", qty=1, expires_in=1800)
+    ctx.clock.advance(601)
+    ctx.clock.sleep_limit = 0
+    ctx.drain(m.sweep)
+    assert ctx.redis.get(STOCK) == "5", f"stock is {ctx.redis.get(STOCK)!r} after sweeping two expired holds of 2 and 3, expected 5"
+    assert ctx.redis.exists("hold:a", "hold:b") == 0, "the sweeper must delete the expired hold keys"
+    assert ctx.redis.zrange("holds", 0, -1) == [c], f"holds is {ctx.redis.zrange('holds', 0, -1)}, expected only the unexpired member {c}"
+    assert ctx.redis.get("hold:c") == c, "an unexpired hold must be left alone"
+
+
+def check_skip_fulfilled(ctx):
+    ctx.redis.set(STOCK, 3)
+    member = "o1:shoe-42:2"
+    ctx.redis.zadd("holds", {member: int(time.time()) - 5})
+    m = ctx.load("hold_sweeper")
+    assert m.release_hold(member) is False, "a member whose hold:o1 is gone (confirmed) must return False"
+    assert ctx.redis.get(STOCK) == "3", f"stock is {ctx.redis.get(STOCK)!r}: a confirmed order's units were given back, they were sold"
+    assert ctx.redis.zscore("holds", member) is None, "the stale member must be ZREMed so the sweeper never reads it again"
+
+    ctx.redis.zadd("holds", {"o2:shoe-42:1": int(time.time()) - 5})
+    ctx.clock.sleep_limit = 0
+    ctx.drain(m.sweep)
+    assert ctx.redis.get(STOCK) == "3", "sweeping a confirmed order must not touch stock"
+    assert ctx.redis.zcard("holds") == 0, "the sweeper must drop the stale member from holds"
+
+
+def check_release_by_order(ctx):
+    ctx.redis.set(STOCK, 3)
+    member = _hold(ctx, "o1", qty=2, expires_in=600)
+    m = ctx.load("hold_sweeper")
+    original = m.release_hold
+    released = []
+
+    def release_hold(value):
+        released.append(value)
+        return original(value)
+
+    m.release_hold = release_hold
+    m.release("o1")
+    assert released == [member], f"release(o1) must pass the stored member {member!r} to release_hold; calls: {released}"
+    assert ctx.redis.get(STOCK) == "5", f"stock is {ctx.redis.get(STOCK)!r} after release(o1), expected 5"
+    assert ctx.redis.exists("hold:o1") == 0, "hold:o1 must be gone after release(o1)"
+    assert ctx.redis.zscore("holds", member) is None, "the member must leave holds after release(o1)"
+    m.release("o1")
+    assert ctx.redis.get(STOCK) == "5", "a second release(o1) must not give the units back again"
+    m.release("never-reserved")
+    assert ctx.redis.get(STOCK) == "5", "release of an unknown order must do nothing"
+`,
+  },
   debrief: `The sorted set is a priority queue keyed by time, and \`ZRANGEBYSCORE … LIMIT\` is the classic way to drain one in bounded slices. The \`EXISTS\` guard inside the script is what makes the sweeper, the API's 503 path and the consumer's no-stock path safe to run concurrently and to repeat: a hold is released at most once no matter who gets there first. Real systems run the sweeper on an elected leader (or shard the sorted set by SKU prefix), treat keyspace notifications only as a hint, and reconcile the Redis counter against the warehouse ledger after the drop — the oversell that any cache-fronted counter eventually produces is caught by accounting, not by more Lua.`,
 };

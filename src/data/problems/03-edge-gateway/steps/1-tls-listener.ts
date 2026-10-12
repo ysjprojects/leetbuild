@@ -422,5 +422,92 @@ int main() {
 `,
     },
   },
+  harness: {
+    python: `import asyncio
+import signal
+import ssl
+
+import uvicorn
+
+
+async def _booted(ctx):
+    """Run main(): the uvicorn stub records the Config and the Server and serve() returns at once.
+    The runtime's loop has no add_signal_handler and there is no process to signal, so the handlers
+    main() installs (loop.add_signal_handler or signal.signal) are captured and can be fired by hand."""
+    m = ctx.load("gateway_server")
+    handlers = {}
+    loop = asyncio.get_running_loop()
+    original_signal = signal.signal
+    loop.add_signal_handler = lambda sig, cb, *args: handlers.__setitem__(int(sig), lambda: cb(*args))
+    signal.signal = lambda sig, h: handlers.__setitem__(int(sig), lambda: h(sig, None))
+    before = len(uvicorn.configs)
+    try:
+        await m.main()
+    finally:
+        del loop.add_signal_handler
+        signal.signal = original_signal
+    assert len(uvicorn.configs) > before, "main() built no uvicorn.Config"
+    return m, uvicorn.configs[-1], handlers
+
+
+async def check_healthz(ctx):
+    m = ctx.load("gateway_server")
+    async with ctx.client(m.app) as c:
+        r = await c.get("/healthz")
+    assert r.status_code == 200, f"GET /healthz answered {r.status_code}, expected 200"
+    assert r.headers.get("content-type", "").startswith("application/json"), f"GET /healthz must answer JSON, got Content-Type {r.headers.get('content-type')!r}"
+    assert r.json() == {"ok": True}, f'GET /healthz body is {r.text!r}, expected {{"ok": true}}'
+
+
+async def check_tls_min(ctx):
+    original_load = uvicorn.Config.load
+
+    def permissive_load(cfg):
+        # this OpenSSL may already default a fresh context to TLS 1.2: start from the lowest floor so
+        # only an explicitly set minimum_version counts
+        original_load(cfg)
+        if cfg.ssl is not None:
+            cfg.ssl.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+
+    uvicorn.Config.load = permissive_load
+    try:
+        m, cfg, _ = await _booted(ctx)
+    finally:
+        uvicorn.Config.load = original_load
+    assert cfg.port == 8443, f"the listener is configured on port {cfg.port}, expected 8443"
+    assert cfg.ssl_certfile and cfg.ssl_keyfile, "the listener must be configured with ssl_certfile=cert.pem and ssl_keyfile=key.pem"
+    assert cfg.ssl is not None, "config.load() was never called, so there is no TLS context to set a floor on"
+    floor = cfg.ssl.minimum_version
+    assert floor == ssl.TLSVersion.TLSv1_2, f"config.ssl.minimum_version is {floor!r}: the floor must be ssl.TLSVersion.TLSv1_2"
+
+
+async def check_hsts(ctx):
+    m = ctx.load("gateway_server")
+    async with ctx.client(m.app) as c:
+        ok = await c.get("/healthz")
+        missing = await c.get("/no-such-route")
+    for name, r in (("/healthz", ok), ("/no-such-route", missing)):
+        value = r.headers.get("strict-transport-security")
+        assert value is not None, f"{name} ({r.status_code}) carries no Strict-Transport-Security header: add it in a middleware so every response has it"
+        assert "max-age=63072000" in value.replace(" ", ""), f"{name}: Strict-Transport-Security is {value!r}, expected max-age=63072000"
+
+
+async def check_sigterm(ctx):
+    m, cfg, handlers = await _booted(ctx)
+    assert uvicorn.servers, "main() built no uvicorn.Server"
+    server = uvicorn.servers[-1]
+    assert int(signal.SIGTERM) in handlers, f"main() installed handlers for {sorted(handlers)}, none for SIGTERM ({int(signal.SIGTERM)})"
+    assert not server.should_exit, "the server must keep serving until SIGTERM arrives"
+    handlers[int(signal.SIGTERM)]()
+    assert server.should_exit, "the SIGTERM handler ran but the server was not told to stop: call server.handle_exit so the listener closes and in-flight requests drain"
+
+
+async def check_drain_bound(ctx):
+    m, cfg, _ = await _booted(ctx)
+    drain = cfg.timeout_graceful_shutdown
+    assert drain is not None, "the Config has no timeout_graceful_shutdown: a client holding a connection open could keep the old process alive forever"
+    assert drain == 10, f"timeout_graceful_shutdown is {drain!r}, expected 10 s"
+`,
+  },
   debrief: `The listener is where three cross-cutting policies live, because it is the one place every request passes: the TLS floor (a property of the context, checked once per handshake), HSTS (a middleware, so a new route cannot forget it) and graceful shutdown (close the accept socket first, then wait with a deadline). Real gateways add OCSP stapling, certificate hot-reload, ALPN for HTTP/2, and health checks that go *unhealthy* a few seconds before the drain starts so the load balancer stops sending traffic first.`,
 };

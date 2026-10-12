@@ -267,5 +267,91 @@ void publish_top_of_book(const std::string& symbol, double bid, double ask, doub
 `,
     },
   },
+  harness: {
+    python: `import json
+
+
+def _market(ctx):
+    """The module, with the fixed client r instrumented: direct commands and the pipelines it opens are recorded."""
+    m = ctx.load("market_data")
+    direct = []  # command names issued on the plain client
+    pipelines = []  # (transaction flag, command names queued at execute time)
+    r = m.r
+    real_execute_command = r.execute_command
+    real_pipeline = r.pipeline
+
+    def execute_command(*args, **kwargs):
+        direct.append(str(args[0]).upper())
+        return real_execute_command(*args, **kwargs)
+
+    def pipeline(transaction=True, shard_hint=None):
+        pipe = real_pipeline(transaction=transaction, shard_hint=shard_hint)
+        real_execute = pipe.execute
+
+        def execute(*args, **kwargs):
+            pipelines.append((bool(pipe.transaction), [str(cmd[0][0]).upper() for cmd in pipe.command_stack]))
+            return real_execute(*args, **kwargs)
+
+        pipe.execute = execute
+        return pipe
+
+    r.execute_command = execute_command
+    r.pipeline = pipeline
+    return m, direct, pipelines
+
+
+def _subscriber(ctx, symbol):
+    pubsub = ctx.redis.pubsub(ignore_subscribe_messages=True)
+    pubsub.subscribe("ticks:" + symbol)
+    pubsub.get_message(timeout=0.01)  # consume the subscribe confirmation
+    return pubsub
+
+
+def check_hash(ctx):
+    m, _, _ = _market(ctx)
+    m.publish_top_of_book("ACME", 10.05, 10.06, 10.05)
+    assert ctx.redis.type("book:ACME") == "hash", f"book:ACME is {ctx.redis.type('book:ACME')!r}, expected a hash"
+    assert ctx.redis.ttl("book:ACME") == -1, f"book:ACME has a TTL of {ctx.redis.ttl('book:ACME')}s; the top of book is state, not a cache entry"
+    m.publish_top_of_book("ACME", 10.07, 10.08, 10.07)
+    assert float(ctx.redis.hget("book:ACME", "bid")) == 10.07, "a second update must overwrite the hash with the current top of book"
+
+
+def check_fields(ctx):
+    m, _, _ = _market(ctx)
+    m.publish_top_of_book("ACME", 10.05, 10.06, 10.0)
+    fields = ctx.redis.hgetall("book:ACME")
+    assert set(fields) == {"bid", "ask", "last"}, f"book:ACME has fields {sorted(fields)}, expected exactly bid, ask, last"
+    values = {k: float(v) for k, v in fields.items()}
+    assert values == {"bid": 10.05, "ask": 10.06, "last": 10.0}, f"book:ACME holds {values}, expected bid 10.05, ask 10.06, last 10.0"
+    m.publish_top_of_book("NEW", 0, 10.5, 0)
+    assert {k: float(v) for k, v in ctx.redis.hgetall("book:NEW").items()} == {"bid": 0.0, "ask": 10.5, "last": 0.0}, "an empty side (0) must still be stored as 0"
+
+
+def check_publish(ctx):
+    m, _, _ = _market(ctx)
+    pubsub = _subscriber(ctx, "ACME")
+    other = _subscriber(ctx, "BETA")
+    m.publish_top_of_book("ACME", 10.05, 10.06, 10.05)
+    message = pubsub.get_message(timeout=0.2)
+    assert message is not None, "nothing was published on ticks:ACME"
+    tick = json.loads(message["data"])
+    assert tick.get("symbol") == "ACME", f"the tick must name the symbol, got {tick}"
+    assert (float(tick.get("bid", -1)), float(tick.get("ask", -1)), float(tick.get("last", -1))) == (10.05, 10.06, 10.05), f"the tick must repeat bid/ask/last, got {tick}"
+    assert other.get_message(timeout=0.05) is None, "the tick for ACME leaked onto ticks:BETA"
+
+
+def check_atomic(ctx):
+    m, direct, pipelines = _market(ctx)
+    pubsub = _subscriber(ctx, "ACME")
+    m.publish_top_of_book("ACME", 10.05, 10.06, 10.05)
+    assert ctx.redis.hgetall("book:ACME") and pubsub.get_message(timeout=0.2) is not None, "the hash and the tick must both be produced"
+    plain = [c for c in direct if c in ("HSET", "HMSET", "PUBLISH")]
+    assert not plain, f"{plain} were issued on the plain client, outside any transaction"
+    assert pipelines, "no pipeline was executed: HSET and PUBLISH must run in one MULTI/EXEC"
+    transaction, commands = pipelines[-1]
+    assert transaction, "the pipeline was opened with transaction=False: without MULTI/EXEC a reader can see one command without the other"
+    assert any(c in ("HSET", "HMSET") for c in commands) and "PUBLISH" in commands, f"the transaction queued {commands}; it must hold both the HSET and the PUBLISH"
+`,
+  },
   debrief: `Two commands, one unit: the transaction is what lets the next step trust a subscriber's tick without re-reading the hash, and lets the snapshot endpoint trust the hash without a tick. The hash has no TTL because expiring it would turn "stale" into "absent", which is a worse lie. A single writer per key (thanks to the partition key) keeps the transaction simple — no WATCH, no Lua. Real market-data feeds add a sequence number to every tick so subscribers can detect gaps, keep the full depth (\`ZADD\` per price level, or a proper feed handler), and multicast at the network layer instead of Pub/Sub, which drops messages for slow subscribers.`,
 };

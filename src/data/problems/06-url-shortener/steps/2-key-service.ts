@@ -565,5 +565,122 @@ std::string next_code() {
 `,
     },
   },
+  harness: {
+    python: `import grpc
+
+import keys_pb2
+import keys_pb2_grpc
+
+
+class FakeKeyService(keys_pb2_grpc.KeyServiceServicer):
+    """Hands out blocks of 'block' counters; successive blocks start 1000 apart, so a client that
+    keeps minting past the end of a block produces a code the service never issued."""
+
+    def __init__(self, block, first=3842000):
+        self.block = block
+        self.next = first
+        self.sizes = []
+        self.lock = None
+        self.locked_during_call = []
+
+    def ReserveBlock(self, request, context):
+        self.sizes.append(request.size)
+        if self.lock is not None:
+            self.locked_during_call.append(self.lock.locked())
+        start = self.next
+        self.next += 1000
+        return keys_pb2.ReserveReply(start=start, size=min(request.size, self.block))
+
+
+def _client(ctx, block):
+    peer = FakeKeyService(block)
+    ctx.grpc.serve(keys_pb2_grpc.add_KeyServiceServicer_to_server, peer)
+    m = ctx.load("key_client")
+    peer.lock = m.lock
+    return m, peer
+
+
+def _rpcs(ctx):
+    return len(ctx.grpc.calls_to("ReserveBlock"))
+
+
+def check_deadline(ctx):
+    m, peer = _client(ctx, block=1)
+    assert m.next_code() == m.base62(3842000), "next_code must hand out the first counter of the reserved block"
+    call = ctx.grpc.calls_to("ReserveBlock")[-1]
+    assert call.timeout is not None, "ReserveBlock carries no deadline: a slow key service would stall every shorten request"
+    assert 0.4 <= call.timeout <= 0.6, f"the deadline must be 500 ms, got {call.timeout} s"
+    ctx.grpc.set_latency("ReserveBlock", 3.0)
+    try:
+        m.next_code()
+        raise AssertionError("a key service slower than the deadline must surface DEADLINE_EXCEEDED")
+    except grpc.RpcError as e:
+        assert e.code() == grpc.StatusCode.DEADLINE_EXCEEDED, f"a slow key service raised {e.code()}, expected DEADLINE_EXCEEDED"
+    assert _rpcs(ctx) == 2, "DEADLINE_EXCEEDED is not UNAVAILABLE: it must not be retried"
+
+
+def check_retry_unavailable(ctx):
+    m, peer = _client(ctx, block=1)
+    ctx.grpc.fail("ReserveBlock", grpc.StatusCode.UNAVAILABLE, "key service restarting", times=1)
+    assert m.next_code() == m.base62(3842000), "one UNAVAILABLE must be retried and the second attempt's block used"
+    assert _rpcs(ctx) == 2, f"expected exactly one retry after UNAVAILABLE, saw {_rpcs(ctx)} calls"
+    ctx.grpc.fail("ReserveBlock", grpc.StatusCode.RESOURCE_EXHAUSTED, "quota", times=1)
+    try:
+        m.next_code()
+        raise AssertionError("RESOURCE_EXHAUSTED must propagate, not be retried or swallowed")
+    except grpc.RpcError as e:
+        assert e.code() == grpc.StatusCode.RESOURCE_EXHAUSTED, f"expected RESOURCE_EXHAUSTED to propagate, got {e.code()}"
+    assert _rpcs(ctx) == 3, "only UNAVAILABLE is worth a second attempt"
+    ctx.grpc.fail("ReserveBlock", grpc.StatusCode.UNAVAILABLE, "down", times=50)
+    try:
+        m.next_code()
+        raise AssertionError("a key service that stays UNAVAILABLE must raise, not return a code")
+    except grpc.RpcError as e:
+        assert e.code() == grpc.StatusCode.UNAVAILABLE, f"expected UNAVAILABLE after the retries, got {e.code()}"
+    attempts = _rpcs(ctx) - 3
+    assert attempts == 2, f"made {attempts} attempts against a down key service; retries must stop after the second"
+
+
+def check_refill_when_empty(ctx):
+    m, peer = _client(ctx, block=3)
+    assert _rpcs(ctx) == 0, "no block is reserved before the first code is needed"
+    for i in range(3):
+        m.next_code()
+        assert _rpcs(ctx) == 1, f"code {i + 1} of a block of 3 reserved another block: refill only when remaining is 0"
+    m.next_code()
+    assert _rpcs(ctx) == 2, "the 4th code needs a new block: expected a second ReserveBlock"
+    m.next_code()
+    m.next_code()
+    assert _rpcs(ctx) == 2, "codes 5 and 6 come from the second block without an RPC"
+    m.next_code()
+    assert _rpcs(ctx) == 3, "the 7th code needs a third block"
+    assert peer.sizes == [m.BLOCK_SIZE] * 3, f"ReserveBlock must ask for BLOCK_SIZE ({m.BLOCK_SIZE}) counters, asked for {peer.sizes}"
+
+
+def check_base62_advance(ctx):
+    m, peer = _client(ctx, block=3)
+    codes = [m.next_code() for _ in range(5)]
+    expected = [m.base62(n) for n in (3842000, 3842001, 3842002, 3843000, 3843001)]
+    assert codes == expected, f"handed out {codes}, expected base62 of 3842000, 3842001, 3842002 then the next block 3843000, 3843001"
+    assert len(set(codes)) == 5, f"codes must be unique, got {codes}"
+
+
+def check_locked(ctx):
+    m, peer = _client(ctx, block=2)
+    m.next_code()
+    assert peer.locked_during_call == [True], "the refill must happen under the lock: another thread could reserve a second block meanwhile"
+    assert not m.lock.locked(), "the lock must be released once the code is handed out"
+    m.next_code()
+    m.next_code()
+    assert peer.locked_during_call == [True, True], "every refill, not only the first, happens under the lock"
+    ctx.grpc.fail("ReserveBlock", grpc.StatusCode.UNAVAILABLE, "down", times=50)
+    m.next_code()
+    try:
+        m.next_code()
+    except grpc.RpcError:
+        pass
+    assert not m.lock.locked(), "a failed refill must release the lock, or every later request deadlocks"
+`,
+  },
   debrief: `Reserving a block turns a coordination problem into a local one: one RPC per thousand codes, and a key service outage only matters when the block runs dry. The codes are sequential, which is fine for a shortener (and is what a database sequence would give you) — a counter is unguessable only if you need it to be, and then you add a random prefix or encrypt it. Real key services pre-fetch the next block before the current one is empty, so the refill never sits on a request path, and survive their own restarts by persisting the high-water mark.`,
 };

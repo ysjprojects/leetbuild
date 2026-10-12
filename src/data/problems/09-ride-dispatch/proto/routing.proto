@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package dispatch;
+
+// The routing service step 6 calls: one unary RPC with a 500 ms deadline.
+service Routing {
+  rpc Eta(EtaRequest) returns (EtaReply);
+}
+
+message LatLng {
+  double lat = 1;
+  double lng = 2;
+}
+
+message EtaRequest {
+  LatLng origin = 1;
+  LatLng dest = 2;
+}
+
+message EtaReply {
+  uint32 seconds = 1;
+}

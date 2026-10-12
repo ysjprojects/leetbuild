@@ -486,5 +486,104 @@ int main() {
 `,
     },
   },
+  harness: {
+    python: `import json
+
+BODY = {"merchant_id": "m-42", "amount_cents": 4999, "currency": "EUR", "card_token": "tok_visa"}
+
+
+def _api(ctx):
+    m = ctx.load("checkout_api")
+    m.calls = []
+    m.seen = []  # what idem:{key} held while process_checkout ran
+
+    def process_checkout(body):
+        m.calls.append(body)
+        m.seen.append((ctx.redis.get("idem:k1"), ctx.redis.ttl("idem:k1")))
+        return {"order_id": f"o-{len(m.calls)}", "status": "captured"}
+
+    m.process_checkout = process_checkout
+    return m
+
+
+async def _post(c, key=None, body=BODY):
+    headers = {} if key is None else {"Idempotency-Key": key}
+    return await c.post("/checkout", json=body, headers=headers)
+
+
+async def check_header_required(ctx):
+    m = _api(ctx)
+    async with ctx.client(m.app) as c:
+        r = await _post(c)
+        assert r.status_code == 400, f"POST /checkout without Idempotency-Key answered {r.status_code}, expected 400"
+        assert m.calls == [], "a request without a key must not reach process_checkout"
+        r = await _post(c, "k1")
+    assert r.status_code == 201, f"POST /checkout with a fresh key answered {r.status_code}, expected 201"
+    assert m.calls == [BODY], f"process_checkout must run once with the request body, got {m.calls}"
+
+
+async def check_reserve_nx(ctx):
+    m = _api(ctx)
+    async with ctx.client(m.app) as c:
+        r = await _post(c, "k1")
+        assert r.status_code == 201
+        assert m.seen, "process_checkout did not run"
+        value, ttl = m.seen[0]
+        assert value == "processing", f"while process_checkout ran idem:k1 held {value!r}, expected the 'processing' reservation"
+        assert 86000 <= ttl <= 86400, f"the reservation TTL was {ttl}, expected 86400 s"
+        ctx.redis.set("idem:k2", "processing")
+        r = await _post(c, "k2")
+    assert r.status_code != 201, "a key already reserved by another request was claimed again: the SET must be NX"
+    assert len(m.calls) == 1, "a key already reserved must not run process_checkout a second time"
+
+
+async def check_in_flight(ctx):
+    m = _api(ctx)
+    ctx.redis.set("idem:k1", "processing", ex=86400)
+    async with ctx.client(m.app) as c:
+        r = await _post(c, "k1")
+    assert r.status_code == 409, f"a key whose first request is still processing answered {r.status_code}, expected 409"
+    assert m.calls == [], "the in-flight key must not run process_checkout again"
+    assert ctx.redis.get("idem:k1") == "processing", "the 409 must leave the running request's reservation in place"
+
+
+async def check_replay(ctx):
+    m = _api(ctx)
+    async with ctx.client(m.app) as c:
+        first = await _post(c, "k1")
+        assert first.status_code == 201, f"the first request answered {first.status_code}, expected 201"
+        again = await _post(c, "k1")
+        other = await _post(c, "k2")
+    assert again.status_code == 200, f"the retry with the same key answered {again.status_code}, expected 200"
+    assert again.content == first.content, f"the replay must return the same body: {again.content!r} != {first.content!r}"
+    assert json.loads(again.content)["order_id"] == "o-1", "the replayed document must be the first response, not a fresh one"
+    assert len(m.calls) == 2 and other.status_code == 201, "the retry must not charge again; a different key is a new order"
+
+
+async def check_store_response(ctx):
+    m = _api(ctx)
+    async with ctx.client(m.app) as c:
+        r = await _post(c, "k1")
+        assert r.status_code == 201
+        stored = ctx.redis.get("idem:k1")
+        assert stored is not None and stored != "processing", f"after the response idem:k1 holds {stored!r}, expected the JSON response"
+        assert json.loads(stored) == json.loads(r.content), f"the stored document {stored!r} differs from the response body {r.content!r}"
+        ttl = ctx.redis.ttl("idem:k1")
+        assert 86000 <= ttl <= 86400, f"the stored response has TTL {ttl}, expected 86400 s (same as the reservation)"
+
+        def failing(body):
+            raise RuntimeError("provider down")
+
+        m.process_checkout = failing
+        try:
+            r = await _post(c, "k3")
+            assert r.status_code >= 500, f"a failing process_checkout answered {r.status_code}"
+        except AssertionError:
+            raise
+        except Exception:
+            pass
+        assert ctx.redis.get("idem:k3") is None, "when process_checkout fails the key must be released, or every retry gets 409 for a day"
+`,
+  },
   debrief: `The idempotency key turns "at least once" from the network into "exactly once" at the API: the atomic \`SET NX EX\` is both the check and the claim, the stored body makes the replay byte-identical, and the TTL bounds how long the promise is kept. Stripe's implementation adds a fingerprint of the request body (same key, different body → 422), scopes keys per API key, and stores the response even when it was an error so a retry does not accidentally succeed.`,
 };

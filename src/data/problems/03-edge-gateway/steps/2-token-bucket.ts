@@ -505,5 +505,102 @@ httplib::Server::HandlerResponse rate_limit(const httplib::Request& req, httplib
 `,
     },
   },
+  harness: {
+    python: `K1 = {"X-API-Key": "k1"}
+
+
+def _gateway(ctx):
+    """The middleware needs something to wrap: a route the harness registers, counting what got through."""
+    m = ctx.load("rate_limit")
+    m.served = []
+
+    @m.app.get("/items/{item_id}")
+    def item(item_id: str):
+        m.served.append(item_id)
+        return {"id": item_id}
+
+    return m
+
+
+async def _burst(c, n, headers=K1):
+    return [(await c.get("/items/42", headers=headers)).status_code for _ in range(n)]
+
+
+async def check_key(ctx):
+    m = _gateway(ctx)
+    async with ctx.client(m.app) as c:
+        await c.get("/items/42", headers=K1)
+        await c.get("/items/42", headers={"X-API-Key": "k2"})
+        await c.get("/items/42")
+    for key in ("bucket:k1", "bucket:k2", "bucket:anonymous"):
+        kind = ctx.redis.type(key)
+        assert kind == "hash", f"{key} is {kind!r} after a request (keys: {sorted(ctx.redis.keys('*'))}), expected a hash with tokens and ts"
+        fields = ctx.redis.hgetall(key)
+        assert "tokens" in fields and "ts" in fields, f"{key} has fields {sorted(fields)}, expected tokens and ts"
+    assert float(ctx.redis.hget("bucket:k1", "tokens")) == 9, f"bucket:k1 holds {ctx.redis.hget('bucket:k1', 'tokens')} tokens after one request, expected burst - 1 = 9"
+
+
+async def check_atomic_lua(ctx):
+    m = _gateway(ctx)
+    commands = []
+    original = m.r.execute_command
+
+    def recording(*args, **kwargs):
+        commands.append(str(args[0]).upper())
+        return original(*args, **kwargs)
+
+    m.r.execute_command = recording
+    async with ctx.client(m.app) as c:
+        await c.get("/items/42", headers=K1)
+    assert ctx.redis.type("bucket:k1") == "hash", "the request wrote no bucket:k1 hash"
+    scripted = [cmd for cmd in commands if cmd in ("EVAL", "EVALSHA")]
+    assert scripted, f"the request sent {commands} to Redis: refill and take must run inside one EVAL/EVALSHA"
+    client_side = [cmd for cmd in commands if cmd.startswith("H")]
+    assert not client_side, f"the request sent {commands} to Redis: the hash must be read and written inside the script, not from the client ({client_side} race between gateway replicas)"
+
+
+async def check_refill_capped(ctx):
+    m = _gateway(ctx)
+    async with ctx.client(m.app) as c:
+        statuses = await _burst(c, 11)
+        assert statuses == [200] * 10 + [429], f"a fresh key gets a full burst of 10, then 429: got {statuses}"
+        ctx.clock.advance(1.0)
+        statuses = await _burst(c, 6)
+        assert statuses == [200] * 5 + [429], f"one second at rate 5 refills 5 tokens, so 5 allowed then 429: got {statuses}"
+        ctx.clock.advance(100.0)
+        statuses = await _burst(c, 11)
+        assert statuses == [200] * 10 + [429], f"after 100 idle seconds the bucket is capped at burst (10), not 500: got {statuses}"
+
+
+async def check_take_one(ctx):
+    m = _gateway(ctx)
+    async with ctx.client(m.app) as c:
+        remaining = [(await c.get("/items/42", headers=K1)).headers.get("x-ratelimit-remaining") for _ in range(3)]
+        assert remaining == ["9", "8", "7"], f"X-RateLimit-Remaining over three requests was {remaining}, expected 9, 8, 7 (one token each)"
+        await _burst(c, 7)
+        denied = await _burst(c, 5)
+        assert denied == [429] * 5, f"with the bucket empty every request is denied: got {denied}"
+        tokens = float(ctx.redis.hget("bucket:k1", "tokens"))
+        assert tokens >= 0, f"bucket:k1 holds {tokens} tokens after denied requests: a denial must not take a token"
+        ctx.clock.advance(0.4)
+        statuses = await _burst(c, 3)
+        assert statuses == [200, 200, 429], f"0.4 s at rate 5 is exactly 2 tokens: got {statuses} (a bucket pushed negative by denials would refill less)"
+
+
+async def check_deny_429(ctx):
+    m = _gateway(ctx)
+    async with ctx.client(m.app) as c:
+        for _ in range(10):
+            r = await c.get("/items/42", headers=K1)
+            assert r.status_code == 200, f"request within the burst answered {r.status_code}"
+        served = len(m.served)
+        r = await c.get("/items/42", headers=K1)
+        other = await c.get("/items/42", headers={"X-API-Key": "k2"})
+    assert r.status_code == 429, f"the 11th request on an empty bucket answered {r.status_code}, expected 429"
+    assert len(m.served) == served + 1 and other.status_code == 200, "a denied request must not reach the route, and other keys must be unaffected"
+    assert r.headers.get("retry-after") == "1", f"Retry-After is {r.headers.get('retry-after')!r}, expected 1 (ceil(1 / rate) seconds until one token refills)"
+    assert r.headers.get("x-ratelimit-remaining") == "0", f"X-RateLimit-Remaining on a 429 is {r.headers.get('x-ratelimit-remaining')!r}, expected 0"
+`,
+  },
   debrief: `A token bucket is two numbers and a clock, which is why it fits in a Redis hash and a dozen lines of Lua. Putting the refill and the take in the script is the whole point: Redis runs scripts one at a time, so every replica of the gateway shares one correct counter without a lock. The \`EXPIRE\` keeps idle keys from living forever, and \`Retry-After\` turns a rejection into advice. Real gateways add a per-route and a global bucket, fail open when Redis is unreachable, and pass \`now\` from the client (as here) rather than calling \`TIME\` inside the script so it stays deterministic under replication.`,
 };

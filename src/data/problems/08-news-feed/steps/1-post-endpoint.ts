@@ -686,5 +686,122 @@ int main() {
 `,
     },
   },
+  harness: {
+    python: `import json
+import time
+
+HEADERS = {"X-User-Id": "alice", "Idempotency-Key": "k-1"}
+
+
+def _api(ctx):
+    """The learner's app plus a log of the provided calls it makes, in order."""
+    m = ctx.load("post_api")
+    log = []
+    real_save, real_publish = m.posts.save, m.publish
+
+    def save(post):
+        log.append(("save", dict(post)))
+        return real_save(post)
+
+    def publish(post):
+        log.append(("publish", dict(post)))
+        return real_publish(post)
+
+    m.posts.save = save
+    m.publish = publish
+    return m, log
+
+
+async def _post(client, body, headers=HEADERS):
+    return await client.post("/posts", json=body, headers=headers)
+
+
+async def check_validate(ctx):
+    m, log = _api(ctx)
+    async with ctx.client(m.app) as c:
+        for body, why in (
+            ({"text": ""}, "empty text"),
+            ({"text": "x" * 281}, "281 characters of text"),
+            ({"text": "hi", "media_ids": ["m1", "m2", "m3", "m4", "m5"]}, "5 media ids"),
+        ):
+            r = await _post(c, body)
+            assert r.status_code == 400, f"{why} must answer 400, got {r.status_code}"
+        assert not log, f"a rejected post must not reach the store or Kafka, but {log[0][0]} was called"
+        assert not ctx.kafka.records("posts"), "a rejected post must not be published"
+        r = await _post(c, {"text": "x" * 280, "media_ids": ["m1", "m2", "m3", "m4"]})
+        assert r.status_code == 201, f"280 characters and 4 media ids are valid: expected 201, got {r.status_code}"
+
+
+async def check_idempotency_key(ctx):
+    m, log = _api(ctx)
+    async with ctx.client(m.app) as c:
+        r = await _post(c, {"text": "hello"}, headers={"X-User-Id": "alice"})
+        assert r.status_code == 400, f"a POST without Idempotency-Key must answer 400, got {r.status_code}"
+        assert not log, "a POST without Idempotency-Key must not be saved or published"
+        first = await _post(c, {"text": "hello"})
+        assert first.status_code == 201, f"a POST with Idempotency-Key must answer 201, got {first.status_code}"
+        retry = await _post(c, {"text": "hello"})
+        assert retry.status_code == 201, f"a retried POST with the same key must answer 201, got {retry.status_code}"
+        assert retry.json().get("post_id") == first.json().get("post_id"), "a retry with the same Idempotency-Key must be the same post: the key must reach posts.save as idempotency_key"
+
+
+async def check_created(ctx):
+    m, log = _api(ctx)
+    async with ctx.client(m.app) as c:
+        r = await _post(c, {"text": "hello", "media_ids": ["m1"]})
+    assert r.status_code == 201, f"a valid post must answer 201, got {r.status_code}"
+    body = r.json()
+    assert body.get("post_id"), f"the 201 body must carry post_id: {body}"
+    assert isinstance(body.get("created_at"), int), f"created_at must be an integer of milliseconds: {body}"
+    assert abs(body["created_at"] - int(time.time() * 1000)) < 5000, f"created_at must be the current time in milliseconds, got {body['created_at']}"
+    assert [kind for kind, _ in log] == ["save", "publish"], f"expected posts.save then publish, observed {[kind for kind, _ in log]}"
+    saved = log[0][1]
+    assert saved.get("post_id") == body["post_id"] and saved.get("author") == "alice", f"the saved post must carry the post_id and the author from X-User-Id: {saved}"
+    assert saved.get("text") == "hello" and saved.get("media_ids") == ["m1"], f"the saved post must carry text and media_ids: {saved}"
+    assert m.posts.get(body["post_id"]) is not None, "the post must be in the store after the 201"
+    records = ctx.kafka.records("posts")
+    assert len(records) == 1, f"expected one record on the posts topic, found {len(records)}"
+    assert json.loads(records[0].value).get("post_id") == body["post_id"], "the published record must be the saved post"
+    assert r.headers.get("cache-control") == "private, no-store", f"Cache-Control must be 'private, no-store', got {r.headers.get('cache-control')!r}"
+
+
+def _timeline(m):
+    calls = []
+
+    def read(user_id, cursor, limit):
+        calls.append((user_id, cursor, limit))
+        return ["p3", "p2"], 1700000000200
+
+    m.timeline.read = read
+    return calls
+
+
+async def check_feed_limit(ctx):
+    m, _ = _api(ctx)
+    calls = _timeline(m)
+    async with ctx.client(m.app) as c:
+        for limit in (0, 51, -1):
+            r = await c.get(f"/feed?limit={limit}", headers=HEADERS)
+            assert r.status_code == 400, f"limit={limit} must answer 400, got {r.status_code}"
+        assert not calls, "a rejected limit must not reach timeline.read"
+        for limit in (1, 50):
+            r = await c.get(f"/feed?limit={limit}", headers=HEADERS)
+            assert r.status_code == 200, f"limit={limit} is valid: expected 200, got {r.status_code}"
+        r = await c.get("/feed", headers=HEADERS)
+        assert r.status_code == 200, f"GET /feed without limit must use the default, got {r.status_code}"
+    assert [c[2] for c in calls] == [1, 50, 20], f"timeline.read must receive the limit (default 20), got {[c[2] for c in calls]}"
+
+
+async def check_feed_response(ctx):
+    m, _ = _api(ctx)
+    calls = _timeline(m)
+    async with ctx.client(m.app) as c:
+        r = await c.get("/feed?cursor=1700000000500&limit=5", headers=HEADERS)
+    assert r.status_code == 200, f"GET /feed must answer 200, got {r.status_code}"
+    assert calls == [("alice", 1700000000500, 5)], f"timeline.read must get the user from X-User-Id, the cursor and the limit unchanged: {calls}"
+    assert r.json() == {"posts": ["p3", "p2"], "next_cursor": 1700000000200}, f"the body must be the page from timeline.read as posts and next_cursor: {r.json()}"
+    assert r.headers.get("cache-control") == "private, no-store", f"Cache-Control must be 'private, no-store', got {r.headers.get('cache-control')!r}"
+`,
+  },
   debrief: `The write path is validate → save → publish → 201, and the order matters: a rejected request costs nothing, and the Kafka record is only produced for a post that exists in the store, so the fan-out worker never pushes an id that cannot be hydrated. The \`Idempotency-Key\` turns a retried POST into the same post instead of two. \`private, no-store\` is the header people forget: a feed is per user, and a shared cache that ignored that would leak one user's timeline to the next. Real APIs add pagination tokens that are opaque (not a raw timestamp), request-size limits, and a 202 path for media that is still processing.`,
 };

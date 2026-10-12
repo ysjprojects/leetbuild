@@ -680,5 +680,103 @@ void run() {
 `,
     },
   },
+  harness: {
+    python: `import json
+import logging
+
+
+def _seed(ctx, *events):
+    for ride_id, event in events:
+        ctx.kafka.seed("trip-events", key=ride_id, value=json.dumps({"ride_id": ride_id, "event": event, "ts": 0}))
+
+
+def _consumer(ctx):
+    m = ctx.load("trip_events")
+    import ride_store  # the provided store the learner's module just imported
+
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logging.getLogger().addHandler(handler)
+    logging.getLogger().setLevel(logging.INFO)
+    return m, ride_store.rides, records
+
+
+def _truthy(value):
+    return value is True or str(value).lower() == "true"
+
+
+def check_durable_producer(ctx):
+    m, store, records = _consumer(ctx)
+    conf = m.producer.conf
+    assert str(conf.get("acks", "")).lower() in ("all", "-1"), f"the producer's acks is {conf.get('acks')!r}, expected all"
+    assert _truthy(conf.get("enable.idempotence")), f"enable.idempotence is {conf.get('enable.idempotence')!r}, expected True"
+    m.publish_event("r-42", "requested")
+    assert len(ctx.kafka.records("trip-events")) == 1, "publish_event must produce one record"
+
+
+def check_keyed_by_ride(ctx):
+    m, store, records = _consumer(ctx)
+    m.publish_event("r-42", "requested")
+    m.publish_event("r-42", "matched")
+    m.publish_event("r-7", "requested")
+    produced = ctx.kafka.records("trip-events")
+    assert len(produced) == 3, f"expected three records on trip-events, found {len(produced)}"
+    keys = [r.key for r in produced]
+    assert keys == [b"r-42", b"r-42", b"r-7"], f"records must be keyed by ride_id, got {keys}"
+    assert produced[0].partition == produced[1].partition, "one ride's events must share a partition"
+    first = json.loads(produced[0].value)
+    assert first.get("ride_id") == "r-42" and first.get("event") == "requested", f"the value must be JSON with ride_id and event: {first}"
+
+
+def check_manual_commit(ctx):
+    _seed(ctx, ("r-42", "requested"), ("r-42", "matched"))
+    m, store, records = _consumer(ctx)
+    assert ctx.kafka.consumers[-1].auto_commit is False, "enable.auto.commit must be False"
+    ctx.drain(m.run)
+    assert not any(e[0] == "auto-commit" for e in ctx.kafka.events), "auto-commit is on: offsets were committed on a timer, not after the write"
+    assert any(e[0] == "manual-commit" for e in ctx.kafka.events), "no explicit commit happened"
+    assert ctx.kafka.lag("trip-state", "trip-events") == 0, "every applied record must be committed"
+    assert store.get("r-42")["status"] == "matched", f"after requested, matched the ride must be matched, got {store.get('r-42')}"
+
+
+def check_illegal_skipped(ctx):
+    _seed(ctx, ("r-42", "requested"), ("r-42", "matched"), ("r-42", "matched"), ("r-42", "completed"), ("r-42", "started"), ("r-99", "started"))
+    m, store, records = _consumer(ctx)
+    ctx.drain(m.run)
+    ride = store.get("r-42")
+    assert ride is not None and ride.get("status") == "started", f"r-42 should be started (requested → matched → started; the duplicate matched and the early completed are illegal), got {ride}"
+    assert store.get("r-99") is None, "started on a ride nobody has seen is illegal and must not create r-99"
+    assert ctx.kafka.lag("trip-state", "trip-events") == 0, "illegal events must be committed too, or the partition replays them forever"
+    logged = [r for r in records if r.levelno >= logging.INFO]
+    assert len(logged) >= 3, f"three illegal transitions were skipped but only {len(logged)} log records were emitted"
+
+
+def check_set_then_commit(ctx):
+    _seed(ctx, ("r-42", "requested"))
+    m, store, records = _consumer(ctx)
+    at_commit = []
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append(store.get("r-42")))
+    ctx.drain(m.run)
+    assert at_commit, "the offset was never committed"
+    assert at_commit[0] is not None and at_commit[0].get("status") == "requested", f"the commit must come after set_status: at commit time r-42 was {at_commit[0]}"
+    # A failing status write must not be committed: the record has to be redelivered.
+    _seed(ctx, ("r-7", "requested"))
+    real_set_status = store.set_status
+
+    def failing_set_status(ride_id, status):
+        if ride_id == "r-7":
+            raise RuntimeError("ride store unavailable")
+        real_set_status(ride_id, status)
+
+    store.set_status = failing_set_status
+    try:
+        ctx.drain(m.run)
+    except Exception:
+        pass
+    assert store.get("r-7") is None
+    assert ctx.kafka.lag("trip-state", "trip-events") == 1, "set_status failed for r-7 but its offset was committed: the event is lost (at-most-once)"
+`,
+  },
   debrief: `The topic is the ride's history and the consumer group is the projection of it: because one ride's events share a partition, the state machine sees them in the order they happened, and because the commit follows the write, a crash replays an event instead of losing it — and the transition table turns that replay into a harmless no-op. Skipping an illegal event *and committing* is the part people get wrong: refusing to commit would block the partition forever on one bad record. Real systems send skipped records to a dead-letter topic, version the event schema, and derive several projections (billing, analytics, the rider's live screen) from the same log.`,
 };

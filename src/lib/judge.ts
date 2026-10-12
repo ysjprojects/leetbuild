@@ -1,12 +1,17 @@
 /**
  * The judge: runs a step's checks against the learner's code and returns a LeetCode-style verdict.
  *
- * Checks are static. Nothing is compiled or executed and no broker or server is contacted: each
- * check is a set of patterns that a correct implementation of the step necessarily contains (a
- * handler on the right route, a TTL on the SET, a commit after the processing call…). Comments are
- * blanked before matching so commented-out code and the starter's TODO notes never satisfy or
- * defeat a check; string literals are kept because routes, topics and keys live in them.
+ * Every check has a static matcher: a set of patterns that a correct implementation of the step
+ * necessarily contains (a handler on the right route, a TTL on the SET, a commit after the
+ * processing call…), evaluated with comments blanked so commented-out code and the starter's TODO
+ * notes never satisfy or defeat a check; string literals are kept because routes, topics and keys
+ * live in them.
+ *
+ * Steps with a runtime harness for the language (`Step.harness`) are also *executed* in the
+ * browser runtime (src/lib/runtime): the harness's `check_<id>` functions decide each check and
+ * acceptance, and the static result survives only as the advisory `shape` note of each check.
  */
+import type {RunResult} from './runtime/python';
 import type {Language, Matcher, Step, StepCheck} from './types';
 
 export interface CheckResult {
@@ -14,6 +19,19 @@ export interface CheckResult {
   title: string;
   detail: string;
   passed: boolean;
+  /** Why the runtime failed the check: the assertion message, or the exception and where it was raised. */
+  message?: string;
+  /** The static matcher's verdict when the runtime decided `passed`: advisory, shown as a shape note. */
+  shape?: boolean;
+}
+
+/** What happened when the step ran. */
+export interface RunInfo {
+  stdout: string;
+  stderr: string;
+  /** The run could not complete (runtime failure, timeout): no check was decided. */
+  error?: string;
+  ms: number;
 }
 
 export interface Verdict {
@@ -21,6 +39,8 @@ export interface Verdict {
   results: CheckResult[];
   passed: number;
   total: number;
+  /** Present when the step ran in the runtime. */
+  run?: RunInfo;
 }
 
 /** Replaces every comment character (but not newlines) with a space so positions and lines survive. */
@@ -150,6 +170,31 @@ export function judge(step: Step, language: Language, code: string): Verdict {
   const results = step.checks.map(check => runCheck(check, language, stripped));
   const passed = results.filter(r => r.passed).length;
   return {accepted: passed === results.length, results, passed, total: results.length};
+}
+
+/**
+ * Fold a runtime run into the static verdict: the runtime decides every check it reports (the
+ * static result becomes `shape`), a check the runtime did not report fails, and a run that could
+ * not complete fails everything with its error.
+ */
+export function withRuntime(verdict: Verdict, run: RunResult): Verdict {
+  const byId: Record<string, {passed: boolean; message?: string}> = {};
+  for (const check of run.checks) byId[check.id] = check;
+  const results = verdict.results.map(r => {
+    const runtime = byId[r.id];
+    if (run.error !== undefined) return {...r, passed: false, shape: r.passed, message: run.error};
+    if (runtime === undefined)
+      return {...r, passed: false, shape: r.passed, message: 'the runtime did not report this check'};
+    return {...r, passed: runtime.passed, shape: r.passed, message: runtime.message};
+  });
+  const passed = results.filter(r => r.passed).length;
+  return {
+    accepted: run.error === undefined && passed === results.length,
+    results,
+    passed,
+    total: results.length,
+    run: {stdout: run.stdout, stderr: run.stderr, error: run.error, ms: run.ms},
+  };
 }
 
 // ---- explaining a check ----------------------------------------------------------------------------

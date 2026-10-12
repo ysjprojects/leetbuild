@@ -130,13 +130,21 @@ keeps one sorted set per day, plus the endpoint that reads it. \`day_key(ts)\` i
       starter: `import json
 import logging
 import threading
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 
 import redis
 from confluent_kafka import Consumer
 from fastapi import FastAPI
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    threading.Thread(target=run, daemon=True).start()  # the worker lives beside the API
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 log = logging.getLogger("top-links")
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
@@ -177,20 +185,25 @@ def top(day: str | None = None) -> list[dict]:
     key = f"top:{day or date.today().isoformat()}"
     # TODO: ZREVRANGE key 0 TOP_N-1 WITHSCORES → [{"code": …, "clicks": …}]
     return []
-
-
-threading.Thread(target=run, daemon=True).start()
 `,
       solution: `import json
 import logging
 import threading
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 
 import redis
 from confluent_kafka import Consumer
 from fastapi import FastAPI
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    threading.Thread(target=run, daemon=True).start()  # the worker lives beside the API
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 log = logging.getLogger("top-links")
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
@@ -239,9 +252,6 @@ def top(day: str | None = None) -> list[dict]:
     key = f"top:{day or date.today().isoformat()}"
     rows = r.zrevrange(key, 0, TOP_N - 1, withscores=True)
     return [{"code": code, "clicks": int(score)} for code, score in rows]
-
-
-threading.Thread(target=run, daemon=True).start()
 `,
     },
     go: {
@@ -697,6 +707,95 @@ int main() {
 }
 `,
     },
+  },
+  harness: {
+    python: `import json
+from datetime import date, datetime, timezone
+
+DAY = "2026-10-05"
+TS = datetime(2026, 10, 5, 12, tzinfo=timezone.utc).timestamp()
+NEXT_DAY_TS = TS + 86400
+KEY = "top:" + DAY
+
+
+def _seed(ctx, *clicks):
+    """clicks: (code, ts) pairs, or just codes (clicked on DAY)."""
+    for click in clicks:
+        code, ts = click if isinstance(click, tuple) else (click, TS)
+        ctx.kafka.seed("clicks", key=code, value=json.dumps({"code": code, "ts": ts, "referrer": None, "ua": None}))
+
+
+def check_consumer(ctx):
+    _seed(ctx, "g9Xc")
+    m = ctx.load("top_links")
+    subscriptions = [e for e in ctx.kafka.events if e[0] == "subscribe"]
+    assert subscriptions, "the consumer must subscribe to a topic"
+    group, topics = subscriptions[-1][1], subscriptions[-1][2]
+    assert group == "top-links", f"group.id must be top-links, got {group!r}"
+    assert "clicks" in topics, f"the consumer must subscribe to clicks, got {topics}"
+    assert ctx.kafka.consumers[-1].auto_commit is False, "enable.auto.commit is on: offsets would be acknowledged on a timer, before the click is counted"
+    ctx.drain(m.run)
+    assert not any(e[0] == "auto-commit" for e in ctx.kafka.events), "offsets were auto-committed"
+    assert any(e[0] == "manual-commit" for e in ctx.kafka.events), "no explicit commit happened after processing"
+    assert ctx.kafka.lag("top-links", "clicks") == 0, "every processed record must be committed"
+
+
+def check_zincrby(ctx):
+    _seed(ctx, "g9Xc", "zz12", "g9Xc", ("g9Xc", NEXT_DAY_TS), "g9Xc")
+    m = ctx.load("top_links")
+    ctx.drain(m.run)
+    assert ctx.redis.type(KEY) == "zset", f"{KEY} is {ctx.redis.type(KEY)!r}, expected a sorted set (keys: {ctx.redis.keys()})"
+    assert ctx.redis.zscore(KEY, "g9Xc") == 3, f"g9Xc in {KEY} scores {ctx.redis.zscore(KEY, 'g9Xc')!r}, expected 3"
+    assert ctx.redis.zscore(KEY, "zz12") == 1, f"zz12 in {KEY} scores {ctx.redis.zscore(KEY, 'zz12')!r}, expected 1"
+    next_key = m.day_key(NEXT_DAY_TS)
+    assert ctx.redis.zscore(next_key, "g9Xc") == 1, f"a click on the next day counts in {next_key}: g9Xc scores {ctx.redis.zscore(next_key, 'g9Xc')!r}, expected 1"
+
+
+def check_expire(ctx):
+    _seed(ctx, "g9Xc")
+    m = ctx.load("top_links")
+    ctx.drain(m.run)
+    ttl = ctx.redis.ttl(KEY)
+    assert ttl > 0, f"{KEY} has no expiry (TTL {ttl}): day leaderboards would accumulate forever"
+    assert 604800 - 60 <= ttl <= 604800, f"{KEY} expires in {ttl} s, expected 7 days (604800)"
+    ctx.clock.advance(604801)
+    assert ctx.redis.exists(KEY) == 0, f"{KEY} must be gone after 7 days"
+
+
+def check_commit_after(ctx):
+    _seed(ctx, "g9Xc")
+    ctx.kafka.seed("clicks", key="bad", value="not json")
+    ctx.kafka.seed("clicks", key="bad", value=json.dumps({"referrer": None}))
+    click = ctx.kafka.records("clicks")[0]
+    at_commit = []
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append((dict(offsets), ctx.redis.zscore(KEY, "g9Xc"))))
+    m = ctx.load("top_links")
+    ctx.drain(m.run)
+    assert at_commit, "no offset was ever committed"
+    covering = [score for offsets, score in at_commit if offsets.get(("clicks", click.partition), 0) > click.offset]
+    assert covering, "the g9Xc click was never committed"
+    assert covering[0] == 1, f"the commit must come after ZINCRBY: when the g9Xc click was committed it scored {covering[0]!r}"
+    assert ctx.kafka.lag("top-links", "clicks") == 0, "malformed records must be skipped and committed, not left to replay forever"
+    assert ctx.redis.zcard(KEY) == 1, f"malformed records must not be counted: {ctx.redis.zrange(KEY, 0, -1)}"
+
+
+async def check_top_endpoint(ctx):
+    m = ctx.load("top_links")
+    scores = {f"code{i:02d}": 100 - i for i in range(12)}
+    ctx.redis.zadd(KEY, scores)
+    async with ctx.client(m.app) as c:
+        r = await c.get("/top", params={"day": DAY})
+    assert r.status_code == 200, f"GET /top?day={DAY} answered {r.status_code}"
+    rows = r.json()
+    assert isinstance(rows, list) and len(rows) == 10, f"expected the 10 top codes, got {rows}"
+    assert [row.get("code") for row in rows] == [f"code{i:02d}" for i in range(10)], f"rows must be in descending score order: {[row.get('code') for row in rows]}"
+    assert [row.get("clicks") for row in rows] == [100 - i for i in range(10)], f"each row carries the click count: {rows}"
+    today = "top:" + date.today().isoformat()
+    ctx.redis.zadd(today, {"today1": 2, "today2": 5})
+    async with ctx.client(m.app) as c:
+        r = await c.get("/top")
+    assert [row.get("code") for row in r.json()] == ["today2", "today1"], f"without ?day the endpoint reads today's set ({today}), got {r.json()}"
+`,
   },
   debrief: `A sorted set is the leaderboard data structure: ZINCRBY keeps it ordered on every write, and the top 10 is one O(log n + 10) read — no scan, no sort at query time. Keying by day gives a natural partition and a natural expiry; a 7-day TTL bounds memory without any cleanup job. Where the commit sits relative to the increment decides the guarantee: process-then-commit is at-least-once, and a leaderboard can afford a rare duplicate. Real analytics pipelines also keep a hourly set, merge days with ZUNIONSTORE for "this week", and write the raw clicks to a warehouse for the questions a sorted set cannot answer (clicks by country, by referrer).`,
 };

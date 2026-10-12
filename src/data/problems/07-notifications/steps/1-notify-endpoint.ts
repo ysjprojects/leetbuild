@@ -616,5 +616,117 @@ int main() {
 `,
     },
   },
+  harness: {
+    python: `BODY = {"user_id": "u42", "channel": "push", "title": "Shipped", "body": "Your order is on its way", "priority": "normal"}
+
+
+def _api(ctx):
+    m = ctx.load("notify_api")
+    m.enqueued = []  # (notification, idem key present at enqueue time)
+    m.broker_down = False
+
+    def enqueue(notification):
+        if m.broker_down:
+            raise RuntimeError("no ack from the broker")
+        m.enqueued.append(notification)
+
+    m.enqueue = enqueue
+    return m
+
+
+def _post(c, body=None, key="k1"):
+    headers = {"Idempotency-Key": key} if key else {}
+    return c.post("/notifications", json=body if body is not None else BODY, headers=headers)
+
+
+async def check_validate(ctx):
+    m = _api(ctx)
+    bad = [
+        ("channel", dict(BODY, channel="fax")),
+        ("priority", dict(BODY, priority="urgent")),
+        ("user_id", dict(BODY, user_id="")),
+        ("title", dict(BODY, title="")),
+    ]
+    async with ctx.client(m.app) as c:
+        for field, body in bad:
+            r = await _post(c, body, key="k-" + field)
+            assert r.status_code == 400, f"an invalid {field} answered {r.status_code}, expected 400"
+        assert ctx.redis.keys("idem:*") == [], f"a rejected request must not claim an idempotency key, found {ctx.redis.keys('idem:*')}"
+        assert m.enqueued == [], "a rejected request must not be enqueued"
+        r = await _post(c, dict(BODY, channel="email", priority="high"), key="k-ok")
+        assert r.status_code == 202, f"a valid request answered {r.status_code}, expected 202"
+
+
+async def check_header_required(ctx):
+    m = _api(ctx)
+    async with ctx.client(m.app) as c:
+        r = await _post(c, key=None)
+        assert r.status_code == 400, f"a request without Idempotency-Key answered {r.status_code}, expected 400"
+        assert m.enqueued == [], "a request without Idempotency-Key must not be enqueued"
+        assert ctx.redis.keys("idem:*") == [], "a request without Idempotency-Key must not claim a key"
+        r = await _post(c, key="k1")
+        assert r.status_code == 202, f"with the header the same request answered {r.status_code}, expected 202"
+
+
+async def check_reserve_nx(ctx):
+    m = _api(ctx)
+    ctx.redis.set("idem:k-taken", "n-earlier")
+    async with ctx.client(m.app) as c:
+        r = await _post(c, key="k1")
+        assert r.status_code == 202, f"POST answered {r.status_code}, expected 202"
+        stored = ctx.redis.get("idem:k1")
+        assert stored is not None, "idem:k1 must be claimed in Redis"
+        assert stored == r.json().get("id"), f"idem:k1 holds {stored!r} but the answer was {r.json()}: the stored value must be the id"
+        ttl = ctx.redis.ttl("idem:k1")
+        assert 86000 <= ttl <= 86400, f"idem:k1 must expire after 86400 s, TTL is {ttl}"
+        r = await _post(c, key="k-taken")
+        assert r.status_code != 202, "a key that already exists must not be claimed again"
+        assert ctx.redis.get("idem:k-taken") == "n-earlier", "SET without NX overwrote the id stored under an existing key"
+        assert ctx.redis.ttl("idem:k-taken") == -1, "a refused SET NX must not touch the existing key's expiry"
+
+
+async def check_replay(ctx):
+    m = _api(ctx)
+    ctx.redis.set("idem:k-old", "n-stored")
+    async with ctx.client(m.app) as c:
+        first = await _post(c, key="k1")
+        assert first.status_code == 202, f"first POST answered {first.status_code}, expected 202"
+        again = await _post(c, key="k1")
+        assert again.status_code == 200, f"a retry with the same key answered {again.status_code}, expected 200"
+        assert again.json().get("id") == first.json().get("id"), f"the replay answered {again.json()}, expected the original id {first.json()}"
+        assert len(m.enqueued) == 1, f"enqueue ran {len(m.enqueued)} times for one key, expected once"
+        old = await _post(c, key="k-old")
+        assert old.status_code == 200 and old.json().get("id") == "n-stored", f"a key stored earlier must replay its id with 200, got {old.status_code} {old.text}"
+        assert len(m.enqueued) == 1, "a replay must not enqueue again"
+
+
+async def check_accepted(ctx):
+    m = _api(ctx)
+    seen = []
+    original = m.enqueue
+
+    def enqueue(notification):
+        seen.append(ctx.redis.get("idem:k1"))
+        original(notification)
+
+    m.enqueue = enqueue
+    async with ctx.client(m.app) as c:
+        r = await _post(c, key="k1")
+        assert r.status_code == 202, f"POST answered {r.status_code}, expected 202 Accepted"
+        nid = r.json().get("id")
+        assert nid, f"the 202 body must carry the id, got {r.text}"
+        assert len(m.enqueued) == 1, f"enqueue ran {len(m.enqueued)} times, expected once"
+        assert m.enqueued[0].get("user_id") == "u42" and m.enqueued[0].get("id") == nid, f"enqueue received {m.enqueued[0]}: expected the notification with its minted id {nid!r}"
+        assert seen == [nid], "the key must be claimed before enqueue runs"
+        m.broker_down = True
+        r = await _post(c, key="k2")
+        assert r.status_code == 503, f"a failed enqueue answered {r.status_code}, expected 503"
+        assert not ctx.redis.exists("idem:k2"), "a failed enqueue must release idem:k2 so the retry can enqueue again"
+        m.broker_down = False
+        r = await _post(c, key="k2")
+        assert r.status_code == 202, f"the retry after a 503 answered {r.status_code}, expected 202"
+        assert len(m.enqueued) == 2, "the retry after a 503 must enqueue the notification"
+`,
+  },
   debrief: `The intake endpoint is where "at least once" from the network becomes "at most once" into the system: the atomic \`SET NX EX\` is both the check and the claim, the stored id makes the replay identical, and releasing the key on a failed enqueue keeps the promise honest. The 202 matters too — the API answers as soon as Kafka has the record, so a slow push provider never slows the services calling it. Real intake APIs also fingerprint the body (same key, different payload → 422) and scope keys per caller so two teams cannot collide on \`order-123\`.`,
 };

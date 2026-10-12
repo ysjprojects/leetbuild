@@ -461,5 +461,99 @@ int main() {
 `,
     },
   },
+  harness: {
+    python: `import time
+
+
+def _app(ctx):
+    m = ctx.load("rate_limiter")
+    m.merchant_of = lambda request: request.headers.get("x-merchant", "m42")  # authentication is provided
+    return m
+
+
+def _at(ctx, second):
+    """Move the clock so the current minute is at :second (plus half a second); returns int(time.time())."""
+    now = time.time()
+    target = int(now) - int(now) % 60 + second + 0.5
+    if target < now:
+        target += 60
+    ctx.clock.advance(target - now)
+    return int(time.time())
+
+
+async def _post(c, merchant="m42"):
+    return await c.post("/checkout", headers={"X-Merchant": merchant})
+
+
+async def check_window_key(ctx):
+    m = _app(ctx)
+    now = _at(ctx, 5)
+    minute = now // 60
+    async with ctx.client(m.app) as c:
+        r = await _post(c)
+        assert r.status_code == 200, f"the first request of the minute answered {r.status_code}"
+        key = f"rl:m42:{minute}"
+        assert ctx.redis.get(key) == "1", f"after one request {key} is {ctx.redis.get(key)!r}, expected '1' (keys: {ctx.redis.keys('rl:*')})"
+        await _post(c, "m7")
+        assert ctx.redis.get(f"rl:m7:{minute}") == "1", "each merchant has its own counter"
+        assert ctx.redis.get(key) == "1", "another merchant's request must not count against m42"
+        ctx.clock.advance(60)
+        await _post(c)
+    assert ctx.redis.get(f"rl:m42:{minute + 1}") == "1", f"a minute later the counter must live under rl:m42:{minute + 1} (keys: {ctx.redis.keys('rl:*')})"
+    assert ctx.redis.get(key) == "1", "the previous window's counter is left alone: the key name is the window"
+
+
+async def check_incr_expire(ctx):
+    m = _app(ctx)
+    now = _at(ctx, 5)
+    key = f"rl:m42:{now // 60}"
+    async with ctx.client(m.app) as c:
+        for _ in range(3):
+            await _post(c)
+        assert ctx.redis.get(key) == "3", f"after three requests {key} is {ctx.redis.get(key)!r}, expected '3'"
+        ttl = ctx.redis.ttl(key)
+        assert 110 <= ttl <= 120, f"{key} has TTL {ttl}, expected 120 s set when the key was created"
+        ctx.clock.advance(30)
+        await _post(c)
+        ttl = ctx.redis.ttl(key)
+        assert 80 <= ttl <= 90, f"30 s later {key} has TTL {ttl}: the expiry is set once, when INCR returns 1, not on every request"
+        ctx.clock.advance(100)
+    assert not ctx.redis.exists(key), f"{key} must have expired 120 s after it was created"
+
+
+async def check_too_many(ctx):
+    m = _app(ctx)
+    now = _at(ctx, 5)
+    ctx.redis.set(f"rl:m42:{now // 60}", 98)  # 98 checkouts already this minute
+    async with ctx.client(m.app) as c:
+        r99 = await _post(c)
+        r100 = await _post(c)
+        r101 = await _post(c)
+        r102 = await _post(c)
+        other = await _post(c, "m7")
+        ctx.clock.advance(60)
+        later = await _post(c)
+    assert r99.status_code == 200 and r100.status_code == 200, f"requests 99 and 100 are within the limit, got {r99.status_code} and {r100.status_code}"
+    assert r101.status_code == 429, f"the 101st request of the minute answered {r101.status_code}, expected 429"
+    assert r102.status_code == 429, f"the 102nd request answered {r102.status_code}, expected 429 for the rest of the window"
+    assert other.status_code == 200, "one merchant over its limit must not block another"
+    assert later.status_code == 200, f"in the next minute the merchant is allowed again, got {later.status_code}"
+
+
+async def check_headers(ctx):
+    m = _app(ctx)
+    now = _at(ctx, 43)
+    ctx.redis.set(f"rl:m42:{now // 60}", 99)
+    async with ctx.client(m.app) as c:
+        last_ok = await _post(c)
+        over = await _post(c)
+        fresh = await _post(c, "m7")
+    assert over.status_code == 429
+    assert over.headers.get("retry-after") == "17", f"at :43 the 429 must say Retry-After: 17 (seconds left in the window), got {over.headers.get('retry-after')!r}"
+    assert over.headers.get("x-ratelimit-remaining") == "0", f"the 429 must carry X-RateLimit-Remaining: 0, got {over.headers.get('x-ratelimit-remaining')!r}"
+    assert last_ok.status_code == 200 and last_ok.headers.get("x-ratelimit-remaining") == "0", f"the 100th request is allowed with X-RateLimit-Remaining: 0, got {last_ok.status_code} / {last_ok.headers.get('x-ratelimit-remaining')!r}"
+    assert fresh.status_code == 200 and fresh.headers.get("x-ratelimit-remaining") == "99", f"a merchant's first request leaves 99, got X-RateLimit-Remaining {fresh.headers.get('x-ratelimit-remaining')!r}"
+`,
+  },
   debrief: `One atomic \`INCR\` per request is the whole limiter: no read-modify-write race, no Lua, and the window boundary is encoded in the key name so nothing ever has to be reset. The \`EXPIRE\` on the first hit is what keeps Redis from filling with dead windows. Real gateways run the limiter at the edge, size the limit per plan, use a sliding window or a token bucket when the double-burst at the boundary matters, and — as the Go solution does — fail open when Redis is unreachable, because a limiter that turns a cache outage into a checkout outage is worse than no limiter at all.`,
 };

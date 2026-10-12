@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package notify;
+
+// The push gateway step 5 calls: one unary RPC with a 3 s deadline and jittered retries.
+service PushGateway {
+  rpc Send(SendRequest) returns (SendReply);
+}
+
+message SendRequest {
+  string device_token = 1;
+  string title = 2;
+  string body = 3;
+  string collapse_key = 4;
+}
+
+message SendReply {
+  string message_id = 1;
+}

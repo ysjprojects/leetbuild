@@ -586,5 +586,116 @@ int main() {
 `,
     },
   },
+  harness: {
+    python: `import time
+
+HOUR_MS = 3600 * 1000
+
+
+class FakeStore:
+    """The provided message store: newest first, ts < before, at most limit; records every call."""
+
+    def __init__(self, rooms):
+        self.rooms = rooms
+        self.calls = []
+
+    def exists(self, room):
+        self.calls.append(("exists", room))
+        return room in self.rooms
+
+    def list(self, room, before_ms, limit):
+        self.calls.append(("list", room, before_ms, limit))
+        newest_first = sorted(self.rooms[room], key=lambda m: -m["ts"])
+        return [m for m in newest_first if m["ts"] < before_ms][:limit]
+
+
+def _app(ctx):
+    """The learner's app over a store holding 120 messages (ts = 1000 .. 120000) plus one dated an hour from now."""
+    m = ctx.load("history_api")
+    room7 = [{"user": "ana" if i % 2 else "bo", "text": f"message {i}", "ts": i * 1000} for i in range(1, 121)]
+    room7.append({"user": "cy", "text": "from the future", "ts": int(time.time() * 1000) + HOUR_MS})
+    store = FakeStore({"room-7": room7, "quiet": []})
+    m.store = store
+    return m, store
+
+
+async def _get(ctx, path):
+    m, store = _app(ctx)
+    async with ctx.client(m.app) as c:
+        r = await c.get(path)
+    return r, store
+
+
+async def check_route(ctx):
+    r, store = await _get(ctx, "/rooms/room-7/messages")
+    assert r.status_code == 200, f"GET /rooms/room-7/messages answered {r.status_code}, expected 200"
+    assert r.headers.get("content-type", "").startswith("application/json"), f"content-type is {r.headers.get('content-type')!r}, expected JSON"
+    body = r.json()
+    assert isinstance(body, dict) and "messages" in body and "next_before" in body, f"the body must be {{'messages': [...], 'next_before': ...}}, got {body!r}"
+    assert len(body["messages"]) == 50, f"the default page holds {len(body['messages'])} messages, expected limit = 50"
+    first = body["messages"][0]
+    assert first == {"user": "bo", "text": "message 120", "ts": 120000}, f"the first message of the page is {first!r}, expected the newest one (ts 120000)"
+
+
+async def check_limit_bounds(ctx):
+    for limit in (0, 101, -5):
+        r, store = await _get(ctx, f"/rooms/room-7/messages?limit={limit}")
+        assert r.status_code == 400, f"limit={limit} answered {r.status_code}, expected 400"
+        assert store.calls == [], f"limit={limit} must be rejected before touching the store, but the store saw {store.calls}"
+    for limit, n in ((1, 1), (100, 100)):
+        r, store = await _get(ctx, f"/rooms/room-7/messages?limit={limit}")
+        assert r.status_code == 200, f"limit={limit} is within 1-100 but answered {r.status_code}"
+        assert len(r.json()["messages"]) == n, f"limit={limit} returned {len(r.json()['messages'])} messages, expected {n}"
+
+
+async def check_unknown_room(ctx):
+    r, store = await _get(ctx, "/rooms/nowhere/messages")
+    assert r.status_code == 404, f"an unknown room answered {r.status_code}, expected 404"
+    assert ("exists", "nowhere") in store.calls, f"the handler must ask store.exists('nowhere'); the store saw {store.calls}"
+    assert not any(c[0] == "list" for c in store.calls), f"an unknown room must not be listed, but the store saw {store.calls}"
+    r, store = await _get(ctx, "/rooms/nowhere/messages?limit=0")
+    assert r.status_code == 400, f"a bad limit on an unknown room answered {r.status_code}, expected 400 (validate before the store lookup)"
+    assert store.calls == [], f"a bad limit must be rejected before store.exists, but the store saw {store.calls}"
+    r, store = await _get(ctx, "/rooms/quiet/messages")
+    assert r.status_code == 200, f"an existing but empty room answered {r.status_code}, expected 200"
+    assert r.json() == {"messages": [], "next_before": None}, f"an empty room must answer {{'messages': [], 'next_before': None}}, got {r.json()!r}"
+
+
+async def check_next_before(ctx):
+    m, store = _app(ctx)
+    async with ctx.client(m.app) as c:
+        r = await c.get("/rooms/room-7/messages?limit=10")
+        assert r.status_code == 200, f"GET ...?limit=10 answered {r.status_code}"
+        lists = [call for call in store.calls if call[0] == "list"]
+        assert len(lists) == 1 and lists[0][1] == "room-7" and lists[0][3] == 10, f"expected one store.list('room-7', <now>, 10), the store saw {store.calls}"
+        before = lists[0][2]
+        now = int(time.time() * 1000)
+        assert abs(before - now) < 60000, f"without ?before the store was asked for ts < {before}, expected about now ({now} ms)"
+        body = r.json()
+        ts = [msg["ts"] for msg in body["messages"]]
+        assert ts == [i * 1000 for i in range(120, 110, -1)], f"the first page holds ts {ts}, expected 120000 down to 111000 (newest first, 'from the future' excluded because before defaults to now)"
+        assert body["next_before"] == 111000, f"next_before is {body['next_before']!r}, expected 111000, the ts of the last message on the page"
+        r = await c.get(f"/rooms/room-7/messages?before={body['next_before']}&limit=10")
+        assert r.status_code == 200
+        assert store.calls[-1] == ("list", "room-7", 111000, 10), f"the second page must list (room-7, 111000, 10); the store saw {store.calls[-1]}"
+        body = r.json()
+        ts = [msg["ts"] for msg in body["messages"]]
+        assert ts == [i * 1000 for i in range(110, 100, -1)], f"the second page holds ts {ts}, expected 110000 down to 101000"
+        assert body["next_before"] == 101000, f"next_before of the second page is {body['next_before']!r}, expected 101000"
+        r = await c.get("/rooms/room-7/messages?before=5000&limit=10")
+        body = r.json()
+        assert len(body["messages"]) == 4, f"before=5000 leaves 4 messages, got {len(body['messages'])}"
+        assert body["next_before"] is None, f"a page shorter than limit is the last one: next_before must be null, got {body['next_before']!r}"
+
+
+async def check_cache_control(ctx):
+    r, store = await _get(ctx, "/rooms/room-7/messages?limit=5")
+    assert r.status_code == 200, f"GET answered {r.status_code}"
+    value = r.headers.get("cache-control")
+    assert value is not None, "the response carries no Cache-Control header"
+    directives = sorted(d.strip().lower() for d in value.split(","))
+    assert directives == ["max-age=5", "private"], f"Cache-Control is {value!r}, expected 'private, max-age=5'"
+`,
+  },
   debrief: `The endpoint is a cursor-paginated read: validate, authorise the resource (404), fetch one page, hand back the cursor for the next. \`next_before\` being derived from the data rather than from arithmetic is what makes it stable while new messages arrive. \`Cache-Control: private\` is the header people forget: without it a CDN or corporate proxy could happily serve one person's private room to the next. Real APIs sign or opaque-encode the cursor, cap the total scroll depth, and add \`ETag\`s so a repeated page costs a 304.`,
 };

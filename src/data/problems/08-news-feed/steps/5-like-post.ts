@@ -629,5 +629,95 @@ int main() {
 `,
     },
   },
+  harness: {
+    python: `import json
+
+
+def _user(name):
+    return {"X-User-Id": name}
+
+
+def _events(ctx):
+    return [json.loads(r.value) for r in ctx.kafka.records("engagement")]
+
+
+async def check_idempotent_like(ctx):
+    m = ctx.load("likes")
+    async with ctx.client(m.app) as c:
+        r = await c.post("/posts/p1/like", headers=_user("alice"))
+        assert r.status_code == 200, f"the first like must answer 200, got {r.status_code}"
+        assert r.json() == {"likes": 1}, f"the first like must answer likes 1, got {r.json()}"
+        r = await c.post("/posts/p1/like", headers=_user("alice"))
+        assert r.status_code == 409, f"a second like by the same user must answer 409, got {r.status_code}"
+        assert ctx.redis.get("likes:p1") == "1", f"a duplicate like must not move the counter: likes:p1 is {ctx.redis.get('likes:p1')!r}"
+        r = await c.post("/posts/p1/like", headers=_user("bob"))
+        assert r.status_code == 200 and r.json() == {"likes": 2}, f"a like by another user counts: expected 200 likes 2, got {r.status_code} {r.text}"
+    assert ctx.redis.smembers("liked:p1") == {"alice", "bob"}, f"liked:p1 must hold the users who liked, got {ctx.redis.smembers('liked:p1')}"
+
+
+async def check_count_after_membership(ctx):
+    m = ctx.load("likes")
+    ctx.redis.sadd("liked:p1", "alice")  # the fact exists; the counter does not yet
+    async with ctx.client(m.app) as c:
+        r = await c.post("/posts/p1/like", headers=_user("alice"))
+        assert r.status_code == 409, f"SADD returned 0 for alice: expected 409, got {r.status_code}"
+        assert ctx.redis.get("likes:p1") is None, f"the counter must not move when SADD added nothing: likes:p1 is {ctx.redis.get('likes:p1')!r}"
+        assert not ctx.kafka.records("engagement"), "a rejected like must not produce an event"
+        r = await c.post("/posts/p1/like", headers=_user("bob"))
+        assert r.status_code == 200 and r.json() == {"likes": 1}, f"bob is a new member: expected 200 likes 1, got {r.status_code} {r.text}"
+    assert ctx.redis.get("likes:p1") == "1", f"likes:p1 must be 1 after one successful INCR, got {ctx.redis.get('likes:p1')!r}"
+    assert ctx.redis.scard("liked:p1") == 2, f"liked:p1 must hold alice and bob, got {ctx.redis.smembers('liked:p1')}"
+
+
+async def check_unlike(ctx):
+    m = ctx.load("likes")
+    async with ctx.client(m.app) as c:
+        r = await c.delete("/posts/p1/like", headers=_user("alice"))
+        assert r.status_code == 409, f"unliking a post alice never liked must answer 409, got {r.status_code}"
+        assert ctx.redis.get("likes:p1") is None, f"a rejected unlike must not touch the counter: likes:p1 is {ctx.redis.get('likes:p1')!r}"
+        await c.post("/posts/p1/like", headers=_user("alice"))
+        await c.post("/posts/p1/like", headers=_user("bob"))
+        r = await c.delete("/posts/p1/like", headers=_user("alice"))
+        assert r.status_code == 200 and r.json() == {"likes": 1}, f"unlike after a like must answer 200 with the decremented count, got {r.status_code} {r.text}"
+        assert ctx.redis.smembers("liked:p1") == {"bob"}, f"SREM must remove alice from liked:p1, got {ctx.redis.smembers('liked:p1')}"
+        r = await c.delete("/posts/p1/like", headers=_user("alice"))
+        assert r.status_code == 409, f"a repeated unlike must answer 409, got {r.status_code}"
+    assert ctx.redis.get("likes:p1") == "1", f"the counter must equal the set size (1), got {ctx.redis.get('likes:p1')!r}"
+    kinds = [e.get("type") for e in _events(ctx)]
+    assert kinds == ["like", "like", "unlike"], f"expected like, like, unlike events, got {kinds}"
+
+
+async def check_event(ctx):
+    m = ctx.load("likes")
+    async with ctx.client(m.app) as c:
+        await c.post("/posts/p1/like", headers=_user("alice"))
+        await c.post("/posts/p1/like", headers=_user("alice"))  # 409: no event
+        await c.post("/posts/p2/like", headers=_user("alice"))
+        await c.delete("/posts/p1/like", headers=_user("alice"))
+    records = ctx.kafka.records("engagement")
+    assert len(records) == 3, f"expected 3 engagement events (like, like, unlike), found {len(records)}"
+    assert [r.key for r in records] == [b"p1", b"p2", b"p1"], f"events must be keyed by the post id, got keys {[r.key for r in records]}"
+    assert records[0].partition == records[2].partition, "one post's events must land on one partition"
+    events = _events(ctx)
+    like, unlike = events[0], events[2]
+    assert like.get("type") == "like" and like.get("post_id") == "p1" and like.get("user_id") == "alice", f"the like event must carry type, post_id and user_id: {like}"
+    assert unlike.get("type") == "unlike" and unlike.get("post_id") == "p1", f"the unlike event must carry type unlike: {unlike}"
+    ids = [e.get("event_id") for e in events]
+    assert all(ids) and len(set(ids)) == 3, f"every event needs its own event_id, got {ids}"
+    assert ctx.kafka.flushes == 0, "the request must not flush: it would wait for the broker"
+
+
+async def check_count_read(ctx):
+    m = ctx.load("likes")
+    async with ctx.client(m.app) as c:
+        r = await c.get("/posts/fresh/likes")
+        assert r.status_code == 200, f"a post nobody liked must answer 200, got {r.status_code}"
+        assert r.json() == {"likes": 0}, f"a post nobody liked has 0 likes, got {r.json()}"
+        await c.post("/posts/p1/like", headers=_user("alice"))
+        await c.post("/posts/p1/like", headers=_user("bob"))
+        r = await c.get("/posts/p1/likes")
+        assert r.status_code == 200 and r.json() == {"likes": 2}, f"after two likes GET must answer likes 2, got {r.status_code} {r.text}"
+`,
+  },
   debrief: `The set is the fact ("alice likes p1") and the counter is a derived number; letting \`SADD\`'s return value gate the \`INCR\` is what makes a retried request harmless. Keying the engagement event by post id keeps a post's likes and unlikes in order on one partition, and the fire-and-forget produce keeps the broker off the request path. Real systems make the two Redis commands atomic (a Lua script or \`MULTI\`), keep the sets in a sharded cluster because \`liked:{post}\` of a viral post has millions of members, and eventually move the counter to the rollup stream of step 6 so the request path only writes the fact.`,
 };

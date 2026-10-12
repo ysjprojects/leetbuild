@@ -413,5 +413,104 @@ std::vector<Candidate> nearest(const std::string& city, double lat, double lng, 
 `,
     },
   },
+  harness: {
+    python: `PICKUP = (48.85, 2.35)  # lat, lng
+
+
+def _seed(ctx, city, *drivers, seen=True):
+    """drivers: (driver_id, lat, lng). Writes the GEO member and, by default, a live presence key."""
+    for driver_id, lat, lng in drivers:
+        ctx.redis.geoadd(f"drivers:{city}", [lng, lat, driver_id])
+        if seen:
+            ctx.redis.set(f"driver:{driver_id}:seen", "1000", ex=30)
+
+
+def _dispatcher(ctx, statuses=None):
+    m = ctx.load("nearest")
+    calls = []
+
+    def driver_status(driver_ids):
+        calls.append(list(driver_ids))
+        return {d: (statuses or {}).get(d, "available") for d in driver_ids}
+
+    m.driver_status = driver_status
+    commands = []
+    real_execute = m.r.execute_command
+
+    def execute_command(*args, **kwargs):
+        commands.append(str(args[0]).upper())
+        return real_execute(*args, **kwargs)
+
+    m.r.execute_command = execute_command
+    return m, calls, commands
+
+
+def _ids(found):
+    return [row[0] for row in found]
+
+
+async def check_geosearch(ctx):
+    _seed(ctx, "paris", ("d-7", 48.852, 2.352), ("d-9", 48.86, 2.37), ("d-far", 48.90, 2.35))
+    _seed(ctx, "lyon", ("d-l", 45.76, 4.84))
+    m, calls, commands = _dispatcher(ctx)
+    found = m.nearest("paris", PICKUP[0], PICKUP[1], 10)
+    assert isinstance(found, list), f"nearest must return a list, got {type(found).__name__}"
+    assert _ids(found) == ["d-7", "d-9"], f"nearest(paris) returned {_ids(found)}, expected [d-7, d-9]: within 3 km of (lat 48.85, lng 2.35), lng before lat in the search"
+    assert "d-far" not in _ids(found), "d-far is 5.6 km away and must be outside the 3 km radius"
+    found = m.nearest("lyon", 45.76, 4.84, 10)
+    assert _ids(found) == ["d-l"], f"nearest(lyon) returned {_ids(found)}, expected [d-l]: the search is on drivers:{{city}}"
+
+
+async def check_sorted_bounded(ctx):
+    drivers = [(f"d-{i}", 48.85 + i / 1000, 2.35) for i in range(1, 26)]  # ~0.111 km apart, 25 within 3 km
+    import random
+
+    random.Random(7).shuffle(drivers)
+    _seed(ctx, "paris", *drivers)
+    m, calls, commands = _dispatcher(ctx)
+    found = m.nearest("paris", PICKUP[0], PICKUP[1], 25)
+    assert len(found) == 20, f"got {len(found)} drivers for k=25 with 25 in range; the search must ask Redis for COUNT 20 candidates"
+    dists = [row[1] for row in found]
+    assert dists == sorted(dists), f"results must be nearest first: distances {dists}"
+    assert _ids(found)[:3] == ["d-1", "d-2", "d-3"], f"the nearest three are d-1, d-2, d-3, got {_ids(found)[:3]}"
+    assert abs(float(dists[0]) - 0.111) < 0.02, f"distances must be in km from WITHDIST: d-1 is 0.11 km away, got {dists[0]}"
+    assert abs(float(dists[9]) - 1.112) < 0.03, f"d-10 is 1.11 km away, got {dists[9]}"
+
+
+async def check_presence_mget(ctx):
+    _seed(ctx, "paris", ("d-2", 48.857, 2.35))
+    ctx.clock.advance(31)  # d-2 went silent: its presence key expired
+    _seed(ctx, "paris", ("d-7", 48.852, 2.352), ("d-9", 48.86, 2.37))
+    _seed(ctx, "paris", ("d-5", 48.83, 2.35), seen=False)
+    m, calls, commands = _dispatcher(ctx)
+    found = m.nearest("paris", PICKUP[0], PICKUP[1], 10)
+    assert _ids(found) == ["d-7", "d-9"], f"nearest returned {_ids(found)}, expected [d-7, d-9]: d-2 and d-5 have no driver:{{id}}:seen key"
+    assert commands.count("MGET") == 1, f"presence must be one MGET over every candidate's seen key; MGET was sent {commands.count('MGET')} times (commands: {commands})"
+    assert commands.count("GET") == 0, f"no GET per driver: {commands.count('GET')} GETs were sent (commands: {commands})"
+    assert all(d not in sum(calls, []) for d in ("d-2", "d-5")), f"silent drivers must be dropped before asking driver_status, which saw {calls}"
+
+
+async def check_available_only(ctx):
+    _seed(ctx, "paris", ("d-7", 48.852, 2.352), ("d-2", 48.857, 2.35), ("d-9", 48.86, 2.37), ("d-5", 48.83, 2.35))
+    m, calls, commands = _dispatcher(ctx, {"d-7": "on_trip", "d-9": "offline"})
+    found = m.nearest("paris", PICKUP[0], PICKUP[1], 10)
+    assert _ids(found) == ["d-2", "d-5"], f"nearest returned {_ids(found)}, expected [d-2, d-5]: d-7 is on_trip and d-9 offline"
+    assert len(calls) == 1, f"driver_status must be asked once with every live candidate, it was called {len(calls)} times: {calls}"
+    assert sorted(calls[0]) == ["d-2", "d-5", "d-7", "d-9"], f"driver_status was asked about {calls[0]}, expected the four live candidates"
+
+
+async def check_top_k(ctx):
+    _seed(ctx, "paris", ("d-7", 48.852, 2.352), ("d-2", 48.857, 2.35), ("d-9", 48.86, 2.37), ("d-5", 48.83, 2.35), ("d-3", 48.87, 2.36))
+    m, calls, commands = _dispatcher(ctx)
+    found = m.nearest("paris", PICKUP[0], PICKUP[1], 2)
+    assert len(found) == 2, f"k=2 but nearest returned {len(found)} drivers: {_ids(found)}"
+    assert _ids(found) == ["d-7", "d-2"], f"the two nearest are d-7 and d-2, got {_ids(found)}"
+    found = m.nearest("paris", PICKUP[0], PICKUP[1], 10)
+    assert len(found) == 5, f"k=10 with five drivers in range must return all five, got {len(found)}"
+    m, calls, commands = _dispatcher(ctx, {"d-7": "on_trip"})
+    found = m.nearest("paris", PICKUP[0], PICKUP[1], 2)
+    assert _ids(found) == ["d-2", "d-9"], f"with d-7 on a trip the top 2 are d-2 and d-9, got {_ids(found)}: filter first, then cut to k"
+`,
+  },
   debrief: `Redis does the geometry — geohash-encoded sorted set, radius query, sort, distance — and the service does the two things Redis cannot know: who is still reporting and who is free. Asking for more candidates than you need (\`COUNT 20\` for \`k = 3\`) is what keeps the result full after the filters. Real dispatchers query several neighbouring cells instead of one radius, weight drivers by ETA rather than straight-line distance, include drivers about to finish a trip, and run the match as a batch over many riders instead of one at a time.`,
 };

@@ -397,5 +397,86 @@ std::optional<std::string> fill(const std::string& key, const std::string& id, i
 `,
     },
   },
+  harness: {
+    python: `MISSING = b"__missing__"
+
+
+def _fill(ctx, render=None):
+    m = ctx.load("thumb_fill")
+    m.render = render or (lambda image_id, width: b"JPEG")
+    m.store = lambda key, data: ctx.redis_bytes.set(key, MISSING if data is None else data, ex=86400)
+    return m
+
+
+def check_lock_nx(ctx):
+    seen = {}
+
+    def render(image_id, width):
+        seen["held"] = ctx.redis.exists("lock:thumb:cat:256")
+        seen["ttl"] = ctx.redis.ttl("lock:thumb:cat:256")
+        return b"JPEG"
+
+    m = _fill(ctx, render)
+    assert m.fill("thumb:cat:256", "cat", 256) == b"JPEG", "the winner returns the rendered bytes"
+    assert seen.get("held") == 1, "lock:thumb:cat:256 must be held while the winner renders"
+    assert 0 < seen["ttl"] <= 5, f"the lock must expire within 5 s (TTL {seen['ttl']})"
+    # Someone else holds the lock: NX must fail and this caller must not render.
+    ctx.redis.set("lock:thumb:dog:256", "1", ex=5)
+    ctx.redis_bytes.set("thumb:dog:256", b"LEADER")
+    calls = []
+    m.render = lambda image_id, width: calls.append(image_id) or b"X"
+    assert m.fill("thumb:dog:256", "dog", 256) == b"LEADER", "a caller that did not win the lock returns the leader's value"
+    assert calls == [], "a caller that did not win the lock must not render"
+
+
+def check_release(ctx):
+    m = _fill(ctx)
+    assert m.fill("thumb:cat:256", "cat", 256) == b"JPEG"
+    assert ctx.redis_bytes.get("thumb:cat:256") == b"JPEG", "the winner must store() the rendered value"
+    assert not ctx.redis.exists("lock:thumb:cat:256"), "the lock must be released once the value is stored"
+
+    def boom(image_id, width):
+        raise RuntimeError("origin down")
+
+    m.render = boom
+    try:
+        m.fill("thumb:bad:256", "bad", 256)
+    except RuntimeError:
+        pass
+    assert not ctx.redis.exists("lock:thumb:bad:256"), "the lock must be released even when render fails"
+
+
+def check_wait_recheck(ctx):
+    m = _fill(ctx)
+    ctx.redis.set("lock:thumb:cat:256", "1", ex=5)
+    reads = []
+    real_get = m.r.get
+
+    def get(key, *args, **kwargs):
+        reads.append(key)
+        if len(reads) == 2:
+            ctx.redis_bytes.set("thumb:cat:256", b"LEADER")  # the leader finishes
+        return real_get(key, *args, **kwargs)
+
+    m.r.get = get
+    calls = []
+    m.render = lambda image_id, width: calls.append(image_id) or b"X"
+    assert m.fill("thumb:cat:256", "cat", 256) == b"LEADER", "the follower must return the value the leader stored"
+    assert calls == [], "the follower must not render while the lock is held"
+    assert ctx.clock.sleeps >= 1, "poll by sleeping briefly between reads, not in a tight loop"
+    assert len(reads) >= 2, "the follower must re-read the key until the value appears"
+
+
+def check_bounded_wait(ctx):
+    m = _fill(ctx)
+    ctx.redis.set("lock:thumb:cat:256", "1", ex=5)  # the leader died holding the lock
+    calls = []
+    m.render = lambda image_id, width: calls.append(image_id) or b"MINE"
+    ctx.clock.sleep_limit = 1000
+    assert m.fill("thumb:cat:256", "cat", 256) == b"MINE", "once the lock TTL passes the follower must render itself"
+    assert calls == ["cat"]
+    assert 50 <= ctx.clock.sleeps <= 200, f"waited through {ctx.clock.sleeps} polls; a 50 ms poll over a 5 s lock TTL is about 100"
+`,
+  },
   debrief: `This is a per-key mutex made of one Redis key: \`NX\` for exclusion, \`EX\` for liveness. Followers trade a few polls for one shared render — the "single flight" pattern. Production variants avoid polling (Pub/Sub on the key, or in-process single-flight so one machine only ever makes one call), and serve the *stale* value while one request refreshes it in the background (stale-while-revalidate), which removes the wait entirely.`,
 };

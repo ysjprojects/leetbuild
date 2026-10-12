@@ -544,5 +544,129 @@ AuthResult authorize(int64_t amount_cents, const std::string& currency, const st
 `,
     },
   },
+  harness: {
+    python: `import grpc
+
+import provider_pb2
+import provider_pb2_grpc
+
+
+class FakeProvider(provider_pb2_grpc.PaymentProviderServicer):
+    def __init__(self):
+        self.requests = []
+
+    def Authorize(self, request, context):
+        self.requests.append(request)
+        if request.card_token == "tok_expired":
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "card expired")
+        return provider_pb2.AuthorizeReply(authorization_id="auth-" + request.idempotency_key)
+
+
+def _client(ctx):
+    peer = FakeProvider()
+    ctx.grpc.serve(provider_pb2_grpc.add_PaymentProviderServicer_to_server, peer)
+    return ctx.load("provider_client"), peer
+
+
+def _authorize(m, token="tok_visa", key="k1"):
+    return m.authorize(4999, "EUR", token, key)
+
+
+def _calls(ctx):
+    return ctx.grpc.calls_to("Authorize")
+
+
+def check_deadline(ctx):
+    m, peer = _client(ctx)
+    result = _authorize(m)
+    assert result.status == "APPROVED", f"a provider that answers must give APPROVED, got {result.status!r}"
+    assert result.authorization_id == "auth-k1", f"authorization_id must be the provider's, got {result.authorization_id!r}"
+    call = _calls(ctx)[-1]
+    assert call.timeout is not None, "the RPC carries no deadline: a hung provider would hang checkout"
+    assert 2.5 <= call.timeout <= 3.5, f"the deadline must be about 3 s, got {call.timeout} s"
+    ctx.grpc.set_latency("Authorize", 30.0)
+    result = _authorize(m, key="k2")
+    assert result.status != "APPROVED", "a provider slower than the deadline cannot have answered"
+    assert len(_calls(ctx)) == 2, f"a DEADLINE_EXCEEDED attempt must not be retried, saw {len(_calls(ctx)) - 1} calls for it"
+    assert _calls(ctx)[-1].timeout is not None and _calls(ctx)[-1].timeout <= 3.5, "every attempt carries the deadline"
+
+
+def check_idempotency_key(ctx):
+    m, peer = _client(ctx)
+    _authorize(m, key="k1")
+    assert peer.requests, "the provider was never called"
+    req = peer.requests[-1]
+    assert req.idempotency_key == "k1", f"the request carried idempotency_key {req.idempotency_key!r}, expected 'k1'"
+    assert (req.amount_cents, req.currency, req.card_token) == (4999, "EUR", "tok_visa"), "amount, currency and card token must be in the request"
+    ctx.grpc.fail("Authorize", grpc.StatusCode.UNAVAILABLE, "restarting", times=1)
+    result = _authorize(m, key="k2")
+    assert result.status == "APPROVED"
+    keys = [c.request.idempotency_key for c in _calls(ctx)[1:]]
+    assert keys == ["k2", "k2"], f"every attempt of one authorization must carry the same key, saw {keys}"
+
+
+def check_retry_unavailable(ctx):
+    m, peer = _client(ctx)
+    ctx.grpc.fail("Authorize", grpc.StatusCode.UNAVAILABLE, "restarting", times=1)
+    result = _authorize(m)
+    assert result.status == "APPROVED", f"one UNAVAILABLE must be retried and succeed, got {result.status!r}"
+    assert len(_calls(ctx)) == 2, f"expected 2 attempts after one UNAVAILABLE, saw {len(_calls(ctx))}"
+    ctx.grpc.fail("Authorize", grpc.StatusCode.UNAVAILABLE, "down", times=50)
+    try:
+        result = _authorize(m, key="k2")
+        raise AssertionError(f"a provider that stays UNAVAILABLE must raise after the last attempt, got {result!r}")
+    except AssertionError:
+        raise
+    except Exception:
+        pass
+    attempts = len(_calls(ctx)) - 2
+    assert attempts == 3, f"made {attempts} attempts against a down provider, expected exactly 3"
+    ctx.grpc.failures.clear()  # the provider is back; the next failure is a different status
+    ctx.grpc.fail("Authorize", grpc.StatusCode.PERMISSION_DENIED, "bad api key", times=5)
+    try:
+        result = _authorize(m, key="k3")
+        raise AssertionError(f"PERMISSION_DENIED must propagate as an error, got {result!r}")
+    except AssertionError:
+        raise
+    except Exception:
+        pass
+    assert len(_calls(ctx)) == 6, "only UNAVAILABLE is retried; PERMISSION_DENIED must be raised after one attempt"
+
+
+def check_backoff_jitter(ctx):
+    m, peer = _client(ctx)
+    gaps = []
+    slept = []  # virtual seconds each authorization slept in total (sleeps are the only thing advancing the clock here)
+    for n in range(4):
+        ctx.grpc.fail("Authorize", grpc.StatusCode.UNAVAILABLE, "restarting", times=2)
+        before, offset = len(_calls(ctx)), ctx.clock.offset
+        result = _authorize(m, key=f"k{n}")
+        assert result.status == "APPROVED", f"two UNAVAILABLE then success must be APPROVED, got {result.status!r}"
+        calls = _calls(ctx)[before:]
+        assert len(calls) == 3, f"expected 3 attempts, saw {len(calls)}"
+        gaps.append((calls[1].started - calls[0].started, calls[2].started - calls[1].started))
+        slept.append(ctx.clock.offset - offset)
+    assert ctx.clock.sleeps >= 8, "the client must sleep before each retry"
+    for first, second in gaps:
+        assert 0.2 <= first <= 0.45, f"the wait before the 2nd attempt was {first:.3f} s, expected 200 ms base plus up to 200 ms jitter"
+        assert 0.4 <= second <= 0.85, f"the wait before the 3rd attempt was {second:.3f} s, expected 400 ms (doubled) plus up to 400 ms jitter"
+    assert len({round(s, 9) for s in slept}) > 1, f"every authorization waited exactly {slept[0]:.3f} s before its retries: add random jitter so a fleet does not retry in lockstep"
+
+
+def check_status_mapping(ctx):
+    m, peer = _client(ctx)
+    ctx.grpc.set_latency("Authorize", 30.0)
+    result = _authorize(m, key="k1")
+    assert result.status == "PENDING", f"a timed-out authorization must be PENDING (the charge may exist), got {result.status!r}"
+    assert len(_calls(ctx)) == 1, "DEADLINE_EXCEEDED must not be retried: a second attempt could charge twice"
+    ctx.grpc.set_latency("Authorize", 0.0)
+    result = _authorize(m, token="tok_expired", key="k2")
+    assert result.status == "DECLINED", f"INVALID_ARGUMENT must be DECLINED, got {result.status!r}"
+    assert result.reason and "card expired" in result.reason, f"DECLINED must carry the provider's message, got reason={result.reason!r}"
+    assert len(_calls(ctx)) == 2, "INVALID_ARGUMENT must not be retried"
+    result = _authorize(m, key="k3")
+    assert result.status == "APPROVED" and result.authorization_id == "auth-k3"
+`,
+  },
   debrief: `Three ideas, each of which fails on its own: the deadline bounds *your* latency, the idempotency key makes the retry safe, and PENDING is the honest answer when a call that moves money times out. Retrying without the key charges twice; treating a timeout as a failure makes the merchant charge twice with a new key. Production clients use the gRPC retry policy in the service config instead of hand-written loops, propagate the caller's deadline, and reconcile PENDING authorizations later through a provider status query or webhook.`,
 };

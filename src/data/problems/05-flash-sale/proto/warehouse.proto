@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package flashsale;
+
+// The warehouse the fulfilment consumer (step 4) calls: one unary RPC with a deadline.
+// Allocate carries the order id so a redelivered record asks for the same allocation again.
+service Warehouse {
+  rpc Allocate(AllocateRequest) returns (AllocateReply);
+}
+
+message AllocateRequest {
+  string order_id = 1;
+  string sku = 2;
+  uint32 qty = 3;
+}
+
+message AllocateReply {
+  string shipment_id = 1;
+}

@@ -550,5 +550,111 @@ void run() {
 `,
     },
   },
+  harness: {
+    python: `import json
+
+
+def _post(ctx, post_id, author):
+    post = {"post_id": post_id, "author": author, "text": "hi", "media_ids": [], "created_at": 1700000000000}
+    ctx.kafka.seed("posts", key=author, value=json.dumps(post))
+
+
+def _worker(ctx, followers):
+    m = ctx.load("fanout_worker")
+    m.graph.followers = lambda author: list(followers.get(author, []))
+    return m
+
+
+def _spy(r):
+    """Round trips the learner's client makes: direct command names, and the size of every executed pipeline."""
+    trips = {"direct": [], "pipelines": []}
+    real_pipeline, real_execute = r.pipeline, r.execute_command
+
+    def pipeline(*args, **kwargs):
+        pipe = real_pipeline(*args, **kwargs)
+        real_pipe_execute = pipe.execute
+
+        def execute(*a, **k):
+            trips["pipelines"].append(len(pipe.command_stack))
+            return real_pipe_execute(*a, **k)
+
+        pipe.execute = execute
+        return pipe
+
+    def execute_command(*args, **kwargs):
+        trips["direct"].append(str(args[0]).lower())
+        return real_execute(*args, **kwargs)
+
+    r.pipeline = pipeline
+    r.execute_command = execute_command
+    return trips
+
+
+def check_group(ctx):
+    _post(ctx, "p1", "ann")
+    m = _worker(ctx, {"ann": ["bob"]})
+    subscriptions = [e for e in ctx.kafka.events if e[0] == "subscribe"]
+    assert subscriptions, "the consumer must subscribe to a topic"
+    group, topics = subscriptions[-1][1], subscriptions[-1][2]
+    assert group == "fanout", f"group.id must be fanout, got {group!r}"
+    assert "posts" in topics, f"the consumer must subscribe to posts, got {topics}"
+    ctx.drain(m.run)
+    assert ctx.redis.lrange("timeline:bob", 0, -1) == ["p1"], f"after consuming p1 by ann, timeline:bob is {ctx.redis.lrange('timeline:bob', 0, -1)}, expected ['p1']"
+
+
+def check_manual_commit(ctx):
+    _post(ctx, "p1", "ann")
+    _post(ctx, "p2", "ann")
+    m = _worker(ctx, {"ann": ["bob", "cat"]})
+    ctx.drain(m.run)
+    assert ctx.kafka.consumers[-1].auto_commit is False, "enable.auto.commit must be False: offsets would be committed on a timer, before the pushes"
+    assert not any(e[0] == "auto-commit" for e in ctx.kafka.events), "auto-commit is on: offsets were committed on a timer, before processing"
+    assert any(e[0] == "manual-commit" for e in ctx.kafka.events), "no explicit commit happened"
+    assert ctx.kafka.lag("fanout", "posts") == 0, "every processed record must be committed"
+
+
+def check_celebrity(ctx):
+    _post(ctx, "p1", "taylor")
+    _post(ctx, "p2", "ann")
+    fans = {"taylor": [f"fan{i}" for i in range(10_001)], "ann": ["bob", "cat"]}
+    m = _worker(ctx, fans)
+    ctx.drain(m.run)
+    assert ctx.redis.lrange("timeline:bob", 0, -1) == ["p2"], f"ann has 2 followers: her post must be pushed, timeline:bob is {ctx.redis.lrange('timeline:bob', 0, -1)}"
+    pushed = [k for k in ctx.redis.keys("timeline:*") if k.startswith("timeline:fan")]
+    assert not pushed, f"taylor has 10 001 followers: her post must not be fanned out, but {len(pushed)} fan timelines were written"
+    assert ctx.kafka.lag("fanout", "posts") == 0, "a skipped celebrity post must still have its offset committed"
+
+
+def check_push_trim(ctx):
+    ctx.redis.rpush("timeline:bob", *[f"old{i}" for i in range(1000)])
+    _post(ctx, "p1", "ann")
+    _post(ctx, "p2", "ann")
+    m = _worker(ctx, {"ann": ["bob", "cat"]})
+    ctx.drain(m.run)
+    bob = ctx.redis.lrange("timeline:bob", 0, -1)
+    assert bob[:2] == ["p2", "p1"], f"timeline:bob must start with the newest post (LPUSH), got {bob[:3]}"
+    assert len(bob) == 1000, f"timeline:bob has {len(bob)} entries, expected it trimmed to 1000"
+    assert bob[-1] == "old997", f"LTRIM must drop the oldest entries: the tail is {bob[-1]!r}, expected 'old997'"
+    assert ctx.redis.lrange("timeline:cat", 0, -1) == ["p2", "p1"], f"timeline:cat is {ctx.redis.lrange('timeline:cat', 0, -1)}, expected ['p2', 'p1']"
+
+
+def check_batched_commit(ctx):
+    fans = [f"f{i}" for i in range(1240)]
+    _post(ctx, "p1", "ann")
+    m = _worker(ctx, {"ann": fans})
+    trips = _spy(m.r)
+    at_commit = []
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append((len(trips["pipelines"]), ctx.redis.llen("timeline:f1239"))))
+    ctx.drain(m.run)
+    assert ctx.redis.lrange("timeline:f1239", 0, -1) == ["p1"], "every one of the 1240 followers must receive the post"
+    writes = [c for c in trips["direct"] if c in ("lpush", "ltrim")]
+    assert not writes, f"{len(writes)} LPUSH/LTRIM were sent one by one: queue them on a pipeline per batch of 500 followers"
+    sizes = trips["pipelines"]
+    assert len(sizes) == 3, f"1240 followers must take 3 pipelines (500, 500, 240 followers), observed {len(sizes)} pipeline execute(s)"
+    assert max(sizes) <= 1000 and sum(sizes) == 2480, f"each pipeline carries LPUSH + LTRIM for at most 500 followers, observed command counts {sizes}"
+    assert at_commit, "the offset was never committed"
+    assert at_commit[0] == (3, 1), f"the commit must come after the last pipeline executed: at commit time {at_commit[0][0]} pipeline(s) had run and timeline:f1239 had {at_commit[0][1]} entries"
+`,
+  },
   debrief: `Fan-out on write moves the cost from every read to the one write: a post costs one Redis command pair per follower, after which every follower's feed is a single \`LRANGE\`. The celebrity threshold is what keeps that bounded — one account with 50 million followers would otherwise turn a post into 50 million writes and a minutes-long delay for everyone else on the same partition. Pipelining matters as much as the threshold: 500 commands in one round trip versus 500 round trips is the difference between milliseconds and seconds. Real systems also skip inactive followers (they rebuild the timeline on their next login instead), shard timelines across Redis clusters, and run several worker groups so one hot author cannot stall the rest.`,
 };

@@ -394,5 +394,68 @@ void shutdown() {
 `,
     },
   },
+  harness: {
+    python: `import json
+import logging
+
+
+def _events(ctx):
+    m = ctx.load("click_events")
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logging.getLogger().addHandler(handler)
+    return m, records
+
+
+def check_topic(ctx):
+    m, _ = _events(ctx)
+    m.record_click("g9Xc", "https://news.example/", "Mozilla/5.0")
+    produced = ctx.kafka.records("clicks")
+    assert len(produced) == 1, f"expected one record on clicks, found {len(produced)} (topics: {list(ctx.kafka.topics)})"
+    event = json.loads(produced[0].value)
+    assert event.get("code") == "g9Xc", f"the value must be JSON carrying the code: {event}"
+    assert event.get("referrer") == "https://news.example/" and event.get("ua") == "Mozilla/5.0", f"the value must carry referrer and ua: {event}"
+    assert "ts" in event, "the event must carry a timestamp"
+
+
+def check_keyed(ctx):
+    m, _ = _events(ctx)
+    m.record_click("g9Xc", None, None)
+    m.record_click("g9Xc", "https://other.example/", None)
+    m.record_click("zz12", None, None)
+    produced = ctx.kafka.records("clicks")
+    assert [r.key for r in produced] == [b"g9Xc", b"g9Xc", b"zz12"], f"records must be keyed by the code, got {[r.key for r in produced]}"
+    assert produced[0].partition == produced[1].partition, "the same code must land on the same partition"
+
+
+def check_non_blocking(ctx):
+    m, _ = _events(ctx)
+    m.record_click("g9Xc", None, None)
+    assert ctx.kafka.flushes == 0, "record_click must not flush: the redirect would wait for the broker"
+    assert len(ctx.kafka.records("clicks")) == 1, "the click must still be handed to the producer"
+    m.record_click("g9Xc", None, None)
+    assert ctx.kafka.flushes == 0, "record_click must not flush: the redirect would wait for the broker"
+    assert len(ctx.kafka.records("clicks")) == 2
+
+
+def check_callback(ctx):
+    m, records = _events(ctx)
+    ctx.kafka.fail_next("clicks")
+    m.record_click("g9Xc", None, None)  # the failure arrives through the delivery callback, not as an exception
+    m.record_click("g9Xc", None, None)  # poll() on the next call serves the pending callback at the latest
+    m.shutdown()
+    warnings = [r for r in records if r.levelno >= logging.WARNING]
+    assert warnings, "a failed delivery must be logged by the delivery callback"
+    assert len(ctx.kafka.records("clicks")) == 1, "the second click must still be produced after the first one failed"
+
+
+def check_flush(ctx):
+    m, _ = _events(ctx)
+    m.record_click("g9Xc", None, None)
+    m.shutdown()
+    assert ctx.kafka.flushes >= 1, "shutdown() must flush the producer"
+`,
+  },
   debrief: `A Kafka producer is a buffer with a background thread: \`produce\`/\`send\` costs microseconds, the network happens later in batches. That is what makes "one event per redirect" free — as long as nobody blocks on the acknowledgement. The key is the ordering and the partitioning contract at once: same code → same partition → the next step's consumer sees every click of a link in order, on one consumer. Real pipelines put the referrer through a domain allow-list before it reaches analytics, enrich the event with a geo lookup, and enable idempotent producers so their own retries cannot double-count a click.`,
 };

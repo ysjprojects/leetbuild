@@ -470,5 +470,93 @@ void register_routes(httplib::Server& svr) {
 `,
     },
   },
+  harness: {
+    python: `import grpc
+
+import catalog_pb2
+import catalog_pb2_grpc
+
+
+class FakeCatalog(catalog_pb2_grpc.CatalogServicer):
+    def GetItem(self, request, context):
+        if request.id == "ghost":
+            context.abort(grpc.StatusCode.NOT_FOUND, "no item ghost")
+        if request.id == "bad":
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "ids are numeric")
+        return catalog_pb2.Item(id=request.id, name="Kettle", price_cents=3499)
+
+
+def _proxy(ctx):
+    ctx.grpc.serve(catalog_pb2_grpc.add_CatalogServicer_to_server, FakeCatalog())
+    return ctx.load("catalog_proxy")
+
+
+async def _get(ctx, m, item_id, headers=None):
+    async with ctx.client(m.app) as c:
+        return await c.get(f"/items/{item_id}", headers=headers or {})
+
+
+async def check_route_call(ctx):
+    m = _proxy(ctx)
+    r = await _get(ctx, m, "42")
+    assert r.status_code == 200, f"GET /items/42 answered {r.status_code}: {r.text}"
+    calls = ctx.grpc.calls_to("GetItem")
+    assert len(calls) == 1, f"GET /items/42 made {len(calls)} GetItem calls, expected exactly one"
+    assert calls[0].request.id == "42", f"GetItem was called with id {calls[0].request.id!r}, expected the path id 42"
+    assert r.headers.get("content-type", "").startswith("application/json"), f"the answer must be JSON, got Content-Type {r.headers.get('content-type')!r}"
+    body = r.json()
+    assert body == {"id": "42", "name": "Kettle", "price_cents": 3499}, f"GET /items/42 answered {body}, expected the item as id, name, price_cents"
+
+
+async def check_deadline(ctx):
+    m = _proxy(ctx)
+    r = await _get(ctx, m, "42")
+    assert r.status_code == 200, f"GET /items/42 answered {r.status_code}: {r.text}"
+    call = ctx.grpc.calls_to("GetItem")[-1]
+    assert call.timeout is not None, "the GetItem call carries no deadline: a stalled catalog would hold the gateway open forever"
+    assert 1.5 <= call.timeout <= 2.5, f"the deadline must be about 2 s, got {call.timeout} s"
+    ctx.grpc.set_latency("GetItem", 5.0)
+    slow = await _get(ctx, m, "42")
+    assert slow.status_code == 504, f"a catalog slower than the deadline answered {slow.status_code}, expected 504 (DEADLINE_EXCEEDED)"
+    assert len(ctx.grpc.calls_to("GetItem")) == 2, "a timed-out call must not be retried: the client decides"
+
+
+async def check_request_id(ctx):
+    m = _proxy(ctx)
+    r = await _get(ctx, m, "42", {"X-Request-Id": "r-9"})
+    assert r.status_code == 200, f"GET /items/42 answered {r.status_code}: {r.text}"
+    metadata = [(str(k), v) for k, v in ctx.grpc.calls_to("GetItem")[-1].metadata]
+    keys = [k for k, _ in metadata]
+    assert "x-request-id" in keys, f"the GetItem call carried metadata {metadata}, expected ('x-request-id', 'r-9') (metadata keys are lowercase on the wire)"
+    assert dict(metadata)["x-request-id"] == "r-9", f"x-request-id metadata is {dict(metadata)['x-request-id']!r}, expected the incoming X-Request-Id r-9"
+    plain = await _get(ctx, m, "42")
+    assert plain.status_code == 200, f"a request without X-Request-Id answered {plain.status_code}, expected 200"
+
+
+async def check_status_map(ctx):
+    m = _proxy(ctx)
+    r = await _get(ctx, m, "ghost")
+    assert r.status_code == 404, f"NOT_FOUND from the catalog answered {r.status_code}, expected 404"
+    r = await _get(ctx, m, "bad")
+    assert r.status_code == 400, f"INVALID_ARGUMENT from the catalog answered {r.status_code}, expected 400"
+    ctx.grpc.fail("GetItem", grpc.StatusCode.UNAVAILABLE, "catalog restarting", times=1)
+    r = await _get(ctx, m, "42")
+    assert r.status_code == 503, f"UNAVAILABLE from the catalog answered {r.status_code}, expected 503"
+    ctx.grpc.set_latency("GetItem", 5.0)
+    r = await _get(ctx, m, "42")
+    assert r.status_code == 504, f"DEADLINE_EXCEEDED answered {r.status_code}, expected 504"
+    assert len(ctx.grpc.calls_to("GetItem")) == 4, f"the four failing requests made {len(ctx.grpc.calls_to('GetItem'))} GetItem calls: the gateway must not retry on the client's behalf"
+
+
+async def check_fallback_502(ctx):
+    m = _proxy(ctx)
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.UNKNOWN):
+        ctx.grpc.fail("GetItem", code, "upstream broke", times=1)
+        r = await _get(ctx, m, "42")
+        assert r.status_code == 502, f"{code.name} from the catalog answered {r.status_code}, expected 502 Bad Gateway"
+    ok = await _get(ctx, m, "42")
+    assert ok.status_code == 200, f"after the failures a healthy catalog must answer 200, got {ok.status_code}"
+`,
+  },
   debrief: `The proxy is a translation layer and nothing more: it turns a path into a request message, a header into metadata, and a status code into another status code. The deadline is what makes it safe to sit in front of a service you do not control, and the 502 default is what keeps upstream internals from leaking to clients. Real gateways generate this code from the proto (grpc-gateway, Envoy's gRPC-JSON transcoder), propagate the *caller's* remaining deadline instead of a fixed 2 s, and copy a whole allow-list of headers (trace context, tenant) into metadata.`,
 };

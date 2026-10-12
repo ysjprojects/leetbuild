@@ -771,5 +771,151 @@ void run() {
 `,
     },
   },
+  harness: {
+    python: `import json
+
+import grpc
+
+import warehouse_pb2
+import warehouse_pb2_grpc
+
+NO_STOCK_SKU = "phantom-9"
+
+
+class FakeWarehouse(warehouse_pb2_grpc.WarehouseServicer):
+    def __init__(self):
+        self.allocated = []
+
+    def Allocate(self, request, context):
+        if request.sku == NO_STOCK_SKU:
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, "no physical stock")
+        self.allocated.append((request.order_id, request.sku, request.qty))
+        return warehouse_pb2.AllocateReply(shipment_id="ship-" + request.order_id)
+
+
+def _order(order_id, sku="shoe-42", qty=2):
+    return {"order_id": order_id, "sku": sku, "qty": qty, "user": "ada"}
+
+
+def _seed(ctx, *orders):
+    for order in orders:
+        ctx.kafka.seed("orders", key=order["sku"], value=json.dumps(order))
+
+
+def _consumer(ctx, *orders):
+    _seed(ctx, *orders)
+    peer = FakeWarehouse()
+    ctx.grpc.serve(warehouse_pb2_grpc.add_WarehouseServicer_to_server, peer)
+    m = ctx.load("fulfilment_consumer")
+    log = []
+    m.confirm = lambda order_id: log.append(("confirm", order_id))
+    m.release = lambda order_id: log.append(("release", order_id))
+    m.publish_failed = lambda order: log.append(("failed", dict(order)))
+    return m, peer, log
+
+
+def _calls(log, kind):
+    return [e[1] for e in log if e[0] == kind]
+
+
+def check_group_manual_commit(ctx):
+    m, peer, log = _consumer(ctx, _order("o1"))
+    subscriptions = [e for e in ctx.kafka.events if e[0] == "subscribe"]
+    assert subscriptions, "the consumer must subscribe to a topic"
+    group, topics = subscriptions[-1][1], subscriptions[-1][2]
+    assert group == "fulfilment", f"group.id must be fulfilment, got {group!r}"
+    assert "orders" in topics, f"the consumer must subscribe to orders, got {topics}"
+    assert ctx.kafka.consumers[-1].auto_commit is False, "enable.auto.commit is on: offsets would be committed on a timer, before the outcome is handled"
+    ctx.drain(m.run)
+    assert not any(e[0] == "auto-commit" for e in ctx.kafka.events), "offsets were auto-committed"
+    assert any(e[0] == "manual-commit" for e in ctx.kafka.events), "the consumer never committed an offset itself"
+    assert ctx.kafka.lag("fulfilment", "orders") == 0, "the handled record must be committed"
+
+
+def check_deadline(ctx):
+    m, peer, log = _consumer(ctx, _order("o1"))
+    ctx.drain(m.run)
+    calls = ctx.grpc.calls_to("Allocate")
+    assert calls, "no Allocate RPC reached the warehouse"
+    assert calls[-1].timeout is not None, "the Allocate RPC carries no deadline: a hung warehouse would stall the partition forever"
+    assert 4.0 < calls[-1].timeout <= 5.0, f"the deadline is {calls[-1].timeout} s, expected 5 s"
+    ctx.grpc.set_latency("Allocate", 30.0)
+    before = len(calls)
+    try:
+        m.allocate(_order("o2"))
+        raise AssertionError("a warehouse slower than the deadline must raise DEADLINE_EXCEEDED, not return")
+    except grpc.RpcError as e:
+        assert e.code() == grpc.StatusCode.DEADLINE_EXCEEDED, f"a slow warehouse raised {e.code()}, expected DEADLINE_EXCEEDED"
+    assert len(ctx.grpc.calls_to("Allocate")) == before + 1, "DEADLINE_EXCEEDED must not be retried"
+
+
+def check_backoff_bounded(ctx):
+    m, peer, log = _consumer(ctx)
+    ctx.grpc.fail("Allocate", grpc.StatusCode.UNAVAILABLE, times=2)
+    waited = ctx.clock.offset
+    assert m.allocate(_order("o1")) is True, "two UNAVAILABLE answers followed by success must end as allocated (True)"
+    assert len(ctx.grpc.calls_to("Allocate")) == 3, f"made {len(ctx.grpc.calls_to('Allocate'))} calls, expected 3 (two UNAVAILABLE, then success)"
+    assert ctx.clock.sleeps == 2, f"slept {ctx.clock.sleeps} times before the retries, expected 2 (never before the first call)"
+    waited = ctx.clock.offset - waited
+    assert 0.74 <= waited <= 0.76, f"waited {waited:.3f} s across two retries, expected 0.25 + 0.5 = 0.75 s (base x 2^(attempt-1))"
+    assert peer.allocated == [("o1", "shoe-42", 2)], f"the warehouse saw {peer.allocated}, expected the order's id, sku and qty"
+
+    ctx.grpc.fail("Allocate", grpc.StatusCode.INVALID_ARGUMENT, "qty", times=1)
+    try:
+        m.allocate(_order("o2"))
+        raise AssertionError("INVALID_ARGUMENT must propagate, not be retried or swallowed")
+    except grpc.RpcError as e:
+        assert e.code() == grpc.StatusCode.INVALID_ARGUMENT, f"got {e.code()}, expected INVALID_ARGUMENT to propagate unchanged"
+    assert len(ctx.grpc.calls_to("Allocate")) == 4, "INVALID_ARGUMENT must not be retried"
+
+    ctx.grpc.fail("Allocate", grpc.StatusCode.UNAVAILABLE, times=50)
+    waited = ctx.clock.offset
+    try:
+        m.allocate(_order("o3"))
+        raise AssertionError("a warehouse that stays UNAVAILABLE must raise after MAX_ATTEMPTS, not return")
+    except AssertionError:
+        raise
+    except Exception:
+        pass
+    attempts = len(ctx.grpc.calls_to("Allocate")) - 4
+    assert attempts == 4, f"made {attempts} attempts against a down warehouse, expected 4 in total"
+    waited = ctx.clock.offset - waited
+    assert 1.74 <= waited <= 1.76, f"waited {waited:.3f} s across three retries, expected 0.25 + 0.5 + 1.0 = 1.75 s"
+
+
+def check_no_stock(ctx):
+    ghost = _order("o2", sku=NO_STOCK_SKU)
+    m, peer, log = _consumer(ctx, _order("o1"), ghost)
+    ctx.drain(m.run)
+    assert _calls(log, "release") == ["o2"], f"release calls were {_calls(log, 'release')}, expected exactly ['o2'] (the order without physical stock)"
+    assert _calls(log, "failed") == [ghost], f"publish_failed calls were {_calls(log, 'failed')}, expected the whole order o2"
+    assert _calls(log, "confirm") == ["o1"], f"confirm calls were {_calls(log, 'confirm')}, expected ['o1'] only"
+    assert len(ctx.grpc.calls_to("Allocate")) == 2, "FAILED_PRECONDITION is final: it must not be retried"
+    assert ctx.kafka.lag("fulfilment", "orders") == 0, "a no-stock order is handled (released and dead-lettered) and must be committed"
+
+
+def check_commit_after(ctx):
+    m, peer, log = _consumer(ctx, _order("o1"))
+    at_commit = []
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append(list(log)))
+    ctx.drain(m.run)
+    assert _calls(log, "confirm") == ["o1"], f"a successful allocation must confirm the sale: confirm calls were {_calls(log, 'confirm')}"
+    assert at_commit, "the offset was never committed"
+    assert ("confirm", "o1") in at_commit[0], "the commit came before confirm(o1): a crash in between would lose the sale"
+    assert ctx.kafka.lag("fulfilment", "orders") == 0, "the handled record must be committed"
+
+    ctx.grpc.fail("Allocate", grpc.StatusCode.INTERNAL, "warehouse bug", times=1)
+    _seed(ctx, _order("o2"))
+    try:
+        ctx.drain(m.run)
+        raise AssertionError("an unexpected status must propagate out of the loop, not be swallowed")
+    except AssertionError:
+        raise
+    except Exception:
+        pass
+    assert ctx.kafka.lag("fulfilment", "orders") == 1, "a record whose outcome is unknown must stay uncommitted so it is redelivered after a restart"
+    assert "o2" not in _calls(log, "confirm") and "o2" not in _calls(log, "release"), "an unexpected status must neither confirm nor release the hold"
+`,
+  },
   debrief: `The consumer is a state machine per record: allocate → (sale | no stock) → commit, and the commit is last so a crash anywhere before it replays the record instead of losing it. The gRPC side does what every good client does — a deadline on each call, backoff only for the one status that means "try later", a hard cap on attempts — and the order id in the request is what makes that replay safe on the warehouse side. Real fulfilment services process partitions with a small worker pool per partition, pause the partition (not the whole consumer) while a warehouse is down, and put the Redis \`confirm\` behind the warehouse's own transactional record so the two never disagree.`,
 };

@@ -370,5 +370,71 @@ int main() {
 `,
     },
   },
+  harness: {
+    python: `BOOK = {"bid": "10.05", "ask": "10.06", "last": "10.05"}
+
+
+def _endpoint(ctx):
+    """The module with its fixed client r instrumented: every Redis command issued is recorded."""
+    m = ctx.load("book_endpoint")
+    commands = []
+    real_execute_command = m.r.execute_command
+
+    def execute_command(*args, **kwargs):
+        commands.append(str(args[0]).upper())
+        return real_execute_command(*args, **kwargs)
+
+    m.r.execute_command = execute_command
+    return m, commands
+
+
+async def check_validate(ctx):
+    m, commands = _endpoint(ctx)
+    ctx.redis.hset("book:ACME", mapping=BOOK)
+    async with ctx.client(m.app) as c:
+        for symbol in ("acme", "ACME1", "TOOLONGX", "AC-ME"):
+            r = await c.get("/book/" + symbol)
+            assert r.status_code == 400, f"GET /book/{symbol} answered {r.status_code}, expected 400"
+        assert commands == [], f"an invalid symbol must be rejected before any Redis call, but {commands} were issued"
+        r = await c.get("/book/ACME")
+        assert r.status_code == 200, f"GET /book/ACME answered {r.status_code}, expected 200"
+
+
+async def check_hash(ctx):
+    m, commands = _endpoint(ctx)
+    ctx.redis.hset("book:ACME", mapping=BOOK)
+    ctx.redis.hset("book:BETA", mapping={"bid": "1", "ask": "2", "last": "1.5"})
+    async with ctx.client(m.app) as c:
+        r = await c.get("/book/ACME")
+        assert r.status_code == 200, f"GET /book/ACME answered {r.status_code}, expected 200"
+        body = r.json()
+        assert body.get("symbol") == "ACME", f"the body must name the symbol, got {body}"
+        got = {k: float(body.get(k, -1)) for k in ("bid", "ask", "last")}
+        assert got == {"bid": 10.05, "ask": 10.06, "last": 10.05}, f"the body must carry bid/ask/last from book:ACME, got {body}"
+        assert "HGETALL" in commands, f"the top of book must be read with HGETALL book:ACME; Redis commands issued: {commands}"
+        r = await c.get("/book/BETA")
+        assert r.status_code == 200 and float(r.json().get("last", -1)) == 1.5, f"GET /book/BETA must read book:BETA, got {r.status_code} {r.text}"
+
+
+async def check_not_found(ctx):
+    m, _ = _endpoint(ctx)
+    async with ctx.client(m.app) as c:
+        r = await c.get("/book/GHOST")
+        assert r.status_code == 404, f"GET /book/GHOST with no hash answered {r.status_code}, expected 404"
+        ctx.redis.hset("book:GHOST", mapping=BOOK)
+        r = await c.get("/book/GHOST")
+        assert r.status_code == 200, f"once book:GHOST exists the endpoint answered {r.status_code}, expected 200"
+
+
+async def check_no_store(ctx):
+    m, _ = _endpoint(ctx)
+    ctx.redis.hset("book:ACME", mapping=BOOK)
+    async with ctx.client(m.app) as c:
+        r = await c.get("/book/ACME")
+    assert r.status_code == 200, f"GET /book/ACME answered {r.status_code}, expected 200"
+    cache_control = r.headers.get("cache-control", "")
+    assert "no-store" in cache_control.lower(), f"the 200 carries Cache-Control {cache_control!r}, expected no-store"
+`,
+  },
   debrief: `The same three-exit shape as the first HTTPS step — validate, look up, represent — with the cache policy flipped: \`no-store\` because the resource's truth has a lifetime of one trade. Validating the path segment before the Redis call is not pedantry; it is what keeps \`GET /book/../../admin\`-style input from ever reaching a key. Real market-data APIs add \`ETag\`s made from the tick sequence number (so a poll can be cheap when nothing changed), rate limits per API key, and serve depth (the full ladder) from a snapshot log rather than one hash.`,
 };

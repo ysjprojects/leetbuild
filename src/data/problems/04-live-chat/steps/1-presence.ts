@@ -440,5 +440,74 @@ std::map<std::string, std::string> online_members(const std::string& room) {
 `,
     },
   },
+  harness: {
+    python: `def check_ttl(ctx):
+    m = ctx.load("presence")
+    m.heartbeat("ana", "srv-a")
+    assert ctx.redis.get("presence:ana") == "srv-a", f"presence:ana is {ctx.redis.get('presence:ana')!r}, expected 'srv-a'"
+    ttl = ctx.redis.ttl("presence:ana")
+    assert 25 <= ttl <= 30, f"presence:ana has TTL {ttl}, expected 30 s"
+    ctx.clock.advance(20)
+    m.heartbeat("ana", "srv-a")
+    ttl = ctx.redis.ttl("presence:ana")
+    assert 25 <= ttl <= 30, f"a heartbeat must restart the 30 s lease; TTL after the second beat is {ttl}"
+    ctx.clock.advance(31)
+    assert ctx.redis.get("presence:ana") is None, "a user who stopped heartbeating must vanish after 30 s"
+
+
+def check_membership(ctx):
+    m = ctx.load("presence")
+    m.join_room("room-7", "ana")
+    m.join_room("room-7", "bo")
+    m.join_room("room-7", "ana")
+    members = ctx.redis.smembers("room:room-7:members")
+    assert members == {"ana", "bo"}, f"room:room-7:members is {sorted(members)}, expected ['ana', 'bo'] (a set: joining twice adds once)"
+    m.leave("room-7", "ana")
+    members = ctx.redis.smembers("room:room-7:members")
+    assert members == {"bo"}, f"after ana leaves, room:room-7:members is {sorted(members)}, expected ['bo']"
+
+
+def check_leave_clears(ctx):
+    m = ctx.load("presence")
+    m.join_room("room-7", "ana")
+    m.heartbeat("ana", "srv-a")
+    m.leave("room-7", "ana")
+    assert ctx.redis.get("presence:ana") is None, "an explicit leave must DEL presence:{user} instead of waiting for the TTL"
+    assert not ctx.redis.sismember("room:room-7:members", "ana"), "leave must SREM the user from the room set"
+
+
+def check_batched(ctx):
+    m = ctx.load("presence")
+    assert m.online_members("empty-room") == {}, "a room with no members has nobody online"
+    for user in ("ana", "bo", "cy"):
+        m.join_room("room-7", user)
+    m.heartbeat("ana", "srv-a")
+    m.heartbeat("cy", "srv-b")
+    m.heartbeat("dee", "srv-b")  # alive but not a member of room-7
+    online = m.online_members("room-7")
+    assert online == {"ana": "srv-a", "cy": "srv-b"}, f"online_members('room-7') is {online!r}, expected {{'ana': 'srv-a', 'cy': 'srv-b'}} (bo never heartbeat)"
+    ctx.clock.advance(31)
+    m.heartbeat("ana", "srv-a")
+    online = m.online_members("room-7")
+    assert online == {"ana": "srv-a"}, f"after cy's lease expired online_members('room-7') is {online!r}, expected {{'ana': 'srv-a'}}"
+    # Round trips: one SMEMBERS plus one MGET (or one pipeline), never a GET per member. Every client
+    # in the runtime shares ctx.redis's class, so patching it sees whatever client the learner uses.
+    calls = []
+    cls = ctx.redis.__class__
+    real = cls.execute_command
+
+    def counting(self, *args, **kw):
+        calls.append(str(args[0]).upper())
+        return real(self, *args, **kw)
+
+    cls.execute_command = counting
+    try:
+        m.online_members("room-7")
+    finally:
+        cls.execute_command = real
+    assert "GET" not in calls, f"online_members issued {calls}: resolve every presence key in one MGET or one pipeline, not a GET per member"
+    assert "MGET" in calls or len(calls) <= 2, f"online_members issued {calls}: expected SMEMBERS then one MGET (or one pipeline)"
+`,
+  },
   debrief: `Presence is the canonical use of a TTL as a *liveness lease*: the client renews it, and the absence of renewals is the failure signal — no health checker, no reaper job. Membership stays in a separate set because it outlives the connection. The MGET is the part that scales: one round trip per room view instead of one per member. Real systems shard presence by user, publish transitions (online → offline) instead of polling, and keep a "last seen" timestamp next to the lease so the UI can say "5 minutes ago".`,
 };

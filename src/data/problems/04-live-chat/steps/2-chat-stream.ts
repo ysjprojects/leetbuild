@@ -143,7 +143,8 @@ async def serve() -> None:
     await server.wait_for_termination()
 
 
-asyncio.run(serve())
+if __name__ == "__main__":
+    asyncio.run(serve())
 `,
       solution: `import asyncio
 import time
@@ -190,7 +191,8 @@ async def serve() -> None:
     await server.wait_for_termination()
 
 
-asyncio.run(serve())
+if __name__ == "__main__":
+    asyncio.run(serve())
 `,
     },
     go: {
@@ -489,6 +491,119 @@ int main() {
 }
 `,
     },
+  },
+  harness: {
+    python: `import asyncio
+import sys
+import time
+
+import grpc
+
+import chat_pb2
+import chat_pb2_grpc
+
+
+def _join(room, user):
+    return chat_pb2.ClientMsg(join=chat_pb2.Join(room=room, user=user))
+
+
+def _say(text):
+    return chat_pb2.ClientMsg(say=chat_pb2.Say(text=text))
+
+
+def _server_msg(user, text, ts=1):
+    return chat_pb2.ServerMsg(room="room-7", user=user, text=text, ts=ts)
+
+
+async def _settle():
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+async def _start(ctx):
+    """The learner's server as a task, a stub on it, the subscription table it shares, and what it published."""
+    m = ctx.load("chat_service")
+    published = []
+    m.publish = lambda room, msg: published.append((room, msg))  # the room bus is step 3's
+    asyncio.create_task(m.serve())
+    await asyncio.sleep(0)
+    assert ctx.grpc.find("/chat.Chat/Chat") is not None, "serve() registered no Chat handler"
+    stub = chat_pb2_grpc.ChatStub(grpc.aio.insecure_channel("chat-server:9000"))
+    return m, stub, sys.modules["subscriptions"], published
+
+
+async def _joined(ctx, room="room-7", user="ana"):
+    m, stub, subs, published = await _start(ctx)
+    call = stub.Chat()
+    await call.write(_join(room, user))
+    await _settle()
+    return call, subs, published
+
+
+async def check_join_first(ctx):
+    m, stub, subs, published = await _start(ctx)
+    call = stub.Chat()
+    await call.write(_say("hi"))
+    try:
+        await call.read()
+        raise AssertionError("a stream whose first message is a say must end with INVALID_ARGUMENT, but it did not fail")
+    except grpc.RpcError as e:
+        assert e.code() in (grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.FAILED_PRECONDITION), f"a say before any join ended the call with {e.code()}, expected INVALID_ARGUMENT"
+    assert subs.subscribers("room-7") == 0, "a rejected first message must not leave a subscription behind"
+    assert published == [], f"a rejected first message must not be published, got {published}"
+    call = stub.Chat()
+    await call.write(_join("room-7", "ana"))
+    await _settle()
+    assert not call.done(), f"a stream that starts with a join must stay open, but it ended with {await call.code()}"
+
+
+async def check_say_publishes(ctx):
+    call, subs, published = await _joined(ctx)
+    await call.write(_say("hi"))
+    await call.write(_say("anyone here?"))
+    await _settle()
+    assert len(published) == 2, f"two says must publish exactly two messages, got {len(published)}: {published}"
+    for (room, msg), text in zip(published, ("hi", "anyone here?")):
+        assert room == "room-7", f"published to room {room!r}, expected 'room-7'"
+        assert isinstance(msg, chat_pb2.ServerMsg), f"publish must receive a ServerMsg, got {type(msg).__name__}"
+        assert (msg.room, msg.user, msg.text) == ("room-7", "ana", text), f"published ServerMsg is {msg!r}, expected room='room-7' user='ana' text={text!r}"
+        assert abs(msg.ts - int(time.time() * 1000)) < 60000, f"ServerMsg.ts is {msg.ts}, expected the current time in milliseconds"
+    # Nothing is written back directly: the first thing this client reads is what the bus delivers.
+    subs.local_deliver("room-7", _server_msg("bo", "hello ana"))
+    got = await asyncio.wait_for(call.read(), 1.0)
+    assert (got.user, got.text) == ("bo", "hello ana"), f"the client received {got!r} before anything came from the bus: a say reaches its sender through publish, never through a direct write"
+
+
+async def check_subscribe_forward(ctx):
+    call, subs, published = await _joined(ctx)
+    n = subs.subscribers("room-7")
+    assert n == 1, f"after the join, room-7 has {n} subscription(s) on this instance, expected 1 (subscribe(room))"
+    subs.local_deliver("room-7", _server_msg("bo", "hello ana", ts=1))
+    subs.local_deliver("room-7", _server_msg("cy", "hi both", ts=2))
+    first = await asyncio.wait_for(call.read(), 1.0)
+    second = await asyncio.wait_for(call.read(), 1.0)
+    assert (first.user, first.text) == ("bo", "hello ana"), f"first forwarded message is {first!r}, expected bo: 'hello ana'"
+    assert (second.user, second.text) == ("cy", "hi both"), f"second forwarded message is {second!r}, expected cy: 'hi both' (forward in order)"
+    assert published == [], "forwarding bus messages must not publish them again"
+
+
+async def check_cancel_cleanup(ctx):
+    call, subs, published = await _joined(ctx)
+    assert subs.subscribers("room-7") == 1, f"after the join, room-7 has {subs.subscribers('room-7')} subscription(s), expected 1"
+    call.cancel()
+    await _settle()
+    n = subs.subscribers("room-7")
+    assert n == 0, f"the client hung up but room-7 still has {n} subscription(s) on this instance: unsubscribe from the call's done callback"
+    # A client that closes its side normally must be cleaned up the same way.
+    m, stub, subs, published = await _start(ctx)
+    call = stub.Chat()
+    await call.write(_join("room-7", "bo"))
+    await _settle()
+    await call.done_writing()
+    await _settle()
+    n = subs.subscribers("room-7")
+    assert n == 0, f"the client finished its stream but room-7 still has {n} subscription(s): the done callback runs however the call ends"
+`,
   },
   debrief: `A bidi stream is two independent half-duplex streams over one HTTP/2 stream, which is why the handler splits into a reader and a writer. The join-first rule turns a stateless RPC into a session with a validated first message, and the cancellation hook is what makes long-lived calls safe: every resource acquired for the call is released by the call's end, whatever caused it. Real chat gateways add flow control (drop or coalesce when a slow client cannot keep up), keep-alive pings, and resume tokens so a reconnecting client asks for "everything since sequence N" instead of rejoining blind.`,
 };

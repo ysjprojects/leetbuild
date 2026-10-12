@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package chat;
+
+// One bidirectional stream per client (step 2): the first ClientMsg must be a join, every later
+// one a say; the server streams back what the room says.
+service Chat {
+  rpc Chat(stream ClientMsg) returns (stream ServerMsg);
+}
+
+message Join {
+  string room = 1;
+  string user = 2;
+}
+
+message Say {
+  string text = 1;
+}
+
+message ClientMsg {
+  oneof kind {
+    Join join = 1;
+    Say say = 2;
+  }
+}
+
+message ServerMsg {
+  string room = 1;
+  string user = 2;
+  string text = 3;
+  int64 ts = 4;
+}

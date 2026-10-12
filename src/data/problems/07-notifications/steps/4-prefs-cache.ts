@@ -511,5 +511,76 @@ int main() {
 `,
     },
   },
+  harness: {
+    python: `import json
+
+ROW = {"push": True, "quiet_start": 22, "quiet_end": 7}
+
+
+def _prefs(ctx):
+    m = ctx.load("preferences")
+    m.db.rows["u42"] = dict(ROW)
+    return m
+
+
+def _loads(m):
+    return [c for c in m.db.calls if c[0] == "load"]
+
+
+def check_key(ctx):
+    m = _prefs(ctx)
+    assert m.get_prefs("u42") == ROW, f"get_prefs must return the database row {ROW}, got {m.get_prefs('u42')}"
+    cached = ctx.redis.get("prefs:u42")
+    assert cached is not None, f"the row must be cached under prefs:u42, keys are {ctx.redis.keys('*')}"
+    assert json.loads(cached) == ROW, f"prefs:u42 must hold the row as JSON, got {cached!r}"
+
+
+def check_read_first(ctx):
+    m = _prefs(ctx)
+    stale = dict(ROW, push=False)
+    ctx.redis.set("prefs:u42", json.dumps(stale))
+    assert m.get_prefs("u42") == stale, "a cached entry must be returned as is, without consulting the database"
+    assert _loads(m) == [], f"the cache held prefs:u42, yet load_prefs was called: {m.db.calls}"
+    assert m.get_prefs("u7") == m.db.DEFAULT_PREFS, "a miss must load the row from the database"
+    assert _loads(m) == [("load", "u7")], f"expected one load for u7, calls were {m.db.calls}"
+    m.get_prefs("u7")
+    assert len(_loads(m)) == 1, "the second read of u7 must hit the cache, not the database"
+
+
+def check_ttl(ctx):
+    m = _prefs(ctx)
+    m.get_prefs("u42")
+    ttl = ctx.redis.ttl("prefs:u42")
+    assert 540 <= ttl <= 600, f"prefs:u42 must expire after 600 s, TTL is {ttl}"
+    ctx.clock.advance(601)
+    assert ctx.redis.get("prefs:u42") is None, "the cached entry must be gone after 600 s"
+    m.get_prefs("u42")
+    assert len(_loads(m)) == 2, "after the entry expired the next read must reload from the database"
+
+
+async def check_invalidate(ctx):
+    m = _prefs(ctx)
+    m.get_prefs("u42")
+    assert ctx.redis.exists("prefs:u42"), "warm the cache first"
+    cache_at_save = []
+    save_prefs = m.db.save_prefs
+
+    def recording_save(user_id, prefs):
+        cache_at_save.append(ctx.redis.exists("prefs:u42"))
+        save_prefs(user_id, prefs)
+
+    m.db.save_prefs = recording_save
+    new = {"push": False, "quiet_start": 23, "quiet_end": 8}
+    async with ctx.client(m.app) as c:
+        r = await c.put("/users/u42/preferences", json=new)
+    assert r.status_code in (200, 204), f"PUT answered {r.status_code}, expected 204 (or 200)"
+    assert m.db.rows.get("u42") == new, f"the database must hold the new preferences, it holds {m.db.rows.get('u42')}"
+    assert cache_at_save == [1], "save_prefs must run before the DEL: the cache entry was already gone when the database was written"
+    assert not ctx.redis.exists("prefs:u42"), f"PUT must delete prefs:u42, it holds {ctx.redis.get('prefs:u42')!r} (invalidate, never SET)"
+    loads = len(_loads(m))
+    assert m.get_prefs("u42") == new, "the next read must see the new preferences"
+    assert len(_loads(m)) == loads + 1, "the read after the PUT must reload from the database"
+`,
+  },
   debrief: `Cache-aside on the read path and invalidate-on-write is the pairing that survives concurrency: readers refill from the source of truth, writers only ever remove, and the TTL bounds how long a missed invalidation can hurt. Updating the cache in place looks faster and is the classic source of "my setting reverted ten minutes later" bugs. Real systems add a short negative entry for users with no row, version the document so an old refill cannot overwrite a newer one, and fan the DEL out to every region's cache.`,
 };

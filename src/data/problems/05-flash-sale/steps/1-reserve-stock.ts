@@ -406,5 +406,95 @@ bool reserve(const std::string& sku, const std::string& order_id, int qty) {
 `,
     },
   },
+  harness: {
+    python: `import time
+
+SKU = "shoe-42"
+STOCK = "stock:shoe-42"
+
+
+def _reservations(ctx, stock):
+    ctx.redis.set(STOCK, stock)
+    return ctx.load("reservations")
+
+
+def check_idempotent_retry(ctx):
+    m = _reservations(ctx, 3)
+    assert m.reserve(SKU, "o1", 2), "3 in stock must cover an order of 2: expected True"
+    assert ctx.redis.get(STOCK) == "1", f"stock after reserving 2 of 3 is {ctx.redis.get(STOCK)!r}, expected 1"
+    assert m.reserve(SKU, "o1", 2), "a retried order whose hold exists must return True"
+    assert ctx.redis.get(STOCK) == "1", f"the retry decremented stock again: {ctx.redis.get(STOCK)!r}, expected still 1"
+    assert ctx.redis.zcard("holds") == 1, f"holds has {ctx.redis.zcard('holds')} members after a retry, expected 1"
+    assert ctx.redis.get("hold:o1") == "o1:shoe-42:2", "the retry must leave the existing hold in place"
+
+
+def check_check_then_decrement(ctx):
+    m = _reservations(ctx, 3)
+    assert m.reserve(SKU, "o1", 2), "3 in stock must cover an order of 2: expected True"
+    assert ctx.redis.get(STOCK) == "1", f"stock is {ctx.redis.get(STOCK)!r} after reserving 2 of 3, expected 1"
+    assert not m.reserve(SKU, "o2", 2), "1 left cannot cover an order of 2: expected False (sold out)"
+    assert ctx.redis.get(STOCK) == "1", f"a refused reservation changed stock to {ctx.redis.get(STOCK)!r}; it must stay 1"
+    assert ctx.redis.exists("hold:o2") == 0, "a refused reservation must not write hold:o2"
+    assert m.reserve(SKU, "o3", 1), "1 left must cover an order of 1"
+    assert ctx.redis.get(STOCK) == "0", f"stock is {ctx.redis.get(STOCK)!r}, expected 0"
+    assert not m.reserve(SKU, "o4", 1), "stock 0 must refuse every further order; the counter may never go negative"
+    assert ctx.redis.get(STOCK) == "0", f"stock went to {ctx.redis.get(STOCK)!r}: the script must not decrement below zero"
+    assert not m.reserve("never-stocked", "o5", 1), "a missing stock key counts as 0: expected False"
+
+
+def check_hold_ttl(ctx):
+    m = _reservations(ctx, 5)
+    assert m.reserve(SKU, "o1", 2), "5 in stock must cover an order of 2"
+    assert ctx.redis.get("hold:o1") == "o1:shoe-42:2", f"hold:o1 is {ctx.redis.get('hold:o1')!r}, expected the member o1:shoe-42:2"
+    ttl = ctx.redis.ttl("hold:o1")
+    assert ttl > 0, "hold:o1 has no TTL: a crashed sweeper would leave it forever"
+    assert 1190 <= ttl <= 1200, f"hold:o1 TTL is {ttl} s, expected 2 x HOLD_TTL_S = 1200 s"
+    ctx.clock.advance(1201)
+    assert ctx.redis.get("hold:o1") is None, "hold:o1 must be gone once its TTL has passed"
+
+
+def check_expiry_index(ctx):
+    m = _reservations(ctx, 5)
+    before = int(time.time())
+    assert m.reserve(SKU, "o1", 2), "5 in stock must cover an order of 2"
+    score = ctx.redis.zscore("holds", "o1:shoe-42:2")
+    assert score is not None, f"holds contains {ctx.redis.zrange('holds', 0, -1)}, expected the member o1:shoe-42:2"
+    assert before + 599 <= score <= time.time() + 601, f"the member's score is {score}, expected now + 600 s ({before + 600})"
+    assert not m.reserve(SKU, "o2", 9), "9 of 3 left must be refused"
+    assert ctx.redis.zcard("holds") == 1, "a refused reservation must not be indexed in holds"
+
+
+def check_script_once(ctx):
+    m = _reservations(ctx, 5)
+    client = m.r
+    counts = {"eval": 0, "evalsha": 0, "script_load": 0}
+
+    def forbid(name):
+        def call(*args, **kwargs):
+            raise AssertionError(f"r.{name}() was called from the client: every read and write of stock and holds belongs inside the script")
+
+        return call
+
+    def counting(name):
+        original = getattr(client, name)
+
+        def call(*args, **kwargs):
+            counts[name] += 1
+            return original(*args, **kwargs)
+
+        return call
+
+    for name in ("get", "decrby", "decr", "incrby", "set", "setex", "zadd"):
+        setattr(client, name, forbid(name))
+    for name in counts:
+        setattr(client, name, counting(name))
+    for i in range(3):
+        assert m.reserve(SKU, f"o{i}", 1), f"order o{i} must be reserved"
+    assert counts["eval"] == 0, f"EVAL was sent {counts['eval']} times: register the script once and call it by SHA"
+    assert counts["evalsha"] >= 3, f"expected one EVALSHA per reserve call, saw {counts['evalsha']}"
+    assert counts["script_load"] <= 1, f"the script was uploaded {counts['script_load']} times; once is enough"
+    assert ctx.redis.get(STOCK) == "2", f"stock is {ctx.redis.get(STOCK)!r} after three reservations of 1, expected 2"
+`,
+  },
   debrief: `The whole reservation is one round trip and one atomic unit: check, decrement, hold and expiry entry either all happen or none do, and the \`EXISTS\` guard makes a retry harmless. Real systems shard hot SKUs across several counters to spread one key's write load, cache the script SHA client-side with a \`NOSCRIPT\` fallback, and back the Redis counter with the allocation the warehouse makes in step 4 — Redis says "probably yours", the ledger says "yours".`,
 };

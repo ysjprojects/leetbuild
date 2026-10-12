@@ -564,5 +564,92 @@ int main() {
 `,
     },
   },
+  harness: {
+    python: `HEADERS = {"X-Api-Key": "k-1f9c", "Idempotency-Key": "idem-1"}
+ORDER = {"symbol": "ACME", "side": "BUY", "price": 10.05, "qty": 100, "client_order_id": "c-1"}
+
+
+def _gateway(ctx, fail=False):
+    """The module with publish_order replaced by a recorder (the real one is built in step 2)."""
+    m = ctx.load("order_gateway")
+    published = []
+
+    def publish_order(order):
+        if fail:
+            raise m.PublishFailed("broker did not acknowledge")
+        published.append(order)
+
+    m.publish_order = publish_order
+    return m, published
+
+
+async def check_auth(ctx):
+    m, published = _gateway(ctx)
+    async with ctx.client(m.app) as c:
+        r = await c.post("/orders", json=ORDER, headers={"Idempotency-Key": "idem-1"})
+        assert r.status_code == 401, f"no X-Api-Key answered {r.status_code}, expected 401"
+        r = await c.post("/orders", json=ORDER, headers={"X-Api-Key": "nope", "Idempotency-Key": "idem-1"})
+        assert r.status_code == 401, f"an unknown X-Api-Key answered {r.status_code}, expected 401"
+        r = await c.post("/orders", content=b"not json", headers={"Content-Type": "application/json"})
+        assert r.status_code == 401, f"a request without a key and with a broken body answered {r.status_code}: the key must be checked before the body is read"
+        assert published == [], "rejected requests must not reach publish_order"
+        r = await c.post("/orders", json=ORDER, headers=HEADERS)
+        assert r.status_code != 401, "a known X-Api-Key must be accepted, got 401"
+
+
+async def check_idempotency_key(ctx):
+    m, published = _gateway(ctx)
+    async with ctx.client(m.app) as c:
+        r = await c.post("/orders", json=ORDER, headers={"X-Api-Key": "k-1f9c"})
+        assert r.status_code == 400, f"a request without Idempotency-Key answered {r.status_code}, expected 400"
+        assert published == [], "a request without Idempotency-Key must not be published"
+        r = await c.post("/orders", json=ORDER, headers=HEADERS)
+        assert r.status_code != 400, "a request with Idempotency-Key and a valid body answered 400"
+
+
+async def check_validate(ctx):
+    m, published = _gateway(ctx)
+    bad = [
+        ("side", dict(ORDER, side="HOLD")),
+        ("price 0", dict(ORDER, price=0)),
+        ("negative price", dict(ORDER, price=-1)),
+        ("qty 0", dict(ORDER, qty=0)),
+        ("missing symbol", {k: v for k, v in ORDER.items() if k != "symbol"}),
+        ("missing client_order_id", {k: v for k, v in ORDER.items() if k != "client_order_id"}),
+    ]
+    async with ctx.client(m.app) as c:
+        for label, body in bad:
+            r = await c.post("/orders", json=body, headers=HEADERS)
+            assert r.status_code == 400, f"an order with a bad {label} answered {r.status_code}, expected 400"
+        assert published == [], "invalid orders must never reach publish_order"
+        r = await c.post("/orders", json=ORDER, headers=HEADERS)
+        assert r.status_code != 400, "a valid order (side BUY, price 10.05, qty 100) was rejected with 400"
+        assert len(published) == 1, f"the valid order must reach publish_order; it was called {len(published)} times"
+
+
+async def check_accepted(ctx):
+    m, published = _gateway(ctx)
+    async with ctx.client(m.app) as c:
+        r = await c.post("/orders", json=ORDER, headers=HEADERS)
+    assert r.status_code == 202, f"a valid order answered {r.status_code}, expected 202"
+    body = r.json()
+    assert body.get("status") == "accepted", f"the 202 body must say status accepted, got {body}"
+    assert len(published) == 1, f"publish_order must be called exactly once, was called {len(published)} times"
+    order = published[0]
+    assert isinstance(order, m.Order), f"publish_order must receive an Order, got {type(order).__name__}"
+    assert (order.symbol, order.side, order.price, order.qty, order.client_order_id) == ("ACME", "BUY", 10.05, 100, "c-1"), f"the published Order does not carry the request's fields: {order}"
+    assert order.order_id and body.get("order_id") == order.order_id, f"the 202 must return the published order_id {order.order_id!r}, got {body.get('order_id')!r}"
+    async with ctx.client(m.app) as c:
+        r2 = await c.post("/orders", json=ORDER, headers=HEADERS)
+    assert r2.json().get("order_id") != body["order_id"], "every order needs a fresh order_id"
+
+
+async def check_unavailable(ctx):
+    m, published = _gateway(ctx, fail=True)
+    async with ctx.client(m.app) as c:
+        r = await c.post("/orders", json=ORDER, headers=HEADERS)
+    assert r.status_code == 503, f"PublishFailed answered {r.status_code}, expected 503"
+`,
+  },
   debrief: `The handler is a funnel: cheap rejections first (headers), then the body, then the one expensive call. \`202\` is the honest status for an exchange — the request is durably accepted, the outcome (a fill, a rest on the book) arrives later on another channel — and it only becomes honest because the gateway waits for Kafka before sending it. Real gateways store the \`Idempotency-Key\` and replay the original response for a duplicate, run pre-trade risk checks (position limits, price bands) before accepting, and speak FIX with session sequence numbers that make idempotency a protocol property rather than a header.`,
 };

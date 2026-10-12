@@ -1,2 +1,4 @@
 .next
 node_modules
+src/data/problems/*/proto.ts
+public/py/worker.js

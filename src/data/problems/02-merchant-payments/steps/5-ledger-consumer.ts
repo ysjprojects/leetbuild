@@ -478,5 +478,105 @@ void run() {
 `,
     },
   },
+  harness: {
+    python: `import json
+import sys
+
+
+def _seed(ctx, *event_ids):
+    for event_id in event_ids:
+        event = {"event_id": event_id, "type": "payment.captured", "merchant_id": "m-42", "order_id": "o-" + event_id, "amount_cents": 4999, "currency": "EUR"}
+        ctx.kafka.seed("payments", key="m-42", value=json.dumps(event))
+
+
+def _consumer(ctx):
+    """The learner's module and the payments.ledger instance it imported (posted = the journal)."""
+    m = ctx.load("ledger_consumer")
+    return m, sys.modules["payments.ledger"]
+
+
+def _posted(ledger):
+    return [e["event_id"] for e in ledger.posted]
+
+
+def check_group_manual_commit(ctx):
+    _seed(ctx, "e1")
+    m, ledger = _consumer(ctx)
+    subscriptions = [e for e in ctx.kafka.events if e[0] == "subscribe"]
+    assert subscriptions, "the consumer must subscribe to a topic"
+    group, topics = subscriptions[-1][1], subscriptions[-1][2]
+    assert group == "ledger", f"group.id must be ledger, got {group!r}"
+    assert "payments" in topics, f"the consumer must subscribe to payments, got {topics}"
+    assert ctx.kafka.consumers[-1].auto_commit is False, "enable.auto.commit is on: offsets would be acknowledged on a timer, before the post"
+    ctx.drain(m.run)
+    assert not any(e[0] == "auto-commit" for e in ctx.kafka.events), "offsets were auto-committed"
+    assert any(e[0] == "manual-commit" for e in ctx.kafka.events), "no explicit commit happened"
+    assert ctx.kafka.lag("ledger", "payments") == 0, "every processed record must be committed"
+
+
+def check_dedupe_nx(ctx):
+    ctx.redis.set("applied:e2", "1", ex=600000)  # applied by an earlier run of the ledger
+    _seed(ctx, "e1", "e2")
+    m, ledger = _consumer(ctx)
+    ctx.drain(m.run)
+    assert ctx.redis.exists("applied:e1"), "after posting e1 the claim applied:e1 must exist"
+    ttl = ctx.redis.ttl("applied:e1")
+    assert 604000 <= ttl <= 604800, f"applied:e1 has TTL {ttl}, expected 604800 s (7 days)"
+    assert _posted(ledger) == ["e1"], f"the ledger posted {_posted(ledger)}: e2 was already applied and must be skipped, e1 must be posted once"
+    assert ctx.redis.ttl("applied:e2") <= 600000, "the claim of an already applied event must not be overwritten (SET NX, not SET)"
+
+
+def check_dedupe_before_post(ctx):
+    _seed(ctx, "e1")
+    m, ledger = _consumer(ctx)
+    claimed_at_post = []
+    real_post = ledger.post
+
+    def post(event):
+        claimed_at_post.append(ctx.redis.exists("applied:" + str(event.get("event_id"))))
+        real_post(event)
+
+    ledger.post = post
+    ctx.drain(m.run)
+    assert claimed_at_post, "ledger.post never ran for e1"
+    assert claimed_at_post == [1], "when ledger.post ran, applied:e1 was not yet claimed: SET NX must come before the post"
+
+
+def check_skip_still_commits(ctx):
+    _seed(ctx, "e1", "e2", "e1")  # the relay replayed e1: a duplicate with a new offset
+    m, ledger = _consumer(ctx)
+    ctx.drain(m.run)
+    assert _posted(ledger) == ["e1", "e2"], f"the ledger posted {_posted(ledger)}: each event exactly once, the replayed e1 skipped"
+    lag = ctx.kafka.lag("ledger", "payments")
+    assert lag == 0, f"{lag} record(s) not committed: the skipped duplicate's offset must be committed too, or it is redelivered forever"
+
+
+def check_commit_after_post(ctx):
+    _seed(ctx, "e1")
+    m, ledger = _consumer(ctx)
+    at_commit = []
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append(len(ledger.posted)))
+    ctx.drain(m.run)
+    assert at_commit, "the offset of e1 was never committed"
+    assert at_commit[0] == 1, "the commit must come after ledger.post: at commit time nothing had been posted"
+    _seed(ctx, "e2")
+
+    def failing_post(event):
+        raise RuntimeError("ledger database down")
+
+    ledger.post = failing_post
+    try:
+        ctx.drain(m.run)
+    except RuntimeError:
+        pass
+    assert ctx.redis.get("applied:e2") is None, "when the post fails the claim applied:e2 must be released (DEL), or no retry will ever post it"
+    assert ctx.kafka.lag("ledger", "payments") == 1, "a record whose post failed must not be committed: it has to come back"
+    # restart the consumer: e1 is deduped by its claim, e2 is redelivered and posted this time
+    m2, ledger2 = _consumer(ctx)
+    ctx.drain(m2.run)
+    assert _posted(ledger2) == ["e2"], f"after a restart the ledger posted {_posted(ledger2)}, expected only the retried e2"
+    assert ctx.kafka.lag("ledger", "payments") == 0
+`,
+  },
   debrief: `The consumer owns its delivery guarantee: at-least-once from the broker (commit after the work) plus a claim keyed by the event's own id turns duplicates into no-ops. The claim is in Redis for speed, but notice its weak spot — a crash between the SET and the post leaves a claimed, unposted event until the TTL. Real ledgers close that gap by making the post itself idempotent (a unique index on \`event_id\` in the journal, insert-or-ignore) so the Redis claim is only a fast path, and they commit offsets in batches once the whole poll was applied.`,
 };

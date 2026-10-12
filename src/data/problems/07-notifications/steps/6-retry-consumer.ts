@@ -682,5 +682,139 @@ void run() {
 `,
     },
   },
+  harness: {
+    python: `import json
+
+
+def _seed(ctx, nid, user_id="u1", priority="normal", topic="notifications", attempt=None):
+    value = json.dumps({"id": nid, "user_id": user_id, "channel": "push", "title": "Shipped", "body": "On its way", "priority": priority})
+    headers = [("attempt", str(attempt).encode())] if attempt is not None else None
+    ctx.kafka.seed(topic, key=user_id, value=value, headers=headers)
+    return value.encode()
+
+
+def _worker(ctx):
+    """The worker with the provided pieces faked: rate limit, preferences, quiet hours and the gateway."""
+    m = ctx.load("delivery_worker")
+    m.sent = []  # notification ids send_push delivered
+    m.failures = {}  # notification id -> remaining Retryable failures
+    m.limited = set()  # notification ids the rate limit rejects
+    m.prefs = {}  # user id -> preferences; "quiet_now" marks a user in quiet hours
+    m.gate = []  # (name, args) in call order
+
+    def allowed(user_id, nid):
+        m.gate.append(("allowed", user_id, nid))
+        return nid not in m.limited
+
+    def get_prefs(user_id):
+        m.gate.append(("get_prefs", user_id))
+        return dict(m.prefs.get(user_id, {"push": True}))
+
+    def quiet(prefs, hour):
+        m.gate.append(("quiet", hour))
+        return bool(prefs.get("quiet_now"))
+
+    def send_push(n):
+        if m.failures.get(n["id"], 0) > 0:
+            m.failures[n["id"]] -= 1
+            raise m.Retryable("push gateway: deadline exceeded")
+        m.sent.append(n["id"])
+
+    m.allowed, m.get_prefs, m.quiet, m.send_push = allowed, get_prefs, quiet, send_push
+    return m
+
+
+def _header(record, name):
+    for key, value in record.headers or []:
+        if key == name:
+            return value.decode() if isinstance(value, bytes) else str(value)
+    return None
+
+
+def check_group_topics(ctx):
+    _seed(ctx, "n1")
+    _seed(ctx, "n2", topic="notifications-retry", attempt=1)
+    m = _worker(ctx)
+    subscriptions = [e for e in ctx.kafka.events if e[0] == "subscribe"]
+    assert subscriptions, "the consumer must subscribe to its topics"
+    group, topics = subscriptions[-1][1], subscriptions[-1][2]
+    assert group == "delivery", f"group.id must be delivery, got {group!r}"
+    assert "notifications" in topics and "notifications-retry" in topics, f"the consumer must subscribe to notifications and notifications-retry, got {topics}"
+    ctx.drain(m.run)
+    assert sorted(m.sent) == ["n1", "n2"], f"records from both topics must be delivered, sent {m.sent}"
+
+
+def check_manual_commit(ctx):
+    _seed(ctx, "n1")
+    _seed(ctx, "n2", user_id="u2")
+    m = _worker(ctx)
+    assert ctx.kafka.consumers and not ctx.kafka.consumers[-1].auto_commit, "enable.auto.commit must be False"
+    ctx.drain(m.run)
+    assert not any(e[0] == "auto-commit" for e in ctx.kafka.events), "auto-commit is on: offsets were committed on a timer, before the outcome"
+    assert any(e[0] == "manual-commit" for e in ctx.kafka.events), "no explicit commit happened"
+    assert ctx.kafka.lag("delivery", "notifications") == 0, "every processed record must be committed"
+
+
+def check_gate(ctx):
+    _seed(ctx, "n-ok", user_id="u-ok")
+    _seed(ctx, "n-limited", user_id="u-limited")
+    _seed(ctx, "n-off", user_id="u-off")
+    _seed(ctx, "n-quiet", user_id="u-quiet")
+    _seed(ctx, "n-urgent", user_id="u-quiet", priority="high")
+    m = _worker(ctx)
+    m.limited.add("n-limited")
+    m.prefs["u-off"] = {"push": False}
+    m.prefs["u-quiet"] = {"push": True, "quiet_now": True}
+    ctx.drain(m.run)
+    assert ("allowed", "u-ok", "n-ok") in m.gate, f"allowed(user_id, id) must be consulted for every record, calls were {m.gate}"
+    assert ("get_prefs", "u-ok") in m.gate, f"get_prefs(user_id) must be consulted, calls were {m.gate}"
+    hours = [h for name, *rest in m.gate if name == "quiet" for h in rest]
+    assert hours and all(isinstance(h, int) and 0 <= h <= 23 for h in hours), f"quiet(prefs, hour) must get the current hour (0-23), got {hours}"
+    assert "n-ok" in m.sent, f"an allowed notification with push on outside quiet hours must be sent, sent {m.sent}"
+    assert "n-limited" not in m.sent, "a rate-limited notification must not be sent"
+    assert "n-off" not in m.sent, "a user with push off must not get a notification"
+    assert "n-quiet" not in m.sent, "a normal notification in quiet hours must not be sent"
+    assert "n-urgent" in m.sent, f"a high-priority notification ignores quiet hours, sent {m.sent}"
+    assert ctx.kafka.lag("delivery", "notifications") == 0, "skipped notifications are an outcome too: they must be committed"
+
+
+def check_retry_topic(ctx):
+    original = _seed(ctx, "n1")
+    _seed(ctx, "n2", user_id="u2", topic="notifications-retry", attempt=4)
+    m = _worker(ctx)
+    m.failures = {"n1": 1, "n2": 1}
+    ctx.drain(m.run)
+    retried = ctx.kafka.records("notifications-retry")
+    requeued = [r for r in retried if r.key == b"u1"]
+    assert requeued, f"n1 failed once: it must be re-queued on notifications-retry, found keys {[r.key for r in retried]}"
+    assert len(requeued) == 1, f"n1 failed once, yet it was re-queued {len(requeued)} times"
+    assert requeued[0].value == original, f"the re-queued value must be the original record, got {requeued[0].value!r}"
+    assert _header(requeued[0], "attempt") == "1", f"the re-queued record must carry attempt=1, headers were {requeued[0].headers!r}"
+    assert m.sent.count("n1") == 1, f"the re-queued n1 must be delivered when it comes back, sent {m.sent}"
+    dead = ctx.kafka.records("notifications-dlq")
+    assert len(dead) == 1 and dead[0].key == b"u2", f"n2 failing on attempt 4 must land on notifications-dlq, found {[(r.key, r.headers) for r in dead]}"
+    assert _header(dead[0], "attempt") == "5", f"the dead-lettered record must carry attempt=5, headers were {dead[0].headers!r}"
+    assert len([r for r in retried if r.key == b"u2"]) == 1, "a record on its fifth attempt goes to the DLQ, not back to the retry topic"
+    assert "n2" not in m.sent
+
+
+def check_commit_after(ctx):
+    _seed(ctx, "n1")
+    m = _worker(ctx)
+    m.failures = {"n1": 1}
+    at_commit = []
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append((sorted(t for t, p in offsets), len(ctx.kafka.records("notifications-retry")), ctx.kafka.flushes, list(m.sent))))
+    ctx.drain(m.run)
+    assert at_commit, "the offset was never committed"
+    first = [c for c in at_commit if "notifications" in c[0]]
+    assert first, f"the record on notifications was never committed, commits were {at_commit}"
+    assert first[0][1] == 1, "the commit of the failed record came before its re-queue: at commit time nothing was on notifications-retry"
+    assert first[0][2] >= 1, "commit before the re-queue was acknowledged: flush the producer first"
+    second = [c for c in at_commit if "notifications-retry" in c[0]]
+    assert second, f"the re-queued record on notifications-retry was never committed, commits were {at_commit}"
+    assert second[0][3] == ["n1"], "the commit of the retried record came before send_push delivered it"
+    assert ctx.kafka.lag("delivery", "notifications") == 0 and ctx.kafka.lag("delivery", "notifications-retry") == 0, "every record must end up committed"
+`,
+  },
   debrief: `A retry topic turns "this one failed" into a record like any other: the partition moves on, the failed notification comes back a little later with its attempt count in a header, and after five tries it lands in the DLQ where a human — or a replay tool — can look at it. The commit after the re-queue acknowledgement is what makes the whole thing at-least-once end to end. Real workers run several retry topics with growing delays (\`retry-1m\`, \`retry-10m\`), pause a partition instead of sleeping in it, honour the \`priority\` header with a separate high-priority group, and alert on the DLQ's depth.`,
 };

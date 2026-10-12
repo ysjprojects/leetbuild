@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package exchange;
+
+// Market data: step 5 streams ticks for one symbol — a snapshot first, then every Pub/Sub message.
+service TickService {
+  rpc SubscribeTicks(SubscribeRequest) returns (stream Tick);
+}
+
+message SubscribeRequest {
+  string symbol = 1;
+}
+
+message Tick {
+  string symbol = 1;
+  double bid = 2;
+  double ask = 3;
+  double last = 4;
+}

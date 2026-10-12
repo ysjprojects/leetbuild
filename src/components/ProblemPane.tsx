@@ -196,6 +196,8 @@ const ProblemPane: FC<{
   onDownload: () => void;
   /** Copy the result card to the clipboard; resolves to whether it worked. */
   onShare: () => Promise<boolean>;
+  /** Fold the pane into a strip beside the IDE (`lg` and up). */
+  onCollapse: () => void;
 }> = memo(
   ({
     problem,
@@ -217,6 +219,7 @@ const ProblemPane: FC<{
     onResetProblem,
     onDownload,
     onShare,
+    onCollapse,
   }) => {
     const score = problemScore(problem, attempts);
     const points = STEP_POINTS[problem.difficulty];
@@ -299,6 +302,25 @@ const ProblemPane: FC<{
               ↺ start over
             </button>
           ) : null}
+          <button
+            aria-label="hide the problem pane"
+            className="text-ink-400 hover:text-ink-50 hidden h-6 w-6 items-center justify-center rounded-md transition lg:flex"
+            onClick={onCollapse}
+            title="hide the problem pane"
+            type="button">
+            <svg
+              aria-hidden
+              fill="none"
+              height={13}
+              stroke="currentColor"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={1.8}
+              viewBox="0 0 16 16"
+              width={13}>
+              <path d="M10 3 5 8l5 5" />
+            </svg>
+          </button>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
           <SystemDiagram

@@ -495,5 +495,90 @@ int main() {
 `,
     },
   },
+  harness: {
+    python: `URL = "https://example.com/launch"
+
+
+class FakeStore:
+    """The links table: knows g9Xc, records every lookup."""
+
+    def __init__(self):
+        self.links = {"g9Xc": URL}
+        self.lookups = []
+
+    def lookup(self, code):
+        self.lookups.append(code)
+        return self.links.get(code)
+
+
+def _redirect(ctx):
+    m = ctx.load("redirect")
+    m.store = FakeStore()
+    return m
+
+
+def check_key(ctx):
+    m = _redirect(ctx)
+    assert m.resolve("g9Xc") == URL, "resolve must return the long url the store knows"
+    assert ctx.redis.get("url:g9Xc") == URL, f"after a miss the url must be cached under url:g9Xc, keys are {ctx.redis.keys()}"
+    ctx.redis.set("url:abcd", "https://example.com/cached")
+    assert m.resolve("abcd") == "https://example.com/cached", "a value cached under url:{code} must be returned as the long url"
+
+
+def check_read_first(ctx):
+    m = _redirect(ctx)
+    ctx.redis.set("url:g9Xc", URL)
+    assert m.resolve("g9Xc") == URL
+    assert m.store.lookups == [], f"a cache hit is the whole request: the store was asked for {m.store.lookups}"
+    m.store.links["zz12"] = "https://example.com/z"
+    assert m.resolve("zz12") == "https://example.com/z", "a miss must fall through to the store"
+    assert m.store.lookups == ["zz12"], f"the store must be asked once on a miss, lookups: {m.store.lookups}"
+    assert m.resolve("zz12") == "https://example.com/z"
+    assert m.store.lookups == ["zz12"], "the second resolve must be served from the cache, not the store again"
+
+
+def check_ttl(ctx):
+    m = _redirect(ctx)
+    m.resolve("g9Xc")
+    ttl = ctx.redis.ttl("url:g9Xc")
+    assert ttl > 0, "url:g9Xc was cached without an expiry (TTL -1): the cache would only grow"
+    assert 86000 <= ttl <= 86400, f"url:g9Xc expires in {ttl} s, expected 86400"
+    ctx.clock.advance(86401)
+    assert ctx.redis.get("url:g9Xc") is None
+    assert m.resolve("g9Xc") == URL
+    assert m.store.lookups == ["g9Xc", "g9Xc"], "once the entry has expired the next resolve goes back to the store"
+
+
+async def check_negative(ctx):
+    m = _redirect(ctx)
+    assert m.resolve("ghost") is None, "an unknown code resolves to nothing"
+    assert m.store.lookups == ["ghost"]
+    sentinel = ctx.redis.get("url:ghost")
+    assert sentinel is not None, "an unknown code must be cached as the MISSING sentinel"
+    assert sentinel == m.MISSING, f"url:ghost holds {sentinel!r}, expected the MISSING sentinel"
+    ttl = ctx.redis.ttl("url:ghost")
+    assert 1 <= ttl <= 60, f"the sentinel expires in {ttl} s, expected 60"
+    assert m.resolve("ghost") is None
+    assert m.store.lookups == ["ghost"], "a hit on the sentinel must not touch the store"
+    async with ctx.client(m.app) as c:
+        r = await c.get("/ghost")
+    assert r.status_code == 404, f"GET /ghost answered {r.status_code}, expected 404"
+    assert m.store.lookups == ["ghost"], "the 404 is answered from the sentinel, not from a store lookup"
+    ctx.clock.advance(61)
+    assert m.resolve("ghost") is None
+    assert m.store.lookups == ["ghost", "ghost"], "after 60 s the sentinel is gone and the store is asked again"
+
+
+async def check_redirect(ctx):
+    m = _redirect(ctx)
+    async with ctx.client(m.app) as c:
+        r = await c.get("/g9Xc")
+    assert r.status_code not in (301, 308), f"GET /g9Xc answered {r.status_code}: a permanent redirect is cached by the browser and later clicks never come back"
+    assert r.status_code in (302, 307), f"GET /g9Xc answered {r.status_code}, expected 302"
+    assert r.headers.get("location") == URL, f"Location is {r.headers.get('location')!r}, expected the long url"
+    cache_control = r.headers.get("cache-control", "")
+    assert "private" in cache_control and "max-age=0" in cache_control, f"Cache-Control is {cache_control!r}, expected 'private, max-age=0'"
+`,
+  },
   debrief: `The redirect is the hot path of a shortener — reads outnumber writes by a hundred to one — so it is shaped to be one Redis round trip and nothing else. Negative caching matters more here than in most caches: unknown codes are *the* abuse pattern (scanners walking the key space), and each one would otherwise be a database query. The 302 is deliberate: a 301 would be cached by the browser forever and the next step would never see the click. Real shorteners add a local in-process cache in front of Redis for the top links, and jitter the TTL so a popular link's entry does not expire on every replica at once.`,
 };

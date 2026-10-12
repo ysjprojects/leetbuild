@@ -490,5 +490,110 @@ class TickServiceImpl final : public TickService::Service {
 `,
     },
   },
+  harness: {
+    python: `import asyncio
+import json
+
+import grpc
+
+import ticks_pb2
+import ticks_pb2_grpc
+
+BOOK = {"bid": "10.05", "ask": "10.06", "last": "10.05"}
+
+
+async def _stub(ctx):
+    """The learner's server running as a task, and a stub talking to it."""
+    ctx.redis.hset("book:ACME", mapping=BOOK)
+    m = ctx.load("tick_stream")
+    asyncio.create_task(m.serve())
+    await asyncio.sleep(0)
+    channel = grpc.aio.insecure_channel("ticks:9100")
+    return ticks_pb2_grpc.TickServiceStub(channel)
+
+
+async def _read(call, what):
+    try:
+        return await asyncio.wait_for(call.read(), 0.5)
+    except asyncio.TimeoutError:
+        raise AssertionError(f"the stream sent nothing within 0.5s: expected {what}")
+
+
+def _assert_tick(tick, what, bid, ask, last):
+    assert tick is not grpc.aio.EOF, f"the stream ended before sending {what}"
+    assert tick.symbol == "ACME", f"{what} names symbol {tick.symbol!r}, expected ACME"
+    assert (tick.bid, tick.ask, tick.last) == (bid, ask, last), f"{what} is bid={tick.bid} ask={tick.ask} last={tick.last}, expected {bid}/{ask}/{last}"
+
+
+async def _settle(call):
+    for _ in range(200):
+        if call.done():
+            return
+        await asyncio.sleep(0)
+
+
+def _subscribers(ctx, symbol):
+    """Subscribers of ticks:{symbol}. Compared as deltas: a subscription leaked by an earlier run stays on the fake server."""
+    return dict(ctx.redis.pubsub_numsub("ticks:" + symbol))["ticks:" + symbol]
+
+
+async def _subscribed(ctx, symbol, before):
+    """Wait (loop turns only) for the handler to add its subscription on top of the count before the call."""
+    for _ in range(50):
+        if _subscribers(ctx, symbol) > before:
+            break
+        await asyncio.sleep(0)
+    return _subscribers(ctx, symbol) - before
+
+
+async def check_snapshot_first(ctx):
+    stub = await _stub(ctx)
+    ctx.redis.publish("ticks:ACME", json.dumps({"symbol": "ACME", "bid": 1, "ask": 2, "last": 3}))  # before this client subscribed: must not reach it
+    call = stub.SubscribeTicks(ticks_pb2.SubscribeRequest(symbol="ACME"))
+    first = await _read(call, "the snapshot of book:ACME")
+    _assert_tick(first, "the first tick (the snapshot from the hash)", 10.05, 10.06, 10.05)
+    call.cancel()
+
+
+async def check_not_found(ctx):
+    stub = await _stub(ctx)
+    before = _subscribers(ctx, "GHOST")
+    call = stub.SubscribeTicks(ticks_pb2.SubscribeRequest(symbol="GHOST"))
+    try:
+        item = await _read(call, "a NOT_FOUND status")
+        raise AssertionError(f"an unknown symbol must end the call with NOT_FOUND; the stream {'ended normally' if item is grpc.aio.EOF else 'sent a tick'}")
+    except grpc.aio.AioRpcError as e:
+        assert e.code() == grpc.StatusCode.NOT_FOUND, f"an unknown symbol ended the call with {e.code()}, expected NOT_FOUND"
+    assert _subscribers(ctx, "GHOST") == before, "nothing must be subscribed for a symbol that does not exist"
+
+
+async def check_forward(ctx):
+    stub = await _stub(ctx)
+    before = _subscribers(ctx, "ACME")
+    call = stub.SubscribeTicks(ticks_pb2.SubscribeRequest(symbol="ACME"))
+    await _read(call, "the snapshot")
+    assert await _subscribed(ctx, "ACME", before) == 1, "after the snapshot the handler must SUBSCRIBE to ticks:ACME"
+    ctx.redis.publish("ticks:ACME", json.dumps({"symbol": "ACME", "bid": 10.07, "ask": 10.08, "last": 10.07}))
+    tick = await _read(call, "the published tick")
+    _assert_tick(tick, "the forwarded tick", 10.07, 10.08, 10.07)
+    ctx.redis.publish("ticks:ACME", json.dumps({"symbol": "ACME", "bid": 10.09, "ask": 10.10, "last": 10.09}))
+    tick = await _read(call, "the second published tick")
+    _assert_tick(tick, "the second forwarded tick", 10.09, 10.10, 10.09)
+    call.cancel()
+
+
+async def check_cancel(ctx):
+    stub = await _stub(ctx)
+    before = _subscribers(ctx, "ACME")
+    call = stub.SubscribeTicks(ticks_pb2.SubscribeRequest(symbol="ACME"))
+    await _read(call, "the snapshot")
+    assert await _subscribed(ctx, "ACME", before) == 1, "the handler must be subscribed to ticks:ACME while the client is connected"
+    call.cancel()
+    await _settle(call)
+    assert call.done(), "the handler kept running after the client cancelled"
+    leaked = _subscribers(ctx, "ACME") - before
+    assert leaked == 0, f"the client went away but ticks:ACME still has {leaked} subscriber(s) from this call: unsubscribe on the way out"
+`,
+  },
   debrief: `Snapshot-then-stream is the shape of every subscription API: the stream alone cannot tell a new client the current state, and the snapshot alone goes stale in a millisecond. The gap between them is the classic race — a tick published between HGETALL and SUBSCRIBE is lost — which real feeds close with sequence numbers (subscribe first, then snapshot, then drop buffered ticks older than the snapshot's sequence). Checking cancellation on a timer instead of only when a message arrives is what keeps a quiet symbol from pinning a connection forever; at scale, one Redis subscription per process fanning out to all its gRPC streams replaces one connection per client.`,
 };

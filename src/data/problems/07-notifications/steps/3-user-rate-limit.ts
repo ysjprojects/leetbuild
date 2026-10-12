@@ -351,5 +351,84 @@ bool allowed(const std::string& user_id, const std::string& notification_id) {
 `,
     },
   },
+  harness: {
+    python: `import time
+
+import redis
+
+
+def _limiter(ctx):
+    m = ctx.load("rate_limit")
+    clients = [c for c in vars(m).values() if isinstance(c, redis.Redis)]
+    assert clients, "the module must create a redis.Redis client"
+    m.direct = []  # commands sent outside a pipeline
+    m.pipelines = 0
+    for client in clients:
+        execute_command, pipeline = client.execute_command, client.pipeline
+
+        def counted_execute(*args, _original=execute_command, **kwargs):
+            m.direct.append(args[0] if args else None)
+            return _original(*args, **kwargs)
+
+        def counted_pipeline(*args, _original=pipeline, **kwargs):
+            m.pipelines += 1
+            return _original(*args, **kwargs)
+
+        client.execute_command = counted_execute
+        client.pipeline = counted_pipeline
+    return m
+
+
+def check_zset_key(ctx):
+    m = _limiter(ctx)
+    before = int(time.time() * 1000)
+    assert m.allowed("u42", "n-1") is True, "the first notification of the hour must be allowed"
+    after = int(time.time() * 1000)
+    assert ctx.redis.type("rl:u42") == "zset", f"rl:u42 must be a sorted set, found {ctx.redis.type('rl:u42')!r}"
+    score = ctx.redis.zscore("rl:u42", "n-1")
+    assert score is not None, f"n-1 must be a member of rl:u42, members are {ctx.redis.zrange('rl:u42', 0, -1)}"
+    assert before <= score <= after, f"n-1 is scored {score}, expected the current time in milliseconds (about {before})"
+    m.allowed("u7", "n-2")
+    assert ctx.redis.zcard("rl:u42") == 1 and ctx.redis.zcard("rl:u7") == 1, "each user has their own rl:{user} set"
+
+
+def check_trim_window(ctx):
+    m = _limiter(ctx)
+    m.allowed("u42", "n-1")
+    m.allowed("u42", "n-2")
+    ctx.clock.advance(1800)
+    m.allowed("u42", "n-3")
+    assert ctx.redis.zcard("rl:u42") == 3, f"after 30 min all three events are still in the window, found {ctx.redis.zcard('rl:u42')}"
+    ctx.clock.advance(1801)
+    assert m.allowed("u42", "n-4") is True
+    members = ctx.redis.zrange("rl:u42", 0, -1)
+    assert members == ["n-3", "n-4"], f"events older than an hour must be trimmed: rl:u42 holds {members}, expected ['n-3', 'n-4']"
+
+
+def check_pipeline(ctx):
+    m = _limiter(ctx)
+    assert m.allowed("u42", "n-1") is True
+    ttl = ctx.redis.ttl("rl:u42")
+    assert 3500 <= ttl <= 3600, f"rl:u42 must expire after 3600 s, TTL is {ttl}"
+    assert m.pipelines >= 1, "the four commands must travel in one pipeline / MULTI"
+    assert m.direct == [], f"an allowed check must cost one round trip; these commands were sent on their own: {m.direct}"
+    ctx.clock.advance(3601)
+    assert ctx.redis.exists("rl:u42") == 0, "an idle user's set must expire with the window"
+
+
+def check_over_limit(ctx):
+    m = _limiter(ctx)
+    for i in range(20):
+        assert m.allowed("u42", f"n-{i}") is True, f"notification {i + 1} of 20 must be allowed"
+    assert ctx.redis.get("dropped:u42") is None, "nothing was dropped yet: dropped:u42 must not exist"
+    assert m.allowed("u42", "n-20") is False, "the 21st notification of the hour must be dropped"
+    assert ctx.redis.get("dropped:u42") == "1", f"dropped:u42 is {ctx.redis.get('dropped:u42')!r}, expected 1"
+    assert m.allowed("u42", "n-21") is False
+    assert ctx.redis.get("dropped:u42") == "2", f"dropped:u42 is {ctx.redis.get('dropped:u42')!r}, expected 2"
+    assert m.allowed("u7", "n-22") is True, "another user's budget is untouched"
+    ctx.clock.advance(3601)
+    assert m.allowed("u42", "n-23") is True, "an hour later the user's budget is back"
+`,
+  },
   debrief: `A sorted set scored by time is a sliding window with no bookkeeping: add, trim, count, and the TTL cleans up after idle users. The four commands travel together so the check costs one round trip, and because the whole thing is per user it shards trivially. Real systems wrap the same four commands in a Lua script so the add-trim-count is atomic against concurrent workers, remove the member again when the decision is "drop" (so dropped pings do not eat the budget), and prefer a cheaper approximation — sliding log with coarse buckets, or a token bucket — once the limit is thousands per window instead of twenty.`,
 };

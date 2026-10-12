@@ -403,5 +403,102 @@ std::vector<ServerMsg> recent(const std::string& room) {
 `,
     },
   },
+  harness: {
+    python: `from google.protobuf import json_format
+
+import chat_pb2
+
+KEY = "recent:room-7"
+
+
+def _msg(i, room="room-7"):
+    return chat_pb2.ServerMsg(room=room, user="ana" if i % 2 else "bo", text=f"m{i}", ts=1700000000000 + i)
+
+
+def _stored(ctx):
+    """The list as Redis holds it, head first, parsed back into ServerMsgs."""
+    return [json_format.Parse(v, chat_pb2.ServerMsg()) for v in ctx.redis.lrange(KEY, 0, -1)]
+
+
+def check_lpush(ctx):
+    m = ctx.load("recent_messages")
+    m.remember("room-7", _msg(1))
+    m.remember("room-7", _msg(2))
+    m.remember("room-8", _msg(3, "room-8"))
+    assert ctx.redis.type(KEY) == "list", f"recent:room-7 is {ctx.redis.type(KEY)!r} (keys: {sorted(ctx.redis.keys())}), expected a list"
+    stored = _stored(ctx)
+    assert [s.text for s in stored] == ["m2", "m1"], f"recent:room-7 holds {[s.text for s in stored]} head first, expected ['m2', 'm1']: LPUSH puts the newest at the head"
+    assert stored[1] == _msg(1), f"the stored JSON parses back to {stored[1]!r}, expected {_msg(1)!r}"
+    other = [s.text for s in (json_format.Parse(v, chat_pb2.ServerMsg()) for v in ctx.redis.lrange("recent:room-8", 0, -1))]
+    assert other == ["m3"], f"recent:room-8 holds {other}, expected ['m3']: one list per room"
+
+
+def check_trim(ctx):
+    m = ctx.load("recent_messages")
+    for i in range(1, 56):
+        m.remember("room-7", _msg(i))
+    n = ctx.redis.llen(KEY)
+    assert n == 50, f"after 55 messages recent:room-7 holds {n} entries, expected 50 (LTRIM 0 49 after every push)"
+    stored = _stored(ctx)
+    assert stored[0].text == "m55" and stored[-1].text == "m6", f"the list runs {stored[0].text} .. {stored[-1].text}, expected m55 .. m6: trimming must drop the oldest, not the newest"
+
+
+def check_expire(ctx):
+    m = ctx.load("recent_messages")
+    m.remember("room-7", _msg(1))
+    ttl = ctx.redis.ttl(KEY)
+    assert 3500 <= ttl <= 3600, f"recent:room-7 has TTL {ttl}, expected 3600 s"
+    ctx.clock.advance(1800)
+    m.remember("room-7", _msg(2))
+    ttl = ctx.redis.ttl(KEY)
+    assert 3500 <= ttl <= 3600, f"a new message must restart the hour: TTL is {ttl} after the second remember, expected 3600"
+    ctx.clock.advance(3601)
+    assert not ctx.redis.exists(KEY), "a room quiet for an hour must drop out of Redis"
+
+
+def check_pipelined(ctx):
+    m = ctx.load("recent_messages")
+    pipe_cls = type(ctx.redis.pipeline())
+    client_cls = ctx.redis.__class__
+    real_execute, real_command = pipe_cls.execute, client_cls.execute_command
+    executes, direct = [], []
+
+    def counting_execute(self, *args, **kw):
+        executes.append((self.transaction, [c[0][0].upper() for c in self.command_stack]))
+        return real_execute(self, *args, **kw)
+
+    def counting_command(self, *args, **kw):
+        direct.append(str(args[0]).upper())
+        return real_command(self, *args, **kw)
+
+    pipe_cls.execute, client_cls.execute_command = counting_execute, counting_command
+    try:
+        m.remember("room-7", _msg(1))
+    finally:
+        pipe_cls.execute, client_cls.execute_command = real_execute, real_command
+    assert direct == [], f"remember sent {direct} outside a pipeline: queue LPUSH, LTRIM and EXPIRE in one pipeline and execute once"
+    assert len(executes) == 1, f"remember executed {len(executes)} pipeline(s), expected exactly one round trip"
+    transaction, commands = executes[0]
+    assert commands == ["LPUSH", "LTRIM", "EXPIRE"], f"the pipeline queued {commands}, expected ['LPUSH', 'LTRIM', 'EXPIRE'] in that order"
+    assert transaction, "the pipeline must be a MULTI (transaction=True) so no reader ever sees the list at 51"
+    stored = _stored(ctx)
+    assert [s.text for s in stored] == ["m1"] and 3500 <= ctx.redis.ttl(KEY) <= 3600, "after execute the list must hold the message with its TTL set"
+
+
+def check_chronological(ctx):
+    m = ctx.load("recent_messages")
+    assert m.recent("room-7") == [], f"a quiet room must give an empty list, got {m.recent('room-7')!r}"
+    for i in range(1, 4):
+        m.remember("room-7", _msg(i))
+    got = m.recent("room-7")
+    assert all(isinstance(s, chat_pb2.ServerMsg) for s in got), f"recent must return ServerMsg objects, got {[type(s).__name__ for s in got]}"
+    assert [s.text for s in got] == ["m1", "m2", "m3"], f"recent('room-7') is {[s.text for s in got]}, expected ['m1', 'm2', 'm3'] oldest first"
+    assert got[0] == _msg(1), f"recent()[0] is {got[0]!r}, expected {_msg(1)!r}"
+    for i in range(4, 61):
+        m.remember("room-7", _msg(i))
+    got = [s.text for s in m.recent("room-7")]
+    assert got == [f"m{i}" for i in range(11, 61)], f"after 60 messages recent('room-7') must be m11 .. m60 oldest first, got {got[:3]} .. {got[-3:]} ({len(got)} entries)"
+`,
+  },
   debrief: `LPUSH + LTRIM + EXPIRE is the Redis idiom for a bounded, self-cleaning recent-items list, and wrapping the three in MULTI/EXEC is what makes it one round trip *and* one atomic unit — a plain pipeline saves the round trips but another client's LRANGE can still slip in between the push and the trim. The list is maintained by the writer, so a miss is not a signal to load anything; it just means the client uses the history endpoint. Real systems store a sequence number with each entry so a reconnecting client can ask for "everything after N", and keep the list per shard when a single room is hot enough to make one Redis key a bottleneck.`,
 };

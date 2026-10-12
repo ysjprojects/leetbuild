@@ -5,3 +5,4 @@ out/
 .DS_Store
 tsconfig.tsbuildinfo
 *.log
+public/py/worker.js

@@ -426,5 +426,125 @@ Page read(const std::string& user, std::optional<int64_t> cursor, int limit) {
 `,
     },
   },
+  harness: {
+    python: `def _pid(ms, tag="a"):
+    """Ids carry their timestamp: '<created_at ms>-<suffix>' (feed.ids.created_at parses the prefix)."""
+    return f"{ms}-{tag}"
+
+
+def _ms(pid):
+    return int(pid.split("-", 1)[0])
+
+
+def _reader(ctx, celebrities=None):
+    m = ctx.load("timeline")
+    celebrities = celebrities or {}
+    m.graph.celebrities_followed = lambda user: list(celebrities.get(user, []))
+    return m
+
+
+def _push(ctx, user, *ids):
+    """Fan-out writes: ids given oldest first end up newest first in the list."""
+    for pid in ids:
+        ctx.redis.lpush(f"timeline:{user}", pid)
+
+
+def _pull(ctx, author, *ids):
+    ctx.redis.zadd(f"posts:{author}", {pid: _ms(pid) for pid in ids})
+
+
+def _spy(r):
+    """Round trips the learner's client makes: direct command names, and the size of every executed pipeline."""
+    trips = {"direct": [], "pipelines": []}
+    real_pipeline, real_execute = r.pipeline, r.execute_command
+
+    def pipeline(*args, **kwargs):
+        pipe = real_pipeline(*args, **kwargs)
+        real_pipe_execute = pipe.execute
+
+        def execute(*a, **k):
+            trips["pipelines"].append(len(pipe.command_stack))
+            return real_pipe_execute(*a, **k)
+
+        pipe.execute = execute
+        return pipe
+
+    def execute_command(*args, **kwargs):
+        trips["direct"].append(str(args[0]).lower())
+        return real_execute(*args, **kwargs)
+
+    r.pipeline = pipeline
+    r.execute_command = execute_command
+    return trips
+
+
+def check_pushed(ctx):
+    ids = [_pid(100 + i) for i in range(10)]
+    _push(ctx, "alice", *ids)
+    m = _reader(ctx)
+    page, next_cursor = m.read("alice", None, 3)
+    assert page == [_pid(109), _pid(108), _pid(107)], f"with 10 pushed ids and limit 3 the page must be the 3 newest, got {page}"
+    assert next_cursor == 107, f"next_cursor must be the created_at of the last id of the page (107), got {next_cursor!r}"
+    page, _ = m.read("alice", None, 20)
+    assert page == list(reversed(ids)), f"with limit 20 every pushed id must be returned newest first, got {page}"
+
+
+def check_pulled(ctx):
+    taylor = [_pid(200 + i, "t") for i in range(5)]
+    nasa = [_pid(150, "n"), _pid(151, "n")]
+    _pull(ctx, "taylor", *taylor)
+    _pull(ctx, "nasa", *nasa)
+    m = _reader(ctx, {"alice": ["taylor", "nasa"]})
+    page, next_cursor = m.read("alice", None, 4)
+    assert page == [_pid(204, "t"), _pid(203, "t"), _pid(202, "t"), _pid(201, "t")], f"nothing was pushed: the page must be the 4 newest celebrity posts, got {page}"
+    assert next_cursor == 201, f"next_cursor must be 201, got {next_cursor!r}"
+    page, _ = m.read("alice", None, 10)
+    assert page == list(reversed(taylor)) + list(reversed(nasa)), f"every post of every followed celebrity must be pulled, newest first: {page}"
+    page, _ = m.read("bob", None, 10)
+    assert page == [], f"bob follows no celebrity and has no timeline: expected an empty page, got {page}"
+
+
+def check_single_pipeline(ctx):
+    _push(ctx, "alice", _pid(100), _pid(300))
+    _pull(ctx, "taylor", _pid(200, "t"))
+    _pull(ctx, "nasa", _pid(400, "n"))
+    m = _reader(ctx, {"alice": ["taylor", "nasa"]})
+    trips = _spy(m.r)
+    page, _ = m.read("alice", None, 10)
+    assert page == [_pid(400, "n"), _pid(300), _pid(200, "t"), _pid(100)], f"unexpected page {page}"
+    reads = [c for c in trips["direct"] if c in ("lrange", "zrevrangebyscore", "zrange")]
+    assert not reads, f"{len(reads)} Redis read(s) were sent outside a pipeline ({reads}): queue the LRANGE and every ZREVRANGEBYSCORE on one pipeline"
+    assert len(trips["pipelines"]) == 1, f"a page must cost one round trip: observed {len(trips['pipelines'])} pipeline execute(s)"
+    assert trips["pipelines"][0] == 3, f"the pipeline must carry the LRANGE and one ZREVRANGEBYSCORE per celebrity (3 commands for 2 celebrities), got {trips['pipelines'][0]}"
+
+
+def check_merged(ctx):
+    _push(ctx, "alice", _pid(100), _pid(300), _pid(500))
+    _pull(ctx, "taylor", _pid(200, "t"), _pid(400, "t"), _pid(600, "t"))
+    _pull(ctx, "nasa", _pid(500))  # the same post also arrived through fan-out
+    m = _reader(ctx, {"alice": ["taylor", "nasa"]})
+    page, next_cursor = m.read("alice", None, 4)
+    assert page == [_pid(600, "t"), _pid(500), _pid(400, "t"), _pid(300)], f"pushed and pulled ids must be merged newest first and cut to limit, got {page}"
+    assert next_cursor == 300, f"next_cursor must be 300, got {next_cursor!r}"
+    page, _ = m.read("alice", None, 10)
+    assert page.count(_pid(500)) == 1, f"an id present in both sources must appear once, got {page}"
+    assert page == [_pid(600, "t"), _pid(500), _pid(400, "t"), _pid(300), _pid(200, "t"), _pid(100)], f"the full merge must be every distinct id newest first, got {page}"
+
+
+def check_cursor(ctx):
+    _push(ctx, "alice", *[_pid(100 + 2 * i) for i in range(10)])  # 100, 102, ..., 118; LRANGE 0 5 sees 118..108
+    _pull(ctx, "taylor", _pid(109, "t"), _pid(113, "t"), _pid(115, "t"), _pid(121, "t"))
+    m = _reader(ctx, {"alice": ["taylor"]})
+    page, next_cursor = m.read("alice", 115, 3)
+    assert page == [_pid(114), _pid(113, "t"), _pid(112)], f"with cursor 115 only ids created before 115 may appear (the bound is exclusive, from both sources), got {page}"
+    assert next_cursor == 112, f"next_cursor must be 112, got {next_cursor!r}"
+    page, next_cursor = m.read("alice", next_cursor, 3)
+    assert page == [_pid(110), _pid(109, "t"), _pid(108)], f"the next page must continue below the cursor without overlap, got {page}"
+    assert next_cursor == 108, f"next_cursor must be 108, got {next_cursor!r}"
+    page, next_cursor = m.read("alice", 100, 3)
+    assert page == [], f"nothing is older than 100: expected an empty page, got {page}"
+    assert next_cursor is None, f"an empty page has no next_cursor, got {next_cursor!r}"
+`,
+  },
   debrief: `The read is where the hybrid pays off: one pipeline, a handful of replies, a sort of at most a few dozen ids — regardless of how many followers the celebrities have. Both sources answer the same question ("posts older than the cursor, newest first") and the merge hides which one each id came from. The honest limitation: a plain list cannot seek by time, so deep pagination over the pushed ids degrades — real feeds keep the timeline itself as a sorted set scored by \`created_at\` (or a time-sortable id such as a Snowflake), apply ranking after this candidate step, and cache the hydrated first page per user for a few seconds.`,
 };

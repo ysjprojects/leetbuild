@@ -460,5 +460,63 @@ void audit(const std::string& api_key, const std::string& path, int status, doub
 `,
     },
   },
+  harness: {
+    python: `import json
+
+
+def check_topic_key(ctx):
+    m = ctx.load("audit_log")
+    m.audit("k1", "/items/42", 200, 12.34)
+    m.audit("k2", "/items/7", 404, 3.0)
+    m.audit("k1", "/items/9", 200, 1.0)
+    records = ctx.kafka.records("gateway-audit")
+    assert len(records) == 3, f"three audit() calls produced {len(records)} records on gateway-audit (topics: {sorted(ctx.kafka.topics)})"
+    keys = [r.key for r in records]
+    assert keys == [b"k1", b"k2", b"k1"], f"records must be keyed by the API key, got {keys}"
+    assert records[0].partition == records[2].partition, "the same API key must land on the same partition so one caller's trail stays ordered"
+    first = json.loads(records[0].value)
+    assert first.get("api_key") == "k1" and first.get("path") == "/items/42" and first.get("status") == 200, f"the value must be JSON with api_key, path, status, latency_ms, ts: {first}"
+    assert first.get("latency_ms") == 12.3, f"latency_ms is {first.get('latency_ms')!r}, expected 12.3"
+    assert "ts" in first, f"the record carries no ts: {first}"
+
+
+def check_bounded_queue(ctx):
+    m = ctx.load("audit_log")
+    # the in-memory producer never fills up, so the bound is read from the producer's configuration
+    bound = m.producer.conf.get("queue.buffering.max.messages")
+    assert bound is not None, f"the producer is configured with {sorted(m.producer.conf)}: without queue.buffering.max.messages a slow broker grows the queue until the gateway runs out of memory"
+    assert int(bound) > 0, f"queue.buffering.max.messages is {bound!r}, expected a positive bound"
+
+
+def check_drop_on_full(ctx):
+    m = ctx.load("audit_log")
+    real_produce = m.producer.produce
+
+    def queue_full(*args, **kwargs):
+        raise BufferError("Local: Queue full")
+
+    m.producer.produce = queue_full
+    for _ in range(3):
+        m.audit("k1", "/items/42", 200, 1.0)  # must neither raise nor wait
+    assert ctx.kafka.records("gateway-audit") == [], "nothing can be produced while the queue is full"
+    assert m.dropped == 3, f"dropped is {m.dropped!r} after three refused records, expected 3"
+    assert ctx.clock.sleeps == 0, "a full queue must be handled by dropping, not by sleeping and retrying"
+    m.producer.produce = real_produce
+    m.audit("k1", "/items/42", 200, 1.0)
+    assert len(ctx.kafka.records("gateway-audit")) == 1, "once the queue has room, audit records flow again"
+    assert m.dropped == 3, f"dropped is {m.dropped!r} after a successful produce, expected to stay at 3"
+
+
+def check_non_blocking(ctx):
+    m = ctx.load("audit_log")
+    for i in range(3):
+        m.audit("k1", f"/items/{i}", 200, 1.0)
+    assert len(ctx.kafka.records("gateway-audit")) == 3, f"three audit() calls produced {len(ctx.kafka.records('gateway-audit'))} records"
+    assert ctx.kafka.flushes == 0, "audit() must not flush: the request would wait for the broker's acknowledgement"
+    assert ctx.clock.sleeps == 0, "audit() must not sleep or wait"
+    pending = len(m.producer)
+    assert pending <= 1, f"after three audit() calls the producer still holds {pending} unserved delivery callbacks: call producer.poll(0) so acknowledged records leave the queue"
+`,
+  },
   debrief: `Audit is a side channel: valuable, but never worth a slow or failed request. That priority decides everything here — an async hand-off, a bounded buffer, and an explicit drop with a counter you can alarm on. Blocking "just a little" when the queue is full is how a Kafka outage becomes an API outage. Real gateways ship audit through a local agent (Vector, Fluent Bit) so the process only ever writes to a socket on the same host, key by tenant rather than raw API key, and treat a rising \`dropped\` counter as a paging alert.`,
 };

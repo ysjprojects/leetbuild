@@ -673,5 +673,126 @@ int main() {
 `,
     },
   },
+  harness: {
+    python: `BODY = {"sku": "shoe-42", "qty": 2, "user": "ada"}
+
+
+def _api(ctx, sold_out=False, broker_down=False):
+    m = ctx.load("checkout_api")
+    log = []
+
+    def reserve(sku, order_id, qty):
+        log.append(("reserve", sku, order_id, qty))
+        return not sold_out
+
+    def release(order_id):
+        log.append(("release", order_id))
+
+    def enqueue_order(order):
+        log.append(("enqueue", dict(order)))
+        if broker_down:
+            raise RuntimeError("no ack within 2s")
+
+    m.reserve = reserve
+    m.release = release
+    m.enqueue_order = enqueue_order
+    return m, log
+
+
+def _calls(log, kind):
+    return [e for e in log if e[0] == kind]
+
+
+async def check_route(ctx):
+    m, log = _api(ctx)
+    async with ctx.client(m.app) as c:
+        r = await c.post("/checkout", json=BODY)
+    assert r.status_code != 404, "no handler is registered for POST /checkout"
+    assert r.status_code == 202, f"POST /checkout with a valid body answered {r.status_code}, expected 202"
+
+
+async def check_validate(ctx):
+    m, log = _api(ctx)
+    bad = [
+        ("a missing sku", {"qty": 2, "user": "ada"}),
+        ("a missing user", {"sku": "shoe-42", "qty": 2}),
+        ("qty 0", dict(BODY, qty=0)),
+        ("qty 6", dict(BODY, qty=6)),
+    ]
+    async with ctx.client(m.app) as c:
+        for label, body in bad:
+            r = await c.post("/checkout", json=body)
+            assert r.status_code == 400, f"{label} answered {r.status_code}, expected 400"
+        assert not _calls(log, "reserve"), "a 400 must be decided before stock is touched: reserve was called for a bad body"
+        assert ctx.redis.keys("attempts:*") == [], "a 400 must be decided before the attempt counter is touched"
+        r = await c.post("/checkout", json=dict(BODY, qty=5))
+        assert r.status_code == 202, f"qty 5 is the maximum and must be accepted, got {r.status_code}"
+        r = await c.post("/checkout", json=dict(BODY, qty=1))
+        assert r.status_code == 202, f"qty 1 is the minimum and must be accepted, got {r.status_code}"
+
+
+async def check_attempt_limit(ctx):
+    m, log = _api(ctx)
+    body = dict(BODY, user="bot")
+    async with ctx.client(m.app) as c:
+        r = await c.post("/checkout", json=body)
+        assert r.status_code == 202, f"the first attempt answered {r.status_code}, expected 202"
+        assert ctx.redis.get("attempts:bot") == "1", f"attempts:bot is {ctx.redis.get('attempts:bot')!r} after one request, expected 1"
+        ttl = ctx.redis.ttl("attempts:bot")
+        assert 0 < ttl <= 60, f"attempts:bot has TTL {ttl}; the window must be set to 60 s when the counter is created"
+        r = await c.post("/checkout", json=body)
+        assert ctx.redis.get("attempts:bot") == "2", "every request must INCR attempts:{user}"
+        reserves = len(_calls(log, "reserve"))
+        ctx.redis.set("attempts:bot", 20, keepttl=True)
+        r = await c.post("/checkout", json=body)
+        assert r.status_code == 429, f"the 21st attempt in the window answered {r.status_code}, expected 429"
+        assert r.headers.get("retry-after") == "60", f"Retry-After is {r.headers.get('retry-after')!r}, expected 60"
+        assert len(_calls(log, "reserve")) == reserves, "a 429 must be decided before reserve is called: a bot must not cost a Lua call"
+        ctx.clock.advance(61)
+        r = await c.post("/checkout", json=body)
+        assert r.status_code == 202, f"after the 60 s window the counter must have expired; got {r.status_code}"
+        r = await c.post("/checkout", json=dict(BODY, user="grace"))
+        assert r.status_code == 202, "the limit is per user: another user must not be throttled"
+
+
+async def check_sold_out(ctx):
+    m, log = _api(ctx, sold_out=True)
+    async with ctx.client(m.app) as c:
+        r = await c.post("/checkout", json=BODY)
+    assert r.status_code == 409, f"a reservation that returned False answered {r.status_code}, expected 409"
+    assert r.json().get("error") == "SOLD_OUT", f"the 409 body is {r.json()}, expected error SOLD_OUT"
+    assert not _calls(log, "enqueue"), "a sold-out order must not be enqueued"
+    assert not _calls(log, "release"), "nothing was reserved, so nothing must be released"
+
+
+async def check_accepted(ctx):
+    m, log = _api(ctx)
+    async with ctx.client(m.app) as c:
+        r = await c.post("/checkout", json=BODY)
+    assert r.status_code == 202, f"a reserved and enqueued order answered {r.status_code}, expected 202"
+    reserves, enqueues = _calls(log, "reserve"), _calls(log, "enqueue")
+    assert len(reserves) == 1, f"reserve was called {len(reserves)} times, expected once"
+    assert len(enqueues) == 1, f"enqueue_order was called {len(enqueues)} times, expected once"
+    assert log.index(reserves[0]) < log.index(enqueues[0]), "reserve must run before enqueue_order"
+    _, sku, order_id, qty = reserves[0]
+    assert (sku, qty) == ("shoe-42", 2), f"reserve was called with {(sku, qty)}, expected ('shoe-42', 2)"
+    assert order_id, "reserve must be called with a generated order id"
+    order = enqueues[0][1]
+    expected = {"order_id": order_id, "sku": "shoe-42", "qty": 2, "user": "ada"}
+    assert order == expected, f"enqueue_order received {order}, expected {expected}"
+    body = r.json()
+    assert body.get("order_id") == order_id, f"the 202 body is {body}; order_id must be the id that was reserved ({order_id})"
+    assert body.get("status") == "reserved", f"the 202 body is {body}; status must be reserved, nothing is paid yet"
+    assert not _calls(log, "release"), "a successful enqueue must not release the hold"
+
+    m, log = _api(ctx, broker_down=True)
+    async with ctx.client(m.app) as c:
+        r = await c.post("/checkout", json=BODY)
+    assert r.status_code == 503, f"when enqueue_order raises the endpoint answered {r.status_code}, expected 503"
+    reserved_id = _calls(log, "reserve")[0][2]
+    releases = _calls(log, "release")
+    assert releases == [("release", reserved_id)], f"the hold {reserved_id} must be released when the enqueue fails; release calls: {releases}"
+`,
+  },
   debrief: `Every branch is ordered by what it costs: a 400 costs nothing, a 429 costs one INCR, a 409 costs the Lua script, and only a 202 pays for a Kafka round trip. The status codes carry meaning a client can act on — 429 says *wait*, 409 says *stop*, 503 says *try again* — and the 202 is honest: the order is accepted, not fulfilled. Real checkouts put a virtual waiting room in front of this endpoint, score requests for bot likelihood instead of counting them, and return a status URL the client polls.`,
 };

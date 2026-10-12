@@ -528,5 +528,123 @@ std::optional<std::string> send_push(const std::string& token, const std::string
 `,
     },
   },
+  harness: {
+    python: `import grpc
+
+import push_pb2
+import push_pb2_grpc
+
+
+class FakeGateway(push_pb2_grpc.PushGatewayServicer):
+    def __init__(self):
+        self.calls = 0
+
+    def Send(self, request, context):
+        self.calls += 1
+        if request.device_token == "stale":
+            context.abort(grpc.StatusCode.NOT_FOUND, "unregistered device token")
+        return push_pb2.SendReply(message_id="m-" + request.device_token + "-" + str(self.calls))
+
+
+def _client(ctx):
+    peer = FakeGateway()
+    ctx.grpc.serve(push_pb2_grpc.add_PushGatewayServicer_to_server, peer)
+    return ctx.load("push_client"), peer
+
+
+def _send(m, token="tok-1"):
+    return m.send_push(token, "Shipped", "On its way", "order-1")
+
+
+def _waited(ctx, m, code, times):
+    """Virtual seconds slept and sleeps taken by one send_push that first meets the given failures."""
+    ctx.grpc.fail("Send", code, times=times)
+    offset, sleeps = ctx.clock.offset, ctx.clock.sleeps
+    result = _send(m)
+    return result, round(ctx.clock.offset - offset, 6), ctx.clock.sleeps - sleeps
+
+
+def check_deadline(ctx):
+    m, peer = _client(ctx)
+    assert _send(m) == "m-tok-1-1", "send_push must return the gateway's message_id"
+    ctx.grpc.fail("Send", grpc.StatusCode.UNAVAILABLE, times=1)
+    assert _send(m) == "m-tok-1-2", "one UNAVAILABLE must be retried and succeed"
+    calls = ctx.grpc.calls_to("Send")
+    assert len(calls) == 3, f"expected 3 calls (one success, one failure, one retry), saw {len(calls)}"
+    for call in calls:
+        assert call.timeout is not None, "an RPC carries no deadline"
+        assert 2.5 <= call.timeout <= 3.0, f"every call must carry a deadline of about 3 s, got {call.timeout} s"
+    request = calls[0].request
+    assert (request.device_token, request.title, request.body, request.collapse_key) == ("tok-1", "Shipped", "On its way", "order-1"), f"the request must carry token, title, body and collapse_key, got {request}"
+
+
+def check_backoff(ctx):
+    m, peer = _client(ctx)
+    result, waited, sleeps = _waited(ctx, m, grpc.StatusCode.UNAVAILABLE, 1)
+    assert result == "m-tok-1-1", "one UNAVAILABLE must be retried and succeed"
+    assert sleeps == 1, f"expected one backoff sleep between the two attempts, saw {sleeps}"
+    assert 0.2 <= waited <= 0.45, f"the first backoff must be about 200 ms plus jitter, it was {waited} s"
+    result, waited2, sleeps = _waited(ctx, m, grpc.StatusCode.RESOURCE_EXHAUSTED, 2)
+    assert result == "m-tok-1-2", "two RESOURCE_EXHAUSTED must be retried and the third attempt succeed"
+    assert sleeps == 2, f"expected two backoff sleeps before the third attempt, saw {sleeps}"
+    assert 0.6 <= waited2 <= 1.05, f"the two backoffs must be about 200 + 400 ms plus jitter, together they were {waited2} s"
+    seen = {waited}
+    for _ in range(6):
+        seen.add(_waited(ctx, m, grpc.StatusCode.UNAVAILABLE, 1)[1])
+    assert len(seen) > 1, f"every first backoff lasted exactly {waited} s: add jitter so retries do not synchronise"
+
+
+def check_bounded(ctx):
+    m, peer = _client(ctx)
+    ctx.grpc.fail("Send", grpc.StatusCode.UNAVAILABLE, times=50)
+    try:
+        _send(m)
+        raise AssertionError("a gateway that stays UNAVAILABLE must raise, send_push returned")
+    except m.Retryable:
+        pass
+    attempts = len(ctx.grpc.calls_to("Send"))
+    assert attempts == 3, f"made {attempts} attempts against a down gateway, expected exactly 3"
+    assert peer.calls == 0, "no attempt reached the gateway: every one was UNAVAILABLE"
+
+
+def check_stale_token(ctx):
+    m, peer = _client(ctx)
+    assert _send(m, "stale") is None, "NOT_FOUND means the token is unregistered: return None"
+    assert m.devices.disabled == ["stale"], f"the stale token must be disabled, devices.disabled is {m.devices.disabled}"
+    assert len(ctx.grpc.calls_to("Send")) == 1, "NOT_FOUND must not be retried"
+    ctx.grpc.fail("Send", grpc.StatusCode.INVALID_ARGUMENT, "malformed token", times=1)
+    assert _send(m, "bad") is None, "INVALID_ARGUMENT means the token is bad: return None"
+    assert m.devices.disabled == ["stale", "bad"], f"the bad token must be disabled, devices.disabled is {m.devices.disabled}"
+    assert len(ctx.grpc.calls_to("Send")) == 2, "INVALID_ARGUMENT must not be retried"
+    assert ctx.clock.sleeps == 0, "a stale token must not wait for a backoff"
+
+
+def check_retryable(ctx):
+    m, peer = _client(ctx)
+    ctx.grpc.set_latency("Send", 5.0)
+    try:
+        _send(m)
+        raise AssertionError("a gateway slower than the deadline must raise Retryable, send_push returned")
+    except m.Retryable:
+        pass
+    assert len(ctx.grpc.calls_to("Send")) == 1, "DEADLINE_EXCEEDED must not be retried: the consumer re-queues the record instead"
+    ctx.grpc.set_latency("Send", 0.0)
+    ctx.grpc.fail("Send", grpc.StatusCode.RESOURCE_EXHAUSTED, times=3)
+    try:
+        _send(m)
+        raise AssertionError("exhausted retries must raise Retryable, send_push returned")
+    except m.Retryable:
+        pass
+    ctx.grpc.fail("Send", grpc.StatusCode.PERMISSION_DENIED, "bad credentials", times=1)
+    try:
+        _send(m)
+        raise AssertionError("PERMISSION_DENIED must propagate as an error, send_push returned")
+    except m.Retryable:
+        raise AssertionError("PERMISSION_DENIED is not transient: it must propagate as a plain error, not Retryable")
+    except grpc.RpcError as e:
+        assert e.code() == grpc.StatusCode.PERMISSION_DENIED
+    assert m.devices.disabled == [], "only INVALID_ARGUMENT / NOT_FOUND disable the token"
+`,
+  },
   debrief: `Three decisions make a provider call safe to put inside a consumer: a deadline, so one stuck call cannot hold a partition; retries only for the statuses that mean "not right now", with backoff and jitter so a provider recovering from an outage is not hit by every worker at once; and a distinct retryable error, so the caller can park the work instead of blocking on it. Disabling a stale token on the spot is what keeps the gateway's error rate honest. Real clients also honour \`Retry-After\` metadata from the gateway, use a circuit breaker when the error rate stays high, and collapse duplicate notifications with the \`collapse_key\` on the device.`,
 };

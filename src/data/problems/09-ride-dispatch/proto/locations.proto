@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package dispatch;
+
+// Driver apps push positions over one client stream (step 2); the server answers once, at the end.
+service Locations {
+  rpc UpdateLocations(stream LocationUpdate) returns (Ack);
+}
+
+message LocationUpdate {
+  string driver_id = 1;
+  string city = 2;
+  double lat = 3;
+  double lng = 4;
+  int64 ts = 5;
+}
+
+message Ack {
+  uint32 count = 1;
+}

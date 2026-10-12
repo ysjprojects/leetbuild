@@ -377,5 +377,62 @@ void shutdown() {
 `,
     },
   },
+  harness: {
+    python: `import json
+import logging
+
+
+def _events(ctx):
+    m = ctx.load("view_events")
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    logging.getLogger().addHandler(handler)
+    return m, records
+
+
+def check_topic(ctx):
+    m, _ = _events(ctx)
+    m.emit_view("cat", 256, True)
+    produced = ctx.kafka.records("image-views")
+    assert len(produced) == 1, f"expected one record on image-views, found {len(produced)}"
+    event = json.loads(produced[0].value)
+    assert event.get("id") == "cat" and event.get("w") == 256 and event.get("hit") is True, f"the value must be JSON with id, w, hit (and ts): {event}"
+    assert "ts" in event, "the event must carry a timestamp"
+
+
+def check_keyed(ctx):
+    m, _ = _events(ctx)
+    m.emit_view("cat", 256, True)
+    m.emit_view("cat", 64, False)
+    produced = ctx.kafka.records("image-views")
+    assert [r.key for r in produced] == [b"cat", b"cat"], f"records must be keyed by the image id, got {[r.key for r in produced]}"
+    assert produced[0].partition == produced[1].partition, "the same image id must land on the same partition"
+
+
+def check_non_blocking(ctx):
+    m, _ = _events(ctx)
+    m.emit_view("cat", 256, True)
+    assert ctx.kafka.flushes == 0, "emit_view must not flush: the request would wait for the broker"
+    assert len(ctx.kafka.records("image-views")) == 1
+
+
+def check_callback(ctx):
+    m, records = _events(ctx)
+    ctx.kafka.fail_next("image-views")
+    m.emit_view("cat", 256, True)  # the failure arrives through the delivery callback, not as an exception
+    m.emit_view("cat", 256, True)  # poll() on the next call serves the pending callback at the latest
+    m.shutdown()
+    warnings = [r for r in records if r.levelno >= logging.WARNING]
+    assert warnings, "a failed delivery must be logged by the delivery callback"
+
+
+def check_flush(ctx):
+    m, _ = _events(ctx)
+    m.emit_view("cat", 256, True)
+    m.shutdown()
+    assert ctx.kafka.flushes >= 1, "shutdown() must flush the producer"
+`,
+  },
   debrief: `A Kafka producer is a buffer with a background thread: \`produce\`/\`send\` costs microseconds, the network happens later in batches. That is what makes "emit an event per request" free — as long as nobody blocks on the acknowledgement. The key is your ordering contract: same key → same partition → same order for that image. Real systems also set \`acks=all\` for events they cannot afford to lose, enable idempotent producers so retries do not duplicate, and never let the buffer grow unbounded (\`queue.buffering.max.messages\`, back-pressure).`,
 };

@@ -24,8 +24,14 @@ interface Props {
   onSubmit?: () => void;
   /** Baseline text for a unified diff against `value` (viewers only): the learner's code under the solution. */
   original?: string | null;
-  /** Editable editors only replace their document (discarding edits) when this key changes. */
-  resetKey?: string | number;
+  /**
+   * Identity of the file being edited (editors only). When it changes the view swaps to that
+   * file's own editor state — undo history and selection stay per file, and Cmd+Z never pulls
+   * another file's text into this one.
+   */
+  fileKey?: string;
+  /** Editors replace the open file's document with `value` in place when this changes (reset, load solution); undo brings the edits back. */
+  resetKey?: number;
   viewRef?: MutableRefObject<EditorView | null>;
   className?: string;
 }
@@ -36,14 +42,31 @@ const languageExtensions = (language: Language): Extension => [
   indentUnit.of(INDENT[language].unit),
 ];
 
+/** Files whose editor state (undo history, selection) is kept while other files are open: a whole course in every language. */
+const STATE_CACHE = 32;
+
 const StepEditor = memo(
-  ({value, language, readOnly = false, onChange, onSubmit, original = null, resetKey, viewRef, className}: Props) => {
+  ({
+    value,
+    language,
+    readOnly = false,
+    onChange,
+    onSubmit,
+    original = null,
+    fileKey,
+    resetKey,
+    viewRef,
+    className,
+  }: Props) => {
     const host = useRef<HTMLDivElement>(null);
     const view = useRef<EditorView | null>(null);
     const onChangeRef = useRef(onChange);
     const onSubmitRef = useRef(onSubmit);
     const languageCompartment = useRef(new Compartment());
     const diffCompartment = useRef(new Compartment());
+    /** Editor state of every file opened on this view, by `fileKey`; restored when the file is reopened. */
+    const states = useRef(new Map<string, EditorState>());
+    const lastFileKey = useRef(fileKey);
     const lastResetKey = useRef(resetKey);
     onChangeRef.current = onChange;
     onSubmitRef.current = onSubmit;
@@ -101,14 +124,14 @@ const StepEditor = memo(
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    // Grammar and indentation follow `language`; document replacement is driven by `resetKey`/`value` below.
+    // Grammar and indentation follow `language`; document swaps and replacements are driven by `fileKey`/`resetKey` below.
     useEffect(() => {
       const v = view.current;
       if (v === null) return;
       v.dispatch({effects: languageCompartment.current.reconfigure(languageExtensions(language))});
     }, [language]);
 
-    // Viewers follow `value`/`original`; editors only follow `resetKey`.
+    // Viewers follow `value`/`original`; editors swap states on `fileKey` and replace in place on `resetKey`.
     useEffect(() => {
       const v = view.current;
       if (v === null) return;
@@ -120,12 +143,34 @@ const StepEditor = memo(
         }
         return;
       }
+      if (lastFileKey.current !== fileKey) {
+        const cache = states.current;
+        // The reopened file's state leaves the cache (it lives in the view now); the outgoing file's
+        // state joins at the end, so the map stays in least-recently-open order for eviction.
+        const cached = fileKey === undefined ? undefined : cache.get(fileKey);
+        if (fileKey !== undefined) cache.delete(fileKey);
+        if (lastFileKey.current !== undefined) {
+          cache.set(lastFileKey.current, v.state);
+          if (cache.size > STATE_CACHE) {
+            const [oldest] = cache.keys();
+            cache.delete(oldest);
+          }
+        }
+        lastFileKey.current = fileKey;
+        lastResetKey.current = resetKey;
+        // A cached state is only reused when the file was not rewritten meanwhile (reset, load solution).
+        v.setState(
+          cached !== undefined && cached.doc.toString() === value ? cached : buildStateRef.current(value, null),
+        );
+        v.dispatch({effects: languageCompartment.current.reconfigure(languageExtensions(language))});
+        return;
+      }
       if (lastResetKey.current === resetKey) return;
       lastResetKey.current = resetKey;
       if (v.state.doc.toString() !== value) {
         v.dispatch({changes: {from: 0, to: v.state.doc.length, insert: value}});
       }
-    }, [value, original, readOnly, resetKey]);
+    }, [value, original, readOnly, fileKey, resetKey, language]);
 
     return <div className={className} ref={host} />;
   },

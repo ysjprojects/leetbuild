@@ -487,5 +487,88 @@ void run() {
 `,
     },
   },
+  harness: {
+    python: `import json
+
+
+def _event(ctx, kind, post_id, event_id, user="alice"):
+    value = {"event_id": event_id, "type": kind, "post_id": post_id, "user_id": user, "ts": 1700000000000}
+    ctx.kafka.seed("engagement", key=post_id, value=json.dumps(value))
+
+
+def check_group(ctx):
+    _event(ctx, "like", "p1", "e1")
+    m = ctx.load("engagement_worker")
+    subscriptions = [e for e in ctx.kafka.events if e[0] == "subscribe"]
+    assert subscriptions, "the consumer must subscribe to a topic"
+    group, topics = subscriptions[-1][1], subscriptions[-1][2]
+    assert group == "engagement-rollup", f"group.id must be engagement-rollup, got {group!r}"
+    assert "engagement" in topics, f"the consumer must subscribe to engagement, got {topics}"
+    ctx.drain(m.run)
+    assert ctx.redis.hget("stats:p1", "likes") == "1", f"after one like event stats:p1 likes is {ctx.redis.hget('stats:p1', 'likes')!r}, expected 1"
+
+
+def check_manual_commit(ctx):
+    _event(ctx, "like", "p1", "e1")
+    _event(ctx, "like", "p1", "e2", "bob")
+    m = ctx.load("engagement_worker")
+    ctx.drain(m.run)
+    assert ctx.kafka.consumers[-1].auto_commit is False, "enable.auto.commit must be False: offsets would be committed on a timer, before the event was counted"
+    assert not any(e[0] == "auto-commit" for e in ctx.kafka.events), "auto-commit is on: offsets were committed on a timer, before processing"
+    assert any(e[0] == "manual-commit" for e in ctx.kafka.events), "no explicit commit happened"
+    assert ctx.kafka.lag("engagement-rollup", "engagement") == 0, "every processed record must be committed"
+
+
+def check_dedupe(ctx):
+    _event(ctx, "like", "p1", "e1")
+    _event(ctx, "like", "p1", "e1")  # the replay
+    _event(ctx, "like", "p1", "e2", "bob")
+    m = ctx.load("engagement_worker")
+    ctx.drain(m.run)
+    assert ctx.redis.hget("stats:p1", "likes") == "2", f"e1 arrived twice: stats:p1 likes must be 2, got {ctx.redis.hget('stats:p1', 'likes')!r}"
+    assert ctx.redis.exists("seen:e1"), "seen:{event_id} must be claimed with SET NX so a replay finds it"
+    ttl = ctx.redis.ttl("seen:e1")
+    assert 604000 < ttl <= 604800, f"seen:e1 must expire after a week (EX 604800), its TTL is {ttl}"
+    assert ctx.kafka.lag("engagement-rollup", "engagement") == 0, "a duplicate must be skipped but still committed, or it is re-read forever"
+
+
+def check_rollup(ctx):
+    _event(ctx, "like", "p1", "e1")
+    _event(ctx, "like", "p1", "e2", "bob")
+    _event(ctx, "unlike", "p1", "e3")
+    _event(ctx, "comment", "p1", "e4")
+    _event(ctx, "share", "p1", "e5")
+    _event(ctx, "like", "p2", "e6")
+    _event(ctx, "view", "p1", "e7")  # unknown type
+    ctx.kafka.seed("engagement", key="p1", value="not json")
+    ctx.kafka.seed("engagement", key="p1", value=json.dumps({"type": "like"}))  # no event_id, no post_id
+    m = ctx.load("engagement_worker")
+    ctx.drain(m.run)
+    stats = ctx.redis.hgetall("stats:p1")
+    assert stats == {"likes": "1", "comments": "1", "shares": "1"}, f"stats:p1 must be likes 1 (2 likes, 1 unlike), comments 1, shares 1, got {stats}"
+    assert ctx.redis.hget("stats:p2", "likes") == "1", f"stats:p2 likes must be 1, got {ctx.redis.hget('stats:p2', 'likes')!r}"
+    assert ctx.kafka.lag("engagement-rollup", "engagement") == 0, "unknown types and malformed records must be skipped and committed, not crash-looped on"
+
+
+def check_order(ctx):
+    _event(ctx, "like", "p1", "e1")
+    m = ctx.load("engagement_worker")
+    real_hincrby = m.r.hincrby
+    at_hincrby = []
+
+    def hincrby(*args, **kwargs):
+        at_hincrby.append(bool(ctx.redis.exists("seen:e1")))
+        return real_hincrby(*args, **kwargs)
+
+    m.r.hincrby = hincrby
+    at_commit = []
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append((ctx.redis.hget("stats:p1", "likes"), bool(ctx.redis.exists("seen:e1")))))
+    ctx.drain(m.run)
+    assert at_hincrby, "HINCRBY stats:p1 never happened"
+    assert at_hincrby[0] is True, "seen:e1 must be claimed (SET NX) before the HINCRBY, not after"
+    assert at_commit, "the offset was never committed"
+    assert at_commit[0] == ("1", True), f"the commit must come after the claim and the HINCRBY: at commit time stats:p1 likes was {at_commit[0][0]!r} and seen:e1 existed: {at_commit[0][1]}"
+`,
+  },
   debrief: `At-least-once delivery plus an idempotent consumer is how streams get effectively-once results without transactions: the \`SET NX\` claim is the idempotency key of the stream, and the counter only moves for events that won the claim. The window between the claim and the \`HINCRBY\` is the one real gap — a crash there loses the event's count, because the replay finds the key already set. Real rollups close it by doing both in one Lua script, batch commits per poll for throughput, and compute the counters per minute into a time series so "likes in the last hour" is a range read instead of a scan.`,
 };

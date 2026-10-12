@@ -1,11 +1,13 @@
 import type {Problem} from '@/lib/types';
 
+import {protoModules} from './proto';
 import {requestRideStep} from './steps/1-request-ride';
 import {locationStreamStep} from './steps/2-location-stream';
 import {nearestDriversStep} from './steps/3-nearest-drivers';
 import {offerLockStep} from './steps/4-offer-lock';
 import {tripEventsStep} from './steps/5-trip-events';
 import {etaStep} from './steps/6-eta';
+import {supportModules} from './support';
 
 /**
  * Ride dispatch: an idempotent ride request API → driver positions streamed over gRPC into Redis
@@ -73,4 +75,5 @@ you must not let take you down.`,
     ],
   },
   steps: [requestRideStep, locationStreamStep, nearestDriversStep, offerLockStep, tripEventsStep, etaStep],
+  support: {python: {...protoModules, ...supportModules}},
 };

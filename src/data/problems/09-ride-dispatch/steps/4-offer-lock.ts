@@ -463,5 +463,102 @@ void decline(const std::string& ride_id, const std::string& driver_id) {
 `,
     },
   },
+  harness: {
+    python: `def _offers(ctx):
+    m = ctx.load("offers")
+    m.moved_on = []
+    m.next_candidate = m.moved_on.append
+    return m
+
+
+def _race(ctx, m, key, newer):
+    """A GET of the offer key from the client (outside a script/transaction) is answered, then the
+    offer is replaced by a newer ride before the learner can act on it. Returns the list of swaps."""
+    swaps = []
+    real_get = m.r.get
+
+    def get(name, *args, **kwargs):
+        value = real_get(name, *args, **kwargs)
+        if name == key and value is not None and not swaps:
+            ctx.redis.set(key, newer, ex=15)
+            swaps.append(value)
+        return value
+
+    m.r.get = get
+    return swaps
+
+
+def check_offer_nx(ctx):
+    m = _offers(ctx)
+    assert m.offer("r-42", "d-7") is True, "the first offer to a free driver must return True"
+    assert ctx.redis.get("offer:driver:d-7") == "r-42", f"offer:driver:d-7 holds {ctx.redis.get('offer:driver:d-7')!r}, expected the ride id r-42"
+    ttl = ctx.redis.ttl("offer:driver:d-7")
+    assert 0 < ttl <= 15, f"offer:driver:d-7 has TTL {ttl}, expected EX 15"
+    assert m.offer("r-43", "d-7") is False, "a driver with an open offer must be skipped: the second offer must return False"
+    assert ctx.redis.get("offer:driver:d-7") == "r-42", "the second offer overwrote the first: the SET must be NX"
+    assert m.offer("r-43", "d-8") is True, "another driver is free and must get the offer"
+    ctx.clock.advance(16)
+    assert m.offer("r-44", "d-7") is True, "after the 15 s window the driver is free again"
+    assert ctx.redis.get("offer:driver:d-7") == "r-44"
+
+
+def check_compare_and_delete(ctx):
+    m = _offers(ctx)
+    m.offer("r-42", "d-7")
+    assert m.accept("r-99", "d-7") is False, "accepting a ride that is not the one on offer must return False"
+    assert ctx.redis.get("offer:driver:d-7") == "r-42", "a mismatched accept must leave the offer in place"
+    assert m.accept("r-42", "d-7") is True, "accepting the ride on offer must return True"
+    assert ctx.redis.get("offer:driver:d-7") is None, "a successful accept must release the offer key"
+    assert m.accept("r-42", "d-7") is False, "the offer is gone: a second accept must return False"
+    m.offer("r-50", "d-8")
+    ctx.clock.advance(16)  # the offer expired unanswered ...
+    m.offer("r-51", "d-8")  # ... and a newer ride landed under the key
+    assert m.accept("r-50", "d-8") is False, "a stale accept after the offer expired must return False"
+    assert ctx.redis.get("offer:driver:d-8") == "r-51", "the stale accept deleted the newer offer r-51: compare and delete must be one atomic step"
+    # The race itself: a GET-then-DEL from the client lets the key change in between.
+    m.offer("r-60", "d-9")
+    swaps = _race(ctx, m, "offer:driver:d-9", "r-61")
+    got = m.accept("r-60", "d-9")
+    if swaps:
+        assert got is False and ctx.redis.get("offer:driver:d-9") == "r-61", "the offer changed to r-61 between the GET and the DEL and the stale accept still won: the compare and the delete must run atomically (a Lua script or WATCH/MULTI)"
+    else:
+        assert got is True and ctx.redis.get("offer:driver:d-9") is None, "accept of the ride on offer must succeed and release the key"
+
+
+def check_assign_after_accept(ctx):
+    m = _offers(ctx)
+    m.offer("r-42", "d-7")
+    assert m.accept("r-42", "d-7") is True
+    assert ctx.redis.get("ride:r-42:driver") == "d-7", f"after a successful accept ride:r-42:driver must be d-7, got {ctx.redis.get('ride:r-42:driver')!r}"
+    m.offer("r-50", "d-8")
+    assert m.accept("r-51", "d-8") is False
+    assert ctx.redis.get("ride:r-51:driver") is None, "the guarded delete returned 0 but ride:r-51:driver was written: assign only after the release succeeded"
+    assert ctx.redis.get("offer:driver:d-8") == "r-50", "a failed accept must not touch the offer"
+    assert m.accept("r-42", "d-9") is False, "d-9 holds no offer: accept must return False"
+    assert ctx.redis.get("ride:r-42:driver") == "d-7", "a failed accept must not reassign the ride"
+
+
+def check_decline_guarded(ctx):
+    m = _offers(ctx)
+    m.offer("r-42", "d-7")
+    m.decline("r-42", "d-7")
+    assert ctx.redis.get("offer:driver:d-7") is None, "declining the ride on offer must release the key"
+    assert m.moved_on == ["r-42"], f"decline must hand the ride to next_candidate; next_candidate saw {m.moved_on}"
+    m.offer("r-50", "d-8")
+    ctx.clock.advance(16)
+    m.offer("r-51", "d-8")
+    m.decline("r-50", "d-8")
+    assert ctx.redis.get("offer:driver:d-8") == "r-51", "a late decline of r-50 deleted the newer offer r-51: the release must be the guarded delete, never a blind DEL"
+    assert m.moved_on == ["r-42", "r-50"], f"a late decline still moves the ride on; next_candidate saw {m.moved_on}"
+    m.offer("r-60", "d-9")
+    swaps = _race(ctx, m, "offer:driver:d-9", "r-61")
+    m.decline("r-60", "d-9")
+    if swaps:
+        assert ctx.redis.get("offer:driver:d-9") == "r-61", "the offer changed to r-61 between the GET and the DEL and decline deleted it anyway: compare and delete atomically"
+    else:
+        assert ctx.redis.get("offer:driver:d-9") is None, "declining the ride on offer must release the key"
+    assert m.moved_on[-1] == "r-60", "decline must call next_candidate with the declined ride"
+`,
+  },
   debrief: `This is the Redis lock pattern in its honest form: \`SET NX EX\` to acquire with a lease, a value that identifies the holder, and a compare-and-delete to release — the only way a release cannot remove someone else's lock after yours expired. The lease is also the product rule (an offer lasts 15 s), so expiry and business logic coincide. Real dispatchers offer one ride to several drivers at once and let the first accept win (the same compare-and-delete, keyed by ride), add a per-ride lock so two dispatcher instances do not offer the same ride, and record every offer and answer for the matching model.`,
 };

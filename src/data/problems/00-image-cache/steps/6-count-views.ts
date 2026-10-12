@@ -398,5 +398,54 @@ void run() {
 `,
     },
   },
+  harness: {
+    python: `import json
+
+
+def _seed(ctx, *ids):
+    for image_id in ids:
+        ctx.kafka.seed("image-views", key=image_id, value=json.dumps({"id": image_id, "w": 256, "hit": True}))
+
+
+def check_group(ctx):
+    _seed(ctx, "cat")
+    m = ctx.load("view_counter")
+    subscriptions = [e for e in ctx.kafka.events if e[0] == "subscribe"]
+    assert subscriptions, "the consumer must subscribe to a topic"
+    group, topics = subscriptions[-1][1], subscriptions[-1][2]
+    assert group == "view-counter", f"group.id must be view-counter, got {group!r}"
+    assert "image-views" in topics, f"the consumer must subscribe to image-views, got {topics}"
+    ctx.drain(m.run)
+
+
+def check_manual_commit(ctx):
+    _seed(ctx, "cat", "dog")
+    m = ctx.load("view_counter")
+    ctx.drain(m.run)
+    assert not any(e[0] == "auto-commit" for e in ctx.kafka.events), "auto-commit is on: offsets were committed on a timer, before processing"
+    assert any(e[0] == "manual-commit" for e in ctx.kafka.events), "no explicit commit happened"
+    assert ctx.kafka.lag("view-counter", "image-views") == 0, "every processed record must be committed"
+
+
+def check_incr(ctx):
+    _seed(ctx, "cat", "cat", "dog", "cat")
+    m = ctx.load("view_counter")
+    ctx.drain(m.run)
+    assert ctx.redis.get("views:cat") == "3", f"views:cat is {ctx.redis.get('views:cat')!r}, expected 3"
+    assert ctx.redis.get("views:dog") == "1", f"views:dog is {ctx.redis.get('views:dog')!r}, expected 1"
+
+
+def check_commit_after(ctx):
+    _seed(ctx, "cat")
+    ctx.kafka.seed("image-views", key="bad", value="not json")
+    at_commit = []
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append(ctx.redis.get("views:cat")))
+    m = ctx.load("view_counter")
+    ctx.drain(m.run)
+    assert at_commit, "the offset was never committed"
+    assert at_commit[0] == "1", "the commit must come after INCR: at commit time views:cat was still unset"
+    assert ctx.kafka.lag("view-counter", "image-views") == 0, "a malformed record must be skipped and committed, not left to replay forever"
+`,
+  },
   debrief: `Where the commit sits relative to the side effect decides the delivery guarantee: commit-then-process is at-most-once (crash → lost), process-then-commit is at-least-once (crash → replayed). A counter tolerates a rare duplicate; a payment does not, which is why the merchant problem stores the record id to make its writes idempotent. Real consumers commit in batches for throughput, handle rebalances (\`on_revoke\` → commit what you have), and send poison records to a dead-letter topic instead of just logging them.`,
 };

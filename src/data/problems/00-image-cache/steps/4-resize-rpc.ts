@@ -325,5 +325,76 @@ std::optional<std::string> render(const std::string& id, int width) {
 `,
     },
   },
+  harness: {
+    python: `import grpc
+
+import resizer_pb2
+import resizer_pb2_grpc
+
+
+class FakeResizer(resizer_pb2_grpc.ResizerServicer):
+    def __init__(self):
+        self.calls = 0
+
+    def Resize(self, request, context):
+        self.calls += 1
+        if request.image_id == "ghost":
+            context.abort(grpc.StatusCode.NOT_FOUND, "no such image")
+        return resizer_pb2.ResizeReply(jpeg=b"JPEG-" + request.image_id.encode() + b"-" + str(request.width).encode())
+
+
+def _client(ctx):
+    peer = FakeResizer()
+    ctx.grpc.serve(resizer_pb2_grpc.add_ResizerServicer_to_server, peer)
+    return ctx.load("resizer_client"), peer
+
+
+def check_deadline(ctx):
+    m, peer = _client(ctx)
+    assert m.render("cat", 256) == b"JPEG-cat-256", "render must return the resizer's bytes"
+    call = ctx.grpc.calls_to("Resize")[-1]
+    assert call.timeout is not None, "the RPC carries no deadline"
+    assert 0.5 <= call.timeout <= 1.0, f"the deadline must be about 800 ms, got {call.timeout} s"
+    ctx.grpc.set_latency("Resize", 3.0)
+    try:
+        m.render("cat", 128)
+        raise AssertionError("a resizer slower than the deadline must surface DEADLINE_EXCEEDED")
+    except grpc.RpcError as e:
+        assert e.code() == grpc.StatusCode.DEADLINE_EXCEEDED, f"a slow resizer raised {e.code()}, expected DEADLINE_EXCEEDED"
+    assert len(ctx.grpc.calls_to("Resize")) == 2, "DEADLINE_EXCEEDED must not be retried"
+
+
+def check_not_found(ctx):
+    m, peer = _client(ctx)
+    assert m.render("ghost", 256) is None, "NOT_FOUND means the origin has no such image: return None"
+    assert peer.calls == 1, "NOT_FOUND must not be retried"
+
+
+def check_retry_unavailable(ctx):
+    m, peer = _client(ctx)
+    ctx.grpc.fail("Resize", grpc.StatusCode.UNAVAILABLE, times=1)
+    assert m.render("cat", 256) == b"JPEG-cat-256", "one UNAVAILABLE must be retried and succeed"
+    assert len(ctx.grpc.calls_to("Resize")) == 2, "exactly one retry after UNAVAILABLE"
+    ctx.grpc.fail("Resize", grpc.StatusCode.INVALID_ARGUMENT, "width", times=1)
+    try:
+        m.render("cat", 256)
+        raise AssertionError("INVALID_ARGUMENT must propagate, not be retried or swallowed")
+    except grpc.RpcError as e:
+        assert e.code() == grpc.StatusCode.INVALID_ARGUMENT
+    assert len(ctx.grpc.calls_to("Resize")) == 3, "INVALID_ARGUMENT must not be retried"
+
+
+def check_bounded(ctx):
+    m, peer = _client(ctx)
+    ctx.grpc.fail("Resize", grpc.StatusCode.UNAVAILABLE, times=50)
+    try:
+        m.render("cat", 256)
+        raise AssertionError("a resizer that stays UNAVAILABLE must raise, not return")
+    except grpc.RpcError as e:
+        assert e.code() == grpc.StatusCode.UNAVAILABLE
+    attempts = len(ctx.grpc.calls_to("Resize"))
+    assert attempts == 2, f"made {attempts} attempts against a down resizer; retries must stop after the second"
+`,
+  },
   debrief: `Deadlines are the single most important thing a client sets: without one, a slow dependency turns into a slow *you*. Retrying only \`UNAVAILABLE\` — and only a bounded number of times — is what keeps a retry from becoming a retry storm. Production clients add jittered backoff between attempts, honour the server's retry policy, and propagate the caller's deadline instead of picking their own (\`ctx\` in Go, \`grpc-timeout\` on the wire).`,
 };

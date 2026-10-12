@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package gateway;
+
+// The internal catalog step 3 proxies to: one unary RPC with a deadline and request-id metadata.
+service Catalog {
+  rpc GetItem(GetItemRequest) returns (Item);
+}
+
+message GetItemRequest {
+  string id = 1;
+}
+
+message Item {
+  string id = 1;
+  string name = 2;
+  int64 price_cents = 3;
+}

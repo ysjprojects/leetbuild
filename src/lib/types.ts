@@ -138,6 +138,13 @@ export interface Step {
   code: Record<Language, StepCode>;
   /** Shown once the step is accepted or revealed: why the solution is shaped this way, what real systems add. */
   debrief: string;
+  /**
+   * Runtime harness per language: a Python module with one `check_<id>(ctx)` per entry of `checks`
+   * (`-` in the id becomes `_`), run against the learner's files in the browser runtime. Its results
+   * decide acceptance; the static matchers become advisory. See public/py/runtime/leetbuild/harness.py
+   * for `ctx`. Python only today.
+   */
+  harness?: Partial<Record<Language, string>>;
 }
 
 export interface Problem {
@@ -154,6 +161,11 @@ export interface Problem {
   statement: string;
   diagram: Diagram;
   steps: Step[];
+  /**
+   * Modules every step of the course can import when it runs, per language: generated protobuf
+   * code (`resizer_pb2.py`), provided helpers (`payments/db.py`). Path → source.
+   */
+  support?: Partial<Record<Language, Record<string, string>>>;
 }
 
 /** `problemId/stepId`: the key attempts and workspaces are stored under. */

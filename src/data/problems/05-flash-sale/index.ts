@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {protoModules} from './proto';
 import {reserveStockStep} from './steps/1-reserve-stock';
 import {checkoutEndpointStep} from './steps/2-checkout-endpoint';
 import {orderIntakeStep} from './steps/3-order-intake';
@@ -75,4 +76,5 @@ and the exact places where each one can lie to the others.`,
     ],
   },
   steps: [reserveStockStep, checkoutEndpointStep, orderIntakeStep, fulfilmentStep, releaseExpiredStep],
+  support: {python: protoModules},
 };

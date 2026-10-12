@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package shortener;
+
+// The key-generation service step 2 calls: one unary RPC reserving a block of counters.
+service KeyService {
+  rpc ReserveBlock(ReserveRequest) returns (ReserveReply);
+}
+
+message ReserveRequest {
+  uint32 size = 1;
+}
+
+message ReserveReply {
+  uint64 start = 1;
+  uint32 size = 2;
+}

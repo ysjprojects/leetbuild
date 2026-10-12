@@ -476,5 +476,77 @@ void enqueue_order(const Order& order) {
 `,
     },
   },
+  harness: {
+    python: `import json
+
+ORDER = {"order_id": "o1", "sku": "shoe-42", "qty": 2, "user": "ada"}
+
+
+def _intake(ctx):
+    m = ctx.load("order_intake")
+    flushes = []
+    original = m.producer.flush
+
+    def flush(*args, **kwargs):
+        timeout = kwargs.get("timeout", args[0] if args else None)
+        flushes.append(timeout)
+        return original(*args, **kwargs)
+
+    m.producer.flush = flush
+    return m, flushes
+
+
+def check_topic_keyed(ctx):
+    m, _ = _intake(ctx)
+    m.enqueue_order(ORDER)
+    produced = ctx.kafka.records("orders")
+    assert len(produced) == 1, f"expected one record on the orders topic, found {len(produced)}"
+    assert produced[0].key == b"shoe-42", f"the record key is {produced[0].key!r}, expected the sku b'shoe-42'"
+    assert json.loads(produced[0].value) == ORDER, f"the record value is {produced[0].value!r}, expected the JSON of the order"
+    m.enqueue_order(dict(ORDER, order_id="o2", user="grace"))
+    m.enqueue_order(dict(ORDER, order_id="o3", sku="hat-7"))
+    produced = ctx.kafka.records("orders")
+    assert [r.key for r in produced] == [b"shoe-42", b"shoe-42", b"hat-7"], f"records must be keyed by sku, got {[r.key for r in produced]}"
+    assert produced[0].partition == produced[1].partition, "two orders for one sku must land on the same partition"
+
+
+def check_durable_producer(ctx):
+    m, _ = _intake(ctx)
+    conf = m.producer.conf
+    acks = str(conf.get("acks", "")).lower()
+    assert acks in ("all", "-1"), f"acks is {conf.get('acks')!r}, expected all: the record must be replicated before it counts as sent"
+    idempotent = conf.get("enable.idempotence")
+    assert idempotent is True or str(idempotent).lower() == "true", f"enable.idempotence is {idempotent!r}, expected True so a retried send cannot duplicate the order"
+    m.enqueue_order(ORDER)
+    assert len(ctx.kafka.records("orders")) == 1, "the order must reach the orders topic"
+
+
+def check_awaits_ack(ctx):
+    m, flushes = _intake(ctx)
+    m.enqueue_order(ORDER)
+    assert ctx.kafka.flushes >= 1, "enqueue_order returned without flushing: the 202 would be a guess, not a fact"
+    assert flushes, "enqueue_order must flush the producer and wait for the acknowledgement"
+    timeout = flushes[0]
+    assert timeout is not None, "flush() was called without a timeout: a slow broker would block the request forever"
+    assert 0 < float(timeout) <= 2.0, f"the ack wait is {timeout} s, expected at most 2 s"
+    delivery = m.producer.conf.get("delivery.timeout.ms")
+    assert delivery is not None, "delivery.timeout.ms is unset: a record could still arrive after the API gave up on it"
+    assert 0 < int(delivery) <= 2000, f"delivery.timeout.ms is {delivery}, expected at most 2000 (the same 2 s as the ack wait)"
+
+
+def check_fails_loud(ctx):
+    m, _ = _intake(ctx)
+    assert issubclass(m.OrderNotAcknowledged, RuntimeError), "OrderNotAcknowledged must stay a RuntimeError so the API's except clause catches it"
+    ctx.kafka.fail_next("orders")
+    try:
+        m.enqueue_order(ORDER)
+        raise AssertionError("the broker reported a delivery error but enqueue_order returned normally; it must raise OrderNotAcknowledged")
+    except m.OrderNotAcknowledged as e:
+        assert "o1" in str(e), f"the error should name the order: {e!r}"
+    assert ctx.kafka.records("orders") == [], "a failed delivery must not leave a record on the topic"
+    m.enqueue_order(dict(ORDER, order_id="o2"))
+    assert len(ctx.kafka.records("orders")) == 1, "after the failure the next order must be acknowledged normally"
+`,
+  },
   debrief: `Two knobs decide what an acknowledged write means: \`acks=all\` makes it "replicated", idempotence makes it "exactly one copy per send". Blocking on that ack is what turns the API's 202 from a hope into a fact, and bounding both the wait and the delivery timeout keeps the two sides of the promise consistent — a record can never sneak in after the hold was released. Real intakes go one step further with the transactional outbox: the order and its event are written in one database transaction and a relay publishes them, so even a crash between "reserved" and "produced" cannot lose an order.`,
 };

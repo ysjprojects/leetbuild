@@ -471,5 +471,130 @@ Eta eta_seconds(const LatLng& origin, const LatLng& dest) {
 `,
     },
   },
+  harness: {
+    python: `import grpc
+
+import geo
+import routing_pb2
+import routing_pb2_grpc
+
+
+class FakeRouting(routing_pb2_grpc.RoutingServicer):
+    def __init__(self):
+        self.calls = 0
+
+    def Eta(self, request, context):
+        self.calls += 1
+        return routing_pb2.EtaReply(seconds=412)
+
+
+def _client(ctx):
+    peer = FakeRouting()
+    ctx.grpc.serve(routing_pb2_grpc.add_RoutingServicer_to_server, peer)
+    return ctx.load("eta_client"), peer
+
+
+def _pair(i=0):
+    """Distinct origin/destination pairs (distinct cache cells) per i."""
+    origin = routing_pb2.LatLng(lat=48.85 + i / 10, lng=2.35)
+    dest = routing_pb2.LatLng(lat=48.86 + i / 10, lng=2.36)
+    return origin, dest
+
+
+def _fallback_seconds(origin, dest):
+    return geo.haversine_km(origin, dest) / 30 * 3600
+
+
+def _key(origin, dest):
+    return f"eta:{geo.cell(origin.lat, origin.lng)}:{geo.cell(dest.lat, dest.lng)}"
+
+
+def check_deadline(ctx):
+    m, peer = _client(ctx)
+    origin, dest = _pair()
+    eta = m.eta_seconds(origin, dest)
+    assert eta.seconds == 412 and not eta.estimated, f"a routing answer of 412 s must be returned as-is, got {eta}"
+    calls = ctx.grpc.calls_to("Eta")
+    assert calls, "no Eta RPC was made"
+    assert calls[-1].timeout is not None, "the Eta call carries no deadline"
+    assert 0.4 <= calls[-1].timeout <= 0.6, f"the deadline must be about 500 ms, got {calls[-1].timeout} s"
+    assert calls[-1].request.origin.lat == origin.lat and calls[-1].request.dest.lng == dest.lng, "the request must carry origin and dest"
+
+
+def check_fallback(ctx):
+    m, peer = _client(ctx)
+    origin, dest = _pair()
+    ctx.grpc.set_latency("Eta", 3.0)
+    eta = m.eta_seconds(origin, dest)
+    expected = _fallback_seconds(origin, dest)
+    assert eta.estimated, f"a routing service slower than the deadline must degrade to an estimate, got {eta}"
+    assert abs(eta.seconds - expected) <= 2, f"the estimate must be haversine_km / 30 km/h in seconds (about {expected:.0f}), got {eta.seconds}"
+    ctx.grpc.set_latency("Eta", 0.0)
+    origin, dest = _pair(1)
+    ctx.grpc.fail("Eta", grpc.StatusCode.UNAVAILABLE, "routing down")
+    eta = m.eta_seconds(origin, dest)
+    assert eta.estimated and abs(eta.seconds - _fallback_seconds(origin, dest)) <= 2, f"UNAVAILABLE must degrade to the straight-line estimate, got {eta}"
+    origin, dest = _pair(2)
+    ctx.grpc.fail("Eta", grpc.StatusCode.INVALID_ARGUMENT, "bad coordinates")
+    try:
+        eta = m.eta_seconds(origin, dest)
+        raise AssertionError(f"INVALID_ARGUMENT must propagate, not be turned into an estimate: got {eta}")
+    except grpc.RpcError as e:
+        assert e.code() == grpc.StatusCode.INVALID_ARGUMENT, f"expected INVALID_ARGUMENT to propagate, got {e.code()}"
+
+
+def check_estimated_flag(ctx):
+    m, peer = _client(ctx)
+    origin, dest = _pair()
+    eta = m.eta_seconds(origin, dest)
+    assert eta.estimated is False, f"a real routing answer must not be flagged as estimated: {eta}"
+    origin, dest = _pair(1)
+    ctx.grpc.set_latency("Eta", 3.0)
+    eta = m.eta_seconds(origin, dest)
+    assert eta.estimated is True, f"the straight-line fallback must be flagged estimated=True so the screen can say '~4 min': {eta}"
+
+
+def check_no_retry(ctx):
+    m, peer = _client(ctx)
+    origin, dest = _pair()
+    ctx.grpc.set_latency("Eta", 3.0)
+    m.eta_seconds(origin, dest)
+    assert len(ctx.grpc.calls_to("Eta")) == 1, f"a slow routing service was called {len(ctx.grpc.calls_to('Eta'))} times; one attempt, then the fallback"
+    ctx.grpc.set_latency("Eta", 0.0)
+    origin, dest = _pair(1)
+    ctx.grpc.fail("Eta", grpc.StatusCode.UNAVAILABLE, "routing down", times=3)
+    eta = m.eta_seconds(origin, dest)
+    assert eta.estimated, "UNAVAILABLE must degrade, not raise"
+    assert len(ctx.grpc.calls_to("Eta")) == 2, f"UNAVAILABLE was retried: {len(ctx.grpc.calls_to('Eta')) - 1} calls for the second request, expected exactly 1"
+
+
+def check_cache_60s(ctx):
+    m, peer = _client(ctx)
+    origin, dest = _pair()
+    key = _key(origin, dest)
+    eta = m.eta_seconds(origin, dest)
+    assert eta.seconds == 412
+    assert ctx.redis.get(key) == "412", f"{key} is {ctx.redis.get(key)!r} after a real answer, expected 412 cached (keys: {ctx.redis.keys('eta:*')})"
+    ttl = ctx.redis.ttl(key)
+    assert 0 < ttl <= 60, f"{key} has TTL {ttl}, expected EX 60"
+    near_origin = routing_pb2.LatLng(lat=origin.lat + 0.001, lng=origin.lng + 0.001)  # same ~1 km cell
+    eta = m.eta_seconds(near_origin, dest)
+    assert eta.seconds == 412 and not eta.estimated
+    assert peer.calls == 1, f"a cached cell pair must not call Routing again (Routing saw {peer.calls} calls)"
+    ctx.clock.advance(61)
+    m.eta_seconds(origin, dest)
+    assert peer.calls == 2, "after 60 s the cached answer has expired and Routing must be asked again"
+    seeded_origin, seeded_dest = _pair(1)
+    ctx.redis.set(_key(seeded_origin, seeded_dest), "99", ex=60)
+    eta = m.eta_seconds(seeded_origin, seeded_dest)
+    assert eta.seconds == 99 and not eta.estimated, f"a cached value must be returned without an RPC, got {eta}"
+    assert peer.calls == 2, "the cache must be read before calling Routing"
+    far_origin, far_dest = _pair(2)
+    ctx.grpc.set_latency("Eta", 3.0)
+    eta = m.eta_seconds(far_origin, far_dest)
+    assert eta.estimated
+    assert ctx.redis.get(_key(far_origin, far_dest)) is None, "an estimate must never be cached: a 500 ms outage would become a 60 s one"
+`,
+  },
   debrief: `Graceful degradation is a design decision made in advance: decide what a *worse but acceptable* answer looks like, and switch to it on exactly the failures that mean "slow or gone". The deadline bounds the cost of finding out, the flag keeps the degradation honest to the caller, and not caching the estimate keeps a 500 ms outage from becoming a 60 s one. Real clients propagate the caller's deadline instead of choosing their own, use hedged requests to a second routing replica, and feed the estimate/actual ratio back to tune the fallback speed per city and hour.`,
 };

@@ -444,5 +444,109 @@ void get_item(const httplib::Request& req, httplib::Response& res) {
 `,
     },
   },
+  harness: {
+    python: `import hashlib
+import json
+
+from fastapi import Response
+
+
+def _cache(ctx):
+    m = ctx.load("response_cache")
+    m.calls = []
+
+    def upstream(request):
+        target = request.url.path + (f"?{request.url.query}" if request.url.query else "")
+        m.calls.append(target)
+        item_id = request.path_params["item_id"]
+        if item_id == "ghost":
+            return Response(content='{"error": "no such item"}', status_code=404, media_type="application/json")
+        if item_id == "down":
+            return Response(content="catalog unavailable", status_code=503, media_type="text/plain")
+        if item_id == "plain":
+            return Response(content=f"plain item, fetch {len(m.calls)}", media_type="text/plain")
+        body = json.dumps({"id": item_id, "name": "Kettle", "price_cents": 3499, "fetch": len(m.calls)})
+        return Response(content=body, media_type="application/json")
+
+    m.upstream = upstream
+    return m
+
+
+def _key(target):
+    return "resp:" + hashlib.sha256(target.encode()).hexdigest()
+
+
+async def check_key_hash(ctx):
+    m = _cache(ctx)
+    async with ctx.client(m.app) as c:
+        r = await c.get("/items/42?fields=name")
+        assert r.status_code == 200, f"GET /items/42?fields=name answered {r.status_code}"
+        await c.get("/items/42")
+    keys = sorted(ctx.redis.keys("*"))
+    for target in ("/items/42?fields=name", "/items/42"):
+        assert ctx.redis.exists(_key(target)), f"no entry under resp:sha256({target!r}) = {_key(target)!r}; Redis holds {keys}"
+    assert len(keys) == 2, f"two distinct targets must make two distinct keys, Redis holds {keys}"
+
+
+async def check_bypass(ctx):
+    m = _cache(ctx)
+    async with ctx.client(m.app) as c:
+        first = await c.get("/items/42")
+        second = await c.get("/items/42")
+        assert second.headers.get("x-cache") == "HIT" and len(m.calls) == 1, "a second request within the TTL must be served from the cache"
+        bypass = await c.get("/items/42", headers={"Cache-Control": "no-cache"})
+        assert len(m.calls) == 2, "Cache-Control: no-cache must reach the upstream, not the cached entry"
+        assert bypass.headers.get("x-cache") == "MISS", f"a bypassed request reports X-Cache {bypass.headers.get('x-cache')!r}, expected MISS"
+        assert bypass.json().get("fetch") == 2, "the bypassed request must answer with the fresh upstream response"
+        after = await c.get("/items/42")
+    assert after.headers.get("x-cache") == "HIT" and len(m.calls) == 2, "the bypassed request still refreshes the entry: the next plain request is a hit"
+    assert after.json().get("fetch") == 2, f"the entry was not refreshed by the bypassed request: served fetch {after.json().get('fetch')}, expected 2"
+
+
+async def check_ttl(ctx):
+    m = _cache(ctx)
+    async with ctx.client(m.app) as c:
+        await c.get("/items/42")
+        ttl = ctx.redis.ttl(_key("/items/42"))
+        assert ttl == 10, f"the entry's TTL is {ttl} (-1 means no expiry), expected EX 10"
+        ctx.clock.advance(9.0)
+        warm = await c.get("/items/42")
+        assert warm.headers.get("x-cache") == "HIT" and len(m.calls) == 1, "9 s after the store the entry is still fresh"
+        ctx.clock.advance(2.0)
+        cold = await c.get("/items/42")
+    assert cold.headers.get("x-cache") == "MISS" and len(m.calls) == 2, "11 s after the store the entry has expired: the upstream must be asked again"
+
+
+async def check_only_200(ctx):
+    m = _cache(ctx)
+    async with ctx.client(m.app) as c:
+        ghost = await c.get("/items/ghost")
+        assert ghost.status_code == 404, f"a 404 from the upstream answered {ghost.status_code}"
+        assert ctx.redis.keys("*") == [], f"a 404 was stored: {ctx.redis.keys('*')}"
+        again = await c.get("/items/ghost")
+        assert again.status_code == 404 and len(m.calls) == 2, "a 404 must be asked upstream again, never served from cache"
+        down = await c.get("/items/down")
+        assert down.status_code == 503, f"a 503 from the upstream answered {down.status_code}"
+        assert ctx.redis.keys("*") == [], f"a 503 was stored: {ctx.redis.keys('*')}"
+        ok = await c.get("/items/42")
+    assert ok.status_code == 200 and ctx.redis.exists(_key("/items/42")), "a 200 must still be stored"
+
+
+async def check_x_cache(ctx):
+    m = _cache(ctx)
+    async with ctx.client(m.app) as c:
+        miss = await c.get("/items/42")
+        hit = await c.get("/items/42")
+        plain_miss = await c.get("/items/plain")
+        plain_hit = await c.get("/items/plain")
+    assert miss.headers.get("x-cache") == "MISS", f"the first request reports X-Cache {miss.headers.get('x-cache')!r}, expected MISS"
+    assert hit.headers.get("x-cache") == "HIT", f"the second request reports X-Cache {hit.headers.get('x-cache')!r}, expected HIT"
+    assert len(m.calls) == 2, f"the upstream was called {len(m.calls)} times for four requests, expected 2 (one per distinct target)"
+    assert hit.status_code == 200 and hit.content == miss.content, "a hit must replay the stored body"
+    assert hit.headers.get("content-type", "").startswith("application/json"), f"a hit must replay the stored content type, got {hit.headers.get('content-type')!r}"
+    assert plain_hit.headers.get("x-cache") == "HIT" and plain_hit.content == plain_miss.content, "text responses are cached like any other 200"
+    assert plain_hit.headers.get("content-type", "").startswith("text/plain"), f"the hit for a text/plain upstream answered Content-Type {plain_hit.headers.get('content-type')!r}: store the content type with the body"
+`,
+  },
   debrief: `A response cache is cache-aside applied to whole HTTP responses, which is why the entry has to carry its content type and why the status guard matters: a cached error is an outage that outlives its cause. Ten seconds is a *micro-cache* — it flattens hot-key bursts without making anyone see stale data for long. Real gateways honour \`Vary\` (per-\`Accept\`, per-tenant keys), respect the upstream's own \`Cache-Control\`, add stale-while-revalidate so a hot key is refreshed in the background, and single-flight concurrent misses as in the stampede step of the image cache.`,
 };

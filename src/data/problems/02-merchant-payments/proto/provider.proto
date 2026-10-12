@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package payments;
+
+// The payment provider step 2 calls: one unary RPC with a deadline and an idempotency key.
+service PaymentProvider {
+  rpc Authorize(AuthorizeRequest) returns (AuthorizeReply);
+}
+
+message AuthorizeRequest {
+  int64 amount_cents = 1;
+  string currency = 2;
+  string card_token = 3;
+  string idempotency_key = 4;
+}
+
+message AuthorizeReply {
+  string authorization_id = 1;
+}

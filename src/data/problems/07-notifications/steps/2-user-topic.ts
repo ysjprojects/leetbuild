@@ -427,5 +427,100 @@ void enqueue(const Notification& n) {
 `,
     },
   },
+  harness: {
+    python: `import json
+
+from confluent_kafka import Producer
+
+
+def _notification(nid, user_id, priority="normal"):
+    return {"id": nid, "user_id": user_id, "channel": "push", "title": "Shipped", "body": "On its way", "priority": priority}
+
+
+def _bus(ctx):
+    m = ctx.load("notification_bus")
+    m.producers = [p for p in vars(m).values() if isinstance(p, Producer)]
+    assert m.producers, "the module must create a confluent_kafka Producer"
+    m.flush_timeouts = []
+    for p in m.producers:
+        original = p.flush
+
+        def flush(*args, _original=original, **kwargs):
+            m.flush_timeouts.append(args[0] if args else kwargs.get("timeout"))
+            return _original(*args, **kwargs)
+
+        p.flush = flush
+    return m
+
+
+def _header(record, name):
+    headers = record.headers or []
+    for key, value in headers.items() if isinstance(headers, dict) else headers:
+        if key == name:
+            return value.decode() if isinstance(value, bytes) else str(value)
+    return None
+
+
+def check_durable_producer(ctx):
+    m = _bus(ctx)
+    conf = m.producers[0].conf
+    acks = conf.get("acks")
+    assert acks in ("all", -1, "-1"), f"the producer must be configured with acks=all, got acks={acks!r}"
+    idempotent = conf.get("enable.idempotence")
+    assert idempotent is True or str(idempotent).lower() == "true", f"the producer must enable enable.idempotence, got {idempotent!r}"
+
+
+def check_keyed(ctx):
+    m = _bus(ctx)
+    m.enqueue(_notification("n1", "u42"))
+    m.enqueue(_notification("n2", "u42"))
+    m.enqueue(_notification("n3", "u7"))
+    produced = ctx.kafka.records("notifications")
+    assert len(produced) == 3, f"expected 3 records on notifications, found {len(produced)}"
+    assert [r.key for r in produced] == [b"u42", b"u42", b"u7"], f"records must be keyed by the user id, got {[r.key for r in produced]}"
+    assert produced[0].partition == produced[1].partition, "one user's notifications must share a partition"
+    assert json.loads(produced[0].value).get("id") == "n1", f"the value must be the notification as JSON, got {produced[0].value!r}"
+
+
+def check_priority_header(ctx):
+    m = _bus(ctx)
+    m.enqueue(_notification("n1", "u42", "high"))
+    m.enqueue(_notification("n2", "u42", "normal"))
+    produced = ctx.kafka.records("notifications")
+    assert len(produced) == 2, f"expected 2 records on notifications, found {len(produced)}"
+    assert _header(produced[0], "priority") == "high", f"the first record must carry a priority=high header, headers were {produced[0].headers!r}"
+    assert _header(produced[1], "priority") == "normal", f"the second record must carry a priority=normal header, headers were {produced[1].headers!r}"
+
+
+def check_wait_ack(ctx):
+    m = _bus(ctx)
+    m.enqueue(_notification("n1", "u42"))
+    assert len(ctx.kafka.records("notifications")) == 1, "the record must be in Kafka when enqueue returns"
+    assert m.flush_timeouts, "enqueue returned without flushing: the 202 was promised before the broker acknowledged"
+    timeout = m.flush_timeouts[-1]
+    assert timeout is not None, "flush() without a timeout can block the request forever"
+    assert 1.0 <= float(timeout) <= 2.5, f"the acknowledgement wait must be bounded by about 2 s, flush was given {timeout!r}"
+
+
+def check_fail_loud(ctx):
+    m = _bus(ctx)
+    ctx.kafka.fail_next("notifications")
+    try:
+        m.enqueue(_notification("n1", "u42"))
+        raise AssertionError("a delivery error must raise BusUnavailable, enqueue returned normally")
+    except m.BusUnavailable:
+        pass
+    assert ctx.kafka.records("notifications") == [], "the failed record must not be in the topic"
+    m.enqueue(_notification("n2", "u42"))
+    assert len(ctx.kafka.records("notifications")) == 1, "after the failure a new enqueue must work"
+    for p in m.producers:
+        p.flush = lambda *args, **kwargs: 1  # still queued when the timeout expires: no delivery report arrives
+    try:
+        m.enqueue(_notification("n3", "u42"))
+        raise AssertionError("no acknowledgement within the timeout must raise BusUnavailable, enqueue returned normally")
+    except m.BusUnavailable:
+        pass
+`,
+  },
   debrief: `Same key → same partition → same order is the only ordering Kafka gives you, and keying by user is exactly the order a user notices. \`acks=all\` plus the idempotent producer make the acknowledged record durable *and* unique across the client's own retries; waiting for that ack is what gives the 202 its meaning. Real producers keep one future per record instead of flushing the whole buffer (so one slow partition does not stall unrelated requests), and set \`delivery.timeout.ms\` so the client's retries and the caller's deadline agree.`,
 };

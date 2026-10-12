@@ -146,7 +146,8 @@ def run_consumer() -> None:
     raise NotImplementedError
 
 
-threading.Thread(target=run_consumer, name="room-bus", daemon=True).start()
+if __name__ == "__main__":
+    threading.Thread(target=run_consumer, name="room-bus", daemon=True).start()
 `,
       solution: `import socket
 import threading
@@ -186,7 +187,8 @@ def run_consumer() -> None:
         local_deliver(record.key().decode(), msg)
 
 
-threading.Thread(target=run_consumer, name="room-bus", daemon=True).start()
+if __name__ == "__main__":
+    threading.Thread(target=run_consumer, name="room-bus", daemon=True).start()
 `,
     },
     go: {
@@ -527,6 +529,106 @@ void run_consumer() {
 }
 `,
     },
+  },
+  harness: {
+    python: `import socket
+
+import chat_pb2
+
+TOPIC = "chat-messages"
+
+
+def _msg(room, user, text, ts=1700000000000):
+    return chat_pb2.ServerMsg(room=room, user=user, text=text, ts=ts)
+
+
+def _recording(m):
+    """Replace the provided local_deliver with a recorder of (room, msg)."""
+    delivered = []
+    m.local_deliver = lambda room, msg: delivered.append((room, msg))
+    return delivered
+
+
+def check_topic_keyed(ctx):
+    m = ctx.load("room_bus")
+    hi = _msg("room-7", "ana", "hi")
+    m.publish("room-7", hi)
+    m.publish("room-8", _msg("room-8", "bo", "yo"))
+    m.publish("room-7", _msg("room-7", "cy", "hey"))
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 3, f"three publish calls produced {len(records)} record(s) to {TOPIC!r}; topics seen: {sorted(ctx.kafka.topics)}"
+    keys = [r.key for r in records]
+    assert keys == [b"room-7", b"room-8", b"room-7"], f"record keys are {keys}, expected the room ids [b'room-7', b'room-8', b'room-7']"
+    assert chat_pb2.ServerMsg.FromString(records[0].value) == hi, f"the record value must be the serialized ServerMsg; parsed back: {chat_pb2.ServerMsg.FromString(records[0].value)!r}"
+    parts = {r.partition for r in records if r.key == b"room-7"}
+    assert len(parts) == 1, f"room-7's messages landed on partitions {sorted(parts)}: keyed by room they stay on one partition"
+    assert ctx.kafka.flushes == 0, "publish must not flush(): the stream handler calls it inline and must not wait on the broker"
+
+
+def check_unique_group(ctx):
+    a = ctx.load("room_bus")
+    b = ctx.load("room_bus")
+    ga, gb = a.GROUP_ID, b.GROUP_ID
+    host = socket.gethostname()
+    assert isinstance(ga, str) and ga.startswith("chat-server-"), f"GROUP_ID is {ga!r}, expected chat-server-{{hostname}}-{{uuid or pid}}"
+    assert host in ga, f"GROUP_ID {ga!r} does not contain the hostname {host!r}"
+    assert len(ga) > len("chat-server-") + len(host) + 1, f"GROUP_ID {ga!r} needs a per-process part (uuid or pid) after the hostname"
+    assert ga != gb, f"two instances on this host computed the same group id {ga!r}: with a shared group the topic is split between them instead of broadcast"
+    groups = {c.group for c in ctx.kafka.consumers}
+    assert ga in groups and gb in groups, f"the broker saw consumer groups {sorted(groups)}, expected the consumers to use group.id = GROUP_ID ({ga!r}, {gb!r})"
+    da, db = _recording(a), _recording(b)
+    seeded = set()
+
+    def on_subscribe(group, topics):  # each instance's first subscription is answered by one new message
+        if group in seeded:
+            return
+        seeded.add(group)
+        a.publish("room-7", _msg("room-7", "ana", "hello from " + ("A" if group == ga else "B")))
+
+    ctx.kafka.on_subscribe(on_subscribe)
+    ctx.drain(a.run_consumer)  # A joins and sees 'hello from A'
+    ctx.drain(b.run_consumer)  # B joins; 'hello from B' is produced while both groups exist
+    ctx.drain(a.run_consumer)  # A resumes from its committed offset
+    texts_a = [msg.text for _, msg in da]
+    texts_b = [msg.text for _, msg in db]
+    assert texts_b == ["hello from B"], f"instance B delivered {texts_b}, expected ['hello from B']"
+    assert texts_a == ["hello from A", "hello from B"], f"instance A delivered {texts_a}, expected ['hello from A', 'hello from B']: with one group per instance every instance receives every message"
+
+
+def check_latest(ctx):
+    m = ctx.load("room_bus")
+    delivered = _recording(m)
+    ctx.kafka.seed(TOPIC, key="room-7", value=_msg("room-7", "ana", "yesterday").SerializeToString())
+    ctx.kafka.on_subscribe(lambda group, topics: m.publish("room-7", _msg("room-7", "bo", "now")))
+    ctx.drain(m.run_consumer)
+    texts = [msg.text for _, msg in delivered]
+    assert texts == ["now"], f"a freshly started instance delivered {texts}, expected ['now']: a new group must start at the latest offset, not replay 'yesterday'"
+    conf = ctx.kafka.consumers[-1].conf
+    assert str(conf.get("auto.offset.reset", "")).lower() == "latest", f"auto.offset.reset is {conf.get('auto.offset.reset')!r}: set it to 'latest' explicitly"
+
+
+def check_deliver(ctx):
+    m = ctx.load("room_bus")
+    delivered = _recording(m)
+    expected = [("room-7", _msg("room-7", "ana", "hi", 1)), ("room-8", _msg("room-8", "bo", "yo", 2)), ("room-7", _msg("room-7", "cy", "hey", 3))]
+
+    def seed(group, topics):
+        for room, msg in expected:
+            m.publish(room, msg)
+
+    ctx.kafka.on_subscribe(seed)
+    ctx.drain(m.run_consumer)
+    subscribed = [e for e in ctx.kafka.events if e[0] == "subscribe" and TOPIC in e[2]]
+    assert subscribed, f"the consumer never subscribed to {TOPIC!r} (subscribe events: {[e for e in ctx.kafka.events if e[0] == 'subscribe']})"
+    assert len(delivered) == 3, f"three records were produced but local_deliver was called {len(delivered)} time(s)"
+    for room, msg in delivered:
+        assert isinstance(msg, chat_pb2.ServerMsg), f"local_deliver must receive a decoded ServerMsg, got {type(msg).__name__}"
+    got = sorted((room, msg.user, msg.text, msg.ts) for room, msg in delivered)
+    want = sorted((room, msg.user, msg.text, msg.ts) for room, msg in expected)
+    assert got == want, f"local_deliver received {got}, expected {want} (room = the record key, msg = the decoded value)"
+    room7 = [msg.text for room, msg in delivered if room == "room-7"]
+    assert room7 == ["hi", "hey"], f"room-7's messages were delivered as {room7}, expected ['hi', 'hey'] in production order"
+`,
   },
   debrief: `Kafka's consumer group is a *work-sharing* primitive: partitions are divided among the members. Fan-out wants the opposite, so each instance becomes a group of one and reads the whole topic — the same topic serves both patterns depending on how you name your groups. Keying by room keeps each room's messages ordered without ordering the whole world, and \`latest\` plus auto-commit is the honest choice for live delivery: what matters is now, and history has its own store. Real systems put a sequence number in each message so clients can detect gaps, use Redis Pub/Sub or a dedicated pub/sub layer when Kafka's per-partition latency is too high, and cap fan-out with room sharding for very large rooms.`,
 };

@@ -431,5 +431,79 @@ void publish_order(const Order& order) {
 `,
     },
   },
+  harness: {
+    python: `import json
+
+
+def _publisher(ctx):
+    m = ctx.load("order_publisher")
+    flushes = []  # the timeout each flush() was called with
+    real_flush = m.producer.flush
+
+    def flush(*args, **kwargs):
+        flushes.append(args[0] if args else kwargs.get("timeout"))
+        return real_flush(*args, **kwargs)
+
+    m.producer.flush = flush
+    return m, flushes
+
+
+def _order(m, order_id="o-1", symbol="ACME"):
+    return m.Order(order_id, symbol, "BUY", 10.05, 100, "c-1")
+
+
+def check_keyed_by_symbol(ctx):
+    m, _ = _publisher(ctx)
+    m.publish_order(_order(m, "o-1", "ACME"))
+    m.publish_order(_order(m, "o-2", "ACME"))
+    m.publish_order(_order(m, "o-3", "BETA"))
+    produced = ctx.kafka.records("orders")
+    assert len(produced) == 3, f"expected three records on orders, found {len(produced)}"
+    assert [r.key for r in produced] == [b"ACME", b"ACME", b"BETA"], f"records must be keyed by the symbol, got {[r.key for r in produced]}"
+    assert produced[0].partition == produced[1].partition, "two ACME orders must land on the same partition"
+    value = json.loads(produced[0].value)
+    assert value.get("order_id") == "o-1" and value.get("symbol") == "ACME" and value.get("qty") == 100, f"the value must be the JSON of the order, got {value}"
+
+
+def check_acks_all(ctx):
+    m, _ = _publisher(ctx)
+    acks = str(m.producer.conf.get("acks", "")).lower()
+    assert acks in ("all", "-1"), f"the producer is configured with acks={m.producer.conf.get('acks')!r}, expected all"
+
+
+def check_idempotent(ctx):
+    m, _ = _publisher(ctx)
+    value = m.producer.conf.get("enable.idempotence")
+    assert value is True or str(value).lower() == "true", f"enable.idempotence is {value!r}, expected True"
+
+
+def check_waits_for_ack(ctx):
+    m, flushes = _publisher(ctx)
+    m.publish_order(_order(m))
+    assert ctx.kafka.flushes >= 1, "publish_order returned without waiting for the delivery report (no flush)"
+    assert flushes and flushes[0] is not None, "the wait for the acknowledgement must be bounded: flush with a timeout"
+    assert 0 < float(flushes[0]) <= m.ACK_TIMEOUT_S, f"the flush timeout must be ACK_TIMEOUT_S ({m.ACK_TIMEOUT_S}s), got {flushes[0]}"
+
+
+def check_raises(ctx):
+    m, _ = _publisher(ctx)
+    ctx.kafka.fail_next("orders")
+    try:
+        m.publish_order(_order(m))
+        raise AssertionError("a delivery error must raise PublishFailed, publish_order returned normally")
+    except m.PublishFailed:
+        pass
+    assert ctx.kafka.records("orders") == [], "the failed order must not be on the topic"
+    m.publish_order(_order(m, "o-2"))  # the producer is still usable afterwards
+    assert len(ctx.kafka.records("orders")) == 1, "the next order must be published normally"
+    # The broker never answers: flush() returns at the timeout with the report still pending.
+    m.producer.flush = lambda *a, **k: 1
+    try:
+        m.publish_order(_order(m, "o-3"))
+        raise AssertionError("a delivery report that never arrives within ACK_TIMEOUT_S must raise PublishFailed")
+    except m.PublishFailed:
+        pass
+`,
+  },
   debrief: `Same producer API as an analytics event, opposite trade-off: here latency is spent to buy durability, because the 202 already left the building as a promise. \`acks=all\` moves the failure from "lost silently" to "reported", idempotence keeps the broker's own retries from turning one order into two, and the symbol key is what lets the next step keep one book per partition with no locks at all. Real exchanges skip Kafka on the hot path — a sequencer assigns a global sequence number and replicates the input log to standbys synchronously — but the shape is identical: nothing is acknowledged to the client before it is on more than one machine, and everything downstream is a deterministic function of the sequenced log.`,
 };

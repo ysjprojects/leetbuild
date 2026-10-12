@@ -127,7 +127,7 @@ several relays can run without publishing the same row.
       detail:
         'An empty pass sleeps briefly before the next poll; a tight loop over an empty table is a denial of service against your own database.',
       match: {
-        python: {all: [/def run\(\)(?:(?!\ndef )[\s\S])*?time\.sleep\(\s*IDLE_SLEEP_S\s*\)/]},
+        python: {all: [/async def run\(\)(?:(?!\ndef )[\s\S])*?await asyncio\.sleep\(\s*IDLE_SLEEP_S\s*\)/]},
         go: {all: [/func run\((?:(?!\n\})[\s\S])*?time\.Sleep\(\s*idleSleep\s*\)/]},
         scala: {all: [/def run\(\)(?:(?!\n {2}def )[\s\S])*?Thread\.sleep\(\s*IdleSleepMillis\s*\)/]},
         cpp: {all: [/void run\(\)(?:(?!\n\})[\s\S])*?sleep_for\(\s*kIdleSleep\s*\)/]},
@@ -136,12 +136,12 @@ several relays can run without publishing the same row.
   ],
   code: {
     python: {
-      starter: `import logging
-import time
+      starter: `import asyncio
+import logging
 
 from confluent_kafka import KafkaError, Message, Producer
 
-from payments.db import db  # with db.transaction() as cur: begins, runs the block, commits (rolls back on exception)
+from payments.db import db  # async with db.transaction() as cur: begins, runs the block, commits (rolls back on exception)
 
 BATCH = 100
 IDLE_SLEEP_S = 0.5
@@ -150,35 +150,36 @@ log = logging.getLogger("outbox-relay")
 producer = Producer({"bootstrap.servers": "kafka:9092"})  # TODO: acks=all and the idempotent producer
 
 
-def fetch_unsent(cur) -> list[tuple[str, str, str, str]]:
+async def fetch_unsent(cur) -> list[tuple[str, str, str, str]]:
     """(id, topic, key, payload) of up to BATCH unsent rows, locked for this transaction."""
-    cur.execute(
+    await cur.execute(
         "SELECT id, topic, key, payload FROM outbox WHERE sent_at IS NULL ORDER BY created_at LIMIT %s FOR UPDATE SKIP LOCKED",
         (BATCH,),
     )
-    return cur.fetchall()
+    rows = await cur.fetchall()
+    return [(row["id"], row["topic"], row["key"], row["payload"]) for row in rows]
 
 
-def relay_once() -> int:
+async def relay_once() -> int:
     """Publishes one batch of outbox rows; returns how many were delivered."""
-    with db.transaction() as cur:
-        rows = fetch_unsent(cur)
+    async with db.transaction() as cur:
+        rows = await fetch_unsent(cur)
         # TODO: produce each row to its topic keyed by key, with a delivery callback that records the row id
         # TODO: flush — block until every delivery report fired — BEFORE touching the table
         # TODO: UPDATE outbox SET sent_at = now() WHERE id = ANY(%s) for the delivered ids only
         return 0
 
 
-def run() -> None:
+async def run() -> None:
     # TODO: loop relay_once(); sleep IDLE_SLEEP_S when it delivered nothing
     raise NotImplementedError
 `,
-      solution: `import logging
-import time
+      solution: `import asyncio
+import logging
 
 from confluent_kafka import KafkaError, Message, Producer
 
-from payments.db import db  # with db.transaction() as cur: begins, runs the block, commits (rolls back on exception)
+from payments.db import db  # async with db.transaction() as cur: begins, runs the block, commits (rolls back on exception)
 
 BATCH = 100
 IDLE_SLEEP_S = 0.5
@@ -187,19 +188,20 @@ log = logging.getLogger("outbox-relay")
 producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "all", "enable.idempotence": True})
 
 
-def fetch_unsent(cur) -> list[tuple[str, str, str, str]]:
+async def fetch_unsent(cur) -> list[tuple[str, str, str, str]]:
     """(id, topic, key, payload) of up to BATCH unsent rows, locked for this transaction."""
-    cur.execute(
+    await cur.execute(
         "SELECT id, topic, key, payload FROM outbox WHERE sent_at IS NULL ORDER BY created_at LIMIT %s FOR UPDATE SKIP LOCKED",
         (BATCH,),
     )
-    return cur.fetchall()
+    rows = await cur.fetchall()
+    return [(row["id"], row["topic"], row["key"], row["payload"]) for row in rows]
 
 
-def relay_once() -> int:
+async def relay_once() -> int:
     """Publishes one batch of outbox rows; returns how many were delivered."""
-    with db.transaction() as cur:
-        rows = fetch_unsent(cur)
+    async with db.transaction() as cur:
+        rows = await fetch_unsent(cur)
         if not rows:
             return 0
         delivered: list[str] = []
@@ -217,14 +219,14 @@ def relay_once() -> int:
             producer.produce(topic, key=key, value=payload, on_delivery=on_delivery(row_id))
         producer.flush()  # blocks until every delivery report has fired
         if delivered:
-            cur.execute("UPDATE outbox SET sent_at = now() WHERE id = ANY(%s)", (delivered,))
+            await cur.execute("UPDATE outbox SET sent_at = now() WHERE id = ANY(%s)", (delivered,))
         return len(delivered)
 
 
-def run() -> None:
+async def run() -> None:
     while True:
-        if relay_once() == 0:
-            time.sleep(IDLE_SLEEP_S)  # nothing to send: do not hammer the database
+        if await relay_once() == 0:
+            await asyncio.sleep(IDLE_SLEEP_S)  # nothing to send: do not hammer the database
 `,
     },
     go: {
@@ -633,6 +635,107 @@ void run() {
 }
 `,
     },
+  },
+  harness: {
+    python: `import json
+
+SCHEMA = """
+CREATE TABLE outbox (
+    id text PRIMARY KEY,
+    topic text NOT NULL,
+    key text NOT NULL,
+    payload text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    sent_at timestamptz
+);
+"""
+
+
+async def _relay(ctx, *rows):
+    """Reset the outbox, seed (id, merchant) rows on the payments topic, load the relay."""
+    await ctx.db.reset(SCHEMA)
+    for row_id, merchant in rows:
+        await _seed(ctx, row_id, merchant)
+    return ctx.load("outbox_relay")
+
+
+async def _seed(ctx, row_id, merchant, topic="payments"):
+    payload = json.dumps({"event_id": row_id, "type": "payment.captured", "merchant_id": merchant})
+    await ctx.db.execute("INSERT INTO outbox (id, topic, key, payload) VALUES (%s, %s, %s, %s)", (row_id, topic, merchant, payload))
+
+
+async def _sent(ctx):
+    rows = await ctx.db.execute("SELECT id, sent_at FROM outbox ORDER BY id")
+    return {row["id"]: row["sent_at"] is not None for row in rows}
+
+
+async def check_durable_producer(ctx):
+    m = await _relay(ctx, ("e1", "m-1"))
+    conf = getattr(m.producer, "conf", None)
+    assert isinstance(conf, dict), "the module must keep its confluent_kafka Producer as producer"
+    acks = str(conf.get("acks", "")).lower()
+    assert acks in ("all", "-1"), f"acks is {conf.get('acks')!r}, expected 'all': a leader failover could lose an acknowledged payment"
+    idem = conf.get("enable.idempotence")
+    assert idem is True or str(idem).lower() == "true", "enable.idempotence must be on so the producer's own retries cannot duplicate an event"
+    assert await m.relay_once() == 1, "relay_once must return how many rows it delivered"
+
+
+async def check_keyed(ctx):
+    m = await _relay(ctx, ("e1", "m-1"), ("e2", "m-2"), ("e3", "m-1"))
+    await _seed(ctx, "e4", "m-1", topic="refunds")
+    assert await m.relay_once() == 4, "relay_once must return how many rows it delivered"
+    records = ctx.kafka.records("payments")
+    assert len(records) == 3, f"expected 3 records on payments, found {len(records)}"
+    by_id = {json.loads(r.value)["event_id"]: r for r in records}
+    assert set(by_id) == {"e1", "e2", "e3"}, f"the record value must be the row's payload, got {sorted(by_id)}"
+    for event_id, merchant in (("e1", "m-1"), ("e2", "m-2"), ("e3", "m-1")):
+        assert by_id[event_id].key == merchant.encode(), f"record {event_id} is keyed {by_id[event_id].key!r}, expected the merchant id {merchant!r}"
+    assert by_id["e1"].partition == by_id["e3"].partition, "one merchant's events must share a partition"
+    refunds = ctx.kafka.records("refunds")
+    assert len(refunds) == 1 and json.loads(refunds[0].value)["event_id"] == "e4", "each row goes to its own topic column"
+
+
+async def check_ack_before_mark(ctx):
+    m = await _relay(ctx, ("e1", "m-1"), ("e2", "m-2"))
+    ctx.kafka.fail_next("payments", times=1)  # the first produce is refused by the broker (delivery report error)
+    delivered = await m.relay_once()
+    sent = await _sent(ctx)
+    marked = sorted(i for i, s in sent.items() if s)
+    unmarked = sorted(i for i, s in sent.items() if not s)
+    assert len(marked) == 1, f"one of two records was acknowledged; rows marked sent: {marked} - only acknowledged rows may be marked, and acknowledged rows must be"
+    assert len(unmarked) == 1, f"the record whose delivery failed must stay unsent, rows unsent: {unmarked}"
+    assert delivered == 1, f"relay_once returned {delivered}, expected 1 delivered row"
+    assert ctx.db.events == ["BEGIN", "COMMIT"], f"select, produce, flush and update belong to one transaction; the database saw {ctx.db.events}"
+
+
+async def check_mark_delivered(ctx):
+    m = await _relay(ctx, ("e1", "m-1"), ("e2", "m-2"), ("e3", "m-3"))
+    assert await m.relay_once() == 3
+    sent = await _sent(ctx)
+    assert all(sent.values()), f"every delivered row must be marked sent_at, got {sent}"
+    assert await m.relay_once() == 0, "a second pass must find nothing: sent rows are not re-published"
+    assert len(ctx.kafka.records("payments")) == 3, "sent rows were produced again"
+    await _seed(ctx, "e4", "m-4")
+    ctx.kafka.fail_next("payments", times=1)
+    assert await m.relay_once() == 0, "a refused delivery is not a delivered row"
+    assert (await _sent(ctx))["e4"] is False, "a row whose delivery failed must stay unsent for the next pass"
+    assert await m.relay_once() == 1, "the next pass must pick the unsent row up again"
+    assert (await _sent(ctx))["e4"] is True, "the retried row must be marked once delivered"
+    assert len(ctx.kafka.records("payments")) == 4
+
+
+async def check_idle_sleep(ctx):
+    m = await _relay(ctx)
+    ctx.clock.sleep_limit = 2
+    await ctx.drain_async(m.run())
+    assert ctx.clock.sleeps >= 2, "run() must sleep between passes over an empty outbox instead of polling in a tight loop"
+    assert 0.1 <= ctx.clock.offset <= 10.0, f"two idle sleeps advanced the clock by {ctx.clock.offset:.2f} s; the idle sleep should be brief (IDLE_SLEEP_S)"
+    await _seed(ctx, "e1", "m-1")
+    ctx.clock.reset(sleep_limit=0)
+    await ctx.drain_async(m.run())
+    assert (await _sent(ctx))["e1"] is True, "run() must relay a pending row before it sleeps"
+    assert len(ctx.kafka.records("payments")) == 1
+`,
   },
   debrief: `The relay is where "durable" is decided: \`acks=all\` plus the idempotent producer make the broker side safe, and marking rows only after the acknowledgement makes the database side honest about what was published. Everything else is throughput: batches of 100, \`SKIP LOCKED\` so relays scale out, an idle sleep so an empty table costs nothing. Production relays add a \`sent_at\` sweeper that deletes old rows, back off on broker errors, and are usually replaced by change data capture once volume grows.`,
 };

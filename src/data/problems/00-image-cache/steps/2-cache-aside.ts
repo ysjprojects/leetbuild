@@ -337,5 +337,58 @@ std::optional<std::string> get_thumb(const std::string& id, int width) {
 `,
     },
   },
+  harness: {
+    python: `def _cache(ctx, calls):
+    m = ctx.load("thumb_cache")
+
+    def render(image_id, width):
+        calls.append((image_id, width))
+        return b"JPEG-" + image_id.encode() if image_id == "cat" else None
+
+    m.render = render
+    return m
+
+
+def check_key(ctx):
+    m = _cache(ctx, [])
+    assert m.get_thumb("cat", 256) == b"JPEG-cat", "a miss must return the rendered bytes"
+    assert ctx.redis.exists("thumb:cat:256"), "after a miss the bytes must be stored under thumb:cat:256"
+    assert ctx.redis_bytes.get("thumb:cat:256") == b"JPEG-cat", "the cached value must be the rendered bytes"
+    m.get_thumb("cat", 64)
+    assert ctx.redis.exists("thumb:cat:64"), "every width is its own entry: thumb:cat:64"
+
+
+def check_read_first(ctx):
+    calls = []
+    m = _cache(ctx, calls)
+    ctx.redis_bytes.set("thumb:cat:256", b"CACHED")
+    assert m.get_thumb("cat", 256) == b"CACHED", "a hit must return the cached bytes"
+    assert calls == [], "render() must not run on a hit"
+    assert m.get_thumb("cat", 128) == b"JPEG-cat"
+    assert calls == [("cat", 128)], "a miss renders exactly once"
+
+
+def check_ttl(ctx):
+    m = _cache(ctx, [])
+    m.get_thumb("cat", 256)
+    ttl = ctx.redis.ttl("thumb:cat:256")
+    assert 86000 <= ttl <= 86400, f"expected a TTL of 86400 s on thumb:cat:256, got {ttl}"
+    ctx.clock.advance(86401)
+    assert ctx.redis.get("thumb:cat:256") is None, "the entry must be gone once the TTL passes"
+
+
+def check_negative(ctx):
+    calls = []
+    m = _cache(ctx, calls)
+    assert m.get_thumb("ghost", 256) is None, "a missing image returns nothing"
+    assert m.get_thumb("ghost", 256) is None, "a missing image still returns nothing on the second call"
+    assert len(calls) == 1, f"render ran {len(calls)} times for a missing image; the second call must hit the negative cache"
+    ttl = ctx.redis.ttl("thumb:ghost:256")
+    assert 0 < ttl <= 60, f"the negative entry must expire within 60 s, got TTL {ttl}"
+    ctx.clock.advance(61)
+    m.get_thumb("ghost", 256)
+    assert len(calls) == 2, "once the sentinel expires the image is rendered again"
+`,
+  },
   debrief: `Cache-aside keeps the cache a pure optimisation: if Redis is flushed the service still works, only slower. The TTL bounds staleness and memory; the sentinel turns a class of expensive repeated misses into cheap hits. Real caches add jittered TTLs so entries written together do not expire together, and size limits with an eviction policy (\`allkeys-lru\`).`,
 };

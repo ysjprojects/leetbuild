@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package feed;
+
+// The post service step 4 hydrates ids from: one batched unary RPC with a deadline.
+service PostService {
+  rpc GetPosts(GetPostsRequest) returns (GetPostsReply);
+}
+
+message GetPostsRequest {
+  repeated string ids = 1;
+}
+
+message GetPostsReply {
+  repeated Post posts = 1;
+}
+
+message Post {
+  string id = 1;
+  string author = 2;
+  string text = 3;
+  repeated string media_ids = 4;
+  int64 created_at = 5;
+}

@@ -1,19 +1,24 @@
 /**
  * Checks every /leetbuild problem: the shape of the problem (steps, diagram, sequences, hints,
- * widgets), and for every step in every language that the starter fails at least one check while
- * the reference solution passes them all. Run after editing problems:
+ * widgets), for every step in every language that the starter fails at least one static check
+ * while the reference solution passes them all, and for every step with a Python harness that the
+ * solution passes every runtime check while the starter does not (the harness runs in Pyodide,
+ * here in Node). Run after editing problems:
  *
  *   yarn verify                               # everything
  *   yarn verify --problem image-cache         # one problem (by id or NN- prefix)
  *   yarn verify --file src/data/problems/00-image-cache/index.ts   # one problem file, not via the index
  *   yarn verify --verbose                     # list every check result
+ *   yarn verify --no-runtime                  # static checks only (no Pyodide boot)
  */
 import {resolve} from 'node:path';
 
 import {widgetsOf} from '../src/components/Markdown';
 import {describePattern, judge, matches, stripComments} from '../src/lib/judge';
+import {type NodeRuntime, createNodeRuntime} from '../src/lib/runtime/node';
+import {type RunJob, type RunResult} from '../src/lib/runtime/python';
 import {COURSE_POINTS, STEP_POINTS} from '../src/lib/scoring';
-import {type Language, type Problem, type Step, CONCEPTS, LANGUAGES} from '../src/lib/types';
+import {type Language, type Problem, type Step, CONCEPTS, fileName, LANGUAGES} from '../src/lib/types';
 import {WIDGETS} from '../src/lib/widgets';
 
 const args = process.argv.slice(2);
@@ -24,6 +29,7 @@ const flag = (name: string): string | null => {
 const onlyProblem = flag('--problem');
 const onlyFile = flag('--file');
 const verbose = args.includes('--verbose');
+const withRuntime = !args.includes('--no-runtime');
 
 const MIN_STEPS = 4;
 const MIN_CHECKS = 3;
@@ -162,6 +168,15 @@ function verifyProblem(problem: Problem): string[] {
   for (const concept of CONCEPTS) if (!covered.has(concept)) errors.push(`${problem.id}: no step exercises ${concept}`);
   for (const concept of problem.concepts)
     if (!covered.has(concept)) errors.push(`${problem.id}: lists concept ${concept} but no step exercises it`);
+  // The playground shows a course as one filesystem per language: two steps may not own one file.
+  for (const language of LANGUAGES) {
+    const names = new Set<string>();
+    for (const step of problem.steps) {
+      const name = fileName(step.file, language);
+      if (names.has(name)) errors.push(`${problem.id}: two steps own the file ${name}`);
+      names.add(name);
+    }
+  }
   const stepIds = new Set<string>();
   for (const [i, step] of problem.steps.entries()) {
     if (stepIds.has(step.id)) errors.push(`${problem.id}: duplicate step id '${step.id}'`);
@@ -187,19 +202,79 @@ async function loadProblems(): Promise<Problem[]> {
   return problems;
 }
 
+/** The job that runs `step` of `problem` with `code` as its file: every other file is the reference solution. */
+function runJob(problem: Problem, step: Step, language: Language, code: string): RunJob {
+  const files: Record<string, string> = {};
+  for (const s of problem.steps) files[fileName(s.file, language)] = s === step ? code : s.code[language].solution;
+  return {
+    files,
+    support: problem.support?.[language] ?? {},
+    harness: step.harness?.[language] ?? '',
+    checks: step.checks.map(c => c.id),
+  };
+}
+
+const describeRun = (run: RunResult): string =>
+  run.error !== undefined
+    ? `error: ${run.error}`
+    : run.checks
+        .filter(c => !c.passed)
+        .map(c => `${c.id}${c.message ? ` (${c.message})` : ''}`)
+        .join(', ');
+
+/** Runtime checks of one problem: harness shape, solution passes, starter does not. */
+async function verifyRuntime(problem: Problem, runtime: NodeRuntime): Promise<string[]> {
+  const errors: string[] = [];
+  const language: Language = 'python';
+  for (const step of problem.steps) {
+    const harness = step.harness?.[language];
+    if (harness === undefined) continue;
+    const tag = `${problem.id}/${step.id} [${language} runtime]`;
+    for (const check of step.checks) {
+      const name = `check_${check.id.replace(/-/g, '_')}`;
+      if (!new RegExp(`^(async )?def ${name}\\(`, 'm').test(harness)) errors.push(`${tag}: harness defines no ${name}`);
+    }
+    const solution = await runtime.run(runJob(problem, step, language, step.code[language].solution));
+    if (solution.error !== undefined || !solution.checks.every(c => c.passed))
+      errors.push(`${tag}: solution fails — ${describeRun(solution)}`);
+    const starter = await runtime.run(runJob(problem, step, language, step.code[language].starter));
+    if (starter.error === undefined && starter.checks.every(c => c.passed))
+      errors.push(`${tag}: the starter already passes every runtime check`);
+    if (verbose) {
+      console.log(
+        `    runtime  solution ${solution.checks.filter(c => c.passed).length}/${solution.checks.length} (${
+          solution.ms
+        } ms) · starter ${starter.checks.filter(c => c.passed).length}/${starter.checks.length}`,
+      );
+      for (const c of starter.checks) if (!c.passed) console.log(`      starter fails ${c.id}: ${c.message ?? ''}`);
+    }
+  }
+  return errors;
+}
+
 async function main(): Promise<void> {
   const errors: string[] = judgeSelfTest();
   console.log(`${errors.length === 0 ? '✓' : '✗'} judge self-tests`);
   const problems = await loadProblems();
   const ids = new Set<string>();
   let steps = 0;
+  let harnesses = 0;
+  const selected = problems.filter(p => onlyProblem === null || p.id === onlyProblem || onlyProblem.endsWith(p.id));
+  let runtime: NodeRuntime | null = null;
+  if (withRuntime && selected.some(p => p.steps.some(s => s.harness?.python !== undefined))) {
+    const started = Date.now();
+    runtime = await createNodeRuntime();
+    console.log(`✓ python runtime booted (${Date.now() - started} ms)`);
+  }
   for (const problem of problems) {
     if (ids.has(problem.id)) errors.push(`duplicate problem id '${problem.id}'`);
     ids.add(problem.id);
-    if (onlyProblem !== null && problem.id !== onlyProblem && !onlyProblem.endsWith(problem.id)) continue;
+    if (!selected.includes(problem)) continue;
     const started = Date.now();
     const e = verifyProblem(problem);
+    if (runtime !== null) e.push(...(await verifyRuntime(problem, runtime)));
     steps += problem.steps.length;
+    harnesses += problem.steps.filter(s => s.harness?.python !== undefined).length;
     console.log(
       `${e.length === 0 ? '✓' : '✗'} ${problem.title} — ${problem.steps.length} steps (${Date.now() - started} ms)`,
     );
@@ -221,7 +296,11 @@ async function main(): Promise<void> {
     } else console.log(`✓ course totals ${COURSE_POINTS} points`);
   }
   const languages: Language[] = [...LANGUAGES];
-  console.log(`\n${steps} step(s) × ${languages.length} languages checked, ${errors.length} problem(s)`);
+  console.log(
+    `\n${steps} step(s) × ${languages.length} languages checked, ${harnesses} python harness(es)${
+      withRuntime ? ' run' : ' skipped'
+    }, ${errors.length} problem(s)`,
+  );
   for (const e of errors) console.log(`  - ${e}`);
   process.exitCode = errors.length === 0 ? 0 : 1;
 }

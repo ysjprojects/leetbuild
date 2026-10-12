@@ -527,5 +527,104 @@ void run() {
 `,
     },
   },
+  harness: {
+    python: `import json
+
+
+def _order(order_id, symbol, side, price, qty):
+    return json.dumps({"order_id": order_id, "symbol": symbol, "side": side, "price": price, "qty": qty, "client_order_id": "c-" + order_id})
+
+
+def _seed(ctx, *orders):
+    for order_id, symbol, side, price, qty in orders:
+        ctx.kafka.seed("orders", key=symbol, value=_order(order_id, symbol, side, price, qty))
+
+
+def _run(ctx):
+    """Load the engine after seeding (it subscribes at import) and drain the orders topic."""
+    m = ctx.load("match_engine")
+    ctx.drain(m.run)
+    return m
+
+
+def _trades(ctx):
+    return [json.loads(r.value) for r in ctx.kafka.records("trades")]
+
+
+def check_group(ctx):
+    _seed(ctx, ("o-1", "ACME", "BUY", 10.05, 100))
+    _run(ctx)
+    subscriptions = [e for e in ctx.kafka.events if e[0] == "subscribe"]
+    assert subscriptions, "the consumer never subscribed"
+    group, topics = subscriptions[-1][1], subscriptions[-1][2]
+    assert group == "engine", f"the consumer joined group {group!r}, expected engine"
+    assert topics == ["orders"], f"the consumer subscribed to {topics}, expected ['orders']"
+    delivered = [e for e in ctx.kafka.events if e[0] == "deliver" and e[1] == "engine"]
+    assert delivered, "group engine consumed nothing from orders"
+
+
+def check_manual_commit(ctx):
+    _seed(ctx, ("o-1", "ACME", "BUY", 10.05, 100))
+    _run(ctx)
+    consumer = ctx.kafka.consumers[-1]
+    assert consumer.auto_commit is False, "enable.auto.commit must be False: the offset moves only when the engine says so"
+    assert not any(e[0] == "auto-commit" for e in ctx.kafka.events), "offsets were auto-committed"
+    assert any(e[0] == "manual-commit" for e in ctx.kafka.events), "the engine never committed the offset explicitly"
+    assert ctx.kafka.lag("engine", "orders") == 0, f"after draining, the engine still has {ctx.kafka.lag('engine', 'orders')} uncommitted orders"
+
+
+def check_match(ctx):
+    _seed(
+        ctx,
+        ("o-1", "ACME", "BUY", 10.05, 100),
+        ("o-2", "BETA", "SELL", 9.00, 100),  # another symbol: must not cross with ACME
+        ("o-3", "ACME", "SELL", 10.00, 60),  # crosses o-1 at the resting price
+    )
+    _run(ctx)
+    trades = _trades(ctx)
+    assert len(trades) == 1, f"expected exactly one fill (ACME 60 @ 10.05), found {len(trades)} trades: {trades}"
+    fill = trades[0]
+    assert fill.get("symbol") == "ACME" and fill.get("qty") == 60 and fill.get("price") == 10.05, f"the fill must be 60 ACME at the resting price 10.05, got {fill}"
+    assert fill.get("buy_order_id") == "o-1" and fill.get("sell_order_id") == "o-3", f"the fill must name o-1 (buy) and o-3 (sell), got {fill}"
+
+
+def check_trades(ctx):
+    _seed(
+        ctx,
+        ("o-1", "ACME", "SELL", 10.05, 50),
+        ("o-2", "ACME", "SELL", 10.06, 50),
+        ("o-3", "ACME", "BUY", 10.10, 80),  # fills 50 @ 10.05 then 30 @ 10.06
+    )
+    _run(ctx)
+    records = ctx.kafka.records("trades")
+    assert len(records) == 2, f"two fills must become two trades records, found {len(records)}"
+    assert all(r.key == b"ACME" for r in records), f"trades must be keyed by the symbol, got {[r.key for r in records]}"
+    assert records[0].partition == records[1].partition, "one symbol's trades must stay on one partition"
+    fills = [(t.get("price"), t.get("qty")) for t in _trades(ctx)]
+    assert fills == [(10.05, 50), (10.06, 30)], f"expected fills [(10.05, 50), (10.06, 30)] in price-time order, got {fills}"
+
+
+def check_commit_after(ctx):
+    _seed(
+        ctx,
+        ("o-1", "ACME", "BUY", 10.05, 100),
+        ("o-2", "ACME", "SELL", 10.00, 40),
+    )
+    ctx.kafka.seed("orders", key="ACME", value="this is not an order")
+    m = ctx.load("match_engine")
+    seen = []  # (trades on the broker, trades still awaiting their delivery report) at the moment of each commit
+    ctx.kafka.on_commit(lambda group, offsets: seen.append((len(ctx.kafka.records("trades")), len(m.producer))))
+    ctx.drain(m.run)
+    assert len(_trades(ctx)) == 1, f"expected one fill, found {len(_trades(ctx))}"
+    assert len(seen) == 3, f"expected one commit per record (two orders and one malformed), found {len(seen)}"
+    assert seen[1][0] == 1, "the offset of the crossing order was committed before its trade reached the broker"
+    assert seen[1][1] == 0, "the offset of the crossing order was committed while its trade was still waiting for the broker's acknowledgement: flush first"
+    events = ctx.kafka.events
+    produced = next(i for i, e in enumerate(events) if e[0] == "produce" and e[1] == "trades")
+    committed = next(i for i, e in enumerate(events) if i > produced and e[0] == "commit")
+    assert any(e[0] == "flush" for e in events[produced:committed]), "no flush between producing the trade and committing its order: the trade could still sit in the producer buffer"
+    assert ctx.kafka.lag("engine", "orders") == 0, "the malformed record must be skipped and committed so the partition does not stall"
+`,
+  },
   debrief: `The consumer group turns the partition key into ownership: whoever holds the \`ACME\` partition holds the \`ACME\` book, so the hottest structure in the system runs single-threaded with no lock. Producing the trades before committing keeps the offset honest — but with an in-memory book, a replay is not idempotent, which is the gap that separates this exercise from a real engine. Real engines close it by making the book a pure function of the sequenced input: on restart they rebuild from a snapshot plus the log (the commit is just a bookmark), and they deduplicate by sequence number so a replayed order is recognised, not re-matched. Add to that a warm standby consuming the same partition a few messages behind, and you have the failover story of every exchange.`,
 };
