@@ -1,4 +1,4 @@
-import {type FC, memo, useCallback, useMemo, useState} from 'react';
+import {type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 
 import {leetbuildHighlighter} from '@/lib/highlight';
 import {type StepAttempt, HINT_COST, potentialScore, problemScore, STEP_POINTS} from '@/lib/scoring';
@@ -327,6 +327,12 @@ const ProblemPane: FC<{
     const onStepTab = useCallback(() => onTab('step'), [onTab]);
     const hasNext = stepIndex < problem.steps.length - 1;
     const done = attempt.status !== 'open';
+    // A new step (or tab) starts at the top: the diagram's highlight, the rail, then the heading — not
+    // wherever the previous step's content had been scrolled to.
+    const scroller = useRef<HTMLDivElement>(null);
+    useEffect(() => {
+      scroller.current?.scrollTo({top: 0});
+    }, [step.id, tab]);
     const [shared, setShared] = useState(false);
     const onShareClick = useCallback(() => {
       void onShare().then(ok => {
@@ -433,7 +439,7 @@ const ProblemPane: FC<{
             </svg>
           </button>
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3" ref={scroller}>
           <SystemDiagram
             compact
             diagram={problem.diagram}
@@ -551,20 +557,26 @@ const ProblemPane: FC<{
           <span className="text-ink-300 flex-1 text-center text-[11px]">
             {score.done}/{score.total} steps done
           </span>
-          <button
-            className={primaryButtonClass}
-            disabled={!done || !hasNext}
-            onClick={onNextStep}
-            title={
-              !hasNext
-                ? 'this is the last step'
-                : done
-                ? `step ${stepIndex + 2}: ${problem.steps[stepIndex + 1].title}`
-                : 'accept or reveal this step to unlock the next'
-            }
-            type="button">
-            {hasNext ? (done ? 'next step →' : 'next step 🔒') : 'last step'}
-          </button>
+          {tab === 'problem' ? (
+            <button className={primaryButtonClass} onClick={onStepTab} title={step.title} type="button">
+              {score.done === 0 ? 'start step 1 →' : `step ${stepIndex + 1} →`}
+            </button>
+          ) : (
+            <button
+              className={primaryButtonClass}
+              disabled={!done || !hasNext}
+              onClick={onNextStep}
+              title={
+                !hasNext
+                  ? 'this is the last step'
+                  : done
+                  ? `step ${stepIndex + 2}: ${problem.steps[stepIndex + 1].title}`
+                  : 'accept or reveal this step to unlock the next'
+              }
+              type="button">
+              {hasNext ? (done ? 'next step →' : 'next step 🔒') : 'last step'}
+            </button>
+          )}
         </div>
       </div>
     );

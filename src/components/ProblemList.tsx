@@ -317,6 +317,11 @@ const ProblemRow: FC<{
   const score = problemScore(problem, attempts);
   const solved = score.done === score.total;
   const started = score.done > 0;
+  /** Where a started problem picks up: its first step not yet done. */
+  const resume =
+    started && !solved
+      ? problem.steps.find(s => (attempts[stepKey(problem.id, s.id)] ?? OPEN_ATTEMPT).status === 'open')
+      : undefined;
   return (
     <li>
       <Link
@@ -363,11 +368,18 @@ const ProblemRow: FC<{
             ) : null}
           </span>
         </span>
-        <span
-          className={`shrink-0 text-[12px] font-semibold ${
-            solved ? 'text-iris-300' : 'text-ink-400 group-hover:text-iris-200'
-          }`}>
-          {solved ? 'solved' : started ? 'continue ›' : 'start ›'}
+        <span className="hidden shrink-0 text-right sm:block">
+          <span
+            className={`block text-[12px] font-semibold ${
+              solved ? 'text-iris-300' : 'text-ink-400 group-hover:text-iris-200'
+            }`}>
+            {solved ? 'solved' : started ? 'continue ›' : 'start ›'}
+          </span>
+          {resume !== undefined ? (
+            <span className="text-ink-400 block max-w-[12rem] truncate text-[10.5px]">
+              step {problem.steps.indexOf(resume) + 1} · {resume.title}
+            </span>
+          ) : null}
         </span>
       </Link>
     </li>

@@ -211,7 +211,7 @@ const FileTab: FC<{
       </button>
       <button
         aria-label={`close ${name}`}
-        className={`hover:bg-ink-700 ml-1 flex h-4 w-4 items-center justify-center rounded text-[12px] leading-none transition ${
+        className={`hover:bg-ink-700 touch:h-6 touch:w-6 touch:opacity-100 ml-1 flex h-4 w-4 items-center justify-center rounded text-[12px] leading-none transition ${
           active ? '' : 'opacity-0 focus:opacity-100 group-hover:opacity-100'
         }`}
         onClick={onCloseClick}
@@ -1157,6 +1157,8 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                   earned={earned}
                   executes={step.harness?.[language] !== undefined}
                   language={language}
+                  nextTitle={problem.steps[stepIndex + 1]?.title}
+                  onNext={stepIndex + 1 < problem.steps.length ? onNextStep : undefined}
                   running={running}
                   runtime={runtimeStatus}
                   stale={verdict !== null && verdictCode !== stepCode}

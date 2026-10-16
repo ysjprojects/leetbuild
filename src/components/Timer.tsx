@@ -64,7 +64,7 @@ export const TimerPill: FC<{
   const tone = over
     ? 'border-danger-400/60 bg-danger-400/10 text-danger-200'
     : remaining <= URGENT_AT
-    ? 'border-danger-400/60 bg-danger-400/10 text-danger-200 animate-pulse'
+    ? 'border-danger-400/60 bg-danger-400/10 text-danger-200 motion-reduce:animate-none animate-pulse'
     : remaining <= WARN_AT
     ? 'border-warning-400/60 bg-warning-400/10 text-warning-200'
     : 'border-success-400/50 bg-success-400/10 text-success-200';

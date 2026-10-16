@@ -136,7 +136,11 @@ const VerdictPane: FC<{
   /** A submission is being executed. */
   running: boolean;
   runtime: RuntimeStatus;
-}> = memo(({step, language, verdict, attempt, earned, stale, executes, running, runtime}) => {
+  /** Title of the step after this one; absent on the last step. */
+  nextTitle?: string;
+  /** Go to the next step (shown on an accepted verdict). */
+  onNext?: () => void;
+}> = memo(({step, language, verdict, attempt, earned, stale, executes, running, runtime, nextTitle, onNext}) => {
   const showShape = attempt.wrong >= SHAPE_AFTER_WRONG;
   const runError = verdict?.run?.error;
   /** Every failing check reported the same thing (typically one unimplemented function): say it once. */
@@ -169,7 +173,7 @@ const VerdictPane: FC<{
           <span className="text-warning-300 ml-auto">edited since the last submit</span>
         ) : null}
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
+      <div aria-live="polite" className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
         {verdict === null ? (
           <p className="text-ink-300 mb-2 text-[12px]">
             {executes
@@ -183,20 +187,36 @@ const VerdictPane: FC<{
             <p className="text-warning-200 mt-0.5 text-[12px]">{runError}. This did not count as a submission.</p>
           </div>
         ) : verdict.accepted ? (
-          <div className="border-success-400/60 bg-success-400/10 mb-3 rounded-xl border p-3">
-            <p className="text-success-300 text-[11px] font-bold uppercase tracking-wider">Result</p>
-            <p className="text-ink-50 mt-0.5 text-lg font-extrabold">
-              Accepted
-              {earned !== null ? (
-                <span className="font-code text-success-200 ml-2 text-[13px] font-semibold">+{earned} pts</span>
-              ) : null}
-            </p>
-            <p className="text-success-200 mt-0.5 text-[12px]">
-              {verdict.passed}/{verdict.total} checks passed
-              {verdict.run !== undefined ? ` in ${verdict.run.ms} ms` : ''}
-              {attempt.status === 'revealed' ? ' · this step was revealed, so it scores 0' : ''}. Read the debrief on
-              the left, then move to the next step.
-            </p>
+          <div className="border-success-400/60 bg-success-400/10 mb-3 flex flex-wrap items-center gap-3 rounded-xl border p-3">
+            <div className="min-w-0 flex-1">
+              <p className="text-success-300 text-[11px] font-bold uppercase tracking-wider">Result</p>
+              <p className="text-ink-50 mt-0.5 text-lg font-extrabold">
+                Accepted
+                {earned !== null ? (
+                  <span className="font-code text-success-200 ml-2 text-[13px] font-semibold">+{earned} pts</span>
+                ) : null}
+              </p>
+              <p className="text-success-200 mt-0.5 text-[12px]">
+                {verdict.passed}/{verdict.total} checks passed
+                {verdict.run !== undefined ? ` in ${verdict.run.ms} ms` : ''}
+                {attempt.status === 'revealed' ? ' · this step was revealed, so it scores 0' : ''}.
+                {onNext === undefined
+                  ? ' That was the last step — read the debrief in the step pane.'
+                  : ' The debrief is in the step pane when you want it.'}
+              </p>
+            </div>
+            {onNext !== undefined ? (
+              <button
+                className="bg-success-400 text-ink-950 hover:bg-success-300 shrink-0 rounded-lg px-3 py-1.5 text-left text-[12px] font-bold transition"
+                onClick={onNext}
+                title={nextTitle}
+                type="button">
+                next step →
+                {nextTitle !== undefined ? (
+                  <span className="block max-w-[14rem] truncate text-[10.5px] font-normal opacity-80">{nextTitle}</span>
+                ) : null}
+              </button>
+            ) : null}
           </div>
         ) : (
           <div className="border-danger-400/60 bg-danger-400/10 mb-3 rounded-xl border p-3">
@@ -239,17 +259,17 @@ const VerdictPane: FC<{
                   </span>
                   <span className="font-code text-ink-400 text-[10px]">{i + 1}</span>
                   <span className="font-semibold">{check.title}</span>
-                  {result !== null && result.shape !== undefined ? (
+                  {result !== null && result.shape !== undefined && result.shape !== result.passed ? (
                     <span
-                      className={`font-code ml-auto rounded-full border px-1.5 text-[9.5px] ${
-                        result.shape ? 'border-ink-600 text-ink-400' : 'border-warning-400/50 text-warning-300'
+                      className={`ml-auto shrink-0 rounded-full border px-1.5 text-[9.5px] ${
+                        result.passed ? 'border-ink-600 text-ink-400' : 'border-warning-400/50 text-warning-300'
                       }`}
                       title={
-                        result.shape
-                          ? 'the static pattern check also passes (advisory)'
-                          : 'the static pattern check does not match the reference shape (advisory: the runtime result decides)'
+                        result.passed
+                          ? 'Your code passes this check but is shaped differently from the reference solution — that is fine; the runtime result decides.'
+                          : 'Your code is shaped like the reference solution but does not pass when run: the logic, not the spelling, is off.'
                       }>
-                      shape {result.shape ? '✓' : '✗'}
+                      {result.passed ? 'unlike the reference' : 'looks right, fails'}
                     </span>
                   ) : null}
                 </p>
