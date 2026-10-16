@@ -224,7 +224,7 @@ const CodeBlock: FC<{
   const onClick = useCallback(() => onTry?.(code), [code, onTry]);
   return (
     <div className="group relative my-3">
-      <pre className="border-ink-700 bg-ink-950 font-code text-ink-100 overflow-x-auto rounded-lg border p-3 text-[12.5px] leading-relaxed">
+      <pre className="border-ink-700 bg-ink-950 font-code text-ink-100 overflow-x-auto rounded-lg border p-3 text-[13px] leading-relaxed">
         <code>
           {spans.map((span, index) =>
             span.className === '' ? (

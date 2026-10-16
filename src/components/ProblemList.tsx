@@ -125,7 +125,7 @@ const ProfileStrip: FC<{
             <p className="from-iris-200 to-ink-50 bg-gradient-to-r bg-clip-text text-[17px] font-extrabold leading-tight text-transparent">
               {rank.rank}
             </p>
-            <p className="text-ink-300 text-[11.5px]">
+            <p className="text-ink-300 text-[12px]">
               <span className="font-code text-ink-100">{profile.score}</span>
               <span className="text-ink-400"> / {profile.max} pts</span>
               {rank.next === null ? (
@@ -226,7 +226,7 @@ const ProfileStrip: FC<{
                 }}
               />
             </span>
-            <span className="font-code text-ink-300 w-9 text-right text-[10.5px]">
+            <span className="font-code text-ink-300 w-9 text-right text-[11px]">
               {c.accepted}/{c.total}
             </span>
           </div>
@@ -244,7 +244,7 @@ const ProfileStrip: FC<{
         <div className="border-ink-700/70 mt-2.5 grid gap-x-6 gap-y-3 border-t pt-3 sm:grid-cols-2">
           <ul className="space-y-1.5">
             {(['easy', 'medium', 'hard'] as const).map(d => (
-              <li className="flex items-center gap-2 text-[11.5px]" key={d}>
+              <li className="flex items-center gap-2 text-[12px]" key={d}>
                 <span className="text-ink-200 w-14 capitalize">{d}</span>
                 <span className="bg-ink-700 h-1.5 flex-1 overflow-hidden rounded-full">
                   <span
@@ -254,13 +254,13 @@ const ProfileStrip: FC<{
                     }}
                   />
                 </span>
-                <span className="font-code text-ink-300 w-16 text-right text-[10.5px]">
+                <span className="font-code text-ink-300 w-16 text-right text-[11px]">
                   {profile.solved[d]}/{profile.problems[d]} solved
                 </span>
               </li>
             ))}
           </ul>
-          <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[11.5px]">
+          <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[12px]">
             <div className="flex items-baseline justify-between gap-2">
               <dt className="text-ink-300">steps accepted</dt>
               <dd className="font-code text-ink-100">{profile.stepsAccepted}</dd>
@@ -277,7 +277,7 @@ const ProfileStrip: FC<{
               <dt className="text-ink-300">acceptance</dt>
               <dd className="font-code text-ink-100">{Math.round(profile.acceptance * 100)}%</dd>
             </div>
-            <p className="text-ink-400 col-span-2 text-[10.5px]">
+            <p className="text-ink-400 col-span-2 text-[11px]">
               Scored like a contest: each hint −20%, each wrong submission −5% (floor 25%), a revealed step 0.
             </p>
           </dl>
@@ -346,7 +346,7 @@ const ProblemRow: FC<{
             ))}
           </span>
           <span className="text-ink-300 mt-0.5 block text-[12px]">{problem.tagline}</span>
-          <span className="text-ink-300 mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10.5px]">
+          <span className="text-ink-300 mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
             <StepSquares attempts={attempts} problem={problem} />
             <span className="font-code">
               {score.done}/{score.total} steps
@@ -376,7 +376,7 @@ const ProblemRow: FC<{
             {solved ? 'solved' : started ? 'continue ›' : 'start ›'}
           </span>
           {resume !== undefined ? (
-            <span className="text-ink-400 block max-w-[12rem] truncate text-[10.5px]">
+            <span className="text-ink-400 block max-w-[12rem] truncate text-[11px]">
               step {problem.steps.indexOf(resume) + 1} · {resume.title}
             </span>
           ) : null}

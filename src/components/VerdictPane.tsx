@@ -6,6 +6,7 @@ import type {StepAttempt, Submission} from '@/lib/scoring';
 import {type Language, type Step, type StepCheck, LANGUAGE_LABEL} from '@/lib/types';
 
 import {InlineMarkdown} from './Markdown';
+import {LinkedInButton} from './Social';
 
 /**
  * LeetCode-style result panel: before a submission it lists the checks as the step's test cases;
@@ -28,7 +29,7 @@ Fragment.displayName = 'ShapeFragment';
 const ExpectedShape: FC<{check: StepCheck; language: Language}> = memo(({check, language}) => {
   const shape = useMemo(() => describeMatcher(check.match[language]), [check, language]);
   return (
-    <div className="text-ink-300 mt-1.5 space-y-1 pl-6 text-[11.5px]">
+    <div className="text-ink-300 mt-1.5 space-y-1 pl-6 text-[12px]">
       <p className="text-ink-400 font-bold uppercase tracking-wider">
         What the judge looks for in {LANGUAGE_LABEL[language]}
       </p>
@@ -140,162 +141,197 @@ const VerdictPane: FC<{
   nextTitle?: string;
   /** Go to the next step (shown on an accepted verdict). */
   onNext?: () => void;
-}> = memo(({step, language, verdict, attempt, earned, stale, executes, running, runtime, nextTitle, onNext}) => {
-  const showShape = attempt.wrong >= SHAPE_AFTER_WRONG;
-  const runError = verdict?.run?.error;
-  /** Every failing check reported the same thing (typically one unimplemented function): say it once. */
-  const common = useMemo(() => {
-    if (verdict === null || verdict.accepted) return null;
-    const failing = verdict.results.filter(r => !r.passed);
-    const first = failing[0]?.message;
-    return first !== undefined && failing.every(r => r.message === first) ? first : null;
-  }, [verdict]);
-  return (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="border-ink-700 text-ink-300 flex shrink-0 flex-wrap items-center gap-2 border-b px-3 py-1.5 text-[11px]">
-        <span className="text-iris-400 font-bold uppercase tracking-wider">Checks</span>
-        <span className="font-code">
-          {step.checks.length} for this step · {attempt.wrong} wrong submission{attempt.wrong === 1 ? '' : 's'}
-        </span>
-        {executes ? (
-          <span
-            className="border-iris-400/40 bg-iris-400/10 text-iris-200 rounded-full border px-2 py-0.5 text-[10px]"
-            title="your code runs in the browser: Python, Redis, Kafka, gRPC and Postgres in-page; these checks exercise it">
-            runs in the browser
+  /** LinkedIn composer prefilled for this step; offered once accepted. */
+  shareUrl?: string;
+  /** Every step of the course is accepted: open the certificate. */
+  onCertificate?: () => void;
+}> = memo(
+  ({
+    step,
+    language,
+    verdict,
+    attempt,
+    earned,
+    stale,
+    executes,
+    running,
+    runtime,
+    nextTitle,
+    onNext,
+    shareUrl,
+    onCertificate,
+  }) => {
+    const showShape = attempt.wrong >= SHAPE_AFTER_WRONG;
+    const runError = verdict?.run?.error;
+    /** Every failing check reported the same thing (typically one unimplemented function): say it once. */
+    const common = useMemo(() => {
+      if (verdict === null || verdict.accepted) return null;
+      const failing = verdict.results.filter(r => !r.passed);
+      const first = failing[0]?.message;
+      return first !== undefined && failing.every(r => r.message === first) ? first : null;
+    }, [verdict]);
+    return (
+      <div className="flex h-full min-h-0 flex-col">
+        <div className="border-ink-700 text-ink-300 flex shrink-0 flex-wrap items-center gap-2 border-b px-3 py-1.5 text-[11px]">
+          <span className="text-iris-400 font-bold uppercase tracking-wider">Checks</span>
+          <span className="font-code">
+            {step.checks.length} for this step · {attempt.wrong} wrong submission{attempt.wrong === 1 ? '' : 's'}
           </span>
-        ) : null}
-        {running ? (
-          <span className="text-iris-200 ml-auto flex items-center gap-1.5">
-            <span className="bg-iris-300 h-1.5 w-1.5 animate-pulse rounded-full" />
-            {runtime.state === 'booting' ? STATUS_TEXT[runtime.phase] : 'running your code…'}
-          </span>
-        ) : stale && verdict !== null ? (
-          <span className="text-warning-300 ml-auto">edited since the last submit</span>
-        ) : null}
-      </div>
-      <div aria-live="polite" className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
-        {verdict === null ? (
-          <p className="text-ink-300 mb-2 text-[12px]">
-            {executes
-              ? 'Submit (⌘/Ctrl + Enter) to run your code. Each check exercises your implementation and reports what it observed; the first run downloads the Python runtime (~10 MB).'
-              : 'Submit (⌘/Ctrl + Enter) to run the checks. Each one is a property a correct implementation has; failures show what was expected.'}
-          </p>
-        ) : runError !== undefined ? (
-          <div className="border-warning-400/60 bg-warning-400/10 mb-3 rounded-xl border p-3">
-            <p className="text-warning-300 text-[11px] font-bold uppercase tracking-wider">Runtime</p>
-            <p className="text-ink-50 mt-0.5 text-lg font-extrabold">Could not run</p>
-            <p className="text-warning-200 mt-0.5 text-[12px]">{runError}. This did not count as a submission.</p>
-          </div>
-        ) : verdict.accepted ? (
-          <div className="border-success-400/60 bg-success-400/10 mb-3 flex flex-wrap items-center gap-3 rounded-xl border p-3">
-            <div className="min-w-0 flex-1">
-              <p className="text-success-300 text-[11px] font-bold uppercase tracking-wider">Result</p>
-              <p className="text-ink-50 mt-0.5 text-lg font-extrabold">
-                Accepted
-                {earned !== null ? (
-                  <span className="font-code text-success-200 ml-2 text-[13px] font-semibold">+{earned} pts</span>
-                ) : null}
-              </p>
-              <p className="text-success-200 mt-0.5 text-[12px]">
-                {verdict.passed}/{verdict.total} checks passed
-                {verdict.run !== undefined ? ` in ${verdict.run.ms} ms` : ''}
-                {attempt.status === 'revealed' ? ' · this step was revealed, so it scores 0' : ''}.
-                {onNext === undefined
-                  ? ' That was the last step — read the debrief in the step pane.'
-                  : ' The debrief is in the step pane when you want it.'}
-              </p>
-            </div>
-            {onNext !== undefined ? (
-              <button
-                className="bg-success-400 text-ink-950 hover:bg-success-300 shrink-0 rounded-lg px-3 py-1.5 text-left text-[12px] font-bold transition"
-                onClick={onNext}
-                title={nextTitle}
-                type="button">
-                next step →
-                {nextTitle !== undefined ? (
-                  <span className="block max-w-[14rem] truncate text-[10.5px] font-normal opacity-80">{nextTitle}</span>
-                ) : null}
-              </button>
-            ) : null}
-          </div>
-        ) : (
-          <div className="border-danger-400/60 bg-danger-400/10 mb-3 rounded-xl border p-3">
-            <p className="text-danger-300 text-[11px] font-bold uppercase tracking-wider">Result</p>
-            <p className="text-ink-50 mt-0.5 text-lg font-extrabold">Wrong Answer</p>
-            <p className="text-danger-200 mt-0.5 text-[12px]">
-              {verdict.passed}/{verdict.total} checks passed.{' '}
-              {common !== null
-                ? 'Every failing check hit the same thing:'
-                : verdict.run !== undefined
-                ? 'Each failing check says what it observed.'
-                : showShape
-                ? 'Failing checks now show the shape the judge expects.'
-                : `Fix the failing ones and submit again — after ${SHAPE_AFTER_WRONG} wrong submissions, failing checks show the exact shape the judge expects.`}
+          {executes ? (
+            <span
+              className="border-iris-400/40 bg-iris-400/10 text-iris-200 rounded-full border px-2 py-0.5 text-[10px]"
+              title="your code runs in the browser: Python, Redis, Kafka, gRPC and Postgres in-page; these checks exercise it">
+              runs in the browser
+            </span>
+          ) : null}
+          {running ? (
+            <span className="text-iris-200 ml-auto flex items-center gap-1.5">
+              <span className="bg-iris-300 h-1.5 w-1.5 animate-pulse rounded-full" />
+              {runtime.state === 'booting' ? STATUS_TEXT[runtime.phase] : 'running your code…'}
+            </span>
+          ) : stale && verdict !== null ? (
+            <span className="text-warning-300 ml-auto">edited since the last submit</span>
+          ) : null}
+        </div>
+        <div aria-live="polite" className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
+          {verdict === null ? (
+            <p className="text-ink-300 mb-2 text-[12px]">
+              {executes
+                ? 'Submit (⌘/Ctrl + Enter) to run your code. Each check exercises your implementation and reports what it observed; the first run downloads the Python runtime (~10 MB).'
+                : 'Submit (⌘/Ctrl + Enter) to run the checks. Each one is a property a correct implementation has; failures show what was expected.'}
             </p>
-            {common !== null ? <p className="font-code text-ink-50 mt-1.5 text-[12px]">{common}</p> : null}
-          </div>
-        )}
-        <ul className="space-y-1.5">
-          {step.checks.map((check, i) => {
-            const result = verdict?.results[i] ?? null;
-            const tone =
-              result === null
-                ? 'border-ink-700 bg-ink-850'
-                : result.passed
-                ? 'border-success-400/40 bg-success-400/5'
-                : 'border-danger-400/50 bg-danger-400/5';
-            return (
-              <li className={`rounded-lg border px-3 py-2 ${tone}`} key={check.id}>
-                <p className="text-ink-100 flex items-center gap-2 text-[12.5px]">
-                  <span
-                    className={`font-code flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] ${
-                      result === null
-                        ? 'border-ink-500 border text-transparent'
-                        : result.passed
-                        ? 'bg-success-400 text-ink-950'
-                        : 'bg-danger-400 text-ink-950'
-                    }`}>
-                    {result === null ? '·' : result.passed ? '✓' : '✗'}
-                  </span>
-                  <span className="font-code text-ink-400 text-[10px]">{i + 1}</span>
-                  <span className="font-semibold">{check.title}</span>
-                  {result !== null && result.shape !== undefined && result.shape !== result.passed ? (
-                    <span
-                      className={`ml-auto shrink-0 rounded-full border px-1.5 text-[9.5px] ${
-                        result.passed ? 'border-ink-600 text-ink-400' : 'border-warning-400/50 text-warning-300'
-                      }`}
-                      title={
-                        result.passed
-                          ? 'Your code passes this check but is shaped differently from the reference solution — that is fine; the runtime result decides.'
-                          : 'Your code is shaped like the reference solution but does not pass when run: the logic, not the spelling, is off.'
-                      }>
-                      {result.passed ? 'unlike the reference' : 'looks right, fails'}
-                    </span>
+          ) : runError !== undefined ? (
+            <div className="border-warning-400/60 bg-warning-400/10 mb-3 rounded-xl border p-3">
+              <p className="text-warning-300 text-[11px] font-bold uppercase tracking-wider">Runtime</p>
+              <p className="text-ink-50 mt-0.5 text-lg font-extrabold">Could not run</p>
+              <p className="text-warning-200 mt-0.5 text-[12px]">{runError}. This did not count as a submission.</p>
+            </div>
+          ) : verdict.accepted ? (
+            <div className="border-success-400/60 bg-success-400/10 mb-3 flex flex-wrap items-center gap-3 rounded-xl border p-3">
+              <div className="min-w-0 flex-1">
+                <p className="text-success-300 text-[11px] font-bold uppercase tracking-wider">Result</p>
+                <p className="text-ink-50 mt-0.5 text-lg font-extrabold">
+                  Accepted
+                  {earned !== null ? (
+                    <span className="font-code text-success-200 ml-2 text-[13px] font-semibold">+{earned} pts</span>
                   ) : null}
                 </p>
-                {result !== null && !result.passed ? (
-                  <>
-                    {result.message !== undefined && result.message !== common ? (
-                      <p className="font-code text-danger-200 mt-1 pl-6 text-[11.5px]">{result.message}</p>
-                    ) : null}
-                    <p className="text-ink-200 mt-1 pl-6 text-[12px]">
-                      <InlineMarkdown source={check.detail} />
-                    </p>
-                    {showShape && result.shape === undefined ? (
-                      <ExpectedShape check={check} language={language} />
-                    ) : null}
-                  </>
+                <p className="text-success-200 mt-0.5 text-[12px]">
+                  {verdict.passed}/{verdict.total} checks passed
+                  {verdict.run !== undefined ? ` in ${verdict.run.ms} ms` : ''}
+                  {attempt.status === 'revealed' ? ' · this step was revealed, so it scores 0' : ''}.
+                  {onNext === undefined
+                    ? onCertificate !== undefined
+                      ? ' That was the last step: the course is complete and your certificate is ready.'
+                      : ' That was the last step — read the debrief in the step pane.'
+                    : ' The debrief is in the step pane when you want it.'}
+                </p>
+                {shareUrl !== undefined && attempt.status === 'accepted' ? (
+                  <div className="-ml-1.5 mt-1.5">
+                    <LinkedInButton label="Share this step on LinkedIn" url={shareUrl} />
+                  </div>
                 ) : null}
-              </li>
-            );
-          })}
-        </ul>
-        {verdict?.run !== undefined ? <Output stderr={verdict.run.stderr} stdout={verdict.run.stdout} /> : null}
-        <Submissions history={attempt.history ?? EMPTY_HISTORY} />
+              </div>
+              {onNext !== undefined ? (
+                <button
+                  className="bg-success-400 text-ink-950 hover:bg-success-300 shrink-0 rounded-lg px-3 py-1.5 text-left text-[12px] font-bold transition"
+                  onClick={onNext}
+                  title={nextTitle}
+                  type="button">
+                  next step →
+                  {nextTitle !== undefined ? (
+                    <span className="block max-w-[14rem] truncate text-[11px] font-normal opacity-80">{nextTitle}</span>
+                  ) : null}
+                </button>
+              ) : onCertificate !== undefined ? (
+                <button
+                  className="bg-success-400 text-ink-950 hover:bg-success-300 shrink-0 rounded-lg px-3 py-1.5 text-left text-[12px] font-bold transition"
+                  onClick={onCertificate}
+                  type="button">
+                  Get your certificate
+                  <span className="block text-[11px] font-normal opacity-80">download · add to LinkedIn · share</span>
+                </button>
+              ) : null}
+            </div>
+          ) : (
+            <div className="border-danger-400/60 bg-danger-400/10 mb-3 rounded-xl border p-3">
+              <p className="text-danger-300 text-[11px] font-bold uppercase tracking-wider">Result</p>
+              <p className="text-ink-50 mt-0.5 text-lg font-extrabold">Wrong Answer</p>
+              <p className="text-danger-200 mt-0.5 text-[12px]">
+                {verdict.passed}/{verdict.total} checks passed.{' '}
+                {common !== null
+                  ? 'Every failing check hit the same thing:'
+                  : verdict.run !== undefined
+                  ? 'Each failing check says what it observed.'
+                  : showShape
+                  ? 'Failing checks now show the shape the judge expects.'
+                  : `Fix the failing ones and submit again — after ${SHAPE_AFTER_WRONG} wrong submissions, failing checks show the exact shape the judge expects.`}
+              </p>
+              {common !== null ? <p className="font-code text-ink-50 mt-1.5 text-[12px]">{common}</p> : null}
+            </div>
+          )}
+          <ul className="space-y-1.5">
+            {step.checks.map((check, i) => {
+              const result = verdict?.results[i] ?? null;
+              const tone =
+                result === null
+                  ? 'border-ink-700 bg-ink-850'
+                  : result.passed
+                  ? 'border-success-400/40 bg-success-400/5'
+                  : 'border-danger-400/50 bg-danger-400/5';
+              return (
+                <li className={`rounded-lg border px-3 py-2 ${tone}`} key={check.id}>
+                  <p className="text-ink-100 flex items-center gap-2 text-[13px]">
+                    <span
+                      className={`font-code flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] ${
+                        result === null
+                          ? 'border-ink-500 border text-transparent'
+                          : result.passed
+                          ? 'bg-success-400 text-ink-950'
+                          : 'bg-danger-400 text-ink-950'
+                      }`}>
+                      {result === null ? '·' : result.passed ? '✓' : '✗'}
+                    </span>
+                    <span className="font-code text-ink-400 text-[10px]">{i + 1}</span>
+                    <span className="font-semibold">{check.title}</span>
+                    {result !== null && result.shape !== undefined && result.shape !== result.passed ? (
+                      <span
+                        className={`ml-auto shrink-0 rounded-full border px-1.5 text-[10px] ${
+                          result.passed ? 'border-ink-600 text-ink-400' : 'border-warning-400/50 text-warning-300'
+                        }`}
+                        title={
+                          result.passed
+                            ? 'Your code passes this check but is shaped differently from the reference solution — that is fine; the runtime result decides.'
+                            : 'Your code is shaped like the reference solution but does not pass when run: the logic, not the spelling, is off.'
+                        }>
+                        {result.passed ? 'unlike the reference' : 'looks right, fails'}
+                      </span>
+                    ) : null}
+                  </p>
+                  {result !== null && !result.passed ? (
+                    <>
+                      {result.message !== undefined && result.message !== common ? (
+                        <p className="font-code text-danger-200 mt-1 pl-6 text-[12px]">{result.message}</p>
+                      ) : null}
+                      <p className="text-ink-200 mt-1 pl-6 text-[12px]">
+                        <InlineMarkdown source={check.detail} />
+                      </p>
+                      {showShape && result.shape === undefined ? (
+                        <ExpectedShape check={check} language={language} />
+                      ) : null}
+                    </>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ul>
+          {verdict?.run !== undefined ? <Output stderr={verdict.run.stderr} stdout={verdict.run.stdout} /> : null}
+          <Submissions history={attempt.history ?? EMPTY_HISTORY} />
+        </div>
       </div>
-    </div>
-  );
-});
+    );
+  },
+);
 VerdictPane.displayName = 'VerdictPane';
 
 export default VerdictPane;

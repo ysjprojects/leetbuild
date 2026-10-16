@@ -109,7 +109,7 @@ const BudgetOption: FC<{
       <span className="font-code text-iris-200 block text-[15px] font-semibold">
         {formatClock(budgetSeconds(problem, factor))}
       </span>
-      <span className="text-ink-400 block text-[10.5px]">{blurb}</span>
+      <span className="text-ink-400 block text-[11px]">{blurb}</span>
     </button>
   );
 });
@@ -168,7 +168,7 @@ export const SessionList: FC<{sessions: readonly TimedSession[]; problems: reado
         {[...sessions].reverse().map(s => (
           <li className="flex items-start gap-3 py-1.5 text-[12px]" key={`${s.problemId}/${s.startedAt}`}>
             <span
-              className={`font-code mt-0.5 w-16 shrink-0 text-right text-[12.5px] font-semibold ${
+              className={`font-code mt-0.5 w-16 shrink-0 text-right text-[13px] font-semibold ${
                 s.counted ? 'text-success-300' : s.outcome === 'completed' ? 'text-ink-200' : 'text-ink-400'
               }`}
               title={s.counted ? 'completed within the budget: counted' : 'not counted'}>
@@ -180,7 +180,7 @@ export const SessionList: FC<{sessions: readonly TimedSession[]; problems: reado
                 <span className="text-ink-50 block font-semibold">{titles[s.problemId] ?? s.problemId}</span>
               ) : null}
               <span className="text-ink-300 block">{describeSession(s)}</span>
-              <span className="text-ink-400 font-code block text-[10.5px]">
+              <span className="text-ink-400 font-code block text-[11px]">
                 {formatWhen(s.startedAt)} · budget {formatClock(s.budget)} · {LANGUAGE_LABEL[s.language]}
               </span>
             </span>

@@ -14,7 +14,8 @@ import {
 } from 'react';
 
 import {problems} from '@/data/problems';
-import {downloadMarkdown, exportFileName, problemToMarkdown, problemUrl} from '@/lib/export';
+import {downloadCertificate} from '@/lib/certificate';
+import {downloadMarkdown, exportFileName, problemToMarkdown, problemUrl, siteUrl} from '@/lib/export';
 import {type Badge, badgeOf, dayKey, earnedBadges, shareText, streakOf} from '@/lib/gamify';
 import {type Verdict, judge, withRuntime} from '@/lib/judge';
 import {type RuntimeStatus, getPythonRunner} from '@/lib/runtime/client';
@@ -27,6 +28,14 @@ import {
   profile as computeProfile,
   stepScore,
 } from '@/lib/scoring';
+import {
+  type CertificateDetails,
+  badgeShareText,
+  certificateDetails,
+  certificateUrl,
+  linkedInPostUrl,
+  stepShareText,
+} from '@/lib/social';
 import {type Progress, type Workspace, EMPTY_PROGRESS, getProgressStore, workspaceKey} from '@/lib/storage';
 import {
   type SessionOutcome,
@@ -56,6 +65,8 @@ import {useDialog} from './Dialog';
 import {ghostButtonClass, selectClass} from './paneShared';
 import ProblemList from './ProblemList';
 import ProblemPane, {type PaneTab, unlocked} from './ProblemPane';
+import {isEditable, KeyboardIcon, MAC, mod, ShortcutList} from './Shortcuts';
+import {CertificateForm, LinkedInButton} from './Social';
 import SplitGutter from './SplitGutter';
 import StepEditor from './StepEditor';
 import ThemeToggle from './ThemeToggle';
@@ -74,9 +85,8 @@ const resolveStep = (problem: Problem, attempts: Record<string, StepAttempt>, wa
   return problem.steps[index >= 0 && unlocked(problem, index, attempts) ? index : 0];
 };
 
-const MAC = /Mac|iP(hone|ad|od)/.test(navigator.platform);
-/** The submit shortcut as this platform writes it (the playground never renders on the server). */
-const SUBMIT_KEYS = MAC ? '⌘⏎' : 'Ctrl+⏎';
+/** The submit shortcut as this platform writes it. */
+const SUBMIT_KEYS = mod('⏎');
 const SUBMIT_SHORTCUT = MAC ? '⌘ Enter' : 'Ctrl + Enter';
 
 /** Below `lg` the checks sit under the editor instead of beside it. */
@@ -141,6 +151,7 @@ const ShareCard: FC<{text: string}> = memo(({text}) => {
 });
 ShareCard.displayName = 'ShareCard';
 
+/** A fresh badge: dismisses itself after a while; the LinkedIn action keeps it open while in use. */
 const BadgeToast: FC<{id: number; badge: Badge; onDismiss: (id: number) => void}> = memo(({id, badge, onDismiss}) => {
   useEffect(() => {
     const timer = window.setTimeout(() => onDismiss(id), TOAST_MS);
@@ -148,17 +159,23 @@ const BadgeToast: FC<{id: number; badge: Badge; onDismiss: (id: number) => void}
   }, [id, onDismiss]);
   const onClick = useCallback(() => onDismiss(id), [id, onDismiss]);
   return (
-    <button
-      className="border-iris-400/60 bg-ink-800 hover:border-iris-300 pointer-events-auto flex items-center gap-3 rounded-xl border p-3 text-left shadow-2xl transition"
-      onClick={onClick}
-      type="button">
+    <div className="border-iris-400/60 bg-ink-800 pointer-events-auto flex items-center gap-3 rounded-xl border p-3 shadow-2xl">
       <BadgeGlyph badge={badge} earned size="lg" />
-      <span className="min-w-0">
+      <span className="min-w-0 flex-1">
         <span className="text-iris-400 block text-[11px] font-bold uppercase tracking-wider">Badge earned</span>
         <span className="text-ink-50 block text-[13px] font-semibold">{badge.title}</span>
         <span className="text-ink-300 block text-[11px]">{badge.blurb}</span>
+        <span className="mt-1 flex items-center gap-2">
+          <LinkedInButton label="Share on LinkedIn" url={linkedInPostUrl(badgeShareText(badge, siteUrl()))} />
+          <button
+            className="text-ink-400 hover:text-ink-50 rounded-md px-1.5 py-0.5 text-[11px] transition"
+            onClick={onClick}
+            type="button">
+            dismiss
+          </button>
+        </span>
       </span>
-    </button>
+    </div>
   );
 });
 BadgeToast.displayName = 'BadgeToast';
@@ -349,7 +366,7 @@ const CollapsedPane: FC<{title: string; onExpand: () => void}> = memo(({title, o
   <button
     className="border-ink-700 text-ink-300 hover:bg-ink-800 hover:text-ink-50 hidden h-full w-full flex-col items-center gap-3 overflow-hidden border-r py-2 transition lg:flex"
     onClick={onExpand}
-    title="show the problem pane"
+    title={`show the problem pane (${mod('\\')})`}
     type="button">
     <span aria-hidden className="text-[14px] leading-none">
       ›
@@ -721,6 +738,47 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     [problem, progress.sessions],
   );
 
+  // Sharing and certificates ---------------------------------------------------------------------
+  /** LinkedIn composer prefilled for the open step; shown once it is accepted. */
+  const stepShareUrl = useMemo(
+    () =>
+      problem === null || step === null
+        ? undefined
+        : linkedInPostUrl(stepShareText(problem, step, language, `${siteUrl()}${stepPath(problem, step)}`)),
+    [problem, step, language],
+  );
+  /** The course is complete with every step accepted: a certificate can be issued. */
+  const certified = useMemo(() => {
+    if (problem === null) return false;
+    return problem.steps.every(
+      s => (progress.attempts[stepKey(problem.id, s.id)] ?? OPEN_ATTEMPT).status === 'accepted',
+    );
+  }, [problem, progress.attempts]);
+  const nameChoice = useRef('');
+  const onNameChange = useCallback((name: string) => {
+    nameChoice.current = name;
+  }, []);
+  const verifyUrl = useCallback((details: CertificateDetails) => certificateUrl(siteUrl(), details), []);
+  const onCertificate = useCallback(() => {
+    if (problem === null || !certified) return;
+    const current = progressRef.current;
+    const details = certificateDetails(problem, current, language);
+    nameChoice.current = current.name;
+    void openDialog({
+      title: `Certificate · ${problem.title}`,
+      body: <CertificateForm details={details} onName={onNameChange} verifyUrl={verifyUrl} />,
+      confirm: '⤓ Download PNG',
+      cancel: 'Close',
+      wide: true,
+    }).then(ok => {
+      const name = nameChoice.current.trim();
+      if (name !== '' && name !== current.name) setProgress(p => ({...p, name}));
+      if (!ok || name === '') return;
+      const final = {...details, name};
+      void downloadCertificate(final, verifyUrl(final));
+    });
+  }, [problem, certified, language, openDialog, onNameChange, verifyUrl]);
+
   const onLanguage = useCallback(
     (e: ChangeEvent<HTMLSelectElement>) => {
       const lang = e.target.value as Language;
@@ -816,18 +874,6 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       showVerdict();
     });
   }, [problem, step, attemptKey, language, running, runner, record, showVerdict]);
-
-  // Cmd/Ctrl+Enter submits from anywhere on the page (the editor has its own binding too).
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && document.querySelector('dialog[open]') === null) {
-        e.preventDefault();
-        submit();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [submit]);
 
   const onRevealHint = useCallback(
     (count: number) => {
@@ -927,6 +973,40 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   const resetY = useCallback(() => setLayout(l => ({...l, y: DEFAULT_SPLIT.y})), []);
   const togglePaneSidebar = useCallback(() => setLayout(l => ({...l, pane: !l.pane})), []);
   const toggleExplorer = useCallback(() => setLayout(l => ({...l, explorer: !l.explorer})), []);
+  const onShortcuts = useCallback(() => {
+    void openDialog({title: 'Keyboard shortcuts', body: <ShortcutList />});
+  }, [openDialog]);
+
+  // Shortcuts work from anywhere on the page (the editor binds Mod-Enter itself too); none while a dialog is open.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (document.querySelector('dialog[open]') !== null) return;
+      const modKey = e.metaKey || e.ctrlKey;
+      if (modKey && e.key === 'Enter') {
+        e.preventDefault();
+        submit();
+      } else if (modKey && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'b' && problem !== null) {
+        e.preventDefault();
+        toggleExplorer();
+      } else if (modKey && !e.shiftKey && !e.altKey && e.code === 'Backslash' && problem !== null) {
+        e.preventDefault();
+        if (window.matchMedia(STACKED).matches) setPaneOpen(v => !v);
+        else togglePaneSidebar();
+      } else if (e.altKey && !modKey && e.code === 'BracketRight') {
+        e.preventDefault();
+        onNextStep();
+      } else if (e.altKey && !modKey && e.code === 'BracketLeft') {
+        e.preventDefault();
+        onPrevStep();
+      } else if (e.key === '?' && !modKey && !e.altKey && !isEditable(e.target)) {
+        e.preventDefault();
+        onShortcuts();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [submit, problem, toggleExplorer, togglePaneSidebar, onNextStep, onPrevStep, onShortcuts]);
+
   useEffect(() => {
     try {
       window.localStorage.setItem(LAYOUT_KEY, JSON.stringify(layout));
@@ -989,6 +1069,14 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
               {streak.current}d streak
             </span>
           ) : null}
+          <button
+            aria-label="keyboard shortcuts"
+            className="border-ink-600 bg-ink-800 text-ink-300 hover:border-iris-400/60 hover:text-ink-50 hidden h-7 w-7 items-center justify-center rounded-full border transition sm:flex"
+            onClick={onShortcuts}
+            title="keyboard shortcuts (?)"
+            type="button">
+            <KeyboardIcon />
+          </button>
           <ThemeToggle />
         </div>
       </header>
@@ -1026,8 +1114,10 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
               <ProblemPane
                 attempt={attempt}
                 attempts={progress.attempts}
+                certified={certified}
                 language={language}
                 onBack={onBack}
+                onCertificate={onCertificate}
                 onCollapse={togglePaneSidebar}
                 onDownload={onDownloadProblem}
                 onLoadSolution={onLoadSolution}
@@ -1081,7 +1171,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                       layout.explorer ? 'bg-ink-800 text-ink-100' : 'text-ink-400'
                     }`}
                     onClick={toggleExplorer}
-                    title={layout.explorer ? 'hide the file explorer' : 'show the file explorer'}
+                    title={`${layout.explorer ? 'hide' : 'show'} the file explorer (${mod('B')})`}
                     type="button">
                     <svg
                       aria-hidden
@@ -1158,9 +1248,11 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                   executes={step.harness?.[language] !== undefined}
                   language={language}
                   nextTitle={problem.steps[stepIndex + 1]?.title}
+                  onCertificate={certified ? onCertificate : undefined}
                   onNext={stepIndex + 1 < problem.steps.length ? onNextStep : undefined}
                   running={running}
                   runtime={runtimeStatus}
+                  shareUrl={stepShareUrl}
                   stale={verdict !== null && verdictCode !== stepCode}
                   step={step}
                   verdict={verdict}

@@ -1,8 +1,11 @@
 import {type FC, memo, useMemo} from 'react';
 
+import {siteUrl} from '@/lib/export';
 import {type Badge, type BadgeProgress, BADGES, TRACKS} from '@/lib/gamify';
+import {badgeShareText, linkedInPostUrl} from '@/lib/social';
 
 import {CONCEPT_COLOR} from './paneShared';
+import {LinkedInButton} from './Social';
 
 /**
  * Badges as the learner sees them: a glyph disc (earned: filled in iris, or the concept colour for
@@ -59,11 +62,20 @@ const BadgeRow: FC<{badge: Badge; progress: BadgeProgress; earnedAt: number | un
         <BadgeGlyph badge={badge} earned={earned} />
         <span className="min-w-0 flex-1">
           <span className="flex items-baseline justify-between gap-2">
-            <span className={`text-[12.5px] font-semibold ${earned ? 'text-ink-50' : 'text-ink-200'}`}>
+            <span className={`text-[13px] font-semibold ${earned ? 'text-ink-50' : 'text-ink-200'}`}>
               {badge.title}
             </span>
-            <span className="font-code text-ink-400 shrink-0 text-[10.5px]">
-              {earned ? `earned ${formatDay(earnedAt)}` : label ?? 'locked'}
+            <span className="flex shrink-0 items-center gap-1">
+              {earned ? (
+                <LinkedInButton
+                  label="share"
+                  title="share this badge on LinkedIn"
+                  url={linkedInPostUrl(badgeShareText(badge, siteUrl()))}
+                />
+              ) : null}
+              <span className="font-code text-ink-400 text-[11px]">
+                {earned ? `earned ${formatDay(earnedAt)}` : label ?? 'locked'}
+              </span>
             </span>
           </span>
           <span className="text-ink-400 block text-[11px]">{badge.blurb}</span>
@@ -102,14 +114,14 @@ export const BadgeCatalog: FC<{progress: Record<string, BadgeProgress>; earned: 
       <div className="space-y-4">
         {next.length > 0 ? (
           <section className="border-iris-400/30 bg-iris-400/5 rounded-lg border px-3 py-2">
-            <p className="text-iris-300 text-[10.5px] font-bold uppercase tracking-wider">Up next</p>
+            <p className="text-iris-300 text-[11px] font-bold uppercase tracking-wider">Up next</p>
             <ul className="mt-1 flex flex-wrap gap-x-4 gap-y-1">
               {next.map(b => (
                 <li className="text-ink-200 flex items-center gap-1.5 text-[12px]" key={b.id}>
                   <BadgeGlyph badge={b} earned={false} size="sm" />
                   <span className="font-semibold">{b.title}</span>
                   {progressLabel(progress[b.id]) !== null ? (
-                    <span className="font-code text-ink-400 text-[10.5px]">{progressLabel(progress[b.id])}</span>
+                    <span className="font-code text-ink-400 text-[11px]">{progressLabel(progress[b.id])}</span>
                   ) : null}
                 </li>
               ))}

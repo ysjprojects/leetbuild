@@ -1,7 +1,7 @@
 import {type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 
 import {leetbuildHighlighter} from '@/lib/highlight';
-import {type StepAttempt, HINT_COST, potentialScore, problemScore, STEP_POINTS} from '@/lib/scoring';
+import {type ProblemScore, type StepAttempt, HINT_COST, potentialScore, problemScore, STEP_POINTS} from '@/lib/scoring';
 import {type TimedSession, bestSession, formatClock} from '@/lib/timer';
 import {type Language, type Problem, type Step, CONCEPT_LABEL, fileName, LANGUAGE_LABEL, stepKey} from '@/lib/types';
 
@@ -9,6 +9,7 @@ import {useDialog} from './Dialog';
 import Markdown from './Markdown';
 import {ConceptChip, DifficultyChip, ghostButtonClass, linkClass, primaryButtonClass} from './paneShared';
 import SequenceDiagram from './SequenceDiagram';
+import {mod} from './Shortcuts';
 import StepEditor from './StepEditor';
 import SystemDiagram from './SystemDiagram';
 import {Clock, SessionList} from './Timer';
@@ -262,6 +263,41 @@ const TimedRuns: FC<{problem: Problem; sessions: readonly TimedSession[]; timerA
   });
 TimedRuns.displayName = 'TimedRuns';
 
+/** Every step done: the certificate (when nothing was revealed), or why there is none. */
+const CourseComplete: FC<{problem: Problem; score: ProblemScore; certified: boolean; onCertificate: () => void}> = memo(
+  ({problem, score, certified, onCertificate}) => (
+    <section
+      className={`mb-4 rounded-xl border px-3 py-2.5 ${
+        certified ? 'border-success-400/50 bg-success-400/10' : 'border-ink-700 bg-ink-850'
+      }`}>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        <span
+          className={`text-[11px] font-bold uppercase tracking-wider ${
+            certified ? 'text-success-300' : 'text-ink-300'
+          }`}>
+          Course complete
+        </span>
+        <span className="text-ink-200 text-[12px]">
+          {certified
+            ? `every step of ${problem.title} accepted · ${score.score}/${score.max} pts`
+            : `${score.done - score.accepted} step${
+                score.done - score.accepted === 1 ? '' : 's'
+              } revealed — certificates go to courses completed with every check passing; start over to earn one`}
+        </span>
+        {certified ? (
+          <button
+            className="bg-success-400 text-ink-950 hover:bg-success-300 ml-auto rounded-lg px-3 py-1 text-[12px] font-bold transition"
+            onClick={onCertificate}
+            type="button">
+            Certificate · LinkedIn
+          </button>
+        ) : null}
+      </div>
+    </section>
+  ),
+);
+CourseComplete.displayName = 'CourseComplete';
+
 const EMPTY_PROBLEMS: Problem[] = [];
 
 const ProblemPane: FC<{
@@ -294,6 +330,10 @@ const ProblemPane: FC<{
   timerActive: boolean;
   /** Finished timed runs of this problem, oldest first. */
   sessions: readonly TimedSession[];
+  /** Every step accepted: a certificate can be issued. */
+  certified: boolean;
+  /** Open the certificate dialog (download, add to LinkedIn, share). */
+  onCertificate: () => void;
 }> = memo(
   ({
     problem,
@@ -319,6 +359,8 @@ const ProblemPane: FC<{
     onStartTimer,
     timerActive,
     sessions,
+    certified,
+    onCertificate,
   }) => {
     const score = problemScore(problem, attempts);
     const points = STEP_POINTS[problem.difficulty];
@@ -423,7 +465,7 @@ const ProblemPane: FC<{
             aria-label="hide the problem pane"
             className="text-ink-400 hover:text-ink-50 hidden h-6 w-6 items-center justify-center rounded-md transition lg:flex"
             onClick={onCollapse}
-            title="hide the problem pane"
+            title={`hide the problem pane (${mod('\\')})`}
             type="button">
             <svg
               aria-hidden
@@ -483,6 +525,9 @@ const ProblemPane: FC<{
                   {problem.steps.length} steps · {points} pts each
                 </span>
               </div>
+              {score.done === score.total ? (
+                <CourseComplete certified={certified} onCertificate={onCertificate} problem={problem} score={score} />
+              ) : null}
               <TimedRuns onStart={onStartTimer} problem={problem} sessions={sessions} timerActive={timerActive} />
               <Markdown highlight={leetbuildHighlighter} renderWidget={renderWidget} source={problem.statement} />
             </div>
@@ -494,7 +539,7 @@ const ProblemPane: FC<{
                 </span>
                 <ConceptChip concept={step.concept} />
                 <span
-                  className={`font-code rounded-full border px-1.5 py-0.5 text-[9.5px] normal-case tracking-normal ${
+                  className={`font-code rounded-full border px-1.5 py-0.5 text-[10px] normal-case tracking-normal ${
                     attempt.status === 'accepted'
                       ? 'border-success-400/60 text-success-300'
                       : attempt.status === 'revealed'

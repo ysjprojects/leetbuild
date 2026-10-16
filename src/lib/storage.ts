@@ -32,6 +32,8 @@ export interface Progress {
   timer: ActiveTimer | null;
   /** Finished timed runs, oldest first. */
   sessions: TimedSession[];
+  /** The name typed on a certificate, offered again next time. */
+  name: string;
 }
 
 export interface Snapshot {
@@ -66,6 +68,7 @@ export const EMPTY_PROGRESS: Progress = {
   badges: {},
   timer: null,
   sessions: [],
+  name: '',
 };
 
 export function workspaceKey(problemId: string, stepId: string, language: Language): string {
@@ -231,6 +234,7 @@ function normalizeProgress(value: unknown): Progress {
     badges: typeof p.badges === 'object' && p.badges !== null ? p.badges : {},
     timer: normalizeTimer(p.timer),
     sessions: normalizeSessions(p.sessions),
+    name: typeof p.name === 'string' ? p.name : '',
   };
 }
 

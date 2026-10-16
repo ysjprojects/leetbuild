@@ -39,7 +39,7 @@ export const DifficultyChip: FC<{difficulty: Difficulty}> = memo(({difficulty}) 
 DifficultyChip.displayName = 'DifficultyChip';
 
 export const ConceptChip: FC<{concept: Concept}> = memo(({concept}) => (
-  <span className={`font-code rounded-full border px-1.5 py-0.5 text-[9.5px] ${CONCEPT_CLASS[concept]}`}>
+  <span className={`font-code rounded-full border px-1.5 py-0.5 text-[10px] ${CONCEPT_CLASS[concept]}`}>
     {CONCEPT_LABEL[concept]}
   </span>
 ));
