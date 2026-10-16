@@ -40,6 +40,7 @@ import {
   stepPath,
 } from '@/lib/types';
 
+import {BadgeGlyph} from './Badges';
 import Confetti from './Confetti';
 import {useDialog} from './Dialog';
 import {ghostButtonClass, selectClass} from './paneShared';
@@ -140,9 +141,7 @@ const BadgeToast: FC<{id: number; badge: Badge; onDismiss: (id: number) => void}
       className="border-iris-400/60 bg-ink-800 hover:border-iris-300 pointer-events-auto flex items-center gap-3 rounded-xl border p-3 text-left shadow-2xl transition"
       onClick={onClick}
       type="button">
-      <span className="bg-iris-400 font-code text-ink-950 flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-[11px] font-bold">
-        {badge.glyph}
-      </span>
+      <BadgeGlyph badge={badge} earned size="lg" />
       <span className="min-w-0">
         <span className="text-iris-400 block text-[11px] font-bold uppercase tracking-wider">Badge earned</span>
         <span className="text-ink-50 block text-[13px] font-semibold">{badge.title}</span>
@@ -435,7 +434,8 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     () => computeProfile(problems, progress.attempts, progress.submissions, progress.acceptedSubmissions),
     [progress.attempts, progress.submissions, progress.acceptedSubmissions],
   );
-  const streak = useMemo(() => streakOf(progress.activeDays, dayKey(new Date())), [progress.activeDays]);
+  const today = dayKey(new Date());
+  const streak = useMemo(() => streakOf(progress.activeDays, today), [progress.activeDays, today]);
 
   // Badges are a function of the attempts; new ones are stored (never revoked) and announced.
   useEffect(() => {
@@ -896,11 +896,13 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       {problem === null || step === null ? (
         <main className="min-h-0 flex-1 overflow-y-auto">
           <ProblemList
+            activeDays={progress.activeDays}
             attempts={progress.attempts}
             badges={progress.badges}
             problems={problems}
             profile={profile}
             streak={streak}
+            today={today}
           />
         </main>
       ) : (

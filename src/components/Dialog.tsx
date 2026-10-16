@@ -13,6 +13,8 @@ export interface DialogSpec {
   confirm?: string;
   /** The affirmative action discards work: red button. */
   danger?: boolean;
+  /** A catalog or table rather than a sentence: wider panel, body scrolls. */
+  wide?: boolean;
 }
 
 const buttonClass = 'rounded-lg px-3 py-1.5 text-[12px] font-semibold transition';
@@ -38,7 +40,9 @@ const Dialog: FC<{spec: DialogSpec; onClose: (ok: boolean) => void}> = memo(({sp
   return (
     <dialog
       aria-labelledby="lb-dialog-title"
-      className="border-ink-600 bg-ink-800 text-ink-200 backdrop:bg-ink-950/70 w-[min(92vw,26rem)] rounded-xl border p-0 shadow-2xl"
+      className={`border-ink-600 bg-ink-800 text-ink-200 backdrop:bg-ink-950/70 rounded-xl border p-0 shadow-2xl ${
+        spec.wide === true ? 'w-[min(94vw,40rem)]' : 'w-[min(92vw,26rem)]'
+      }`}
       onClick={onClick}
       onClose={cancel}
       ref={ref}>
@@ -46,7 +50,12 @@ const Dialog: FC<{spec: DialogSpec; onClose: (ok: boolean) => void}> = memo(({sp
         <h2 className="text-ink-50 text-[15px] font-bold" id="lb-dialog-title">
           {spec.title}
         </h2>
-        <div className="text-ink-300 mt-2 text-[13px] leading-relaxed">{spec.body}</div>
+        <div
+          className={`text-ink-300 mt-2 text-[13px] leading-relaxed ${
+            spec.wide === true ? 'max-h-[70vh] overflow-y-auto pr-1' : ''
+          }`}>
+          {spec.body}
+        </div>
         <div className="mt-4 flex justify-end gap-2">
           {spec.confirm === undefined ? (
             <button autoFocus className={cancelClass} onClick={cancel} type="button">
