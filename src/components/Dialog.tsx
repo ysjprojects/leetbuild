@@ -11,6 +11,8 @@ export interface DialogSpec {
   body: ReactNode;
   /** Label of the affirmative button; omit for a notice that only closes. */
   confirm?: string;
+  /** Label of the dismissing button when it is a real choice ("Keep going"), not just "Cancel". */
+  cancel?: string;
   /** The affirmative action discards work: red button. */
   danger?: boolean;
   /** A catalog or table rather than a sentence: wider panel, body scrolls. */
@@ -64,7 +66,7 @@ const Dialog: FC<{spec: DialogSpec; onClose: (ok: boolean) => void}> = memo(({sp
           ) : (
             <>
               <button autoFocus className={cancelClass} onClick={cancel} type="button">
-                Cancel
+                {spec.cancel ?? 'Cancel'}
               </button>
               <button className={spec.danger === true ? dangerClass : confirmClass} onClick={confirm} type="button">
                 {spec.confirm}

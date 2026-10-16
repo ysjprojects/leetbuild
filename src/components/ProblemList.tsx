@@ -3,11 +3,13 @@ import {type FC, memo, useCallback, useMemo, useState} from 'react';
 
 import {type Streak, badgeProgress, BADGES} from '@/lib/gamify';
 import {type Profile, type StepAttempt, OPEN_ATTEMPT, problemScore, rankProgress} from '@/lib/scoring';
+import {type TimedSession, bestSession, formatClock} from '@/lib/timer';
 import {type Problem, CONCEPT_LABEL, stepKey} from '@/lib/types';
 
 import {BadgeCatalog, BadgeGlyph} from './Badges';
 import {useDialog} from './Dialog';
 import {CONCEPT_COLOR, ConceptChip, DifficultyChip} from './paneShared';
+import {Clock, SessionList} from './Timer';
 
 /**
  * The landing page: a short profile strip — where you stand (points inside a rank ring, the next
@@ -80,7 +82,8 @@ const ProfileStrip: FC<{
   attempts: Record<string, StepAttempt>;
   activeDays: readonly string[];
   today: string;
-}> = memo(({profile, streak, badges, problems, attempts, activeDays, today}) => {
+  sessions: readonly TimedSession[];
+}> = memo(({profile, streak, badges, problems, attempts, activeDays, today, sessions}) => {
   const rank = rankProgress(profile.score, profile.max);
   const share = Math.min(1, Math.max(0, (profile.score - rank.from) / Math.max(1, rank.nextAt - rank.from)));
   const earned = useMemo(() => BADGES.filter(b => badges[b.id] !== undefined), [badges]);
@@ -98,6 +101,19 @@ const ProfileStrip: FC<{
       wide: true,
     });
   }, [openDialog, earned.length, badges, progress]);
+  const counted = useMemo(() => sessions.filter(s => s.counted).length, [sessions]);
+  const onRuns = useCallback(() => {
+    void openDialog({
+      title: `Timed runs · ${sessions.length}`,
+      body:
+        sessions.length === 0 ? (
+          <p>No timed runs yet. Open a problem and press Start under “Timed run” to race its estimate from step 1.</p>
+        ) : (
+          <SessionList problems={problems} sessions={sessions} showProblem />
+        ),
+      wide: sessions.length > 0,
+    });
+  }, [openDialog, sessions, problems]);
   const shown = earned.slice(-5);
   return (
     <section className="border-ink-700 bg-ink-850 rounded-xl border px-4 py-3">
@@ -140,6 +156,26 @@ const ProfileStrip: FC<{
             </p>
           </div>
         </div>
+
+        {/* Timed runs */}
+        <button
+          className="hover:bg-ink-800 group flex items-center gap-2 rounded-lg px-1.5 py-1 text-left transition"
+          onClick={onRuns}
+          title="every timed run, newest first"
+          type="button">
+          <span className={sessions.length > 0 ? 'text-iris-300' : 'text-ink-500'}>
+            <Clock />
+          </span>
+          <span>
+            <span className="text-ink-50 block text-[13px] font-bold leading-tight">
+              {sessions.length === 0 ? 'No timed runs' : `${counted} counted`}
+              {sessions.length > 0 ? <span className="text-ink-400 font-normal"> / {sessions.length} runs</span> : null}
+            </span>
+            <span className="text-iris-300 group-hover:text-iris-200 block text-[11px]">
+              {sessions.length === 0 ? 'race a problem’s estimate ›' : 'history ›'}
+            </span>
+          </span>
+        </button>
 
         {/* Badges */}
         <button
@@ -276,7 +312,8 @@ const ProblemRow: FC<{
   problem: Problem;
   index: number;
   attempts: Record<string, StepAttempt>;
-}> = memo(({problem, index, attempts}) => {
+  best: TimedSession | null;
+}> = memo(({problem, index, attempts, best}) => {
   const score = problemScore(problem, attempts);
   const solved = score.done === score.total;
   const started = score.done > 0;
@@ -313,6 +350,14 @@ const ProblemRow: FC<{
               {score.score}/{score.max} pts
             </span>
             <span className="font-code">~{problem.minutes} min</span>
+            {best !== null ? (
+              <span
+                className="font-code text-success-300 flex items-center gap-1"
+                title="your fastest timed run within the budget">
+                <Clock />
+                {formatClock(best.elapsed)}
+              </span>
+            ) : null}
             {score.accepted < score.done ? (
               <span className="font-code text-warning-300">{score.done - score.accepted} revealed</span>
             ) : null}
@@ -338,7 +383,8 @@ const ProblemList: FC<{
   badges: Record<string, number>;
   activeDays: readonly string[];
   today: string;
-}> = memo(({problems, attempts, profile, streak, badges, activeDays, today}) => (
+  sessions: readonly TimedSession[];
+}> = memo(({problems, attempts, profile, streak, badges, activeDays, today, sessions}) => (
   <div className="mx-auto w-full max-w-4xl space-y-5 px-4 py-5">
     <div>
       <h1 className="text-ink-50 text-2xl font-extrabold leading-tight">Build systems, step by step</h1>
@@ -355,6 +401,7 @@ const ProblemList: FC<{
       badges={badges}
       problems={problems}
       profile={profile}
+      sessions={sessions}
       streak={streak}
       today={today}
     />
@@ -362,7 +409,13 @@ const ProblemList: FC<{
       <p className="text-iris-400 mb-2 text-[11px] font-bold uppercase tracking-wider">Problems</p>
       <ul className="space-y-2">
         {problems.map((problem, i) => (
-          <ProblemRow attempts={attempts} index={i} key={problem.id} problem={problem} />
+          <ProblemRow
+            attempts={attempts}
+            best={bestSession(sessions, problem.id)}
+            index={i}
+            key={problem.id}
+            problem={problem}
+          />
         ))}
       </ul>
     </section>

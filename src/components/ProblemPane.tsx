@@ -2,6 +2,7 @@ import {type FC, memo, useCallback, useMemo, useState} from 'react';
 
 import {leetbuildHighlighter} from '@/lib/highlight';
 import {type StepAttempt, HINT_COST, potentialScore, problemScore, STEP_POINTS} from '@/lib/scoring';
+import {type TimedSession, bestSession, formatClock} from '@/lib/timer';
 import {type Language, type Problem, type Step, CONCEPT_LABEL, fileName, LANGUAGE_LABEL, stepKey} from '@/lib/types';
 
 import {useDialog} from './Dialog';
@@ -10,6 +11,7 @@ import {ConceptChip, DifficultyChip, ghostButtonClass, linkClass, primaryButtonC
 import SequenceDiagram from './SequenceDiagram';
 import StepEditor from './StepEditor';
 import SystemDiagram from './SystemDiagram';
+import {Clock, SessionList} from './Timer';
 import {renderWidget} from './widgets';
 
 export type PaneTab = 'problem' | 'step';
@@ -174,6 +176,55 @@ const Solution: FC<{
 });
 Solution.displayName = 'Solution';
 
+/** Timer mode on the description tab: start a run, or see the clock is already running, and the problem's past runs. */
+const TimedRuns: FC<{problem: Problem; sessions: readonly TimedSession[]; timerActive: boolean; onStart: () => void}> =
+  memo(({problem, sessions, timerActive, onStart}) => {
+    const best = useMemo(() => bestSession(sessions, problem.id), [sessions, problem.id]);
+    const [open, setOpen] = useState(false);
+    const toggle = useCallback(() => setOpen(v => !v), []);
+    return (
+      <section className="border-ink-700 bg-ink-850 mb-4 rounded-xl border px-3 py-2.5">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+          <span className="text-iris-300 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider">
+            <Clock />
+            Timed run
+          </span>
+          <span className="text-ink-300 text-[12px]">
+            {timerActive
+              ? 'in progress — the clock is in the header'
+              : best === null
+              ? `race the ${problem.minutes} min estimate, from step 1`
+              : `your time: ${formatClock(best.elapsed)}`}
+          </span>
+          <span className="ml-auto flex items-center gap-2">
+            {sessions.length > 0 ? (
+              <button
+                aria-expanded={open}
+                className="text-ink-400 hover:text-ink-50 rounded-md px-1.5 py-0.5 text-[11px] transition"
+                onClick={toggle}
+                type="button">
+                {sessions.length} run{sessions.length === 1 ? '' : 's'} {open ? '▴' : '▾'}
+              </button>
+            ) : null}
+            {timerActive ? null : (
+              <button className={`${ghostButtonClass} border-ink-600 border py-1`} onClick={onStart} type="button">
+                Start
+              </button>
+            )}
+          </span>
+        </div>
+        {open ? (
+          <div className="border-ink-700/70 mt-2 border-t pt-1">
+            <SessionList problems={EMPTY_PROBLEMS} sessions={sessions} showProblem={false} />
+          </div>
+        ) : null}
+      </section>
+    );
+  });
+TimedRuns.displayName = 'TimedRuns';
+
+const EMPTY_PROBLEMS: Problem[] = [];
+
 const ProblemPane: FC<{
   problem: Problem;
   step: Step;
@@ -198,6 +249,12 @@ const ProblemPane: FC<{
   onShare: () => Promise<boolean>;
   /** Fold the pane into a strip beside the IDE (`lg` and up). */
   onCollapse: () => void;
+  /** Timer mode: open the start dialog for this problem. */
+  onStartTimer: () => void;
+  /** A timed run of this problem is in progress (the header shows the clock). */
+  timerActive: boolean;
+  /** Finished timed runs of this problem, oldest first. */
+  sessions: readonly TimedSession[];
 }> = memo(
   ({
     problem,
@@ -220,6 +277,9 @@ const ProblemPane: FC<{
     onDownload,
     onShare,
     onCollapse,
+    onStartTimer,
+    timerActive,
+    sessions,
   }) => {
     const score = problemScore(problem, attempts);
     const points = STEP_POINTS[problem.difficulty];
@@ -373,6 +433,7 @@ const ProblemPane: FC<{
                   {problem.steps.length} steps · {points} pts each
                 </span>
               </div>
+              <TimedRuns onStart={onStartTimer} problem={problem} sessions={sessions} timerActive={timerActive} />
               <Markdown highlight={leetbuildHighlighter} renderWidget={renderWidget} source={problem.statement} />
             </div>
           ) : (

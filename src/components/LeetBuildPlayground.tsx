@@ -29,6 +29,16 @@ import {
 } from '@/lib/scoring';
 import {type Progress, type Workspace, EMPTY_PROGRESS, getProgressStore, workspaceKey} from '@/lib/storage';
 import {
+  type SessionOutcome,
+  elapsedSeconds,
+  finishSession,
+  formatClock,
+  isComplete,
+  SESSION_HISTORY,
+  startTimer,
+  stepsDone,
+} from '@/lib/timer';
+import {
   type Language,
   type Problem,
   type Step,
@@ -49,6 +59,7 @@ import ProblemPane, {type PaneTab, unlocked} from './ProblemPane';
 import SplitGutter from './SplitGutter';
 import StepEditor from './StepEditor';
 import ThemeToggle from './ThemeToggle';
+import {BudgetPicker, TimerPill} from './Timer';
 import VerdictPane from './VerdictPane';
 
 const problemById: Record<string, Problem> = {};
@@ -593,7 +604,31 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     onSelectStep(problem.steps[stepIndex - 1].id);
   }, [problem, stepIndex, onSelectStep]);
 
-  /** Clear every attempt and saved workspace of the problem and start it over from step 1. */
+  /** Clear every attempt and saved workspace of the problem and reopen it on step 1. */
+  const resetProblem = useCallback(
+    (target: Problem) => {
+      for (const s of target.steps) {
+        for (const lang of LANGUAGES) {
+          const key = workspaceKey(target.id, s.id, lang);
+          delete workspaces.current[key];
+          store.deleteWorkspace(key);
+        }
+      }
+      const first = target.steps[0];
+      setProgress(p => {
+        const attempts = {...p.attempts};
+        for (const s of target.steps) delete attempts[stepKey(target.id, s.id)];
+        return {...p, attempts, lastStep: {...p.lastStep, [target.id]: first.id}};
+      });
+      setTab('step');
+      setOpenTabs([first.id]);
+      // Clearing the attempts locks every later step, so the address re-resolves to step 1 and opens it;
+      // only when step 1 is already open does nothing change and the starter has to be loaded here.
+      if (stepIndex === 0) mount(target, first, language);
+    },
+    [stepIndex, language, mount, store],
+  );
+
   const onResetProblem = useCallback(() => {
     if (problem === null) return;
     void openDialog({
@@ -602,27 +637,89 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       confirm: 'Start over',
       danger: true,
     }).then(ok => {
-      if (!ok) return;
-      for (const s of problem.steps) {
-        for (const lang of LANGUAGES) {
-          const key = workspaceKey(problem.id, s.id, lang);
-          delete workspaces.current[key];
-          store.deleteWorkspace(key);
-        }
-      }
-      const first = problem.steps[0];
-      setProgress(p => {
-        const attempts = {...p.attempts};
-        for (const s of problem.steps) delete attempts[stepKey(problem.id, s.id)];
-        return {...p, attempts, lastStep: {...p.lastStep, [problem.id]: first.id}};
-      });
-      setTab('step');
-      setOpenTabs([first.id]);
-      // Clearing the attempts locks every later step, so the address re-resolves to step 1 and opens it;
-      // only when step 1 is already open does nothing change and the starter has to be loaded here.
-      if (stepIndex === 0) mount(problem, first, language);
+      if (ok) resetProblem(problem);
     });
-  }, [problem, stepIndex, language, mount, openDialog, store]);
+  }, [problem, resetProblem, openDialog]);
+
+  // Timer mode -------------------------------------------------------------------------------------
+  const timer = progress.timer;
+  const timedProblem = timer === null ? undefined : problemById[timer.problemId];
+
+  /** Close the run as `outcome` and file it in the history. */
+  const endTimer = useCallback((outcome: SessionOutcome) => {
+    setProgress(p => {
+      if (p.timer === null) return p;
+      const target = problemById[p.timer.problemId];
+      if (target === undefined) return {...p, timer: null};
+      const session = finishSession(p.timer, target, p.attempts, outcome, Date.now());
+      return {...p, timer: null, sessions: [...p.sessions, session].slice(-SESSION_HISTORY)};
+    });
+  }, []);
+
+  // Every step done: the run is over, counted or not.
+  useEffect(() => {
+    if (timer === null || timedProblem === undefined) return;
+    if (isComplete(timedProblem, progress.attempts)) endTimer('completed');
+  }, [timer, timedProblem, progress.attempts, endTimer]);
+
+  const budgetChoice = useRef(1);
+  const onBudgetChange = useCallback((factor: number) => {
+    budgetChoice.current = factor;
+  }, []);
+
+  /** Start a timed run of the open problem: pick a budget, then reset the problem and start the clock. */
+  const onStartTimer = useCallback(() => {
+    if (problem === null) return;
+    budgetChoice.current = 1;
+    void openDialog({
+      title: `Timed run · ${problem.title}`,
+      body: <BudgetPicker initial={1} onChange={onBudgetChange} problem={problem} />,
+      confirm: timer === null ? 'Start the clock' : 'End the current run and start',
+      danger: true,
+    }).then(ok => {
+      if (!ok) return;
+      if (timer !== null) endTimer('ended');
+      resetProblem(problem);
+      const started = startTimer(problem, budgetChoice.current, language, Date.now());
+      setProgress(p => ({...p, timer: started}));
+    });
+  }, [problem, timer, language, openDialog, onBudgetChange, endTimer, resetProblem]);
+
+  /** The budget ran out: stop here, or keep going knowing the run will not be counted. */
+  const onTimerExpired = useCallback(() => {
+    if (timer === null || timedProblem === undefined) return;
+    const done = stepsDone(timedProblem, progressRef.current.attempts);
+    void openDialog({
+      title: `Time’s up · ${timedProblem.title}`,
+      body: `The ${formatClock(timer.budget)} budget has run out with ${done.accepted} of ${
+        timedProblem.steps.length
+      } steps accepted. End the run and record it, or keep going — the clock keeps counting, and the run will not be counted.`,
+      confirm: 'End the run',
+      cancel: 'Keep going (not counted)',
+    }).then(ok => {
+      if (ok) endTimer('expired');
+      else setProgress(p => (p.timer === null ? p : {...p, timer: {...p.timer, overtime: true}}));
+    });
+  }, [timer, timedProblem, openDialog, endTimer]);
+
+  const onTimerClick = useCallback(() => {
+    if (timer === null || timedProblem === undefined) return;
+    const done = stepsDone(timedProblem, progressRef.current.attempts);
+    const elapsed = formatClock(elapsedSeconds(timer, Date.now()));
+    void openDialog({
+      title: `End this timed run?`,
+      body: `${timedProblem.title} · ${elapsed} on the clock · ${done.accepted} of ${timedProblem.steps.length} steps accepted. The run is recorded as ended early; your progress on the problem stays.`,
+      confirm: 'End the run',
+      cancel: 'Keep going',
+    }).then(ok => {
+      if (ok) endTimer('ended');
+    });
+  }, [timer, timedProblem, openDialog, endTimer]);
+
+  const problemSessions = useMemo(
+    () => (problem === null ? [] : progress.sessions.filter(s => s.problemId === problem.id)),
+    [problem, progress.sessions],
+  );
 
   const onLanguage = useCallback(
     (e: ChangeEvent<HTMLSelectElement>) => {
@@ -880,6 +977,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
             {profile.score}
             <span className="text-ink-400">/{profile.max}</span> pts
           </span>
+          {timer !== null ? (
+            <TimerPill onClick={onTimerClick} onExpire={onTimerExpired} problem={timedProblem} timer={timer} />
+          ) : null}
           {streak.current > 0 ? (
             <span
               className="border-iris-400/40 bg-iris-400/10 font-code text-iris-200 hidden rounded-full border px-2.5 py-1 text-[11px] sm:inline"
@@ -901,6 +1001,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
             badges={progress.badges}
             problems={problems}
             profile={profile}
+            sessions={progress.sessions}
             streak={streak}
             today={today}
           />
@@ -937,11 +1038,14 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                 onRevealSolution={onRevealSolution}
                 onSelectStep={onSelectStep}
                 onShare={onShare}
+                onStartTimer={onStartTimer}
                 onTab={setTab}
                 problem={problem}
+                sessions={problemSessions}
                 step={step}
                 stepIndex={stepIndex}
                 tab={tab}
+                timerActive={timer !== null && timer.problemId === problem.id}
                 userCode={stepCode}
               />
             </div>

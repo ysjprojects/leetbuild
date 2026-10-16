@@ -8,6 +8,7 @@
  * and `flush()` runs on page hide so the last edits survive navigation.
  */
 import type {StepAttempt} from './scoring';
+import {type ActiveTimer, type TimedSession, SESSION_HISTORY} from './timer';
 import {type Language, LANGUAGES} from './types';
 
 export interface Workspace {
@@ -27,6 +28,10 @@ export interface Progress {
   activeDays: string[];
   /** Badge id → time earned. Never revoked, even if the attempts behind it are reset. */
   badges: Record<string, number>;
+  /** The timed run in progress, if any (one at a time); survives reloads. */
+  timer: ActiveTimer | null;
+  /** Finished timed runs, oldest first. */
+  sessions: TimedSession[];
 }
 
 export interface Snapshot {
@@ -59,6 +64,8 @@ export const EMPTY_PROGRESS: Progress = {
   acceptedSubmissions: 0,
   activeDays: [],
   badges: {},
+  timer: null,
+  sessions: [],
 };
 
 export function workspaceKey(problemId: string, stepId: string, language: Language): string {
@@ -172,18 +179,58 @@ class LocalStorageBackend implements Backend {
   }
 }
 
+const isLanguage = (v: unknown): v is Language => typeof v === 'string' && LANGUAGES.includes(v as Language);
+
+const normalizeTimer = (value: unknown): ActiveTimer | null => {
+  if (typeof value !== 'object' || value === null) return null;
+  const t = value as Partial<ActiveTimer>;
+  if (typeof t.problemId !== 'string' || typeof t.startedAt !== 'number' || typeof t.budget !== 'number') return null;
+  return {
+    problemId: t.problemId,
+    startedAt: t.startedAt,
+    budget: t.budget,
+    overtime: t.overtime === true,
+    language: isLanguage(t.language) ? t.language : 'python',
+  };
+};
+
+const normalizeSessions = (value: unknown): TimedSession[] => {
+  if (!Array.isArray(value)) return [];
+  const sessions: TimedSession[] = [];
+  for (const item of value) {
+    if (typeof item !== 'object' || item === null) continue;
+    const s = item as Partial<TimedSession>;
+    if (typeof s.problemId !== 'string' || typeof s.startedAt !== 'number' || typeof s.elapsed !== 'number') continue;
+    sessions.push({
+      problemId: s.problemId,
+      startedAt: s.startedAt,
+      budget: typeof s.budget === 'number' ? s.budget : 0,
+      elapsed: s.elapsed,
+      accepted: typeof s.accepted === 'number' ? s.accepted : 0,
+      revealed: typeof s.revealed === 'number' ? s.revealed : 0,
+      total: typeof s.total === 'number' ? s.total : 0,
+      language: isLanguage(s.language) ? s.language : 'python',
+      outcome: s.outcome === 'completed' || s.outcome === 'expired' ? s.outcome : 'ended',
+      counted: s.counted === true,
+    });
+  }
+  return sessions.slice(-SESSION_HISTORY);
+};
+
 function normalizeProgress(value: unknown): Progress {
   if (typeof value !== 'object' || value === null)
-    return {...EMPTY_PROGRESS, attempts: {}, lastStep: {}, activeDays: [], badges: {}};
+    return {...EMPTY_PROGRESS, attempts: {}, lastStep: {}, activeDays: [], badges: {}, sessions: []};
   const p = value as Partial<Progress>;
   return {
     attempts: typeof p.attempts === 'object' && p.attempts !== null ? p.attempts : {},
-    language: typeof p.language === 'string' && LANGUAGES.includes(p.language) ? p.language : 'python',
+    language: isLanguage(p.language) ? p.language : 'python',
     lastStep: typeof p.lastStep === 'object' && p.lastStep !== null ? p.lastStep : {},
     submissions: typeof p.submissions === 'number' ? p.submissions : 0,
     acceptedSubmissions: typeof p.acceptedSubmissions === 'number' ? p.acceptedSubmissions : 0,
     activeDays: Array.isArray(p.activeDays) ? p.activeDays.filter((d): d is string => typeof d === 'string') : [],
     badges: typeof p.badges === 'object' && p.badges !== null ? p.badges : {},
+    timer: normalizeTimer(p.timer),
+    sessions: normalizeSessions(p.sessions),
   };
 }
 
