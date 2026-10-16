@@ -28,6 +28,35 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* Keyboard focus in the palette's accent instead of the browser default; pointer focus stays quiet. */
+:focus-visible {
+  outline: 2px solid theme('colors.iris.400');
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Native dialogs open and close abruptly by default; a short fade and lift reads as intentional. */
+dialog[open] {
+  animation: lb-dialog-in 140ms ease-out;
+}
+
+@keyframes lb-dialog-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  dialog[open] {
+    animation: none;
+  }
+}
+
 /* The playground: CodeMirror chrome, the syntax token palette shared by editors and static code
  * blocks, and the unified-diff colours of the reference-solution viewer. */
 .leetbuild-playground {

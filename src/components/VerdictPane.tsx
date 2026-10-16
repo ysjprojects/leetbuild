@@ -139,6 +139,13 @@ const VerdictPane: FC<{
 }> = memo(({step, language, verdict, attempt, earned, stale, executes, running, runtime}) => {
   const showShape = attempt.wrong >= SHAPE_AFTER_WRONG;
   const runError = verdict?.run?.error;
+  /** Every failing check reported the same thing (typically one unimplemented function): say it once. */
+  const common = useMemo(() => {
+    if (verdict === null || verdict.accepted) return null;
+    const failing = verdict.results.filter(r => !r.passed);
+    const first = failing[0]?.message;
+    return first !== undefined && failing.every(r => r.message === first) ? first : null;
+  }, [verdict]);
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="border-ink-700 text-ink-300 flex shrink-0 flex-wrap items-center gap-2 border-b px-3 py-1.5 text-[11px]">
@@ -197,12 +204,15 @@ const VerdictPane: FC<{
             <p className="text-ink-50 mt-0.5 text-lg font-extrabold">Wrong Answer</p>
             <p className="text-danger-200 mt-0.5 text-[12px]">
               {verdict.passed}/{verdict.total} checks passed.{' '}
-              {verdict.run !== undefined
+              {common !== null
+                ? 'Every failing check hit the same thing:'
+                : verdict.run !== undefined
                 ? 'Each failing check says what it observed.'
                 : showShape
                 ? 'Failing checks now show the shape the judge expects.'
                 : `Fix the failing ones and submit again — after ${SHAPE_AFTER_WRONG} wrong submissions, failing checks show the exact shape the judge expects.`}
             </p>
+            {common !== null ? <p className="font-code text-ink-50 mt-1.5 text-[12px]">{common}</p> : null}
           </div>
         )}
         <ul className="space-y-1.5">
@@ -245,7 +255,7 @@ const VerdictPane: FC<{
                 </p>
                 {result !== null && !result.passed ? (
                   <>
-                    {result.message !== undefined ? (
+                    {result.message !== undefined && result.message !== common ? (
                       <p className="font-code text-danger-200 mt-1 pl-6 text-[11.5px]">{result.message}</p>
                     ) : null}
                     <p className="text-ink-200 mt-1 pl-6 text-[12px]">

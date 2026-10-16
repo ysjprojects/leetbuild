@@ -23,7 +23,11 @@ export function unlocked(problem: Problem, index: number, attempts: Record<strin
   return previous !== undefined && previous.status !== 'open';
 }
 
-const StepChip: FC<{
+/**
+ * One node of the step rail: the step's number, or its status once decided (✓ accepted, ◐ revealed,
+ * 🔒 locked). The title lives in the tooltip; the open step's title is the heading below.
+ */
+const StepNode: FC<{
   step: Step;
   index: number;
   active: boolean;
@@ -34,29 +38,64 @@ const StepChip: FC<{
   const onClick = useCallback(() => onSelect(step.id), [onSelect, step.id]);
   return (
     <button
-      className={`flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition disabled:cursor-not-allowed ${
-        active
-          ? 'border-iris-400 bg-iris-400/15 text-ink-50'
-          : status === 'accepted'
-          ? 'border-success-400/60 bg-success-400/10 text-success-200 hover:text-ink-50'
+      aria-current={active ? 'step' : undefined}
+      className={`font-code relative flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold transition disabled:cursor-not-allowed ${
+        active ? 'ring-iris-400/30 ring-4' : ''
+      } ${
+        status === 'accepted'
+          ? 'border-success-400 bg-success-400 text-ink-950'
           : status === 'revealed'
-          ? 'border-warning-400/60 bg-warning-400/10 text-warning-200 hover:text-ink-50'
+          ? 'border-warning-400 bg-warning-400 text-ink-950'
+          : active
+          ? 'border-iris-400 bg-iris-400 text-ink-950'
           : locked
-          ? 'border-ink-700 text-ink-500'
-          : 'border-ink-600 text-ink-200 hover:border-iris-400/60 hover:text-ink-50'
+          ? 'border-ink-700 text-ink-500 border-dashed'
+          : 'border-ink-500 text-ink-200 hover:border-iris-400 hover:text-ink-50'
       }`}
       disabled={locked}
       onClick={onClick}
-      title={locked ? 'Finish the previous step first' : step.title}
+      title={`Step ${index + 1}: ${step.title}${locked ? ' — finish the previous step first' : ''}`}
       type="button">
-      <span className="font-code">
-        {status === 'accepted' ? '✓' : status === 'revealed' ? '◐' : locked ? '🔒' : index + 1}
-      </span>
-      <span className="max-w-[140px] truncate">{step.title}</span>
+      {status === 'accepted' ? '✓' : status === 'revealed' ? '◐' : locked ? '🔒' : index + 1}
     </button>
   );
 });
-StepChip.displayName = 'StepChip';
+StepNode.displayName = 'StepNode';
+
+/** The steps as a rail: nodes joined by a line that fills as steps are done. */
+const StepRail: FC<{
+  problem: Problem;
+  attempts: Record<string, StepAttempt>;
+  activeId: string | null;
+  onSelect: (id: string) => void;
+}> = memo(({problem, attempts, activeId, onSelect}) => (
+  <ol aria-label="steps" className="mt-3 flex items-center">
+    {problem.steps.map((s, i) => {
+      const status = attempts[stepKey(problem.id, s.id)]?.status ?? 'open';
+      const previousDone =
+        i > 0 && (attempts[stepKey(problem.id, problem.steps[i - 1].id)]?.status ?? 'open') !== 'open';
+      return (
+        <li className={`flex items-center ${i > 0 ? 'flex-1' : ''}`} key={s.id}>
+          {i > 0 ? (
+            <span
+              aria-hidden
+              className={`h-0.5 min-w-[12px] flex-1 ${previousDone ? 'bg-success-400/70' : 'bg-ink-700'}`}
+            />
+          ) : null}
+          <StepNode
+            active={s.id === activeId}
+            index={i}
+            locked={!unlocked(problem, i, attempts)}
+            onSelect={onSelect}
+            status={status}
+            step={s}
+          />
+        </li>
+      );
+    })}
+  </ol>
+));
+StepRail.displayName = 'StepRail';
 
 const Hints: FC<{
   hints: readonly string[];
@@ -355,11 +394,23 @@ const ProblemPane: FC<{
           ) : null}
           {problem.steps.some(s => attempts[stepKey(problem.id, s.id)] !== undefined) ? (
             <button
-              className="text-ink-400 hover:text-danger-200 rounded-md px-1.5 py-0.5 text-[11px] transition"
+              aria-label="start this problem over"
+              className="border-ink-600 bg-ink-800 text-ink-200 hover:border-danger-400/60 hover:text-danger-200 flex h-6 w-6 items-center justify-center rounded-md border transition"
               onClick={onResetProblem}
-              title="clear this problem's results and code and start over"
+              title="start over: clear this problem's results and code"
               type="button">
-              ↺ start over
+              <svg
+                aria-hidden
+                fill="none"
+                height={13}
+                stroke="currentColor"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={1.8}
+                viewBox="0 0 16 16"
+                width={13}>
+                <path d="M2.5 8a5.5 5.5 0 1 0 1.6-3.9M2.5 2.5v3h3" />
+              </svg>
             </button>
           ) : null}
           <button
@@ -390,19 +441,12 @@ const ProblemPane: FC<{
             onSelectNode={onSelectNode}
             stepsByNode={stepsByNode}
           />
-          <div className="no-scrollbar mt-3 flex items-center gap-1.5 overflow-x-auto pb-1">
-            {problem.steps.map((s, i) => (
-              <StepChip
-                active={tab === 'step' && s.id === step.id}
-                index={i}
-                key={s.id}
-                locked={!unlocked(problem, i, attempts)}
-                onSelect={onSelectStep}
-                status={attempts[stepKey(problem.id, s.id)]?.status ?? 'open'}
-                step={s}
-              />
-            ))}
-          </div>
+          <StepRail
+            activeId={tab === 'step' ? step.id : null}
+            attempts={attempts}
+            onSelect={onSelectStep}
+            problem={problem}
+          />
           <div className="border-ink-700 mt-3 flex items-center gap-1 border-b">
             <button
               className={`border-b-2 px-2.5 py-1.5 text-[12px] font-semibold transition ${
@@ -460,8 +504,11 @@ const ProblemPane: FC<{
               </p>
               <h1 className="text-ink-50 mt-1 text-xl font-extrabold leading-tight">{step.title}</h1>
               <p className="text-ink-300 mt-1 text-[12px]">
-                Edit <code className="font-code text-iris-200">{fileName(step.file, language)}</code> on the right, then
-                submit. Checks are static: they read the shape of your code, nothing is executed.
+                Edit <code className="font-code text-iris-200">{fileName(step.file, language)}</code> in the editor,
+                then submit.{' '}
+                {step.harness?.[language] !== undefined
+                  ? 'Your code runs in the browser: each check exercises it and reports what it observed.'
+                  : 'The checks read the shape of your code; nothing is executed in this language.'}
               </p>
               {step.sequence !== undefined ? (
                 <div className="mt-3">
@@ -504,8 +551,19 @@ const ProblemPane: FC<{
           <span className="text-ink-300 flex-1 text-center text-[11px]">
             {score.done}/{score.total} steps done
           </span>
-          <button className={primaryButtonClass} disabled={!done || !hasNext} onClick={onNextStep} type="button">
-            {hasNext ? 'next step →' : 'last step'}
+          <button
+            className={primaryButtonClass}
+            disabled={!done || !hasNext}
+            onClick={onNextStep}
+            title={
+              !hasNext
+                ? 'this is the last step'
+                : done
+                ? `step ${stepIndex + 2}: ${problem.steps[stepIndex + 1].title}`
+                : 'accept or reveal this step to unlock the next'
+            }
+            type="button">
+            {hasNext ? (done ? 'next step →' : 'next step 🔒') : 'last step'}
           </button>
         </div>
       </div>
