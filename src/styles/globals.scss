@@ -28,6 +28,16 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* The LinkedIn [in] logo may only be blue, black or white (brand.linkedin.com/in-logo): white on the
+ * Night palette, LinkedIn blue on Day. Buttons are LinkedIn's own blue in both themes. */
+html {
+  --lb-linkedin: #fff;
+}
+
+html[data-theme='light'] {
+  --lb-linkedin: #0a66c2;
+}
+
 /* Keyboard focus in the palette's accent instead of the browser default; pointer focus stays quiet. */
 :focus-visible {
   outline: 2px solid theme('colors.iris.400');

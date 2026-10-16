@@ -7,8 +7,8 @@
  * (`/profile/add?startTask=CERTIFICATION_NAME&…`) for a completed course's certificate, which lands
  * it in the Licenses & certifications section with a link back to the certificate page here.
  */
-import type {Badge} from './gamify';
-import {problemScore} from './scoring';
+import {type Badge, shareText} from './gamify';
+import {type StepAttempt, problemScore} from './scoring';
 import type {Progress} from './storage';
 import {bestSession, formatClock} from './timer';
 import {type Concept, type Difficulty, type Language, type Problem, type Step, LANGUAGE_LABEL, stepKey} from './types';
@@ -18,6 +18,16 @@ const HASHTAGS = '#LeetBuild #SystemDesign #DistributedSystems';
 
 export function linkedInPostUrl(text: string): string {
   return `https://www.linkedin.com/feed/?shareActive=true&text=${encodeURIComponent(text)}`;
+}
+
+/** A course's Wordle-style result card (one square per step, the score, the course link) as a post. */
+export function resultShareText(
+  problem: Problem,
+  attempts: Record<string, StepAttempt>,
+  language: Language,
+  url: string,
+): string {
+  return `${shareText(problem, attempts, language, url)}\n\n${HASHTAGS}`;
 }
 
 /** What a certificate needs to know about a course — a tenth of a `Problem`, so the certificate page ships no step code. */

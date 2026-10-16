@@ -4,7 +4,7 @@ import Link from 'next/link';
 import {useRouter} from 'next/router';
 import {type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 
-import {LinkedInButton} from '@/components/Social';
+import {LinkedInButton, POST_HINT, PROFILE_HINT} from '@/components/Social';
 import {problems} from '@/data/problems';
 import {downloadCertificate, drawCertificate} from '@/lib/certificate';
 import {STEP_POINTS} from '@/lib/scoring';
@@ -98,11 +98,13 @@ const Certificate: FC<{course: CourseSummary}> = memo(({course}) => {
             </button>
             <LinkedInButton
               label="Add to LinkedIn profile"
+              title={PROFILE_HINT}
               tone="solid"
               url={linkedInAddCertificateUrl(details, url)}
             />
             <LinkedInButton
               label="Share on LinkedIn"
+              title={POST_HINT}
               tone="solid"
               url={linkedInPostUrl(courseShareText(details, url))}
             />

@@ -6,7 +6,7 @@ import type {StepAttempt, Submission} from '@/lib/scoring';
 import {type Language, type Step, type StepCheck, LANGUAGE_LABEL} from '@/lib/types';
 
 import {InlineMarkdown} from './Markdown';
-import {LinkedInButton} from './Social';
+import {LinkedInButton, POST_HINT} from './Social';
 
 /**
  * LeetCode-style result panel: before a submission it lists the checks as the step's test cases;
@@ -228,7 +228,7 @@ const VerdictPane: FC<{
                 </p>
                 {shareUrl !== undefined && attempt.status === 'accepted' ? (
                   <div className="-ml-1.5 mt-1.5">
-                    <LinkedInButton label="Share this step on LinkedIn" url={shareUrl} />
+                    <LinkedInButton label="Share this step on LinkedIn" title={POST_HINT} url={shareUrl} />
                   </div>
                 ) : null}
               </div>

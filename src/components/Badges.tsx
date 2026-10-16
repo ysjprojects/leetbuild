@@ -5,7 +5,7 @@ import {type Badge, type BadgeProgress, BADGES, TRACKS} from '@/lib/gamify';
 import {badgeShareText, linkedInPostUrl} from '@/lib/social';
 
 import {CONCEPT_COLOR} from './paneShared';
-import {LinkedInButton} from './Social';
+import {LinkedInButton, POST_HINT} from './Social';
 
 /**
  * Badges as the learner sees them: a glyph disc (earned: filled in iris, or the concept colour for
@@ -68,8 +68,9 @@ const BadgeRow: FC<{badge: Badge; progress: BadgeProgress; earnedAt: number | un
             <span className="flex shrink-0 items-center gap-1">
               {earned ? (
                 <LinkedInButton
-                  label="share"
-                  title="share this badge on LinkedIn"
+                  label="share this badge on LinkedIn"
+                  title={`share this badge on LinkedIn: ${POST_HINT}`}
+                  tone="icon"
                   url={linkedInPostUrl(badgeShareText(badge, siteUrl()))}
                 />
               ) : null}

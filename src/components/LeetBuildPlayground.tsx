@@ -4,7 +4,6 @@ import {
   type ChangeEvent,
   type CSSProperties,
   type FC,
-  type FocusEvent,
   memo,
   useCallback,
   useEffect,
@@ -16,7 +15,7 @@ import {
 import {problems} from '@/data/problems';
 import {downloadCertificate} from '@/lib/certificate';
 import {downloadMarkdown, exportFileName, problemToMarkdown, problemUrl, siteUrl} from '@/lib/export';
-import {type Badge, badgeOf, dayKey, earnedBadges, shareText, streakOf} from '@/lib/gamify';
+import {type Badge, badgeOf, dayKey, earnedBadges, streakOf} from '@/lib/gamify';
 import {type Verdict, judge, withRuntime} from '@/lib/judge';
 import {type RuntimeStatus, getPythonRunner} from '@/lib/runtime/client';
 import type {RunJob} from '@/lib/runtime/python';
@@ -34,6 +33,7 @@ import {
   certificateDetails,
   certificateUrl,
   linkedInPostUrl,
+  resultShareText,
   stepShareText,
 } from '@/lib/social';
 import {type Progress, type Workspace, EMPTY_PROGRESS, getProgressStore, workspaceKey} from '@/lib/storage';
@@ -66,7 +66,7 @@ import {ghostButtonClass, selectClass} from './paneShared';
 import ProblemList from './ProblemList';
 import ProblemPane, {type PaneTab, unlocked} from './ProblemPane';
 import {isEditable, KeyboardIcon, MAC, mod, ShortcutList} from './Shortcuts';
-import {CertificateForm, LinkedInButton} from './Social';
+import {CertificateForm, LinkedInButton, POST_HINT} from './Social';
 import SplitGutter from './SplitGutter';
 import StepEditor from './StepEditor';
 import ThemeToggle from './ThemeToggle';
@@ -133,24 +133,6 @@ const loadLayout = (): Layout => {
 
 const TOAST_MS = 6000;
 
-/** Body of the share fallback when the clipboard is unavailable: the card, selected for a manual copy. */
-const ShareCard: FC<{text: string}> = memo(({text}) => {
-  const selectAll = useCallback((e: FocusEvent<HTMLTextAreaElement>) => e.currentTarget.select(), []);
-  return (
-    <>
-      <p>The clipboard is not available here; copy the card by hand.</p>
-      <textarea
-        className="border-ink-600 bg-ink-900 font-code text-ink-100 focus:border-iris-400 mt-2 w-full resize-none rounded-lg border p-2 text-[11px] leading-relaxed focus:outline-none focus:ring-0"
-        onFocus={selectAll}
-        readOnly
-        rows={8}
-        value={text}
-      />
-    </>
-  );
-});
-ShareCard.displayName = 'ShareCard';
-
 /** A fresh badge: dismisses itself after a while; the LinkedIn action keeps it open while in use. */
 const BadgeToast: FC<{id: number; badge: Badge; onDismiss: (id: number) => void}> = memo(({id, badge, onDismiss}) => {
   useEffect(() => {
@@ -166,7 +148,11 @@ const BadgeToast: FC<{id: number; badge: Badge; onDismiss: (id: number) => void}
         <span className="text-ink-50 block text-[13px] font-semibold">{badge.title}</span>
         <span className="text-ink-300 block text-[11px]">{badge.blurb}</span>
         <span className="mt-1 flex items-center gap-2">
-          <LinkedInButton label="Share on LinkedIn" url={linkedInPostUrl(badgeShareText(badge, siteUrl()))} />
+          <LinkedInButton
+            label="Share on LinkedIn"
+            title={POST_HINT}
+            url={linkedInPostUrl(badgeShareText(badge, siteUrl()))}
+          />
           <button
             className="text-ink-400 hover:text-ink-50 rounded-md px-1.5 py-0.5 text-[11px] transition"
             onClick={onClick}
@@ -946,17 +932,13 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     if (problem === null) return;
     downloadMarkdown(exportFileName(problem.id, language), problemToMarkdown(problem, language));
   }, [problem, language]);
-  const onShare = useCallback(async (): Promise<boolean> => {
-    if (problem === null) return false;
-    const text = shareText(problem, progress.attempts, language, problemUrl(problem));
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch {
-      await openDialog({title: 'Copy your result card', body: <ShareCard text={text} />});
-      return false;
-    }
-  }, [problem, progress.attempts, language, openDialog]);
+  const shareUrl = useMemo(
+    () =>
+      problem === null
+        ? ''
+        : linkedInPostUrl(resultShareText(problem, progress.attempts, language, problemUrl(problem))),
+    [problem, progress.attempts, language],
+  );
 
   // Layout: the gutters report pixel deltas; convert them to shares of the container being split.
   const dragX = useCallback((delta: number) => {
@@ -1127,11 +1109,11 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                 onRevealHint={onRevealHint}
                 onRevealSolution={onRevealSolution}
                 onSelectStep={onSelectStep}
-                onShare={onShare}
                 onStartTimer={onStartTimer}
                 onTab={setTab}
                 problem={problem}
                 sessions={problemSessions}
+                shareUrl={shareUrl}
                 step={step}
                 stepIndex={stepIndex}
                 tab={tab}

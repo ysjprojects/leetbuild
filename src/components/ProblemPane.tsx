@@ -10,6 +10,7 @@ import Markdown from './Markdown';
 import {ConceptChip, DifficultyChip, ghostButtonClass, linkClass, primaryButtonClass} from './paneShared';
 import SequenceDiagram from './SequenceDiagram';
 import {mod} from './Shortcuts';
+import {LinkedInButton, POST_HINT} from './Social';
 import StepEditor from './StepEditor';
 import SystemDiagram from './SystemDiagram';
 import {Clock, SessionList} from './Timer';
@@ -320,8 +321,8 @@ const ProblemPane: FC<{
   onResetProblem: () => void;
   /** Download this problem's tutorial as Markdown in the current language. */
   onDownload: () => void;
-  /** Copy the result card to the clipboard; resolves to whether it worked. */
-  onShare: () => Promise<boolean>;
+  /** LinkedIn composer prefilled with this problem's result card. */
+  shareUrl: string;
   /** Fold the pane into a strip beside the IDE (`lg` and up). */
   onCollapse: () => void;
   /** Timer mode: open the start dialog for this problem. */
@@ -354,7 +355,7 @@ const ProblemPane: FC<{
     onPrevStep,
     onResetProblem,
     onDownload,
-    onShare,
+    shareUrl,
     onCollapse,
     onStartTimer,
     timerActive,
@@ -375,13 +376,6 @@ const ProblemPane: FC<{
     useEffect(() => {
       scroller.current?.scrollTo({top: 0});
     }, [step.id, tab]);
-    const [shared, setShared] = useState(false);
-    const onShareClick = useCallback(() => {
-      void onShare().then(ok => {
-        setShared(ok);
-        if (ok) window.setTimeout(() => setShared(false), 2000);
-      });
-    }, [onShare]);
     /** Steps that build each diagram node (1-based numbers), for tooltips and click-to-jump. */
     const stepsByNode = useMemo(() => {
       const map: Record<string, number[]> = {};
@@ -432,13 +426,7 @@ const ProblemPane: FC<{
             </svg>
           </button>
           {score.done > 0 ? (
-            <button
-              className="text-ink-400 hover:text-ink-50 rounded-md px-1.5 py-0.5 text-[11px] transition"
-              onClick={onShareClick}
-              title="copy a result card for this problem to the clipboard"
-              type="button">
-              {shared ? 'copied' : '⇪ share'}
-            </button>
+            <LinkedInButton label="share" title={`share your result card on LinkedIn: ${POST_HINT}`} url={shareUrl} />
           ) : null}
           {problem.steps.some(s => attempts[stepKey(problem.id, s.id)] !== undefined) ? (
             <button
