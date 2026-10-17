@@ -89,9 +89,10 @@ export const TimerPill: FC<{
 TimerPill.displayName = 'TimerPill';
 
 /**
- * The timer's resting state in the header, where the countdown will be: the open problem's best
- * counted time (or an invitation to race its estimate); a click starts a run, the chevron opens the
- * problem's run history.
+ * The timer's resting state in the header, where the countdown will be: the time a run of the
+ * open problem starts with (its estimate, the picker's default budget), so the clock reads the same
+ * before Start as just after it. A click starts a run; the chevron opens the problem's run history,
+ * and the tooltip names the best counted time once there is one.
  */
 export const TimerIdlePill: FC<{
   problem: Problem;
@@ -100,23 +101,18 @@ export const TimerIdlePill: FC<{
   onHistory: () => void;
 }> = memo(({problem, sessions, onStart, onHistory}) => {
   const best = bestSession(sessions, problem.id);
+  const budget = formatClock(budgetSeconds(problem, 1));
   return (
     <span className="border-ink-600 text-ink-300 hidden items-center rounded-full border text-[11px] sm:inline-flex">
       <button
-        className="hover:text-ink-50 flex items-center gap-1.5 rounded-l-full py-1 pl-2.5 transition"
+        className="hover:text-ink-50 flex items-center gap-1.5 rounded-l-full py-1 pl-2.5 pr-2.5 transition"
         onClick={onStart}
-        title={
-          best === null
-            ? `timed run: race the ${problem.minutes} min estimate, from step 1`
-            : `your best counted time is ${formatClock(best.elapsed)} · start another timed run`
-        }
+        title={`timed run: ${budget} for this problem, from step 1 — click to start${
+          best === null ? '' : ` · your best counted time is ${formatClock(best.elapsed)}`
+        }`}
         type="button">
         <Clock />
-        {best === null ? (
-          <span className="pr-2.5">timed run</span>
-        ) : (
-          <span className="font-code text-success-200 pr-2.5">{formatClock(best.elapsed)}</span>
-        )}
+        <span className="font-code">{budget}</span>
       </button>
       {sessions.length > 0 ? (
         <button

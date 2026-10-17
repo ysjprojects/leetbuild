@@ -535,12 +535,12 @@ object CounterApi {
   implicit val addFormat: RootJsonFormat[AddRequest] = jsonFormat2(AddRequest)
 
   /** Built in later steps. */
-  def addBestEffort(ns: String, name: String, delta: Long): Long = ??? // step 2
-  def getBestEffort(ns: String, name: String): Long = ???
-  def clearBestEffort(ns: String, name: String): Unit = ???
-  def appendEvent(ns: String, name: String, delta: Long, token: String): Unit = ??? // step 3
-  def getRolledUp(ns: String, name: String): Long = ??? // step 4
-  def clearRolledUp(ns: String, name: String): Unit = ???
+  def addBestEffort(ns: String, name: String, delta: Long): Long = BestEffort.addCount(ns, name, delta) // step 2
+  def getBestEffort(ns: String, name: String): Long = BestEffort.getCount(ns, name) // step 2
+  def clearBestEffort(ns: String, name: String): Unit = BestEffort.clearCount(ns, name) // step 2
+  def appendEvent(ns: String, name: String, delta: Long, token: String): Unit = CountEvents.appendEvent(ns, name, delta, token) // step 3: throws EventNotDurable
+  def getRolledUp(ns: String, name: String): Long = Rollup.getCount(ns, name) // step 4
+  def clearRolledUp(ns: String, name: String): Unit = Rollup.clearCount(ns, name) // step 4
 
   private def json(status: StatusCode, body: String): Route =
     complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
@@ -554,7 +554,7 @@ object CounterApi {
             entity(as[AddRequest]) { req =>
               // TODO: 400 when delta is missing, 0 or beyond ±MaxDelta; eventually_consistent → 400 without a token
               // TODO: best_effort → addBestEffort → 200 {"count": …}
-              // TODO: eventually_consistent → appendEvent → 202 {"accepted": true}
+              // TODO: eventually_consistent → appendEvent → 202 {"accepted": true}; catch EventNotDurable → 503
               json(StatusCodes.NotImplemented, """{"error":"not implemented"}""")
             }
           }
@@ -602,12 +602,12 @@ object CounterApi {
   implicit val addFormat: RootJsonFormat[AddRequest] = jsonFormat2(AddRequest)
 
   /** Built in later steps. */
-  def addBestEffort(ns: String, name: String, delta: Long): Long = ??? // step 2
-  def getBestEffort(ns: String, name: String): Long = ???
-  def clearBestEffort(ns: String, name: String): Unit = ???
-  def appendEvent(ns: String, name: String, delta: Long, token: String): Unit = ??? // step 3
-  def getRolledUp(ns: String, name: String): Long = ??? // step 4
-  def clearRolledUp(ns: String, name: String): Unit = ???
+  def addBestEffort(ns: String, name: String, delta: Long): Long = BestEffort.addCount(ns, name, delta) // step 2
+  def getBestEffort(ns: String, name: String): Long = BestEffort.getCount(ns, name) // step 2
+  def clearBestEffort(ns: String, name: String): Unit = BestEffort.clearCount(ns, name) // step 2
+  def appendEvent(ns: String, name: String, delta: Long, token: String): Unit = CountEvents.appendEvent(ns, name, delta, token) // step 3: throws EventNotDurable
+  def getRolledUp(ns: String, name: String): Long = Rollup.getCount(ns, name) // step 4
+  def clearRolledUp(ns: String, name: String): Unit = Rollup.clearCount(ns, name) // step 4
 
   private def json(status: StatusCode, body: String): Route =
     complete(HttpResponse(status, entity = HttpEntity(ContentTypes.\`application/json\`, body)))
@@ -634,8 +634,13 @@ object CounterApi {
                     req.token.filter(_.nonEmpty) match {
                       case None => json(StatusCodes.BadRequest, """{"error":"token is required: it is what makes a retry safe"}""")
                       case Some(token) =>
-                        appendEvent(ns, name, req.delta.get, token)
-                        json(StatusCodes.Accepted, """{"accepted":true}""")
+                        try {
+                          appendEvent(ns, name, req.delta.get, token)
+                          json(StatusCodes.Accepted, """{"accepted":true}""")
+                        } catch {
+                          case _: EventNotDurable =>
+                            json(StatusCodes.ServiceUnavailable, """{"error":"the event is not durable yet: retry with the same token"}""")
+                        }
                     }
                 }
               }
@@ -672,6 +677,7 @@ object CounterApi {
 #include <cstdlib>
 #include <map>
 #include <regex>
+#include <stdexcept>
 #include <string>
 
 using json = nlohmann::json;
@@ -684,11 +690,15 @@ const std::map<std::string, std::string> kNamespaces = {
 const std::regex kNameRe(R"(^[A-Za-z0-9_-]{1,64}$)");
 constexpr long long kMaxDelta = 1000000;
 
-// Built in later steps.
+// Built in later steps (declared here, linked with those files).
 long long add_best_effort(const std::string& ns, const std::string& name, long long delta);  // step 2
 long long get_best_effort(const std::string& ns, const std::string& name);
 void clear_best_effort(const std::string& ns, const std::string& name);
-void append_event(const std::string& ns, const std::string& name, long long delta, const std::string& token);  // step 3
+// step 3: logs the add durably, or throws EventNotDurable when the broker did not acknowledge it in time
+struct EventNotDurable : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+void append_event(const std::string& ns, const std::string& name, long long delta, const std::string& token);
 long long get_rolled_up(const std::string& ns, const std::string& name);  // step 4
 void clear_rolled_up(const std::string& ns, const std::string& name);
 
@@ -702,7 +712,7 @@ int main() {
     // TODO: 404 unless kNamespaces has ns; 400 unless std::regex_match(name, kNameRe)
     // TODO: 400 unless "delta" is an integer, non-zero and within ±kMaxDelta; eventually_consistent → 400 without "token"
     // TODO: best_effort → add_best_effort → 200 {"count": …}
-    // TODO: eventually_consistent → append_event → 202 {"accepted": true}
+    // TODO: eventually_consistent → append_event → 202 {"accepted": true}; catch EventNotDurable → 503
     res.status = 501;
   });
 
@@ -728,6 +738,7 @@ int main() {
 #include <cstdlib>
 #include <map>
 #include <regex>
+#include <stdexcept>
 #include <string>
 
 using json = nlohmann::json;
@@ -740,11 +751,15 @@ const std::map<std::string, std::string> kNamespaces = {
 const std::regex kNameRe(R"(^[A-Za-z0-9_-]{1,64}$)");
 constexpr long long kMaxDelta = 1000000;
 
-// Built in later steps.
+// Built in later steps (declared here, linked with those files).
 long long add_best_effort(const std::string& ns, const std::string& name, long long delta);  // step 2
 long long get_best_effort(const std::string& ns, const std::string& name);
 void clear_best_effort(const std::string& ns, const std::string& name);
-void append_event(const std::string& ns, const std::string& name, long long delta, const std::string& token);  // step 3
+// step 3: logs the add durably, or throws EventNotDurable when the broker did not acknowledge it in time
+struct EventNotDurable : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+void append_event(const std::string& ns, const std::string& name, long long delta, const std::string& token);
 long long get_rolled_up(const std::string& ns, const std::string& name);  // step 4
 void clear_rolled_up(const std::string& ns, const std::string& name);
 
@@ -791,7 +806,12 @@ int main() {
       fail(res, 400, "token is required: it is what makes a retry safe");
       return;
     }
-    append_event(ns, name, delta, token);
+    try {
+      append_event(ns, name, delta, token);
+    } catch (const EventNotDurable&) {
+      fail(res, 503, "the event is not durable yet: retry with the same token");
+      return;
+    }
     res.status = 202;
     res.set_content(R"({"accepted":true})", "application/json");
   });
