@@ -23,10 +23,11 @@ export const SHORTCUTS: readonly Shortcut[] = [
   {keys: mod('⏎'), label: 'Submit the step'},
   {keys: mod('B'), label: 'Show or hide the file explorer'},
   {keys: mod('\\'), label: 'Show or hide the problem pane'},
+  {keys: mod(';'), label: 'Open or close the scratchpad'},
   {keys: alt(']'), label: 'Next step (once unlocked)'},
   {keys: alt('['), label: 'Previous step'},
   {keys: '?', label: 'This list (outside the editor)'},
-  {keys: 'Esc', label: 'Close a dialog'},
+  {keys: 'Esc', label: 'Close a dialog or the scratchpad'},
 ];
 
 /** True when typing in `target` should keep plain keys (like `?`) to itself. */

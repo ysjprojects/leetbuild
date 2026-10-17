@@ -1,13 +1,14 @@
 /**
  * Durable state for /leetbuild: one record per workspace (the learner's code for one step in one
- * language) and one progress record (attempts per step, chosen language, submission counters,
- * last position).
+ * language), one scratchpad per course (the sketch), and one progress record (attempts per step,
+ * chosen language, submission counters, last position).
  *
  * IndexedDB is the primary backend; localStorage is the fallback where IndexedDB is unavailable
  * (some private modes). Writes are debounced per record so typing does not hammer the database,
  * and `flush()` runs on page hide so the last edits survive navigation.
  */
 import type {StepAttempt} from './scoring';
+import {type Scratchpad, normalizeShapes} from './scratchpad';
 import {type ActiveTimer, type TimedSession, SESSION_HISTORY} from './timer';
 import {type Language, LANGUAGES} from './types';
 
@@ -40,6 +41,8 @@ export interface Snapshot {
   progress: Progress;
   /** Keyed by `problemId/stepId/language`. */
   workspaces: Record<string, Workspace>;
+  /** Keyed by problem id (`general` for the landing page's). */
+  scratchpads: Record<string, Scratchpad>;
 }
 
 interface Backend {
@@ -47,13 +50,16 @@ interface Backend {
   writeWorkspace(id: string, state: Workspace): Promise<void>;
   deleteWorkspace(id: string): Promise<void>;
   writeProgress(progress: Progress): Promise<void>;
+  writeScratchpad(id: string, pad: Scratchpad): Promise<void>;
 }
 
 // Storage keys are stable identifiers, not branding: renaming them would orphan existing progress.
 const DB_NAME = 'leetbuild';
-const DB_VERSION = 1;
+// 2: the `scratchpads` store.
+const DB_VERSION = 2;
 const WORKSPACES = 'workspaces';
 const PROGRESS = 'progress';
+const SCRATCHPADS = 'scratchpads';
 const FALLBACK_KEY = 'leetbuild:snapshot';
 const WRITE_DELAY_MS = 400;
 const OPEN_TIMEOUT_MS = 4000;
@@ -100,6 +106,7 @@ class IdbBackend implements Backend {
       const db = req.result;
       if (!db.objectStoreNames.contains(WORKSPACES)) db.createObjectStore(WORKSPACES);
       if (!db.objectStoreNames.contains(PROGRESS)) db.createObjectStore(PROGRESS);
+      if (!db.objectStoreNames.contains(SCRATCHPADS)) db.createObjectStore(SCRATCHPADS);
     };
     req.onsuccess = () => resolve(new IdbBackend(req.result));
     req.onerror = () => reject(req.error ?? new Error('IndexedDB open failed'));
@@ -108,18 +115,25 @@ class IdbBackend implements Backend {
   }
 
   async readAll(): Promise<Snapshot> {
-    const tx = this.db.transaction([WORKSPACES, PROGRESS], 'readonly');
+    const tx = this.db.transaction([WORKSPACES, PROGRESS, SCRATCHPADS], 'readonly');
     const store = tx.objectStore(WORKSPACES);
-    const [keys, values, progress] = await Promise.all([
+    const pads = tx.objectStore(SCRATCHPADS);
+    const [keys, values, progress, padKeys, padValues] = await Promise.all([
       request(store.getAllKeys()),
       request(store.getAll()),
       request(tx.objectStore(PROGRESS).get('progress')),
+      request(pads.getAllKeys()),
+      request(pads.getAll()),
     ]);
     const workspaces: Record<string, Workspace> = {};
     keys.forEach((key, i) => {
       workspaces[String(key)] = values[i] as Workspace;
     });
-    return {progress: normalizeProgress(progress), workspaces};
+    const scratchpads: Record<string, Scratchpad> = {};
+    padKeys.forEach((key, i) => {
+      scratchpads[String(key)] = normalizeScratchpad(padValues[i]);
+    });
+    return {progress: normalizeProgress(progress), workspaces, scratchpads};
   }
 
   async writeWorkspace(id: string, state: Workspace): Promise<void> {
@@ -139,23 +153,39 @@ class IdbBackend implements Backend {
     tx.objectStore(PROGRESS).put(progress, 'progress');
     await transactionDone(tx);
   }
+
+  async writeScratchpad(id: string, pad: Scratchpad): Promise<void> {
+    const tx = this.db.transaction(SCRATCHPADS, 'readwrite');
+    tx.objectStore(SCRATCHPADS).put(pad, id);
+    await transactionDone(tx);
+  }
 }
 
 /** Whole snapshot as one JSON value; only used when IndexedDB cannot be opened. */
 class LocalStorageBackend implements Backend {
-  private snapshot: Snapshot = {progress: {...EMPTY_PROGRESS}, workspaces: {}};
+  private snapshot: Snapshot = {progress: {...EMPTY_PROGRESS}, workspaces: {}, scratchpads: {}};
 
   async readAll(): Promise<Snapshot> {
     try {
       const raw = window.localStorage.getItem(FALLBACK_KEY);
       if (raw !== null) {
         const parsed = JSON.parse(raw) as Partial<Snapshot>;
-        this.snapshot = {progress: normalizeProgress(parsed.progress), workspaces: parsed.workspaces ?? {}};
+        const scratchpads: Record<string, Scratchpad> = {};
+        for (const [id, pad] of Object.entries(parsed.scratchpads ?? {})) scratchpads[id] = normalizeScratchpad(pad);
+        this.snapshot = {
+          progress: normalizeProgress(parsed.progress),
+          workspaces: parsed.workspaces ?? {},
+          scratchpads,
+        };
       }
     } catch {
       // unreadable or unavailable: start empty
     }
-    return {progress: {...this.snapshot.progress}, workspaces: {...this.snapshot.workspaces}};
+    return {
+      progress: {...this.snapshot.progress},
+      workspaces: {...this.snapshot.workspaces},
+      scratchpads: {...this.snapshot.scratchpads},
+    };
   }
 
   async writeWorkspace(id: string, state: Workspace): Promise<void> {
@@ -173,6 +203,11 @@ class LocalStorageBackend implements Backend {
     this.persist();
   }
 
+  async writeScratchpad(id: string, pad: Scratchpad): Promise<void> {
+    this.snapshot.scratchpads[id] = pad;
+    this.persist();
+  }
+
   private persist(): void {
     try {
       window.localStorage.setItem(FALLBACK_KEY, JSON.stringify(this.snapshot));
@@ -183,6 +218,11 @@ class LocalStorageBackend implements Backend {
 }
 
 const isLanguage = (v: unknown): v is Language => typeof v === 'string' && LANGUAGES.includes(v as Language);
+
+const normalizeScratchpad = (value: unknown): Scratchpad => {
+  const pad = typeof value === 'object' && value !== null ? (value as Partial<Scratchpad>) : {};
+  return {shapes: normalizeShapes(pad.shapes), updatedAt: typeof pad.updatedAt === 'number' ? pad.updatedAt : 0};
+};
 
 const normalizeTimer = (value: unknown): ActiveTimer | null => {
   if (typeof value !== 'object' || value === null) return null;
@@ -309,6 +349,11 @@ export class ProgressStore {
   saveProgress(progress: Progress): void {
     if (this.snapshot !== null) this.snapshot.progress = progress;
     this.schedule('progress', async () => (await this.backend).writeProgress(progress));
+  }
+
+  saveScratchpad(id: string, pad: Scratchpad): void {
+    if (this.snapshot !== null) this.snapshot.scratchpads[id] = pad;
+    this.schedule(`scratchpad:${id}`, async () => (await this.backend).writeScratchpad(id, pad));
   }
 
   /** Run every pending write now. */

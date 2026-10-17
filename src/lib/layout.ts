@@ -30,6 +30,10 @@ export interface RoutedEdge {
   /** Where the label sits. */
   label: Point | null;
   labelW: number;
+  /** The path's ends and, for curves, its two cubic control points — the same geometry as `d`. */
+  from: Point;
+  to: Point;
+  controls: [Point, Point] | null;
 }
 export interface Layout {
   width: number;
@@ -220,6 +224,25 @@ export function layoutDiagram(diagram: Diagram): Layout {
     }
   });
 
+  // Edges leaving a box share its right side and edges entering share its left; spread them along the
+  // side (ordered by the other end's row) so arrowheads and tails do not stack on one point.
+  const outgoing: Record<string, DiagramEdge[]> = {};
+  const incoming: Record<string, DiagramEdge[]> = {};
+  for (const e of edges) {
+    const s = placed[e.from];
+    const t = placed[e.to];
+    if (s === undefined || t === undefined || t.layer <= s.layer) continue;
+    (outgoing[e.from] ??= []).push(e);
+    (incoming[e.to] ??= []).push(e);
+  }
+  for (const list of Object.values(outgoing)) list.sort((a, b) => placed[a.to].cy - placed[b.to].cy);
+  for (const list of Object.values(incoming)) list.sort((a, b) => placed[a.from].cy - placed[b.from].cy);
+  const anchorY = (n: PlacedNode, list: DiagramEdge[] | undefined, e: DiagramEdge): number => {
+    if (list === undefined || list.length <= 1) return n.cy;
+    const span = Math.min(n.h - 18, (list.length - 1) * 14);
+    return n.cy - span / 2 + (span * list.indexOf(e)) / (list.length - 1);
+  };
+
   // Edges: forward edges are horizontal-tangent S-curves between columns with the label in the first
   // gap after the source; same-column edges run vertically; back edges arc over the top.
   const routed: RoutedEdge[] = [];
@@ -230,8 +253,8 @@ export function layoutDiagram(diagram: Diagram): Layout {
     const kind = e.kind ?? 'plain';
     const labelW = e.label === undefined ? 0 : edgeLabelWidth(e.label);
     if (t.layer > s.layer) {
-      const p0 = {x: s.cx + s.w / 2, y: s.cy};
-      const p3 = {x: t.cx - t.w / 2, y: t.cy};
+      const p0 = {x: s.cx + s.w / 2, y: anchorY(s, outgoing[e.from], e)};
+      const p3 = {x: t.cx - t.w / 2, y: anchorY(t, incoming[e.to], e)};
       const dx = p3.x - p0.x;
       let p1 = {x: p0.x + dx * 0.45, y: p0.y};
       let p2 = {x: p3.x - dx * 0.45, y: p3.y};
@@ -275,19 +298,40 @@ export function layoutDiagram(diagram: Diagram): Layout {
         d: `M${p0.x} ${p0.y} C${p1.x} ${p1.y} ${p2.x} ${p2.y} ${p3.x} ${p3.y}`,
         label,
         labelW,
+        from: p0,
+        to: p3,
+        controls: [p1, p2],
       });
     } else if (t.layer === s.layer) {
       const down = t.cy > s.cy;
       const p0 = {x: s.cx, y: down ? s.cy + s.h / 2 : s.cy - s.h / 2};
       const p3 = {x: t.cx, y: down ? t.cy - t.h / 2 : t.cy + t.h / 2};
       const label = e.label === undefined ? null : {x: (p0.x + p3.x) / 2, y: (p0.y + p3.y) / 2 + 3};
-      routed.push({edge: e, kind, d: `M${p0.x} ${p0.y} L${p3.x} ${p3.y}`, label, labelW});
+      routed.push({
+        edge: e,
+        kind,
+        d: `M${p0.x} ${p0.y} L${p3.x} ${p3.y}`,
+        label,
+        labelW,
+        from: p0,
+        to: p3,
+        controls: null,
+      });
     } else {
       const p0 = {x: s.cx, y: s.cy - s.h / 2};
       const p3 = {x: t.cx, y: t.cy - t.h / 2};
-      const lift = 34;
-      const p1 = {x: p0.x, y: Math.min(p0.y, p3.y) - lift};
-      const p2 = {x: p3.x, y: Math.min(p0.y, p3.y) - lift};
+      // The arc's apex clears every box in the columns it spans, not just the two it joins: a cubic
+      // with both controls at `c` peaks at ⅛(p0+p3) + ¾c, so solve for the control height.
+      const spanTop = Math.min(
+        ...columns
+          .slice(t.layer, s.layer + 1)
+          .flat()
+          .map(n => placed[n.id].cy - placed[n.id].h / 2),
+      );
+      const apex = spanTop - 26;
+      const control = (apex - (p0.y + p3.y) / 8) / 0.75;
+      const p1 = {x: p0.x, y: control};
+      const p2 = {x: p3.x, y: control};
       const label =
         e.label === undefined ? null : {...cubicAt(p0, p1, p2, p3, 0.5), y: cubicAt(p0, p1, p2, p3, 0.5).y - 8};
       routed.push({
@@ -296,6 +340,9 @@ export function layoutDiagram(diagram: Diagram): Layout {
         d: `M${p0.x} ${p0.y} C${p1.x} ${p1.y} ${p2.x} ${p2.y} ${p3.x} ${p3.y}`,
         label,
         labelW,
+        from: p0,
+        to: p3,
+        controls: [p1, p2],
       });
     }
   }

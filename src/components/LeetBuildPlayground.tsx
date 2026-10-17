@@ -27,6 +27,7 @@ import {
   profile as computeProfile,
   stepScore,
 } from '@/lib/scoring';
+import {type Scratchpad as ScratchpadRecord, type Shape} from '@/lib/scratchpad';
 import {
   type CertificateDetails,
   badgeShareText,
@@ -65,6 +66,7 @@ import {useDialog} from './Dialog';
 import {ghostButtonClass, selectClass} from './paneShared';
 import ProblemList from './ProblemList';
 import ProblemPane, {type PaneTab, unlocked} from './ProblemPane';
+import Scratchpad, {ScratchpadIcon} from './Scratchpad';
 import {isEditable, KeyboardIcon, MAC, mod, ShortcutList} from './Shortcuts';
 import {CertificateForm, LinkedInButton, POST_HINT} from './Social';
 import SplitGutter from './SplitGutter';
@@ -132,6 +134,7 @@ const loadLayout = (): Layout => {
 };
 
 const TOAST_MS = 6000;
+const EMPTY_SHAPES: readonly Shape[] = [];
 
 /** A fresh badge: dismisses itself after a while; the LinkedIn action keeps it open while in use. */
 const BadgeToast: FC<{id: number; badge: Badge; onDismiss: (id: number) => void}> = memo(({id, badge, onDismiss}) => {
@@ -429,6 +432,8 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   const mounted = useRef<string | null>(null);
   /** Saved code per `problem/step/language`, restored from the store and written through on every edit. */
   const workspaces = useRef<Record<string, Workspace>>({});
+  const [scratchpads, setScratchpads] = useState<Record<string, ScratchpadRecord>>({});
+  const [scratchOpen, setScratchOpen] = useState(false);
   filesRef.current = files;
   openTabsRef.current = openTabs;
   openFileRef.current = openFile;
@@ -538,6 +543,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     void store.load().then(snapshot => {
       if (cancelled) return;
       workspaces.current = snapshot.workspaces;
+      setScratchpads(snapshot.scratchpads);
       setProgress(snapshot.progress);
       setLoaded(true);
     });
@@ -959,6 +965,19 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     void openDialog({title: 'Keyboard shortcuts', body: <ShortcutList />});
   }, [openDialog]);
 
+  // Scratchpad: one sketch per course (and one for the landing page), persisted like the workspaces.
+  const scratchKey = problem?.id ?? 'general';
+  const toggleScratchpad = useCallback(() => setScratchOpen(v => !v), []);
+  const closeScratchpad = useCallback(() => setScratchOpen(false), []);
+  const onScratchChange = useCallback(
+    (shapes: Shape[]) => {
+      const pad: ScratchpadRecord = {shapes, updatedAt: Date.now()};
+      setScratchpads(p => ({...p, [scratchKey]: pad}));
+      store.saveScratchpad(scratchKey, pad);
+    },
+    [scratchKey, store],
+  );
+
   // Shortcuts work from anywhere on the page (the editor binds Mod-Enter itself too); none while a dialog is open.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -980,6 +999,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       } else if (e.altKey && !modKey && e.code === 'BracketLeft') {
         e.preventDefault();
         onPrevStep();
+      } else if (modKey && !e.shiftKey && !e.altKey && e.code === 'Semicolon') {
+        e.preventDefault();
+        toggleScratchpad();
       } else if (e.key === '?' && !modKey && !e.altKey && !isEditable(e.target)) {
         e.preventDefault();
         onShortcuts();
@@ -987,7 +1009,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [submit, problem, toggleExplorer, togglePaneSidebar, onNextStep, onPrevStep, onShortcuts]);
+  }, [submit, problem, toggleExplorer, togglePaneSidebar, onNextStep, onPrevStep, onShortcuts, toggleScratchpad]);
 
   useEffect(() => {
     try {
@@ -1051,6 +1073,17 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
               {streak.current}d streak
             </span>
           ) : null}
+          <button
+            aria-label="scratchpad"
+            aria-pressed={scratchOpen}
+            className={`border-ink-600 hover:border-iris-400/60 hover:text-ink-50 flex h-7 w-7 items-center justify-center rounded-full border transition ${
+              scratchOpen ? 'bg-iris-400/20 text-iris-200' : 'bg-ink-800 text-ink-300'
+            }`}
+            onClick={toggleScratchpad}
+            title={`scratchpad: sketch the system while you build it (${mod(';')})`}
+            type="button">
+            <ScratchpadIcon />
+          </button>
           <button
             aria-label="keyboard shortcuts"
             className="border-ink-600 bg-ink-800 text-ink-300 hover:border-iris-400/60 hover:text-ink-50 hidden h-7 w-7 items-center justify-center rounded-full border transition sm:flex"
@@ -1252,6 +1285,15 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
             <BadgeToast badge={t.badge} id={t.id} key={t.id} onDismiss={dismissToast} />
           ))}
         </div>
+      ) : null}
+      {scratchOpen ? (
+        <Scratchpad
+          key={scratchKey}
+          onChange={onScratchChange}
+          onClose={closeScratchpad}
+          problem={problem}
+          shapes={scratchpads[scratchKey]?.shapes ?? EMPTY_SHAPES}
+        />
       ) : null}
     </div>
   );

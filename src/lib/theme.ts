@@ -80,3 +80,17 @@ export function useTheme(): [Theme, () => void] {
 
   return [theme, toggle];
 }
+
+/**
+ * The theme as the document shows it, for components that paint with it (a canvas) rather than
+ * through CSS variables: follows every `data-theme` change, whichever component made it.
+ */
+export function useDocumentTheme(): Theme {
+  const [theme, setTheme] = useState<Theme>(current);
+  useEffect(() => {
+    const observer = new MutationObserver(() => setTheme(current()));
+    observer.observe(document.documentElement, {attributes: true, attributeFilter: ['data-theme']});
+    return () => observer.disconnect();
+  }, []);
+  return theme;
+}
