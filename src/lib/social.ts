@@ -98,13 +98,18 @@ export function certificateId(details: Pick<CertificateDetails, 'name' | 'proble
   return `LB-${prefix}-${hash.toString(36).toUpperCase().padStart(7, '0')}`;
 }
 
-/** The certificate's own page: everything it needs travels in the query string (there is no server). */
+/**
+ * The certificate's own page: everything it needs travels in the query string (there is no server).
+ * The maximum travels too: points are re-balanced whenever a course is added, and an issued
+ * certificate keeps the scale it was earned on.
+ */
 export function certificateUrl(origin: string, details: CertificateDetails): string {
   const params = new URLSearchParams({
     n: details.name,
     d: String(details.completedAt),
     l: details.language,
     s: String(details.score),
+    m: String(details.max),
     id: certificateId(details),
   });
   if (details.time !== null) params.set('t', String(details.time));

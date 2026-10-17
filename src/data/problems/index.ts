@@ -16,8 +16,8 @@ import {discordMessagesProblem} from './12-discord-messages/index';
 import {stripeLedgerProblem} from './13-stripe-ledger/index';
 
 /**
- * Problem order on the list page: the core courses easy first, then medium, then hard; then the
- * company-tagged courses (derived from engineering blogs, see `Problem.company`) in the same order.
+ * Problem order on the list page: easy first, then medium, then hard. Company-tagged courses
+ * (derived from engineering blogs, see `Problem.company`) sit with the others of their difficulty.
  */
 export const problems: Problem[] = [
   urlShortenerProblem,
@@ -25,13 +25,13 @@ export const problems: Problem[] = [
   imageCacheProblem,
   liveChatProblem,
   notificationsProblem,
+  redditPlaceProblem,
+  netflixCountersProblem,
   matchEngineProblem,
   merchantPaymentsProblem,
   flashSaleProblem,
   newsFeedProblem,
   rideDispatchProblem,
-  redditPlaceProblem,
-  netflixCountersProblem,
   discordMessagesProblem,
   stripeLedgerProblem,
 ];

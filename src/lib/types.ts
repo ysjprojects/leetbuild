@@ -198,9 +198,6 @@ export interface Problem {
   sources?: Source[];
 }
 
-/** Company-tagged: derived from a company's published engineering writing, with the sources linked. */
-export const isCompanyTagged = (problem: Problem): boolean => problem.company !== undefined;
-
 /** `problemId/stepId`: the key attempts and workspaces are stored under. */
 export function stepKey(problemId: string, stepId: string): string {
   return `${problemId}/${stepId}`;

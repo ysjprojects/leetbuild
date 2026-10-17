@@ -18,7 +18,7 @@ import {describePattern, judge, matches, stripComments} from '../src/lib/judge';
 import {type NodeRuntime, createNodeRuntime} from '../src/lib/runtime/node';
 import {type RunJob, type RunResult} from '../src/lib/runtime/python';
 import {COURSE_POINTS, STEP_POINTS} from '../src/lib/scoring';
-import {type Language, type Problem, type Step, CONCEPTS, fileName, isCompanyTagged, LANGUAGES} from '../src/lib/types';
+import {type Language, type Problem, type Step, CONCEPTS, fileName, LANGUAGES} from '../src/lib/types';
 import {WIDGETS} from '../src/lib/widgets';
 
 const args = process.argv.slice(2);
@@ -295,26 +295,20 @@ async function main(): Promise<void> {
     );
     errors.push(...e);
   }
-  // The core courses total a fixed number; company-tagged courses add to it. Only meaningful when every problem was loaded.
+  // The course total is a fixed number; only meaningful when every problem was loaded.
   if (onlyFile === null && onlyProblem === null) {
-    const core = problems.filter(p => !isCompanyTagged(p));
-    const pointsOf = (list: Problem[]): number =>
-      list.reduce((sum, p) => sum + STEP_POINTS[p.difficulty] * p.steps.length, 0);
-    const total = pointsOf(core);
+    const total = problems.reduce((sum, p) => sum + STEP_POINTS[p.difficulty] * p.steps.length, 0);
     if (total !== COURSE_POINTS) {
-      const counts = core.reduce<Record<string, number>>((acc, p) => {
+      const counts = problems.reduce<Record<string, number>>((acc, p) => {
         acc[p.difficulty] = (acc[p.difficulty] ?? 0) + p.steps.length;
         return acc;
       }, {});
       errors.push(
-        `core courses total ${total} points, not ${COURSE_POINTS}: re-balance STEP_POINTS in src/lib/scoring.ts for ${JSON.stringify(
+        `course totals ${total} points, not ${COURSE_POINTS}: re-balance STEP_POINTS in src/lib/scoring.ts for ${JSON.stringify(
           counts,
         )} steps`,
       );
-    } else {
-      const company = pointsOf(problems.filter(isCompanyTagged));
-      console.log(`✓ core courses total ${COURSE_POINTS} points${company > 0 ? ` (+${company} company tagged)` : ''}`);
-    }
+    } else console.log(`✓ course totals ${COURSE_POINTS} points`);
   }
   const languages: Language[] = [...LANGUAGES];
   console.log(

@@ -50,7 +50,10 @@ const Certificate: FC<{course: CourseSummary}> = memo(({course}) => {
     const completedAt = Number(one(q.d));
     const language = one(q.l);
     if (!name || !Number.isFinite(completedAt) || !LANGUAGES.includes(language as Language)) return null;
-    const max = STEP_POINTS[course.difficulty] * course.steps;
+    // The scale the certificate was earned on; links issued before `m` existed fall back to today's.
+    const issuedMax = Number(one(q.m));
+    const max =
+      Number.isInteger(issuedMax) && issuedMax > 0 ? issuedMax : STEP_POINTS[course.difficulty] * course.steps;
     const score = Math.min(max, Math.max(0, Number(one(q.s)) || 0));
     const time = Number(one(q.t));
     return {

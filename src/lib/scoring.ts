@@ -32,14 +32,14 @@ export interface StepAttempt {
 export const OPEN_ATTEMPT: StepAttempt = {status: 'open', hints: 0, wrong: 0, language: null, solvedAt: null};
 
 /**
- * Points per step by difficulty, chosen so the ten core courses add up to exactly `COURSE_POINTS`
- * (10 easy + 17 medium + 29 hard steps: 110 + 357 + 870 = 1337). The verify script enforces the
- * total, so adding or removing a core step means re-balancing these. Company-tagged courses add
- * their points on top at the same rates.
+ * Points per step by difficulty, chosen so every course together adds up to exactly
+ * `COURSE_POINTS` (10 easy + 27 medium + 41 hard steps: 70 + 324 + 943 = 1337). The verify script
+ * enforces the total, so adding or removing a step — or a course — means re-balancing these; an
+ * issued certificate keeps the maximum it was earned under (it travels in its URL).
  */
-export const STEP_POINTS: Record<Difficulty, number> = {easy: 11, medium: 21, hard: 30};
+export const STEP_POINTS: Record<Difficulty, number> = {easy: 7, medium: 12, hard: 23};
 
-/** The core courses are worth exactly this many points — the number is the point. */
+/** Every course together is worth exactly this many points — the number is the point. */
 export const COURSE_POINTS = 1337;
 
 /** Fraction of a step's points lost per hint revealed. */

@@ -4,7 +4,7 @@ import {type FC, memo, useCallback, useMemo, useState} from 'react';
 import {type Streak, badgeProgress, BADGES} from '@/lib/gamify';
 import {type Profile, type StepAttempt, OPEN_ATTEMPT, problemScore, rankProgress} from '@/lib/scoring';
 import {type TimedSession, bestSession, formatClock} from '@/lib/timer';
-import {type Difficulty, type Problem, CONCEPT_LABEL, isCompanyTagged, stepKey} from '@/lib/types';
+import {type Difficulty, type Problem, CONCEPT_LABEL, stepKey} from '@/lib/types';
 
 import {BadgeCatalog, BadgeGlyph} from './Badges';
 import {useDialog} from './Dialog';
@@ -450,39 +450,17 @@ const ProblemList: FC<{
     <section>
       <p className="text-iris-400 mb-2 text-[11px] font-bold uppercase tracking-wider">Problems</p>
       <ul className="space-y-2">
-        {problems
-          .filter(p => !isCompanyTagged(p))
-          .map((problem, i) => (
-            <ProblemRow
-              attempts={attempts}
-              best={bestSession(sessions, problem.id)}
-              index={i}
-              key={problem.id}
-              problem={problem}
-            />
-          ))}
+        {problems.map((problem, i) => (
+          <ProblemRow
+            attempts={attempts}
+            best={bestSession(sessions, problem.id)}
+            index={i}
+            key={problem.id}
+            problem={problem}
+          />
+        ))}
       </ul>
     </section>
-    {problems.some(isCompanyTagged) ? (
-      <section>
-        <p className="text-iris-400 mb-1 text-[11px] font-bold uppercase tracking-wider">Company tagged</p>
-        <p className="text-ink-300 mb-2 text-[12px] leading-relaxed">
-          Derived from engineering blogs: each course rebuilds the part of a system a company wrote about, the way they
-          described it, and links the source on its page.
-        </p>
-        <ul className="space-y-2">
-          {problems.filter(isCompanyTagged).map((problem, i) => (
-            <ProblemRow
-              attempts={attempts}
-              best={bestSession(sessions, problem.id)}
-              index={i}
-              key={problem.id}
-              problem={problem}
-            />
-          ))}
-        </ul>
-      </section>
-    ) : null}
   </div>
 ));
 ProblemList.displayName = 'ProblemList';
