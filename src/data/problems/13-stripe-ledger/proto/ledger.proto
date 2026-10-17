@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package ledger;
+
+// The balance service step 6 serves: one unary RPC summing an account's entries.
+service LedgerService {
+  rpc GetBalance(BalanceRequest) returns (Balance);
+}
+
+message BalanceRequest {
+  string account = 1;
+  string currency = 2;
+  // Milliseconds since the epoch; 0 means "now" (the cached current balance).
+  int64 as_of = 3;
+}
+
+message Balance {
+  string account = 1;
+  string currency = 2;
+  // Minor units; debits positive, credits negative.
+  int64 amount = 3;
+  int64 as_of = 4;
+}

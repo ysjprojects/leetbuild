@@ -1,0 +1,996 @@
+import type {Step} from '@/lib/types';
+
+// ---- 3. Money-movement events → balanced transactions -------------------------------------------
+export const eventIngestionStep: Step = {
+  id: 'event-ingestion',
+  title: 'Turn money-events into transactions',
+  concept: 'kafka',
+  file: 'event_consumer',
+  focus: ['kafka', 'ingest', 'dead', 'db'],
+  task: `## Task
+
+Most of the ledger is not posted over HTTPS: the systems that move money publish **events** to the
+\`money-events\` topic, keyed by event id —
+
+\`\`\`json
+{"event_id": "evt_01", "type": "payment.captured", "amount": 4999, "currency": "EUR",
+ "occurred_at": 1700000000000, "charge": "ch_1"}
+\`\`\`
+
+— and the ingest consumer turns each one into a balanced transaction. The **mapping** from event type to
+accounts is provided: \`payment.captured\` debits \`cash:acquirer\` and credits \`clearing:payments\`,
+\`payout.sent\` debits \`clearing:payouts\` and credits \`cash:bank\`, \`refund.issued\` debits
+\`clearing:payments\` and credits \`cash:acquirer\`. \`parse(raw)\` returns the event as a dict or \`None\`
+when it is not a well-formed event, and \`write_transaction\` (step 4) writes the rows.
+
+Implement \`to_entries(event)\` and the consumer loop \`run()\` in group **\`ledger\`**:
+
+- Disable auto-commit; the offset is committed by you, **after** the write.
+- \`to_entries\`: two entries in the event's currency — the amount **debited** from the first account,
+  **credited** (negated) to the second — or \`None\` when the type has no mapping.
+- An event that cannot be parsed or has no mapping goes to **\`money-events.dead\`** with the original key
+  and value and a \`reason\` header; **flush** the producer, commit the offset, and carry on. A consumer
+  that stops on the first unknown event stops the whole ledger.
+- Otherwise \`await write_transaction(entries, event["type"], event_id=…, posted_at=event["occurred_at"])\`,
+  **then** commit this message's offset. If the write throws, do not commit: the record comes back.
+
+:::widget consumer-groups {"partitions": 3}
+
+> The dead-letter topic is the consumer's "I don't know what this is" — which is different from "this is
+> wrong". Someone looks at it, adds the mapping, and replays. Stripe's post calls this the long tail:
+> the tiny fraction of events that need a human, kept out of the way of the billions that do not.`,
+  sequence: {
+    participants: ['Kafka', 'ledger-ingest', 'Postgres', 'money-events.dead'],
+    messages: [
+      {from: 'Kafka', to: 'ledger-ingest', label: 'evt_01 payment.captured 4999 EUR', kind: 'async'},
+      {
+        from: 'ledger-ingest',
+        to: 'ledger-ingest',
+        label: 'MAPPING → [+4999 cash:acquirer, −4999 clearing:payments]',
+        kind: 'sync',
+      },
+      {
+        from: 'ledger-ingest',
+        to: 'Postgres',
+        label: 'write_transaction(entries, event_id=evt_01, posted_at=occurred_at)',
+        kind: 'sync',
+      },
+      {from: 'ledger-ingest', to: 'Kafka', label: 'commit offset', kind: 'sync'},
+      {from: 'Kafka', to: 'ledger-ingest', label: 'evt_02 dispute.opened 4999 EUR', kind: 'async'},
+      {
+        from: 'ledger-ingest',
+        to: 'money-events.dead',
+        label: 'produce evt_02 · reason: unmapped type · flush',
+        kind: 'async',
+      },
+      {from: 'ledger-ingest', to: 'Kafka', label: 'commit offset', kind: 'sync'},
+    ],
+  },
+  hints: [
+    'Three branches per record, every one ending in a commit except the failed write: parse/map fails → dead-letter then commit; write succeeds → commit; write throws → re-raise without committing.',
+    'The dead-letter record is the original record — `msg.key()` and `msg.value()` as they came — plus a header; do not re-serialise what you could not parse. Flush before the commit, or a crash in between loses the only copy you parked.',
+    'The credit is the negated amount in the same currency: `[{debit, +amount}, {credit, -amount}]` is balanced by construction, which is why the API validation of step 1 is not repeated here.',
+  ],
+  checks: [
+    {
+      id: 'group-manual-commit',
+      title: 'Joins group ledger on money-events with auto-commit disabled',
+      detail:
+        'The consumer uses `group.id` `ledger`, subscribes to `money-events` and commits offsets itself; auto-commit acknowledges on a timer, before the write.',
+      match: {
+        python: {all: [/"group\.id"\s*:\s*"ledger"/, /"enable\.auto\.commit"\s*:\s*False/, /consumer\.commit\(/]},
+        go: {
+          all: [/GroupID:\s*"ledger"/, /reader\.FetchMessage\(/, /reader\.CommitMessages\(/],
+          none: [/ReadMessage\(/],
+        },
+        scala: {all: [/"group\.id"\s*,\s*"ledger"/, /"enable\.auto\.commit"\s*,\s*"false"/, /commitSync\(/]},
+        cpp: {all: [/"group\.id"\s*,\s*"ledger"/, /"enable\.auto\.commit"\s*,\s*"false"/, /commitSync\(/]},
+      },
+    },
+    {
+      id: 'mapping',
+      title: 'Maps each event to a debit and a negated credit through the mapping table',
+      detail:
+        "Look the type up in the mapping; the first account gets `+amount`, the second `-amount`, both in the event's currency. The write carries the event id and the event's own `occurred_at`.",
+      match: {
+        python: {
+          all: [
+            /MAPPING\.get\(|MAPPING\[/,
+            /-\s*amount\b/,
+            /(?<!def )write_transaction\([^\n]*event_id\s*=/,
+            /posted_at\s*=\s*event\[["']occurred_at["']\]/,
+          ],
+        },
+        go: {all: [/mapping\[/, /-amount\b|-\s*event\.Amount\b/, /(?<!func )writeTransaction\(/, /event\.OccurredAt/]},
+        scala: {
+          all: [/Mapping\.get\(/, /-amount\b|-\s*event\.amount\b/, /(?<!def )writeTransaction\(/, /\w+\.occurredAt/],
+        },
+        cpp: {
+          all: [
+            /kMapping\.find\(/,
+            /-amount\b|-\s*event\.amount\b/,
+            /(?<!string )write_transaction\(/,
+            /event(->|\.)occurred_at/,
+          ],
+        },
+      },
+    },
+    {
+      id: 'dead-letter',
+      title: 'Parks unparseable or unmapped events on money-events.dead',
+      detail:
+        'Produce the original key and value to `money-events.dead` with a `reason` header and flush; nothing is written to the journal for such an event.',
+      match: {
+        python: {all: [/producer\.produce\(\s*DEAD_TOPIC/, /producer\.flush\(/, /reason/]},
+        go: {all: [/deadWriter\.WriteMessages\(/, /reason/]},
+        scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*DeadTopic/, /\.get\(\)/, /reason/]},
+        cpp: {all: [/producer->produce\(\s*kDeadTopic/, /producer->flush\(/, /reason/]},
+      },
+    },
+    {
+      id: 'continues-after-dead',
+      title: 'Commits the dead-lettered offset and keeps consuming',
+      detail:
+        'A parked record is committed like any other and the loop goes on; skipping it without committing would redeliver it forever, stopping would stall the partition.',
+      match: {
+        python: {
+          order: [/producer\.produce\(\s*DEAD_TOPIC/, /consumer\.commit\(/, /continue/, /await write_transaction\(/],
+        },
+        go: {
+          order: [
+            /deadWriter\.WriteMessages\(/,
+            /reader\.CommitMessages\(/,
+            /continue/,
+            /(?<!func )writeTransaction\(/,
+          ],
+        },
+        scala: {
+          order: [/ProducerRecord\[[^\]]*\]\(\s*DeadTopic/, /commit\(\s*record\s*\)/, /(?<!def )writeTransaction\(/],
+        },
+        cpp: {
+          order: [/produce\(\s*kDeadTopic/, /consumer->commitSync\(/, /continue/, /(?<!string )write_transaction\(/],
+        },
+      },
+    },
+    {
+      id: 'commit-after-write',
+      title: 'Commits only after the write succeeded',
+      detail:
+        'The commit follows `write_transaction`; a crash between the two replays the record, and step 4 makes the replay harmless.',
+      match: {
+        python: {order: [/await write_transaction\(/, /consumer\.commit\(/]},
+        go: {order: [/(?<!func )writeTransaction\(/, /reader\.CommitMessages\(/]},
+        scala: {order: [/(?<!def )writeTransaction\(/, /commit\(\s*record\s*\)/]},
+        cpp: {order: [/(?<!string )write_transaction\(/, /consumer->commitSync\(/]},
+      },
+    },
+  ],
+  code: {
+    python: {
+      starter: `import json
+import logging
+
+from confluent_kafka import Consumer, Producer
+
+from ledger_writer import write_transaction  # built in step 4: insert-or-skip on event_id, returns the id or None
+
+log = logging.getLogger("ledger-ingest")
+
+TOPIC = "money-events"
+DEAD_TOPIC = "money-events.dead"
+REQUIRED = ("event_id", "type", "amount", "currency", "occurred_at")
+
+# Event type → (debit account, credit account): the amount is debited from the first, credited to the second.
+MAPPING = {
+    "payment.captured": ("cash:acquirer", "clearing:payments"),
+    "payout.sent": ("clearing:payouts", "cash:bank"),
+    "refund.issued": ("clearing:payments", "cash:acquirer"),
+}
+
+consumer = Consumer(
+    {
+        "bootstrap.servers": "kafka:9092",
+        "group.id": "ledger",
+        "auto.offset.reset": "earliest",
+        # TODO: disable auto-commit
+    }
+)
+consumer.subscribe([TOPIC])
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "all", "enable.idempotence": True})
+
+
+def parse(raw: bytes) -> dict | None:
+    """The event as a dict, or None when it is not JSON or lacks a required field."""
+    try:
+        event = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(event, dict) or any(field not in event for field in REQUIRED):
+        return None
+    return event
+
+
+def to_entries(event: dict) -> list[dict] | None:
+    """The two balanced entries for an event, or None when its type has no mapping."""
+    # TODO: MAPPING[type] → [{debit account, +amount}, {credit account, -amount}] in the event's currency
+    return None
+
+
+async def run() -> None:
+    while True:
+        msg = consumer.poll(1.0)
+        if msg is None:
+            continue
+        if msg.error():
+            log.error("consumer error: %s", msg.error())
+            continue
+        # TODO: parse + to_entries; None → produce the original key/value to DEAD_TOPIC with a reason header, flush, commit, continue
+        # TODO: await write_transaction(entries, event["type"], event_id=event["event_id"], posted_at=event["occurred_at"]), then commit
+        raise NotImplementedError
+`,
+      solution: `import json
+import logging
+
+from confluent_kafka import Consumer, Producer
+
+from ledger_writer import write_transaction  # built in step 4: insert-or-skip on event_id, returns the id or None
+
+log = logging.getLogger("ledger-ingest")
+
+TOPIC = "money-events"
+DEAD_TOPIC = "money-events.dead"
+REQUIRED = ("event_id", "type", "amount", "currency", "occurred_at")
+
+# Event type → (debit account, credit account): the amount is debited from the first, credited to the second.
+MAPPING = {
+    "payment.captured": ("cash:acquirer", "clearing:payments"),
+    "payout.sent": ("clearing:payouts", "cash:bank"),
+    "refund.issued": ("clearing:payments", "cash:acquirer"),
+}
+
+consumer = Consumer(
+    {
+        "bootstrap.servers": "kafka:9092",
+        "group.id": "ledger",
+        "auto.offset.reset": "earliest",
+        "enable.auto.commit": False,
+    }
+)
+consumer.subscribe([TOPIC])
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "all", "enable.idempotence": True})
+
+
+def parse(raw: bytes) -> dict | None:
+    """The event as a dict, or None when it is not JSON or lacks a required field."""
+    try:
+        event = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(event, dict) or any(field not in event for field in REQUIRED):
+        return None
+    return event
+
+
+def to_entries(event: dict) -> list[dict] | None:
+    """The two balanced entries for an event, or None when its type has no mapping."""
+    accounts = MAPPING.get(event["type"])
+    if accounts is None:
+        return None
+    debit, credit = accounts
+    amount, currency = event["amount"], event["currency"]
+    return [
+        {"account": debit, "currency": currency, "amount": amount},
+        {"account": credit, "currency": currency, "amount": -amount},
+    ]
+
+
+def dead_letter(msg, reason: str) -> None:
+    """Park the original record where a human can look at it; flushed so a crash cannot lose it."""
+    producer.produce(DEAD_TOPIC, key=msg.key(), value=msg.value(), headers={"reason": reason})
+    producer.flush()
+
+
+async def run() -> None:
+    while True:
+        msg = consumer.poll(1.0)
+        if msg is None:
+            continue
+        if msg.error():
+            log.error("consumer error: %s", msg.error())
+            continue
+        event = parse(msg.value())
+        entries = to_entries(event) if event is not None else None
+        if entries is None:
+            dead_letter(msg, "malformed event" if event is None else f"no mapping for event type {event['type']}")
+            consumer.commit(message=msg, asynchronous=False)
+            continue
+        await write_transaction(entries, event["type"], event_id=event["event_id"], posted_at=event["occurred_at"])
+        consumer.commit(message=msg, asynchronous=False)
+`,
+    },
+    go: {
+      starter: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+
+	"github.com/segmentio/kafka-go"
+)
+
+const (
+	topic     = "money-events"
+	deadTopic = "money-events.dead"
+)
+
+type Entry struct {
+	Account  string \`json:"account"\`
+	Currency string \`json:"currency"\`
+	Amount   int64  \`json:"amount"\`
+}
+
+type Event struct {
+	EventID    string \`json:"event_id"\`
+	Type       string \`json:"type"\`
+	Amount     int64  \`json:"amount"\`
+	Currency   string \`json:"currency"\`
+	OccurredAt int64  \`json:"occurred_at"\`
+}
+
+// Event type → {debit account, credit account}: the amount is debited from the first, credited to the second.
+var mapping = map[string][2]string{
+	"payment.captured": {"cash:acquirer", "clearing:payments"},
+	"payout.sent":      {"clearing:payouts", "cash:bank"},
+	"refund.issued":    {"clearing:payments", "cash:acquirer"},
+}
+
+// writeTransaction is built in step 4 (ledger_writer.go): insert-or-skip on the event id.
+func writeTransaction(ctx context.Context, entries []Entry, description string, eventID *string, postedAt int64, settles *string) (string, error) {
+	panic("not implemented")
+}
+
+var reader = kafka.NewReader(kafka.ReaderConfig{
+	Brokers: []string{"kafka:9092"},
+	GroupID: "ledger",
+	Topic:   topic,
+})
+
+var deadWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: deadTopic, RequiredAcks: kafka.RequireAll}
+
+// parse returns the event, or false when the value is not a well-formed event.
+func parse(value []byte) (Event, bool) {
+	var event Event
+	if err := json.Unmarshal(value, &event); err != nil || event.EventID == "" || event.Type == "" || event.Currency == "" || event.OccurredAt <= 0 {
+		return Event{}, false
+	}
+	return event, true
+}
+
+// toEntries returns the two balanced entries for an event, or nil when its type has no mapping.
+func toEntries(event Event) []Entry {
+	// TODO: mapping[event.Type] → {debit, +amount}, {credit, -amount} in the event's currency
+	return nil
+}
+
+func run(ctx context.Context) error {
+	for {
+		// TODO: FetchMessage (ReadMessage commits automatically — not what we want)
+		// TODO: parse + toEntries; nil → deadWriter.WriteMessages the original key/value with a reason header, CommitMessages, continue
+		// TODO: writeTransaction(ctx, entries, event.Type, &event.EventID, event.OccurredAt, nil), then CommitMessages
+		log.Println("not implemented")
+		return nil
+	}
+}
+`,
+      solution: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+
+	"github.com/segmentio/kafka-go"
+)
+
+const (
+	topic     = "money-events"
+	deadTopic = "money-events.dead"
+)
+
+type Entry struct {
+	Account  string \`json:"account"\`
+	Currency string \`json:"currency"\`
+	Amount   int64  \`json:"amount"\`
+}
+
+type Event struct {
+	EventID    string \`json:"event_id"\`
+	Type       string \`json:"type"\`
+	Amount     int64  \`json:"amount"\`
+	Currency   string \`json:"currency"\`
+	OccurredAt int64  \`json:"occurred_at"\`
+}
+
+// Event type → {debit account, credit account}: the amount is debited from the first, credited to the second.
+var mapping = map[string][2]string{
+	"payment.captured": {"cash:acquirer", "clearing:payments"},
+	"payout.sent":      {"clearing:payouts", "cash:bank"},
+	"refund.issued":    {"clearing:payments", "cash:acquirer"},
+}
+
+// writeTransaction is built in step 4 (ledger_writer.go): insert-or-skip on the event id.
+func writeTransaction(ctx context.Context, entries []Entry, description string, eventID *string, postedAt int64, settles *string) (string, error) {
+	panic("not implemented")
+}
+
+var reader = kafka.NewReader(kafka.ReaderConfig{
+	Brokers: []string{"kafka:9092"},
+	GroupID: "ledger",
+	Topic:   topic,
+})
+
+var deadWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: deadTopic, RequiredAcks: kafka.RequireAll}
+
+// parse returns the event, or false when the value is not a well-formed event.
+func parse(value []byte) (Event, bool) {
+	var event Event
+	if err := json.Unmarshal(value, &event); err != nil || event.EventID == "" || event.Type == "" || event.Currency == "" || event.OccurredAt <= 0 {
+		return Event{}, false
+	}
+	return event, true
+}
+
+// toEntries returns the two balanced entries for an event, or nil when its type has no mapping.
+func toEntries(event Event) []Entry {
+	accounts, ok := mapping[event.Type]
+	if !ok {
+		return nil
+	}
+	return []Entry{
+		{Account: accounts[0], Currency: event.Currency, Amount: event.Amount},
+		{Account: accounts[1], Currency: event.Currency, Amount: -event.Amount},
+	}
+}
+
+// deadLetter parks the original record where a human can look at it; WriteMessages is synchronous, so it is durable before the commit.
+func deadLetter(ctx context.Context, msg kafka.Message, reason string) error {
+	return deadWriter.WriteMessages(ctx, kafka.Message{
+		Key:     msg.Key,
+		Value:   msg.Value,
+		Headers: []kafka.Header{{Key: "reason", Value: []byte(reason)}},
+	})
+}
+
+func run(ctx context.Context) error {
+	for {
+		msg, err := reader.FetchMessage(ctx)
+		if err != nil {
+			return err
+		}
+		event, ok := parse(msg.Value)
+		var entries []Entry
+		if ok {
+			entries = toEntries(event)
+		}
+		if entries == nil {
+			reason := "malformed event"
+			if ok {
+				reason = "no mapping for event type " + event.Type
+			}
+			if err := deadLetter(ctx, msg, reason); err != nil {
+				return err
+			}
+			if err := reader.CommitMessages(ctx, msg); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := writeTransaction(ctx, entries, event.Type, &event.EventID, event.OccurredAt, nil); err != nil {
+			return err // not committed: the record comes back
+		}
+		if err := reader.CommitMessages(ctx, msg); err != nil {
+			return err
+		}
+	}
+}
+`,
+    },
+    scala: {
+      starter: `import java.time.Duration
+import java.util.Properties
+
+import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
+import spray.json._
+import scala.jdk.CollectionConverters._
+
+final case class Entry(account: String, currency: String, amount: Long)
+final case class Event(eventId: String, \`type\`: String, amount: Long, currency: String, occurredAt: Long)
+
+object EventConsumer {
+  val Topic = "money-events"
+  val DeadTopic = "money-events.dead"
+
+  /** Event type → (debit account, credit account): the amount is debited from the first, credited to the second. */
+  val Mapping: Map[String, (String, String)] = Map(
+    "payment.captured" -> ("cash:acquirer", "clearing:payments"),
+    "payout.sent" -> ("clearing:payouts", "cash:bank"),
+    "refund.issued" -> ("clearing:payments", "cash:acquirer"))
+
+  /** Built in step 4 (LedgerWriter): insert-or-skip on the event id. */
+  def writeTransaction(entries: Seq[Entry], description: String, eventId: Option[String], postedAt: Long, settles: Option[String]): Option[String] = ???
+
+  private val consumerProps = new Properties()
+  consumerProps.put("bootstrap.servers", "kafka:9092")
+  consumerProps.put("group.id", "ledger")
+  consumerProps.put("auto.offset.reset", "earliest")
+  // TODO: disable auto-commit
+  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
+  consumer.subscribe(List(Topic).asJava)
+
+  private val producerProps = new Properties()
+  producerProps.put("bootstrap.servers", "kafka:9092")
+  producerProps.put("acks", "all")
+  producerProps.put("enable.idempotence", "true")
+  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
+
+  /** The event, or None when the value is not a well-formed event. */
+  def parse(raw: String): Option[Event] =
+    scala.util.Try {
+      val f = raw.parseJson.asJsObject.fields
+      Event(f("event_id").convertTo[String], f("type").convertTo[String], f("amount").convertTo[Long],
+            f("currency").convertTo[String], f("occurred_at").convertTo[Long])
+    }.toOption
+
+  /** The two balanced entries for an event, or None when its type has no mapping. */
+  def toEntries(event: Event): Option[Seq[Entry]] = {
+    // TODO: Mapping.get(type) → Seq(Entry(debit, currency, +amount), Entry(credit, currency, -amount))
+    None
+  }
+
+  /** Commits this record's offset synchronously. */
+  private def commit(record: ConsumerRecord[String, String]): Unit =
+    consumer.commitSync(
+      Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
+
+  def run(): Unit =
+    while (true)
+      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
+        // TODO: parse + toEntries; None → send the original key/value to DeadTopic with a reason header, .get() it, commit(record)
+        // TODO: writeTransaction(entries, event.type, Some(event.eventId), event.occurredAt, None), then commit(record)
+      }
+}
+`,
+      solution: `import java.time.Duration
+import java.util.Properties
+
+import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetAndMetadata}
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.TopicPartition
+import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
+import spray.json._
+import scala.jdk.CollectionConverters._
+
+final case class Entry(account: String, currency: String, amount: Long)
+final case class Event(eventId: String, \`type\`: String, amount: Long, currency: String, occurredAt: Long)
+
+object EventConsumer {
+  val Topic = "money-events"
+  val DeadTopic = "money-events.dead"
+
+  /** Event type → (debit account, credit account): the amount is debited from the first, credited to the second. */
+  val Mapping: Map[String, (String, String)] = Map(
+    "payment.captured" -> ("cash:acquirer", "clearing:payments"),
+    "payout.sent" -> ("clearing:payouts", "cash:bank"),
+    "refund.issued" -> ("clearing:payments", "cash:acquirer"))
+
+  /** Built in step 4 (LedgerWriter): insert-or-skip on the event id. */
+  def writeTransaction(entries: Seq[Entry], description: String, eventId: Option[String], postedAt: Long, settles: Option[String]): Option[String] = ???
+
+  private val consumerProps = new Properties()
+  consumerProps.put("bootstrap.servers", "kafka:9092")
+  consumerProps.put("group.id", "ledger")
+  consumerProps.put("auto.offset.reset", "earliest")
+  consumerProps.put("enable.auto.commit", "false")
+  private val consumer = new KafkaConsumer[String, String](consumerProps, new StringDeserializer, new StringDeserializer)
+  consumer.subscribe(List(Topic).asJava)
+
+  private val producerProps = new Properties()
+  producerProps.put("bootstrap.servers", "kafka:9092")
+  producerProps.put("acks", "all")
+  producerProps.put("enable.idempotence", "true")
+  private val producer = new KafkaProducer[String, String](producerProps, new StringSerializer, new StringSerializer)
+
+  /** The event, or None when the value is not a well-formed event. */
+  def parse(raw: String): Option[Event] =
+    scala.util.Try {
+      val f = raw.parseJson.asJsObject.fields
+      Event(f("event_id").convertTo[String], f("type").convertTo[String], f("amount").convertTo[Long],
+            f("currency").convertTo[String], f("occurred_at").convertTo[Long])
+    }.toOption
+
+  /** The two balanced entries for an event, or None when its type has no mapping. */
+  def toEntries(event: Event): Option[Seq[Entry]] =
+    Mapping.get(event.\`type\`).map { case (debit, credit) =>
+      Seq(Entry(debit, event.currency, event.amount), Entry(credit, event.currency, -event.amount))
+    }
+
+  /** Parks the original record where a human can look at it; .get() blocks until the broker acknowledged it. */
+  private def deadLetter(record: ConsumerRecord[String, String], reason: String): Unit = {
+    val parked = new ProducerRecord[String, String](DeadTopic, record.key, record.value)
+    parked.headers().add("reason", reason.getBytes("UTF-8"))
+    producer.send(parked).get()
+  }
+
+  /** Commits this record's offset synchronously. */
+  private def commit(record: ConsumerRecord[String, String]): Unit =
+    consumer.commitSync(
+      Map(new TopicPartition(record.topic, record.partition) -> new OffsetAndMetadata(record.offset + 1)).asJava)
+
+  def run(): Unit =
+    while (true)
+      consumer.poll(Duration.ofSeconds(1)).asScala.foreach { record =>
+        val event = parse(record.value)
+        event.flatMap(toEntries) match {
+          case None =>
+            deadLetter(record, event.fold("malformed event")(e => s"no mapping for event type \${e.\`type\`}"))
+            commit(record)
+          case Some(entries) =>
+            val e = event.get
+            writeTransaction(entries, e.\`type\`, Some(e.eventId), e.occurredAt, None) // throws → not committed, the record comes back
+            commit(record)
+        }
+      }
+}
+`,
+    },
+    cpp: {
+      starter: `#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
+
+#include <cstdint>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+using json = nlohmann::json;
+
+const std::string kTopic = "money-events";
+const std::string kDeadTopic = "money-events.dead";
+
+struct Entry {
+  std::string account;
+  std::string currency;
+  int64_t amount;
+};
+
+struct Event {
+  std::string event_id;
+  std::string type;
+  int64_t amount;
+  std::string currency;
+  int64_t occurred_at;
+};
+
+// Event type → {debit account, credit account}: the amount is debited from the first, credited to the second.
+const std::map<std::string, std::pair<std::string, std::string>> kMapping = {
+    {"payment.captured", {"cash:acquirer", "clearing:payments"}},
+    {"payout.sent", {"clearing:payouts", "cash:bank"}},
+    {"refund.issued", {"clearing:payments", "cash:acquirer"}},
+};
+
+// Built in step 4 (ledger_writer.cpp): insert-or-skip on the event id; nullopt when the event was already recorded.
+std::optional<std::string> write_transaction(const std::vector<Entry>& entries, const std::string& description,
+                                             std::optional<std::string> event_id, int64_t posted_at,
+                                             std::optional<std::string> settles);
+
+std::unique_ptr<RdKafka::KafkaConsumer> make_consumer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("group.id", "ledger", err);
+  conf->set("auto.offset.reset", "earliest", err);
+  // TODO: disable auto-commit
+  auto consumer = std::unique_ptr<RdKafka::KafkaConsumer>(RdKafka::KafkaConsumer::create(conf.get(), err));
+  consumer->subscribe({kTopic});
+  return consumer;
+}
+
+std::unique_ptr<RdKafka::Producer> make_producer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "all", err);
+  conf->set("enable.idempotence", "true", err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
+}
+
+auto consumer = make_consumer();
+auto producer = make_producer();
+
+// The event, or nullopt when the value is not a well-formed event.
+std::optional<Event> parse(const std::string& raw) {
+  const json j = json::parse(raw, nullptr, false);
+  if (!j.is_object()) return std::nullopt;
+  for (const char* field : {"event_id", "type", "amount", "currency", "occurred_at"})
+    if (!j.contains(field)) return std::nullopt;
+  if (!j["amount"].is_number_integer() || !j["occurred_at"].is_number_integer()) return std::nullopt;
+  return Event{j["event_id"].get<std::string>(), j["type"].get<std::string>(), j["amount"].get<int64_t>(),
+               j["currency"].get<std::string>(), j["occurred_at"].get<int64_t>()};
+}
+
+// The two balanced entries for an event, or nullopt when its type has no mapping.
+std::optional<std::vector<Entry>> to_entries(const Event& event) {
+  // TODO: kMapping.find(type) → {debit, +amount}, {credit, -amount} in the event's currency
+  return std::nullopt;
+}
+
+void run() {
+  while (true) {
+    std::unique_ptr<RdKafka::Message> msg(consumer->consume(1000));
+    if (msg->err() == RdKafka::ERR__TIMED_OUT) continue;
+    if (msg->err() != RdKafka::ERR_NO_ERROR) {
+      std::cerr << "consumer error: " << msg->errstr() << "\\n";
+      continue;
+    }
+    // TODO: parse + to_entries; nullopt → produce the original key/payload to kDeadTopic with a reason header, flush, commitSync, continue
+    // TODO: write_transaction(entries, event.type, event.event_id, event.occurred_at, std::nullopt), then commitSync this message
+  }
+}
+`,
+      solution: `#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
+
+#include <cstdint>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+using json = nlohmann::json;
+
+const std::string kTopic = "money-events";
+const std::string kDeadTopic = "money-events.dead";
+
+struct Entry {
+  std::string account;
+  std::string currency;
+  int64_t amount;
+};
+
+struct Event {
+  std::string event_id;
+  std::string type;
+  int64_t amount;
+  std::string currency;
+  int64_t occurred_at;
+};
+
+// Event type → {debit account, credit account}: the amount is debited from the first, credited to the second.
+const std::map<std::string, std::pair<std::string, std::string>> kMapping = {
+    {"payment.captured", {"cash:acquirer", "clearing:payments"}},
+    {"payout.sent", {"clearing:payouts", "cash:bank"}},
+    {"refund.issued", {"clearing:payments", "cash:acquirer"}},
+};
+
+// Built in step 4 (ledger_writer.cpp): insert-or-skip on the event id; nullopt when the event was already recorded.
+std::optional<std::string> write_transaction(const std::vector<Entry>& entries, const std::string& description,
+                                             std::optional<std::string> event_id, int64_t posted_at,
+                                             std::optional<std::string> settles);
+
+std::unique_ptr<RdKafka::KafkaConsumer> make_consumer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("group.id", "ledger", err);
+  conf->set("auto.offset.reset", "earliest", err);
+  conf->set("enable.auto.commit", "false", err);
+  auto consumer = std::unique_ptr<RdKafka::KafkaConsumer>(RdKafka::KafkaConsumer::create(conf.get(), err));
+  consumer->subscribe({kTopic});
+  return consumer;
+}
+
+std::unique_ptr<RdKafka::Producer> make_producer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "all", err);
+  conf->set("enable.idempotence", "true", err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
+}
+
+auto consumer = make_consumer();
+auto producer = make_producer();
+
+// The event, or nullopt when the value is not a well-formed event.
+std::optional<Event> parse(const std::string& raw) {
+  const json j = json::parse(raw, nullptr, false);
+  if (!j.is_object()) return std::nullopt;
+  for (const char* field : {"event_id", "type", "amount", "currency", "occurred_at"})
+    if (!j.contains(field)) return std::nullopt;
+  if (!j["amount"].is_number_integer() || !j["occurred_at"].is_number_integer()) return std::nullopt;
+  return Event{j["event_id"].get<std::string>(), j["type"].get<std::string>(), j["amount"].get<int64_t>(),
+               j["currency"].get<std::string>(), j["occurred_at"].get<int64_t>()};
+}
+
+// The two balanced entries for an event, or nullopt when its type has no mapping.
+std::optional<std::vector<Entry>> to_entries(const Event& event) {
+  const auto it = kMapping.find(event.type);
+  if (it == kMapping.end()) return std::nullopt;
+  const auto& [debit, credit] = it->second;
+  return std::vector<Entry>{Entry{debit, event.currency, event.amount}, Entry{credit, event.currency, -event.amount}};
+}
+
+// Parks the original record where a human can look at it; flushed so a crash cannot lose it.
+void dead_letter(const RdKafka::Message& msg, const std::string& reason) {
+  RdKafka::Headers* headers = RdKafka::Headers::create();
+  headers->add("reason", reason);
+  const std::string payload(static_cast<const char*>(msg.payload()), msg.len());
+  const std::string key = msg.key() ? *msg.key() : "";
+  producer->produce(kDeadTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(payload.data()),
+                    payload.size(), key.data(), key.size(), 0, headers, nullptr);
+  producer->flush(5000);
+}
+
+void run() {
+  while (true) {
+    std::unique_ptr<RdKafka::Message> msg(consumer->consume(1000));
+    if (msg->err() == RdKafka::ERR__TIMED_OUT) continue;
+    if (msg->err() != RdKafka::ERR_NO_ERROR) {
+      std::cerr << "consumer error: " << msg->errstr() << "\\n";
+      continue;
+    }
+    const auto event = parse(std::string(static_cast<const char*>(msg->payload()), msg->len()));
+    const auto entries = event ? to_entries(*event) : std::nullopt;
+    if (!entries) {
+      dead_letter(*msg, event ? "no mapping for event type " + event->type : "malformed event");
+      consumer->commitSync(msg.get());
+      continue;
+    }
+    write_transaction(*entries, event->type, event->event_id, event->occurred_at, std::nullopt);  // throws → not committed
+    consumer->commitSync(msg.get());
+  }
+}
+`,
+    },
+  },
+  harness: {
+    python: `import json
+
+T0 = 1700000000000
+
+
+def _event(event_id, type="payment.captured", amount=4999, currency="EUR", occurred_at=T0):
+    return {"event_id": event_id, "type": type, "amount": amount, "currency": currency, "occurred_at": occurred_at, "charge": "ch_" + event_id}
+
+
+def _seed(ctx, *events):
+    for event in events:
+        if isinstance(event, dict):
+            ctx.kafka.seed("money-events", key=event["event_id"], value=json.dumps(event))
+        else:
+            ctx.kafka.seed("money-events", key="raw", value=event)
+
+
+def _consumer(ctx):
+    """The learner's module with the journal (step 4) replaced by a recorder."""
+    m = ctx.load("event_consumer")
+    m.written = []
+
+    async def write_transaction(entries, description, event_id=None, posted_at=None, settles=None):
+        m.written.append({"entries": entries, "description": description, "event_id": event_id, "posted_at": posted_at, "settles": settles})
+        return f"tx-{len(m.written)}"
+
+    m.write_transaction = write_transaction
+    return m
+
+
+def _dead(ctx):
+    return ctx.kafka.records("money-events.dead")
+
+
+async def check_group_manual_commit(ctx):
+    _seed(ctx, _event("e1"))
+    m = _consumer(ctx)
+    subscriptions = [e for e in ctx.kafka.events if e[0] == "subscribe"]
+    assert subscriptions, "the consumer must subscribe to a topic"
+    group, topics = subscriptions[-1][1], subscriptions[-1][2]
+    assert group == "ledger", f"group.id must be ledger, got {group!r}"
+    assert "money-events" in topics, f"the consumer must subscribe to money-events, got {topics}"
+    assert ctx.kafka.consumers[-1].auto_commit is False, "enable.auto.commit is on: offsets would be acknowledged on a timer, before the write"
+    await ctx.drain_async(m.run())
+    assert not any(e[0] == "auto-commit" for e in ctx.kafka.events), "offsets were auto-committed"
+    assert any(e[0] == "manual-commit" for e in ctx.kafka.events), "no explicit commit happened"
+    assert ctx.kafka.lag("ledger", "money-events") == 0, "every processed record must be committed"
+    assert len(m.written) == 1, f"one event must become one write, got {len(m.written)}"
+
+
+async def check_mapping(ctx):
+    _seed(ctx, _event("e1"), _event("e2", type="payout.sent", amount=120000, currency="USD", occurred_at=T0 + 5), _event("e3", type="refund.issued", amount=999))
+    m = _consumer(ctx)
+    await ctx.drain_async(m.run())
+    assert len(m.written) == 3, f"three mapped events must become three writes, got {len(m.written)}"
+    expected = {
+        "e1": ([("cash:acquirer", "EUR", 4999), ("clearing:payments", "EUR", -4999)], "payment.captured", T0),
+        "e2": ([("clearing:payouts", "USD", 120000), ("cash:bank", "USD", -120000)], "payout.sent", T0 + 5),
+        "e3": ([("clearing:payments", "EUR", 999), ("cash:acquirer", "EUR", -999)], "refund.issued", T0),
+    }
+    for w in m.written:
+        assert w["event_id"] in expected, f"write_transaction got event_id {w['event_id']!r}, expected the event's own id"
+        entries, description, occurred_at = expected[w["event_id"]]
+        got = [(e.get("account"), e.get("currency"), e.get("amount")) for e in w["entries"]]
+        assert got == entries, f"{w['event_id']}: entries {got} — expected {entries} (debit first, credit negated, event currency)"
+        assert sum(e["amount"] for e in w["entries"]) == 0, f"{w['event_id']}: the entries do not balance"
+        assert w["description"] == description, f"{w['event_id']}: description {w['description']!r}, expected the event type"
+        assert w["posted_at"] == occurred_at, f"{w['event_id']}: posted_at {w['posted_at']!r}, expected the event's occurred_at {occurred_at}"
+    assert m.to_entries(_event("x", type="dispute.opened")) is None, "to_entries must return None for a type without a mapping"
+
+
+async def check_dead_letter(ctx):
+    unknown = _event("e2", type="dispute.opened")
+    _seed(ctx, _event("e1"), unknown, "{not json", _event("e4"))
+    m = _consumer(ctx)
+    await ctx.drain_async(m.run())
+    dead = _dead(ctx)
+    assert len(dead) == 2, f"the unmapped event and the malformed record must both be parked on money-events.dead, found {len(dead)} record(s) there"
+    values = [r.value for r in dead]
+    assert json.dumps(unknown).encode() in values, "the unmapped event must be parked with its original value, unchanged"
+    assert b"{not json" in values, "the malformed record must be parked with its original value, unchanged"
+    parked = next(r for r in dead if r.value == json.dumps(unknown).encode())
+    assert parked.key == b"e2", f"the parked record must keep the original key, got {parked.key!r}"
+    assert any(name == "reason" and value for name, value in parked.headers), f"the parked record must carry a 'reason' header, got headers {parked.headers}"
+    assert sorted(w["event_id"] for w in m.written) == ["e1", "e4"], f"only the mapped events are written, got {[w['event_id'] for w in m.written]}"
+    assert ctx.kafka.flushes >= 1, "flush the producer after parking a record: a crash before the flush loses the only copy"
+
+
+async def check_continues_after_dead(ctx):
+    _seed(ctx, _event("e1", type="dispute.opened"), _event("e2"), _event("e3", type="chargeback.won"), _event("e4"))
+    m = _consumer(ctx)
+    try:
+        await ctx.drain_async(m.run())
+    except Exception as exc:
+        raise AssertionError(f"an unmapped event must not stop the consumer, but run() raised {exc!r}")
+    assert sorted(w["event_id"] for w in m.written) == ["e2", "e4"], f"the events after an unmapped one must still be written, got {[w['event_id'] for w in m.written]}"
+    assert len(_dead(ctx)) == 2
+    lag = ctx.kafka.lag("ledger", "money-events")
+    assert lag == 0, f"{lag} record(s) not committed: a parked record's offset must be committed too, or it is redelivered forever"
+
+
+async def check_commit_after_write(ctx):
+    _seed(ctx, _event("e1"))
+    m = _consumer(ctx)
+    at_commit = []
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append(len(m.written)))
+    await ctx.drain_async(m.run())
+    assert at_commit, "the offset of e1 was never committed"
+    assert at_commit[0] == 1, "the commit must come after write_transaction: at commit time nothing had been written"
+    _seed(ctx, _event("e2"))
+
+    async def failing(entries, description, event_id=None, posted_at=None, settles=None):
+        raise RuntimeError("journal database down")
+
+    m.write_transaction = failing
+    try:
+        await ctx.drain_async(m.run())
+    except RuntimeError:
+        pass
+    assert ctx.kafka.lag("ledger", "money-events") == 1, "a record whose write failed must not be committed: it has to come back"
+    assert _dead(ctx) == [], "a failed write is not a dead letter: the record is retried, not parked"
+    m2 = _consumer(ctx)
+    await ctx.drain_async(m2.run())
+    assert [w["event_id"] for w in m2.written] == ["e2"], f"after a restart the consumer must redeliver and write e2, got {[w['event_id'] for w in m2.written]}"
+    assert ctx.kafka.lag("ledger", "money-events") == 0
+`,
+  },
+  debrief: `The mapping table is the course's stand-in for Stripe's fund flows: a declaration of which accounts an event moves money between, kept out of the consumer's code so adding a producer is a data change. The consumer's job is then only ordering and failure handling — write, then commit, so a crash replays rather than loses — and the dead-letter topic separates "I do not understand this" from "this failed": the first is parked and committed so the partition keeps flowing, the second is retried. Real ingestion pipelines version the mappings, carry the mapping version on each transaction so a bad mapping can be found and reversed, and alert on the dead-letter topic's growth rate rather than on every record.`,
+};

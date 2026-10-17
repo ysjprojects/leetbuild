@@ -1,6 +1,6 @@
-import {type FC, memo} from 'react';
+import {type FC, memo, useMemo} from 'react';
 
-import {type Concept, type Difficulty, CONCEPT_LABEL} from '@/lib/types';
+import {type Company, type Concept, type Difficulty, CONCEPT_LABEL} from '@/lib/types';
 import {concept} from '@/styles/palette';
 
 /** Difficulty is a level, not a tag: a solid badge with 1–3 bars, unlike the outlined concept pills. */
@@ -44,6 +44,33 @@ export const ConceptChip: FC<{concept: Concept}> = memo(({concept}) => (
   </span>
 ));
 ConceptChip.displayName = 'ConceptChip';
+
+/** The company's monogram on a tile in its brand colour: the tag's mark (no trademarked logo assets ship). */
+export const CompanyMark: FC<{company: Company; size?: 'sm' | 'lg'}> = memo(({company, size = 'sm'}) => {
+  const style = useMemo(() => ({background: company.color}), [company.color]);
+  return (
+    <span
+      aria-hidden
+      className={`inline-flex shrink-0 items-center justify-center rounded font-extrabold leading-none text-white ${
+        size === 'lg' ? 'h-9 w-9 text-[17px]' : 'h-4 w-4 text-[10px]'
+      }`}
+      style={style}>
+      {company.name[0]}
+    </span>
+  );
+});
+CompanyMark.displayName = 'CompanyMark';
+
+/** "Company tagged": the mark and the name, outlined like the concept pills. */
+export const CompanyChip: FC<{company: Company}> = memo(({company}) => (
+  <span
+    className="border-ink-500 text-ink-100 inline-flex items-center gap-1 rounded-full border py-0.5 pl-0.5 pr-1.5 text-[10px] font-semibold"
+    title={`company tagged: derived from the ${company.publication}`}>
+    <CompanyMark company={company} />
+    {company.name}
+  </span>
+));
+CompanyChip.displayName = 'CompanyChip';
 
 export const ghostButtonClass =
   'rounded-lg px-3 py-1.5 text-[12px] font-semibold text-ink-200 transition hover:bg-ink-800 hover:text-ink-50 disabled:cursor-not-allowed disabled:opacity-30';

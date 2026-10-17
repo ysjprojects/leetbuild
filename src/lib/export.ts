@@ -185,10 +185,22 @@ export function problemToMarkdown(problem: Problem, language: Language): string 
   parts.push('');
   parts.push(problem.tagline);
   parts.push('');
+  if (problem.company !== undefined)
+    parts.push(
+      `> **Company tagged** — derived from the [${problem.company.publication}](${problem.company.url}); the sources are listed at the end.`,
+      '',
+    );
   // The statement already starts with its own `# Title`; drop it and demote the rest under ours.
   const statement = problem.statement.replace(/^#\s+[^\n]*\n/, '');
   parts.push(widgetsToNotes(shiftHeadings(statement, 1), problemUrl(problem)).trim());
   parts.push('');
+  if (problem.sources !== undefined && problem.sources.length > 0) {
+    parts.push('## Sources');
+    parts.push('');
+    for (const s of problem.sources)
+      parts.push(`- [${s.title}](${s.url})${s.by !== undefined ? ` — ${s.by}` : ''}, ${s.date}. ${s.takes}`);
+    parts.push('');
+  }
   parts.push('## Architecture');
   parts.push('');
   parts.push('```mermaid');

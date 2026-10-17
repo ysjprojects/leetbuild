@@ -1,0 +1,496 @@
+import type {Step} from '@/lib/types';
+
+export const countEventsStep: Step = {
+  id: 'count-events',
+  title: 'Eventually consistent: every add is an event, durable before the 202',
+  concept: 'kafka',
+  file: 'count_events',
+  focus: ['api', 'kafka'],
+  task: `## Task
+
+An eventually-consistent counter is not a number anywhere yet — it is a log of adds that a rollup
+will fold later. Implement \`append_event(ns, name, delta, token)\`, which the API calls before it
+answers **202**:
+
+- Produce one record to the **\`counter-events\`** topic, keyed by **\`{ns}:{name}\`**: every event of one
+  counter lands on one partition, in order, and the rollup of the next step can fold a counter without
+  merging partitions.
+- The value is JSON: \`{"ns": …, "name": …, "delta": …, "token": …, "ts": …}\`. The \`token\` is carried as
+  is — it is the client's idempotency key, and the rollup needs it to drop a retry.
+- The producer must ask for **\`acks=all\`** and enable idempotence: a 202 is a durability promise, and
+  a leader-only ack can be lost when the leader dies.
+- Wait for the acknowledgement with a **bounded flush** — \`producer.flush(timeout=FLUSH_TIMEOUT_S)\`
+  (1 s) — **before returning**. If the delivery callback reports an error or the flush leaves the
+  record pending, raise \`EventNotDurable\`: the API turns it into a **503**, and the client retries
+  with the *same token*, which is why the retry is safe.
+
+:::widget idempotency {}
+
+:::widget kafka-partitions {"partitions": 6}
+
+> This is the opposite trade from a click stream: there a lost event was cheaper than a slow redirect,
+> here a lost event is a wrong number forever. So the add waits — but never longer than a second.`,
+  sequence: {
+    participants: ['counters', 'Producer', 'Kafka'],
+    messages: [
+      {
+        from: 'counters',
+        to: 'Producer',
+        label: 'produce(counter-events, key=plays:stranger-things, {delta: 1, token: t-9f3, ts})',
+        kind: 'sync',
+      },
+      {from: 'Producer', to: 'Kafka', label: 'partition hash(plays:stranger-things) % 6 · acks=all', kind: 'sync'},
+      {from: 'Kafka', to: 'Producer', label: 'ack: every in-sync replica has it (offset 88 412)', kind: 'reply'},
+      {from: 'Producer', to: 'counters', label: 'delivery callback (err = None)', kind: 'async'},
+      {from: 'counters', to: 'counters', label: 'flush(timeout 1 s) → 0 pending · return', kind: 'sync'},
+    ],
+  },
+  hints: [
+    'Configure durability on the producer, not per call: `acks=all` and `enable.idempotence=true` in the producer configuration.',
+    'Give `produce` a delivery callback that stores the error it receives, then `flush(timeout=FLUSH_TIMEOUT_S)`; `flush` returns how many records are still pending — anything but 0, or a stored error, means not durable.',
+    'Raise `EventNotDurable` rather than returning a boolean: the API already knows how to turn an exception into a 503, and the token on the retry makes the duplicate harmless.',
+  ],
+  checks: [
+    {
+      id: 'topic-key',
+      title: 'Produces to counter-events keyed by ns:name',
+      detail:
+        'The record goes to the `counter-events` topic with `{ns}:{name}` as its key, so one counter is one partition.',
+      match: {
+        python: {all: [/"counter-events"/, /f["']\{ns\}:\{name\}["']/, /producer\.produce\(/]},
+        go: {all: [/"counter-events"/, /Key:\s*\[\]byte\(\s*ns\s*\+\s*":"\s*\+\s*name\s*\)/, /WriteMessages\(/]},
+        scala: {all: [/"counter-events"/, /s"\$ns:\$name"|s"\$\{ns\}:\$\{name\}"/, /producer\.send\(/]},
+        cpp: {all: [/"counter-events"/, /ns\s*\+\s*":"\s*\+\s*name/, /producer->produce\(/]},
+      },
+    },
+    {
+      id: 'event-shape',
+      title: 'The value carries ns, name, delta, token and ts as JSON',
+      detail:
+        'The event is a JSON document with the five fields; the token must travel with the event for the rollup to dedupe on it.',
+      match: {
+        python: {all: [/json\.dumps\(/, /"delta"/, /"token"/, /"ts"/]},
+        go: {all: [/json\.Marshal\(/, /json:"delta"/, /json:"token"/, /json:"ts"/]},
+        scala: {all: [/"delta"\s*->/, /"token"\s*->/, /"ts"\s*->/, /compactPrint/]},
+        cpp: {all: [/\{"delta",/, /\{"token",/, /\{"ts",/, /\.dump\(\)/]},
+      },
+    },
+    {
+      id: 'acks-all',
+      title: 'Producer requires acks=all with idempotence',
+      detail:
+        'A 202 promises durability; `acks=all` means every in-sync replica has the record, and idempotence keeps the producer’s own retries from doubling it.',
+      match: {
+        python: {all: [/"acks"\s*:\s*"all"/, /"enable\.idempotence"\s*:\s*True/]},
+        go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
+        scala: {
+          all: [
+            /"acks"\s*,\s*"all"|ACKS_CONFIG\s*,\s*"all"/,
+            /"enable\.idempotence"\s*,\s*"true"|ENABLE_IDEMPOTENCE_CONFIG\s*,\s*"true"/,
+          ],
+        },
+        cpp: {all: [/"acks"\s*,\s*"all"/, /"enable\.idempotence"\s*,\s*"true"/]},
+      },
+    },
+    {
+      id: 'bounded-flush',
+      title: 'Waits for the ack with a bounded flush before returning',
+      detail:
+        '`append_event` flushes with `FLUSH_TIMEOUT_S` (1 s) so the 202 is only sent once the broker acknowledged — and a dead broker fails the add instead of hanging it.',
+      match: {
+        python: {
+          all: [/def append_event(?:(?!\ndef )[\s\S])*?producer\.flush\(\s*(timeout\s*=\s*)?FLUSH_TIMEOUT_S\s*\)/],
+          none: [/producer\.flush\(\s*\)/],
+        },
+        go: {
+          all: [/context\.WithTimeout\(\s*ctx\s*,\s*flushTimeout\s*\)/, /writer\.WriteMessages\(/],
+          none: [/Async:\s*true/],
+        },
+        scala: {all: [/\.get\(\s*FlushTimeoutMillis\s*,\s*TimeUnit\.MILLISECONDS\s*\)/]},
+        cpp: {all: [/producer->flush\(\s*kFlushTimeoutMs\s*\)/], none: [/producer->flush\(\s*-1\s*\)/]},
+      },
+    },
+    {
+      id: 'not-durable-raises',
+      title: 'Raises EventNotDurable when the record was not acknowledged',
+      detail:
+        'A delivery error reported through the callback, or a record still pending after the flush, raises `EventNotDurable` so the API answers 503 and the client retries with the same token.',
+      match: {
+        python: {all: [/on_delivery\s*=|callback\s*=/, /raise EventNotDurable\(/]},
+        go: {all: [/return ErrNotDurable|errors\.Join\(\s*ErrNotDurable|fmt\.Errorf\([^\n]*ErrNotDurable/]},
+        scala: {all: [/throw new EventNotDurable\(/]},
+        cpp: {all: [/dr_cb\(/, /throw EventNotDurable\(/]},
+      },
+    },
+  ],
+  code: {
+    python: {
+      starter: `import json
+import time
+
+from confluent_kafka import Producer
+
+TOPIC = "counter-events"
+FLUSH_TIMEOUT_S = 1.0
+
+producer = Producer({"bootstrap.servers": "kafka:9092"})  # TODO: acks=all, enable.idempotence
+
+
+class EventNotDurable(Exception):
+    """The broker did not acknowledge the event in time; the API answers 503 and the client retries with the same token."""
+
+
+def append_event(ns: str, name: str, delta: int, token: str) -> None:
+    value = json.dumps({"ns": ns, "name": name, "delta": delta, "token": token, "ts": time.time()})
+    # TODO: produce to TOPIC keyed by {ns}:{name} with a delivery callback that remembers the error
+    # TODO: flush with timeout=FLUSH_TIMEOUT_S; a pending record or a delivery error → raise EventNotDurable
+    raise NotImplementedError
+`,
+      solution: `import json
+import time
+
+from confluent_kafka import Producer
+
+TOPIC = "counter-events"
+FLUSH_TIMEOUT_S = 1.0
+
+producer = Producer({"bootstrap.servers": "kafka:9092", "acks": "all", "enable.idempotence": True})
+
+
+class EventNotDurable(Exception):
+    """The broker did not acknowledge the event in time; the API answers 503 and the client retries with the same token."""
+
+
+def append_event(ns: str, name: str, delta: int, token: str) -> None:
+    value = json.dumps({"ns": ns, "name": name, "delta": delta, "token": token, "ts": time.time()})
+    outcome: dict = {}
+
+    def on_delivery(err, msg) -> None:
+        outcome["err"] = err
+
+    producer.produce(TOPIC, key=f"{ns}:{name}", value=value, on_delivery=on_delivery)
+    pending = producer.flush(timeout=FLUSH_TIMEOUT_S)
+    if pending or outcome.get("err") is not None:
+        raise EventNotDurable(f"counter event {token} not acknowledged: {outcome.get('err') or 'timed out'}")
+`,
+    },
+    go: {
+      starter: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/segmentio/kafka-go"
+)
+
+const (
+	topic        = "counter-events"
+	flushTimeout = time.Second
+)
+
+// ErrNotDurable: the broker did not acknowledge the event in time; the API answers 503 and the client retries with the same token.
+var ErrNotDurable = errors.New("counter event not acknowledged")
+
+var writer = &kafka.Writer{
+	Addr:     kafka.TCP("kafka:9092"),
+	Topic:    topic,
+	Balancer: &kafka.Hash{},
+	// TODO: RequiredAcks: every in-sync replica
+}
+
+type countEvent struct {
+	NS    string  \`json:"ns"\`
+	Name  string  \`json:"name"\`
+	Delta int64   \`json:"delta"\`
+	Token string  \`json:"token"\`
+	Ts    float64 \`json:"ts"\`
+}
+
+func appendEvent(ctx context.Context, ns, name string, delta int64, token string) error {
+	value, _ := json.Marshal(countEvent{NS: ns, Name: name, Delta: delta, Token: token, Ts: float64(time.Now().UnixMilli()) / 1000})
+	// TODO: WriteMessages keyed by ns:name under a context that expires after flushTimeout (a synchronous writer waits for the ack)
+	// TODO: any error → ErrNotDurable
+	_ = value
+	return errors.New("not implemented")
+}
+`,
+      solution: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/segmentio/kafka-go"
+)
+
+const (
+	topic        = "counter-events"
+	flushTimeout = time.Second
+)
+
+// ErrNotDurable: the broker did not acknowledge the event in time; the API answers 503 and the client retries with the same token.
+var ErrNotDurable = errors.New("counter event not acknowledged")
+
+var writer = &kafka.Writer{
+	Addr:         kafka.TCP("kafka:9092"),
+	Topic:        topic,
+	Balancer:     &kafka.Hash{},
+	RequiredAcks: kafka.RequireAll,
+}
+
+type countEvent struct {
+	NS    string  \`json:"ns"\`
+	Name  string  \`json:"name"\`
+	Delta int64   \`json:"delta"\`
+	Token string  \`json:"token"\`
+	Ts    float64 \`json:"ts"\`
+}
+
+func appendEvent(ctx context.Context, ns, name string, delta int64, token string) error {
+	value, _ := json.Marshal(countEvent{NS: ns, Name: name, Delta: delta, Token: token, Ts: float64(time.Now().UnixMilli()) / 1000})
+	callCtx, cancel := context.WithTimeout(ctx, flushTimeout)
+	defer cancel()
+	// A synchronous writer returns once every in-sync replica acknowledged the batch, or the context expired.
+	if err := writer.WriteMessages(callCtx, kafka.Message{Key: []byte(ns + ":" + name), Value: value}); err != nil {
+		return fmt.Errorf("%w: %v", ErrNotDurable, err)
+	}
+	return nil
+}
+`,
+    },
+    scala: {
+      starter: `import java.util.Properties
+import java.util.concurrent.TimeUnit
+
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.serialization.StringSerializer
+import spray.json._
+
+/** The broker did not acknowledge the event in time; the API answers 503 and the client retries with the same token. */
+final class EventNotDurable(message: String) extends RuntimeException(message)
+
+object CountEvents {
+  val Topic = "counter-events"
+  val FlushTimeoutMillis = 1000L
+
+  private val props = new Properties()
+  props.put("bootstrap.servers", "kafka:9092")
+  // TODO: acks=all, enable.idempotence=true
+  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
+
+  def appendEvent(ns: String, name: String, delta: Long, token: String): Unit = {
+    val value = JsObject(
+      "ns" -> JsString(ns),
+      "name" -> JsString(name),
+      "delta" -> JsNumber(delta),
+      "token" -> JsString(token),
+      "ts" -> JsNumber(System.currentTimeMillis() / 1000.0),
+    ).compactPrint
+    // TODO: send a record keyed by s"$ns:$name" and wait on the future for at most FlushTimeoutMillis
+    // TODO: any exception (timeout, delivery failure) → throw new EventNotDurable
+    ???
+  }
+}
+`,
+      solution: `import java.util.Properties
+import java.util.concurrent.TimeUnit
+
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.serialization.StringSerializer
+import spray.json._
+
+/** The broker did not acknowledge the event in time; the API answers 503 and the client retries with the same token. */
+final class EventNotDurable(message: String) extends RuntimeException(message)
+
+object CountEvents {
+  val Topic = "counter-events"
+  val FlushTimeoutMillis = 1000L
+
+  private val props = new Properties()
+  props.put("bootstrap.servers", "kafka:9092")
+  props.put("acks", "all")
+  props.put("enable.idempotence", "true")
+  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
+
+  def appendEvent(ns: String, name: String, delta: Long, token: String): Unit = {
+    val value = JsObject(
+      "ns" -> JsString(ns),
+      "name" -> JsString(name),
+      "delta" -> JsNumber(delta),
+      "token" -> JsString(token),
+      "ts" -> JsNumber(System.currentTimeMillis() / 1000.0),
+    ).compactPrint
+    val record = new ProducerRecord[String, String](Topic, s"$ns:$name", value)
+    try producer.send(record).get(FlushTimeoutMillis, TimeUnit.MILLISECONDS) // blocks until every in-sync replica acknowledged
+    catch { case e: Exception => throw new EventNotDurable(s"counter event $token not acknowledged: \${e.getMessage}") }
+  }
+}
+`,
+    },
+    cpp: {
+      starter: `#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
+
+#include <chrono>
+#include <memory>
+#include <stdexcept>
+#include <string>
+
+using json = nlohmann::json;
+
+const std::string kTopic = "counter-events";
+constexpr int kFlushTimeoutMs = 1000;
+
+// The broker did not acknowledge the event in time; the API answers 503 and the client retries with the same token.
+struct EventNotDurable : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+// TODO: a DeliveryReportCb that remembers the last delivery error
+
+std::unique_ptr<RdKafka::Producer> make_producer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  // TODO: acks=all, enable.idempotence=true, dr_cb
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
+}
+
+auto producer = make_producer();
+
+void append_event(const std::string& ns, const std::string& name, long long delta, const std::string& token) {
+  const double ts = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+  const std::string value = json{{"ns", ns}, {"name", name}, {"delta", delta}, {"token", token}, {"ts", ts}}.dump();
+  // TODO: produce keyed by ns + ":" + name (RK_MSG_COPY); flush(kFlushTimeoutMs)
+  // TODO: a produce error, a flush that leaves the record pending, or a delivery error → throw EventNotDurable
+}
+`,
+      solution: `#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
+
+#include <chrono>
+#include <memory>
+#include <stdexcept>
+#include <string>
+
+using json = nlohmann::json;
+
+const std::string kTopic = "counter-events";
+constexpr int kFlushTimeoutMs = 1000;
+
+// The broker did not acknowledge the event in time; the API answers 503 and the client retries with the same token.
+struct EventNotDurable : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+class RememberFailure : public RdKafka::DeliveryReportCb {
+ public:
+  RdKafka::ErrorCode last = RdKafka::ERR_NO_ERROR;
+  void dr_cb(RdKafka::Message& message) override { last = message.err(); }
+};
+
+RememberFailure delivery;
+
+std::unique_ptr<RdKafka::Producer> make_producer() {
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "all", err);
+  conf->set("enable.idempotence", "true", err);
+  conf->set("dr_cb", &delivery, err);
+  return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
+}
+
+auto producer = make_producer();
+
+void append_event(const std::string& ns, const std::string& name, long long delta, const std::string& token) {
+  const double ts = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+  const std::string value = json{{"ns", ns}, {"name", name}, {"delta", delta}, {"token", token}, {"ts", ts}}.dump();
+  const std::string key = ns + ":" + name;
+  delivery.last = RdKafka::ERR_NO_ERROR;
+  const RdKafka::ErrorCode produced =
+      producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
+                        const_cast<char*>(value.data()), value.size(), key.c_str(), key.size(), 0, nullptr);
+  if (produced != RdKafka::ERR_NO_ERROR) throw EventNotDurable("counter event " + token + ": " + RdKafka::err2str(produced));
+  // flush serves the delivery report; a timeout leaves the record in the queue.
+  if (producer->flush(kFlushTimeoutMs) != RdKafka::ERR_NO_ERROR || delivery.last != RdKafka::ERR_NO_ERROR)
+    throw EventNotDurable("counter event " + token + " not acknowledged: " + RdKafka::err2str(delivery.last));
+}
+`,
+    },
+  },
+  harness: {
+    python: `import json
+import re
+import time
+
+TOPIC = "counter-events"
+
+
+def check_topic_key(ctx):
+    m = ctx.load("count_events")
+    m.append_event("plays", "stranger-things", 1, "t-9f3")
+    m.append_event("plays", "stranger-things", 2, "t-9f4")
+    m.append_event("plays", "the-crown", 1, "t-9f5")
+    produced = ctx.kafka.records(TOPIC)
+    assert len(produced) == 3, f"expected three records on {TOPIC}, found {len(produced)} (topics: {list(ctx.kafka.topics)})"
+    keys = [r.key for r in produced]
+    assert keys == [b"plays:stranger-things", b"plays:stranger-things", b"plays:the-crown"], f"records must be keyed by ns:name, got {keys}"
+    assert produced[0].partition == produced[1].partition, "the same counter must land on the same partition"
+
+
+def check_event_shape(ctx):
+    m = ctx.load("count_events")
+    m.append_event("plays", "stranger-things", -2, "t-9f3")
+    produced = ctx.kafka.records(TOPIC)
+    assert len(produced) == 1, f"expected one record on {TOPIC}, found {len(produced)}"
+    event = json.loads(produced[0].value)
+    assert event.get("ns") == "plays" and event.get("name") == "stranger-things", f"the value must carry ns and name: {event}"
+    assert event.get("delta") == -2 and isinstance(event["delta"], int), f"the value must carry the delta as an integer: {event}"
+    assert event.get("token") == "t-9f3", f"the value must carry the client's token unchanged — the rollup dedupes on it: {event}"
+    assert isinstance(event.get("ts"), (int, float)) and abs(event["ts"] - time.time()) < 60, f"the value must carry a current timestamp: {event}"
+
+
+def check_acks_all(ctx):
+    m = ctx.load("count_events")
+    conf = m.producer.conf
+    acks = str(conf.get("acks", "")).lower()
+    assert acks in ("all", "-1"), f"the producer asks for acks={conf.get('acks')!r}: a 202 promises durability, so every in-sync replica must have the event (acks=all)"
+    idempotence = conf.get("enable.idempotence")
+    assert idempotence is True or str(idempotence).lower() == "true", "enable.idempotence must be on: the producer's own retries would otherwise double an event"
+
+
+def check_bounded_flush(ctx):
+    m = ctx.load("count_events")
+    m.append_event("plays", "stranger-things", 1, "t-9f3")
+    assert ctx.kafka.flushes == 1, f"append_event must flush once before returning (saw {ctx.kafka.flushes} flushes): the 202 is only true once the broker acknowledged"
+    assert len(ctx.kafka.records(TOPIC)) == 1
+    m.append_event("plays", "stranger-things", 1, "t-9f4")
+    assert ctx.kafka.flushes == 2, "every add waits for its own acknowledgement"
+    source = ctx.source("count_events")
+    assert re.search(r"flush\\(\\s*\\)", source) is None, "flush() without a timeout waits forever on a dead broker; bound it with FLUSH_TIMEOUT_S"
+    assert re.search(r"flush\\(\\s*(timeout\\s*=\\s*)?(FLUSH_TIMEOUT_S|[\\d.]+)\\s*\\)", source) is not None, "flush must be bounded by FLUSH_TIMEOUT_S"
+
+
+def check_not_durable_raises(ctx):
+    m = ctx.load("count_events")
+    ctx.kafka.fail_next(TOPIC)
+    try:
+        m.append_event("plays", "stranger-things", 1, "t-9f3")
+        raise AssertionError("the broker refused the record (delivery error) but append_event returned normally: the API would answer 202 for an event that was lost")
+    except m.EventNotDurable:
+        pass
+    assert len(ctx.kafka.records(TOPIC)) == 0
+    m.append_event("plays", "stranger-things", 1, "t-9f3")  # the client's retry, same token
+    assert len(ctx.kafka.records(TOPIC)) == 1, "after the failure a retry must be produced normally"
+    assert json.loads(ctx.kafka.records(TOPIC)[0].value).get("token") == "t-9f3", "the retry carries the same token, which is what makes it safe"
+`,
+  },
+  debrief: `The eventually consistent counter does not exist as a number at write time; it exists as a durable fact — "add 1 to plays/stranger-things, token t-9f3, at this time" — and that fact is what the 202 vouches for. Everything about the producer follows from that: acks=all because a leader-only ack can vanish with the leader, idempotence because the producer's own retries must not double a fact, a bounded flush because a promise you cannot keep in a second is better refused than kept late. The token is the other half of the design: the API cannot know whether a 503 was returned before or after the record landed, so instead of guessing it lets the client retry and the rollup dedupe. Netflix logs these events to its TimeSeries abstraction with the same idea — write durably, dedupe downstream — and partitions them by time bucket as well as by counter.`,
+};

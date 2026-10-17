@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package place;
+
+// The live tile stream (step 4): one server-streaming call per connected client, every accepted
+// placement fanned out to all of them.
+service Place {
+  rpc StreamTiles(Subscribe) returns (stream Tile);
+}
+
+message Subscribe {
+  string client = 1;
+}
+
+message Tile {
+  uint32 x = 1;
+  uint32 y = 2;
+  uint32 color = 3;
+  string user = 4;
+  int64 ts = 5;
+}

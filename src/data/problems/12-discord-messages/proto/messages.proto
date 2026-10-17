@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package discord;
+
+// The data service in front of the messages table: step 3 serves it, step 4 routes to it.
+service MessageData {
+  rpc GetMessages(GetMessagesRequest) returns (GetMessagesReply);
+}
+
+message GetMessagesRequest {
+  uint64 channel_id = 1;
+  uint64 before = 2;
+  uint32 limit = 3;
+}
+
+message Message {
+  uint64 id = 1;
+  uint64 author_id = 2;
+  string content = 3;
+}
+
+message GetMessagesReply {
+  repeated Message messages = 1;
+}

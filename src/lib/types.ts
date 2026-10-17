@@ -147,6 +147,33 @@ export interface Step {
   harness?: Partial<Record<Language, string>>;
 }
 
+/**
+ * A company whose published engineering writing a course is derived from. Shown as a tag — a
+ * monogram tile in the brand colour beside the name; no trademarked logo assets ship.
+ */
+export interface Company {
+  id: string;
+  name: string;
+  /** Brand colour behind the monogram. */
+  color: string;
+  /** Where the writing appears: "Netflix TechBlog". */
+  publication: string;
+  /** The publication's home. */
+  url: string;
+}
+
+/** A post or paper a company-tagged course is derived from. */
+export interface Source {
+  title: string;
+  url: string;
+  /** Author(s), when the piece names them. */
+  by?: string;
+  /** Publication date, `YYYY-MM-DD` (or `YYYY-MM` when the day is not published). */
+  date: string;
+  /** One sentence: what the course takes from this piece. */
+  takes: string;
+}
+
 export interface Problem {
   id: string;
   title: string;
@@ -166,7 +193,13 @@ export interface Problem {
    * code (`resizer_pb2.py`), provided helpers (`payments/db.py`). Path → source.
    */
   support?: Partial<Record<Language, Record<string, string>>>;
+  /** Company-tagged courses: the company whose writing the course is derived from, and the pieces themselves. */
+  company?: Company;
+  sources?: Source[];
 }
+
+/** Company-tagged: derived from a company's published engineering writing, with the sources linked. */
+export const isCompanyTagged = (problem: Problem): boolean => problem.company !== undefined;
 
 /** `problemId/stepId`: the key attempts and workspaces are stored under. */
 export function stepKey(problemId: string, stepId: string): string {

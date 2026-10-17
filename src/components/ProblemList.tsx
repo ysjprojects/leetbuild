@@ -4,11 +4,11 @@ import {type FC, memo, useCallback, useMemo, useState} from 'react';
 import {type Streak, badgeProgress, BADGES} from '@/lib/gamify';
 import {type Profile, type StepAttempt, OPEN_ATTEMPT, problemScore, rankProgress} from '@/lib/scoring';
 import {type TimedSession, bestSession, formatClock} from '@/lib/timer';
-import {type Problem, CONCEPT_LABEL, stepKey} from '@/lib/types';
+import {type Difficulty, type Problem, CONCEPT_LABEL, isCompanyTagged, stepKey} from '@/lib/types';
 
 import {BadgeCatalog, BadgeGlyph} from './Badges';
 import {useDialog} from './Dialog';
-import {CONCEPT_COLOR, ConceptChip, DifficultyChip} from './paneShared';
+import {CompanyChip, CONCEPT_COLOR, ConceptChip, DifficultyChip} from './paneShared';
 import {Clock, SessionList} from './Timer';
 
 /**
@@ -18,7 +18,7 @@ import {Clock, SessionList} from './Timer';
  * the full badge catalog with progress) is one click away, not on the page.
  */
 
-const DIFFICULTY_BAR: Record<'easy' | 'medium' | 'hard', string> = {
+const DIFFICULTY_BAR: Record<Difficulty, string> = {
   easy: 'bg-success-400',
   medium: 'bg-warning-400',
   hard: 'bg-danger-400',
@@ -73,6 +73,51 @@ const Flame: FC<{lit: boolean}> = memo(({lit}) => (
   </svg>
 ));
 Flame.displayName = 'Flame';
+
+const DIFFICULTY_TEXT: Record<Difficulty, string> = {
+  easy: 'text-success-300',
+  medium: 'text-warning-300',
+  hard: 'text-danger-300',
+};
+
+const DIFFICULTY_SHORT: Record<Difficulty, string> = {easy: 'Easy', medium: 'Med.', hard: 'Hard'};
+
+/** Problems solved by difficulty, the way LeetCode counts them: a problem is solved when every step is accepted. */
+const SolvedByDifficulty: FC<{profile: Profile}> = memo(({profile}) => {
+  const solved = profile.solved.easy + profile.solved.medium + profile.solved.hard;
+  const total = profile.problems.easy + profile.problems.medium + profile.problems.hard;
+  return (
+    <div className="min-w-[13rem]" title="a problem counts as solved when every step is accepted">
+      <p className="flex items-baseline justify-between text-[11px]">
+        <span className="text-ink-300 font-bold uppercase tracking-wider">Solved</span>
+        <span className="font-code text-ink-100">
+          {solved}
+          <span className="text-ink-400">/{total}</span>
+        </span>
+      </p>
+      <ul className="mt-1 space-y-1">
+        {(['easy', 'medium', 'hard'] as const).map(d => (
+          <li className="flex items-center gap-2 text-[11px]" key={d}>
+            <span className={`w-9 font-semibold ${DIFFICULTY_TEXT[d]}`}>{DIFFICULTY_SHORT[d]}</span>
+            <span className="bg-ink-700 h-1.5 flex-1 overflow-hidden rounded-full">
+              <span
+                className={`block h-full rounded-full ${DIFFICULTY_BAR[d]}`}
+                style={{
+                  width: profile.problems[d] === 0 ? '0%' : `${(100 * profile.solved[d]) / profile.problems[d]}%`,
+                }}
+              />
+            </span>
+            <span className="font-code text-ink-100 w-9 text-right">
+              {profile.solved[d]}
+              <span className="text-ink-400">/{profile.problems[d]}</span>
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+});
+SolvedByDifficulty.displayName = 'SolvedByDifficulty';
 
 const ProfileStrip: FC<{
   profile: Profile;
@@ -139,6 +184,8 @@ const ProfileStrip: FC<{
             </p>
           </div>
         </div>
+
+        <SolvedByDifficulty profile={profile} />
 
         {/* Streak */}
         <div className="flex items-center gap-2" title="accept a step on consecutive days">
@@ -241,25 +288,7 @@ const ProfileStrip: FC<{
       </div>
 
       {statsOpen ? (
-        <div className="border-ink-700/70 mt-2.5 grid gap-x-6 gap-y-3 border-t pt-3 sm:grid-cols-2">
-          <ul className="space-y-1.5">
-            {(['easy', 'medium', 'hard'] as const).map(d => (
-              <li className="flex items-center gap-2 text-[12px]" key={d}>
-                <span className="text-ink-200 w-14 capitalize">{d}</span>
-                <span className="bg-ink-700 h-1.5 flex-1 overflow-hidden rounded-full">
-                  <span
-                    className={`block h-full rounded-full ${DIFFICULTY_BAR[d]}`}
-                    style={{
-                      width: profile.problems[d] === 0 ? '0%' : `${(100 * profile.solved[d]) / profile.problems[d]}%`,
-                    }}
-                  />
-                </span>
-                <span className="font-code text-ink-300 w-16 text-right text-[11px]">
-                  {profile.solved[d]}/{profile.problems[d]} solved
-                </span>
-              </li>
-            ))}
-          </ul>
+        <div className="border-ink-700/70 mt-2.5 border-t pt-3">
           <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[12px]">
             <div className="flex items-baseline justify-between gap-2">
               <dt className="text-ink-300">steps accepted</dt>
@@ -341,6 +370,7 @@ const ProblemRow: FC<{
           <span className="flex flex-wrap items-center gap-2">
             <span className="text-ink-50 group-hover:text-iris-200 text-[14px] font-bold">{problem.title}</span>
             <DifficultyChip difficulty={problem.difficulty} />
+            {problem.company !== undefined ? <CompanyChip company={problem.company} /> : null}
             {problem.concepts.map(c => (
               <ConceptChip concept={c} key={c} />
             ))}
@@ -420,17 +450,39 @@ const ProblemList: FC<{
     <section>
       <p className="text-iris-400 mb-2 text-[11px] font-bold uppercase tracking-wider">Problems</p>
       <ul className="space-y-2">
-        {problems.map((problem, i) => (
-          <ProblemRow
-            attempts={attempts}
-            best={bestSession(sessions, problem.id)}
-            index={i}
-            key={problem.id}
-            problem={problem}
-          />
-        ))}
+        {problems
+          .filter(p => !isCompanyTagged(p))
+          .map((problem, i) => (
+            <ProblemRow
+              attempts={attempts}
+              best={bestSession(sessions, problem.id)}
+              index={i}
+              key={problem.id}
+              problem={problem}
+            />
+          ))}
       </ul>
     </section>
+    {problems.some(isCompanyTagged) ? (
+      <section>
+        <p className="text-iris-400 mb-1 text-[11px] font-bold uppercase tracking-wider">Company tagged</p>
+        <p className="text-ink-300 mb-2 text-[12px] leading-relaxed">
+          Derived from engineering blogs: each course rebuilds the part of a system a company wrote about, the way they
+          described it, and links the source on its page.
+        </p>
+        <ul className="space-y-2">
+          {problems.filter(isCompanyTagged).map((problem, i) => (
+            <ProblemRow
+              attempts={attempts}
+              best={bestSession(sessions, problem.id)}
+              index={i}
+              key={problem.id}
+              problem={problem}
+            />
+          ))}
+        </ul>
+      </section>
+    ) : null}
   </div>
 ));
 ProblemList.displayName = 'ProblemList';

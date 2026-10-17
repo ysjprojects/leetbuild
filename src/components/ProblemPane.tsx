@@ -3,11 +3,21 @@ import {type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from '
 import {leetbuildHighlighter} from '@/lib/highlight';
 import {type ProblemScore, type StepAttempt, HINT_COST, potentialScore, problemScore, STEP_POINTS} from '@/lib/scoring';
 import {type TimedSession, bestSession, formatClock} from '@/lib/timer';
-import {type Language, type Problem, type Step, CONCEPT_LABEL, fileName, LANGUAGE_LABEL, stepKey} from '@/lib/types';
+import {
+  type Company,
+  type Language,
+  type Problem,
+  type Source,
+  type Step,
+  CONCEPT_LABEL,
+  fileName,
+  LANGUAGE_LABEL,
+  stepKey,
+} from '@/lib/types';
 
 import {useDialog} from './Dialog';
 import Markdown from './Markdown';
-import {ConceptChip, DifficultyChip, ghostButtonClass, linkClass, primaryButtonClass} from './paneShared';
+import {CompanyMark, ConceptChip, DifficultyChip, ghostButtonClass, linkClass, primaryButtonClass} from './paneShared';
 import SequenceDiagram from './SequenceDiagram';
 import {mod} from './Shortcuts';
 import {LinkedInButton, POST_HINT} from './Social';
@@ -216,6 +226,66 @@ const Solution: FC<{
   );
 });
 Solution.displayName = 'Solution';
+
+/** Company-tagged courses open with the company: whose writing this is, and where it appears. */
+const CompanyHeader: FC<{company: Company}> = memo(({company}) => (
+  <div className="border-ink-700 bg-ink-800/60 mb-3 flex items-center gap-3 rounded-xl border p-3">
+    <CompanyMark company={company} size="lg" />
+    <div className="min-w-0">
+      <p className="text-iris-400 text-[10px] font-bold uppercase tracking-wider">Company tagged</p>
+      <p className="text-ink-100 text-[12px] leading-snug">
+        Derived from the{' '}
+        <a className={linkClass} href={company.url} rel="noopener noreferrer" target="_blank">
+          {company.publication}
+        </a>
+        : this course rebuilds the part of {company.name}&apos;s system described there, the way they described it. The
+        sources are listed at the end.
+      </p>
+    </div>
+  </div>
+));
+CompanyHeader.displayName = 'CompanyHeader';
+
+const formatSourceDate = (date: string): string => {
+  const [y, m, d] = date.split('-').map(Number);
+  if (!Number.isFinite(y) || !Number.isFinite(m)) return date;
+  const when = new Date(Date.UTC(y, m - 1, Number.isFinite(d) ? d : 1));
+  return when.toLocaleDateString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    ...(Number.isFinite(d) ? {day: 'numeric'} : {}),
+    timeZone: 'UTC',
+  });
+};
+
+/** The pieces a company-tagged course is derived from, each with what the course takes from it. */
+const Sources: FC<{company: Company | undefined; sources: readonly Source[]}> = memo(({company, sources}) => (
+  <section className="border-ink-700 mt-6 border-t pt-4">
+    <h2 className="text-iris-400 text-[11px] font-bold uppercase tracking-wider">Sources</h2>
+    <ol className="mt-2 space-y-3">
+      {sources.map(source => (
+        <li className="flex gap-3" key={source.url}>
+          {company !== undefined ? <CompanyMark company={company} /> : null}
+          <div className="min-w-0">
+            <a
+              className="text-ink-50 hover:text-iris-200 decoration-ink-500 text-[13px] font-semibold underline underline-offset-2"
+              href={source.url}
+              rel="noopener noreferrer"
+              target="_blank">
+              {source.title}
+            </a>
+            <p className="text-ink-400 font-code mt-0.5 text-[10.5px]">
+              {company?.publication ?? ''}
+              {source.by !== undefined ? ` · ${source.by}` : ''} · {formatSourceDate(source.date)}
+            </p>
+            <p className="text-ink-200 mt-1 text-[12px] leading-relaxed">{source.takes}</p>
+          </div>
+        </li>
+      ))}
+    </ol>
+  </section>
+));
+Sources.displayName = 'Sources';
 
 /** Timer mode on the description tab: start a run, or see the clock is already running, and the problem's past runs. */
 const TimedRuns: FC<{problem: Problem; sessions: readonly TimedSession[]; timerActive: boolean; onStart: () => void}> =
@@ -504,6 +574,7 @@ const ProblemPane: FC<{
 
           {tab === 'problem' ? (
             <div className="mt-3">
+              {problem.company !== undefined ? <CompanyHeader company={problem.company} /> : null}
               <div className="text-ink-300 mb-3 flex flex-wrap items-center gap-2 text-[11px]">
                 {problem.concepts.map(c => (
                   <ConceptChip concept={c} key={c} />
@@ -518,6 +589,9 @@ const ProblemPane: FC<{
               ) : null}
               <TimedRuns onStart={onStartTimer} problem={problem} sessions={sessions} timerActive={timerActive} />
               <Markdown highlight={leetbuildHighlighter} renderWidget={renderWidget} source={problem.statement} />
+              {problem.sources !== undefined && problem.sources.length > 0 ? (
+                <Sources company={problem.company} sources={problem.sources} />
+              ) : null}
             </div>
           ) : (
             <div className="mt-3">

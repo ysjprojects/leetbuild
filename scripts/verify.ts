@@ -18,7 +18,7 @@ import {describePattern, judge, matches, stripComments} from '../src/lib/judge';
 import {type NodeRuntime, createNodeRuntime} from '../src/lib/runtime/node';
 import {type RunJob, type RunResult} from '../src/lib/runtime/python';
 import {COURSE_POINTS, STEP_POINTS} from '../src/lib/scoring';
-import {type Language, type Problem, type Step, CONCEPTS, fileName, LANGUAGES} from '../src/lib/types';
+import {type Language, type Problem, type Step, CONCEPTS, fileName, isCompanyTagged, LANGUAGES} from '../src/lib/types';
 import {WIDGETS} from '../src/lib/widgets';
 
 const args = process.argv.slice(2);
@@ -183,6 +183,21 @@ function verifyProblem(problem: Problem): string[] {
     stepIds.add(step.id);
     errors.push(...verifyStep(problem, step, i));
   }
+  // Company tagged: the company and at least one source, each a real https link with a dated, explained take.
+  if (problem.company !== undefined || problem.sources !== undefined) {
+    if (problem.company === undefined) errors.push(`${problem.id}: lists sources but names no company`);
+    if (problem.sources === undefined || problem.sources.length === 0)
+      errors.push(`${problem.id}: company tagged but lists no source`);
+    if (!/^## From the source\b/m.test(problem.statement))
+      errors.push(`${problem.id}: company tagged but the statement has no "## From the source" section`);
+    for (const s of problem.sources ?? []) {
+      if (!/^https:\/\/\S+$/.test(s.url)) errors.push(`${problem.id}: source '${s.title}' needs an https URL`);
+      if (!/^\d{4}-\d{2}(-\d{2})?$/.test(s.date))
+        errors.push(`${problem.id}: source '${s.title}' date must be YYYY-MM-DD or YYYY-MM (got '${s.date}')`);
+      if (s.title.trim() === '' || s.takes.trim() === '')
+        errors.push(`${problem.id}: a source needs a title and what the course takes from it`);
+    }
+  }
   return errors;
 }
 
@@ -280,20 +295,26 @@ async function main(): Promise<void> {
     );
     errors.push(...e);
   }
-  // The course total is a fixed number; only meaningful when every problem was loaded.
+  // The core courses total a fixed number; company-tagged courses add to it. Only meaningful when every problem was loaded.
   if (onlyFile === null && onlyProblem === null) {
-    const total = problems.reduce((sum, p) => sum + STEP_POINTS[p.difficulty] * p.steps.length, 0);
+    const core = problems.filter(p => !isCompanyTagged(p));
+    const pointsOf = (list: Problem[]): number =>
+      list.reduce((sum, p) => sum + STEP_POINTS[p.difficulty] * p.steps.length, 0);
+    const total = pointsOf(core);
     if (total !== COURSE_POINTS) {
-      const counts = problems.reduce<Record<string, number>>((acc, p) => {
+      const counts = core.reduce<Record<string, number>>((acc, p) => {
         acc[p.difficulty] = (acc[p.difficulty] ?? 0) + p.steps.length;
         return acc;
       }, {});
       errors.push(
-        `course totals ${total} points, not ${COURSE_POINTS}: re-balance STEP_POINTS in src/lib/scoring.ts for ${JSON.stringify(
+        `core courses total ${total} points, not ${COURSE_POINTS}: re-balance STEP_POINTS in src/lib/scoring.ts for ${JSON.stringify(
           counts,
         )} steps`,
       );
-    } else console.log(`✓ course totals ${COURSE_POINTS} points`);
+    } else {
+      const company = pointsOf(problems.filter(isCompanyTagged));
+      console.log(`✓ core courses total ${COURSE_POINTS} points${company > 0 ? ` (+${company} company tagged)` : ''}`);
+    }
   }
   const languages: Language[] = [...LANGUAGES];
   console.log(
