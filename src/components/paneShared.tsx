@@ -1,4 +1,4 @@
-import {type FC, memo, useMemo} from 'react';
+import {type FC, memo} from 'react';
 
 import {type Company, type Concept, type Difficulty, CONCEPT_LABEL} from '@/lib/types';
 import {concept} from '@/styles/palette';
@@ -45,26 +45,24 @@ export const ConceptChip: FC<{concept: Concept}> = memo(({concept}) => (
 ));
 ConceptChip.displayName = 'ConceptChip';
 
-/** The company's monogram on a tile in its brand colour: the tag's mark (no trademarked logo assets ship). */
+/** The company's logo, in the colours its brand guidelines use (see `src/data/companies.ts`). */
 export const CompanyMark: FC<{company: Company; size?: 'sm' | 'lg'}> = memo(({company, size = 'sm'}) => {
-  const style = useMemo(() => ({background: company.color}), [company.color]);
+  const {path, fill, tile, cutout} = company.logo;
+  const px = size === 'lg' ? 36 : 14;
   return (
-    <span
-      aria-hidden
-      className={`inline-flex shrink-0 items-center justify-center rounded font-extrabold leading-none text-white ${
-        size === 'lg' ? 'h-9 w-9 text-[17px]' : 'h-4 w-4 text-[10px]'
-      }`}
-      style={style}>
-      {company.name[0]}
-    </span>
+    <svg aria-hidden className="shrink-0" height={px} viewBox="0 0 24 24" width={px}>
+      {tile !== undefined ? <rect fill={tile} height={24} rx={5.5} width={24} /> : null}
+      {cutout !== undefined ? <circle cx={12} cy={12} fill={cutout} r={11} /> : null}
+      <path d={path} fill={fill} transform={tile !== undefined ? 'translate(4.5 4.5) scale(0.625)' : undefined} />
+    </svg>
   );
 });
 CompanyMark.displayName = 'CompanyMark';
 
-/** "Company tagged": the mark and the name, outlined like the concept pills. */
+/** "Company tagged": the company's logo and name, outlined like the concept pills. */
 export const CompanyChip: FC<{company: Company}> = memo(({company}) => (
   <span
-    className="border-ink-500 text-ink-100 inline-flex items-center gap-1 rounded-full border py-0.5 pl-0.5 pr-1.5 text-[10px] font-semibold"
+    className="border-ink-500 text-ink-100 inline-flex items-center gap-1 rounded-full border py-0.5 pl-1 pr-1.5 text-[10px] font-semibold"
     title={`company tagged: derived from the ${company.publication}`}>
     <CompanyMark company={company} />
     {company.name}

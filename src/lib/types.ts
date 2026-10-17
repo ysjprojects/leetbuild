@@ -148,14 +148,25 @@ export interface Step {
 }
 
 /**
- * A company whose published engineering writing a course is derived from. Shown as a tag — a
- * monogram tile in the brand colour beside the name; no trademarked logo assets ship.
+ * A company's logo as its tag draws it: the official mark's path data in a 24 × 24 box, in the
+ * colours its brand guidelines use (see `src/data/companies.ts`).
  */
+export interface CompanyLogo {
+  /** SVG path data, 24 × 24. */
+  path: string;
+  /** The mark's colour. */
+  fill: string;
+  /** Drawn inset on a rounded tile of this colour, as the company's own icon is (Stripe's white S). */
+  tile?: string;
+  /** Colour showing through the mark's cut-outs instead of the page behind (Reddit's white Snoo). */
+  cutout?: string;
+}
+
+/** A company whose published engineering writing a course is derived from, shown as a tag: its logo beside its name. */
 export interface Company {
   id: string;
   name: string;
-  /** Brand colour behind the monogram. */
-  color: string;
+  logo: CompanyLogo;
   /** Where the writing appears: "Netflix TechBlog". */
   publication: string;
   /** The publication's home. */
