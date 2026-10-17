@@ -72,7 +72,7 @@ import {CertificateForm, LinkedInButton, POST_HINT} from './Social';
 import SplitGutter from './SplitGutter';
 import StepEditor from './StepEditor';
 import ThemeToggle from './ThemeToggle';
-import {BudgetPicker, TimerPill} from './Timer';
+import {BudgetPicker, SessionList, TimerIdlePill, TimerPill} from './Timer';
 import VerdictPane from './VerdictPane';
 
 const problemById: Record<string, Problem> = {};
@@ -135,6 +135,8 @@ const loadLayout = (): Layout => {
 
 const TOAST_MS = 6000;
 const EMPTY_SHAPES: readonly Shape[] = [];
+/** The per-problem run history names no other problem, so the list needs none. */
+const EMPTY_PROBLEMS: readonly Problem[] = [];
 
 /** A fresh badge: dismisses itself after a while; the LinkedIn action keeps it open while in use. */
 const BadgeToast: FC<{id: number; badge: Badge; onDismiss: (id: number) => void}> = memo(({id, badge, onDismiss}) => {
@@ -730,6 +732,16 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     [problem, progress.sessions],
   );
 
+  /** The open problem's timed runs, newest first, from the header pill. */
+  const onTimerHistory = useCallback(() => {
+    if (problem === null) return;
+    void openDialog({
+      title: `Timed runs · ${problem.title}`,
+      body: <SessionList problems={EMPTY_PROBLEMS} sessions={problemSessions} showProblem={false} />,
+      wide: true,
+    });
+  }, [problem, problemSessions, openDialog]);
+
   // Sharing and certificates ---------------------------------------------------------------------
   /** LinkedIn composer prefilled for the open step; shown once it is accepted. */
   const stepShareUrl = useMemo(
@@ -1072,6 +1084,13 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
           </span>
           {timer !== null ? (
             <TimerPill onClick={onTimerClick} onExpire={onTimerExpired} problem={timedProblem} timer={timer} />
+          ) : problem !== null ? (
+            <TimerIdlePill
+              onHistory={onTimerHistory}
+              onStart={onStartTimer}
+              problem={problem}
+              sessions={problemSessions}
+            />
           ) : null}
           {streak.current > 0 ? (
             <span
@@ -1151,15 +1170,12 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                 onRevealHint={onRevealHint}
                 onRevealSolution={onRevealSolution}
                 onSelectStep={onSelectStep}
-                onStartTimer={onStartTimer}
                 onTab={setTab}
                 problem={problem}
-                sessions={problemSessions}
                 shareUrl={shareUrl}
                 step={step}
                 stepIndex={stepIndex}
                 tab={tab}
-                timerActive={timer !== null && timer.problemId === problem.id}
                 userCode={stepCode}
               />
             </div>

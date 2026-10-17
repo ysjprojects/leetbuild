@@ -2,7 +2,6 @@ import {type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from '
 
 import {leetbuildHighlighter} from '@/lib/highlight';
 import {type ProblemScore, type StepAttempt, HINT_COST, potentialScore, problemScore, STEP_POINTS} from '@/lib/scoring';
-import {type TimedSession, bestSession, formatClock} from '@/lib/timer';
 import {
   type Company,
   type Language,
@@ -23,7 +22,6 @@ import {mod} from './Shortcuts';
 import {LinkedInButton, POST_HINT} from './Social';
 import StepEditor from './StepEditor';
 import SystemDiagram from './SystemDiagram';
-import {Clock, SessionList} from './Timer';
 import {renderWidget} from './widgets';
 
 export type PaneTab = 'problem' | 'step';
@@ -287,53 +285,6 @@ const Sources: FC<{company: Company | undefined; sources: readonly Source[]}> = 
 ));
 Sources.displayName = 'Sources';
 
-/** Timer mode on the description tab: start a run, or see the clock is already running, and the problem's past runs. */
-const TimedRuns: FC<{problem: Problem; sessions: readonly TimedSession[]; timerActive: boolean; onStart: () => void}> =
-  memo(({problem, sessions, timerActive, onStart}) => {
-    const best = useMemo(() => bestSession(sessions, problem.id), [sessions, problem.id]);
-    const [open, setOpen] = useState(false);
-    const toggle = useCallback(() => setOpen(v => !v), []);
-    return (
-      <section className="border-ink-700 bg-ink-850 mb-4 rounded-xl border px-3 py-2.5">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-          <span className="text-iris-300 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider">
-            <Clock />
-            Timed run
-          </span>
-          <span className="text-ink-300 text-[12px]">
-            {timerActive
-              ? 'in progress — the clock is in the header'
-              : best === null
-              ? `race the ${problem.minutes} min estimate, from step 1`
-              : `your time: ${formatClock(best.elapsed)}`}
-          </span>
-          <span className="ml-auto flex items-center gap-2">
-            {sessions.length > 0 ? (
-              <button
-                aria-expanded={open}
-                className="text-ink-400 hover:text-ink-50 rounded-md px-1.5 py-0.5 text-[11px] transition"
-                onClick={toggle}
-                type="button">
-                {sessions.length} run{sessions.length === 1 ? '' : 's'} {open ? '▴' : '▾'}
-              </button>
-            ) : null}
-            {timerActive ? null : (
-              <button className={`${ghostButtonClass} border-ink-600 border py-1`} onClick={onStart} type="button">
-                Start
-              </button>
-            )}
-          </span>
-        </div>
-        {open ? (
-          <div className="border-ink-700/70 mt-2 border-t pt-1">
-            <SessionList problems={EMPTY_PROBLEMS} sessions={sessions} showProblem={false} />
-          </div>
-        ) : null}
-      </section>
-    );
-  });
-TimedRuns.displayName = 'TimedRuns';
-
 /** Every step done: the certificate (when nothing was revealed), or why there is none. */
 const CourseComplete: FC<{problem: Problem; score: ProblemScore; certified: boolean; onCertificate: () => void}> = memo(
   ({problem, score, certified, onCertificate}) => (
@@ -369,8 +320,6 @@ const CourseComplete: FC<{problem: Problem; score: ProblemScore; certified: bool
 );
 CourseComplete.displayName = 'CourseComplete';
 
-const EMPTY_PROBLEMS: Problem[] = [];
-
 const ProblemPane: FC<{
   problem: Problem;
   step: Step;
@@ -395,12 +344,6 @@ const ProblemPane: FC<{
   shareUrl: string;
   /** Fold the pane into a strip beside the IDE (`lg` and up). */
   onCollapse: () => void;
-  /** Timer mode: open the start dialog for this problem. */
-  onStartTimer: () => void;
-  /** A timed run of this problem is in progress (the header shows the clock). */
-  timerActive: boolean;
-  /** Finished timed runs of this problem, oldest first. */
-  sessions: readonly TimedSession[];
   /** Every step accepted: a certificate can be issued. */
   certified: boolean;
   /** Open the certificate dialog (download, add to LinkedIn, share). */
@@ -427,9 +370,6 @@ const ProblemPane: FC<{
     onDownload,
     shareUrl,
     onCollapse,
-    onStartTimer,
-    timerActive,
-    sessions,
     certified,
     onCertificate,
   }) => {
@@ -587,7 +527,6 @@ const ProblemPane: FC<{
               {score.done === score.total ? (
                 <CourseComplete certified={certified} onCertificate={onCertificate} problem={problem} score={score} />
               ) : null}
-              <TimedRuns onStart={onStartTimer} problem={problem} sessions={sessions} timerActive={timerActive} />
               <Markdown highlight={leetbuildHighlighter} renderWidget={renderWidget} source={problem.statement} />
               {problem.sources !== undefined && problem.sources.length > 0 ? (
                 <Sources company={problem.company} sources={problem.sources} />

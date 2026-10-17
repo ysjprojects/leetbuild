@@ -3,6 +3,7 @@ import {type FC, memo, useCallback, useEffect, useRef, useState} from 'react';
 import {
   type ActiveTimer,
   type TimedSession,
+  bestSession,
   BUDGETS,
   budgetSeconds,
   describeSession,
@@ -86,6 +87,51 @@ export const TimerPill: FC<{
   );
 });
 TimerPill.displayName = 'TimerPill';
+
+/**
+ * The timer's resting state in the header, where the countdown will be: the open problem's best
+ * counted time (or an invitation to race its estimate); a click starts a run, the chevron opens the
+ * problem's run history.
+ */
+export const TimerIdlePill: FC<{
+  problem: Problem;
+  sessions: readonly TimedSession[];
+  onStart: () => void;
+  onHistory: () => void;
+}> = memo(({problem, sessions, onStart, onHistory}) => {
+  const best = bestSession(sessions, problem.id);
+  return (
+    <span className="border-ink-600 text-ink-300 hidden items-center rounded-full border text-[11px] sm:inline-flex">
+      <button
+        className="hover:text-ink-50 flex items-center gap-1.5 rounded-l-full py-1 pl-2.5 transition"
+        onClick={onStart}
+        title={
+          best === null
+            ? `timed run: race the ${problem.minutes} min estimate, from step 1`
+            : `your best counted time is ${formatClock(best.elapsed)} · start another timed run`
+        }
+        type="button">
+        <Clock />
+        {best === null ? (
+          <span className="pr-2.5">timed run</span>
+        ) : (
+          <span className="font-code text-success-200 pr-2.5">{formatClock(best.elapsed)}</span>
+        )}
+      </button>
+      {sessions.length > 0 ? (
+        <button
+          aria-label={`${sessions.length} timed run${sessions.length === 1 ? '' : 's'} of this problem`}
+          className="border-ink-600 hover:text-ink-50 rounded-r-full border-l px-1.5 py-1 transition"
+          onClick={onHistory}
+          title={`${sessions.length} timed run${sessions.length === 1 ? '' : 's'} of this problem`}
+          type="button">
+          ▾
+        </button>
+      ) : null}
+    </span>
+  );
+});
+TimerIdlePill.displayName = 'TimerIdlePill';
 
 const BudgetOption: FC<{
   problem: Problem;
