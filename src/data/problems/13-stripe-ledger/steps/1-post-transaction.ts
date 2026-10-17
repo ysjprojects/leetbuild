@@ -714,6 +714,23 @@ int main() {
   harness: {
     python: `import time
 
+SCHEMA = """
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL REFERENCES transactions (id),
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL,
+    posted_at bigint NOT NULL
+);
+"""
+
 EUR = "EUR"
 BALANCED = {
     "description": "capture ch_1",
@@ -729,65 +746,83 @@ def _entries(*amounts, currency=EUR):
     return [{"account": accounts[i], "currency": currency, "amount": a} for i, a in enumerate(amounts)]
 
 
-def _api(ctx):
-    m = ctx.load("ledger_api")
-    m.written = []
-
-    async def write_transaction(entries, description, event_id=None, posted_at=None, settles=None):
-        m.written.append({"entries": entries, "description": description, "event_id": event_id, "posted_at": posted_at, "settles": settles})
-        return f"tx-{len(m.written)}"
-
-    m.write_transaction = write_transaction  # the journal is built in step 4
-    return m
+async def _api(ctx):
+    """The learner's API in front of the real journal writer (step 4) and an empty ledger database."""
+    await ctx.db.reset(SCHEMA)
+    return ctx.load("ledger_api")
 
 
 async def _post(c, body):
-    return await c.post("/transactions", json=body)
+    try:
+        return await c.post("/transactions", json=body)
+    except Exception as exc:
+        raise AssertionError(f"POST /transactions with {body} crashed the service with {type(exc).__name__}: {exc} — validate before writing: the journal only takes integer amounts in one currency")
+
+
+async def _journal(ctx):
+    transactions = await ctx.db.execute("SELECT * FROM transactions ORDER BY posted_at, id")
+    entries = await ctx.db.execute("SELECT * FROM entries ORDER BY transaction_id, account")
+    return transactions, entries
+
+
+async def _assert_nothing_written(ctx, why):
+    transactions, entries = await _journal(ctx)
+    assert not transactions and not entries, f"{why}, yet the journal now holds {len(transactions)} transaction(s) and {len(entries)} entr(ies): {[(e['account'], e['amount']) for e in entries]}"
 
 
 async def check_route(ctx):
-    m = _api(ctx)
+    m = await _api(ctx)
     async with ctx.client(m.app) as c:
         r = await _post(c, BALANCED)
     assert r.status_code not in (404, 405), f"POST /transactions answered {r.status_code}: no handler is registered for it"
     assert r.status_code == 201, f"POST /transactions with a balanced body answered {r.status_code}: {r.text}"
-    assert r.json().get("transaction_id") == "tx-1", f"the answer must carry the transaction id from write_transaction, got {r.json()}"
+    transactions, _ = await _journal(ctx)
+    assert len(transactions) == 1, f"a balanced POST must leave one transaction in the journal, found {len(transactions)}"
+    assert r.json().get("transaction_id") == transactions[0]["id"], f"the answer must carry the id of the transaction written to the journal ({transactions[0]['id']}), got {r.json()}"
 
 
 async def check_two_entries_balanced(ctx):
-    m = _api(ctx)
+    m = await _api(ctx)
     async with ctx.client(m.app) as c:
         for body, why in (
             ({"entries": _entries(4999)}, "a single entry"),
             ({"entries": []}, "no entries"),
             ({}, "a body without entries"),
+            ({"entries": [{"currency": EUR, "amount": 4999}, {"account": "clearing:payments", "currency": EUR, "amount": -4999}]}, "an entry without an account"),
             ({"entries": _entries(4999, -4000)}, "entries summing to 999"),
             ({"entries": _entries(4999, -4999, 1)}, "three entries summing to 1"),
         ):
             r = await _post(c, body)
             assert r.status_code == 422, f"{why} is not double entry: expected 422, got {r.status_code}"
             assert isinstance(r.json().get("error"), str) and r.json()["error"], f"a 422 must say why in {{'error': reason}}, got {r.json()}"
-        assert m.written == [], "a rejected body must never reach write_transaction"
+        await _assert_nothing_written(ctx, "every request so far was refused")
         r = await _post(c, {"entries": _entries(4999, -4850, -149)})
         assert r.status_code == 201, f"three entries netting to zero are a valid transaction: expected 201, got {r.status_code} {r.text}"
+    transactions, entries = await _journal(ctx)
+    assert len(transactions) == 1 and len(entries) == 3, f"the valid transaction must leave one transaction and its three entries, found {len(transactions)} and {len(entries)}"
+    assert sum(e["amount"] for e in entries) == 0, f"the journal's entries must net to zero, they sum to {sum(e['amount'] for e in entries)}"
 
 
 async def check_integer_amounts(ctx):
-    m = _api(ctx)
+    m = await _api(ctx)
     async with ctx.client(m.app) as c:
-        for bad, why in ((49.99, "a float"), ("4999", "a string"), (True, "a boolean"), (0, "zero"), (None, "a missing amount")):
+        for bad, why in ((49.99, "a float"), (4999.0, "a whole float"), ("4999", "a string"), (True, "a boolean"), (0, "zero"), (None, "a missing amount")):
             body = {"entries": [{"account": "cash:acquirer", "currency": EUR, "amount": bad}, {"account": "clearing:payments", "currency": EUR, "amount": -4999}]}
             r = await _post(c, body)
             assert r.status_code == 422, f"amount {bad!r} ({why}) is not an integer in minor units: expected 422, got {r.status_code}"
+        r = await _post(c, {"entries": [{"account": "cash:acquirer", "currency": EUR, "amount": 49.99}, {"account": "clearing:payments", "currency": EUR, "amount": -49.99}]})
+        assert r.status_code == 422, f"49.99 against -49.99 nets to zero but is a float: expected 422, got {r.status_code}"
         r = await _post(c, {"entries": _entries(4999, 0, -4999)})
         assert r.status_code == 422, f"an entry with amount 0 moves nothing and must be refused: expected 422, got {r.status_code}"
-        assert m.written == [], "a rejected amount must never reach write_transaction"
+        await _assert_nothing_written(ctx, "every amount so far was refused")
         r = await _post(c, {"entries": _entries(-250000, 250000)})
         assert r.status_code == 201, f"a credit first and a debit second is fine: expected 201, got {r.status_code} {r.text}"
+    _, entries = await _journal(ctx)
+    assert sorted(e["amount"] for e in entries) == [-250000, 250000], f"the journal must hold the integer amounts -250000 and 250000, holds {[e['amount'] for e in entries]}"
 
 
 async def check_one_currency(ctx):
-    m = _api(ctx)
+    m = await _api(ctx)
     async with ctx.client(m.app) as c:
         mixed = {"entries": [{"account": "cash:acquirer", "currency": "EUR", "amount": 4999}, {"account": "clearing:payments", "currency": "USD", "amount": -4999}]}
         r = await _post(c, mixed)
@@ -797,31 +832,36 @@ async def check_one_currency(ctx):
             assert r.status_code == 422, f"currency {bad!r} does not match ^[A-Z]{{3}}$: expected 422, got {r.status_code}"
         r = await _post(c, {"entries": [{"account": "a", "amount": 1}, {"account": "b", "amount": -1}]})
         assert r.status_code == 422, f"entries without a currency: expected 422, got {r.status_code}"
-        assert m.written == [], "a rejected currency must never reach write_transaction"
+        await _assert_nothing_written(ctx, "every currency so far was refused")
         r = await _post(c, {"entries": _entries(4999, -4999, currency="GBP")})
         assert r.status_code == 201, f"GBP on every entry is valid: expected 201, got {r.status_code} {r.text}"
+    _, entries = await _journal(ctx)
+    assert [e["currency"] for e in entries] == ["GBP", "GBP"], f"the journal must hold two GBP entries, holds {[e['currency'] for e in entries]}"
 
 
 async def check_created(ctx):
-    m = _api(ctx)
+    m = await _api(ctx)
     body = dict(BALANCED, settles="tx-0")
     body["entries"] = [dict(e, note="ignored") for e in body["entries"]]
     async with ctx.client(m.app) as c:
         r = await _post(c, body)
     assert r.status_code == 201, f"expected 201 Created, got {r.status_code} {r.text}"
-    assert len(m.written) == 1, f"write_transaction must run exactly once, ran {len(m.written)} times"
-    w = m.written[0]
-    assert w["entries"] == BALANCED["entries"], f"write_transaction must get the cleaned entries (account, currency, amount only), got {w['entries']}"
-    assert w["description"] == "capture ch_1", f"the description must be passed through, got {w['description']!r}"
-    assert w["settles"] == "tx-0", f"the settles field must be passed through, got {w['settles']!r}"
-    assert w["event_id"] is None, "an API-originated transaction has no event id"
+    transactions, entries = await _journal(ctx)
+    assert len(transactions) == 1, f"one valid POST must write exactly one transaction, the journal holds {len(transactions)}"
+    t = transactions[0]
+    assert len(entries) == 2, f"the transaction must have its two entries in the journal, found {len(entries)}"
+    stored = sorted((e["account"], e["currency"], e["amount"]) for e in entries)
+    assert stored == [("cash:acquirer", "EUR", 4999), ("clearing:payments", "EUR", -4999)], f"the journal holds the entries {stored}"
+    assert t["description"] == "capture ch_1", f"the description must be passed through to the journal, it holds {t['description']!r}"
+    assert t["settles"] == "tx-0", f"the settles field must be passed through to the journal, it holds {t['settles']!r}"
+    assert t["event_id"] is None, f"an API-originated transaction has no event id, the journal holds {t['event_id']!r}"
     now = int(time.time() * 1000)
-    assert isinstance(w["posted_at"], int) and abs(w["posted_at"] - now) < 5000, f"posted_at must be now in milliseconds, got {w['posted_at']!r}"
+    assert abs(t["posted_at"] - now) < 5000, f"posted_at must be now in milliseconds ({now}), the journal holds {t['posted_at']}"
     payload = r.json()
-    assert payload.get("transaction_id") == "tx-1", f"the body must carry the transaction id, got {payload}"
-    assert payload.get("posted_at") == w["posted_at"], f"the body must carry the posted_at the journal got, got {payload}"
-    assert payload.get("entries") == BALANCED["entries"], f"the body must echo the cleaned entries, got {payload.get('entries')}"
-    assert r.headers.get("location") == "/transactions/tx-1", f"Location must be /transactions/tx-1, got {r.headers.get('location')!r}"
+    assert payload.get("transaction_id") == t["id"], f"the body must carry the journal's transaction id {t['id']}, got {payload}"
+    assert payload.get("posted_at") == t["posted_at"], f"the body must carry the posted_at the journal got ({t['posted_at']}), got {payload.get('posted_at')!r}"
+    assert payload.get("entries") == BALANCED["entries"], f"the body must echo the cleaned entries (account, currency, amount only), got {payload.get('entries')}"
+    assert r.headers.get("location") == f"/transactions/{t['id']}", f"Location must be /transactions/{t['id']}, got {r.headers.get('location')!r}"
 `,
   },
   debrief: `The validation is the product: a ledger that accepts one unbalanced transaction is no longer a ledger, because every balance computed from it is now suspect. The rules are cheap and run before any I/O — count, types, currency, sum — and each failure names the rule in the body so the publishing team can fix their producer. Integers in minor units are not pedantry: 0.1 + 0.2 ≠ 0.3 in a float, and a ledger that sums floats drifts by cents until it fails a clearing check. Stripe's post treats every event as a transaction between accounts of a fund flow; the entries here are the same idea with the account names flattened to strings. Real ledgers also type the accounts (asset, liability, clearing), restrict which accounts a producer may post to, and version the fund-flow definitions so a transaction can be re-validated against the rules that applied when it was posted.`,

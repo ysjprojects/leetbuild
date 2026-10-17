@@ -867,7 +867,26 @@ void run() {
   harness: {
     python: `import json
 
+SCHEMA = """
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL REFERENCES transactions (id),
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL,
+    posted_at bigint NOT NULL
+);
+"""
+
 T0 = 1700000000000
+TOPIC = "money-events"
+DEAD = "money-events.dead"
 
 
 def _event(event_id, type="payment.captured", amount=4999, currency="EUR", occurred_at=T0):
@@ -877,70 +896,137 @@ def _event(event_id, type="payment.captured", amount=4999, currency="EUR", occur
 def _seed(ctx, *events):
     for event in events:
         if isinstance(event, dict):
-            ctx.kafka.seed("money-events", key=event["event_id"], value=json.dumps(event))
+            ctx.kafka.seed(TOPIC, key=event["event_id"], value=json.dumps(event))
         else:
-            ctx.kafka.seed("money-events", key="raw", value=event)
+            ctx.kafka.seed(TOPIC, key="raw", value=event)
 
 
-def _consumer(ctx):
-    """The learner's module with the journal (step 4) replaced by a recorder."""
-    m = ctx.load("event_consumer")
-    m.written = []
+async def _consumer(ctx):
+    """The learner's consumer in front of the real journal writer (step 4) and an empty ledger database."""
+    await ctx.db.reset(SCHEMA)
+    return ctx.load("event_consumer")
 
-    async def write_transaction(entries, description, event_id=None, posted_at=None, settles=None):
-        m.written.append({"entries": entries, "description": description, "event_id": event_id, "posted_at": posted_at, "settles": settles})
-        return f"tx-{len(m.written)}"
 
-    m.write_transaction = write_transaction
-    return m
+async def _run(m):
+    try:
+        await m.run()
+    except KeyboardInterrupt:
+        pass
+
+
+async def _journal(ctx):
+    """{event_id: (transaction row, [(account, currency, amount, posted_at)])} as the database holds it."""
+    transactions = await ctx.db.execute("SELECT * FROM transactions ORDER BY event_id")
+    entries = await ctx.db.execute("SELECT * FROM entries ORDER BY account")
+    return {t["event_id"]: (t, [(e["account"], e["currency"], e["amount"], e["posted_at"]) for e in entries if e["transaction_id"] == t["id"]]) for t in transactions}
 
 
 def _dead(ctx):
-    return ctx.kafka.records("money-events.dead")
+    return ctx.kafka.records(DEAD)
+
+
+def _watch_commits(ctx):
+    """Every commit as the broker saw it, with the database's query log and the dead-letter topic at that instant."""
+    seen = []
+    ctx.kafka.on_commit(lambda group, offsets: seen.append((group, dict(offsets), list(ctx.db.queries), [r.value for r in _dead(ctx)])))
+    return seen
+
+
+def _write_committed(queries, event_id):
+    """Whether the database had committed a write of event_id by the end of this query log."""
+    insert = next((i for i, (sql, params) in enumerate(queries) if "insert into transactions" in sql.lower() and event_id in params), None)
+    return insert is not None and any(sql.strip().upper() == "COMMIT" for sql, _ in queries[insert + 1:])
+
+
+def _newly_committed(ctx, commits):
+    """(record, query log, dead-letter values) for each record of money-events as its offset was first committed."""
+    out = []
+    done = {}
+    for group, offsets, queries, dead in commits:
+        if group != "ledger":
+            continue
+        for (topic, partition), offset in offsets.items():
+            if topic != TOPIC:
+                continue
+            for record in ctx.kafka.records(TOPIC):
+                if record.partition == partition and done.get(partition, 0) <= record.offset < offset:
+                    out.append((record, queries, dead))
+            done[partition] = max(done.get(partition, 0), offset)
+    return out
+
+
+def _fully_committed(ctx):
+    lag = ctx.kafka.lag("ledger", TOPIC)
+    assert lag == 0, f"{lag} record(s) of money-events are not committed for group ledger after the consumer handled them"
 
 
 async def check_group_manual_commit(ctx):
-    _seed(ctx, _event("e1"))
-    m = _consumer(ctx)
-    subscriptions = [e for e in ctx.kafka.events if e[0] == "subscribe"]
-    assert subscriptions, "the consumer must subscribe to a topic"
-    group, topics = subscriptions[-1][1], subscriptions[-1][2]
-    assert group == "ledger", f"group.id must be ledger, got {group!r}"
-    assert "money-events" in topics, f"the consumer must subscribe to money-events, got {topics}"
-    assert ctx.kafka.consumers[-1].auto_commit is False, "enable.auto.commit is on: offsets would be acknowledged on a timer, before the write"
-    await ctx.drain_async(m.run())
-    assert not any(e[0] == "auto-commit" for e in ctx.kafka.events), "offsets were auto-committed"
-    assert any(e[0] == "manual-commit" for e in ctx.kafka.events), "no explicit commit happened"
-    assert ctx.kafka.lag("ledger", "money-events") == 0, "every processed record must be committed"
-    assert len(m.written) == 1, f"one event must become one write, got {len(m.written)}"
+    _seed(ctx, _event("e1"), _event("e2", amount=120), _event("e3", amount=7))
+    m = await _consumer(ctx)
+    commits = _watch_commits(ctx)
+    await _run(m)
+    journal = await _journal(ctx)
+    assert sorted(journal) == ["e1", "e2", "e3"], f"the consumer must read money-events and write every event: the journal holds {sorted(journal)}"
+    assert ctx.kafka.commits("ledger"), f"no offsets were committed for group ledger (groups that committed: {sorted({c[0] for c in commits})})"
+    _fully_committed(ctx)
+    for record, queries, _ in _newly_committed(ctx, commits):
+        event_id = record.key.decode()
+        assert _write_committed(queries, event_id), f"the offset of {event_id} was committed before its transaction was in the journal: offsets are committed by the consumer, after the write"
+    # e4's write is slow (the transactions insert takes 6 s) and then fails on a constraint: while it is
+    # in flight, a consumer that auto-commits acknowledges e4 on its timer — and e4 is lost.
+    await ctx.db.execute("ALTER TABLE entries ADD CONSTRAINT journal_down CHECK (amount <> 7777) NOT VALID")
+    slow = ctx.db_after("INSERT INTO transactions", lambda: ctx.clock.advance(6))
+    _seed(ctx, _event("e4", amount=7777))
+    try:
+        await _run(m)
+    except Exception:
+        pass
+    assert slow.fired, "e4 was never written: the consumer must keep reading money-events"
+    lag = ctx.kafka.lag("ledger", TOPIC)
+    assert lag == 1, f"e4's write took 6 s and then failed, yet group ledger's lag is {lag} instead of 1: e4 was acknowledged while it was still being written — with auto-commit on, the timer commits polled records; disable enable.auto.commit and commit after the write"
+    await ctx.db.execute("ALTER TABLE entries DROP CONSTRAINT journal_down")
+    restarted = ctx.load("event_consumer")
+    await _run(restarted)
+    journal = await _journal(ctx)
+    assert "e4" in journal and len(journal["e4"][1]) == 2, f"after a restart e4 must be redelivered and written once, the journal holds {sorted(journal)}"
+    _fully_committed(ctx)
 
 
 async def check_mapping(ctx):
-    _seed(ctx, _event("e1"), _event("e2", type="payout.sent", amount=120000, currency="USD", occurred_at=T0 + 5), _event("e3", type="refund.issued", amount=999))
-    m = _consumer(ctx)
-    await ctx.drain_async(m.run())
-    assert len(m.written) == 3, f"three mapped events must become three writes, got {len(m.written)}"
+    _seed(ctx, _event("e1"), _event("e2", type="payout.sent", amount=120000, currency="USD", occurred_at=T0 + 5), _event("e3", type="refund.issued", amount=999, occurred_at=T0 + 9))
+    m = await _consumer(ctx)
+    await _run(m)
+    journal = await _journal(ctx)
+    assert sorted(journal) == ["e1", "e2", "e3"], f"three mapped events must become three transactions keyed by their event id, the journal holds {sorted(journal)}"
     expected = {
-        "e1": ([("cash:acquirer", "EUR", 4999), ("clearing:payments", "EUR", -4999)], "payment.captured", T0),
-        "e2": ([("clearing:payouts", "USD", 120000), ("cash:bank", "USD", -120000)], "payout.sent", T0 + 5),
-        "e3": ([("clearing:payments", "EUR", 999), ("cash:acquirer", "EUR", -999)], "refund.issued", T0),
+        "e1": ({("cash:acquirer", "EUR", 4999), ("clearing:payments", "EUR", -4999)}, "payment.captured", T0),
+        "e2": ({("clearing:payouts", "USD", 120000), ("cash:bank", "USD", -120000)}, "payout.sent", T0 + 5),
+        "e3": ({("clearing:payments", "EUR", 999), ("cash:acquirer", "EUR", -999)}, "refund.issued", T0 + 9),
     }
-    for w in m.written:
-        assert w["event_id"] in expected, f"write_transaction got event_id {w['event_id']!r}, expected the event's own id"
-        entries, description, occurred_at = expected[w["event_id"]]
-        got = [(e.get("account"), e.get("currency"), e.get("amount")) for e in w["entries"]]
-        assert got == entries, f"{w['event_id']}: entries {got} — expected {entries} (debit first, credit negated, event currency)"
-        assert sum(e["amount"] for e in w["entries"]) == 0, f"{w['event_id']}: the entries do not balance"
-        assert w["description"] == description, f"{w['event_id']}: description {w['description']!r}, expected the event type"
-        assert w["posted_at"] == occurred_at, f"{w['event_id']}: posted_at {w['posted_at']!r}, expected the event's occurred_at {occurred_at}"
+    for event_id, (transaction, entries) in journal.items():
+        accounts, description, occurred_at = expected[event_id]
+        got = {(a, c, amount) for a, c, amount, _ in entries}
+        assert len(entries) == 2 and got == accounts, f"{event_id}: the journal holds the entries {sorted(got)} — expected {sorted(accounts)} (the first account debited, the second credited the negated amount, in the event's currency)"
+        assert transaction["description"] == description, f"{event_id}: the transaction's description is {transaction['description']!r}, expected the event type"
+        assert transaction["posted_at"] == occurred_at and all(at == occurred_at for *_, at in entries), f"{event_id}: posted at {transaction['posted_at']} / {[at for *_, at in entries]}, expected the event's occurred_at {occurred_at}"
+    got = m.to_entries(_event("x", amount=250))
+    assert got == [{"account": "cash:acquirer", "currency": "EUR", "amount": 250}, {"account": "clearing:payments", "currency": "EUR", "amount": -250}], f"to_entries of a 250 EUR payment.captured returned {got}"
     assert m.to_entries(_event("x", type="dispute.opened")) is None, "to_entries must return None for a type without a mapping"
 
 
 async def check_dead_letter(ctx):
     unknown = _event("e2", type="dispute.opened")
     _seed(ctx, _event("e1"), unknown, "{not json", _event("e4"))
-    m = _consumer(ctx)
-    await ctx.drain_async(m.run())
+    m = await _consumer(ctx)
+    # The dead-letter topic's leader is slow to acknowledge for the first 30 s of the run.
+    ctx.kafka.stall(DEAD, seconds=30)
+    commits = _watch_commits(ctx)
+    await _run(m)
+    journal = await _journal(ctx)
+    assert sorted(journal) == ["e1", "e4"], f"only the mapped events are written, the journal holds {sorted(journal)}"
+    for record, _, dead in _newly_committed(ctx, commits):
+        if record.key.decode() in ("e2", "raw"):
+            assert record.value in dead, f"the offset of {record.value.decode()!r} was committed while its dead-letter copy was not on money-events.dead yet: flush the producer before committing, or a crash in between loses the only copy"
     dead = _dead(ctx)
     assert len(dead) == 2, f"the unmapped event and the malformed record must both be parked on money-events.dead, found {len(dead)} record(s) there"
     values = [r.value for r in dead]
@@ -948,48 +1034,51 @@ async def check_dead_letter(ctx):
     assert b"{not json" in values, "the malformed record must be parked with its original value, unchanged"
     parked = next(r for r in dead if r.value == json.dumps(unknown).encode())
     assert parked.key == b"e2", f"the parked record must keep the original key, got {parked.key!r}"
-    assert any(name == "reason" and value for name, value in parked.headers), f"the parked record must carry a 'reason' header, got headers {parked.headers}"
-    assert sorted(w["event_id"] for w in m.written) == ["e1", "e4"], f"only the mapped events are written, got {[w['event_id'] for w in m.written]}"
-    assert ctx.kafka.flushes >= 1, "flush the producer after parking a record: a crash before the flush loses the only copy"
+    for r in dead:
+        assert any(name == "reason" and value for name, value in r.headers), f"every parked record must carry a 'reason' header, got headers {r.headers}"
 
 
 async def check_continues_after_dead(ctx):
-    _seed(ctx, _event("e1", type="dispute.opened"), _event("e2"), _event("e3", type="chargeback.won"), _event("e4"))
-    m = _consumer(ctx)
+    _seed(ctx, _event("e1", type="dispute.opened"), _event("e2"), "{not json", _event("e4"), _event("e5", type="chargeback.won"))
+    m = await _consumer(ctx)
     try:
-        await ctx.drain_async(m.run())
+        await _run(m)
     except Exception as exc:
-        raise AssertionError(f"an unmapped event must not stop the consumer, but run() raised {exc!r}")
-    assert sorted(w["event_id"] for w in m.written) == ["e2", "e4"], f"the events after an unmapped one must still be written, got {[w['event_id'] for w in m.written]}"
-    assert len(_dead(ctx)) == 2
-    lag = ctx.kafka.lag("ledger", "money-events")
+        raise AssertionError(f"an event that cannot be mapped must not stop the consumer, but run() raised {type(exc).__name__}: {exc}")
+    journal = await _journal(ctx)
+    assert sorted(journal) == ["e2", "e4"], f"the events after a parked one must still be written, the journal holds {sorted(journal)}"
+    assert len(_dead(ctx)) == 3, f"three records must be parked, money-events.dead holds {len(_dead(ctx))}"
+    lag = ctx.kafka.lag("ledger", TOPIC)
     assert lag == 0, f"{lag} record(s) not committed: a parked record's offset must be committed too, or it is redelivered forever"
 
 
 async def check_commit_after_write(ctx):
-    _seed(ctx, _event("e1"))
-    m = _consumer(ctx)
-    at_commit = []
-    ctx.kafka.on_commit(lambda group, offsets: at_commit.append(len(m.written)))
-    await ctx.drain_async(m.run())
-    assert at_commit, "the offset of e1 was never committed"
-    assert at_commit[0] == 1, "the commit must come after write_transaction: at commit time nothing had been written"
-    _seed(ctx, _event("e2"))
-
-    async def failing(entries, description, event_id=None, posted_at=None, settles=None):
-        raise RuntimeError("journal database down")
-
-    m.write_transaction = failing
+    _seed(ctx, _event("e1"), _event("e2", amount=120))
+    m = await _consumer(ctx)
+    commits = _watch_commits(ctx)
+    await _run(m)
+    committed = _newly_committed(ctx, commits)
+    assert committed, "the offsets of e1 and e2 were never committed"
+    for record, queries, _ in committed:
+        event_id = record.key.decode()
+        assert _write_committed(queries, event_id), f"the offset of {event_id} was committed before its transaction was committed in the journal: commit the offset only after write_transaction returned"
+    # The journal starts refusing: an entry of 7777 now violates a constraint, so e3's write rolls back.
+    await ctx.db.execute("ALTER TABLE entries ADD CONSTRAINT journal_down CHECK (amount <> 7777) NOT VALID")
+    _seed(ctx, _event("e3", amount=7777))
     try:
-        await ctx.drain_async(m.run())
-    except RuntimeError:
+        await _run(m)
+    except Exception:
         pass
-    assert ctx.kafka.lag("ledger", "money-events") == 1, "a record whose write failed must not be committed: it has to come back"
+    assert "e3" not in await _journal(ctx), "e3's write failed in the database and must have left nothing in the journal"
+    assert ctx.kafka.lag("ledger", TOPIC) == 1, "a record whose write failed must not be committed: it has to come back"
     assert _dead(ctx) == [], "a failed write is not a dead letter: the record is retried, not parked"
-    m2 = _consumer(ctx)
-    await ctx.drain_async(m2.run())
-    assert [w["event_id"] for w in m2.written] == ["e2"], f"after a restart the consumer must redeliver and write e2, got {[w['event_id'] for w in m2.written]}"
-    assert ctx.kafka.lag("ledger", "money-events") == 0
+    await ctx.db.execute("ALTER TABLE entries DROP CONSTRAINT journal_down")
+    restarted = ctx.load("event_consumer")
+    await _run(restarted)
+    journal = await _journal(ctx)
+    assert sorted(journal) == ["e1", "e2", "e3"], f"after a restart the consumer must redeliver e3 and write it, the journal holds {sorted(journal)}"
+    assert len(journal["e3"][1]) == 2, f"e3 must be written exactly once, the journal holds {len(journal['e3'][1])} entries for it"
+    _fully_committed(ctx)
 `,
   },
   debrief: `The mapping table is the course's stand-in for Stripe's fund flows: a declaration of which accounts an event moves money between, kept out of the consumer's code so adding a producer is a data change. The consumer's job is then only ordering and failure handling — write, then commit, so a crash replays rather than loses — and the dead-letter topic separates "I do not understand this" from "this failed": the first is parked and committed so the partition keeps flowing, the second is retried. Real ingestion pipelines version the mappings, carry the mapping version on each transaction so a bad mapping can be found and reversed, and alert on the dead-letter topic's growth rate rather than on every record.`,

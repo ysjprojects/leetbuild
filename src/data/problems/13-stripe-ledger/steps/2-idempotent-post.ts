@@ -616,8 +616,27 @@ int main() {
     },
   },
   harness: {
-    python: `import hashlib
+    python: `import asyncio
+import hashlib
 import json
+import types
+
+SCHEMA = """
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL REFERENCES transactions (id),
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL,
+    posted_at bigint NOT NULL
+);
+"""
 
 BODY = {
     "description": "capture ch_1",
@@ -629,24 +648,17 @@ BODY = {
 REORDERED = {"entries": [{"amount": 4999, "currency": "EUR", "account": "cash:acquirer"}, {"amount": -4999, "currency": "EUR", "account": "clearing:payments"}], "description": "capture ch_1"}
 UNBALANCED = {"description": "oops", "entries": [{"account": "cash:acquirer", "currency": "EUR", "amount": 4999}, {"account": "clearing:payments", "currency": "EUR", "amount": -4000}]}
 OTHER = dict(BODY, description="capture ch_2")
+DAY = 86400
 
 
 def _digest(body):
     return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _api(ctx):
-    m = ctx.load("idempotent_api")
-    m.calls = []
-
-    async def handle(body):
-        m.calls.append(body)
-        if body.get("description") == "oops":
-            return 422, {"error": "debits and credits must net to zero"}
-        return 201, {"transaction_id": f"tx-{len(m.calls)}", "posted_at": 1700000000000, "entries": body["entries"]}
-
-    m.handle = handle  # step 1's outcome
-    return m
+async def _api(ctx):
+    """The learner's idempotency layer over the real step 1 handler and the real journal writer, on an empty ledger."""
+    await ctx.db.reset(SCHEMA)
+    return ctx.load("idempotent_api")
 
 
 async def _post(c, key=None, body=BODY):
@@ -654,49 +666,100 @@ async def _post(c, key=None, body=BODY):
     return await c.post("/transactions", json=body, headers=headers)
 
 
+async def _transactions(ctx):
+    return await ctx.db.execute("SELECT id, description FROM transactions ORDER BY posted_at, id")
+
+
+@types.coroutine
+def _resume(coro, pending):
+    while True:
+        try:
+            yield pending
+        except BaseException as exc:
+            try:
+                pending = coro.throw(exc)
+            except StopIteration as done:
+                return done.value
+            continue
+        try:
+            pending = coro.send(None)
+        except StopIteration as done:
+            return done.value
+
+
+def _land_now(coro):
+    """Another app server's request arriving at this very instant: it runs until it first has to wait
+    (on the database, say) and the rest of it continues as a task, which is returned."""
+    loop = asyncio.get_running_loop()
+    try:
+        pending = coro.send(None)
+    except StopIteration as done:
+        future = loop.create_future()
+        future.set_result(done.value)
+        return future
+
+    async def finish():
+        return await _resume(coro, pending)
+
+    return asyncio.ensure_future(finish())
+
+
 async def check_header_required(ctx):
-    m = _api(ctx)
+    m = await _api(ctx)
     async with ctx.client(m.app) as c:
         r = await _post(c)
         assert r.status_code == 400, f"POST /transactions without Idempotency-Key answered {r.status_code}, expected 400"
-        assert m.calls == [], "a request without a key must not reach handle"
+        assert await _transactions(ctx) == [], "a request without a key must not reach the journal, but a transaction was written"
         r = await _post(c, "k1")
     assert r.status_code == 201, f"POST /transactions with a fresh key answered {r.status_code}, expected 201"
-    assert m.calls == [BODY], f"handle must run once with the request body, got {m.calls}"
+    rows = await _transactions(ctx)
+    assert len(rows) == 1 and r.json().get("transaction_id") == rows[0]["id"], f"a fresh key must post the transaction once: the journal holds {rows}, the answer was {r.json()}"
 
 
 async def check_fingerprint_nx(ctx):
-    m = _api(ctx)
+    m = await _api(ctx)
     async with ctx.client(m.app) as c:
-        r = await _post(c, "k1")
-        assert r.status_code == 201, f"POST /transactions with a fresh key answered {r.status_code}, expected 201"
-        stored = ctx.redis.get("idem:k1")
-        assert stored is not None, "after the request idem:k1 must hold the fingerprint of the body"
-        assert stored == _digest(BODY), f"idem:k1 holds {stored!r}, expected the SHA-256 hex digest of the canonical JSON body (sort_keys, no whitespace)"
-        ttl = ctx.redis.ttl("idem:k1")
-        assert 86000 <= ttl <= 86400, f"the reservation TTL was {ttl}, expected 86400 s"
-        ctx.redis.set("idem:k2", _digest(BODY), ex=86400)  # reserved by another instance a moment ago
-        r = await _post(c, "k2")
-    assert r.status_code == 409, f"a key reserved by another request that has not finished answered {r.status_code}, expected 409 (in progress)"
-    assert len(m.calls) == 1, "a key already reserved must not run handle a second time: the SET must be NX"
-    assert ctx.redis.ttl("idem:k2") <= 86400 and ctx.redis.get("idem:k2") == _digest(BODY), "the existing reservation must be left untouched"
+        # A retry from the client's other connection lands on another app server right after this
+        # request's first Redis command on idem:k1 — the window a check-then-set leaves open.
+        racer = ctx.redis_after("idem:k1", lambda: _land_now(_post(c, "k1")))
+        first = await _post(c, "k1")
+        assert racer.fired, "idem:k1 was never touched: the key must be reserved in Redis as idem:{Idempotency-Key}"
+        assert racer.error is None, f"the concurrent retry failed to run: {racer.error!r}"
+        try:
+            other = await racer.result
+        except Exception as exc:
+            raise AssertionError(f"the concurrent retry crashed the service with {type(exc).__name__}: {exc}")
+    rows = await _transactions(ctx)
+    assert len(rows) == 1, f"two requests with key k1 arrived together and the journal booked {len(rows)} transactions: reserving the key must be one atomic SET NX, so only one of them can win"
+    statuses = sorted([first.status_code, other.status_code])
+    assert statuses == [201, 409], f"the two concurrent requests answered {statuses}: one creates the transaction (201), the other finds the key reserved with no outcome yet (409)"
+    stored = ctx.redis.get("idem:k1")
+    assert stored is not None, "after the request idem:k1 must hold the fingerprint of the body"
+    assert stored == _digest(BODY), f"idem:k1 holds {stored!r}, expected the SHA-256 hex digest of the canonical JSON body (sort_keys, no whitespace)"
+    ttl = ctx.redis.ttl("idem:k1")
+    assert DAY - 400 <= ttl <= DAY, f"the reservation TTL was {ttl}, expected {DAY} s"
+    ctx.clock.advance(DAY - 60)
+    assert ctx.redis.get("idem:k1") == stored, "the reservation must still be there just under 24 h later"
+    ctx.clock.advance(120)
+    assert ctx.redis.get("idem:k1") is None, "24 h after the request the reservation must have expired"
 
 
 async def check_mismatch_409(ctx):
-    m = _api(ctx)
+    m = await _api(ctx)
     async with ctx.client(m.app) as c:
         first = await _post(c, "k1")
         assert first.status_code == 201, f"the first request answered {first.status_code}, expected 201"
         r = await _post(c, "k1", OTHER)
         assert r.status_code == 409, f"the same key with a different body answered {r.status_code}, expected 409"
-        assert len(m.calls) == 1, "a mismatching body must not reach handle"
+        rows = await _transactions(ctx)
+        assert [t["description"] for t in rows] == ["capture ch_1"], f"a mismatching body must not be posted, the journal holds {[t['description'] for t in rows]}"
         assert ctx.redis.get("idem:k1") == _digest(BODY), "the mismatching request must not overwrite the stored fingerprint"
         again = await _post(c, "k1")
-    assert again.status_code == 201 and again.json() == first.json(), "after the 409 the original request must still replay under its key"
+    assert again.status_code == 201 and again.json() == first.json(), f"after the 409 the original request must still replay under its key, got {again.status_code} {again.json()}"
 
 
 async def check_replay(ctx):
-    m = _api(ctx)
+    m = await _api(ctx)
     async with ctx.client(m.app) as c:
         first = await _post(c, "k1")
         assert first.status_code == 201, f"the first request answered {first.status_code}, expected 201"
@@ -704,18 +767,20 @@ async def check_replay(ctx):
         again = await _post(c, "k1")
         assert again.status_code == 201, f"the retry answered {again.status_code}, expected the stored 201"
         assert again.json() == first.json(), f"the replay must return the same body: {again.json()} != {first.json()}"
-        assert again.json().get("transaction_id") == "tx-1", "the replayed document must be the first outcome, not a fresh one"
         assert again.headers.get("idempotent-replayed") == "true", f"a replay carries Idempotent-Replayed: true, got {dict(again.headers)}"
-        assert len(m.calls) == 1, "a retry must not run handle again"
+        rows = await _transactions(ctx)
+        assert len(rows) == 1, f"a retry must not post again: the journal holds {len(rows)} transactions after one request and its retry"
         reordered = await _post(c, "k1", REORDERED)
         assert reordered.status_code == 201 and reordered.headers.get("idempotent-replayed") == "true", "the same body with its keys in another order is the same request: canonical JSON before hashing"
-        assert len(m.calls) == 1, "the reordered retry must not run handle"
+        assert reordered.json() == first.json(), "the reordered retry must replay the first outcome"
+        assert len(await _transactions(ctx)) == 1, "the reordered retry must not post again"
         other = await _post(c, "k2")
-    assert other.status_code == 201 and other.json().get("transaction_id") == "tx-2", "a different key is a new transaction"
+    assert other.status_code == 201 and other.json().get("transaction_id") != first.json().get("transaction_id"), "a different key is a new transaction"
+    assert len(await _transactions(ctx)) == 2, "a different key must post a second transaction"
 
 
 async def check_store_outcome(ctx):
-    m = _api(ctx)
+    m = await _api(ctx)
     async with ctx.client(m.app) as c:
         r = await _post(c, "k1")
         assert r.status_code == 201, f"POST /transactions with a fresh key answered {r.status_code}, expected 201"
@@ -724,29 +789,34 @@ async def check_store_outcome(ctx):
         assert stored.get("status") == "201", f"idem:k1:response.status is {stored.get('status')!r}, expected '201'"
         assert json.loads(stored.get("body", "null")) == r.json(), f"idem:k1:response.body {stored.get('body')!r} differs from the response body"
         ttl = ctx.redis.ttl("idem:k1:response")
-        assert 86000 <= ttl <= 86400, f"the stored outcome has TTL {ttl}, expected 86400 s (same as the reservation)"
+        assert DAY - 400 <= ttl <= DAY, f"the stored outcome has TTL {ttl}, expected {DAY} s (same as the reservation)"
         r = await _post(c, "k2", UNBALANCED)
-        assert r.status_code == 422, f"a 422 from handle must be answered as 422, got {r.status_code}"
+        assert r.status_code == 422, f"an unbalanced body must be answered 422, got {r.status_code}"
         again = await _post(c, "k2", UNBALANCED)
-        assert again.status_code == 422, f"the retry of a rejected request must replay the 422, got {again.status_code}"
-        assert again.headers.get("idempotent-replayed") == "true", "the replayed 422 is a replay too"
-        assert len(m.calls) == 2, "the rejected request must not be re-run on retry: error outcomes are stored as well"
-        ctx.redis.set("idem:k3", _digest(BODY), ex=86400)  # reserved, no outcome yet: the first request is still running
-        r = await _post(c, "k3")
-        assert r.status_code == 409, f"a key reserved without a stored outcome is in progress: expected 409, got {r.status_code}"
-
-        async def failing(body):
-            raise RuntimeError("journal down")
-
-        m.handle = failing
+        assert again.status_code == 422, f"the retry of a rejected request must replay the stored 422, got {again.status_code}"
+        assert again.headers.get("idempotent-replayed") == "true", "the replayed 422 is a replay too: error outcomes are stored as well"
+        assert again.json() == r.json(), f"the replayed 422 must carry the stored reason, got {again.json()} != {r.json()}"
+        # Two first requests with one key at once: the second finds the key reserved and no outcome yet.
+        both = await asyncio.gather(_post(c, "k3"), _post(c, "k3"))
+        statuses = sorted(x.status_code for x in both)
+        assert statuses == [201, 409], f"two simultaneous first requests with key k3 answered {statuses}: one posts (201), the other is still in progress (409)"
+        assert len(await _transactions(ctx)) == 2, "k1 and k3 must have posted one transaction each"
+        # The journal breaks mid-write: from now on an entry of 4999 violates a constraint and the database rolls back.
+        await ctx.db.execute("ALTER TABLE entries ADD CONSTRAINT journal_down CHECK (amount <> 4999) NOT VALID")
         try:
             r = await _post(c, "k4")
-            assert r.status_code >= 500, f"a failing handle answered {r.status_code}"
+            assert r.status_code >= 500, f"a write that failed in the database answered {r.status_code}, expected a 5xx"
         except AssertionError:
             raise
         except Exception:
             pass
-        assert ctx.redis.get("idem:k4") is None, "when handle fails the reservation must be released (DEL), or every retry gets 409 for a day"
+        assert len(await _transactions(ctx)) == 2, "the failed write must leave nothing in the journal"
+        assert ctx.redis.get("idem:k4") is None, "when the write fails the reservation must be released (DEL), or every retry gets 409 for a day"
+        assert not ctx.redis.exists("idem:k4:response"), "a failure is not an outcome: nothing may be stored for k4"
+        await ctx.db.execute("ALTER TABLE entries DROP CONSTRAINT journal_down")
+        retry = await _post(c, "k4")
+    assert retry.status_code == 201, f"once the database is back, the client's retry with the same key must go through, got {retry.status_code} {retry.text}"
+    assert len(await _transactions(ctx)) == 3, "the retry must post the k4 transaction exactly once"
 `,
   },
   debrief: `The key turns the network's at-least-once into exactly-once at the API, and the fingerprint turns the key into a *promise about a request* rather than a promise about a string: a mismatch is refused instead of silently returning somebody else's transaction. Storing the outcome whatever the status matters for a ledger in particular — a rejected posting that is re-run on retry might pass a second time if the rules or the data changed in between, and the caller would never learn it had been rejected. Stripe's post scopes keys per API key, answers a mismatched body with a 400 rather than a 409, and keeps keys for 24 hours; it also recommends that clients retry with exponential backoff and jitter, and that the key be generated once per *intent* (a UUID stored next to the order), not per attempt.`,

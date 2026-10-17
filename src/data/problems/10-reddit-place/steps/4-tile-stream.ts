@@ -430,16 +430,14 @@ int main() {
   },
   harness: {
     python: `import asyncio
-import sys
+import importlib
+import json
 
 import grpc
+from confluent_kafka import Consumer
 
 import place_pb2
 import place_pb2_grpc
-
-
-def _tile(user="ana", x=3, y=7, color=12, ts=1700000000000):
-    return {"user": user, "x": x, "y": y, "color": color, "ts": ts}
 
 
 async def _settle():
@@ -447,14 +445,33 @@ async def _settle():
         await asyncio.sleep(0)
 
 
+class _Instance:
+    """One tile-stream instance as deployed: the learner's server, its bus fed from placements by the
+    given pump in its own consumer group, and the real placement producer (step 3) upstream."""
+
+    def __init__(self, ctx, m):
+        self.ctx = ctx
+        self.m = m
+        self.bus = importlib.import_module("tile_bus")
+        self.events = importlib.import_module("placement_events")
+        self.feed = Consumer({"bootstrap.servers": "kafka:9092", "group.id": "tile-stream-1", "auto.offset.reset": "earliest"})
+        self.feed.subscribe(["placements"])
+        self.stub = place_pb2_grpc.PlaceStub(grpc.aio.insecure_channel("tile-stream:9000"))
+
+    def pump(self):
+        """The instance consumes everything on placements and publishes it on its bus."""
+        self.ctx.drain(self.bus.pump, self.feed)
+
+    def placed(self):
+        return [json.loads(r.value) for r in self.ctx.kafka.records("placements")]
+
+
 async def _start(ctx):
-    """The learner's server as a task, a stub on it, and the bus it shares with the harness."""
     m = ctx.load("tile_stream")
     asyncio.create_task(m.serve())
     await asyncio.sleep(0)
     assert ctx.grpc.find("/place.Place/StreamTiles") is not None, "serve() registered no StreamTiles handler"
-    stub = place_pb2_grpc.PlaceStub(grpc.aio.insecure_channel("tile-stream:9000"))
-    return m, stub, sys.modules["tile_bus"]
+    return _Instance(ctx, m)
 
 
 async def _open(stub, client="web"):
@@ -464,56 +481,66 @@ async def _open(stub, client="web"):
 
 
 async def check_serve_stream(ctx):
-    m, stub, bus = await _start(ctx)
-    call = await _open(stub)
+    place = await _start(ctx)
+    call = await _open(place.stub)
     assert not call.done(), f"a fresh StreamTiles call must stay open waiting for tiles, but it ended with {await call.code()}"
-    bus.publish(_tile())
+    place.events.record_placement("ana", 3, 7, 12)
+    place.pump()
+    want = place.placed()[0]
     got = await asyncio.wait_for(call.read(), 1.0)
     assert isinstance(got, place_pb2.Tile), f"the stream must carry Tile messages, got {type(got).__name__}"
-    assert (got.x, got.y, got.color, got.user, got.ts) == (3, 7, 12, "ana", 1700000000000), f"the Tile is {got!r}, expected x=3 y=7 color=12 user='ana' ts=1700000000000"
+    assert (got.x, got.y, got.color, got.user, got.ts) == (3, 7, 12, "ana", want["ts"]), f"the Tile is {got!r}, expected x=3 y=7 color=12 user='ana' ts={want['ts']}"
 
 
 async def check_forward_order(ctx):
-    m, stub, bus = await _start(ctx)
-    call = await _open(stub)
-    assert bus.subscribers() == 1, f"one open call must mean one subscription, found {bus.subscribers()}"
-    other = await _open(stub, "mobile")
-    assert bus.subscribers() == 2, f"two open calls must mean two subscriptions, found {bus.subscribers()}"
-    for i, user in enumerate(("ana", "bo", "cy")):
-        bus.publish(_tile(user=user, x=i, y=0, color=i + 1, ts=1700000000000 + i))
+    place = await _start(ctx)
+    call = await _open(place.stub)
+    assert place.bus.subscribers() == 1, f"one open call must mean one subscription, found {place.bus.subscribers()}"
+    other = await _open(place.stub, "mobile")
+    assert place.bus.subscribers() == 2, f"two open calls must mean two subscriptions, found {place.bus.subscribers()}"
+    for i, user in enumerate(("ana", "bo", "cy")):  # three tiles on one pixel: one partition, one order
+        place.events.record_placement(user, 3, 7, i + 1)
+        ctx.clock.advance(1)
+    place.pump()
+    want = [(e["user"], e["x"], e["y"], e["color"], e["ts"]) for e in place.placed()]
     for stream, name in ((call, "web"), (other, "mobile")):
         got = [await asyncio.wait_for(stream.read(), 1.0) for _ in range(3)]
         assert [t.user for t in got] == ["ana", "bo", "cy"], f"client {name} received {[t.user for t in got]}, expected ana, bo, cy in publish order"
-        assert [(t.x, t.color, t.ts) for t in got] == [(0, 1, 1700000000000), (1, 2, 1700000000001), (2, 3, 1700000000002)], f"client {name} received {got!r}: every field of every tile must be forwarded"
-    assert bus.subscribers() == 2, f"after forwarding three tiles the bus has {bus.subscribers()} subscription(s), expected still 2: subscribe once per call, not per tile"
+        assert [(t.user, t.x, t.y, t.color, t.ts) for t in got] == want, f"client {name} received {got!r}: every field of every tile must be forwarded, expected {want}"
+    assert place.bus.subscribers() == 2, f"after forwarding three tiles the bus has {place.bus.subscribers()} subscription(s), expected still 2: subscribe once per call, not per tile"
 
 
 async def check_cancel_cleanup(ctx):
-    m, stub, bus = await _start(ctx)
-    call = await _open(stub)
-    assert bus.subscribers() == 1, f"after the call opened the bus has {bus.subscribers()} subscription(s), expected 1 (subscribe())"
+    place = await _start(ctx)
+    call = await _open(place.stub)
+    assert place.bus.subscribers() == 1, f"after the call opened the bus has {place.bus.subscribers()} subscription(s), expected 1 (subscribe())"
     call.cancel()
     await _settle()
-    n = bus.subscribers()
+    n = place.bus.subscribers()
     assert n == 0, f"the client hung up but the bus still has {n} subscription(s): unsubscribe from the call's done callback"
-    bus.publish(_tile())  # must not reach anyone, must not raise
-    second = await _open(stub, "mobile")
-    assert bus.subscribers() == 1, "a new call after a cancelled one subscribes afresh"
-    bus.publish(_tile(user="bo"))
+    place.events.record_placement("ana", 3, 7, 12)
+    place.pump()  # must not reach anyone, must not raise
+    second = await _open(place.stub, "mobile")
+    assert place.bus.subscribers() == 1, "a new call after a cancelled one subscribes afresh"
+    place.events.record_placement("bo", 4, 7, 1)
+    place.pump()
     got = await asyncio.wait_for(second.read(), 1.0)
     assert got.user == "bo", f"the new client must only see tiles published after it subscribed, got {got!r}"
 
 
 async def check_slow_client(ctx):
-    m, stub, bus = await _start(ctx)
-    call = await _open(stub)
-    for i in range(m.MAX_LAG):
-        bus.publish(_tile(x=i % 100, y=i // 100, ts=1700000000000 + i))
-    got = [await asyncio.wait_for(call.read(), 1.0) for _ in range(m.MAX_LAG)]
-    assert [t.ts for t in got] == [1700000000000 + i for i in range(m.MAX_LAG)], f"a backlog of exactly MAX_LAG tiles is still delivered in order"
+    place = await _start(ctx)
+    call = await _open(place.stub)
+    lag = place.m.MAX_LAG
+    for i in range(lag):  # tiles from the other place-api instances, all on one pixel: one partition, one order
+        ctx.kafka.seed("placements", key="3:7", value=json.dumps({"user": "ana", "x": 3, "y": 7, "color": i % 16, "ts": 1700000000000 + i}))
+    place.pump()
+    got = [await asyncio.wait_for(call.read(), 1.0) for _ in range(lag)]
+    assert [t.ts for t in got] == [1700000000000 + i for i in range(lag)], "a backlog of exactly MAX_LAG tiles is still delivered in order"
     assert not call.done(), "a client that caught up stays connected"
-    for i in range(m.MAX_LAG + 2):
-        bus.publish(_tile(ts=1800000000000 + i))
+    for i in range(lag + 2):
+        ctx.kafka.seed("placements", key="3:7", value=json.dumps({"user": "ana", "x": 3, "y": 7, "color": 12, "ts": 1800000000000 + i}))
+    place.pump()
     await _settle()
     try:
         while True:
@@ -523,7 +550,7 @@ async def check_slow_client(ctx):
     except asyncio.TimeoutError:
         raise AssertionError("a client more than MAX_LAG tiles behind must be dropped with RESOURCE_EXHAUSTED, but the stream stayed open")
     await _settle()
-    assert bus.subscribers() == 0, f"a dropped client must be unsubscribed, the bus still has {bus.subscribers()} subscription(s)"
+    assert place.bus.subscribers() == 0, f"a dropped client must be unsubscribed, the bus still has {place.bus.subscribers()} subscription(s)"
 `,
   },
   debrief: `A server stream is the gRPC shape of "tell me everything from now on": one request, an open HTTP/2 stream, messages pushed as they happen. The handler is a loop around a queue, and the two rules around it are what make it survive at 80 000 clients: the done callback guarantees every subscription dies with its call, whatever killed it, and the lag cap turns a slow reader from a memory leak into a reconnect — cheap, because the catch-up path is a single cached \`GET /board\`. That is also why the client opens the stream before it fetches the board: a snapshot plus every change since before the snapshot is consistent, and nothing is lost in between. Reddit ran 24 websocket instances pushing 4 Gbps of tiny messages and found the boxes CPU-bound, not network-bound — per-message work, not bytes, is the cost of fan-out; real deployments batch tiles per 50 ms frame, exactly as the browser batched draws per animation frame.`,

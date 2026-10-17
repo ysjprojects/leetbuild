@@ -6,13 +6,20 @@ seeds topics, reads what was produced and inspects commits.
 
 Faithful where it matters for the courses: delivery callbacks are served by `poll()`/`flush()`,
 `auto.offset.reset` decides where a new group starts, `enable.auto.commit` (librdkafka's default)
-commits the last delivered offsets on the next poll, and manual `commit(message=…)` records exactly
-the offset the learner asked for. Not modelled: rebalances, timeouts, transactions.
+commits the last delivered offsets on the next poll, manual `commit(message=…)` records exactly
+the offset the learner asked for, and a stalled broker makes producers wait and time out on the
+virtual clock as librdkafka does. Not modelled: rebalances, transactions.
 """
 from __future__ import annotations
 
+import math
 import zlib
 from typing import Callable
+
+from .clock import CLOCK
+
+# How long a record acknowledged by the leader alone (acks 0/1) stays only on the leader.
+REPLICATION_LAG = 0.1
 
 OFFSET_BEGINNING = -2
 OFFSET_END = -1
@@ -65,6 +72,11 @@ class Broker:
         self.flushes = 0
         self.seq = 0
         self.failing: dict[str, int] = {}
+        # Topic (None: every topic) → virtual time the broker acknowledges produces again (inf: until resumed).
+        self.stalls: dict[str | None, float] = {}
+        # Written but not yet acknowledged to the producer (lost ack → retry), and records only the leader has.
+        self.ack_losses: dict[str, int] = {}
+        self.unreplicated: list[tuple[Record, float]] = []
         self.commit_hooks: list[Callable[[str, dict[tuple[str, int], int]], None]] = []
         self.subscribe_hooks: list[Callable[[str, list[str]], None]] = []
         self.stop_when_drained = True
@@ -99,6 +111,55 @@ class Broker:
     def fail_next(self, topic: str, times: int = 1) -> None:
         """The next `times` produces to `topic` fail with a delivery error (served through the callback)."""
         self.failing[topic] = self.failing.get(topic, 0) + times
+
+    def stall(self, topic: str | None = None, seconds: float | None = None) -> None:
+        """
+        The broker stops acknowledging produces — to `topic`, or to every topic — as a dead or
+        partitioned cluster does: records stay in the producer's queue and time out after
+        `message.timeout.ms`. With `seconds` it answers again after that much virtual time.
+        """
+        self.stalls[topic] = math.inf if seconds is None else CLOCK.time() + seconds
+
+    def resume(self, topic: str | None = None) -> None:
+        """End a stall (every stall when no topic is given); in-flight records deliver on the next poll/flush."""
+        if topic is None:
+            self.stalls.clear()
+        else:
+            self.stalls.pop(topic, None)
+
+    def stalled_until(self, topic: str) -> float | None:
+        """When the broker answers produces to `topic` again (inf: not until resumed); None if it answers now."""
+        now = CLOCK.time()
+        until = max((t for key, t in self.stalls.items() if key is None or key == topic), default=None)
+        return until if until is not None and until > now else None
+
+    def lose_acks(self, topic: str, times: int = 1) -> None:
+        """
+        The next `times` produce requests to `topic` are written but their acknowledgement never reaches
+        the producer, which retries (librdkafka does, transparently): without `enable.idempotence` the
+        retry is written again — a duplicate on the topic; with it the broker recognises the producer's
+        sequence number and writes it once. The delivery report says success either way.
+        """
+        self.ack_losses[topic] = self.ack_losses.get(topic, 0) + times
+
+    def failover(self, topic: str | None = None) -> None:
+        """
+        The partition leader fails and a follower takes over: records acknowledged by the leader alone
+        (`acks` 0 or 1) that had not reached the followers yet — written in the last REPLICATION_LAG
+        seconds — are gone; records written with `acks=all` survive.
+        """
+        now = CLOCK.time()
+        lost = [r for r, at in self.unreplicated if (topic is None or r.topic == topic) and now - at < REPLICATION_LAG]
+        for record in lost:
+            log = self.topics[record.topic][record.partition]
+            if record in log:
+                log.remove(record)
+        for name in {r.topic for r in lost}:
+            for log in self.topics[name]:
+                for i, r in enumerate(log):
+                    r.offset = i
+        self.unreplicated = [(r, at) for r, at in self.unreplicated if r not in lost]
+        self.events.append(("failover", topic, len(lost)))
 
     def records(self, topic: str) -> list[Record]:
         """Everything produced to `topic`, in production order."""
@@ -163,6 +224,7 @@ class KafkaError(Exception):
     UNKNOWN_TOPIC_OR_PART = 3
     REQUEST_TIMED_OUT = 7
     NOT_LEADER_FOR_PARTITION = 6
+    _INVALID_ARG = -186
 
     _NAMES = {
         -191: "_PARTITION_EOF",
@@ -172,6 +234,7 @@ class KafkaError(Exception):
         -185: "_TIMED_OUT",
         -150: "_FATAL",
         -184: "_QUEUE_FULL",
+        -186: "_INVALID_ARG",
         3: "UNKNOWN_TOPIC_OR_PART",
         7: "REQUEST_TIMED_OUT",
         6: "NOT_LEADER_FOR_PARTITION",
@@ -276,9 +339,29 @@ class Message:
 
 
 class Producer:
+    """
+    librdkafka's producer as the courses meet it: `produce` enqueues, delivery reports are served by
+    `poll`/`flush`. While the broker is stalled records stay in flight: `poll(t)` and `flush(t)` wait
+    `t` seconds of virtual time and return, `flush()` waits until every record is delivered or has
+    been unacknowledged for `message.timeout.ms` (librdkafka's default: 300 s), when it fails with
+    _MSG_TIMED_OUT through its delivery callback — so an unbounded flush on a dead broker costs
+    exactly what it costs in production.
+    """
+
     def __init__(self, conf: dict | None = None, **kwargs) -> None:
         self.conf = dict(conf or {}, **kwargs)
+        # librdkafka's defaults: acks=all (-1), idempotence off.
+        acks = self.conf.get("acks", self.conf.get("request.required.acks", -1))
+        acks = -1 if str(acks).strip().lower() == "all" else int(acks)
+        self._acks = -1 if acks < 0 else acks
+        self._idempotent = _truthy(self.conf.get("enable.idempotence", False))
+        if self._idempotent and self._acks != -1:
+            raise KafkaException(
+                KafkaError(KafkaError._INVALID_ARG, "Failed to create producer: `acks` must be set to `all` when `enable.idempotence` is true")
+            )
+        # Delivery reports ready to serve, and records the broker has not acknowledged (topic args, enqueued at).
         self._pending: list[tuple[Callable | None, KafkaError | None, Message]] = []
+        self._inflight: list[tuple[Callable | None, dict, float]] = []
         BROKER.events.append(("producer", self.conf.get("bootstrap.servers")))
 
     def produce(self, topic, value=None, key=None, partition=-1, on_delivery=None, callback=None, timestamp=0, headers=None):
@@ -290,26 +373,96 @@ class Producer:
             BROKER.events.append(("produce-failed", topic))
             self._pending.append((cb, error, Message(record, error)))
             return
-        record = BROKER.produce(topic, key=key, value=value, headers=headers, partition=partition if partition >= 0 else None)
-        self._pending.append((cb, None, Message(record)))
+        args = {"topic": topic, "key": key, "value": value, "headers": headers, "partition": partition if partition >= 0 else None}
+        if BROKER.stalled_until(topic) is not None:
+            if self._acks == 0:
+                # acks=0: nobody waits for the broker — the report says delivered and the record is gone.
+                record = Record(topic, 0, -1, _bytes(key), _bytes(value), _headers(headers), 0, 0)
+                BROKER.events.append(("produce-lost", topic))
+                self._pending.append((cb, None, Message(record)))
+                return
+            self._inflight.append((cb, args, CLOCK.time()))
+            BROKER.events.append(("produce-stalled", topic))
+            return
+        self._pending.append((cb, None, Message(self._write(args))))
+
+    def _write(self, args: dict) -> Record:
+        """The broker writes the record: what `acks` and idempotence mean when the cluster misbehaves."""
+        record = BROKER.produce(**args)
+        if self._acks != -1:
+            BROKER.unreplicated.append((record, CLOCK.time()))
+        topic = args["topic"]
+        if BROKER.ack_losses.get(topic, 0) > 0:
+            BROKER.ack_losses[topic] -= 1
+            BROKER.events.append(("ack-lost", topic))
+            if not self._idempotent:
+                # The retry of a write whose ack was lost is written again; the report carries the retry.
+                record = BROKER.produce(**args)
+                if self._acks != -1:
+                    BROKER.unreplicated.append((record, CLOCK.time()))
+        return record
 
     def poll(self, timeout: float = 0) -> int:
+        self._settle()
+        if not self._pending and self._inflight and timeout and timeout > 0:
+            self._wait(timeout)
         return self._serve()
 
     def flush(self, timeout: float | None = None) -> int:
+        """Serve every delivery report, waiting for in-flight records; returns how many are still in flight."""
         BROKER.flushes += 1
         BROKER.events.append(("flush",))
+        self._settle()
+        self._wait(None if timeout is None or timeout < 0 else float(timeout))
         self._serve()
-        return 0
+        return len(self._inflight)
 
     def purge(self, *args, **kwargs) -> None:
         self._pending.clear()
+        self._inflight.clear()
 
     def __len__(self) -> int:
-        return len(self._pending)
+        return len(self._pending) + len(self._inflight)
 
     def list_topics(self, *args, **kwargs):
         raise NotImplementedError("list_topics is not available in the LeetBuild runtime")
+
+    def _message_timeout(self) -> float:
+        for key in ("message.timeout.ms", "delivery.timeout.ms"):
+            if key in self.conf:
+                return max(0.0, float(self.conf[key]) / 1000)
+        return 300.0
+
+    def _settle(self) -> None:
+        """Deliver what the broker accepts again; fail what has waited past the message timeout."""
+        now = CLOCK.time()
+        still = []
+        for cb, args, at in self._inflight:
+            if BROKER.stalled_until(args["topic"]) is None:
+                self._pending.append((cb, None, Message(self._write(args))))
+            elif now - at >= self._message_timeout():
+                record = Record(args["topic"], 0, -1, _bytes(args["key"]), _bytes(args["value"]), _headers(args["headers"]), 0, 0)
+                error = KafkaError(KafkaError._MSG_TIMED_OUT, "Local: Message timed out", retriable=True)
+                BROKER.events.append(("produce-timed-out", args["topic"]))
+                self._pending.append((cb, error, Message(record, error)))
+            else:
+                still.append((cb, args, at))
+        self._inflight = still
+
+    def _wait(self, timeout: float | None) -> None:
+        """Block on the virtual clock until nothing is in flight, or for `timeout` seconds."""
+        deadline = None if timeout is None else CLOCK.time() + timeout
+        while self._inflight:
+            moments = [at + self._message_timeout() for _cb, _args, at in self._inflight]
+            moments += [u for u in (BROKER.stalled_until(a["topic"]) for _cb, a, _at in self._inflight) if u is not None and u != math.inf]
+            if deadline is not None:
+                moments.append(deadline)
+            now = CLOCK.time()
+            if min(moments) > now:
+                CLOCK.advance(min(moments) - now)
+            self._settle()
+            if deadline is not None and CLOCK.time() >= deadline:
+                return
 
     def _serve(self) -> int:
         served = 0
@@ -326,6 +479,12 @@ class Consumer:
         self.conf = dict(conf or {}, **kwargs)
         self.group = self.conf.get("group.id")
         self.auto_commit = _truthy(self.conf.get("enable.auto.commit", True))
+        # librdkafka's defaults: poll() stores each delivered offset (enable.auto.offset.store) and a
+        # background timer commits the stored offsets every auto.commit.interval.ms — also while the
+        # application is still processing the record it just got.
+        self.auto_store = _truthy(self.conf.get("enable.auto.offset.store", True))
+        self.auto_commit_interval = float(self.conf.get("auto.commit.interval.ms", 5000)) / 1000
+        self._last_auto_commit = CLOCK.time()
         self.reset_policy = str(self.conf.get("auto.offset.reset", "latest")).lower()
         self._assignment: list[TopicPartition] = []
         self._positions: dict[tuple[str, int], int] = {}
@@ -416,9 +575,14 @@ class Consumer:
         return out
 
     def _auto_commit(self) -> None:
-        if self._delivered:
-            BROKER.commit(self.group, dict(self._delivered))
+        """Commit what librdkafka would: the offsets stored so far — at delivery, unless the learner stores them."""
+        self._last_auto_commit = CLOCK.time()
+        offsets = self._delivered if self.auto_store else self._stored
+        due = {k: v for k, v in offsets.items() if BROKER.committed_offset(self.group, k[0], k[1]) != v}
+        if due:
+            BROKER.commit(self.group, due)
             BROKER.events.append(("auto-commit", self.group))
+        if self.auto_store:
             self._delivered = {}
 
     # ---- offsets --------------------------------------------------------------------------------
@@ -480,3 +644,14 @@ def _truthy(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
     return bool(value)
+
+
+def _auto_commit_timer() -> None:
+    """librdkafka's background thread: every auto.commit.interval.ms each auto-committing consumer commits its stored offsets."""
+    now = CLOCK.time()
+    for consumer in BROKER.consumers:
+        if consumer.auto_commit and not consumer._closed and now - consumer._last_auto_commit >= consumer.auto_commit_interval:
+            consumer._auto_commit()
+
+
+CLOCK.on_advance(_auto_commit_timer)

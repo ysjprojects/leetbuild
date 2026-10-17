@@ -843,10 +843,19 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       showVerdict();
       return;
     }
-    // The step executes: every file of the course is in the runtime's filesystem so cross-file imports resolve.
+    // The step runs inside the course's real system. The step's own file is the learner's, and so is every
+    // step they have passed in this language; every other step — not reached yet, revealed, or passed in
+    // another language — runs its reference implementation, so the code under test talks to real neighbours
+    // instead of TODO stubs. (`yarn verify` mounts the reference for every other step the same way.)
+    const attempts = progressRef.current.attempts;
     const files: Record<string, string> = {};
-    for (const s of problem.steps)
-      files[fileName(s.file, language)] = filesRef.current[s.id] ?? s.code[language].starter;
+    for (const s of problem.steps) {
+      const attempt = attempts[stepKey(problem.id, s.id)];
+      const own = s.id === step.id || (attempt?.status === 'accepted' && attempt.language === language);
+      files[fileName(s.file, language)] = own
+        ? filesRef.current[s.id] ?? s.code[language].starter
+        : s.code[language].solution;
+    }
     const job: RunJob = {
       files,
       support: problem.support?.[language] ?? {},

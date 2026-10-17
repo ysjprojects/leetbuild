@@ -1,8 +1,9 @@
 """
-gRPC without a network: channels route calls through a REGISTRY of method handlers that fake
-peers (registered by the harness) or the learner's own servicers (started through grpc.aio.server)
-install. Deadlines, latency and injected failures run on the virtual clock, so "sets a deadline"
-and "retries UNAVAILABLE once" are observable outcomes.
+gRPC without a network: channels route calls through a REGISTRY of method handlers that peers
+(registered by the harness, optionally as instances at addresses) or the learner's own servicers
+(started through grpc.aio.server) install. Deadlines, latency and injected failures run on the
+virtual clock, and a channel reaches the instance at the address it dialled, so "sets a deadline",
+"retries UNAVAILABLE once" and "routes this channel to that instance" are observable outcomes.
 
 The `grpc` and `grpc.aio` packages of this runtime are thin re-exports of what is defined here,
 shaped exactly like what grpcio's generated `*_pb2_grpc.py` modules expect.
@@ -93,11 +94,13 @@ class RpcMethodHandler:
 class Call:
     """One invocation as the registry saw it."""
 
-    def __init__(self, path: str, request, metadata, timeout) -> None:
+    def __init__(self, path: str, request, metadata, timeout, target: str | None = None) -> None:
         self.path = path
         self.request = request
         self.metadata = tuple(metadata or ())
         self.timeout = timeout
+        # The address the caller dialled: which instance a routed call reached.
+        self.target = target
         self.started = CLOCK.time()
         self.code: StatusCode | None = None
 
@@ -114,59 +117,89 @@ class Registry:
         self.reset()
 
     def reset(self) -> None:
+        # Peers reachable at any address, by method path, and instances served at one address, by
+        # (target, path). A channel to a target reaches that instance, else an any-address peer, else
+        # nothing: UNAVAILABLE, as a connection to a host that is down or was never there.
         self.handlers: dict[str, RpcMethodHandler] = {}
-        self.latency: dict[str, float] = {}
-        self.failures: dict[str, list[tuple[StatusCode, str]]] = {}
+        self.targeted: dict[tuple[str, str], RpcMethodHandler] = {}
+        # Faults by (target or None for every address, path).
+        self.latency: dict[tuple[str | None, str], float] = {}
+        self.failures: dict[tuple[str | None, str], list[tuple[StatusCode, str]]] = {}
         self.calls: list[Call] = []
         self.contexts: list[ServicerContext] = []
 
     # ---- peers ----------------------------------------------------------------------------------
-    def register(self, service: str, method: str, handler: RpcMethodHandler) -> None:
-        self.handlers[f"/{service}/{method}"] = handler
+    def register(self, service: str, method: str, handler: RpcMethodHandler, target: str | None = None) -> None:
+        path = f"/{service}/{method}"
+        if target is None:
+            self.handlers[path] = handler
+        else:
+            self.targeted[(target, path)] = handler
 
-    def serve(self, add_servicer_to_server: Callable, servicer) -> None:
-        """Install a fake peer: `registry.serve(x_pb2_grpc.add_XServicer_to_server, XServicer())`."""
-        add_servicer_to_server(servicer, Server())
+    def serve(self, add_servicer_to_server: Callable, servicer, target: str | None = None) -> None:
+        """
+        Install a peer: `registry.serve(x_pb2_grpc.add_XServicer_to_server, XServicer())` answers on
+        any address; with `target="data-2:9100"` it is one instance, reached only by channels to it.
+        """
+        add_servicer_to_server(servicer, Server(target=target))
 
-    def find(self, path: str) -> RpcMethodHandler | None:
+    def stop(self, target: str) -> None:
+        """Take the instance at `target` down: calls to it fail UNAVAILABLE from now on."""
+        for key in [k for k in self.targeted if k[0] == target]:
+            del self.targeted[key]
+
+    def find(self, path: str, target: str | None = None) -> RpcMethodHandler | None:
+        if target is not None and (target, path) in self.targeted:
+            return self.targeted[(target, path)]
         return self.handlers.get(path)
 
     # ---- faults -----------------------------------------------------------------------------------
-    def set_latency(self, method: str, seconds: float) -> None:
-        """Every call to `method` ('/pkg.Svc/M' or just 'M') takes `seconds` of virtual time."""
-        self.latency[self._path(method)] = seconds
+    def set_latency(self, method: str, seconds: float, target: str | None = None) -> None:
+        """Every call to `method` ('/pkg.Svc/M' or just 'M') takes `seconds` of virtual time — on every address, or on `target`."""
+        self.latency[(target, self._path(method))] = seconds
 
-    def fail(self, method: str, code: StatusCode, details: str = "", times: int = 1) -> None:
-        """The next `times` calls to `method` fail with `code` before reaching any handler."""
-        self.failures.setdefault(self._path(method), []).extend([(code, details)] * times)
+    def fail(self, method: str, code: StatusCode, details: str = "", times: int = 1, target: str | None = None) -> None:
+        """The next `times` calls to `method` (to `target`, when given) fail with `code` before reaching any handler."""
+        self.failures.setdefault((target, self._path(method)), []).extend([(code, details)] * times)
 
-    def pop_failure(self, path: str) -> tuple[StatusCode, str] | None:
-        queue = self.failures.get(path)
+    def pop_failure(self, path: str, target: str | None = None) -> tuple[StatusCode, str] | None:
+        queue = self.failures.get((target, path))
         if queue:
             return queue.pop(0)
         return None
 
-    def calls_to(self, method: str) -> list[Call]:
-        """Calls whose path ends with `method` ('/pkg.Svc/M' or 'M'), oldest first."""
+    def calls_to(self, method: str, target: str | None = None) -> list[Call]:
+        """Calls whose path ends with `method` ('/pkg.Svc/M' or 'M'), to `target` when given, oldest first."""
         suffix = method if method.startswith("/") else "/" + method
-        return [c for c in self.calls if c.path.endswith(suffix)]
+        return [c for c in self.calls if c.path.endswith(suffix) and (target is None or c.target == target)]
 
     def _path(self, method: str) -> str:
         if method.startswith("/"):
             return method
-        for path in list(self.handlers) + list(self.latency) + list(self.failures):
+        known = list(self.handlers) + [p for _t, p in self.targeted] + [p for _t, p in self.latency] + [p for _t, p in self.failures]
+        for path in known:
             if path.endswith("/" + method):
                 return path
         return "/" + method
 
-    def _lookup(self, path: str) -> float:
-        if path in self.latency:
-            return self.latency[path]
-        return self.latency.get("/" + path.rsplit("/", 1)[-1], 0.0)
+    def _lookup(self, path: str, target: str | None) -> float:
+        short = "/" + path.rsplit("/", 1)[-1]
+        targets = ([target] if target is not None else []) + [None]
+        for t in targets:
+            for p in (path, short):
+                if (t, p) in self.latency:
+                    return self.latency[(t, p)]
+        return 0.0
 
-    def _pop(self, path: str) -> tuple[StatusCode, str] | None:
-        return self.pop_failure(path) or self.pop_failure("/" + path.rsplit("/", 1)[-1])
-
+    def _pop(self, path: str, target: str | None) -> tuple[StatusCode, str] | None:
+        short = "/" + path.rsplit("/", 1)[-1]
+        targets = ([target] if target is not None else []) + [None]
+        for t in targets:
+            for p in (path, short):
+                failure = self.pop_failure(p, t)
+                if failure is not None:
+                    return failure
+        return None
 
 REGISTRY = Registry()
 
@@ -318,23 +351,24 @@ def _roundtrip(message, serializer, deserializer):
     return deserializer(serializer(message))
 
 
-def _begin(path: str, request, timeout, metadata) -> tuple[Call, RpcMethodHandler]:
-    call = Call(path, request, metadata, timeout)
+def _begin(path: str, request, timeout, metadata, target: str | None = None) -> tuple[Call, RpcMethodHandler]:
+    call = Call(path, request, metadata, timeout, target)
     REGISTRY.calls.append(call)
-    failure = REGISTRY._pop(path)
+    failure = REGISTRY._pop(path, target)
     if failure is not None:
         call.code = failure[0]
         raise CallError(failure[0], failure[1] or failure[0].value[1])
-    latency = REGISTRY._lookup(path)
+    latency = REGISTRY._lookup(path, target)
     if timeout is not None and latency > timeout:
         CLOCK.advance(timeout)
         call.code = StatusCode.DEADLINE_EXCEEDED
         raise CallError(StatusCode.DEADLINE_EXCEEDED, "Deadline Exceeded")
     CLOCK.advance(latency)
-    handler = REGISTRY.find(path)
+    handler = REGISTRY.find(path, target)
     if handler is None:
         call.code = StatusCode.UNAVAILABLE
-        raise CallError(StatusCode.UNAVAILABLE, f"failed to connect to all addresses; nothing serves {path}")
+        where = f" at {target}" if target else ""
+        raise CallError(StatusCode.UNAVAILABLE, f"failed to connect to all addresses; nothing serves {path}{where}")
     return call, handler
 
 
@@ -359,8 +393,8 @@ def _settle(ctx: ServicerContext, call: Call) -> None:
     call.code = StatusCode.OK
 
 
-def invoke_sync(path, request, timeout, metadata, serializer, deserializer):
-    call, handler = _begin(path, request, timeout, metadata)
+def invoke_sync(path, request, timeout, metadata, serializer, deserializer, target=None):
+    call, handler = _begin(path, request, timeout, metadata, target)
     ctx = ServicerContext(metadata, timeout)
     try:
         req = _roundtrip(request, serializer, handler.request_deserializer)
@@ -375,9 +409,9 @@ def invoke_sync(path, request, timeout, metadata, serializer, deserializer):
     return result, ctx
 
 
-def invoke_sync_stream(path, request, timeout, metadata, serializer, deserializer):
+def invoke_sync_stream(path, request, timeout, metadata, serializer, deserializer, target=None):
     """Server-streaming over a sync channel: a generator that translates aborts as they happen."""
-    call, handler = _begin(path, request, timeout, metadata)
+    call, handler = _begin(path, request, timeout, metadata, target)
     ctx = ServicerContext(metadata, timeout)
     req = _roundtrip(request, serializer, handler.request_deserializer)
 
@@ -393,8 +427,8 @@ def invoke_sync_stream(path, request, timeout, metadata, serializer, deserialize
     return generator(), ctx
 
 
-async def invoke_aio(path, request, timeout, metadata, serializer, deserializer):
-    call, handler = _begin(path, request, timeout, metadata)
+async def invoke_aio(path, request, timeout, metadata, serializer, deserializer, target=None):
+    call, handler = _begin(path, request, timeout, metadata, target)
     ctx = AioServicerContext(metadata, timeout)
     try:
         req = _roundtrip(request, serializer, handler.request_deserializer)
@@ -422,7 +456,8 @@ class AioStream:
     client reads with `async for` / `read()`, writes with `write()` (bidi) and may `cancel()`.
     """
 
-    def __init__(self, path, request, timeout, metadata, serializer, deserializer, request_streaming: bool, request_iterator=None):
+    def __init__(self, path, request, timeout, metadata, serializer, deserializer, request_streaming: bool, request_iterator=None, target: str | None = None):
+        self._target = target
         self._path = path
         self._deserializer = deserializer
         self._serializer = serializer
@@ -464,7 +499,7 @@ class AioStream:
 
     async def _run(self) -> None:
         try:
-            self._call, handler = _begin(self._path, self._request, self._timeout, self._metadata)
+            self._call, handler = _begin(self._path, self._request, self._timeout, self._metadata, self._target)
         except CallError as exc:
             self._error = exc
             self._code = exc.code()
@@ -658,27 +693,22 @@ class GenericRpcHandler:
 
 
 class Server:
-    """A sync server (or a fake peer): handlers are registered as soon as they are added."""
+    """A sync server (or a peer): handlers are registered as soon as they are added — at `target` when
+    the harness serves an addressed instance, otherwise reachable at any address."""
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, target: str | None = None, **kwargs) -> None:
         self.ports: list[str] = []
+        self._target = target
         self._stopped = asyncio.Event()
 
     def add_generic_rpc_handlers(self, generic_rpc_handlers) -> None:
         for handler in generic_rpc_handlers:
             for method, rpc_handler in handler.method_handlers.items():
-                REGISTRY.register(handler.service_name, method, rpc_handler)
+                REGISTRY.register(handler.service_name, method, rpc_handler, self._target)
 
     def add_registered_method_handlers(self, service_name: str, method_handlers: dict) -> None:
         for method, rpc_handler in method_handlers.items():
-            REGISTRY.register(service_name, method, rpc_handler)
-
-    def add_insecure_port(self, address: str) -> int:
-        self.ports.append(address)
-        return int(address.rsplit(":", 1)[-1] or 0) if address.rsplit(":", 1)[-1].isdigit() else 0
-
-    def add_secure_port(self, address: str, server_credentials) -> int:
-        return self.add_insecure_port(address)
+            REGISTRY.register(service_name, method, rpc_handler, self._target)
 
     def start(self) -> None:
         pass

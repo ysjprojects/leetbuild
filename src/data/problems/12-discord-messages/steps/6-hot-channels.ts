@@ -741,49 +741,79 @@ int main() {
     },
   },
   harness: {
-    python: `import json
+    python: `import importlib
+import json
+import time
 
-import messages_pb2
-import messages_pb2_grpc
 from messages.db import SCHEMA
 
-CHANNEL = 1032000000000000001
+EPOCH = 1420070400000
+BUCKET_MS = 10 * 24 * 3600 * 1000
+INSERT = "INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES (%s, %s, %s, %s, %s)"
+NOW_B = (int(time.time() * 1000) - EPOCH) // BUCKET_MS
+
+
+def sf(bucket, offset_ms=0):
+    return ((bucket * BUCKET_MS + offset_ms) << 22) | (1 << 17)
+
+
+CHANNEL = sf(NOW_B - 1, 5000)  # created last bucket
 KEY = f"recent:{CHANNEL}"
-BASE = 1561000000000000000
 
 
-class FakeData(messages_pb2_grpc.MessageDataServicer):
-    """The data service: answers \`n\` messages just below the cursor; records every request."""
-
-    def __init__(self, n=3):
-        self.requests = []
-        self.n = n
-
-    def GetMessages(self, request, context):
-        self.requests.append(request)
-        base = request.before - 1
-        return messages_pb2.GetMessagesReply(messages=[messages_pb2.Message(id=base - i, author_id=7, content=f"db{i}") for i in range(min(request.limit, self.n))])
-
-
-def _entry(i):
-    return json.dumps({"id": str(BASE + i), "author_id": "7", "content": f"cached{i}"})
-
-
-async def _api(ctx, cached=0, n=3):
-    """The app with \`cached\` entries already in recent:{CHANNEL}, newest (highest i) first."""
+async def _api(ctx, stored=0, cached=0):
+    """
+    The API over the real stack: Postgres holds \`stored\` messages of CHANNEL (db0 the oldest), the newest
+    \`cached\` of them sit in recent:{CHANNEL} as POST left them, and step 3's data service serves at every
+    instance step 4's ring routes to. Returns the app module and the stored messages, newest first.
+    """
     await ctx.db.reset(SCHEMA)
-    peer = FakeData(n)
-    ctx.grpc.serve(messages_pb2_grpc.add_MessageDataServicer_to_server, peer)
+    entries = []
+    for i in range(stored):
+        mid = sf(NOW_B - 1, 10000 + 1000 * i)
+        await ctx.db.execute(INSERT, (str(CHANNEL), NOW_B - 1, str(mid), "7", f"db{i}"))
+        entries.insert(0, {"id": str(mid), "author_id": "7", "content": f"db{i}"})
     if cached:
-        ctx.redis.rpush(KEY, *[_entry(cached - i) for i in range(cached)])
-    return ctx.load("hot_channels"), peer
+        ctx.redis.rpush(KEY, *[json.dumps(e) for e in entries[:cached]])
+    m = ctx.load("hot_channels")
+    routing = importlib.import_module("channel_routing")
+    data_service = importlib.import_module("data_service")
+    pb2_grpc = importlib.import_module("messages_pb2_grpc")
+    base = pb2_grpc.MessageDataServicer
+    servicers = [v for v in vars(data_service).values() if isinstance(v, type) and issubclass(v, base) and v is not base]
+    assert servicers, "data_service (step 3) defines no MessageDataServicer to read through"
+    for node in routing.INSTANCES:
+        ctx.grpc.serve(pb2_grpc.add_MessageDataServicer_to_server, servicers[0](), target=node)
+    return m, entries
+
+
+class _Reads:
+    """What reached the data path since it was made: GetMessages calls (to any instance) and the reads Postgres ran."""
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.calls_from = len(ctx.grpc.calls_to("GetMessages"))
+        self.queries_from = len(ctx.db.queries)
+
+    def calls(self):
+        return self.ctx.grpc.calls_to("GetMessages")[self.calls_from :]
+
+    def selects(self):
+        return [sql for sql, _params in self.ctx.db.queries[self.queries_from :] if " ".join(sql.split()).lower().startswith("select")]
+
+    def none(self):
+        return not self.calls() and not self.selects()
+
+    def __str__(self):
+        return f"{len(self.calls())} GetMessages call(s) and {len(self.selects())} SELECT(s) on Postgres"
 
 
 async def _get(m, ctx, **params):
+    reads = _Reads(ctx)
     async with ctx.client(m.app) as c:
         r = await c.get(f"/channels/{CHANNEL}/messages", params=params)
     assert r.status_code == 200, f"GET answered {r.status_code}: {r.text[:120]}"
-    return r.json()
+    return r.json(), reads
 
 
 async def _post(m, ctx, content):
@@ -792,14 +822,14 @@ async def _post(m, ctx, content):
 
 
 async def check_cache_read(ctx):
-    m, peer = await _api(ctx, cached=60)
-    page = await _get(m, ctx, limit=50)
-    assert page == [json.loads(_entry(60 - i)) for i in range(50)], f"with 60 cached entries limit=50 must be the first 50 of the list, newest first; got {len(page)} entries starting {page[:2]}"
-    assert peer.requests == [], "the page was in the list: the data service must not be called"
-    page = await _get(m, ctx)
-    assert len(page) == 50 and peer.requests == [], "without ?limit the default page of 50 comes from the list too"
-    page = await _get(m, ctx, limit=60)
-    assert len(page) == 60 and peer.requests == [], "limit=60 is covered by 60 entries: still no data-service call"
+    m, entries = await _api(ctx, stored=60, cached=60)
+    page, reads = await _get(m, ctx, limit=50)
+    assert page == entries[:50], f"with 60 cached entries limit=50 must be the first 50 of the list, newest first; got {len(page)} entries starting {page[:2]}"
+    assert reads.none(), f"the page was in the list, yet the read cost {reads}: a cache hit touches neither the data service nor the database"
+    page, reads = await _get(m, ctx)
+    assert len(page) == 50 and reads.none(), f"without ?limit the default page of 50 comes from the list too; got {len(page)} entries for {reads}"
+    page, reads = await _get(m, ctx, limit=60)
+    assert page == entries and reads.none(), f"limit=60 is covered by 60 entries: the whole list, no data path; got {len(page)} entries for {reads}"
     async with ctx.client(m.app) as c:
         for bad in (0, 101):
             r = await c.get(f"/channels/{CHANNEL}/messages", params={"limit": bad})
@@ -807,35 +837,39 @@ async def check_cache_read(ctx):
 
 
 async def check_full_page_only(ctx):
-    m, peer = await _api(ctx, cached=10)
-    page = await _get(m, ctx, limit=50)
-    assert len(peer.requests) == 1, f"10 cached entries cannot answer a page of 50: the data service must be asked once, it was asked {len(peer.requests)} time(s)"
-    assert peer.requests[0].channel_id == CHANNEL and peer.requests[0].limit == 50, f"the fallback must ask for this channel and limit, asked {peer.requests[0]}"
-    assert [x["content"] for x in page] == ["db0", "db1", "db2"], f"the fallback answer is the data service's page, got {page}"
-    page = await _get(m, ctx, limit=10)
-    assert len(peer.requests) == 1, "10 cached entries do answer a page of 10: no new data-service call"
-    assert page == [json.loads(_entry(10 - i)) for i in range(10)], f"limit=10 must be served from the list, got {page}"
-    page = await _get(m, ctx, limit=5, before=BASE + 4)
-    assert len(peer.requests) == 2, "a request with ?before is never the newest page: it must go to the data service even though the list holds enough entries"
-    assert peer.requests[-1].before == BASE + 4, f"the before cursor must be passed through, the data service saw {peer.requests[-1].before}"
-    assert [x["content"] for x in page] == ["db0", "db1", "db2"], f"the cursor page is the data service's answer, got {page}"
+    m, entries = await _api(ctx, stored=12, cached=10)
+    page, reads = await _get(m, ctx, limit=50)
+    calls = reads.calls()
+    assert len(calls) == 1, f"10 cached entries cannot answer a page of 50: the data service must be asked once, it was asked {len(calls)} time(s)"
+    assert calls[0].request.channel_id == CHANNEL and calls[0].request.limit == 50, f"the fallback must ask for this channel and limit, asked {calls[0].request}"
+    assert page == entries, f"the list holds only 10 of the channel's 12 messages: the page must be all 12 from the data service, got {len(page)}: {[x.get('content') for x in page]}"
+    assert ctx.redis.lrange(KEY, 0, -1) == [json.dumps(e) for e in entries[:10]], "reads never write the list: after the fallback it must hold exactly the 10 entries POST left there"
+    page, reads = await _get(m, ctx, limit=10)
+    assert reads.none(), f"10 cached entries do answer a page of 10, yet the read cost {reads}"
+    assert page == entries[:10], f"limit=10 must be served from the list, got {page}"
+    page, reads = await _get(m, ctx, limit=5, before=entries[7]["id"])
+    calls = reads.calls()
+    assert len(calls) == 1, "a request with ?before is never the newest page: it must go to the data service even though the list holds enough entries"
+    assert calls[0].request.before == int(entries[7]["id"]), f"the before cursor must be passed through, the data service saw {calls[0].request.before}"
+    assert page == entries[8:], f"the page older than db4 is db3..db0 from the data service, got {[x.get('content') for x in page]}"
 
 
 async def check_fallback(ctx):
-    m, peer = await _api(ctx)
-    page = await _get(m, ctx, limit=50)
-    assert len(peer.requests) == 1, f"an empty list must fall back to the data service once, it was called {len(peer.requests)} time(s)"
-    request = peer.requests[0]
-    assert request.before > 2**53, f"without ?before the fallback must pass latest_snowflake() (an id newer than anything minted), it passed {request.before}"
-    expected = [{"id": str(request.before - 1 - i), "author_id": "7", "content": f"db{i}"} for i in range(3)]
-    assert page == expected, f"the data service's messages must be answered as {{id, author_id, content}} with string ids, got {page}"
+    m, entries = await _api(ctx, stored=3)
+    page, reads = await _get(m, ctx, limit=50)
+    calls = reads.calls()
+    assert len(calls) == 1, f"an empty list must fall back to the data service once, it was called {len(calls)} time(s)"
+    assert calls[0].request.before > int(entries[0]["id"]), f"without ?before the fallback must pass latest_snowflake(), an id newer than anything stored; it passed {calls[0].request.before}"
+    assert reads.selects(), "the fallback page must come from Postgres through the data service, no query reached it"
+    assert page == entries, f"the data service's messages must be answered as {{id, author_id, content}} with string ids, newest first: expected {entries}, got {page}"
     assert ctx.redis.exists(KEY) == 0, "reads never fill the list: it is written only by POST, otherwise an old page could shadow a newer message"
-    await _get(m, ctx, limit=50)
-    assert len(peer.requests) == 2, "a second miss is a second data-service call: nothing was cached by the read"
+    page, reads = await _get(m, ctx, limit=50)
+    assert len(reads.calls()) == 1, f"a second miss is a second data-service call (nothing was cached by the read), it made {len(reads.calls())}"
+    assert page == entries and ctx.redis.exists(KEY) == 0, "the second miss answers the same page and still leaves the list alone"
 
 
 async def check_write_through(ctx):
-    m, peer = await _api(ctx, cached=99)
+    m, entries = await _api(ctx, stored=99, cached=99)
     r = await _post(m, ctx, "")
     assert r.status_code == 400, f"empty content must be a 400, got {r.status_code}"
     assert ctx.redis.llen(KEY) == 99, "a rejected message must not touch the list"
@@ -844,20 +878,21 @@ async def check_write_through(ctx):
         r = await _post(m, ctx, content)
         assert r.status_code == 201, f"POST answered {r.status_code}, expected 201"
         ids.append(r.json()["id"])
-    rows = await ctx.db.execute("SELECT message_id, content FROM messages ORDER BY message_id")
-    assert [row["message_id"] for row in rows] == ids, f"every message must be stored (store_message), the table holds {[row['content'] for row in rows]}"
+    rows = await ctx.db.execute("SELECT message_id, content FROM messages ORDER BY message_id DESC LIMIT 3")
+    assert [row["message_id"] for row in rows] == ids[::-1], f"every message must be stored (store_message), the newest rows are {[row['content'] for row in rows]}"
     produced = ctx.kafka.records("message-events")
     assert len(produced) == 3 and all(rec.key == str(CHANNEL).encode() for rec in produced), f"every stored message must be published once, keyed by the channel; produced {[(rec.key, rec.offset) for rec in produced]}"
     assert ctx.redis.llen(KEY) == 100, f"99 cached + 3 pushed must be trimmed to 100 (LTRIM 0 99), the list holds {ctx.redis.llen(KEY)}"
     head = [json.loads(x) for x in ctx.redis.lrange(KEY, 0, 2)]
     assert head == [{"id": ids[2], "author_id": "7", "content": "third"}, {"id": ids[1], "author_id": "7", "content": "second"}, {"id": ids[0], "author_id": "7", "content": "first"}], f"the three posts must sit at the head of the list, newest first, as {{id, author_id, content}}: {head}"
-    assert ctx.redis.lrange(KEY, -1, -1) == [_entry(3)], "the two oldest cached entries must have been trimmed away"
-    page = await _get(m, ctx, limit=50)
-    assert page[:3] == head and peer.requests == [], "the newest page now comes from the list and starts with the messages just posted"
+    assert [json.loads(x) for x in ctx.redis.lrange(KEY, -1, -1)] == [entries[96]], "the two oldest cached entries must have been trimmed away"
+    page, reads = await _get(m, ctx, limit=50)
+    assert reads.none(), f"the newest page is in the list now, yet the read cost {reads}"
+    assert page[:3] == head and page[3:] == entries[:47], "the newest page comes from the list and starts with the messages just posted"
 
 
 async def check_ttl(ctx):
-    m, peer = await _api(ctx)
+    m, entries = await _api(ctx)
     r = await _post(m, ctx, "hello")
     assert r.status_code == 201, f"POST answered {r.status_code}"
     ttl = ctx.redis.ttl(KEY)
@@ -865,11 +900,12 @@ async def check_ttl(ctx):
     assert 290 <= ttl <= 300, f"{KEY} expires in {ttl} s, expected 300"
     ctx.clock.advance(200)
     await _post(m, ctx, "again")
-    assert ctx.redis.ttl(KEY) > 250, f"a new message must re-arm the expiry, TTL is {ctx.redis.ttl(KEY)} s"
+    assert ctx.redis.ttl(KEY) > 250, f"a new message must re-arm the expiry, 200 s later the TTL is {ctx.redis.ttl(KEY)} s"
     ctx.clock.advance(301)
     assert ctx.redis.exists(KEY) == 0, f"{KEY} must be gone 300 s after the last message"
-    await _get(m, ctx, limit=50)
-    assert len(peer.requests) == 1, "once the list expired the newest page comes from the data service again"
+    page, reads = await _get(m, ctx, limit=50)
+    assert len(reads.calls()) == 1, f"once the list expired the newest page comes from the data service again, it was called {len(reads.calls())} time(s)"
+    assert [x["content"] for x in page] == ["again", "hello"], f"the page after expiry is read from Postgres: again, hello — got {[x.get('content') for x in page]}"
 `,
   },
   debrief: `The list is the cheapest cache in the system because it has exactly one writer and one shape: the request that stored the message pushes it, so the head of the list is the newest message by construction, and a read that finds a full page can trust it without a version or a timestamp. Refusing to answer from a short list is what keeps that trust — a list that holds 30 items says nothing about item 31, which may well exist in the database. Not filling on a miss is the same discipline from the other side: a read-populated list would race the write that happened between the database read and the push, and could shadow a newer message until the TTL rescued it. Write-through costs one pipeline per post, which is nothing next to the write itself, and the TTL only decides when a cold channel stops paying rent. Discord's note that they "do not want to have to cache messages in Redis" is about the database being fast enough for the long tail; the hot head of a popular channel is a different workload, and a bounded list per channel is the usual answer to it. Real systems invalidate the list on edits and deletes, store a compact encoding instead of JSON, and keep the per-channel hash from the previous step beside it so "is there anything new since id X" is one HGET.`,

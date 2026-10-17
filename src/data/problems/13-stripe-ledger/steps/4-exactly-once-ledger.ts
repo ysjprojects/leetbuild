@@ -511,6 +511,11 @@ std::optional<std::string> write_transaction(const std::vector<Entry>& entries, 
 import time
 import uuid
 
+import grpc
+
+import ledger_pb2
+import ledger_pb2_grpc
+
 SCHEMA = """
 CREATE TABLE transactions (
     id text PRIMARY KEY,
@@ -520,7 +525,7 @@ CREATE TABLE transactions (
     posted_at bigint NOT NULL
 );
 CREATE TABLE entries (
-    transaction_id text NOT NULL REFERENCES transactions (id),
+    transaction_id text NOT NULL,
     account text NOT NULL,
     currency text NOT NULL,
     amount bigint NOT NULL CHECK (amount <> 0),
@@ -533,21 +538,37 @@ ENTRIES = [
     {"account": "cash:acquirer", "currency": "EUR", "amount": 4999},
     {"account": "clearing:payments", "currency": "EUR", "amount": -4999},
 ]
+PAYOUT = [
+    {"account": "clearing:payments", "currency": "EUR", "amount": 4999},
+    {"account": "cash:bank", "currency": "EUR", "amount": -4999},
+]
 
 
 async def _writer(ctx):
-    """The learner's module with the step 5 / step 6 hooks replaced by recorders that note the database state when called."""
+    """The learner's writer on an empty ledger; its track (step 5) and invalidate (step 6) are the real ones."""
     await ctx.db.reset(SCHEMA)
-    m = ctx.load("ledger_writer")
-    m.hooks = []
-    m.track = lambda transaction_id, posted_at, entries, settles=None: m.hooks.append(("track", transaction_id, posted_at, entries, settles, list(ctx.db.events)))
-    m.invalidate = lambda account, currency: m.hooks.append(("invalidate", account, currency, list(ctx.db.events)))
-    return m
+    return ctx.load("ledger_writer")
+
+
+def _balances(ctx):
+    """The real balance service (step 6) — the reader whose cache the writer must invalidate — and a stub on it."""
+    import balance_service
+
+    ctx.grpc.serve(ledger_pb2_grpc.add_LedgerServiceServicer_to_server, balance_service.LedgerService())
+    return ledger_pb2_grpc.LedgerServiceStub(grpc.aio.insecure_channel("ledger:9100"))
+
+
+async def _balance(stub, account, currency="EUR"):
+    return (await stub.GetBalance(ledger_pb2.BalanceRequest(account=account, currency=currency), timeout=2.0)).amount
 
 
 async def _rows(ctx, table):
     order = "posted_at, account, amount" if table == "entries" else "posted_at, id"
     return await ctx.db.execute(f"SELECT * FROM {table} ORDER BY {order}")
+
+
+def _open(ctx):
+    return {member: int(score) for member, score in ctx.redis.zrange("clearing:open", 0, -1, withscores=True)}
 
 
 async def check_unique_event_id(ctx):
@@ -576,7 +597,7 @@ async def check_no_double_entries(ctx):
     await m.write_transaction(ENTRIES, "payment.captured", event_id="evt_01", posted_at=T0)
     entries = await _rows(ctx, "entries")
     assert len(entries) == 2, f"three deliveries of one event must leave exactly two entries, found {len(entries)}: the duplicate must return before the entries loop"
-    # End to end: the step 3 consumer redelivers evt_02 (a replayed record with a new offset).
+    # End to end: the real step 3 consumer meets evt_02 twice (a producer retry: a second record with a new offset).
     for event_id in ("evt_02", "evt_03", "evt_02"):
         event = {"event_id": event_id, "type": "payout.sent", "amount": 120000, "currency": "USD", "occurred_at": T0 + 10}
         ctx.kafka.seed("money-events", key=event_id, value=json.dumps(event))
@@ -609,12 +630,15 @@ async def check_event_time(ctx):
 
 async def check_atomic(ctx):
     m = await _writer(ctx)
-    await m.write_transaction(ENTRIES, "payment.captured", event_id="evt_01", posted_at=T0)
+    first = await m.write_transaction(ENTRIES, "payment.captured", event_id="evt_01", posted_at=T0)
     assert ctx.db.events == ["BEGIN", "COMMIT"], f"the transaction row and its entries must be written in one database transaction; the database saw {ctx.db.events}"
+    stub = _balances(ctx)
+    assert await _balance(stub, "cash:acquirer") == 4999  # now cached by the balance service
+    assert ctx.redis.exists("bal:cash:acquirer:EUR"), "the balance service must have cached cash:acquirer EUR"
     # The second entry violates entries.amount <> 0: the transaction row must roll back with it.
     broken = [{"account": "cash:acquirer", "currency": "EUR", "amount": 4999}, {"account": "clearing:payments", "currency": "EUR", "amount": 0}]
     try:
-        await m.write_transaction(broken, "payment.captured", event_id="evt_02", posted_at=T0)
+        await m.write_transaction(broken, "payment.captured", event_id="evt_02", posted_at=T0 + 1)
         raise AssertionError("a failed entry insert must propagate (the transaction rolls back), not be swallowed")
     except AssertionError:
         raise
@@ -624,27 +648,39 @@ async def check_atomic(ctx):
     transactions = await _rows(ctx, "transactions")
     assert [t["event_id"] for t in transactions] == ["evt_01"], f"evt_02's entry failed but its transactions row was committed: the two inserts are not in one transaction ({[t['event_id'] for t in transactions]})"
     assert len(await _rows(ctx, "entries")) == 2, "no entry of the failed transaction may survive"
-    assert not any(h[0] == "track" and h[1] != transactions[0]["id"] for h in m.hooks), "a rolled-back transaction must not be tracked"
+    assert _open(ctx) == {first: T0}, f"only evt_01 is in the journal, so only it may be open in clearing; clearing:open holds {_open(ctx)} — a rolled-back transaction must not be tracked"
+    assert ctx.redis.exists("bal:cash:acquirer:EUR"), "the rolled-back write changed no balance, yet the cached cash:acquirer EUR balance was dropped: the hooks must run only after a commit"
 
 
 async def check_after_commit_hooks(ctx):
     m = await _writer(ctx)
-    tx = await m.write_transaction(ENTRIES, "payout.sent", event_id="evt_01", posted_at=T0, settles="tx-0")
-    tracks = [h for h in m.hooks if h[0] == "track"]
-    invalidates = [h for h in m.hooks if h[0] == "invalidate"]
-    assert len(tracks) == 1, f"track must be called exactly once per written transaction, was called {len(tracks)} times"
-    _, tracked_id, posted_at, entries, settles, events = tracks[0]
-    assert tracked_id == tx, f"track must receive the transaction id {tx}, got {tracked_id}"
-    assert posted_at == T0, f"track must receive posted_at {T0}, got {posted_at}"
-    assert [(e["account"], e["amount"]) for e in entries] == [("cash:acquirer", 4999), ("clearing:payments", -4999)], f"track must receive the entries, got {entries}"
-    assert settles == "tx-0", f"track must receive settles, got {settles!r}"
-    assert events and events[-1] == "COMMIT", f"track must run after the commit; when it ran the database had seen {events}"
-    assert sorted((h[1], h[2]) for h in invalidates) == [("cash:acquirer", "EUR"), ("clearing:payments", "EUR")], f"invalidate must run once per entry with (account, currency), got {[(h[1], h[2]) for h in invalidates]}"
-    assert all(h[3][-1] == "COMMIT" for h in invalidates), "invalidate must run after the commit"
-    m.hooks.clear()
-    again = await m.write_transaction(ENTRIES, "payout.sent", event_id="evt_01", posted_at=T0, settles="tx-0")
-    assert again is None
-    assert m.hooks == [], f"a skipped duplicate must call neither track nor invalidate, but called {[h[0] for h in m.hooks]}"
+    await m.write_transaction(ENTRIES, "payment.captured", event_id="evt_00", posted_at=T0 - 1000)
+    stub = _balances(ctx)
+    assert await _balance(stub, "cash:acquirer") == 4999
+    assert await _balance(stub, "clearing:payments") == -4999
+    before = len(ctx.db.events)
+    # Snapshots of what the database had been through at the moment each Redis side effect happened.
+    tracked = ctx.redis_after("clearing:open", lambda: list(ctx.db.events[before:]))
+    dropped = ctx.redis_after("bal:clearing:payments:EUR", lambda: list(ctx.db.events[before:]))
+    tx = await m.write_transaction(ENTRIES, "payment.captured", event_id="evt_01", posted_at=T0)
+    assert tracked.fired, "the written transaction touches clearing:payments but clearing:open was never updated: call track after the commit"
+    assert tracked.result == ["BEGIN", "COMMIT"], f"clearing:open was updated when the database had seen only {tracked.result}: track must run after the commit"
+    assert dropped.fired and not ctx.redis.exists("bal:clearing:payments:EUR"), "the cached clearing:payments EUR balance survived the write: invalidate(account, currency) for every entry"
+    assert dropped.result == ["BEGIN", "COMMIT"], f"the cached balance was dropped when the database had seen only {dropped.result}: invalidate must run after the commit"
+    assert not ctx.redis.exists("bal:cash:acquirer:EUR"), "the cached cash:acquirer EUR balance survived the write: invalidate every entry's account"
+    assert await _balance(stub, "cash:acquirer") == 9998, "right after the write the balance service must answer the new cash:acquirer balance 9998"
+    opened = _open(ctx)
+    assert opened.get(tx) == T0, f"the transaction must be open in clearing:open at its posted_at {T0}, clearing:open holds {opened}"
+    payout = await m.write_transaction(PAYOUT, "payout.sent", event_id="evt_02", posted_at=T0 + 5000, settles=tx)
+    opened = _open(ctx)
+    assert tx not in opened and payout not in opened, f"the payout settles {tx}: track must get settles, close that item and open none, clearing:open holds {opened}"
+    # A redelivery of evt_01 is skipped: nothing changed, so nothing may be tracked or invalidated.
+    assert await _balance(stub, "cash:acquirer") == 9998
+    open_before = _open(ctx)
+    again = await m.write_transaction(ENTRIES, "payment.captured", event_id="evt_01", posted_at=T0)
+    assert again is None, f"the duplicate must return None, got {again!r}"
+    assert _open(ctx) == open_before, f"a skipped duplicate must not be tracked: clearing:open went from {open_before} to {_open(ctx)}"
+    assert ctx.redis.exists("bal:cash:acquirer:EUR"), "a skipped duplicate changed no balance, yet the cached cash:acquirer EUR balance was dropped"
 `,
   },
   debrief: `The unique index on \`event_id\` is the only exactly-once mechanism that survives everything: the consumer may crash after writing and before committing, two consumers may briefly own the same partition during a rebalance, a producer may publish twice — and the journal still holds one row per event, because the database refuses the second. Reading the affected row count turns that refusal into a decision instead of an error. The hooks run after the commit because Redis is not part of the transaction: a tracked clearing item for a rolled-back transaction would be a phantom the sweeper could never settle. Stripe's post describes Ledger as immutable — nothing is updated or deleted, corrections are new transactions — and the shape here is the same: the only write is an insert, and the only conflict resolution is "already there".`,

@@ -561,37 +561,18 @@ def sf(bucket, offset_ms=0):
     return ((bucket * BUCKET_MS + offset_ms) << 22) | (1 << 17)
 
 
-CHANNEL = sf(NOW_B - 1, 5000)
+CHANNEL = sf(NOW_B - 1, 5000)  # created last bucket: a page walk reads two buckets
+HOT = sf(NOW_B, 500)  # created this bucket: one page walk is exactly one query on Postgres
 END = sf(NOW_B, BUCKET_MS - 1)
-PAGE = [{"id": str(sf(NOW_B, 3000)), "author_id": "7", "content": "c"}, {"id": str(sf(NOW_B, 2000)), "author_id": "7", "content": "b"}, {"id": str(sf(NOW_B, 1000)), "author_id": "9", "content": "a"}]
+HOT_ROWS = [(NOW_B, 1000, "a"), (NOW_B, 2000, "b"), (NOW_B, 3000, "c")]
 
 
-class _Store:
-    """Stands in for step 2's read_page: counts reads, holds them until released, can fail once."""
-
-    def __init__(self, page=PAGE):
-        self.page = page
-        self.calls = []
-        self.gate = asyncio.Event()
-        self.gate.set()
-        self.fail = 0
-
-    async def read_page(self, channel_id, before, limit):
-        self.calls.append((channel_id, before, limit))
-        await self.gate.wait()
-        if self.fail:
-            self.fail -= 1
-            raise RuntimeError("scylla timed out")
-        return [dict(r) for r in self.page[:limit]]
-
-
-async def _start(ctx, rows=(), store=None):
+async def _start(ctx, rows=(), channel=CHANNEL):
+    """Postgres with \`rows\` (bucket, offset_ms, content) of \`channel\`, and the data service serving over the real page walk (step 2)."""
     await ctx.db.reset(SCHEMA)
     for bucket, offset_ms, content in rows:
-        await ctx.db.execute(INSERT, (str(CHANNEL), bucket, str(sf(bucket, offset_ms)), "7", content))
+        await ctx.db.execute(INSERT, (str(channel), bucket, str(sf(bucket, offset_ms)), "7", content))
     m = ctx.load("data_service")
-    if store is not None:
-        m.read_page = store.read_page
     asyncio.create_task(m.serve())
     await asyncio.sleep(0)
     assert ctx.grpc.find("/discord.MessageData/GetMessages") is not None, "serve() registered no MessageData.GetMessages handler"
@@ -602,9 +583,13 @@ def _req(channel=CHANNEL, before=END, limit=50):
     return messages_pb2.GetMessagesRequest(channel_id=channel, before=before, limit=limit)
 
 
-async def _settle(n=6):
-    for _ in range(n):
-        await asyncio.sleep(0)
+def _selects(ctx, since):
+    """The reads of the messages table Postgres ran since \`since\` (its query log)."""
+    return [sql for sql, _params in ctx.db.queries[since:] if " ".join(sql.split()).lower().startswith("select") and "messages" in sql.lower()]
+
+
+def _contents(reply):
+    return [x.content for x in reply.messages]
 
 
 async def check_servicer(ctx):
@@ -617,70 +602,62 @@ async def check_servicer(ctx):
 async def check_reads_page(ctx):
     rows = [(NOW_B - 1, 1000, "old"), (NOW_B, 1000, "a"), (NOW_B, 2000, "b"), (NOW_B, 3000, "c")]
     m, stub = await _start(ctx, rows=rows)
+    await ctx.db.execute(INSERT, (str(HOT), NOW_B, str(sf(NOW_B, 2500)), "9", "another channel"))
     reply = await stub.GetMessages(_req(limit=2))
     got = [(x.id, x.author_id, x.content) for x in reply.messages]
-    assert got == [(sf(NOW_B, 3000), 7, "c"), (sf(NOW_B, 2000), 7, "b")], f"limit=2 must return the two newest rows, ids as 64-bit integers: got {got}"
+    assert got == [(sf(NOW_B, 3000), 7, "c"), (sf(NOW_B, 2000), 7, "b")], f"limit=2 must return the two newest rows of the channel, ids as 64-bit integers: got {got}"
     reply = await stub.GetMessages(_req(before=sf(NOW_B, 2000), limit=5))
-    assert [x.content for x in reply.messages] == ["a", "old"], f"before=<id of b> must walk back to the channel's first bucket: expected a, old — got {[x.content for x in reply.messages]}"
-    selects = [s for s in ctx.db.statements if s.lstrip().upper().startswith("SELECT")]
-    assert selects, "the page must come from read_page, which queries the messages table"
+    assert _contents(reply) == ["a", "old"], f"before=<id of b> must walk back to the channel's first bucket: expected a, old — got {_contents(reply)}"
+    reply = await stub.GetMessages(_req(channel=HOT, limit=5))
+    assert _contents(reply) == ["another channel"], f"channel_id selects the channel: the other channel's page is its one message, got {_contents(reply)}"
 
 
 async def check_single_flight(ctx):
-    store = _Store()
-    m, stub = await _start(ctx, store=store)
-    store.gate.clear()
-    fan_out = asyncio.gather(*[stub.GetMessages(_req()) for _ in range(5)])
-    other = asyncio.ensure_future(stub.GetMessages(_req(limit=10)))
-    await _settle()
-    assert len(store.calls) >= 1, "no database read was started for the concurrent requests"
-    assert len(store.calls) == 2, f"5 identical requests plus one with another limit must start exactly 2 reads while the first is still running, started {len(store.calls)}: {store.calls}"
-    assert store.calls[0] == (CHANNEL, END, 50) and store.calls[1] == (CHANNEL, END, 10), f"read_page must receive the request's channel_id, before and limit, got {store.calls}"
-    store.gate.set()
-    replies = await fan_out
-    await other
+    m, stub = await _start(ctx, rows=HOT_ROWS, channel=HOT)
+    since = len(ctx.db.queries)
+    replies = await asyncio.gather(*[stub.GetMessages(_req(channel=HOT)) for _ in range(5)], stub.GetMessages(_req(channel=HOT, limit=10)))
+    reads = _selects(ctx, since)
+    assert len(reads) >= 1, "no database read happened for the concurrent requests"
+    assert len(reads) == 2, f"5 identical concurrent GetMessages plus one with another limit must cost Postgres 2 page reads (one query each here), it ran {len(reads)} queries: identical requests in flight together must share one read, a different key reads on its own"
     for reply in replies:
-        assert [x.content for x in reply.messages] == ["c", "b", "a"], f"every coalesced caller gets the full page, one got {[x.content for x in reply.messages]}"
-    assert len(store.calls) == 2, f"no extra read may happen once the callers are served, saw {len(store.calls)}"
+        assert _contents(reply) == ["c", "b", "a"], f"every coalesced caller gets the full page, one got {_contents(reply)}"
     # One impatient subscriber must not cancel the read for the others.
-    store.gate.clear()
-    first = asyncio.ensure_future(stub.GetMessages(_req()))
-    second = asyncio.ensure_future(stub.GetMessages(_req()))
-    await _settle()
+    since = len(ctx.db.queries)
+    first = asyncio.ensure_future(stub.GetMessages(_req(channel=HOT)))
+    second = asyncio.ensure_future(stub.GetMessages(_req(channel=HOT)))
+    await asyncio.sleep(0)  # both callers are in and waiting on one read that has not finished
     first.cancel()
-    await _settle()
-    store.gate.set()
     try:
         reply = await second
     except (grpc.RpcError, asyncio.CancelledError) as e:
-        raise AssertionError(f"a subscriber hung up and the other caller's request failed with {e!r}: await the shared task through asyncio.shield")
-    assert [x.content for x in reply.messages] == ["c", "b", "a"], "the remaining subscriber must still get the full page"
+        raise AssertionError(f"a subscriber hung up and the other caller's request failed with {e!r}: the shared read was cancelled with it — await it through asyncio.shield")
+    await asyncio.gather(first, return_exceptions=True)
+    assert _contents(reply) == ["c", "b", "a"], f"the remaining subscriber must still get the full page, got {_contents(reply)}"
+    assert len(_selects(ctx, since)) == 1, f"the two callers must have shared one read, Postgres ran {len(_selects(ctx, since))} queries"
 
 
 async def check_slot_cleared(ctx):
-    store = _Store()
-    m, stub = await _start(ctx, store=store)
-    await stub.GetMessages(_req())
-    await _settle()
-    assert not m.inflight, f"the key must leave inflight once the read completed, inflight still holds {list(m.inflight)}"
-    await stub.GetMessages(_req())
-    assert len(store.calls) == 2, f"an identical request after the first completed must read again (no stale result), saw {len(store.calls)} read(s)"
-    store.fail = 1
-    store.gate.clear()
-    calls = [asyncio.ensure_future(stub.GetMessages(_req())) for _ in range(2)]
-    await _settle()
-    store.gate.set()
-    for call in calls:
-        try:
-            await call
-            raise AssertionError("a failed database read must fail the callers, not answer an empty page")
-        except grpc.RpcError as e:
-            assert e.code() == grpc.StatusCode.UNAVAILABLE, f"a failed read must surface as UNAVAILABLE, got {e.code()}"
-    assert len(store.calls) == 3, f"both callers must have shared the one failing read, saw {len(store.calls)} read(s)"
-    await _settle()
-    assert not m.inflight, f"a failed read must leave inflight too, it still holds {list(m.inflight)}"
-    reply = await stub.GetMessages(_req())
-    assert [x.content for x in reply.messages] == ["c", "b", "a"], "after a failure the next request must read fresh and succeed"
+    m, stub = await _start(ctx, rows=HOT_ROWS, channel=HOT)
+    reply = await stub.GetMessages(_req(channel=HOT))
+    assert _contents(reply) == ["c", "b", "a"], f"expected the page c, b, a, got {_contents(reply)}"
+    await ctx.db.execute(INSERT, (str(HOT), NOW_B, str(sf(NOW_B, 4000)), "7", "d"))
+    since = len(ctx.db.queries)
+    reply = await stub.GetMessages(_req(channel=HOT))
+    assert len(_selects(ctx, since)) == 1 and _contents(reply) == ["d", "c", "b", "a"], f"an identical request after the first completed must read again (no stale result): message d was stored since, the reply was {_contents(reply)} and Postgres ran {len(_selects(ctx, since))} queries"
+    await ctx.db.execute("ALTER TABLE messages RENAME TO messages_offline")  # the store goes away under the read
+    since = len(ctx.db.queries)
+    outcomes = await asyncio.gather(stub.GetMessages(_req(channel=HOT)), stub.GetMessages(_req(channel=HOT)), return_exceptions=True)
+    for outcome in outcomes:
+        assert isinstance(outcome, grpc.RpcError), f"a failed database read must fail the callers, one was answered {outcome!r}"
+        assert outcome.code() == grpc.StatusCode.UNAVAILABLE, f"a failed read must surface as UNAVAILABLE, got {outcome.code()}"
+    assert len(_selects(ctx, since)) == 1, f"both callers must have shared the one failing read, Postgres was asked {len(_selects(ctx, since))} times"
+    await ctx.db.execute("ALTER TABLE messages_offline RENAME TO messages")
+    since = len(ctx.db.queries)
+    try:
+        reply = await stub.GetMessages(_req(channel=HOT))
+    except grpc.RpcError as e:
+        raise AssertionError(f"the store is back, yet the next identical request failed with {e.code()}: the failed read was kept as the answer instead of leaving inflight")
+    assert _contents(reply) == ["d", "c", "b", "a"] and len(_selects(ctx, since)) == 1, f"after a failure the next request must read fresh and succeed, got {_contents(reply)} from {len(_selects(ctx, since))} queries"
 
 
 async def check_reply(ctx):

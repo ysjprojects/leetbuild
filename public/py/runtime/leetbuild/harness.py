@@ -4,10 +4,15 @@ Runs a step's harness against the learner's files. A harness is a Python module 
 empty broker, no gRPC peers, the clock at zero, every learner/support module unloaded — and
 passes unless it raises. `AssertionError` messages become the verdict's explanation.
 
-`ctx` is the harness's handle on that world: the learner's modules (`ctx.load`), Redis probes
-(`ctx.redis`, `ctx.redis_bytes`), the broker (`ctx.kafka`), the gRPC registry (`ctx.grpc`), the
-clock (`ctx.clock`), Postgres (`ctx.db`), an in-memory HTTP client for ASGI apps (`ctx.client`)
-and `ctx.drain`, which runs a consumer/sweeper loop until the runtime stops it.
+`ctx` is the harness's handle on that world: the learner's modules (`ctx.load`), Redis
+(`ctx.redis`, `ctx.redis_bytes`, and `ctx.redis_after` to land a parallel request between two of
+the learner's commands), the broker (`ctx.kafka`: records, commits, stalls), the gRPC registry
+(`ctx.grpc`: peers at addresses, latency, failures, the calls made), the clock (`ctx.clock`),
+Postgres (`ctx.db`: rows, transactions, the queries run), an in-memory HTTP client for ASGI apps
+(`ctx.client`) and `ctx.drain`, which runs a consumer/sweeper loop until the runtime stops it.
+
+A check grades what the code does, never what it looks like: there is deliberately no access to
+the learner's source.
 """
 from __future__ import annotations
 
@@ -19,6 +24,7 @@ import traceback
 from typing import Any, Awaitable, Callable
 
 import fakeredis
+from fakeredis._socket._base import BaseFakeSocket
 import httpx
 
 from .clock import CLOCK
@@ -29,6 +35,43 @@ from .kafka import BROKER
 WORK = "/work"
 SUPPORT = "/support"
 SERVER = fakeredis.FakeServer()
+
+
+class RedisProbe:
+    def __init__(self, key: bytes, fn: Callable[[], Any]) -> None:
+        self.key = key
+        self.fn = fn
+        self.fired = False
+        self.result: Any = None
+        self.error: BaseException | None = None
+
+
+_PROBES: list[RedisProbe] = []
+_process_command = BaseFakeSocket._process_command
+
+
+def _process_command_with_probes(self, fields: list[bytes]) -> None:
+    """The server's dispatch with probes: they fire after a command — or a whole MULTI/EXEC, or a Lua
+    script, which run atomically — has executed, before its client reads the reply."""
+    if not _PROBES or not fields:
+        return _process_command(self, fields)
+    if getattr(self, "_queueing", False):
+        if bytes(fields[0]).lower() != b"exec":
+            return _process_command(self, fields)  # queued: it runs, and is observed, at EXEC
+        queued = getattr(self, "_transaction", None) or []
+        touched = {bytes(a) for _func, _sig, args in queued for a in args if isinstance(a, (bytes, bytearray, memoryview))}
+    else:
+        touched = {bytes(a) for a in fields[1:] if isinstance(a, (bytes, bytearray, memoryview))}
+    _process_command(self, fields)
+    for probe in [p for p in _PROBES if not p.fired and p.key in touched]:
+        probe.fired = True
+        try:
+            probe.result = probe.fn()
+        except Exception as exc:  # reported through the probe, not inside the learner's Redis call
+            probe.error = exc
+
+
+BaseFakeSocket._process_command = _process_command_with_probes
 
 
 class Ctx:
@@ -46,12 +89,26 @@ class Ctx:
         _purge_modules()
         return importlib.import_module(stem)
 
-    def source(self, stem: str) -> str:
-        """The learner's source for a file stem, for the rare property only the text shows."""
-        for name, text in self.files.items():
-            if name == stem or name.rsplit(".", 1)[0] == stem:
-                return text
-        raise KeyError(stem)
+    def redis_after(self, key: str, fn: Callable[[], Any]) -> "RedisProbe":
+        """
+        Run `fn` once, right after the first command that touches `key` has executed on the Redis
+        server — from any client, a pipeline's EXEC or a Lua script included — and before that client
+        reads its reply: another worker's request landing between two of the learner's commands (a
+        race, the way two app servers produce one), or a snapshot of the world at that instant. The
+        probe records whether `key` was touched at all (`fired`), and what `fn` returned or raised.
+        """
+        probe = RedisProbe(key.encode(), fn)
+        _PROBES.append(probe)
+        return probe
+
+    def db_after(self, pattern: str, fn: Callable[[], Any]):
+        """
+        Run `fn` once, right after the first SQL statement containing `pattern` has run on Postgres —
+        succeeded or failed — before its caller sees the outcome: make a write slow
+        (`ctx.clock.advance(6)` while its transaction is open lets Kafka's auto-commit timer fire), or
+        snapshot the world mid-transaction. Returns the probe (`fired`, `result`, `error`).
+        """
+        return DB.after(pattern, fn)
 
     def client(self, app, base_url: str = "http://service", **kwargs) -> httpx.AsyncClient:
         """An HTTP client that calls the ASGI `app` in-process: `async with ctx.client(m.app) as c:`."""
@@ -86,6 +143,9 @@ def reset_world() -> None:
     REGISTRY.reset()
     DB.events.clear()
     DB.statements.clear()
+    DB.queries.clear()
+    DB.probes.clear()
+    _PROBES.clear()
     _purge_modules()
 
 

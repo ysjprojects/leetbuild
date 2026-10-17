@@ -427,10 +427,14 @@ void append_event(const std::string& ns, const std::string& name, long long delt
   },
   harness: {
     python: `import json
-import re
 import time
 
 TOPIC = "counter-events"
+FLUSH_TIMEOUT_S = 1.0
+
+
+def _tokens(ctx):
+    return [json.loads(r.value).get("token") for r in ctx.kafka.records(TOPIC)]
 
 
 def check_topic_key(ctx):
@@ -459,23 +463,41 @@ def check_event_shape(ctx):
 
 def check_acks_all(ctx):
     m = ctx.load("count_events")
-    conf = m.producer.conf
-    acks = str(conf.get("acks", "")).lower()
-    assert acks in ("all", "-1"), f"the producer asks for acks={conf.get('acks')!r}: a 202 promises durability, so every in-sync replica must have the event (acks=all)"
-    idempotence = conf.get("enable.idempotence")
-    assert idempotence is True or str(idempotence).lower() == "true", "enable.idempotence must be on: the producer's own retries would otherwise double an event"
+    # The partition leader fails right after acknowledging: only an event every in-sync replica has survives.
+    m.append_event("plays", "stranger-things", 1, "t-9f3")
+    ctx.kafka.failover(TOPIC)
+    held = len(ctx.kafka.records(TOPIC))
+    assert held == 1, f"append_event returned (the API would answer 202), then the partition leader failed and {TOPIC} holds {held} record(s) instead of the event: it had been acknowledged by the leader alone. A durability promise needs acks=all"
+    # The broker writes the next event but its acknowledgement is lost: the producer retries it.
+    ctx.kafka.lose_acks(TOPIC)
+    m.append_event("plays", "stranger-things", 2, "t-9f4")
+    copies = len(ctx.kafka.records(TOPIC)) - 1
+    assert copies == 1, f"the broker wrote the second event, its acknowledgement was lost and the producer retried: {TOPIC} now holds it {copies} times. With enable.idempotence the broker recognises the retry and writes the event once"
 
 
 def check_bounded_flush(ctx):
     m = ctx.load("count_events")
-    m.append_event("plays", "stranger-things", 1, "t-9f3")
-    assert ctx.kafka.flushes == 1, f"append_event must flush once before returning (saw {ctx.kafka.flushes} flushes): the 202 is only true once the broker acknowledged"
-    assert len(ctx.kafka.records(TOPIC)) == 1
-    m.append_event("plays", "stranger-things", 1, "t-9f4")
-    assert ctx.kafka.flushes == 2, "every add waits for its own acknowledgement"
-    source = ctx.source("count_events")
-    assert re.search(r"flush\\(\\s*\\)", source) is None, "flush() without a timeout waits forever on a dead broker; bound it with FLUSH_TIMEOUT_S"
-    assert re.search(r"flush\\(\\s*(timeout\\s*=\\s*)?(FLUSH_TIMEOUT_S|[\\d.]+)\\s*\\)", source) is not None, "flush must be bounded by FLUSH_TIMEOUT_S"
+    # The broker is slow but answers within FLUSH_TIMEOUT_S: the add waits for the ack and succeeds.
+    ctx.kafka.stall(TOPIC, seconds=0.8)
+    try:
+        m.append_event("plays", "stranger-things", 1, "t-9f3")
+    except m.EventNotDurable as e:
+        raise AssertionError(f"the broker acknowledged after 0.8 s, within FLUSH_TIMEOUT_S (1 s), but append_event raised EventNotDurable ({e}): it must wait for the acknowledgement up to the bound")
+    held = len(ctx.kafka.records(TOPIC))
+    assert held == 1, f"append_event returned while the event was still unacknowledged ({TOPIC} holds {held} record(s)): it must not return — and the API must not answer 202 — before the broker has the event, exactly once"
+    # The broker is down: the add gives up after FLUSH_TIMEOUT_S instead of hanging the request.
+    ctx.kafka.stall(TOPIC)
+    start = ctx.clock.time()
+    try:
+        m.append_event("plays", "stranger-things", 1, "t-9f4")
+        returned = True
+    except m.EventNotDurable:
+        returned = False
+    waited = ctx.clock.time() - start
+    assert waited <= FLUSH_TIMEOUT_S + 0.05, f"with the broker down append_event waited {waited:.0f} s before giving up — an unbounded flush waits for the whole message timeout while the client's request hangs: bound it with FLUSH_TIMEOUT_S (1 s)"
+    assert not returned, f"with the broker down append_event returned normally after {waited:.1f} s without an acknowledgement: the API would answer 202 for an event that may never be written"
+    held = len(ctx.kafka.records(TOPIC))
+    assert held == 1, f"nothing can be written while the broker is down, yet {TOPIC} holds {held} record(s)"
 
 
 def check_not_durable_raises(ctx):
@@ -488,8 +510,13 @@ def check_not_durable_raises(ctx):
         pass
     assert len(ctx.kafka.records(TOPIC)) == 0
     m.append_event("plays", "stranger-things", 1, "t-9f3")  # the client's retry, same token
-    assert len(ctx.kafka.records(TOPIC)) == 1, "after the failure a retry must be produced normally"
-    assert json.loads(ctx.kafka.records(TOPIC)[0].value).get("token") == "t-9f3", "the retry carries the same token, which is what makes it safe"
+    assert _tokens(ctx) == ["t-9f3"], f"after the failure the retry must be produced normally, carrying the same token, which is what makes it safe: {TOPIC} holds {_tokens(ctx)}"
+    ctx.kafka.stall(TOPIC)
+    try:
+        m.append_event("plays", "stranger-things", 1, "t-9f4")
+        raise AssertionError("the broker did not acknowledge the record within the flush (it is still pending) but append_event returned normally: the API would answer 202 for an event that may never be written")
+    except m.EventNotDurable:
+        pass
 `,
   },
   debrief: `The eventually consistent counter does not exist as a number at write time; it exists as a durable fact — "add 1 to plays/stranger-things, token t-9f3, at this time" — and that fact is what the 202 vouches for. Everything about the producer follows from that: acks=all because a leader-only ack can vanish with the leader, idempotence because the producer's own retries must not double a fact, a bounded flush because a promise you cannot keep in a second is better refused than kept late. The token is the other half of the design: the API cannot know whether a 503 was returned before or after the record landed, so instead of guessing it lets the client retry and the rollup dedupe. Netflix logs these events to its TimeSeries abstraction with the same idea — write durably, dedupe downstream — and partitions them by time bucket as well as by counter.`,

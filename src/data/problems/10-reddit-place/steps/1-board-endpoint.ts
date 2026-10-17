@@ -703,22 +703,24 @@ int main() {
     },
   },
   harness: {
-    python: `def _api(ctx, wait=0):
-    """board_api with steps 2 and 3 replaced by recorders: what was placed, what was recorded."""
-    m = ctx.load("board_api")
-    m.placed = []
-    m.recorded = []
-
-    def place_tile(user, x, y, color):
-        m.placed.append((user, x, y, color))
-        return wait
-
-    m.place_tile = place_tile
-    m.record_placement = lambda user, x, y, color: m.recorded.append((user, x, y, color))
-    return m
-
+    python: `import json
 
 TILE = {"x": 3, "y": 7, "color": 12, "user": "ana"}
+
+
+def _api(ctx):
+    """board_api as deployed: POST /place runs the real cooldown (step 2) and the real placement producer (step 3)."""
+    return ctx.load("board_api")
+
+
+def _pixel(ctx, m, x, y):
+    board = ctx.redis_bytes.get("board") or b""
+    off = y * m.SIZE + x
+    return board[off] if off < len(board) else 0
+
+
+def _placements(ctx):
+    return [json.loads(r.value) for r in ctx.kafka.records("placements")]
 
 
 async def check_board_blob(ctx):
@@ -767,21 +769,31 @@ async def check_validate(ctx):
         for bad in ({"x": -1}, {"x": size}, {"y": -1}, {"y": size}, {"color": -1}, {"color": 16}, {"user": ""}):
             r = await c.post("/place", json={**TILE, **bad})
             assert r.status_code == 400, f"POST /place with {bad} answered {r.status_code}, expected 400"
-        assert m.placed == [], f"a rejected placement must never reach place_tile, but it saw {m.placed}"
-        assert m.recorded == [], "a rejected placement must not be recorded"
-        for ok in ({"x": size - 1, "y": size - 1}, {"x": 0, "y": 0}, {"color": 15}, {"color": 0}):
-            r = await c.post("/place", json={**TILE, **ok})
+        cooling = ctx.redis.keys("cooldown:*")
+        assert cooling == [], f"after only rejected requests Redis holds {cooling}: a rejected placement reached place_tile and cost a user their turn"
+        board = ctx.redis_bytes.get("board") or b""
+        assert board.count(0) == len(board), "a rejected placement changed the board"
+        assert ctx.kafka.records("placements") == [], f"a rejected placement must not be recorded, but placements holds {_placements(ctx)}"
+        for i, ok in enumerate(({"x": size - 1, "y": size - 1}, {"x": 0, "y": 0}, {"color": 15}, {"color": 0})):
+            tile = {**TILE, **ok, "user": f"user{i}"}
+            r = await c.post("/place", json=tile)
             assert r.status_code == 200, f"POST /place with {ok} is within range: expected 200, got {r.status_code}"
+            assert _pixel(ctx, m, tile["x"], tile["y"]) == tile["color"], f"after the accepted tile {tile} the board byte at ({tile['x']}, {tile['y']}) is {_pixel(ctx, m, tile['x'], tile['y'])}, expected {tile['color']}"
 
 
 async def check_cooldown_429(ctx):
-    m = _api(ctx, wait=187)
+    m = _api(ctx)
     async with ctx.client(m.app) as c:
-        r = await c.post("/place", json=TILE)
-    assert r.status_code == 429, f"place_tile said 187 seconds left: expected 429, got {r.status_code}"
-    assert r.headers.get("retry-after") == "187", f"Retry-After is {r.headers.get('retry-after')!r}, expected the 187 seconds place_tile returned"
-    assert m.placed == [("ana", 3, 7, 12)], f"place_tile must be called with (user, x, y, color), got {m.placed}"
-    assert m.recorded == [], "a tile refused by the cooldown is not a placement: nothing to record"
+        first = await c.post("/place", json=TILE)
+        assert first.status_code == 200, f"ana's first tile answered {first.status_code}, expected 200"
+        ctx.clock.advance(113)
+        r = await c.post("/place", json={**TILE, "x": 4, "color": 5})
+    ttl = ctx.redis.ttl("cooldown:ana")
+    assert r.status_code == 429, f"113 s after ana's first tile her second one answered {r.status_code}, expected 429: her cooldown still has {ttl} s to run"
+    assert r.headers.get("retry-after") == str(ttl), f"Retry-After is {r.headers.get('retry-after')!r}, expected the {ttl} s left on ana's cooldown (what place_tile returned)"
+    assert _pixel(ctx, m, 4, 7) == 0, f"the refused tile was painted: the board byte at (4, 7) is {_pixel(ctx, m, 4, 7)}"
+    events = _placements(ctx)
+    assert len(events) == 1, f"a tile refused by the cooldown is not a placement: expected only ana's first tile on placements, found {events}"
 
 
 async def check_placed(ctx):
@@ -789,10 +801,15 @@ async def check_placed(ctx):
     async with ctx.client(m.app) as c:
         r = await c.post("/place", json=TILE)
     assert r.status_code == 200, f"a painted tile answers 200, got {r.status_code}"
-    assert m.placed == [("ana", 3, 7, 12)], f"place_tile must be called once with (user, x, y, color), got {m.placed}"
-    assert m.recorded == [("ana", 3, 7, 12)], f"record_placement must be called once with (user, x, y, color), got {m.recorded}"
     body = r.json()
     assert {k: body.get(k) for k in TILE} == TILE, f"the body must carry the tile {TILE}, got {body}"
+    assert _pixel(ctx, m, 3, 7) == 12, f"after POST /place of {TILE} the board byte at (3, 7) is {_pixel(ctx, m, 3, 7)}, expected 12: place_tile(user, x, y, color) paints it"
+    ttl = ctx.redis.ttl("cooldown:ana")
+    assert ttl > 0, f"after her tile was painted ana is not on cooldown (TTL of cooldown:ana is {ttl}): place_tile(user, x, y, color) must run with her name"
+    events = _placements(ctx)
+    assert len(events) == 1, f"one painted tile must put exactly one record on placements, found {len(events)}: {events}"
+    got = {k: events[0].get(k) for k in ("user", "x", "y", "color")}
+    assert got == {"user": "ana", "x": 3, "y": 7, "color": 12}, f"the placement recorded is {got}, expected the painted tile: record_placement(user, x, y, color)"
 `,
   },
   debrief: `Two endpoints with opposite shapes. \`GET /board\` is the hot read: one Redis \`GET\`, a fixed-size body and headers written for the cache in front — \`max-age=1\` means the origin sees one request per edge node per second no matter how many clients refresh, \`stale-while-revalidate\` keeps that true at the moment the second rolls over, and the \`ETag\` turns a revalidation into a 304 instead of 10 000 bytes. \`POST /place\` is a funnel: three comparisons reject most bad input for free, the cooldown decides the rest, and only a painted tile becomes an event. Reddit's board was 1000 × 1000 with two 4-bit pixels per byte (500 KB per read, under 100 ms from Redis) and was served through Fastly with exactly this cache policy; the single-tile detail endpoint, which was not cached, was the one scrapers hammered.`,

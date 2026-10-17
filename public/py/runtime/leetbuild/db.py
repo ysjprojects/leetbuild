@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 _PLACEHOLDER = re.compile(r"%(%|s)")
 
@@ -102,10 +102,22 @@ class _Transaction:
         return False
 
 
+class DbProbe:
+    def __init__(self, pattern: str, fn: Callable[[], Any]) -> None:
+        self.pattern = pattern
+        self.fn = fn
+        self.fired = False
+        self.result: Any = None
+        self.error: BaseException | None = None
+
+
 class Db:
     def __init__(self) -> None:
         self.events: list[str] = []
         self.statements: list[str] = []
+        # What the server was asked, in order: (sql, params) — the query log a DBA would read.
+        self.queries: list[tuple[str, list]] = []
+        self.probes: list[DbProbe] = []
 
     def transaction(self) -> _Transaction:
         return _Transaction(self)
@@ -121,6 +133,7 @@ class Db:
 
         self.events = []
         self.statements = []
+        self.queries = []
         try:
             await leetbuild_host.db_exec("DROP SCHEMA public CASCADE; CREATE SCHEMA public;" + schema)
         except Exception as exc:
@@ -130,12 +143,34 @@ class Db:
         import leetbuild_host
 
         self.statements.append(sql)
+        self.queries.append((sql, list(params)))
         try:
             out = await leetbuild_host.db_query(dollarize(sql), json.dumps([_plain(p) for p in params]))
         except Exception as exc:
+            self._fire(sql)
             raise DbError(_message(exc)) from None
+        self._fire(sql)
         data = json.loads(out)
         return data["rows"], data.get("affected", -1)
+
+    def after(self, pattern: str, fn: Callable[[], Any]) -> "DbProbe":
+        """
+        Run `fn` once, right after the first statement containing `pattern` (case-insensitive) has run
+        on the server — succeeded or failed — before its caller sees the outcome: a slow write (advance
+        the clock while the transaction is open), a snapshot of the world mid-transaction, or another
+        client acting at that instant.
+        """
+        probe = DbProbe(pattern.lower(), fn)
+        self.probes.append(probe)
+        return probe
+
+    def _fire(self, sql: str) -> None:
+        for probe in [p for p in self.probes if not p.fired and p.pattern in sql.lower()]:
+            probe.fired = True
+            try:
+                probe.result = probe.fn()
+            except Exception as exc:  # reported through the probe, not inside the learner's query
+                probe.error = exc
 
 
 def _message(exc: BaseException) -> str:

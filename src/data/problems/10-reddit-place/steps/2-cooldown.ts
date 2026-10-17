@@ -312,54 +312,59 @@ int place_tile(const std::string& user, int x, int y, int color) {
     },
   },
   harness: {
-    python: `def _cooldown(ctx):
-    """The learner's module with every Redis command it sends recorded as (NAME, args…)."""
-    m = ctx.load("cooldown")
-    m.commands = []
-    original = m.r.execute_command
-
-    def recording(*args, **kwargs):
-        m.commands.append(tuple(str(a).upper() if i == 0 else str(a) for i, a in enumerate(args)))
-        return original(*args, **kwargs)
-
-    m.r.execute_command = recording
-    return m
-
-
-def _board(ctx):
+    python: `def _board(ctx):
     return ctx.redis_bytes.get("board") or b""
 
 
+def _pixel(ctx, m, x, y):
+    board = _board(ctx)
+    off = y * m.SIZE + x
+    return board[off] if off < len(board) else 0
+
+
+def _settled(probe, what):
+    """The parallel request landed and finished: its result, or its own error re-raised."""
+    assert probe.fired, f"place_tile never touched {what}"
+    if probe.error is not None:
+        raise probe.error
+    return probe.result
+
+
 def check_cooldown_key(ctx):
-    m = _cooldown(ctx)
+    m = ctx.load("cooldown")
     assert m.place_tile("ana", 3, 7, 12) == 0, "a user who never placed a tile is free: place_tile must return 0"
     assert ctx.redis.exists("cooldown:ana") == 1, f"after a placement the key cooldown:ana must exist (keys: {ctx.redis.keys()})"
     ttl = ctx.redis.ttl("cooldown:ana")
     assert 295 <= ttl <= 300, f"cooldown:ana expires in {ttl} s, expected COOLDOWN_S = 300"
     assert m.place_tile("bo", 3, 8, 1) == 0, "the cooldown is per user: bo is not affected by ana's tile"
-    ctx.clock.advance(301)
+    ctx.clock.advance(299)
+    assert m.place_tile("ana", 4, 7, 1) > 0, "299 s after her tile ana is still on cooldown: place_tile must refuse"
+    ctx.clock.advance(2)
     assert ctx.redis.exists("cooldown:ana") == 0, "cooldown:ana must be gone after 300 s"
     assert m.place_tile("ana", 3, 7, 12) == 0, "once the key expired the user is free again"
 
 
 def check_atomic_nx(ctx):
-    m = _cooldown(ctx)
-    m.place_tile("ana", 3, 7, 12)
-    sets = [c for c in m.commands if c[0] == "SET" and c[1] == "cooldown:ana"]
-    assert sets, f"no SET on cooldown:ana was sent; commands: {m.commands}"
-    flags = [a.upper() for a in sets[0][2:]]
-    assert "NX" in flags, f"the SET on cooldown:ana was {sets[0]}: without NX it overwrites a running cooldown instead of refusing"
-    assert "EX" in flags or "PX" in flags, f"the SET on cooldown:ana was {sets[0]}: without EX the cooldown never ends"
-    reads = [c for c in m.commands if c[0] in ("GET", "EXISTS", "MGET") and "cooldown:ana" in c[1:]]
-    assert not reads, f"{reads[0][0]} cooldown:ana then SET is a race: two parallel requests both pass the check. Let SET NX decide"
-    first = next(c for c in m.commands if c[1:2] == ("cooldown:ana",))
-    assert first[0] == "SET", f"the first command on cooldown:ana was {first[0]}, expected the SET NX that both checks and claims"
-    wait = m.place_tile("ana", 3, 7, 5)
-    assert wait > 0, f"a second tile from the same user within 300 s must be refused, but place_tile returned {wait}"
+    m = ctx.load("cooldown")
+    # A bot fires two requests at once; they reach two app servers. The second one runs right after
+    # the first one's first command on cooldown:ana, the gap Reddit's check-then-write left open.
+    rival = ctx.redis_after("cooldown:ana", lambda: m.place_tile("ana", 4, 7, 5))
+    mine = m.place_tile("ana", 3, 7, 12)
+    theirs = _settled(rival, "cooldown:ana")
+    painted = [wait == 0 for wait in (mine, theirs)]
+    assert painted.count(True) == 1, (
+        f"two parallel placements by ana returned {mine} and {theirs}: "
+        + ("both were painted. A check followed by a separate write lets every parallel request through — about 15 000 tiles slipped past r/place's cooldown that way; let one SET … NX decide" if all(painted) else "neither was painted, but one of them must win")
+    )
+    won, lost = ((3, 7, 12), (4, 7)) if painted[0] else ((4, 7, 5), (3, 7))
+    assert _pixel(ctx, m, won[0], won[1]) == won[2], f"the winning placement returned 0 but ({won[0]}, {won[1]}) shows {_pixel(ctx, m, won[0], won[1])}, expected {won[2]}"
+    assert _pixel(ctx, m, *lost) == 0, f"the refused placement painted ({lost[0]}, {lost[1]}) anyway"
+    wait = m.place_tile("ana", 5, 7, 1)
+    assert wait > 0, f"a later tile from the same user within 300 s must be refused, but place_tile returned {wait}"
 
 
 def check_paint(ctx):
-    m = _cooldown(ctx)
+    m = ctx.load("cooldown")
     off = 7 * m.SIZE + 3
     m.place_tile("ana", 3, 7, 12)
     board = _board(ctx)
@@ -373,10 +378,17 @@ def check_paint(ctx):
     m.place_tile("cy", 3, 7, 3)
     assert _board(ctx)[off] == 3, "painting over a pixel replaces its colour"
     assert ctx.redis_bytes.type("board") == b"string", f"board is a {ctx.redis_bytes.type('board')!r}, expected one string"
+    # 200 placements a second: dee's tile is written while eve's is in progress.
+    rival = ctx.redis_after("board", lambda: m.place_tile("dee", 50, 50, 7))
+    assert m.place_tile("eve", 10, 10, 9) == 0, "eve is free: her tile must be painted"
+    assert _settled(rival, "the board") == 0, "dee is free: her tile must be painted"
+    assert _pixel(ctx, m, 10, 10) == 9, f"eve's tile at (10, 10) is {_pixel(ctx, m, 10, 10)}, expected 9"
+    assert _pixel(ctx, m, 50, 50) == 7, f"dee's tile at (50, 50), painted while eve's was being written, is {_pixel(ctx, m, 50, 50)} instead of 7: eve's write replaced the board with a copy read before dee painted. Write the one byte in place"
+    assert _pixel(ctx, m, m.SIZE - 1, m.SIZE - 1) == 15 and _pixel(ctx, m, 3, 7) == 3, "earlier tiles must survive later ones"
 
 
 def check_retry_after(ctx):
-    m = _cooldown(ctx)
+    m = ctx.load("cooldown")
     m.place_tile("ana", 3, 7, 12)
     ctx.clock.advance(100)
     wait = m.place_tile("ana", 4, 7, 12)
@@ -389,14 +401,19 @@ def check_retry_after(ctx):
 
 
 async def check_claim_first(ctx):
-    m = _cooldown(ctx)
-    off = 7 * m.SIZE + 3
-    m.place_tile("ana", 3, 7, 12)
-    m.commands.clear()
+    m = ctx.load("cooldown")
+    assert m.place_tile("ana", 3, 7, 12) == 0, "ana is free: her tile must be painted"
     wait = m.place_tile("ana", 3, 7, 5)
     assert wait > 0, "the second tile within the cooldown must be refused"
-    assert _board(ctx)[off] == 12, f"a refused placement painted the board: byte {off} is {_board(ctx)[off]}, expected the earlier 12"
-    assert not any(c[0] == "SETRANGE" for c in m.commands), f"a refused placement sent SETRANGE: {m.commands}. Claim the cooldown first, paint second"
+    assert _pixel(ctx, m, 3, 7) == 12, f"a refused placement painted the board: (3, 7) is {_pixel(ctx, m, 3, 7)}, expected the earlier 12. Claim the cooldown first, paint second"
+    # cy's two parallel requests on one pixel: the board must show the one that was accepted.
+    rival = ctx.redis_after("cooldown:cy", lambda: m.place_tile("cy", 6, 7, 5))
+    mine = m.place_tile("cy", 6, 7, 9)
+    theirs = _settled(rival, "cooldown:cy")
+    refused = [color for color, wait in ((9, mine), (5, theirs)) if wait > 0]
+    accepted = [color for color, wait in ((9, mine), (5, theirs)) if wait == 0]
+    shown = _pixel(ctx, m, 6, 7)
+    assert shown not in refused or shown in accepted, f"two parallel tiles by cy on (6, 7): colour {accepted} was accepted, {refused} refused, and the board shows {shown} — the refused tile was painted. Claim the cooldown first, paint second"
     api = ctx.load("board_api")
     async with ctx.client(api.app) as c:
         r = await c.post("/place", json={"x": 3, "y": 7, "color": 5, "user": "ana"})
@@ -404,7 +421,7 @@ async def check_claim_first(ctx):
         assert r.headers.get("retry-after") in ("299", "300"), f"Retry-After is {r.headers.get('retry-after')!r}, expected the TTL (300)"
         r = await c.post("/place", json={"x": 3, "y": 7, "color": 5, "user": "bo"})
         assert r.status_code == 200, f"another user may paint the same pixel: expected 200, got {r.status_code}"
-    assert _board(ctx)[off] == 5, "bo's tile must be painted"
+    assert _pixel(ctx, api, 3, 7) == 5, "bo's tile must be painted"
 `,
   },
   debrief: `The cooldown and the lock are the same key. \`SET NX EX\` answers "was this user free?" and makes them not free in one atomic step, so a thousand parallel requests from one bot produce exactly one tile — the race Reddit shipped with (check in Cassandra, then write, with nothing in between) is simply not expressible here. \`SETRANGE\` is the other half of the design: the board is a flat array in a string, a pixel is one byte at a computed offset, and Redis updates it in place with no read, no lock and no version check, which is why 200 placements per second never contended. Real deployments pack two 4-bit pixels per byte with \`BITFIELD SET u4 #offset\`, keep the per-tile author and timestamp in a wide table for "who placed this?", and make the cooldown adjustable at runtime — Reddit turned the knob several times during the event to shed load.`,

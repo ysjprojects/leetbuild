@@ -10,8 +10,8 @@ export const counterApiStep: Step = {
 
 Counters live in **namespaces**, and a namespace is configured once as \`best_effort\` or
 \`eventually_consistent\` — the caller never chooses per request. \`NAMESPACES\` is provided
-(\`views\` is best-effort, \`plays\` is eventually consistent), and so are stubs of the functions the
-later steps build: \`add_best_effort\` / \`get_best_effort\` / \`clear_best_effort\` (step 2),
+(\`views\` is best-effort, \`plays\` is eventually consistent), and the functions the later steps build
+are available to this file: \`add_best_effort\` / \`get_best_effort\` / \`clear_best_effort\` (step 2),
 \`append_event\` (step 3), \`get_rolled_up\` / \`clear_rolled_up\` (step 4).
 
 Implement the three routes:
@@ -25,7 +25,8 @@ Implement the three routes:
   the rollup dedupes on. Best-effort adds ignore the token — a cache cannot dedupe.
 - Best-effort add → \`add_best_effort\` and **200** \`{"count": …}\`: the new value is known right away.
   Eventually-consistent add → \`append_event\` and **202** \`{"accepted": true}\`: the event is durable, the
-  count is not visible yet.
+  count is not visible yet. If the event could not be made durable (\`EventNotDurable\`), answer **503**:
+  the client retries with the same token, and the rollup counts the add once.
 - \`GET\` answers **200** \`{"count": …}\` from \`get_best_effort\` or \`get_rolled_up\`; \`DELETE\` calls the
   matching clear and answers **204**.
 
@@ -129,7 +130,7 @@ Implement the three routes:
       id: 'add-dispatch',
       title: 'Best-effort adds answer 200 with the count, eventually-consistent ones 202',
       detail:
-        'A best-effort namespace calls `add_best_effort` and returns the new count with `200`; an eventually-consistent one calls `append_event` and answers `202 Accepted` — the count is not yet visible.',
+        'A best-effort namespace calls `add_best_effort` and returns the new count with `200`; an eventually-consistent one calls `append_event` and answers `202 Accepted` — the count is not yet visible — or `503` when the event could not be made durable.',
       match: {
         python: {all: [/(?<!def )add_best_effort\(/, /(?<!def )append_event\(/, /status_code\s*=\s*202/, /"count"/]},
         go: {all: [/(?<!func )addBestEffort\(/, /(?<!func )appendEvent\(/, /http\.StatusAccepted|\b202\b/, /"count"/]},
@@ -192,6 +193,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
+from best_effort import add_count as add_best_effort  # built in step 2: INCRBY, returns the new count
+from best_effort import clear_count as clear_best_effort  # built in step 2
+from best_effort import get_count as get_best_effort  # built in step 2
+from count_events import EventNotDurable, append_event  # built in step 3: logs the add durably, or raises EventNotDurable
+from rollup import clear_count as clear_rolled_up  # built in step 4
+from rollup import get_count as get_rolled_up  # built in step 4: the sum over the minute buckets
+
 app = FastAPI()
 
 # Namespaces and their counter type (provided): configured per use case, never chosen per request.
@@ -201,33 +209,6 @@ NAMESPACES = {
 }
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MAX_DELTA = 1_000_000
-
-
-# Built in later steps.
-def add_best_effort(ns: str, name: str, delta: int) -> int:
-    """INCRBY on the cached counter; returns the new count (step 2)."""
-    raise NotImplementedError
-
-
-def get_best_effort(ns: str, name: str) -> int:
-    raise NotImplementedError
-
-
-def clear_best_effort(ns: str, name: str) -> None:
-    raise NotImplementedError
-
-
-def append_event(ns: str, name: str, delta: int, token: str) -> None:
-    """Logs the add durably; the count moves once the rollup has run (step 3)."""
-    raise NotImplementedError
-
-
-def get_rolled_up(ns: str, name: str) -> int:
-    raise NotImplementedError
-
-
-def clear_rolled_up(ns: str, name: str) -> None:
-    raise NotImplementedError
 
 
 class AddRequest(BaseModel):
@@ -240,7 +221,7 @@ def add(ns: str, name: str, body: AddRequest) -> JSONResponse:
     # TODO: 404 unless ns is in NAMESPACES; 400 unless NAME_RE matches name
     # TODO: 400 when delta is 0 or beyond ±MAX_DELTA; eventually_consistent → 400 without a token
     # TODO: best_effort → add_best_effort → 200 {"count": …}
-    # TODO: eventually_consistent → append_event → 202 {"accepted": true}
+    # TODO: eventually_consistent → append_event → 202 {"accepted": true}; EventNotDurable → 503
     raise HTTPException(status_code=501)
 
 
@@ -264,6 +245,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
+from best_effort import add_count as add_best_effort  # built in step 2: INCRBY, returns the new count
+from best_effort import clear_count as clear_best_effort  # built in step 2
+from best_effort import get_count as get_best_effort  # built in step 2
+from count_events import EventNotDurable, append_event  # built in step 3: logs the add durably, or raises EventNotDurable
+from rollup import clear_count as clear_rolled_up  # built in step 4
+from rollup import get_count as get_rolled_up  # built in step 4: the sum over the minute buckets
+
 app = FastAPI()
 
 # Namespaces and their counter type (provided): configured per use case, never chosen per request.
@@ -273,33 +261,6 @@ NAMESPACES = {
 }
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MAX_DELTA = 1_000_000
-
-
-# Built in later steps.
-def add_best_effort(ns: str, name: str, delta: int) -> int:
-    """INCRBY on the cached counter; returns the new count (step 2)."""
-    raise NotImplementedError
-
-
-def get_best_effort(ns: str, name: str) -> int:
-    raise NotImplementedError
-
-
-def clear_best_effort(ns: str, name: str) -> None:
-    raise NotImplementedError
-
-
-def append_event(ns: str, name: str, delta: int, token: str) -> None:
-    """Logs the add durably; the count moves once the rollup has run (step 3)."""
-    raise NotImplementedError
-
-
-def get_rolled_up(ns: str, name: str) -> int:
-    raise NotImplementedError
-
-
-def clear_rolled_up(ns: str, name: str) -> None:
-    raise NotImplementedError
 
 
 class AddRequest(BaseModel):
@@ -326,7 +287,10 @@ def add(ns: str, name: str, body: AddRequest) -> JSONResponse:
         return JSONResponse({"count": add_best_effort(ns, name, body.delta)}, status_code=200)
     if not body.token:
         raise HTTPException(status_code=400, detail="token is required: it is what makes a retry safe")
-    append_event(ns, name, body.delta, body.token)
+    try:
+        append_event(ns, name, body.delta, body.token)
+    except EventNotDurable:
+        raise HTTPException(status_code=503, detail="the event is not durable yet: retry with the same token")
     return JSONResponse({"accepted": True}, status_code=202)
 
 
@@ -858,134 +822,165 @@ int main() {
     },
   },
   harness: {
-    python: `def _api(ctx):
-    """The API with the later steps replaced by fakes that record every call."""
+    python: `import json
+
+TOPIC = "counter-events"
+
+
+def _api(ctx):
+    """The API as it runs: on the best-effort counters (step 2), the event log (step 3) and the rollup (step 4)."""
     m = ctx.load("counter_api")
-    calls = []
-    best = {}
-    rolled = {"plays:stranger-things": 1207}
+    import rollup  # the rollup worker whose buckets the API reads eventually-consistent counts from
 
-    def add_best_effort(ns, name, delta):
-        calls.append(("add_best_effort", ns, name, delta))
-        best[f"{ns}:{name}"] = best.get(f"{ns}:{name}", 0) + delta
-        return best[f"{ns}:{name}"]
+    return m, rollup
 
-    def get_best_effort(ns, name):
-        calls.append(("get_best_effort", ns, name))
-        return best.get(f"{ns}:{name}", 0)
 
-    def clear_best_effort(ns, name):
-        calls.append(("clear_best_effort", ns, name))
-        best.pop(f"{ns}:{name}", None)
+async def _call(c, method, url, **kwargs):
+    """(status, body) the API answered, or (the exception it let escape, None)."""
+    try:
+        r = await getattr(c, method)(url, **kwargs)
+    except Exception as e:
+        return f"{type(e).__name__}: {e}", None
+    try:
+        return r.status_code, r.json()
+    except ValueError:
+        return r.status_code, None
 
-    def append_event(ns, name, delta, token):
-        calls.append(("append_event", ns, name, delta, token))
 
-    def get_rolled_up(ns, name):
-        calls.append(("get_rolled_up", ns, name))
-        return rolled.get(f"{ns}:{name}", 0)
+async def _count(c, ns, name):
+    status, body = await _call(c, "get", f"/counters/{ns}/{name}")
+    assert status == 200, f"GET /counters/{ns}/{name} answered {status}, expected 200 with the count"
+    return (body or {}).get("count")
 
-    def clear_rolled_up(ns, name):
-        calls.append(("clear_rolled_up", ns, name))
-        rolled.pop(f"{ns}:{name}", None)
 
-    m.add_best_effort = add_best_effort
-    m.get_best_effort = get_best_effort
-    m.clear_best_effort = clear_best_effort
-    m.append_event = append_event
-    m.get_rolled_up = get_rolled_up
-    m.clear_rolled_up = clear_rolled_up
-    return m, calls
+def _untouched(ctx, what):
+    keys = ctx.redis.keys()
+    events = ctx.kafka.records(TOPIC)
+    assert keys == [] and events == [], f"{what} must be refused before any store is touched, yet Redis holds {keys} and {TOPIC} holds {len(events)} event(s)"
 
 
 async def check_routes(ctx):
-    m, calls = _api(ctx)
+    m, rollup = _api(ctx)
     async with ctx.client(m.app) as c:
-        r = await c.post("/counters/views/trailer-7/add", json={"delta": 1, "token": "t-1"})
-        assert r.status_code not in (404, 405), f"POST /counters/views/trailer-7/add answered {r.status_code}: no handler is registered for it"
-        assert r.status_code == 200, f"a best-effort add answered {r.status_code}, expected 200"
-        r = await c.get("/counters/views/trailer-7")
-        assert r.status_code not in (404, 405), f"GET /counters/views/trailer-7 answered {r.status_code}: no handler is registered for it"
-        assert r.status_code == 200, f"GET on a configured namespace answered {r.status_code}, expected 200"
-        r = await c.delete("/counters/views/trailer-7")
-        assert r.status_code not in (404, 405), f"DELETE /counters/views/trailer-7 answered {r.status_code}: no handler is registered for it"
-        assert r.status_code == 204, f"DELETE answered {r.status_code}, expected 204"
+        status, _ = await _call(c, "post", "/counters/views/trailer-7/add", json={"delta": 1, "token": "t-1"})
+        assert status not in (404, 405), f"POST /counters/views/trailer-7/add answered {status}: no handler is registered for it"
+        assert status == 200, f"a best-effort add answered {status}, expected 200"
+        status, _ = await _call(c, "get", "/counters/views/trailer-7")
+        assert status not in (404, 405), f"GET /counters/views/trailer-7 answered {status}: no handler is registered for it"
+        assert status == 200, f"GET on a configured namespace answered {status}, expected 200"
+        status, _ = await _call(c, "delete", "/counters/views/trailer-7")
+        assert status not in (404, 405), f"DELETE /counters/views/trailer-7 answered {status}: no handler is registered for it"
+        assert status == 204, f"DELETE answered {status}, expected 204"
+        status, _ = await _call(c, "post", "/counters/plays/stranger-things/add", json={"delta": 1, "token": "t-2"})
+        assert status == 202, f"POST /counters/plays/stranger-things/add answered {status}, expected 202"
+        status, _ = await _call(c, "get", "/counters/plays/stranger-things")
+        assert status == 200, f"GET /counters/plays/stranger-things answered {status}, expected 200"
+        status, _ = await _call(c, "delete", "/counters/plays/stranger-things")
+        assert status == 204, f"DELETE /counters/plays/stranger-things answered {status}, expected 204"
 
 
 async def check_unknown_namespace(ctx):
-    m, calls = _api(ctx)
+    m, rollup = _api(ctx)
     async with ctx.client(m.app) as c:
-        r = await c.post("/counters/likes/trailer-7/add", json={"delta": 1, "token": "t-1"})
-        assert r.status_code == 404, f"namespace 'likes' is not configured: expected 404, got {r.status_code}"
-        r = await c.get("/counters/likes/trailer-7")
-        assert r.status_code == 404, f"GET on an unknown namespace answered {r.status_code}, expected 404"
-        r = await c.delete("/counters/likes/trailer-7")
-        assert r.status_code == 404, f"DELETE on an unknown namespace answered {r.status_code}, expected 404"
-        r = await c.post("/counters/likes/bad name/add", json={"delta": 0})
-        assert r.status_code == 404, f"the namespace is checked first: an unknown namespace with a bad name and a bad delta is still a 404, got {r.status_code}"
-    assert calls == [], f"an unknown namespace must be refused before any store is touched, calls: {calls}"
+        status, _ = await _call(c, "post", "/counters/likes/trailer-7/add", json={"delta": 1, "token": "t-1"})
+        assert status == 404, f"namespace 'likes' is not configured: expected 404, got {status}"
+        status, _ = await _call(c, "get", "/counters/likes/trailer-7")
+        assert status == 404, f"GET on an unknown namespace answered {status}, expected 404"
+        status, _ = await _call(c, "delete", "/counters/likes/trailer-7")
+        assert status == 404, f"DELETE on an unknown namespace answered {status}, expected 404"
+        status, _ = await _call(c, "post", "/counters/likes/bad name/add", json={"delta": 0})
+        assert status == 404, f"the namespace is checked first: an unknown namespace with a bad name and a bad delta is still a 404, got {status}"
+    _untouched(ctx, "an add to an unknown namespace")
 
 
 async def check_validate(ctx):
-    m, calls = _api(ctx)
+    m, rollup = _api(ctx)
     async with ctx.client(m.app) as c:
         for bad in ("bad name", "dots.are.out", "a" * 65, "caf\u00e9"):
-            r = await c.post(f"/counters/views/{bad}/add", json={"delta": 1, "token": "t-1"})
-            assert r.status_code == 400, f"name {bad!r} does not match NAME_RE: expected 400, got {r.status_code}"
-            r = await c.get(f"/counters/views/{bad}")
-            assert r.status_code == 400, f"GET with name {bad!r} answered {r.status_code}, expected 400"
+            status, _ = await _call(c, "post", f"/counters/views/{bad}/add", json={"delta": 1, "token": "t-1"})
+            assert status == 400, f"name {bad!r} does not match NAME_RE: expected 400, got {status}"
+            status, _ = await _call(c, "post", f"/counters/plays/{bad}/add", json={"delta": 1, "token": "t-1"})
+            assert status == 400, f"name {bad!r} does not match NAME_RE: an eventually-consistent add answered {status}, expected 400"
+            status, _ = await _call(c, "get", f"/counters/views/{bad}")
+            assert status == 400, f"GET with name {bad!r} answered {status}, expected 400"
         for delta in (0, 1_000_001, -1_000_001):
-            r = await c.post("/counters/views/trailer-7/add", json={"delta": delta, "token": "t-1"})
-            assert r.status_code == 400, f"delta {delta} is zero or beyond ±MAX_DELTA: expected 400, got {r.status_code}"
-        r = await c.post("/counters/plays/stranger-things/add", json={"delta": 1})
-        assert r.status_code == 400, f"an eventually-consistent add without a token answered {r.status_code}, expected 400: the token is the idempotency key"
-        r = await c.post("/counters/plays/stranger-things/add", json={"delta": 1, "token": ""})
-        assert r.status_code == 400, f"an empty token is no token: expected 400, got {r.status_code}"
-        assert calls == [], f"a rejected request must not reach any store, calls: {calls}"
-        r = await c.post("/counters/views/trailer-7/add", json={"delta": -1_000_000})
-        assert r.status_code == 200, f"a best-effort add of exactly -MAX_DELTA without a token is valid: expected 200, got {r.status_code}"
-        r = await c.post("/counters/views/trailer_7-v2/add", json={"delta": 1_000_000, "token": "t-1"})
-        assert r.status_code == 200, f"name 'trailer_7-v2' and delta MAX_DELTA are valid: expected 200, got {r.status_code}"
+            status, _ = await _call(c, "post", "/counters/views/trailer-7/add", json={"delta": delta, "token": "t-1"})
+            assert status == 400, f"delta {delta} is zero or beyond ±MAX_DELTA: expected 400, got {status}"
+            status, _ = await _call(c, "post", "/counters/plays/stranger-things/add", json={"delta": delta, "token": "t-1"})
+            assert status == 400, f"delta {delta} is zero or beyond ±MAX_DELTA: an eventually-consistent add answered {status}, expected 400"
+        status, _ = await _call(c, "post", "/counters/plays/stranger-things/add", json={"delta": 1})
+        assert status == 400, f"an eventually-consistent add without a token answered {status}, expected 400: the token is the idempotency key"
+        status, _ = await _call(c, "post", "/counters/plays/stranger-things/add", json={"delta": 1, "token": ""})
+        assert status == 400, f"an empty token is no token: expected 400, got {status}"
+        _untouched(ctx, "a request with a bad name, delta or token")
+        status, _ = await _call(c, "post", "/counters/views/trailer-7/add", json={"delta": -1_000_000})
+        assert status == 200, f"a best-effort add of exactly -MAX_DELTA without a token is valid: expected 200, got {status}"
+        status, _ = await _call(c, "post", "/counters/views/trailer_7-v2/add", json={"delta": 1_000_000, "token": "t-1"})
+        assert status == 200, f"name 'trailer_7-v2' and delta MAX_DELTA are valid: expected 200, got {status}"
 
 
 async def check_add_dispatch(ctx):
-    m, calls = _api(ctx)
+    m, rollup = _api(ctx)
     async with ctx.client(m.app) as c:
-        r = await c.post("/counters/views/trailer-7/add", json={"delta": 3, "token": "t-1"})
-        assert r.status_code == 200, f"a best-effort add answered {r.status_code}, expected 200"
-        assert r.json().get("count") == 3, f"the 200 body must carry the new count from add_best_effort, got {r.json()}"
-        r = await c.post("/counters/views/trailer-7/add", json={"delta": 4})
-        assert r.json().get("count") == 7, f"the second add must return the running count 7, got {r.json()}"
-        assert calls == [("add_best_effort", "views", "trailer-7", 3), ("add_best_effort", "views", "trailer-7", 4)], f"best-effort adds go through add_best_effort only, calls: {calls}"
-        calls.clear()
-        r = await c.post("/counters/plays/stranger-things/add", json={"delta": 1, "token": "t-9f3"})
-        assert r.status_code == 202, f"an eventually-consistent add answered {r.status_code}, expected 202: the count is not visible yet"
-        assert calls == [("append_event", "plays", "stranger-things", 1, "t-9f3")], f"an eventually-consistent add is one append_event carrying the token, calls: {calls}"
-        assert "count" not in r.json(), f"a 202 must not claim a count the rollup has not computed, got {r.json()}"
+        status, body = await _call(c, "post", "/counters/views/trailer-7/add", json={"delta": 3, "token": "t-1"})
+        assert status == 200, f"a best-effort add answered {status}, expected 200"
+        assert (body or {}).get("count") == 3, f"the 200 body must carry the new count of the best-effort counter, got {body}"
+        status, body = await _call(c, "post", "/counters/views/trailer-7/add", json={"delta": 4})
+        assert (body or {}).get("count") == 7, f"the second add must return the running count 7, got {status} {body}"
+        assert ctx.redis.get("counter:views:trailer-7") == "7", f"best-effort adds move the cached counter counter:views:trailer-7 at once: it holds {ctx.redis.get('counter:views:trailer-7')!r}, expected 7"
+        assert ctx.kafka.records(TOPIC) == [], f"a best-effort add is not logged as an event, yet {TOPIC} holds {ctx.kafka.values(TOPIC)}"
+
+        status, body = await _call(c, "post", "/counters/plays/stranger-things/add", json={"delta": 1, "token": "t-9f3"})
+        assert status == 202, f"an eventually-consistent add answered {status}, expected 202: the count is not visible yet"
+        assert "count" not in (body or {}), f"a 202 must not claim a count the rollup has not computed, got {body}"
+        events = [json.loads(v) for v in ctx.kafka.values(TOPIC)]
+        seen = [(e.get("ns"), e.get("name"), e.get("delta"), e.get("token")) for e in events]
+        assert seen == [("plays", "stranger-things", 1, "t-9f3")], f"an eventually-consistent add is one event on {TOPIC} carrying the delta and the client's token, found {seen}"
+        assert ctx.redis.keys("counter:*") == ["counter:views:trailer-7"], f"an eventually-consistent add must not touch a best-effort counter, Redis holds {ctx.redis.keys('counter:*')}"
+        count = await _count(c, "plays", "stranger-things")
+        assert count == 0, f"before the rollup has folded the event the count is not visible yet: GET answered {count}, expected 0"
+        ctx.drain(rollup.run)
+        count = await _count(c, "plays", "stranger-things")
+        assert count == 1, f"once the rollup has folded the event GET must show it: expected 1, got {count}"
+
+        ctx.kafka.stall(TOPIC)  # the cluster stops acknowledging
+        start = ctx.clock.time()
+        status, body = await _call(c, "post", "/counters/plays/stranger-things/add", json={"delta": 2, "token": "t-a1"})
+        waited = ctx.clock.time() - start
+        assert status != 202, "with the broker down the event could not be made durable, yet the add answered 202: the client was promised a count that may never arrive"
+        assert status == 503, f"with the broker down the add answered {status}: an event that is not durable (EventNotDurable) is a 503, which tells the client to retry with the same token"
+        assert waited <= 1.5, f"with the broker down the add took {waited:.0f} s to answer 503: it must fail as fast as append_event gives up (about 1 s)"
+        ctx.kafka.resume(TOPIC)
+        status, body = await _call(c, "post", "/counters/plays/stranger-things/add", json={"delta": 2, "token": "t-a1"})
+        assert status == 202, f"the client's retry with the same token, once the broker is back, answered {status}, expected 202"
+        ctx.drain(rollup.run)
+        count = await _count(c, "plays", "stranger-things")
+        assert count == 3, f"the failed add and its retry carry the client's token t-a1, so the rollup counts the 2 once: expected 1 + 2 = 3, GET answered {count}"
 
 
 async def check_read_clear_dispatch(ctx):
-    m, calls = _api(ctx)
+    m, rollup = _api(ctx)
     async with ctx.client(m.app) as c:
-        await c.post("/counters/views/trailer-7/add", json={"delta": 5})
-        calls.clear()
-        r = await c.get("/counters/views/trailer-7")
-        assert r.status_code == 200 and r.json().get("count") == 5, f"GET on a best-effort counter must answer 200 with the count 5, got {r.status_code} {r.json()}"
-        assert calls == [("get_best_effort", "views", "trailer-7")], f"a best-effort read is one get_best_effort, calls: {calls}"
-        calls.clear()
-        r = await c.get("/counters/plays/stranger-things")
-        assert r.status_code == 200 and r.json().get("count") == 1207, f"GET on an eventually-consistent counter must answer 200 with the rolled-up 1207, got {r.status_code} {r.json()}"
-        assert calls == [("get_rolled_up", "plays", "stranger-things")], f"an eventually-consistent read is one get_rolled_up, calls: {calls}"
-        calls.clear()
-        r = await c.delete("/counters/views/trailer-7")
-        assert r.status_code == 204, f"DELETE on a best-effort counter answered {r.status_code}, expected 204"
-        assert calls == [("clear_best_effort", "views", "trailer-7")], f"a best-effort clear is one clear_best_effort, calls: {calls}"
-        calls.clear()
-        r = await c.delete("/counters/plays/stranger-things")
-        assert r.status_code == 204, f"DELETE on an eventually-consistent counter answered {r.status_code}, expected 204"
-        assert calls == [("clear_rolled_up", "plays", "stranger-things")], f"an eventually-consistent clear is one clear_rolled_up, calls: {calls}"
-        r = await c.get("/counters/plays/stranger-things")
-        assert r.json().get("count") == 0, f"after the clear the counter reads 0, got {r.json()}"
+        await _call(c, "post", "/counters/views/trailer-7/add", json={"delta": 5})
+        await _call(c, "post", "/counters/plays/trailer-7/add", json={"delta": 1200, "token": "t-1"})
+        await _call(c, "post", "/counters/plays/trailer-7/add", json={"delta": 7, "token": "t-2"})
+        ctx.drain(rollup.run)
+        count = await _count(c, "views", "trailer-7")
+        assert count == 5, f"GET on the best-effort views/trailer-7 must answer its cached count 5, got {count}"
+        count = await _count(c, "plays", "trailer-7")
+        assert count == 1207, f"GET on the eventually-consistent plays/trailer-7 must answer the rolled-up 1207, got {count}"
+        status, _ = await _call(c, "delete", "/counters/views/trailer-7")
+        assert status == 204, f"DELETE on a best-effort counter answered {status}, expected 204"
+        assert ctx.redis.exists("counter:views:trailer-7") == 0, "DELETE /counters/views/trailer-7 must clear the cached counter counter:views:trailer-7"
+        count = await _count(c, "views", "trailer-7")
+        assert count == 0, f"after the clear views/trailer-7 reads 0, got {count}"
+        count = await _count(c, "plays", "trailer-7")
+        assert count == 1207, f"clearing views/trailer-7 must leave plays/trailer-7 alone: expected 1207, got {count}"
+        status, _ = await _call(c, "delete", "/counters/plays/trailer-7")
+        assert status == 204, f"DELETE on an eventually-consistent counter answered {status}, expected 204"
+        assert ctx.redis.exists("rollup:plays:trailer-7") == 0, "DELETE /counters/plays/trailer-7 must clear the rolled-up buckets rollup:plays:trailer-7"
+        count = await _count(c, "plays", "trailer-7")
+        assert count == 0, f"after the clear plays/trailer-7 reads 0, got {count}"
 `,
   },
   debrief: `The API is the whole abstraction: callers see AddCount, GetCount and ClearCount, and the namespace — not the request — decides which machinery runs. That is why the namespace is checked first and why the two adds answer differently: a 200 with a count is a promise that the number moved, a 202 is a promise that it will, and the second promise is the only one a durable log can make synchronously. The token is required only where it has a consumer; asking a cache to honour it would be a lie. Netflix's real control plane also configures cardinality and TTL per namespace, offers AddAndGetCount, and treats a clear as just another event in the log rather than a direct delete.`,

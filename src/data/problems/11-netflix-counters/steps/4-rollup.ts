@@ -686,42 +686,85 @@ NEXT_MINUTE_TS = TS + 60
 
 
 def _seed(ctx, *events):
-    """events: (token, delta) pairs, or (token, delta, ts) triples, all for plays/stranger-things."""
+    """Events other producers put on the topic — (token, delta) or (token, delta, ts) — all for plays/stranger-things."""
     for e in events:
         token, delta, ts = e if len(e) == 3 else (e[0], e[1], TS)
         value = {"ns": "plays", "name": "stranger-things", "delta": delta, "token": token, "ts": ts}
         ctx.kafka.seed(TOPIC, key="plays:stranger-things", value=json.dumps(value))
 
 
+def _total(ctx, key=KEY):
+    return sum(int(v) for v in ctx.redis.hvals(key))
+
+
+def _folded_at_commits(ctx):
+    """At every commit of group rollup: the committed offsets and the total the hash held at that instant."""
+    seen = []
+    ctx.kafka.on_commit(lambda group, offsets: seen.append((group, dict(offsets), _total(ctx))) if group == "rollup" else None)
+    return seen
+
+
 def check_consumer_group(ctx):
-    _seed(ctx, ("t-1", 1))
+    _seed(ctx, ("t-1", 1), ("t-2", 2), ("t-3", 4))  # produced before the worker started
+    deltas = [json.loads(r.value)["delta"] for r in ctx.kafka.records(TOPIC)]
+    partition = ctx.kafka.records(TOPIC)[0].partition
+    at_commit = _folded_at_commits(ctx)
     m = ctx.load("rollup")
-    subscriptions = [e for e in ctx.kafka.events if e[0] == "subscribe"]
-    assert subscriptions, "the consumer must subscribe to a topic"
-    group, topics = subscriptions[-1][1], subscriptions[-1][2]
-    assert group == "rollup", f"group.id must be rollup, got {group!r}"
-    assert "counter-events" in topics, f"the consumer must subscribe to counter-events, got {topics}"
-    assert ctx.kafka.consumers[-1].auto_commit is False, "enable.auto.commit is on: offsets would be acknowledged on a timer, before the event is folded"
     ctx.drain(m.run)
-    assert not any(e[0] == "auto-commit" for e in ctx.kafka.events), "offsets were auto-committed"
-    assert any(e[0] == "manual-commit" for e in ctx.kafka.events), "no explicit commit happened after the fold"
-    assert ctx.kafka.lag("rollup", TOPIC) == 0, "every folded record must be committed"
+    others = sorted({group for (group, _topic, _p) in ctx.kafka.committed if group != "rollup"})
+    assert ctx.kafka.committed_offset("rollup", TOPIC, partition) is not None, f"consumer group rollup never committed an offset on {TOPIC} (groups that did: {others}): the worker must join group rollup and subscribe to {TOPIC}"
+    assert ctx.kafka.lag("rollup", TOPIC) == 0, f"group rollup left {ctx.kafka.lag('rollup', TOPIC)} event(s) of {TOPIC} uncommitted: events produced before the worker started must be read from the earliest offset, folded and committed"
+    assert _total(ctx) == 7, f"the three events (+1, +2, +4) must fold to 7, the hash holds {ctx.redis.hgetall(KEY)}"
+    for _group, offsets, total in at_commit:
+        upto = offsets.get((TOPIC, partition))
+        if upto is not None:
+            assert total >= sum(deltas[:upto]), f"group rollup committed offset {upto} (events up to +{deltas[upto - 1]}) while the hash held {total}, less than the {sum(deltas[:upto])} those events add up to: an offset is committed only once its event has been folded, never ahead of the work"
+    # The worker stalls 6 s right after claiming an event (longer than auto.commit.interval.ms), then its
+    # fold fails for real: rollup:plays:broken is not a hash, so HINCRBY raises and the worker dies.
+    ctx.redis.set("rollup:plays:broken", "not a hash")
+    ctx.kafka.seed(TOPIC, key="plays:broken", value=json.dumps({"ns": "plays", "name": "broken", "delta": 1, "token": "t-x", "ts": TS}))
+    failed = ctx.kafka.records(TOPIC)[-1]
+    probe = ctx.redis_after("seen:t-x", lambda: ctx.clock.advance(6))
+    try:
+        ctx.drain(m.run)
+    except Exception:
+        pass  # the worker died on the failed fold, as it should: the event is not lost, it is redelivered
+    assert probe.fired, "the worker never claimed seen:t-x before folding the event"
+    committed = ctx.kafka.committed_offset("rollup", TOPIC, failed.partition) or 0
+    assert committed <= failed.offset, f"the fold of t-x failed and the worker died, yet group rollup has committed past it (offset {committed}): the auto-commit timer committed the event while it was still being processed, so it is never redelivered. Turn enable.auto.commit off and commit only after the fold"
 
 
 def check_dedupe_first(ctx):
     _seed(ctx, ("t-1", 1), ("t-1", 1), ("t-2", 5), ("t-1", 1))
     m = ctx.load("rollup")
     ctx.drain(m.run)
-    values = ctx.redis.hvals(KEY)
-    assert sum(int(v) for v in values) == 6, f"tokens t-1 (+1, replayed twice) and t-2 (+5) must fold to 6, the hash holds {ctx.redis.hgetall(KEY)}"
-    assert ctx.redis.get("seen:t-1") is not None, "seen:t-1 must be claimed so a later replay is dropped"
-    ttl = ctx.redis.ttl("seen:t-1")
-    assert 86400 - 60 <= ttl <= 86400, f"seen:t-1 expires in {ttl} s, expected SEEN_TTL_S (86400)"
+    assert _total(ctx) == 6, f"tokens t-1 (+1, redelivered twice) and t-2 (+5) must fold to 6, the hash holds {ctx.redis.hgetall(KEY)}"
     assert ctx.kafka.lag("rollup", TOPIC) == 0, "a skipped duplicate must still be committed, or it is redelivered forever"
-    ctx.redis.set("seen:t-3", 1)  # a token folded by another replica before this one saw the event
-    _seed(ctx, ("t-3", 100))
+    ttl = ctx.redis.ttl("seen:t-1")
+    assert 86400 - 60 <= ttl <= 86400, f"seen:t-1 expires in {ttl} s, expected SEEN_TTL_S (86400): the claim must outlive any client retry, and not live forever"
+    # A redelivery 1000 s later is dropped, and does not extend the claim.
+    ctx.clock.advance(1000)
+    _seed(ctx, ("t-1", 1))
     ctx.drain(m.run)
-    assert sum(int(v) for v in ctx.redis.hvals(KEY)) == 6, "a token already in seen:* must not be folded, whoever claimed it"
+    assert _total(ctx) == 6, f"a redelivery of t-1 1000 s later must be dropped, the hash holds {ctx.redis.hgetall(KEY)}"
+    ttl = ctx.redis.ttl("seen:t-1")
+    assert ttl <= 86400 - 1000 + 5, f"a redelivery of t-1 re-armed its claim to {ttl} s: the claim lives SEEN_TTL_S from the first time the token was seen"
+    ctx.clock.advance(86400 - 1000)
+    assert ctx.redis.exists("seen:t-1") == 0, "seen:t-1 must be gone SEEN_TTL_S after it was claimed"
+    # Another rollup replica takes over the partition while this one is mid-event (its session timed out):
+    # it redelivers the uncommitted t-9 at the first moment this worker touches seen:t-9.
+    _seed(ctx, ("t-9", 10))
+
+    def replica_takes_over():
+        replica = ctx.load("rollup")
+        ctx.drain(replica.run)
+
+    probe = ctx.redis_after("seen:t-9", replica_takes_over)
+    ctx.drain(m.run)
+    assert probe.fired, "the worker never touched seen:t-9: every event must be claimed under seen:{token} before it is folded"
+    if probe.error is not None:
+        raise probe.error
+    assert _total(ctx) == 16, f"t-9 (+10) was redelivered to a second replica right after this worker first touched seen:t-9, and the hash now holds {_total(ctx) - 6} for it instead of 10: claim the token atomically (SET NX) before folding, so whoever loses the claim skips the event"
 
 
 def check_hincrby_window(ctx):
@@ -736,27 +779,35 @@ def check_hincrby_window(ctx):
 
 
 def check_commit_after(ctx):
-    _seed(ctx, ("t-1", 1))
-    ctx.kafka.seed(TOPIC, key="bad", value="not json")
-    ctx.kafka.seed(TOPIC, key="bad", value=json.dumps({"ns": "plays", "name": "stranger-things"}))
-    first = ctx.kafka.records(TOPIC)[0]
-    at_commit = []
-    ctx.kafka.on_commit(lambda group, offsets: at_commit.append((dict(offsets), ctx.redis.hgetall(KEY))))
+    _seed(ctx, ("t-1", 1), ("t-2", 2))
+    first, second = ctx.kafka.records(TOPIC)
+    at_commit = _folded_at_commits(ctx)
     m = ctx.load("rollup")
     ctx.drain(m.run)
-    assert at_commit, "no offset was ever committed"
-    covering = [snapshot for offsets, snapshot in at_commit if offsets.get((TOPIC, first.partition), 0) > first.offset]
-    assert covering, "the t-1 event was never committed"
-    assert sum(int(v) for v in covering[0].values()) == 1, f"the commit must come after the HINCRBY: when t-1 was committed the hash held {covering[0]}"
-    assert ctx.kafka.lag("rollup", TOPIC) == 0, "malformed records must be skipped and committed, not left to replay forever"
-    assert sum(int(v) for v in ctx.redis.hvals(KEY)) == 1, f"malformed records must not be folded: {ctx.redis.hgetall(KEY)}"
+    assert at_commit, "no offset was ever committed by group rollup"
+    for record, total, label in ((first, 1, "t-1 (+1)"), (second, 3, "t-2 (+2)")):
+        covering = [t for _g, offsets, t in at_commit if offsets.get((TOPIC, record.partition), 0) > record.offset]
+        assert covering, f"the {label} event was never committed"
+        assert covering[0] == total, f"the commit must come after the fold: when {label} was committed the hash held {covering[0]}, expected {total}"
+    # Records the worker skips are committed too — even when nothing follows them to commit past them.
+    ctx.kafka.seed(TOPIC, key="plays:stranger-things", value="not json")
+    ctx.kafka.seed(TOPIC, key="plays:stranger-things", value=json.dumps({"ns": "plays", "name": "stranger-things"}))
+    ctx.drain(m.run)
+    lag = ctx.kafka.lag("rollup", TOPIC)
+    assert lag == 0, f"{lag} malformed record(s) left uncommitted: skip them (log) and commit, or they are redelivered forever"
+    _seed(ctx, ("t-1", 1))
+    ctx.drain(m.run)
+    lag = ctx.kafka.lag("rollup", TOPIC)
+    assert lag == 0, f"the redelivered t-1 was skipped but left uncommitted ({lag} record(s) of lag): a duplicate is committed too, or it is redelivered forever"
+    assert _total(ctx) == 3, f"malformed records must not be folded and the duplicate t-1 only once: the hash holds {ctx.redis.hgetall(KEY)}, expected a total of 3"
 
 
 def check_get_clear(ctx):
     m = ctx.load("rollup")
     assert m.get_count("plays", "stranger-things") == 0, "a counter without events reads as 0"
-    ctx.redis.hset(KEY, mapping={"1760616000": "3", "1760616060": "4", "1760616120": "-1"})
-    assert m.get_count("plays", "stranger-things") == 6, f"get_count must sum every minute bucket (3 + 4 - 1 = 6), got {m.get_count('plays', 'stranger-things')}"
+    _seed(ctx, ("t-1", 3), ("t-2", 4, NEXT_MINUTE_TS), ("t-3", -1, NEXT_MINUTE_TS + 60))
+    ctx.drain(m.run)
+    assert m.get_count("plays", "stranger-things") == 6, f"get_count must sum every minute bucket (3 + 4 - 1 = 6) of {ctx.redis.hgetall(KEY)}, got {m.get_count('plays', 'stranger-things')}"
     assert isinstance(m.get_count("plays", "stranger-things"), int), "get_count must return an int"
     m.clear_count("plays", "stranger-things")
     assert ctx.redis.exists(KEY) == 0, f"clear_count must DEL {KEY}"

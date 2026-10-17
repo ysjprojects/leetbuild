@@ -17,6 +17,8 @@ class Clock:
         self.offset = 0.0
         self.sleeps = 0
         self.sleep_limit: int | None = None
+        # Background timers (Kafka's auto-commit) — they outlive `reset`, which only rewinds time.
+        self._listeners: list = []
 
     def install(self) -> None:
         time.time = self.time
@@ -38,8 +40,13 @@ class Clock:
         return self._real_monotonic() + self.offset
 
     def advance(self, seconds: float) -> None:
-        """Move the clock forward: keys expire, windows roll over, deadlines pass."""
+        """Move the clock forward: keys expire, windows roll over, deadlines pass, background timers fire."""
         self.offset += float(seconds)
+        self._fire()
+
+    def on_advance(self, fn) -> None:
+        """Run `fn()` whenever virtual time moves forward: a background timer (it checks its own interval)."""
+        self._listeners.append(fn)
 
     def sleep(self, seconds: float) -> None:
         self._tick(seconds)
@@ -57,6 +64,11 @@ class Clock:
         if self.sleep_limit is not None and self.sleeps > self.sleep_limit:
             raise KeyboardInterrupt(f"stopped after {self.sleep_limit} sleeps")
         self.offset += seconds
+        self._fire()
+
+    def _fire(self) -> None:
+        for fn in list(self._listeners):
+            fn()
 
 
 CLOCK = Clock()

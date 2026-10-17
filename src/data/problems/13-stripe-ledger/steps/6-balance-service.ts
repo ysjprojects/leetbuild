@@ -629,50 +629,68 @@ CREATE TABLE entries (
 """
 
 T0 = 1700000000000
-# (account, currency, amount, posted_at): a capture, a partial refund a second later, a USD capture.
-ENTRIES = [
-    ("cash:acquirer", "EUR", 4999, T0),
-    ("clearing:payments", "EUR", -4999, T0),
-    ("cash:acquirer", "EUR", -1500, T0 + 1000),
-    ("clearing:payments", "EUR", 1500, T0 + 1000),
-    ("cash:acquirer", "USD", 700, T0 + 2000),
-    ("clearing:payments", "USD", -700, T0 + 2000),
+KEY = "bal:cash:acquirer:EUR"
+
+
+def _pair(debit, credit, currency, amount):
+    return [{"account": debit, "currency": currency, "amount": amount}, {"account": credit, "currency": currency, "amount": -amount}]
+
+
+# (event id, entries, posted_at): a capture, a partial refund a second later, a USD capture.
+JOURNAL = [
+    ("evt-capture", _pair("cash:acquirer", "clearing:payments", "EUR", 4999), T0),
+    ("evt-refund", _pair("clearing:payments", "cash:acquirer", "EUR", 1500), T0 + 1000),
+    ("evt-usd", _pair("cash:acquirer", "clearing:payments", "USD", 700), T0 + 2000),
 ]
 
 
-async def _start(ctx, entries=ENTRIES):
-    """Tables seeded, the learner's server running as a task, and a stub on it."""
+async def _start(ctx):
+    """The journal filled through the real writer (step 4), the learner's server running as a task, and a stub on it."""
     await ctx.db.reset(SCHEMA)
-    for i, (account, currency, amount, posted_at) in enumerate(entries):
-        await ctx.db.execute("INSERT INTO transactions (id, event_id, description, posted_at) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING", (f"tx-{posted_at}", f"evt-{posted_at}", "seed", posted_at))
-        await ctx.db.execute("INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES (%s, %s, %s, %s, %s)", (f"tx-{posted_at}", account, currency, amount, posted_at))
-    ctx.db.statements.clear()
-    m = ctx.load("balance_service")
-    asyncio.create_task(m.serve())
+    writer = ctx.load("ledger_writer")
+    for event_id, entries, posted_at in JOURNAL:
+        await writer.write_transaction(entries, "seed", event_id=event_id, posted_at=posted_at)
+    import balance_service
+
+    asyncio.create_task(balance_service.serve())
     await asyncio.sleep(0)
-    assert ctx.grpc.find("/ledger.LedgerService/GetBalance") is not None, "serve() registered no GetBalance handler"
     stub = ledger_pb2_grpc.LedgerServiceStub(grpc.aio.insecure_channel("ledger:9100"))
-    return m, stub
+    return writer, stub
 
 
-def _queries(ctx):
-    return [s for s in ctx.db.statements if "entries" in s.lower()]
+async def _correct_in_sql(ctx, name, account, amount, posted_at):
+    """A correction applied straight in SQL by an operator, outside the writer: nothing invalidates the cache."""
+    await ctx.db.execute("INSERT INTO transactions (id, description, posted_at) VALUES (%s, 'correction', %s)", (name, posted_at))
+    await ctx.db.execute("INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES (%s, %s, 'EUR', %s, %s)", (name, account, amount, posted_at))
+    await ctx.db.execute("INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES (%s, 'revenue:adjustments', 'EUR', %s, %s)", (name, -amount, posted_at))
+
+
+def _reads(ctx):
+    """Reads of the entries table in the database's query log."""
+    return len([sql for sql, _ in ctx.db.queries if sql.lstrip().lower().startswith("select") and "entries" in sql.lower()])
+
+
+def _call(stub, account="cash:acquirer", currency="EUR", as_of=0):
+    return stub.GetBalance(ledger_pb2.BalanceRequest(account=account, currency=currency, as_of=as_of), timeout=2.0)
 
 
 async def _balance(stub, account="cash:acquirer", currency="EUR", as_of=0):
-    return await stub.GetBalance(ledger_pb2.BalanceRequest(account=account, currency=currency, as_of=as_of), timeout=2.0)
-
-
-async def _code(coro):
     try:
-        await coro
+        return await _call(stub, account, currency, as_of)
+    except grpc.RpcError as e:
+        raise AssertionError(f"GetBalance({account}, {currency}, as_of={as_of}) failed with {e.code()}: {e.details()}")
+
+
+async def _code(call):
+    try:
+        await call
     except grpc.RpcError as e:
         return e.code()
     return grpc.StatusCode.OK
 
 
 async def check_serves_balance(ctx):
-    m, stub = await _start(ctx)
+    _, stub = await _start(ctx)
     reply = await _balance(stub)
     assert isinstance(reply, ledger_pb2.Balance), f"GetBalance must answer a Balance, got {type(reply).__name__}"
     assert reply.amount == 3499, f"cash:acquirer EUR is 4999 - 1500 = 3499, got {reply.amount}"
@@ -686,52 +704,54 @@ async def check_serves_balance(ctx):
 
 
 async def check_invalid_argument(ctx):
-    m, stub = await _start(ctx)
+    _, stub = await _start(ctx)
+    reads = _reads(ctx)
     for account, currency in (("cash:acquirer", "eur"), ("cash:acquirer", "EURO"), ("cash:acquirer", ""), ("", "EUR")):
-        code = await _code(_balance(stub, account=account, currency=currency))
+        code = await _code(_call(stub, account=account, currency=currency))
         assert code == grpc.StatusCode.INVALID_ARGUMENT, f"account {account!r} currency {currency!r} answered {code}, expected INVALID_ARGUMENT"
-    assert _queries(ctx) == [], "a request rejected as INVALID_ARGUMENT must not query the database"
-    assert not ctx.redis.keys("bal:*"), "a request rejected as INVALID_ARGUMENT must not touch the cache"
+    assert _reads(ctx) == reads, "a request rejected as INVALID_ARGUMENT must not query the database"
+    assert not ctx.redis.keys("bal:*"), f"a request rejected as INVALID_ARGUMENT must not touch the cache, found {ctx.redis.keys('bal:*')}"
 
 
 async def check_not_found(ctx):
-    m, stub = await _start(ctx)
-    code = await _code(_balance(stub, account="cash:nowhere"))
+    _, stub = await _start(ctx)
+    code = await _code(_call(stub, account="cash:nowhere"))
     assert code == grpc.StatusCode.NOT_FOUND, f"an account with no entries answered {code}, expected NOT_FOUND"
     assert ctx.redis.get("bal:cash:nowhere:EUR") is None, "a NOT_FOUND must not be cached as a balance"
     gbp = await _balance(stub, currency="GBP")
     assert gbp.amount == 0, f"a known account with no GBP entries has a GBP balance of 0, got {gbp.amount} (not NOT_FOUND)"
-    code = await _code(_balance(stub, account="cash:nowhere", as_of=T0))
+    code = await _code(_call(stub, account="cash:nowhere", as_of=T0))
     assert code == grpc.StatusCode.NOT_FOUND, f"an unknown account is NOT_FOUND at any as_of, got {code}"
 
 
 async def check_cache(ctx):
-    m, stub = await _start(ctx)
+    writer, stub = await _start(ctx)
+    reads = _reads(ctx)
     first = await _balance(stub)
-    assert first.amount == 3499
-    assert len(_queries(ctx)) == 1, f"the first current balance is a cache miss: expected one query, saw {len(_queries(ctx))}"
-    cached = ctx.redis.get("bal:cash:acquirer:EUR")
-    assert cached is not None, "after a miss the balance must be stored under bal:cash:acquirer:EUR"
-    assert str(cached) == "3499", f"bal:cash:acquirer:EUR holds {cached!r}, expected '3499'"
-    ttl = ctx.redis.ttl("bal:cash:acquirer:EUR")
-    assert 1 <= ttl <= 5, f"bal:cash:acquirer:EUR has TTL {ttl}, expected 5 s"
+    assert first.amount == 3499, f"cash:acquirer EUR is 3499, got {first.amount}"
+    assert _reads(ctx) == reads + 1, f"the first current balance is a cache miss: expected one query, saw {_reads(ctx) - reads}"
+    cached = ctx.redis.get(KEY)
+    assert cached is not None, f"after a miss the balance must be stored under {KEY}"
+    assert str(cached) == "3499", f"{KEY} holds {cached!r}, expected '3499'"
+    ttl = ctx.redis.ttl(KEY)
+    assert 1 <= ttl <= 5, f"{KEY} has TTL {ttl}, expected 5 s"
+    # An operator books +100 straight in SQL: no invalidation, so for up to 5 s the cache still answers.
+    await _correct_in_sql(ctx, "fix-1", "cash:acquirer", 100, T0 + 3000)
     second = await _balance(stub)
-    assert second.amount == 3499
-    assert len(_queries(ctx)) == 1, f"the second current balance within 5 s must come from Redis, but the database was queried {len(_queries(ctx))} times"
-    ctx.redis.set("bal:cash:acquirer:EUR", "42", ex=5)
-    planted = await _balance(stub)
-    assert planted.amount == 42, f"the current balance must be read from the cache when present (planted 42, got {planted.amount})"
-    m.invalidate("cash:acquirer", "EUR")
-    assert ctx.redis.get("bal:cash:acquirer:EUR") is None, "invalidate(account, currency) must DEL bal:{account}:{currency}"
-    after = await _balance(stub)
-    assert after.amount == 3499 and len(_queries(ctx)) == 2, "after invalidate the next read must hit the database again"
+    assert second.amount == 3499, f"within 5 s the current balance must come from the cache (3499), but the service answered {second.amount} from the database"
+    assert _reads(ctx) == reads + 1, "the second current balance within 5 s must come from Redis, but the database was queried"
     ctx.clock.advance(6)
-    await _balance(stub)
-    assert len(_queries(ctx)) == 3, "after the 5 s TTL the cached balance must have expired and be recomputed"
+    third = await _balance(stub)
+    assert third.amount == 3599, f"after the 5 s TTL the cached balance must have expired and be recomputed (3599), got {third.amount}"
+    # A write through the journal writer invalidates: the very next read sees it.
+    await writer.write_transaction(_pair("cash:acquirer", "revenue:fees", "EUR", 1), "fee", event_id="evt-fee", posted_at=T0 + 4000)
+    assert ctx.redis.get(KEY) is None, f"after a write to cash:acquirer EUR, invalidate(account, currency) must have deleted {KEY}"
+    fourth = await _balance(stub)
+    assert fourth.amount == 3600, f"right after a write the next read must hit the database (3600), got {fourth.amount}"
 
 
 async def check_as_of(ctx):
-    m, stub = await _start(ctx)
+    _, stub = await _start(ctx)
     at_t0 = await _balance(stub, as_of=T0)
     assert at_t0.amount == 4999, f"as of T0 only the capture is posted: expected 4999, got {at_t0.amount}"
     assert at_t0.as_of == T0, f"the reply's as_of must be the requested time {T0}, got {at_t0.as_of}"
@@ -740,11 +760,13 @@ async def check_as_of(ctx):
     later = await _balance(stub, as_of=T0 + 1000)
     assert later.amount == 3499, f"as of T0 + 1 s the refund is posted too: expected 3499, got {later.amount}"
     assert not ctx.redis.keys("bal:*"), f"a point-in-time balance must not be cached, found {ctx.redis.keys('bal:*')}"
-    ctx.redis.set("bal:cash:acquirer:EUR", "42", ex=5)
-    n = len(_queries(ctx))
+    current = await _balance(stub)
+    assert current.amount == 3499 and ctx.redis.get(KEY) is not None, "the current balance must be cached"
+    # A backdated correction straight in SQL: the history changes, the cached current balance does not know.
+    await _correct_in_sql(ctx, "fix-1", "cash:acquirer", 100, T0 - 500)
     historical = await _balance(stub, as_of=T0)
-    assert historical.amount == 4999, f"a point-in-time balance must bypass the cache (cache holds 42, expected 4999, got {historical.amount})"
-    assert len(_queries(ctx)) == n + 1, "a point-in-time balance must always query the database"
+    assert historical.amount == 5099, f"a point-in-time balance must come from the database (5099 as of T0 after the correction), got {historical.amount}"
+    assert str(ctx.redis.get(KEY)) == "3499", "a point-in-time balance must not overwrite the cached current balance"
 `,
   },
   debrief: `The balance is a fold over the journal, which is why the read side can be cached so aggressively and so briefly: the five-second TTL only matters when an invalidation is lost, because every committed write deletes the key itself. The point-in-time branch bypasses the cache because its answer never changes — the journal is immutable, so "the balance as of Tuesday" is the same number whenever you ask, and caching it under the current key would poison the current balance. Returning NOT_FOUND from the same query that computes the sum avoids a second round trip and a race between them. Real balance services keep running balances per account as a materialised view updated by the writer, snapshot them nightly so a historical query folds a day of entries instead of years, and serve the gRPC streams of balance changes that dashboards subscribe to.`,

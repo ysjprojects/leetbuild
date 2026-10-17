@@ -20,7 +20,7 @@ message GetCountReply   { int64 count = 1; int64 as_of = 2; }
 \`\`\`
 
 \`NAMESPACES\` and \`NAME_RE\` are the ones from step 1; \`get_best_effort\` (step 2's read) and
-\`get_rolled_up\` (step 4's sum over the buckets) are provided.
+\`get_rolled_up\` (step 4's sum over the buckets) are the functions those steps built, available to this file.
 
 - An unknown namespace ends the call with **\`NOT_FOUND\`**, a name that does not match \`NAME_RE\` with
   **\`INVALID_ARGUMENT\`** — the gRPC spellings of the API's 404 and 400.
@@ -159,6 +159,8 @@ import redis
 
 import counters_pb2
 import counters_pb2_grpc
+from best_effort import get_count as get_best_effort  # built in step 2: the cached counter, 0 when missing
+from rollup import get_count as get_rolled_up  # built in step 4: the sum over the minute buckets
 
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
@@ -169,16 +171,6 @@ NAMESPACES = {
 }
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 CACHE_TTL_S = 2
-
-
-def get_best_effort(ns: str, name: str) -> int:
-    """Step 2's get_count (provided)."""
-    raise NotImplementedError
-
-
-def get_rolled_up(ns: str, name: str) -> int:
-    """Step 4's get_count: the sum over the minute buckets (provided)."""
-    raise NotImplementedError
 
 
 def cached_total(ns: str, name: str) -> tuple[int, int]:
@@ -217,6 +209,8 @@ import redis
 
 import counters_pb2
 import counters_pb2_grpc
+from best_effort import get_count as get_best_effort  # built in step 2: the cached counter, 0 when missing
+from rollup import get_count as get_rolled_up  # built in step 4: the sum over the minute buckets
 
 r = redis.Redis(host="redis", port=6379, decode_responses=True)
 
@@ -227,16 +221,6 @@ NAMESPACES = {
 }
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 CACHE_TTL_S = 2
-
-
-def get_best_effort(ns: str, name: str) -> int:
-    """Step 2's get_count (provided)."""
-    raise NotImplementedError
-
-
-def get_rolled_up(ns: str, name: str) -> int:
-    """Step 4's get_count: the sum over the minute buckets (provided)."""
-    raise NotImplementedError
 
 
 def cached_total(ns: str, name: str) -> tuple[int, int]:
@@ -672,25 +656,22 @@ KEY = "total:plays:stranger-things"
 
 
 def _service(ctx):
-    """The learner's servicer installed as the peer, a stub on it, and the fakes behind it."""
+    """The learner's servicer served as CounterService, a client stub on it, and the real steps behind it."""
     m = ctx.load("count_service")
-    reads = {"best": [], "rolled": []}
-    totals = {"plays:stranger-things": 1207}
-    best = {"views:trailer-7": 42}
+    import best_effort  # step 2: the best-effort counters GetCount reads
+    import count_events  # step 3: how eventually-consistent adds become events
+    import rollup  # step 4: the worker that folds them into the buckets GetCount sums
 
-    def get_best_effort(ns, name):
-        reads["best"].append((ns, name))
-        return best.get(f"{ns}:{name}", 0)
-
-    def get_rolled_up(ns, name):
-        reads["rolled"].append((ns, name))
-        return totals.get(f"{ns}:{name}", 0)
-
-    m.get_best_effort = get_best_effort
-    m.get_rolled_up = get_rolled_up
     ctx.grpc.serve(counters_pb2_grpc.add_CounterServiceServicer_to_server, m.CounterService())
     stub = counters_pb2_grpc.CounterServiceStub(grpc.insecure_channel("counters:9000"))
-    return m, stub, reads, totals
+    return stub, best_effort, count_events, rollup
+
+
+def _plays(ctx, count_events, rollup, *adds):
+    """Eventually-consistent adds to plays/stranger-things as production makes them: logged, then rolled up."""
+    for token, delta in adds:
+        count_events.append_event("plays", "stranger-things", delta, token)
+    ctx.drain(rollup.run)
 
 
 def _get(stub, ns, name):
@@ -707,24 +688,24 @@ def _fails_with(stub, ns, name, code):
 
 
 def check_not_found(ctx):
-    m, stub, reads, totals = _service(ctx)
+    stub, best_effort, count_events, rollup = _service(ctx)
     _fails_with(stub, "likes", "stranger-things", grpc.StatusCode.NOT_FOUND)
     _fails_with(stub, "", "stranger-things", grpc.StatusCode.NOT_FOUND)
-    assert reads == {"best": [], "rolled": []}, f"an unknown namespace must be refused before any store is read, reads: {reads}"
-    assert ctx.redis.keys() == [], "an unknown namespace must not leave anything in the cache"
+    assert ctx.redis.keys() == [], f"an unknown namespace must not leave anything in the cache, Redis holds {ctx.redis.keys()}"
 
 
 def check_invalid_argument(ctx):
-    m, stub, reads, totals = _service(ctx)
+    stub, best_effort, count_events, rollup = _service(ctx)
     for bad in ("bad name", "", "a" * 65, "dots.are.out"):
         _fails_with(stub, "plays", bad, grpc.StatusCode.INVALID_ARGUMENT)
         _fails_with(stub, "views", bad, grpc.StatusCode.INVALID_ARGUMENT)
-    assert reads == {"best": [], "rolled": []}, f"a bad name must be refused before any store is read, reads: {reads}"
+    assert ctx.redis.keys() == [], f"a bad name must be refused before any store is consulted, yet Redis holds {ctx.redis.keys()}"
     _fails_with(stub, "likes", "bad name", grpc.StatusCode.NOT_FOUND)  # the namespace is checked first
 
 
 def check_cache_key_ttl(ctx):
-    m, stub, reads, totals = _service(ctx)
+    stub, best_effort, count_events, rollup = _service(ctx)
+    _plays(ctx, count_events, rollup, ("t-1", 1200), ("t-2", 7))
     reply = _get(stub, "plays", "stranger-things")
     assert reply.count == 1207, f"GetCount answered {reply.count}, expected the rolled-up 1207"
     cached = ctx.redis.get(KEY)
@@ -738,35 +719,33 @@ def check_cache_key_ttl(ctx):
 
 
 def check_cache_aside(ctx):
-    m, stub, reads, totals = _service(ctx)
+    stub, best_effort, count_events, rollup = _service(ctx)
+    _plays(ctx, count_events, rollup, ("t-1", 1200), ("t-2", 7))
     first = _get(stub, "plays", "stranger-things")
-    assert len(reads["rolled"]) == 1, f"a miss sums the buckets once, saw {len(reads['rolled'])} get_rolled_up calls"
-    second = _get(stub, "plays", "stranger-things")
-    assert len(reads["rolled"]) == 1, "the second read within 2 s must be served from the cache, not from the buckets again"
-    assert (second.count, second.as_of) == (first.count, first.as_of), f"a cache hit returns the cached pair {(first.count, first.as_of)}, got {(second.count, second.as_of)}"
-    totals["plays:stranger-things"] = 1300
+    assert first.count == 1207, f"GetCount answered {first.count}, expected the rolled-up 1207"
+    _plays(ctx, count_events, rollup, ("t-3", 93))  # the buckets move on to 1300
     ctx.clock.advance(1)
-    assert _get(stub, "plays", "stranger-things").count == 1207, "within the TTL the cached total is what callers see, even though the buckets moved"
-    ctx.clock.advance(2)
+    second = _get(stub, "plays", "stranger-things")
+    assert (second.count, second.as_of) == (first.count, first.as_of), f"1 s after the first read the buckets moved to 1300, but a read within CACHE_TTL_S is served from {KEY}: expected the cached pair {(first.count, first.as_of)}, got {(second.count, second.as_of)}"
+    ctx.clock.advance(1.5)
     third = _get(stub, "plays", "stranger-things")
-    assert len(reads["rolled"]) == 2, "after the TTL the next read must go back to the buckets"
-    assert third.count == 1300, f"after the TTL the reply carries the new total 1300, got {third.count}"
-    assert third.as_of >= first.as_of + 3, f"as_of must be the time of the recomputation ({first.as_of + 3} or later), got {third.as_of}"
-    ctx.redis.set(KEY, json.dumps({"count": 5, "as_of": 1700000000}))
-    hit = _get(stub, "plays", "stranger-things")
-    assert (hit.count, hit.as_of) == (5, 1700000000), f"whatever is in {KEY} is the answer while it lives, got {(hit.count, hit.as_of)}"
+    assert third.count == 1300, f"2.5 s after the total was cached the entry has expired and the next read must sum the buckets again: expected the new total 1300, got {third.count}"
+    assert third.as_of >= first.as_of + 2, f"as_of must be the time of the recomputation ({first.as_of + 2} or later), got {third.as_of}"
 
 
 def check_reply(ctx):
-    m, stub, reads, totals = _service(ctx)
+    stub, best_effort, count_events, rollup = _service(ctx)
+    best_effort.add_count("views", "trailer-7", 42)
     reply = _get(stub, "views", "trailer-7")
-    assert reply.count == 42, f"a best-effort namespace answers get_best_effort's 42, got {reply.count}"
+    assert reply.count == 42, f"a best-effort namespace answers the counter's 42, got {reply.count}"
     assert abs(reply.as_of - int(time.time())) <= 1, f"a best-effort reply's as_of is now ({int(time.time())}), got {reply.as_of}"
-    assert reads == {"best": [("views", "trailer-7")], "rolled": []}, f"a best-effort read goes to get_best_effort only, reads: {reads}"
     assert ctx.redis.exists("total:views:trailer-7") == 0, "best-effort counters are not cached: they are already one GET away"
+    best_effort.add_count("views", "trailer-7", 8)
+    reply = _get(stub, "views", "trailer-7")
+    assert reply.count == 50, f"a best-effort read goes straight to the counter: right after another add of 8 GetCount must answer 50, got {reply.count}"
+    _plays(ctx, count_events, rollup, ("t-1", 1200), ("t-2", 7))
     reply = _get(stub, "plays", "stranger-things")
     assert reply.count == 1207 and abs(reply.as_of - int(time.time())) <= 1, f"an eventually-consistent reply carries the rolled-up 1207 and a current as_of, got {(reply.count, reply.as_of)}"
-    assert reads["rolled"] == [("plays", "stranger-things")], f"an eventually-consistent read goes to get_rolled_up, reads: {reads}"
 `,
   },
   debrief: `GetCount is the read side of the abstraction, and it is served from a cache for the same reason the write side is a log: a popular counter is read far more often than its total changes, and summing buckets on every read would make the rollup store the hot spot. Two seconds of TTL is nothing on a number that is already eventually consistent, and as_of makes the staleness honest — a caller can see exactly how old the figure is instead of guessing. The status codes mirror the API's: NOT_FOUND and INVALID_ARGUMENT are the same two failures in gRPC's vocabulary, which is what lets one abstraction serve HTTPS clients and internal services alike. Netflix caches rolled-up values in EVCache in front of its rollup store and, for the counters that must be exact, offers a read that waits for the rollup instead of reading the cache.`,

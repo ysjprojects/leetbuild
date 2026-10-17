@@ -616,6 +616,23 @@ int main() {
   harness: {
     python: `import time
 
+SCHEMA = """
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL REFERENCES transactions (id),
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL,
+    posted_at bigint NOT NULL
+);
+"""
+
 H = 3600 * 1000
 CAPTURE = [{"account": "cash:acquirer", "currency": "EUR", "amount": 4999}, {"account": "clearing:payments", "currency": "EUR", "amount": -4999}]
 PAYOUT = [{"account": "clearing:payments", "currency": "EUR", "amount": 4999}, {"account": "clearing:payouts", "currency": "EUR", "amount": -4999}]
@@ -626,77 +643,96 @@ def _now():
     return int(time.time() * 1000)
 
 
+async def _world(ctx):
+    """The real journal writer (step 4) on an empty ledger, calling the learner's tracker after every commit."""
+    await ctx.db.reset(SCHEMA)
+    writer = ctx.load("ledger_writer")
+    import clearing_tracker
+
+    return writer, clearing_tracker
+
+
+async def _write(writer, entries, posted_at, settles=None):
+    """A real transaction through the journal, posted at its own time; returns its id."""
+    return await writer.write_transaction(entries, "flow", posted_at=posted_at, settles=settles)
+
+
 def _open(ctx):
     return {m: int(s) for m, s in ctx.redis.zrange("clearing:open", 0, -1, withscores=True)}
 
 
-def check_opens_item(ctx):
-    m = ctx.load("clearing_tracker")
+async def check_opens_item(ctx):
+    writer, _ = await _world(ctx)
     t0 = _now() - 3 * H
-    m.track("tx-1", t0, CAPTURE)
+    a = await _write(writer, CAPTURE, t0)
     assert ctx.redis.type("clearing:open") == "zset", f"clearing:open must be a sorted set, found {ctx.redis.type('clearing:open')!r}"
-    score = ctx.redis.zscore("clearing:open", "tx-1")
-    assert score is not None, "a transaction crediting clearing:payments must be added to clearing:open"
+    score = ctx.redis.zscore("clearing:open", a)
+    assert score is not None, "a transaction crediting clearing:payments must be added to clearing:open under its transaction id"
     assert int(score) == t0, f"the score must be the transaction's own posted_at ({t0}), got {int(score)}: a late event must already be overdue"
-    m.track("tx-2", _now(), CASH_ONLY)
-    assert ctx.redis.zscore("clearing:open", "tx-2") is None, "a transaction between cash accounts touches no clearing account and must not be tracked"
-    m.track("tx-3", t0 + 1, PAYOUT)
-    assert _open(ctx) == {"tx-1": t0, "tx-3": t0 + 1}, f"clearing:open should hold tx-1 and tx-3, holds {_open(ctx)}"
+    b = await _write(writer, CASH_ONLY, _now())
+    assert ctx.redis.zscore("clearing:open", b) is None, "a transaction between cash accounts touches no clearing account and must not be tracked"
+    c = await _write(writer, PAYOUT, t0 + 1)
+    assert _open(ctx) == {a: t0, c: t0 + 1}, f"clearing:open should hold the capture and the payout, holds {_open(ctx)}"
 
 
-def check_settles_closes(ctx):
-    m = ctx.load("clearing_tracker")
+async def check_settles_closes(ctx):
+    writer, _ = await _world(ctx)
     t0 = _now() - 3 * H
-    m.track("tx-1", t0, CAPTURE)
-    m.track("tx-2", t0 + 2 * H, PAYOUT, settles="tx-1")
-    assert ctx.redis.zscore("clearing:open", "tx-1") is None, "the transaction that settles tx-1 must ZREM it from clearing:open"
-    assert ctx.redis.zscore("clearing:open", "tx-2") is None, "the settling transaction is the closing side of the flow: it must not open an item of its own"
+    a = await _write(writer, CAPTURE, t0)
+    b = await _write(writer, PAYOUT, t0 + 2 * H, settles=a)
+    assert ctx.redis.zscore("clearing:open", a) is None, "the transaction that settles the capture must ZREM it from clearing:open"
+    assert ctx.redis.zscore("clearing:open", b) is None, "the settling transaction is the closing side of the flow: it must not open an item of its own"
     try:
-        m.track("tx-9", t0, PAYOUT, settles="tx-unknown")
+        await _write(writer, PAYOUT, t0, settles="tx-unknown")
     except Exception as exc:
-        raise AssertionError(f"settling an id that is not open must be a no-op, but track raised {exc!r}")
+        raise AssertionError(f"settling an id that is not open must be a no-op, but the write failed in track with {type(exc).__name__}: {exc}")
     assert _open(ctx) == {}, f"clearing:open should be empty, holds {_open(ctx)}"
-    m.track("tx-4", t0, CAPTURE)
-    m.track("tx-5", t0 + 1, CAPTURE)
-    m.track("tx-6", t0 + 2, PAYOUT, settles="tx-4")
-    assert _open(ctx) == {"tx-5": t0 + 1}, f"only tx-4 was settled: clearing:open should hold tx-5, holds {_open(ctx)}"
+    c = await _write(writer, CAPTURE, t0)
+    d = await _write(writer, CAPTURE, t0 + 1)
+    await _write(writer, PAYOUT, t0 + 2, settles=c)
+    assert _open(ctx) == {d: t0 + 1}, f"only the first of two captures was settled: clearing:open should hold the second, holds {_open(ctx)}"
 
 
-def check_stuck_window(ctx):
-    m = ctx.load("clearing_tracker")
+async def check_stuck_window(ctx):
+    writer, m = await _world(ctx)
     now = _now()
-    ctx.redis.zadd("clearing:open", {"tx-48h": now - 48 * H, "tx-23h": now - 23 * H, "tx-25h": now - 25 * H, "tx-1h": now - 1 * H})
+    ids = {}
+    for name, hours in (("48h", 48), ("23h", 23), ("25h", 25), ("1h", 1)):
+        ids[await _write(writer, CAPTURE, now - hours * H)] = name
     items = m.stuck()
     assert isinstance(items, list), f"stuck() must return a list, got {type(items).__name__}"
-    ids = [i.get("transaction_id") for i in items]
-    assert ids == ["tx-48h", "tx-25h"], f"items older than 24 h, oldest first, are ['tx-48h', 'tx-25h']; got {ids}"
+    assert len(_open(ctx)) == 4, "stuck() reports; it must not remove anything from clearing:open"
+    got = [ids.get(i.get("transaction_id"), i.get("transaction_id")) for i in items]
+    assert got == ["48h", "25h"], f"of transactions posted 48 h, 23 h, 25 h and 1 h ago, the ones older than 24 h, oldest first, are ['48h', '25h']; got {got}"
     for item in items:
         assert item.get("opened_at") == int(ctx.redis.zscore("clearing:open", item["transaction_id"])), f"opened_at must be the item's score, got {item}"
-    ages = {i["transaction_id"]: i.get("age_s") for i in items}
-    assert abs(ages["tx-48h"] - 48 * 3600) <= 2 and abs(ages["tx-25h"] - 25 * 3600) <= 2, f"age_s must be the age in seconds, got {ages}"
-    assert len(_open(ctx)) == 4, "stuck() reports; it must not remove anything from clearing:open"
+    ages = {ids[i["transaction_id"]]: i.get("age_s") for i in items}
+    assert abs(ages["48h"] - 48 * 3600) <= 2 and abs(ages["25h"] - 25 * 3600) <= 2, f"age_s must be the age in seconds, got {ages}"
     ctx.clock.advance(2 * 3600)
-    ids = [i["transaction_id"] for i in m.stuck()]
-    assert ids == ["tx-48h", "tx-25h", "tx-23h"], f"two hours later tx-23h has crossed 24 h and must be reported: got {ids}"
-    # A late event: posted 30 h ago, tracked just now — stuck immediately, because the score is its own time.
-    m.track("tx-late", _now() - 30 * H, CAPTURE)
-    assert "tx-late" in [i["transaction_id"] for i in m.stuck()], "an event posted 30 h ago that arrives now is already stuck"
+    got = [ids.get(i["transaction_id"], i["transaction_id"]) for i in m.stuck()]
+    assert got == ["48h", "25h", "23h"], f"two hours later the 23 h one has crossed 24 h and must be reported: got {got}"
+    # A late event: posted 30 h ago, journaled just now — stuck immediately, because the score is its own time.
+    late = await _write(writer, CAPTURE, _now() - 30 * H)
+    assert late in [i["transaction_id"] for i in m.stuck()], "a transaction posted 30 h ago that reaches the journal now is already stuck"
 
 
 async def check_stuck_endpoint(ctx):
-    m = ctx.load("clearing_tracker")
+    writer, m = await _world(ctx)
     now = _now()
-    ctx.redis.zadd("clearing:open", {"tx-27h": now - 27 * H, "tx-2h": now - 2 * H, "tx-30h": now - 30 * H})
+    ids = {}
+    for name, hours in (("27h", 27), ("2h", 2), ("30h", 30)):
+        ids[await _write(writer, CAPTURE, now - hours * H)] = name
     async with ctx.client(m.app) as c:
         r = await c.get("/clearing/stuck")
     assert r.status_code == 200, f"GET /clearing/stuck answered {r.status_code}"
     assert r.headers.get("content-type", "").startswith("application/json"), f"the report must be JSON, got Content-Type {r.headers.get('content-type')!r}"
     body = r.json()
     assert isinstance(body, list), f"the report is a JSON list, got {body!r}"
-    assert [i.get("transaction_id") for i in body] == ["tx-30h", "tx-27h"], f"expected the two items older than 24 h, oldest first; got {body}"
+    got = [ids.get(i.get("transaction_id"), i.get("transaction_id")) for i in body]
+    assert got == ["30h", "27h"], f"expected the two transactions older than 24 h, oldest first (['30h', '27h']); got {got}"
     for item in body:
         assert set(item) >= {"transaction_id", "opened_at", "age_s"}, f"every item carries transaction_id, opened_at and age_s, got {item}"
-    assert abs(body[0]["age_s"] - 30 * 3600) <= 2, f"tx-30h's age_s should be about {30 * 3600}, got {body[0]['age_s']}"
+    assert abs(body[0]["age_s"] - 30 * 3600) <= 2, f"the 30 h one's age_s should be about {30 * 3600}, got {body[0]['age_s']}"
     assert len(_open(ctx)) == 3, "reading the report must not change clearing:open"
 `,
   },

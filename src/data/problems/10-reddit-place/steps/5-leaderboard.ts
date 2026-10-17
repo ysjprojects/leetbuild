@@ -886,18 +886,24 @@ def _seed(ctx, *placements):
 
 
 def check_consumer(ctx):
-    _seed(ctx, "ana")
+    _seed(ctx, "ana", ("bo", 4, 7, 5))
+    bo = ctx.kafka.records("placements")[1]
+    ctx.redis.set("history:4:7", "corrupt")  # bo's pixel: the worker's write fails while it handles her tile
     m = ctx.load("leaderboard")
-    subscriptions = [e for e in ctx.kafka.events if e[0] == "subscribe"]
-    assert subscriptions, "the consumer must subscribe to a topic"
-    group, topics = subscriptions[-1][1], subscriptions[-1][2]
-    assert group == "leaderboard", f"group.id must be leaderboard, got {group!r}"
-    assert "placements" in topics, f"the consumer must subscribe to placements, got {topics}"
-    assert ctx.kafka.consumers[-1].auto_commit is False, "enable.auto.commit is on: offsets would be acknowledged on a timer, before the tile is counted"
+    try:
+        ctx.drain(m.run)
+    except Exception:
+        pass  # the worker died on bo's placement
+    m.consumer.close()  # the process is stopped (deploy, SIGTERM): its consumer leaves the group
+    committed = ctx.kafka.committed_offset("leaderboard", "placements", bo.partition)
+    assert committed is None or committed <= bo.offset, f"bo's placement never reached her pixel's history, yet group leaderboard committed past it (offset {committed}) by the time the worker stopped: offsets were acknowledged for what was delivered, not for what was processed. Turn auto-commit off and commit after the writes"
+    ctx.redis.delete("history:4:7")  # the fault is repaired and the worker restarts
+    m = ctx.load("leaderboard")
     ctx.drain(m.run)
-    assert not any(e[0] == "auto-commit" for e in ctx.kafka.events), "offsets were auto-committed"
-    assert any(e[0] == "manual-commit" for e in ctx.kafka.events), "no explicit commit happened after processing"
-    assert ctx.kafka.lag("leaderboard", "placements") == 0, "every processed record must be committed"
+    history = ctx.redis.lrange("history:4:7", 0, -1)
+    assert history and json.loads(history[0]).get("user") == "bo", f"after the restart bo's placement must be replayed into history:4:7, which holds {history}: it was lost"
+    lag = ctx.kafka.lag("leaderboard", "placements")
+    assert lag == 0, f"group leaderboard on placements has {lag} uncommitted record(s) after the worker processed everything: commit each record once it is counted"
 
 
 def check_zincrby(ctx):

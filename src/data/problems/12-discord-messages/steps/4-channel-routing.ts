@@ -695,50 +695,56 @@ std::vector<discord::Message> fetch_messages(int64_t channel_id, int64_t before,
     },
   },
   harness: {
-    python: `from collections import Counter
+    python: `import importlib
+from collections import Counter
 
 import grpc
 
-import messages_pb2
-import messages_pb2_grpc
+from messages.db import SCHEMA
 
 EPOCH = 1420070400000
 BUCKET_MS = 10 * 24 * 3600 * 1000
+INSERT = "INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES (%s, %s, %s, %s, %s)"
 
 
 def sf(bucket, offset_ms=0):
     return ((bucket * BUCKET_MS + offset_ms) << 22) | (1 << 17)
 
 
-END = sf(431, BUCKET_MS - 1)
-CHANNELS = [sf(400 + i, 1000 * i) for i in range(12)]
+B = 430
+END = sf(B + 1, BUCKET_MS - 1)
+CHANNELS = [sf(B, 1000 * i + 1) for i in range(12)]  # twelve channels created in bucket B
 
 
-class FakePeer(messages_pb2_grpc.MessageDataServicer):
-    """A data service answering three messages just below the cursor; records every request."""
-
-    def __init__(self):
-        self.requests = []
-
-    def GetMessages(self, request, context):
-        self.requests.append(request)
-        base = request.before - 1
-        n = min(request.limit, 3)
-        return messages_pb2.GetMessagesReply(messages=[messages_pb2.Message(id=base - i, author_id=7, content=f"m{i}") for i in range(n)])
+def _page(i):
+    """What Postgres holds for CHANNELS[i], newest first."""
+    return [f"{i}:2", f"{i}:1", f"{i}:0"]
 
 
-def _client(ctx):
-    peer = FakePeer()
-    ctx.grpc.serve(messages_pb2_grpc.add_MessageDataServicer_to_server, peer)
+async def _cluster(ctx):
+    """The routing module, with step 3's data service — the real one, over Postgres — serving one instance at each of its INSTANCES."""
+    await ctx.db.reset(SCHEMA)
+    for i, channel in enumerate(CHANNELS):
+        for j in range(3):
+            await ctx.db.execute(INSERT, (str(channel), B, str(sf(B, 1000 * i + 10 + j)), "7", f"{i}:{j}"))
     m = ctx.load("channel_routing")
-    routed = []
-    for name, stub in m.stubs.items():
-        def wrapped(request, *args, _name=name, _original=stub.GetMessages, **kwargs):
-            routed.append(_name)
-            return _original(request, *args, **kwargs)
+    data_service = importlib.import_module("data_service")
+    pb2_grpc = importlib.import_module("messages_pb2_grpc")
+    base = pb2_grpc.MessageDataServicer
+    servicers = [v for v in vars(data_service).values() if isinstance(v, type) and issubclass(v, base) and v is not base]
+    assert servicers, "data_service (step 3) defines no MessageDataServicer to route to"
+    for node in m.INSTANCES:
+        ctx.grpc.serve(pb2_grpc.add_MessageDataServicer_to_server, servicers[0](), target=node)
+    return m
 
-        stub.GetMessages = wrapped
-    return m, peer, routed
+
+async def _fetch(ctx, m, channel):
+    """fetch_messages for one channel: the contents it returned and the one GetMessages call it made."""
+    n = len(ctx.grpc.calls_to("GetMessages"))
+    rows = await m.fetch_messages(channel, END, 50)
+    calls = ctx.grpc.calls_to("GetMessages")[n:]
+    assert len(calls) == 1, f"fetch_messages for channel {channel} made {len(calls)} GetMessages calls, expected one"
+    return [x.content for x in rows], calls[0]
 
 
 def _expected(m, nodes, key):
@@ -752,7 +758,7 @@ def _expected(m, nodes, key):
 
 
 def check_virtual_nodes(ctx):
-    m, peer, routed = _client(ctx)
+    m = ctx.load("channel_routing")
     assert m.VNODES >= 50, f"VNODES is {m.VNODES}: a handful of points per instance cannot split the ring evenly"
     ring = m.Ring(m.INSTANCES)
     keys = [sf(425, i * 4096 * 7919) for i in range(3000)]
@@ -772,7 +778,7 @@ def check_virtual_nodes(ctx):
 
 
 def check_clockwise_pick(ctx):
-    m, peer, routed = _client(ctx)
+    m = ctx.load("channel_routing")
     for nodes in (m.INSTANCES, m.INSTANCES[:2], ["data-7:9000", "data-8:9000", "data-9:9000", "data-10:9000"]):
         ring = m.Ring(nodes)
         for key in [sf(425, i * 4096 * 7919) for i in range(400)]:
@@ -784,7 +790,7 @@ def check_clockwise_pick(ctx):
 
 
 def check_remove_minimal(ctx):
-    m, peer, routed = _client(ctx)
+    m = ctx.load("channel_routing")
     ring = m.Ring(m.INSTANCES)
     keys = [sf(425, i * 4096 * 7919) for i in range(1500)]
     before = {k: ring.pick(k) for k in keys}
@@ -804,37 +810,51 @@ def check_remove_minimal(ctx):
 
 
 async def check_route_by_channel(ctx):
-    m, peer, routed = _client(ctx)
-    used = set()
-    for channel in CHANNELS:
-        rows = await m.fetch_messages(channel, END, 50)
-        expected = m.ring.pick(channel)
-        assert routed and routed[-1] == expected, f"fetch_messages for channel {channel} called {routed[-1] if routed else 'no stub'}, but ring.pick says {expected}"
-        used.add(routed[-1])
-        request = peer.requests[-1]
-        assert (request.channel_id, request.before, request.limit) == (channel, END, 50), f"the request must carry channel_id, before and limit as given: {request}"
-        assert [x.id for x in rows] == [END - 1, END - 2, END - 3], f"fetch_messages must return the reply's messages, got {[x.id for x in rows]}"
-    assert len(used) >= 2, f"twelve channels all went to {used}: the ring must spread channels over the instances"
+    m = await _cluster(ctx)
+    homes = {}
+    for i, channel in enumerate(CHANNELS):
+        page, call = await _fetch(ctx, m, channel)
+        owner = m.ring.pick(channel)
+        assert call.target == owner, f"fetch_messages for channel {channel} reached {call.target}, but ring.pick says {owner}: a channel's reads must go to the instance that owns it on the ring"
+        assert (call.request.channel_id, call.request.before, call.request.limit) == (channel, END, 50), f"the request must carry channel_id, before and limit as given, the data service received {call.request}"
+        assert page == _page(i), f"fetch_messages must return the data service's page for channel {channel} ({_page(i)}), got {page}"
+        homes[channel] = call.target
+    assert len(set(homes.values())) >= 2, f"twelve channels all reached {set(homes.values())}: the ring must spread channels over the instances"
     for _ in range(3):
-        await m.fetch_messages(CHANNELS[0], END, 50)
-    assert len(set(routed[-3:])) == 1 and routed[-1] == m.ring.pick(CHANNELS[0]), "repeated reads of one channel must all reach the same instance"
-    m.ring.remove(m.ring.pick(CHANNELS[0]))
-    await m.fetch_messages(CHANNELS[0], END, 50)
-    assert routed[-1] == m.ring.pick(CHANNELS[0]), "after its instance left, the channel's reads must follow the ring to the new owner"
+        _page0, call = await _fetch(ctx, m, CHANNELS[0])
+        assert call.target == homes[CHANNELS[0]], f"repeated reads of one channel must all reach the same instance: {homes[CHANNELS[0]]} first, then {call.target}"
+    gone = homes[CHANNELS[0]]
+    ctx.grpc.stop(gone)  # the instance goes down; service discovery drops it from the ring
+    m.ring.remove(gone)
+    for i, channel in enumerate(CHANNELS):
+        try:
+            page, call = await _fetch(ctx, m, channel)
+        except grpc.RpcError as e:
+            raise AssertionError(f"after {gone} went down and left the ring, channel {channel} failed with {e.code()}: its reads must follow the ring to a live instance")
+        assert call.target != gone, f"channel {channel} still dialled {gone} after it left the ring"
+        if homes[channel] != gone:
+            assert call.target == homes[channel], f"channel {channel} lived on {homes[channel]}, which is still up, yet moved to {call.target} when {gone} left"
+        assert call.target == m.ring.pick(channel), f"channel {channel} reached {call.target}, but the ring now says {m.ring.pick(channel)}"
+        assert page == _page(i), f"the new owner must answer channel {channel}'s real page {_page(i)}, got {page}"
 
 
 async def check_deadline(ctx):
-    m, peer, routed = _client(ctx)
-    await m.fetch_messages(CHANNELS[1], END, 50)
-    call = ctx.grpc.calls_to("GetMessages")[-1]
+    m = await _cluster(ctx)
+    channel = CHANNELS[1]
+    page, call = await _fetch(ctx, m, channel)
+    assert page == _page(1), f"expected channel {channel}'s page {_page(1)}, got {page}"
     assert call.timeout is not None, "GetMessages carries no deadline: a stalled data service would hold the API request forever"
-    assert 0.25 <= call.timeout <= 0.35, f"the deadline must be 300 ms, got {call.timeout} s"
-    ctx.grpc.set_latency("GetMessages", 2.0)
+    assert 0.25 <= call.timeout <= 0.35, f"the deadline must be 300 ms, the call carried {call.timeout} s"
+    owner = call.target
+    ctx.grpc.set_latency("GetMessages", 2.0, target=owner)  # that instance stalls for 2 s
+    started = ctx.clock.time()
     try:
-        rows = await m.fetch_messages(CHANNELS[1], END, 50)
-        raise AssertionError(f"a data service slower than the deadline must surface DEADLINE_EXCEEDED, fetch_messages returned {rows}")
+        rows = await m.fetch_messages(channel, END, 50)
+        raise AssertionError(f"{owner} took 2 s to answer and fetch_messages waited {ctx.clock.time() - started:.1f} s for {len(rows)} messages: a data service slower than the deadline must surface DEADLINE_EXCEEDED")
     except grpc.RpcError as e:
-        assert e.code() == grpc.StatusCode.DEADLINE_EXCEEDED, f"expected DEADLINE_EXCEEDED, got {e.code()}"
+        assert e.code() == grpc.StatusCode.DEADLINE_EXCEEDED, f"expected DEADLINE_EXCEEDED from the stalled instance, got {e.code()}"
+    waited = ctx.clock.time() - started
+    assert waited <= 0.5, f"the API waited {waited:.1f} s for a stalled instance, the deadline is 300 ms"
 `,
   },
   debrief: `Consistent hashing is the routing policy that makes coalescing worth having: the hash of the channel, not of the request, decides the instance, so the thousand clients opening one channel meet in one process and one of them pays for the database. Virtual nodes fix the two problems of a naive ring — three points split a circle very unevenly, and when one leaves its whole arc lands on a single neighbour; a hundred points per instance make the shares close to equal and spread a departure over every survivor. The guarantee that matters operationally is the minimal move: adding or losing an instance changes homes for only that instance's share of channels, so a deploy is a small cold spot rather than a cluster-wide one. Discord routes on the channel id for messages and on other keys for other services, each one chosen so that the requests that would coalesce share a key. Real routers get the instance list from service discovery, weight points by instance capacity, and hedge: when the owner fails fast with UNAVAILABLE, the next point clockwise is already the right fallback.`,

@@ -179,22 +179,23 @@ class _CompletedFuture(_SyncCall):
 
 
 class UnaryUnaryMultiCallable:
-    def __init__(self, path: str, request_serializer, response_deserializer) -> None:
+    def __init__(self, path: str, request_serializer, response_deserializer, target: str | None = None) -> None:
         self._path = path
         self._serializer = request_serializer
         self._deserializer = response_deserializer
+        self._target = target
 
     def __call__(self, request, timeout=None, metadata=None, credentials=None, wait_for_ready=None, compression=None):
-        result, _ = _sim.invoke_sync(self._path, request, timeout, metadata, self._serializer, self._deserializer)
+        result, _ = _sim.invoke_sync(self._path, request, timeout, metadata, self._serializer, self._deserializer, self._target)
         return result
 
     def with_call(self, request, timeout=None, metadata=None, credentials=None, wait_for_ready=None, compression=None):
-        result, ctx = _sim.invoke_sync(self._path, request, timeout, metadata, self._serializer, self._deserializer)
+        result, ctx = _sim.invoke_sync(self._path, request, timeout, metadata, self._serializer, self._deserializer, self._target)
         return result, _SyncCall(ctx)
 
     def future(self, request, timeout=None, metadata=None, credentials=None, wait_for_ready=None, compression=None):
         try:
-            result, ctx = _sim.invoke_sync(self._path, request, timeout, metadata, self._serializer, self._deserializer)
+            result, ctx = _sim.invoke_sync(self._path, request, timeout, metadata, self._serializer, self._deserializer, self._target)
         except _CallError as exc:
             return _CompletedFuture(exception=exc)
         return _CompletedFuture(result, ctx=ctx)
@@ -202,24 +203,24 @@ class UnaryUnaryMultiCallable:
 
 class UnaryStreamMultiCallable(UnaryUnaryMultiCallable):
     def __call__(self, request, timeout=None, metadata=None, credentials=None, wait_for_ready=None, compression=None):
-        iterator, ctx = _sim.invoke_sync_stream(self._path, request, timeout, metadata, self._serializer, self._deserializer)
+        iterator, ctx = _sim.invoke_sync_stream(self._path, request, timeout, metadata, self._serializer, self._deserializer, self._target)
         return _SyncCall(ctx, iterator=iterator)
 
 
 class StreamUnaryMultiCallable(UnaryUnaryMultiCallable):
     # Request iterators reach the handler as-is (serialization is per message, which a stream defers).
     def __call__(self, request_iterator, timeout=None, metadata=None, credentials=None, wait_for_ready=None, compression=None):
-        result, _ = _sim.invoke_sync(self._path, request_iterator, timeout, metadata, None, self._deserializer)
+        result, _ = _sim.invoke_sync(self._path, request_iterator, timeout, metadata, None, self._deserializer, self._target)
         return result
 
     def with_call(self, request_iterator, timeout=None, metadata=None, credentials=None, wait_for_ready=None, compression=None):
-        result, ctx = _sim.invoke_sync(self._path, request_iterator, timeout, metadata, None, self._deserializer)
+        result, ctx = _sim.invoke_sync(self._path, request_iterator, timeout, metadata, None, self._deserializer, self._target)
         return result, _SyncCall(ctx)
 
 
 class StreamStreamMultiCallable(UnaryUnaryMultiCallable):
     def __call__(self, request_iterator, timeout=None, metadata=None, credentials=None, wait_for_ready=None, compression=None):
-        iterator, ctx = _sim.invoke_sync_stream(self._path, request_iterator, timeout, metadata, None, self._deserializer)
+        iterator, ctx = _sim.invoke_sync_stream(self._path, request_iterator, timeout, metadata, None, self._deserializer, self._target)
         return _SyncCall(ctx, iterator=iterator)
 
 
@@ -230,16 +231,16 @@ class Channel:
         self.credentials = credentials
 
     def unary_unary(self, method, request_serializer=None, response_deserializer=None, _registered_method=False):
-        return UnaryUnaryMultiCallable(method, request_serializer, response_deserializer)
+        return UnaryUnaryMultiCallable(method, request_serializer, response_deserializer, self.target)
 
     def unary_stream(self, method, request_serializer=None, response_deserializer=None, _registered_method=False):
-        return UnaryStreamMultiCallable(method, request_serializer, response_deserializer)
+        return UnaryStreamMultiCallable(method, request_serializer, response_deserializer, self.target)
 
     def stream_unary(self, method, request_serializer=None, response_deserializer=None, _registered_method=False):
-        return StreamUnaryMultiCallable(method, request_serializer, response_deserializer)
+        return StreamUnaryMultiCallable(method, request_serializer, response_deserializer, self.target)
 
     def stream_stream(self, method, request_serializer=None, response_deserializer=None, _registered_method=False):
-        return StreamStreamMultiCallable(method, request_serializer, response_deserializer)
+        return StreamStreamMultiCallable(method, request_serializer, response_deserializer, self.target)
 
     def subscribe(self, callback, try_to_connect=False) -> None:
         callback(ChannelConnectivity.READY)

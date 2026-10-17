@@ -433,19 +433,29 @@ void shutdown() {
     },
   },
   harness: {
-    python: `import json
+    python: `import importlib
+import json
 import logging
-import sys
 import time
 
 
 def _events(ctx):
     m = ctx.load("placement_events")
+    return m, _logged()
+
+
+def _logged():
     records = []
     handler = logging.Handler()
     handler.emit = records.append
     logging.getLogger().addHandler(handler)
-    return m, records
+    return records
+
+
+def _pixel(ctx, api, x, y):
+    board = ctx.redis_bytes.get("board") or b""
+    off = y * api.SIZE + x
+    return board[off] if off < len(board) else 0
 
 
 def check_topic(ctx):
@@ -468,14 +478,25 @@ def check_keyed_by_tile(ctx):
     assert produced[0].partition == produced[1].partition, "two placements on the same pixel must land on the same partition, in order"
 
 
-def check_non_blocking(ctx):
-    m, _ = _events(ctx)
-    m.record_placement("ana", 3, 7, 12)
-    assert ctx.kafka.flushes == 0, "record_placement must not flush: the request would wait for the broker"
-    assert len(ctx.kafka.records("placements")) == 1, "the placement must still be handed to the producer"
-    m.record_placement("bo", 4, 7, 1)
-    assert ctx.kafka.flushes == 0, "record_placement must not flush: the request would wait for the broker"
-    assert len(ctx.kafka.records("placements")) == 2
+async def check_non_blocking(ctx):
+    api = ctx.load("board_api")
+    events = importlib.import_module("placement_events")
+    ctx.kafka.stall()  # the brokers stop answering
+    start = ctx.clock.time()
+    async with ctx.client(api.app) as c:
+        r = await c.post("/place", json={"x": 3, "y": 7, "color": 12, "user": "ana"})
+    took = ctx.clock.time() - start
+    assert took < 0.5, f"with the broker not answering, POST /place took {took:.1f} s: record_placement must hand the record to the producer and return, not wait for the acknowledgement"
+    assert r.status_code == 200, f"with the broker not answering, POST /place answered {r.status_code}: the tile is painted, the event follows when the broker is back"
+    assert _pixel(ctx, api, 3, 7) == 12, "the tile must be on the board while its event waits for the broker"
+    start = ctx.clock.time()
+    events.record_placement("bo", 4, 7, 1)
+    took = ctx.clock.time() - start
+    assert took < 0.5, f"record_placement waited {took:.1f} s for a broker that does not answer: enqueue and return"
+    ctx.kafka.resume()
+    events.record_placement("cy", 5, 7, 2)  # the next request serves the producer again
+    users = sorted(json.loads(r.value).get("user") for r in ctx.kafka.records("placements"))
+    assert users == ["ana", "bo", "cy"], f"once the broker answered again the next record_placement must deliver what was waiting: placements holds the tiles of {users}, expected ana's, bo's and cy's"
 
 
 async def check_callback(ctx):
@@ -489,21 +510,30 @@ async def check_callback(ctx):
     assert len(ctx.kafka.records("placements")) == 1, "the second placement must still be produced after the first one failed"
     # Through the API: a broker failure must not undo a painted tile.
     api = ctx.load("board_api")
-    events = sys.modules["placement_events"]
+    events = importlib.import_module("placement_events")
+    records.clear()
     ctx.kafka.fail_next("placements")
     async with ctx.client(api.app) as c:
         r = await c.post("/place", json={"x": 5, "y": 7, "color": 9, "user": "cy"})
     assert r.status_code == 200, f"with the broker failing, POST /place answered {r.status_code}: the tile is painted, the event is best effort"
-    board = ctx.redis_bytes.get("board")
-    assert board[7 * api.SIZE + 5] == 9, "the tile must stay on the board even though its event was not delivered"
+    assert _pixel(ctx, api, 5, 7) == 9, "the tile must stay on the board even though its event was not delivered"
     events.shutdown()
+    assert [r for r in records if r.levelno >= logging.WARNING], "the failed delivery of cy's placement must be logged"
 
 
 def check_flush(ctx):
     m, _ = _events(ctx)
+    ctx.kafka.stall(seconds=2)  # the broker is slow to answer at the moment of the stop
     m.record_placement("ana", 3, 7, 12)
     m.shutdown()
-    assert ctx.kafka.flushes >= 1, "shutdown() must flush the producer"
+    users = [json.loads(r.value).get("user") for r in ctx.kafka.records("placements")]
+    assert users == ["ana"], f"shutdown() returned with ana's placement still in the producer's buffer (placements holds the tiles of {users}; the broker answered after 2 s): flush so a clean stop loses nothing"
+    ctx.kafka.stall()  # now the broker is down for good
+    m.record_placement("bo", 4, 7, 1)
+    start = ctx.clock.time()
+    m.shutdown()
+    took = ctx.clock.time() - start
+    assert took <= 60, f"with the broker down, shutdown() took {took:.0f} s: flush with a timeout so a stop is not held for the producer's whole message timeout"
 `,
   },
   debrief: `A Kafka producer is a buffer with a background thread: \`produce\` costs microseconds and the network happens later in batches, which is what makes "one event per tile" free on the request path — as long as nobody blocks on the acknowledgement. The key is the ordering contract: the only consumer that needs order is the per-pixel history, so the pixel is the key, and the leaderboard, which only sums, rides along. Decoupling the write from its consumers is also the operational lesson of the original: Reddit's write path called the websocket fan-out directly, and when the message bus behind it buckled under the burst, the fix was to lengthen the cooldown for everyone. With a log in between, a slow consumer falls behind on its own; the board keeps taking tiles.`,

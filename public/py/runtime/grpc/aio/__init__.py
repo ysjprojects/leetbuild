@@ -50,8 +50,8 @@ class Metadata(list):
 class UnaryUnaryCall:
     """Awaitable: `reply = await stub.Method(request, timeout=…)`; also `.code()`/`.details()` after."""
 
-    def __init__(self, path, request, timeout, metadata, serializer, deserializer) -> None:
-        self._coro = _sim.invoke_aio(path, request, timeout, metadata, serializer, deserializer)
+    def __init__(self, path, request, timeout, metadata, serializer, deserializer, target=None) -> None:
+        self._coro = _sim.invoke_aio(path, request, timeout, metadata, serializer, deserializer, target)
         self._code = None
         self._details = ""
         self._ctx = None
@@ -103,34 +103,35 @@ class UnaryUnaryCall:
 
 
 class _MultiCallable:
-    def __init__(self, path: str, request_serializer, response_deserializer) -> None:
+    def __init__(self, path: str, request_serializer, response_deserializer, target: str | None = None) -> None:
         self._path = path
         self._serializer = request_serializer
         self._deserializer = response_deserializer
+        self._target = target
 
 
 class UnaryUnaryMultiCallable(_MultiCallable):
     def __call__(self, request, *, timeout=None, metadata=None, credentials=None, wait_for_ready=None, compression=None):
-        return UnaryUnaryCall(self._path, request, timeout, metadata, self._serializer, self._deserializer)
+        return UnaryUnaryCall(self._path, request, timeout, metadata, self._serializer, self._deserializer, self._target)
 
 
 class UnaryStreamMultiCallable(_MultiCallable):
     def __call__(self, request, *, timeout=None, metadata=None, credentials=None, wait_for_ready=None, compression=None):
-        call = AioStream(self._path, request, timeout, metadata, self._serializer, self._deserializer, request_streaming=False)
+        call = AioStream(self._path, request, timeout, metadata, self._serializer, self._deserializer, request_streaming=False, target=self._target)
         call._ensure_started()
         return call
 
 
 class StreamUnaryMultiCallable(_MultiCallable):
     def __call__(self, request_iterator=None, timeout=None, metadata=None, credentials=None, wait_for_ready=None, compression=None):
-        call = AioStream(self._path, None, timeout, metadata, self._serializer, self._deserializer, request_streaming=True, request_iterator=request_iterator)
+        call = AioStream(self._path, None, timeout, metadata, self._serializer, self._deserializer, request_streaming=True, request_iterator=request_iterator, target=self._target)
         call._ensure_started()
         return call
 
 
 class StreamStreamMultiCallable(_MultiCallable):
     def __call__(self, request_iterator=None, timeout=None, metadata=None, credentials=None, wait_for_ready=None, compression=None):
-        call = AioStream(self._path, None, timeout, metadata, self._serializer, self._deserializer, request_streaming=True, request_iterator=request_iterator)
+        call = AioStream(self._path, None, timeout, metadata, self._serializer, self._deserializer, request_streaming=True, request_iterator=request_iterator, target=self._target)
         call._ensure_started()
         return call
 
@@ -142,16 +143,16 @@ class Channel:
         self.credentials = credentials
 
     def unary_unary(self, method, request_serializer=None, response_deserializer=None, _registered_method=False):
-        return UnaryUnaryMultiCallable(method, request_serializer, response_deserializer)
+        return UnaryUnaryMultiCallable(method, request_serializer, response_deserializer, self.target)
 
     def unary_stream(self, method, request_serializer=None, response_deserializer=None, _registered_method=False):
-        return UnaryStreamMultiCallable(method, request_serializer, response_deserializer)
+        return UnaryStreamMultiCallable(method, request_serializer, response_deserializer, self.target)
 
     def stream_unary(self, method, request_serializer=None, response_deserializer=None, _registered_method=False):
-        return StreamUnaryMultiCallable(method, request_serializer, response_deserializer)
+        return StreamUnaryMultiCallable(method, request_serializer, response_deserializer, self.target)
 
     def stream_stream(self, method, request_serializer=None, response_deserializer=None, _registered_method=False):
-        return StreamStreamMultiCallable(method, request_serializer, response_deserializer)
+        return StreamStreamMultiCallable(method, request_serializer, response_deserializer, self.target)
 
     async def channel_ready(self) -> None:
         pass

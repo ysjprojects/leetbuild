@@ -416,6 +416,15 @@ def check_pipelined(ctx):
     assert ctx.redis.get(KEY) == "2", "both adds must count"
     ctx.clock.advance(2401)
     assert ctx.redis.exists(KEY) == 0, "the counter expires 3600 s after its creation, regardless of later adds"
+    # The counter's hour runs out in the middle of an add: only an add whose SET NX and INCRBY reach
+    # Redis as one unit (a MULTI/EXEC pipeline) cannot leave a counter behind without an expiry.
+    m.add_count("views", "trailer-7", 1)
+    ctx.clock.advance(3599)
+    probe = ctx.redis_after(KEY, lambda: ctx.clock.advance(2))
+    m.add_count("views", "trailer-7", 1)
+    assert probe.fired, f"add_count never touched {KEY}"
+    ttl = ctx.redis.ttl(KEY)
+    assert ttl != -1, f"the counter's hour ran out between the SET NX and the INCRBY of one add, and the INCRBY recreated {KEY} without any expiry (it now holds {ctx.redis.get(KEY)!r} forever): send both in one MULTI/EXEC pipeline so nothing lands between them"
 
 
 def check_get_clear(ctx):

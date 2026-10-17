@@ -843,28 +843,53 @@ def check_keyed_by_channel(ctx):
 
 
 def check_non_blocking(ctx):
-    m, _ = _module(ctx)
+    m, logged = _module(ctx)
     m.publish(_stored(CHANNEL, 1561000000000000001))
-    assert ctx.kafka.flushes == 0, "publish must not flush: the request would wait for the broker"
-    assert len(ctx.kafka.records("message-events")) == 1, "the event must still be handed to the producer"
+    assert len(ctx.kafka.records("message-events")) == 1, "the event must be handed to the producer"
+    ctx.kafka.stall()  # the brokers stop acknowledging, as a partitioned or overloaded cluster does
+    started = ctx.clock.time()
     m.publish(_stored(CHANNEL, 1561000000000000002))
-    assert ctx.kafka.flushes == 0, "publish must not flush: the request would wait for the broker"
-    assert len(ctx.kafka.records("message-events")) == 2
+    m.publish(_stored(CHANNEL, 1561000000000000003))
+    waited = ctx.clock.time() - started
+    assert waited < 0.1, f"with the broker not acknowledging, two publish calls took {waited:.1f} s: publish waits for the broker (a flush on the request path), so every POST would hang with it"
+    ctx.kafka.resume()
+    ctx.kafka.fail_next("message-events")
+    m.publish(_stored(CHANNEL, 1561000000000000004))
+    m.publish(_stored(CHANNEL, 1561000000000000005))
+    failures = [r for r in logged if r.levelno >= logging.WARNING]
+    assert failures, "the broker failed to deliver a record and nothing was logged: publish must serve delivery callbacks (poll(0)) so on_delivery reports failures"
 
 
 def check_consumer_group(ctx):
-    _seed(ctx, (CHANNEL, 1561000000000000001))
+    _seed(ctx, (CHANNEL, 1561000000000000001), (OTHER, 1561000000000000002), (CHANNEL, 1561000000000000003))
+    records = ctx.kafka.records("message-events")
+    commits = []
+    ctx.kafka.on_commit(lambda group, offsets: commits.append((group, dict(offsets), {c: ctx.redis.hget(f"channel:{c}", "messages") for c in (CHANNEL, OTHER)})))
     m, _ = _module(ctx)
-    subscriptions = [e for e in ctx.kafka.events if e[0] == "subscribe"]
-    assert subscriptions, "the consumer must subscribe to a topic"
-    group, topics = subscriptions[-1][1], subscriptions[-1][2]
-    assert group == "channel-state", f"group.id must be channel-state, got {group!r}"
-    assert "message-events" in topics, f"the consumer must subscribe to message-events, got {topics}"
-    assert ctx.kafka.consumers[-1].auto_commit is False, "enable.auto.commit is on: offsets would be acknowledged on a timer, before the hash is updated"
     ctx.drain(m.run)
-    assert not any(e[0] == "auto-commit" for e in ctx.kafka.events), "offsets were auto-committed"
-    assert any(e[0] == "manual-commit" for e in ctx.kafka.events), "no explicit commit happened after processing"
-    assert ctx.kafka.lag("channel-state", "message-events") == 0, "every processed record must be committed"
+    assert commits, "no offset was ever committed: the consumer must commit what it processed"
+    groups = sorted({group for group, _offsets, _state in commits})
+    assert groups == ["channel-state"], f"offsets were committed for group(s) {groups}, expected channel-state"
+    seen = {}
+    for record in records:
+        channel = record.key.decode()
+        seen[channel] = seen.get(channel, 0) + 1
+        state = next((s for _g, offsets, s in commits if offsets.get(("message-events", record.partition), -1) > record.offset), None)
+        assert state is not None, f"the record at partition {record.partition} offset {record.offset} was processed but never committed by channel-state"
+        counted = int(state[channel] or 0)
+        assert counted >= seen[channel], f"the record at partition {record.partition} offset {record.offset} was committed while channel:{channel} counted {counted} message(s), before its own event was written: commit after processing"
+    # A write that is slow and then fails: the record must stay uncommitted, to be redelivered.
+    broken = "1032000000000000009"
+    ctx.redis.set(f"channel:{broken}", "not a hash")  # a corrupted key: HSET/HINCRBY fail with WRONGTYPE
+    ctx.redis_after(f"channel:{broken}", lambda: ctx.clock.advance(6))
+    _seed(ctx, (broken, 1561000000000000009))
+    record = ctx.kafka.records("message-events")[-1]
+    try:
+        ctx.drain(m.run)
+    except Exception:
+        pass  # the worker crashed on the failed write; a restart would redeliver the record
+    committed = ctx.kafka.committed_offset("channel-state", "message-events", record.partition)
+    assert committed is None or committed <= record.offset, f"the write for channel:{broken} took 6 s and then failed, yet its record (partition {record.partition} offset {record.offset}) was committed: offsets were committed while the record was still being processed (auto-commit on a timer), so the event is lost"
 
 
 def check_channel_state(ctx):
