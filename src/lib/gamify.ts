@@ -8,10 +8,20 @@
  * what the profile shows and what the toasts announce.
  */
 import {type StepAttempt, OPEN_ATTEMPT, problemScore, profile as computeProfile, RANKS} from './scoring';
-import {type Concept, type Language, type Problem, CONCEPT_LABEL, CONCEPTS, LANGUAGE_LABEL, stepKey} from './types';
+import {type TimedSession, budgetSeconds} from './timer';
+import {
+  type Concept,
+  type Language,
+  type Problem,
+  CONCEPT_LABEL,
+  CONCEPTS,
+  LANGUAGE_LABEL,
+  LANGUAGES,
+  stepKey,
+} from './types';
 
 /** Badges are grouped into tracks so the catalog reads as a few short lists, not one wall. */
-export type BadgeTrack = 'milestone' | 'craft' | 'mastery' | 'habit' | 'languages';
+export type BadgeTrack = 'milestone' | 'craft' | 'mastery' | 'habit' | 'languages' | 'timed';
 
 export const TRACKS: readonly {id: BadgeTrack; title: string; blurb: string}[] = [
   {id: 'milestone', title: 'Milestones', blurb: 'The road from the first accepted step to the top of the ladder.'},
@@ -19,7 +29,11 @@ export const TRACKS: readonly {id: BadgeTrack; title: string; blurb: string}[] =
   {id: 'mastery', title: 'Mastery', blurb: 'Every step of a concept, across the whole course.'},
   {id: 'habit', title: 'Habit', blurb: 'Accept a step on consecutive days.'},
   {id: 'languages', title: 'Languages', blurb: 'The same systems in more than one language.'},
+  {id: 'timed', title: 'Timed', blurb: 'Counted runs: completed within the budget, nothing revealed.'},
 ];
+
+/** The Tight budget's factor of the estimate (`BUDGETS` in timer.ts): the bar the Timed badges are set at. */
+const TIGHT_FACTOR = 0.75;
 
 export interface Badge {
   id: string;
@@ -114,7 +128,62 @@ export const BADGES: readonly Badge[] = [
     glyph: '2',
     track: 'languages',
   },
-  {id: 'polyglot', title: 'Polyglot', blurb: 'Accept steps in all four languages.', glyph: '4', track: 'languages'},
+  {
+    id: 'polyglot',
+    title: 'Polyglot',
+    blurb: 'Accept steps in all five languages.',
+    glyph: '5',
+    track: 'languages',
+  },
+  {
+    id: 'clocked-in',
+    title: 'Clocked in',
+    blurb: 'Complete a timed run within its budget with nothing revealed.',
+    glyph: '⏱',
+    track: 'timed',
+  },
+  {
+    id: 'tight-finish',
+    title: 'Tight finish',
+    blurb: 'Complete a problem under the Tight budget — three quarters of its estimate.',
+    glyph: '¾',
+    track: 'timed',
+  },
+  {
+    id: 'sprint',
+    title: 'Sprint',
+    blurb: 'Complete a counted run in half its budget or less.',
+    glyph: '⚡',
+    track: 'timed',
+  },
+  {
+    id: 'photo-finish',
+    title: 'Photo finish',
+    blurb: 'Complete a counted run with less than a minute to spare.',
+    glyph: ':59',
+    track: 'timed',
+  },
+  {
+    id: 'hard-and-fast',
+    title: 'Hard and fast',
+    blurb: 'Complete a hard problem under the Tight budget.',
+    glyph: 'H¾',
+    track: 'timed',
+  },
+  {
+    id: 'five-under',
+    title: 'Five under',
+    blurb: 'Complete five different problems under the Tight budget.',
+    glyph: '5¾',
+    track: 'timed',
+  },
+  {
+    id: 'clockwork',
+    title: 'Clockwork',
+    blurb: 'Complete every problem under the Tight budget.',
+    glyph: '⚙',
+    track: 'timed',
+  },
 ];
 
 const BADGE_BY_ID: Record<string, Badge> = {};
@@ -200,12 +269,39 @@ const closest = (
   return best;
 };
 
+/**
+ * The Timed track, from the session history. Only *counted* runs matter — completed within the
+ * budget with nothing revealed — and "tight" means the ¾× budget (`TIGHT_FACTOR`), recognised by
+ * the budget the run was started with.
+ */
+const timedProgress = (
+  problems: readonly Problem[],
+  sessions: readonly TimedSession[],
+): Record<string, BadgeProgress> => {
+  const byId: Record<string, Problem> = {};
+  for (const p of problems) byId[p.id] = p;
+  const counted = sessions.filter(s => s.counted && byId[s.problemId] !== undefined);
+  const tight = counted.filter(s => s.budget <= budgetSeconds(byId[s.problemId], TIGHT_FACTOR));
+  const tightProblems = new Set(tight.map(s => s.problemId));
+  const tightHard = tight.filter(s => byId[s.problemId].difficulty === 'hard');
+  return {
+    'clocked-in': flag(counted.length > 0),
+    'tight-finish': flag(tight.length > 0),
+    sprint: flag(counted.some(s => s.elapsed * 2 <= s.budget)),
+    'photo-finish': flag(counted.some(s => s.budget - s.elapsed < 60)),
+    'hard-and-fast': flag(tightHard.length > 0),
+    'five-under': {value: Math.min(tightProblems.size, 5), target: 5, detail: 'problems'},
+    clockwork: {value: tightProblems.size, target: Math.max(1, problems.length), detail: 'problems'},
+  };
+};
+
 /** Progress toward every badge, by id. */
 export function badgeProgress(
   problems: readonly Problem[],
   attempts: Record<string, StepAttempt>,
   activeDays: readonly string[],
   today: string,
+  sessions: readonly TimedSession[],
 ): Record<string, BadgeProgress> {
   const languages = new Set<Language>();
   let accepted = 0;
@@ -264,7 +360,12 @@ export function badgeProgress(
     'streak-3': {value: streak.best >= 3 ? 3 : Math.min(streak.current, 3), target: 3, detail: 'days'},
     'streak-7': {value: streak.best >= 7 ? 7 : Math.min(streak.current, 7), target: 7, detail: 'days'},
     bilingual: {value: Math.min(languages.size, 2), target: 2, detail: languageList || undefined},
-    polyglot: {value: Math.min(languages.size, 4), target: 4, detail: languageList || undefined},
+    polyglot: {
+      value: Math.min(languages.size, LANGUAGES.length),
+      target: LANGUAGES.length,
+      detail: languageList || undefined,
+    },
+    ...timedProgress(problems, sessions),
   };
   for (const concept of CONCEPTS) {
     const mastery = summary.concepts.find(c => c.concept === concept);
@@ -283,8 +384,9 @@ export function earnedBadges(
   attempts: Record<string, StepAttempt>,
   activeDays: readonly string[],
   today: string,
+  sessions: readonly TimedSession[],
 ): string[] {
-  const progress = badgeProgress(problems, attempts, activeDays, today);
+  const progress = badgeProgress(problems, attempts, activeDays, today, sessions);
   return BADGES.filter(b => progress[b.id].value >= progress[b.id].target).map(b => b.id);
 }
 

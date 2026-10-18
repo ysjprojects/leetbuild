@@ -45,7 +45,7 @@ const progressLabel = (p: BadgeProgress): string | null => {
   const detail =
     p.detail === undefined
       ? ''
-      : p.detail.endsWith('steps') || p.detail === 'points' || p.detail === 'days'
+      : p.detail.endsWith('steps') || p.detail === 'points' || p.detail === 'days' || p.detail === 'problems'
       ? ` ${p.detail}`
       : ` · ${p.detail}`;
   return `${p.value}/${p.target}${detail}`;

@@ -134,8 +134,8 @@ const ProfileStrip: FC<{
   const share = Math.min(1, Math.max(0, (profile.score - rank.from) / Math.max(1, rank.nextAt - rank.from)));
   const earned = useMemo(() => BADGES.filter(b => badges[b.id] !== undefined), [badges]);
   const progress = useMemo(
-    () => badgeProgress(problems, attempts, activeDays, today),
-    [problems, attempts, activeDays, today],
+    () => badgeProgress(problems, attempts, activeDays, today, sessions),
+    [problems, attempts, activeDays, today, sessions],
   );
   const [statsOpen, setStatsOpen] = useState(false);
   const toggleStats = useCallback(() => setStatsOpen(v => !v), []);

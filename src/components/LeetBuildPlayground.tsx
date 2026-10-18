@@ -458,10 +458,16 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   const today = dayKey(new Date());
   const streak = useMemo(() => streakOf(progress.activeDays, today), [progress.activeDays, today]);
 
-  // Badges are a function of the attempts; new ones are stored (never revoked) and announced.
+  // Badges are a function of the attempts and the timed runs; new ones are stored (never revoked) and announced.
   useEffect(() => {
     if (!loaded) return;
-    const earnedNow = earnedBadges(problems, progress.attempts, progress.activeDays, dayKey(new Date()));
+    const earnedNow = earnedBadges(
+      problems,
+      progress.attempts,
+      progress.activeDays,
+      dayKey(new Date()),
+      progress.sessions,
+    );
     const fresh = earnedNow.filter(id => progress.badges[id] === undefined);
     if (fresh.length === 0) {
       announceBadges.current = true;
@@ -482,7 +488,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       for (const id of fresh) badges[id] = now;
       return {...p, badges};
     });
-  }, [loaded, progress.attempts, progress.activeDays, progress.badges]);
+  }, [loaded, progress.attempts, progress.activeDays, progress.badges, progress.sessions]);
 
   const dismissToast = useCallback((id: number) => setToasts(t => t.filter(x => x.id !== id)), []);
   const onCelebrated = useCallback(() => setCelebration(0), []);
