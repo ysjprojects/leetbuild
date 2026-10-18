@@ -8,6 +8,7 @@ import {type Difficulty, type Problem, CONCEPT_LABEL, stepKey} from '@/lib/types
 
 import {BadgeCatalog, BadgeGlyph} from './Badges';
 import {useDialog} from './Dialog';
+import {LandingIntro} from './LoadingScreen';
 import {CompanyChip, CONCEPT_COLOR, ConceptChip, DifficultyChip} from './paneShared';
 import {Clock, SessionList} from './Timer';
 
@@ -428,15 +429,7 @@ const ProblemList: FC<{
   sessions: readonly TimedSession[];
 }> = memo(({problems, attempts, profile, streak, badges, activeDays, today, sessions}) => (
   <div className="mx-auto w-full max-w-4xl space-y-5 px-4 py-5">
-    <div>
-      <h1 className="text-ink-50 text-2xl font-extrabold leading-tight">Build systems, step by step</h1>
-      <p className="text-ink-200 mt-1 max-w-2xl text-[13px] leading-relaxed">
-        Every problem is a real system cut down to the parts that matter: an HTTPS API, a gRPC call, a Kafka topic, a
-        Redis key. You implement it one file at a time in Python, Go, Scala or C++; the judge checks each step, hints
-        cost points, and revealing the answer costs all of them. Each problem's tutorial can be downloaded as Markdown
-        from its page.
-      </p>
-    </div>
+    <LandingIntro />
     <ProfileStrip
       activeDays={activeDays}
       attempts={attempts}

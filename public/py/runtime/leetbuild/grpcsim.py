@@ -710,6 +710,17 @@ class Server:
         for method, rpc_handler in method_handlers.items():
             REGISTRY.register(service_name, method, rpc_handler, self._target)
 
+    def add_insecure_port(self, address: str) -> int:
+        """grpcio's `server.add_insecure_port("[::]:9000")` → the port; nothing listens on a socket here."""
+        self.ports.append(address)
+        try:
+            return int(address.rsplit(":", 1)[-1])
+        except ValueError:
+            return 0
+
+    def add_secure_port(self, address: str, server_credentials=None) -> int:
+        return self.add_insecure_port(address)
+
     def start(self) -> None:
         pass
 

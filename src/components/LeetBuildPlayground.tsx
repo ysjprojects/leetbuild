@@ -63,6 +63,7 @@ import {
 import {BadgeGlyph} from './Badges';
 import Confetti from './Confetti';
 import {useDialog} from './Dialog';
+import {LoadingScreen, LogoMark, wordmarkClass} from './LoadingScreen';
 import {ghostButtonClass, selectClass} from './paneShared';
 import ProblemList from './ProblemList';
 import ProblemPane, {type PaneTab, unlocked} from './ProblemPane';
@@ -366,25 +367,6 @@ const CollapsedPane: FC<{title: string; onExpand: () => void}> = memo(({title, o
   </button>
 ));
 CollapsedPane.displayName = 'CollapsedPane';
-
-const Skeleton: FC = memo(() => (
-  <div className="leetbuild-playground bg-ink-900 text-ink-100 flex h-dvh flex-col overflow-hidden">
-    <header className="border-ink-700 bg-ink-950/60 flex shrink-0 items-center gap-3 border-b px-3 py-2">
-      <span className="from-iris-300 to-ink-50 bg-gradient-to-r bg-clip-text text-lg font-extrabold tracking-tight text-transparent">
-        LeetBuild
-      </span>
-      <span className="text-ink-300 animate-pulse text-[11px]">restoring your progress…</span>
-    </header>
-    <div className="mx-auto w-full max-w-4xl animate-pulse space-y-3 p-5">
-      <div className="bg-ink-800 h-6 w-1/3 rounded" />
-      <div className="bg-ink-800/70 h-3 w-2/3 rounded" />
-      <div className="bg-ink-800/50 h-32 rounded-xl" />
-      <div className="bg-ink-800/40 h-16 rounded-xl" />
-      <div className="bg-ink-800/40 h-16 rounded-xl" />
-    </div>
-  </div>
-));
-Skeleton.displayName = 'LeetBuildSkeleton';
 
 /** `problemId`/`stepId` come from the address (`/`, `/<problem>`, `/<problem>/<step>`); the URL is the source of truth. */
 const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}> = memo(({problemId, stepId}) => {
@@ -1058,20 +1040,17 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   );
   const ideStyle = useMemo(() => ({'--lb-rows': `${layout.y}fr 8px ${1 - layout.y}fr`} as CSSProperties), [layout.y]);
 
-  if (!loaded) return <Skeleton />;
+  if (!loaded) return <LoadingScreen phase="progress" problemId={problemId} />;
 
   return (
     <div className="leetbuild-playground bg-ink-900 text-ink-100 flex h-dvh flex-col overflow-hidden">
       <header className="border-ink-700 bg-ink-950/60 flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b px-3 py-2">
         <div className="flex items-center gap-2">
-          <button
-            className="from-iris-300 to-ink-50 bg-gradient-to-r bg-clip-text text-lg font-extrabold tracking-tight text-transparent"
-            onClick={onBack}
-            title="all problems"
-            type="button">
-            LeetBuild
+          <button className="flex items-center gap-2" onClick={onBack} title="all problems" type="button">
+            <LogoMark />
+            <span className={wordmarkClass}>LeetBuild</span>
           </button>
-          <span className="text-ink-300 hidden text-[11px] sm:inline">build systems, not just algorithms</span>
+          <span className="text-ink-300 hidden text-[11px] sm:inline">build systems step by step</span>
         </div>
         <div className="ml-auto flex items-center gap-2">
           <label className="text-ink-300 flex items-center gap-1.5 text-[11px]">

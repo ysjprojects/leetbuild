@@ -14,12 +14,14 @@ import {redditPlaceProblem} from './10-reddit-place/index';
 import {netflixCountersProblem} from './11-netflix-counters/index';
 import {discordMessagesProblem} from './12-discord-messages/index';
 import {stripeLedgerProblem} from './13-stripe-ledger/index';
+import {dropboxGatesProblem} from './14-dropbox-gates/index';
 
 /**
  * Problem order on the list page: easy first, then medium, then hard. Company-tagged courses
  * (derived from engineering blogs, see `Problem.company`) sit with the others of their difficulty.
  */
 export const problems: Problem[] = [
+  dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
   imageCacheProblem,

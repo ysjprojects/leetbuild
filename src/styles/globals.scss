@@ -67,6 +67,48 @@ dialog[open] {
   }
 }
 
+/* The loading screen (LoadingScreen.tsx): bones with a sheen passing left to right, and the phase
+ * bar with the same sheen; both still under reduced motion. */
+.lb-bone,
+.lb-progress {
+  position: relative;
+  overflow: hidden;
+
+  &::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    transform: translateX(-100%);
+    animation: lb-sheen 1.8s ease-in-out infinite;
+  }
+}
+
+/* Border tone, the one grey that reads on the page, a panel and a raised control in both themes. */
+.lb-bone {
+  background: theme('colors.ink.700');
+
+  &::after {
+    background: linear-gradient(90deg, transparent, theme('colors.ink.600 / 45%'), transparent);
+  }
+}
+
+.lb-progress::after {
+  background: linear-gradient(90deg, transparent, theme('colors.ink.50 / 60%'), transparent);
+}
+
+@keyframes lb-sheen {
+  to {
+    transform: translateX(100%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lb-bone::after,
+  .lb-progress::after {
+    animation: none;
+  }
+}
+
 /* The playground: CodeMirror chrome, the syntax token palette shared by editors and static code
  * blocks, and the unified-diff colours of the reference-solution viewer. */
 .leetbuild-playground {

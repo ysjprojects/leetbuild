@@ -41,6 +41,25 @@ const fitText = (
   }
 };
 
+/** The rising-steps mark (public/leetbuild-logo.svg) at `size` px with its top-left corner at (x, y); brand colours, not themed. */
+const drawMark = (ctx: CanvasRenderingContext2D, x: number, y: number, size: number): void => {
+  const scale = size / 512;
+  const boxes: [number, number, string][] = [
+    [51.1, 333.7, '#6c4cf1'],
+    [192.4, 192.4, '#6c4cf1'],
+    [192.4, 333.7, '#6c4cf1'],
+    [333.7, 51.1, '#2dd4a0'],
+    [333.7, 192.4, '#6c4cf1'],
+    [333.7, 333.7, '#6c4cf1'],
+  ];
+  for (const [bx, by, fill] of boxes) {
+    ctx.fillStyle = fill;
+    ctx.beginPath();
+    ctx.roundRect(x + bx * scale, y + by * scale, 127.2 * scale, 127.2 * scale, 17.8 * scale);
+    ctx.fill();
+  }
+};
+
 export function drawCertificate(canvas: HTMLCanvasElement, details: CertificateDetails, verifyUrl: string): void {
   const {width: W, height: H} = CERTIFICATE_SIZE;
   canvas.width = W;
@@ -75,14 +94,16 @@ export function drawCertificate(canvas: HTMLCanvasElement, details: CertificateD
   const right = W - 220;
   const maxWidth = right - left;
   ctx.textBaseline = 'alphabetic';
-  // Wordmark and kicker.
+  // Mark, wordmark and kicker.
+  drawMark(ctx, left, 260 - 46, 52);
+  const wordmarkLeft = left + 52 + 20;
   ctx.fillStyle = iris[300];
   ctx.font = `800 54px ${SANS}`;
-  ctx.fillText(ORGANIZATION, left, 260);
+  ctx.fillText(ORGANIZATION, wordmarkLeft, 260);
   const wordmarkWidth = ctx.measureText(ORGANIZATION).width;
   ctx.fillStyle = ink[300];
   ctx.font = `500 30px ${SANS}`;
-  ctx.fillText('build systems, not just algorithms', left + wordmarkWidth + 36, 260);
+  ctx.fillText('build systems step by step', wordmarkLeft + wordmarkWidth + 36, 260);
 
   ctx.fillStyle = ink[300];
   ctx.font = `600 34px ${SANS}`;

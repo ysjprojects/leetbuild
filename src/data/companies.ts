@@ -5,8 +5,20 @@ import type {Company} from '@/lib/types';
  * companies' own — trademarks of their owners, shown only to say whose writing a course is based
  * on — as traced by Simple Icons (CC0 path data) from each brand page, and drawn in the colours
  * those pages give: redditinc.com/brand, brand.netflix.com/en/assets/logos, discord.com/branding,
- * stripe.com/newsroom/information.
+ * stripe.com/newsroom/information, dropbox.com/branding.
  */
+
+export const DROPBOX: Company = {
+  id: 'dropbox',
+  name: 'Dropbox',
+  // The five-box glyph in Dropbox blue.
+  logo: {
+    path: 'M6 1.807L0 5.629l6 3.822 6.001-3.822L6 1.807zM18 1.807l-6 3.822 6 3.822 6-3.822-6-3.822zM0 13.274l6 3.822 6.001-3.822L6 9.452l-6 3.822zM18 9.452l-6 3.822 6 3.822 6-3.822-6-3.822zM6 18.371l6.001 3.822 6-3.822-6-3.822L6 18.371z',
+    fill: '#0061ff',
+  },
+  publication: 'Dropbox Tech Blog',
+  url: 'https://dropbox.tech',
+};
 
 export const STRIPE: Company = {
   id: 'stripe',

@@ -11,6 +11,7 @@ import Idempotency from './Idempotency';
 import KafkaPartitions from './KafkaPartitions';
 import OrderBook from './OrderBook';
 import Outbox from './Outbox';
+import PercentRollout from './PercentRollout';
 import StatusCodes from './StatusCodes';
 import TokenBucket from './TokenBucket';
 
@@ -33,6 +34,7 @@ export const WIDGET_COMPONENTS: Record<string, FC<WidgetProps>> = {
   'token-bucket': TokenBucket,
   outbox: Outbox,
   'order-book': OrderBook,
+  'percent-rollout': PercentRollout,
 };
 
 export const renderWidget: WidgetRenderer = (name, params) => {

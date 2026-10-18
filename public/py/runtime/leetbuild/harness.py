@@ -89,6 +89,10 @@ class Ctx:
         _purge_modules()
         return importlib.import_module(stem)
 
+    def reload(self, stem: str) -> Any:
+        """A second instance of the learner's module (another replica): the same as `load`, which always imports fresh."""
+        return self.load(stem)
+
     def redis_after(self, key: str, fn: Callable[[], Any]) -> "RedisProbe":
         """
         Run `fn` once, right after the first command that touches `key` has executed on the Redis

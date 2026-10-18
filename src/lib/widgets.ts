@@ -75,6 +75,11 @@ export const WIDGETS: Record<string, WidgetSpec> = {
       'Interactive limit order book with price-time priority: add bids and asks, watch resting orders queue by price then time, and see fills when the book crosses.',
     params: {},
   },
+  'percent-rollout': {
+    about:
+      'Interactive: a grid of users coloured by variant; sliders for the shares, a seed, and a hash-vs-coin-toss toggle show that a stateless hash keeps every assignment when a share grows while a coin toss reshuffles everyone on every evaluation.',
+    params: {users: 'number of users in the grid (default 200)'},
+  },
 };
 
 export const WIDGET_NAMES = Object.keys(WIDGETS);

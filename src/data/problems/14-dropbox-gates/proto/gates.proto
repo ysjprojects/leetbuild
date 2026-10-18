@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package gates;
+
+// The batch variant lookup desktop and mobile clients make at start-up (step 3): one call for
+// every gate the build knows, answered from the server's config snapshot.
+service Gates {
+  rpc GetVariants(GetVariantsRequest) returns (GetVariantsReply);
+}
+
+message GetVariantsRequest {
+  string user_id = 1;
+  // Targeting attributes the caller already knows: locale, plan, country, platform …
+  map<string, string> attrs = 2;
+  // Gate names to evaluate; empty asks for every gate in the snapshot.
+  repeated string features = 3;
+}
+
+message GetVariantsReply {
+  // Gate name → variant; a gate the server does not know answers OFF.
+  map<string, string> variants = 1;
+  // The config snapshot version the answer came from.
+  uint64 version = 2;
+}

@@ -3,6 +3,7 @@ import dynamic from 'next/dynamic';
 import Head from 'next/head';
 import {type FC, memo} from 'react';
 
+import {AppLoading, LoadingRoute} from '@/components/LoadingScreen';
 import {problems} from '@/data/problems';
 import {stepBySlug, stepPath, stepSlug} from '@/lib/types';
 
@@ -16,7 +17,7 @@ import {stepBySlug, stepPath, stepSlug} from '@/lib/types';
 
 const TITLE = 'LeetBuild — build systems step by step';
 const DESCRIPTION =
-  'LeetBuild: practice building systems, not just algorithms. Implement a URL shortener, a match engine, a news feed, ride dispatch and more step by step in Python, Go, Scala or C++ — HTTPS servers, gRPC, Kafka and Redis — with hints, revealable answers, diagrams and LeetCode-style scoring.';
+  'LeetBuild: build systems step by step. Implement a URL shortener, a match engine, a news feed, ride dispatch and more in Python, TypeScript, Go, Scala or C++ — HTTPS servers, gRPC, Kafka and Redis — with hints, revealable answers, diagrams and LeetCode-style scoring.';
 const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL;
 
 interface Props {
@@ -28,11 +29,8 @@ interface Props {
   description: string;
 }
 
-const loading = () => (
-  <div className="bg-ink-900 text-ink-300 flex h-dvh items-center justify-center">
-    <span className="animate-pulse text-sm">loading LeetBuild…</span>
-  </div>
-);
+/** `dynamic()` wants a plain render function; `AppLoading` reads the route from `LoadingRoute` below. */
+const loading = (): JSX.Element => <AppLoading />;
 
 // CodeMirror and IndexedDB are browser-only; the playground never renders on the server.
 // eslint-disable-next-line react-memo/require-memo
@@ -53,7 +51,9 @@ const Page: FC<Props> = memo(({problemId, stepId, path, title, description}) => 
         <meta content={description} name="twitter:description" />
         <meta content="width=device-width, initial-scale=1" name="viewport" />
       </Head>
-      <LeetBuildPlayground problemId={problemId} stepId={stepId} />
+      <LoadingRoute.Provider value={problemId}>
+        <LeetBuildPlayground problemId={problemId} stepId={stepId} />
+      </LoadingRoute.Provider>
     </>
   );
 });
