@@ -52,3 +52,7 @@ Stacks the reference solutions use: Python — FastAPI, grpcio, confluent-kafka,
 ## Deploy
 
 A plain Next.js 14 (pages router) app with no server-side state: deploy to Vercel or any Node host, or `next build` with static export. `NEXT_PUBLIC_SITE_URL` is optional: without it every share, certificate and export link is built from the page's own origin and the canonical/`og:url` tags are omitted; set it when the site answers on more than one origin (preview deployments, a vercel.app host beside a custom domain) so links and certificates always name the public one. The runtimes are static too: `public/py/` ships the Python worker bundle (built by `prebuild`), the runtime's `.py` files and two vendored wheels; `public/ts/` ships the TypeScript worker bundle; Pyodide, its packages, esbuild-wasm and PGlite are fetched by the browser from jsDelivr at first use.
+
+## Contributing
+
+Bugs, courses, runtime fidelity, playground features: see [CONTRIBUTING.md](CONTRIBUTING.md) — the setup, the four commands every PR passes, what `yarn verify` holds a course to, and what reviewers look for beyond it.
