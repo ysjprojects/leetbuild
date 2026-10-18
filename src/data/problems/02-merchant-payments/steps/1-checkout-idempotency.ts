@@ -52,6 +52,7 @@ steps): it authorizes, captures and records the order, and returns the response 
         'Read the `Idempotency-Key` header and answer `400 Bad Request` when it is missing; without it the server cannot promise anything.',
       match: {
         python: {all: [/idempotency-key/i, /status_code\s*=\s*400|HTTP_400/]},
+        typescript: {all: [/idempotency-key/i, /code\(\s*400\s*\)|status\(\s*400\s*\)|badRequest\(/]},
         go: {all: [/Idempotency-Key/i, /http\.StatusBadRequest|\b400\b/]},
         scala: {all: [/Idempotency-Key/i, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/Idempotency-Key/i, /status\s*=\s*400/]},
@@ -68,6 +69,13 @@ steps): it authorizes, captures and records the order, and returns the response 
             /f["']idem:\{/,
             /\.set\(\s*\w+\s*,\s*PROCESSING\s*,[^\n]*nx\s*=\s*True/,
             /\.set\(\s*\w+\s*,\s*PROCESSING\s*,[^\n]*ex\s*=\s*IDEM_TTL_S/,
+          ],
+        },
+        typescript: {
+          all: [
+            /`idem:\$\{/,
+            /\.set\(\s*\w+\s*,\s*PROCESSING\s*,[^\n]*['"]NX['"]/,
+            /\.set\(\s*\w+\s*,\s*PROCESSING\s*,[^\n]*['"]EX['"]\s*,\s*IDEM_TTL_S/,
           ],
         },
         go: {all: [/"idem:"\s*\+/, /rdb\.SetNX\(\s*[\w.()]+\s*,\s*\w+\s*,\s*processing\s*,\s*idemTTL\s*\)/]},
@@ -89,6 +97,7 @@ steps): it authorizes, captures and records the order, and returns the response 
         'When the stored value is the `processing` marker, another request with the same key is in flight: `409 Conflict`, not a second charge.',
       match: {
         python: {all: [/status_code\s*=\s*409|HTTP_409/, /[=!]=\s*PROCESSING/]},
+        typescript: {all: [/code\(\s*409\s*\)|status\(\s*409\s*\)/, /[=!]==?\s*PROCESSING/]},
         go: {all: [/http\.StatusConflict|\b409\b/, /[=!]=\s*processing/]},
         scala: {all: [/StatusCodes\.Conflict|\b409\b/, /[=!]=\s*Processing/]},
         cpp: {all: [/status\s*=\s*409/, /[=!]=\s*kProcessing/]},
@@ -101,6 +110,7 @@ steps): it authorizes, captures and records the order, and returns the response 
         'A retry after completion gets the original response body back from Redis with status `200`; the handler never runs again.',
       match: {
         python: {all: [/\br\.get\(/, /status_code\s*=\s*200/]},
+        typescript: {all: [/\bredis\.get\(/, /code\(\s*200\s*\)|status\(\s*200\s*\)/]},
         go: {all: [/rdb\.Get\(/, /http\.StatusOK|\b200\b/]},
         scala: {all: [/jedis\.get\(/, /StatusCodes\.OK|\b200\b/]},
         cpp: {all: [/redis\.get\(/, /status\s*=\s*200/]},
@@ -113,6 +123,12 @@ steps): it authorizes, captures and records the order, and returns the response 
         'After `process_checkout` returns, SET the JSON response over `idem:{key}` with the 86400 s expiry so replays outlive the marker.',
       match: {
         python: {order: [/=\s*process_checkout\(/, /\.set\(\s*\w+\s*,\s*[^,\n]+,\s*ex\s*=\s*IDEM_TTL_S\s*\)/]},
+        typescript: {
+          order: [
+            /=\s*await\s+orders\.processCheckout\(/,
+            /\.set\(\s*\w+\s*,\s*[^,\n]+,\s*['"]EX['"]\s*,\s*IDEM_TTL_S\s*\)/,
+          ],
+        },
         go: {order: [/=\s*processCheckout\(/, /rdb\.Set\(\s*[\w.()]+\s*,\s*\w+\s*,\s*[^,\n]+,\s*idemTTL\s*\)/]},
         scala: {
           order: [
@@ -194,6 +210,93 @@ async def checkout(request: Request) -> Response:
 
 
 # uvicorn checkout_api:app --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const IDEM_TTL_S = 86400;
+export const PROCESSING = 'processing';
+
+export interface CheckoutBody {
+  merchant_id: string;
+  amount_cents: number;
+  currency: string;
+  card_token: string;
+}
+
+/** Authorize, capture and record the order (built in the next steps); returns the response document. */
+export const orders = {
+  async processCheckout(body: CheckoutBody): Promise<Record<string, unknown>> {
+    throw new Error('not implemented');
+  },
+};
+
+app.post('/checkout', async (request, reply) => {
+  const body = request.body as CheckoutBody;
+  // TODO: 400 when the Idempotency-Key header is missing
+  // TODO: SET idem:{key} PROCESSING NX EX IDEM_TTL_S; refused → replay the stored response (200) or 409 while processing
+  // TODO: orders.processCheckout(body), SET the JSON response over the key with the same TTL, answer 201
+  return reply.code(501).send();
+});
+
+// app.listen({port: 8443, https: {cert, key}})
+`,
+      solution: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const IDEM_TTL_S = 86400;
+export const PROCESSING = 'processing';
+
+export interface CheckoutBody {
+  merchant_id: string;
+  amount_cents: number;
+  currency: string;
+  card_token: string;
+}
+
+/** Authorize, capture and record the order (built in the next steps); returns the response document. */
+export const orders = {
+  async processCheckout(body: CheckoutBody): Promise<Record<string, unknown>> {
+    throw new Error('not implemented');
+  },
+};
+
+app.post('/checkout', async (request, reply) => {
+  const body = request.body as CheckoutBody;
+  const idemKey = request.headers['idempotency-key'];
+  if (typeof idemKey !== 'string' || idemKey === '') {
+    return reply.code(400).send({error: 'Idempotency-Key header is required'});
+  }
+  const key = \`idem:\${idemKey}\`;
+  const reserved = await redis.set(key, PROCESSING, 'EX', IDEM_TTL_S, 'NX');
+  if (reserved === null) {
+    const stored = await redis.get(key);
+    if (stored === null || stored === PROCESSING) {
+      return reply.code(409).send({error: 'a request with this Idempotency-Key is in progress'});
+    }
+    return reply.code(200).type('application/json').send(stored);
+  }
+  let result: Record<string, unknown>;
+  try {
+    result = await orders.processCheckout(body);
+  } catch (e) {
+    await redis.del(key); // let the client retry with the same key
+    throw e;
+  }
+  const encoded = JSON.stringify(result);
+  await redis.set(key, encoded, 'EX', IDEM_TTL_S);
+  return reply.code(201).type('application/json').send(encoded);
+});
+
+// app.listen({port: 8443, https: {cert, key}})
 `,
     },
     go: {
@@ -583,6 +686,102 @@ async def check_store_response(ctx):
         except Exception:
             pass
         assert ctx.redis.get("idem:k3") is None, "when process_checkout fails the key must be released, or every retry gets 409 for a day"
+`,
+    typescript: `const BODY = {merchant_id: 'm-42', amount_cents: 4999, currency: 'EUR', card_token: 'tok_visa'};
+
+/** The learner's app with the provided processor swapped for a recorder: calls, and what idem:k1 held while it ran. */
+function api(ctx) {
+  const m = ctx.load('checkout_api');
+  const calls: unknown[] = [];
+  const seen: [string | null, number][] = [];
+  m.orders.processCheckout = async (body: unknown) => {
+    calls.push(body);
+    seen.push([ctx.redis.get('idem:k1'), ctx.redis.ttl('idem:k1')]);
+    return {order_id: \`o-\${calls.length}\`, status: 'captured'};
+  };
+  return {m, calls, seen};
+}
+
+const post = (c, key: string | null = null, body: unknown = BODY) =>
+  c.post('/checkout', {json: body, headers: key === null ? {} : {'Idempotency-Key': key}});
+
+export async function check_header_required(ctx) {
+  const {m, calls} = api(ctx);
+  const c = ctx.client(m.app);
+  let r = await post(c);
+  assert.equal(r.status, 400, \`POST /checkout without Idempotency-Key answered \${r.status}, expected 400\`);
+  assert.deepEqual(calls, [], 'a request without a key must not reach orders.processCheckout');
+  r = await post(c, 'k1');
+  assert.equal(r.status, 201, \`POST /checkout with a fresh key answered \${r.status}, expected 201\`);
+  assert.deepEqual(calls, [BODY], \`orders.processCheckout must run once with the request body, got \${JSON.stringify(calls)}\`);
+}
+
+export async function check_reserve_nx(ctx) {
+  const {m, calls, seen} = api(ctx);
+  const c = ctx.client(m.app);
+  let r = await post(c, 'k1');
+  assert.equal(r.status, 201);
+  assert(seen.length > 0, 'orders.processCheckout did not run');
+  const [value, ttl] = seen[0];
+  assert.equal(value, 'processing', \`while processCheckout ran idem:k1 held \${JSON.stringify(value)}, expected the 'processing' reservation\`);
+  assert(86000 <= ttl && ttl <= 86400, \`the reservation TTL was \${ttl}, expected 86400 s\`);
+  ctx.redis.set('idem:k2', 'processing');
+  r = await post(c, 'k2');
+  assert.notEqual(r.status, 201, 'a key already reserved by another request was claimed again: the SET must be NX');
+  assert.equal(calls.length, 1, 'a key already reserved must not run orders.processCheckout a second time');
+  // A concurrent retry with the same key lands right after the first command that touches idem:k3.
+  let claimedByRetry = false;
+  ctx.redisAfter('idem:k3', () => {
+    claimedByRetry = ctx.redis.set('idem:k3', 'processing', 'NX') === 'OK';
+  });
+  r = await post(c, 'k3');
+  if (claimedByRetry) {
+    assert.notEqual(r.status, 201, 'a retry claimed idem:k3 between your read and your write and both charged: the reservation must be one atomic SET NX');
+    assert.equal(calls.length, 1, 'a retry claimed idem:k3 between your read and your write and both ran orders.processCheckout: the reservation must be one atomic SET NX');
+  } else {
+    assert.equal(r.status, 201, \`the request that won the SET NX answered \${r.status}, expected 201\`);
+  }
+}
+
+export async function check_in_flight(ctx) {
+  const {m, calls} = api(ctx);
+  ctx.redis.set('idem:k1', 'processing', 'EX', 86400);
+  const r = await post(ctx.client(m.app), 'k1');
+  assert.equal(r.status, 409, \`a key whose first request is still processing answered \${r.status}, expected 409\`);
+  assert.deepEqual(calls, [], 'the in-flight key must not run orders.processCheckout again');
+  assert.equal(ctx.redis.get('idem:k1'), 'processing', "the 409 must leave the running request's reservation in place");
+}
+
+export async function check_replay(ctx) {
+  const {m, calls} = api(ctx);
+  const c = ctx.client(m.app);
+  const first = await post(c, 'k1');
+  assert.equal(first.status, 201, \`the first request answered \${first.status}, expected 201\`);
+  const again = await post(c, 'k1');
+  const other = await post(c, 'k2');
+  assert.equal(again.status, 200, \`the retry with the same key answered \${again.status}, expected 200\`);
+  assert.equal(again.text, first.text, \`the replay must return the same body: \${JSON.stringify(again.text)} != \${JSON.stringify(first.text)}\`);
+  assert.equal(again.json().order_id, 'o-1', 'the replayed document must be the first response, not a fresh one');
+  assert(calls.length === 2 && other.status === 201, 'the retry must not charge again; a different key is a new order');
+}
+
+export async function check_store_response(ctx) {
+  const {m} = api(ctx);
+  const c = ctx.client(m.app);
+  let r = await post(c, 'k1');
+  assert.equal(r.status, 201);
+  const stored = ctx.redis.get('idem:k1');
+  assert(stored !== null && stored !== 'processing', \`after the response idem:k1 holds \${JSON.stringify(stored)}, expected the JSON response\`);
+  assert.deepEqual(JSON.parse(stored), r.json(), \`the stored document \${stored} differs from the response body \${r.text}\`);
+  const ttl = ctx.redis.ttl('idem:k1');
+  assert(86000 <= ttl && ttl <= 86400, \`the stored response has TTL \${ttl}, expected 86400 s (same as the reservation)\`);
+  m.orders.processCheckout = async () => {
+    throw new Error('provider down');
+  };
+  r = await post(c, 'k3');
+  assert(r.status >= 500, \`a failing processCheckout answered \${r.status}\`);
+  assert.equal(ctx.redis.get('idem:k3'), null, 'when processCheckout fails the key must be released, or every retry gets 409 for a day');
+}
 `,
   },
   debrief: `The idempotency key turns "at least once" from the network into "exactly once" at the API: the atomic \`SET NX EX\` is both the check and the claim, the stored body makes the replay byte-identical, and the TTL bounds how long the promise is kept. Stripe's implementation adds a fingerprint of the request body (same key, different body → 422), scopes keys per API key, and stores the response even when it was an error so a retry does not accidentally succeed.`,

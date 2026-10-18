@@ -1,28 +1,33 @@
 /**
- * Main-thread handle on the Python runtime worker: `prewarm()` when a step that will run opens,
- * `run()` on submit. The worker is `public/py/worker.js`, an ES-module bundle built by
+ * Main-thread handle on a runtime worker — one per executing language: `prewarm()` when a step
+ * that will run opens, `run()` on submit. The workers are `public/py/worker.js` (Python, Pyodide)
+ * and `public/ts/worker.js` (TypeScript, esbuild-wasm), ES-module bundles built by
  * `yarn build:runtime` (Pyodide only runs in module workers, which webpack cannot emit here). A run
- * that overshoots its budget (a learner's infinite loop cannot be interrupted from outside Pyodide)
- * terminates the worker; the next run boots a fresh one.
+ * that overshoots its budget (a learner's infinite loop cannot be interrupted from outside the
+ * worker) terminates the worker; the next run boots a fresh one.
  */
-import type {BootPhase, RunJob, RunResult} from './python';
-import type {WorkerIn, WorkerOut} from './worker';
+import type {Language} from '../types';
+import type {Phase, RunJob, RunResult, WorkerIn, WorkerOut} from './types';
 
 export type RuntimeStatus =
   | {state: 'idle'}
-  | {state: 'booting'; phase: BootPhase}
+  | {state: 'booting'; phase: Phase}
   | {state: 'ready'}
   | {state: 'running'}
   | {state: 'failed'; message: string};
 
 export const RUN_TIMEOUT_MS = 20_000;
 
-/** The worker bundle `yarn build:runtime` writes under public/. */
-export const WORKER_URL = '/py/worker.js';
+/** Languages graded by execution, with their worker bundle (`yarn build:runtime` writes it under public/) and first boot phase. */
+export const RUNTIMES: Partial<Record<Language, {workerUrl: string; firstPhase: Phase}>> = {
+  python: {workerUrl: '/py/worker.js', firstPhase: 'pyodide'},
+  typescript: {workerUrl: '/ts/worker.js', firstPhase: 'esbuild'},
+};
 
-export const STATUS_TEXT: Record<BootPhase, string> = {
+export const STATUS_TEXT: Record<Phase, string> = {
   pyodide: 'starting Python (downloading the runtime, ~10 MB the first time)',
   packages: 'loading FastAPI, Redis, protobuf…',
+  esbuild: 'starting TypeScript (downloading the compiler, ~14 MB the first time)',
   runtime: 'installing the LeetBuild runtime',
 };
 
@@ -32,13 +37,15 @@ interface Pending {
   timer: number | null;
 }
 
-export class PythonRunner {
+export class RuntimeRunner {
   status: RuntimeStatus = {state: 'idle'};
   private worker: Worker | null = null;
   private ready = false;
   private readonly pending = new Map<number, Pending>();
   private readonly listeners = new Set<(status: RuntimeStatus) => void>();
   private nextId = 1;
+
+  constructor(private readonly workerUrl: string, private readonly firstPhase: Phase) {}
 
   onStatus(listener: (status: RuntimeStatus) => void): () => void {
     this.listeners.add(listener);
@@ -65,12 +72,12 @@ export class PythonRunner {
   }
 
   private spawn(): Worker {
-    const worker = new Worker(WORKER_URL, {type: 'module'});
+    const worker = new Worker(this.workerUrl, {type: 'module'});
     worker.onmessage = (event: MessageEvent<WorkerOut>) => this.receive(event.data);
     worker.onerror = event => this.fail(`the runtime worker crashed: ${event.message}`);
     this.worker = worker;
     this.ready = false;
-    this.setStatus({state: 'booting', phase: 'pyodide'});
+    this.setStatus({state: 'booting', phase: this.firstPhase});
     return worker;
   }
 
@@ -138,9 +145,16 @@ export class PythonRunner {
   }
 }
 
-let singleton: PythonRunner | null = null;
+const runners = new Map<Language, RuntimeRunner>();
 
-export function getPythonRunner(): PythonRunner {
-  if (singleton === null) singleton = new PythonRunner();
-  return singleton;
+/** The runner for `language`, or null when it is graded statically. */
+export function getRunner(language: Language): RuntimeRunner | null {
+  const runtime = RUNTIMES[language];
+  if (runtime === undefined) return null;
+  let runner = runners.get(language);
+  if (runner === undefined) {
+    runner = new RuntimeRunner(runtime.workerUrl, runtime.firstPhase);
+    runners.set(language, runner);
+  }
+  return runner;
 }

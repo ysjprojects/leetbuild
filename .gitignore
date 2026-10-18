@@ -7,3 +7,4 @@ out/
 tsconfig.tsbuildinfo
 *.log
 public/py/worker.js
+public/ts/worker.js

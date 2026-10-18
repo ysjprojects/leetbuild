@@ -1,14 +1,14 @@
 import {DISCORD} from '@/data/companies';
 import type {Problem} from '@/lib/types';
 
-import {protoModules} from './proto';
+import {protoFiles, protoModules} from './proto';
 import {postMessageStep} from './steps/1-post-message';
 import {readMessagesStep} from './steps/2-read-messages';
 import {dataServiceStep} from './steps/3-data-service';
 import {channelRoutingStep} from './steps/4-channel-routing';
 import {messageEventsStep} from './steps/5-message-events';
 import {hotChannelsStep} from './steps/6-hot-channels';
-import {supportModules} from './support';
+import {supportModules, supportModulesTs} from './support';
 
 /**
  * Discord's message store, from the two posts that describe it: snowflake ids and (channel, bucket)
@@ -122,5 +122,5 @@ channel.`,
     ],
   },
   steps: [postMessageStep, readMessagesStep, dataServiceStep, channelRoutingStep, messageEventsStep, hotChannelsStep],
-  support: {python: {...protoModules, ...supportModules}},
+  support: {python: {...protoModules, ...supportModules}, typescript: {...protoFiles, ...supportModulesTs}},
 };

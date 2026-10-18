@@ -51,6 +51,7 @@ so duplicates *will* arrive. Implement the consumer in group **\`ledger\`** so e
         'The consumer uses `group.id` `ledger` and commits offsets itself; auto-commit acknowledges on a timer, before the post happened.',
       match: {
         python: {all: [/"group\.id"\s*:\s*"ledger"/, /"enable\.auto\.commit"\s*:\s*False/]},
+        typescript: {all: [/groupId:\s*['"]ledger['"]/, /autoCommit:\s*false/]},
         go: {all: [/GroupID:\s*"ledger"/, /reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
         scala: {all: [/"group\.id"\s*,\s*"ledger"/, /"enable\.auto\.commit"\s*,\s*"false"/]},
         cpp: {all: [/"group\.id"\s*,\s*"ledger"/, /"enable\.auto\.commit"\s*,\s*"false"/]},
@@ -67,6 +68,13 @@ so duplicates *will* arrive. Implement the consumer in group **\`ledger\`** so e
             /f["']applied:\{/,
             /\.set\(\s*\w+\s*,[^\n]*nx\s*=\s*True/,
             /\.set\(\s*\w+\s*,[^\n]*ex\s*=\s*APPLIED_TTL_S/,
+          ],
+        },
+        typescript: {
+          all: [
+            /`applied:\$\{/,
+            /\.set\(\s*\w+\s*,[^\n]*['"]NX['"]/,
+            /\.set\(\s*\w+\s*,[^\n]*['"]EX['"]\s*,\s*APPLIED_TTL_S/,
           ],
         },
         go: {all: [/"applied:"\s*\+/, /rdb\.SetNX\(\s*[\w.()]+\s*,\s*\w+\s*,[^\n]*appliedTTL\s*\)/]},
@@ -86,6 +94,7 @@ so duplicates *will* arrive. Implement the consumer in group **\`ledger\`** so e
         'The SET NX runs before `ledger.post`; claiming afterwards leaves a window where a second consumer posts the same event.',
       match: {
         python: {order: [/\.set\(\s*\w+\s*,[^\n]*nx\s*=\s*True/, /ledger\.post\(/]},
+        typescript: {order: [/\.set\(\s*\w+\s*,[^\n]*['"]NX['"]/, /ledger\.post\(/]},
         go: {order: [/rdb\.SetNX\(/, /ledger\.Post\(/]},
         scala: {order: [/jedis\.set\(/, /Ledger\.post\(/]},
         cpp: {order: [/redis\.set\(/, /ledger::post\(/]},
@@ -98,6 +107,9 @@ so duplicates *will* arrive. Implement the consumer in group **\`ledger\`** so e
         'When the claim is refused the record is committed without posting; skipping without committing would redeliver the duplicate on every restart.',
       match: {
         python: {order: [/if not (r\.set\(|\w+\s*:)/, /consumer\.commit\(/, /ledger\.post\(/]},
+        typescript: {
+          order: [/if \(\s*(claimed|\w+)\s*===?\s*null\s*\)|if \(\s*!\w+\s*\)/, /commitOffsets\(/, /ledger\.post\(/],
+        },
         go: {order: [/if !\w+/, /reader\.CommitMessages\(/, /ledger\.Post\(/]},
         scala: {order: [/if \(!\w+\)|==\s*null\)/, /commit\(\s*\w+\s*\)/, /Ledger\.post\(/]},
         cpp: {order: [/if \(!\w+/, /consumer->commitSync\(/, /ledger::post\(/]},
@@ -110,6 +122,7 @@ so duplicates *will* arrive. Implement the consumer in group **\`ledger\`** so e
         'Commit follows `ledger.post`; a crash in between replays the record, and the claim makes the replay harmless.',
       match: {
         python: {order: [/ledger\.post\(/, /consumer\.commit\(/]},
+        typescript: {order: [/ledger\.post\(/, /commitOffsets\(/]},
         go: {order: [/ledger\.Post\(/, /reader\.CommitMessages\(/]},
         scala: {order: [/Ledger\.post\(/, /commit\(\s*\w+\s*\)/]},
         cpp: {order: [/ledger::post\(/, /consumer->commitSync\(/]},
@@ -199,6 +212,72 @@ def run() -> None:
             r.delete(key)  # release the claim: the redelivery must be allowed to post
             raise
         consumer.commit(message=msg, asynchronous=False)
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+import {ledger} from 'payments/ledger'; // ledger.post(event) writes the double-entry rows; NOT idempotent
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const APPLIED_TTL_S = 604800; // 7 days: longer than any replay window
+
+const kafka = new Kafka({clientId: 'ledger', brokers: ['kafka:9092']});
+export const consumer = kafka.consumer({groupId: 'ledger'});
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: 'payments', fromBeginning: true});
+  await consumer.run({
+    // TODO: disable auto-commit
+    eachMessage: async ({topic, partition, message}) => {
+      const event = JSON.parse(String(message.value));
+      // TODO: SET applied:{event_id} 1 NX EX APPLIED_TTL_S; refused → already applied: commit and skip
+      // TODO: ledger.post(event) (DEL the claim and rethrow on failure), then commit this message's offset + 1
+      throw new Error('not implemented');
+    },
+  });
+}
+`,
+      solution: `import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+import {ledger} from 'payments/ledger'; // ledger.post(event) writes the double-entry rows; NOT idempotent
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const APPLIED_TTL_S = 604800; // 7 days: longer than any replay window
+
+const kafka = new Kafka({clientId: 'ledger', brokers: ['kafka:9092']});
+export const consumer = kafka.consumer({groupId: 'ledger'});
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: 'payments', fromBeginning: true});
+  await consumer.run({
+    autoCommit: false,
+    eachMessage: async ({topic, partition, message}) => {
+      const event = JSON.parse(String(message.value));
+      const key = \`applied:\${event.event_id}\`;
+      const next = [{topic, partition, offset: String(Number(message.offset) + 1)}];
+      const claimed = await redis.set(key, 1, 'EX', APPLIED_TTL_S, 'NX');
+      if (claimed === null) {
+        console.info(\`event \${event.event_id} already applied; skipping\`);
+        await consumer.commitOffsets(next);
+        return;
+      }
+      try {
+        ledger.post(event);
+      } catch (e) {
+        await redis.del(key); // release the claim: the redelivery must be allowed to post
+        throw e;
+      }
+      await consumer.commitOffsets(next);
+    },
+  });
+}
 `,
     },
     go: {
@@ -576,6 +655,112 @@ def check_commit_after_post(ctx):
     ctx.drain(m2.run)
     assert _posted(ledger2) == ["e2"], f"after a restart the ledger posted {_posted(ledger2)}, expected only the retried e2"
     assert ctx.kafka.lag("ledger", "payments") == 0
+`,
+    typescript: `function seed(ctx, ...eventIds: string[]) {
+  for (const eventId of eventIds) {
+    const event = {event_id: eventId, type: 'payment.captured', merchant_id: 'm-42', order_id: 'o-' + eventId, amount_cents: 4999, currency: 'EUR'};
+    ctx.kafka.seed('payments', {key: 'm-42', value: JSON.stringify(event)});
+  }
+}
+
+/** The learner's module and the payments/ledger instance it imported (ledger.posted = the journal). */
+function consumer(ctx) {
+  const m = ctx.load('ledger_consumer');
+  return {m, ledger: ctx.load('/support/payments/ledger.ts').ledger};
+}
+
+const posted = ledger => ledger.posted.map(e => e.event_id);
+
+export async function check_group_manual_commit(ctx) {
+  seed(ctx, 'e1');
+  const {m} = consumer(ctx);
+  await ctx.drain(m.run());
+  const subscriptions = ctx.kafka.events.filter(e => e[0] === 'subscribe');
+  assert(subscriptions.length > 0, 'the consumer must subscribe to a topic');
+  const [, group, topics] = subscriptions[subscriptions.length - 1];
+  assert.equal(group, 'ledger', \`groupId must be ledger, got \${JSON.stringify(group)}\`);
+  assert(topics.includes('payments'), \`the consumer must subscribe to payments, got \${JSON.stringify(topics)}\`);
+  const c = ctx.kafka.consumers[ctx.kafka.consumers.length - 1];
+  assert.equal(c.autoCommit, false, 'autoCommit is on: offsets would be acknowledged on a timer, before the post');
+  assert(!ctx.kafka.events.some(e => e[0] === 'auto-commit'), 'offsets were auto-committed');
+  assert(ctx.kafka.events.some(e => e[0] === 'manual-commit'), 'no explicit commit happened');
+  assert.equal(ctx.kafka.lag('ledger', 'payments'), 0, 'every processed record must be committed');
+}
+
+export async function check_dedupe_nx(ctx) {
+  ctx.redis.set('applied:e2', '1', 'EX', 600000); // applied by an earlier run of the ledger
+  seed(ctx, 'e1', 'e2', 'e3');
+  // Another ledger replica claims e3 right after the first command that touches its key.
+  let claimedByReplica = false;
+  ctx.redisAfter('applied:e3', () => {
+    claimedByReplica = ctx.redis.set('applied:e3', '1', 'EX', 604800, 'NX') === 'OK';
+  });
+  const {m, ledger} = consumer(ctx);
+  await ctx.drain(m.run());
+  assert(ctx.redis.exists('applied:e1'), 'after posting e1 the claim applied:e1 must exist');
+  const ttl = ctx.redis.ttl('applied:e1');
+  assert(604000 <= ttl && ttl <= 604800, \`applied:e1 has TTL \${ttl}, expected 604800 s (7 days)\`);
+  assert.deepEqual(posted(ledger).filter(id => id !== 'e3'), ['e1'], \`the ledger posted \${JSON.stringify(posted(ledger))}: e2 was already applied and must be skipped, e1 must be posted once\`);
+  assert(ctx.redis.ttl('applied:e2') <= 600000, 'the claim of an already applied event must not be overwritten (SET NX, not SET)');
+  if (claimedByReplica) {
+    assert(!posted(ledger).includes('e3'), 'another replica claimed applied:e3 between your read and your write and both posted e3: the claim must be one atomic SET NX');
+  } else {
+    assert.deepEqual(posted(ledger).slice(1), ['e3'], \`the replica that won the SET NX must post e3, the ledger posted \${JSON.stringify(posted(ledger))}\`);
+  }
+}
+
+export async function check_dedupe_before_post(ctx) {
+  seed(ctx, 'e1');
+  const {m, ledger} = consumer(ctx);
+  const claimedAtPost: number[] = [];
+  const realPost = ledger.post;
+  ledger.post = event => {
+    claimedAtPost.push(ctx.redis.exists('applied:' + String(event.event_id)));
+    realPost(event);
+  };
+  await ctx.drain(m.run());
+  assert(claimedAtPost.length > 0, 'ledger.post never ran for e1');
+  assert.deepEqual(claimedAtPost, [1], 'when ledger.post ran, applied:e1 was not yet claimed: SET NX must come before the post');
+}
+
+export async function check_skip_still_commits(ctx) {
+  seed(ctx, 'e1', 'e2', 'e1'); // the relay replayed e1: a duplicate with a new offset
+  const {m, ledger} = consumer(ctx);
+  await ctx.drain(m.run());
+  assert.deepEqual(posted(ledger), ['e1', 'e2'], \`the ledger posted \${JSON.stringify(posted(ledger))}: each event exactly once, the replayed e1 skipped\`);
+  const lag = ctx.kafka.lag('ledger', 'payments');
+  assert.equal(lag, 0, \`\${lag} record(s) not committed: the skipped duplicate's offset must be committed too, or it is redelivered forever\`);
+}
+
+export async function check_commit_after_post(ctx) {
+  seed(ctx, 'e1');
+  const {m, ledger} = consumer(ctx);
+  const atCommit: number[] = [];
+  ctx.kafka.onCommit(() => atCommit.push(ledger.posted.length));
+  await ctx.drain(m.run());
+  assert(atCommit.length > 0, 'the offset of e1 was never committed');
+  assert.equal(atCommit[0], 1, 'the commit must come after ledger.post: at commit time nothing had been posted');
+  seed(ctx, 'e2');
+  const realPost = ledger.post;
+  ledger.post = () => {
+    throw new Error('ledger database down');
+  };
+  try {
+    await ctx.drain(m.run());
+  } catch (e) {
+    if (!(e instanceof Error) || e.message !== 'ledger database down') throw e;
+  }
+  assert.equal(ctx.redis.get('applied:e2'), null, 'when the post fails the claim applied:e2 must be released (DEL), or no retry will ever post it');
+  assert.equal(ctx.kafka.lag('ledger', 'payments'), 1, 'a record whose post failed must not be committed: it has to come back');
+  // restart the consumer (a fresh replica; the ledger is back): e1 is deduped by its claim, e2 is redelivered and posted this time
+  ledger.post = realPost;
+  const before = ledger.posted.length;
+  const m2 = ctx.reload('ledger_consumer');
+  await ctx.drain(m2.run());
+  const after = posted(ledger).slice(before);
+  assert.deepEqual(after, ['e2'], \`after a restart the ledger posted \${JSON.stringify(after)}, expected only the retried e2\`);
+  assert.equal(ctx.kafka.lag('ledger', 'payments'), 0);
+}
 `,
   },
   debrief: `The consumer owns its delivery guarantee: at-least-once from the broker (commit after the work) plus a claim keyed by the event's own id turns duplicates into no-ops. The claim is in Redis for speed, but notice its weak spot — a crash between the SET and the post leaves a claimed, unposted event until the TTL. Real ledgers close that gap by making the post itself idempotent (a unique index on \`event_id\` in the journal, insert-or-ignore) so the Redis claim is only a fast path, and they commit offsets in batches once the whole poll was applied.`,

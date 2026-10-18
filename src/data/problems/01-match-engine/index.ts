@@ -1,13 +1,13 @@
 import type {Problem} from '@/lib/types';
 
-import {protoModules} from './proto';
+import {protoFiles, protoModules} from './proto';
 import {orderGatewayStep} from './steps/1-order-gateway';
 import {publishOrdersStep} from './steps/2-publish-orders';
 import {matchConsumerStep} from './steps/3-match-consumer';
 import {topOfBookStep} from './steps/4-top-of-book';
 import {streamTicksStep} from './steps/5-stream-ticks';
 import {bookSnapshotStep} from './steps/6-book-snapshot';
-import {supportModules} from './support';
+import {supportModules, supportModulesTs} from './support';
 
 /**
  * Match engine: an exchange in miniature. HTTPS order gateway with auth, validation and an
@@ -74,5 +74,5 @@ order matters.`,
     ],
   },
   steps: [orderGatewayStep, publishOrdersStep, matchConsumerStep, topOfBookStep, streamTicksStep, bookSnapshotStep],
-  support: {python: {...protoModules, ...supportModules}},
+  support: {python: {...protoModules, ...supportModules}, typescript: {...protoFiles, ...supportModulesTs}},
 };

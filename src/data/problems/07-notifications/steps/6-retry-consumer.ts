@@ -57,6 +57,12 @@ which raises \`Retryable\` when the gateway asked for a retry.
             /subscribe\(\s*\[[^\]]*(TOPIC|"notifications")[^\]]*(RETRY_TOPIC|"notifications-retry")[^\]]*\]\s*\)/,
           ],
         },
+        typescript: {
+          all: [
+            /groupId:\s*['"]delivery['"]/,
+            /subscribe\(\s*\{[^}]*topics:\s*\[[^\]]*(TOPIC|['"]notifications['"])[^\]]*(RETRY_TOPIC|['"]notifications-retry['"])[^\]]*\]/,
+          ],
+        },
         go: {
           all: [
             /GroupID:\s*"delivery"/,
@@ -83,6 +89,7 @@ which raises \`Retryable\` when the gateway asked for a retry.
       detail: 'Offsets are committed explicitly after the outcome is recorded — not on a timer.',
       match: {
         python: {all: [/"enable\.auto\.commit"\s*:\s*False/]},
+        typescript: {all: [/autoCommit:\s*false/]},
         go: {all: [/reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
         scala: {all: [/"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/]},
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/]},
@@ -95,6 +102,7 @@ which raises \`Retryable\` when the gateway asked for a retry.
         'Every record passes through `allowed`, `get_prefs` and `quiet` first; a skipped notification is still committed.',
       match: {
         python: {all: [/\ballowed\(/, /\bget_prefs\(/, /\bquiet\(/]},
+        typescript: {all: [/\ballowed\(/, /\bgetPrefs\(/, /\bquiet\(/]},
         go: {all: [/\ballowed\(/, /\bgetPrefs\(/, /\bQuiet\(/]},
         scala: {all: [/RateLimit\.allowed\(/, /Preferences\.getPrefs\(/, /Preferences\.quiet\(/]},
         cpp: {all: [/\ballowed\(/, /\bget_prefs\(/, /\bquiet\(/]},
@@ -107,6 +115,7 @@ which raises \`Retryable\` when the gateway asked for a retry.
         'A retryable failure produces the record to `notifications-retry` with an incremented `attempt` header, or to `notifications-dlq` once the attempt count reaches 5.',
       match: {
         python: {all: [/producer\.produce\(/, /headers\s*=\s*[^\n]*["']attempt["']/, />=\s*(MAX_ATTEMPTS|5)\b/]},
+        typescript: {all: [/producer\.send\(/, /headers:\s*\{[^\n]*attempt/, />=\s*(MAX_ATTEMPTS|5)\b/]},
         go: {all: [/writer\.WriteMessages\(/, /kafka\.Header\{\{?\s*Key:\s*"attempt"/, />=\s*(maxAttempts|5)\b/]},
         scala: {all: [/producer\.send\(/, /headers\(\)\.add\(\s*"attempt"/, />=\s*(MaxAttempts|5)\b/]},
         cpp: {all: [/producer->produce\(/, /->add\(\s*"attempt"/, />=\s*(kMaxAttempts|5)\b/]},
@@ -119,6 +128,7 @@ which raises \`Retryable\` when the gateway asked for a retry.
         'The offset commit sits after `send_push` and after the re-queue: a crash before it replays the record (at-least-once) instead of losing it (at-most-once).',
       match: {
         python: {order: [/(?<!def )send_push\(/, /(?<!def )requeue\(/, /consumer\.commit\(/]},
+        typescript: {order: [/\bsendPush\(/, /(?<!function )\brequeue\(/, /consumer\.commitOffsets\(/]},
         go: {order: [/(?<!func )sendPush\(/, /(?<!func )requeue\(/, /reader\.CommitMessages\(/]},
         scala: {order: [/PushClient\.sendPush\(/, /(?<!def )requeue\(/, /consumer\.commitSync\(/]},
         cpp: {order: [/(?<!\w )send_push\(/, /(?<!void )requeue\(/, /consumer->commitSync\(/]},
@@ -241,6 +251,125 @@ def run() -> None:
                 log.warning("%s: %s, re-queueing", n["id"], e)
                 requeue(msg, attempt_of(msg))
         consumer.commit(message=msg, asynchronous=False)
+`,
+    },
+    typescript: {
+      starter: `import {Kafka, type KafkaMessage} from 'kafkajs';
+
+import {getPrefs, quiet} from './preferences'; // step 4 — provided
+import {Retryable, sendPush} from './push_client'; // step 5 — provided: sendPush(token, title, body, collapseKey)
+import {allowed} from './rate_limit'; // step 3 — provided
+
+export const TOPIC = 'notifications';
+export const RETRY_TOPIC = 'notifications-retry';
+export const DLQ_TOPIC = 'notifications-dlq';
+export const MAX_ATTEMPTS = 5;
+
+const kafka = new Kafka({clientId: 'delivery', brokers: ['kafka:9092']});
+const consumer = kafka.consumer({groupId: 'delivery'});
+const producer = kafka.producer({idempotent: true});
+
+interface Notification {
+  id: string;
+  user_id: string;
+  title: string;
+  body: string;
+  priority: string;
+}
+
+/** The attempt header, 0 on first delivery (provided). */
+export function attemptOf(message: KafkaMessage): number {
+  const value = message.headers?.attempt;
+  return value === undefined ? 0 : Number(Buffer.from(value).toString());
+}
+
+export async function requeue(message: KafkaMessage, attempt: number): Promise<void> {
+  // TODO: send message (same key and value) with attempt + 1 in the header to RETRY_TOPIC, or to DLQ_TOPIC once it reaches MAX_ATTEMPTS
+  // TODO: await the send so the re-queued record is acknowledged before the caller commits
+  throw new Error('not implemented');
+}
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await producer.connect();
+  // TODO: subscribe to TOPIC and RETRY_TOPIC
+  await consumer.run({
+    // TODO: disable auto-commit
+    eachMessage: async ({topic, partition, message}) => {
+      const n = JSON.parse(Buffer.from(message.value!).toString()) as Notification;
+      // TODO: deliver only if allowed(user_id, id), prefs.push, and (priority high or not quiet(prefs, hour))
+      // TODO: sendPush(n.user_id, n.title, n.body, n.id) — one device per user: the token is the user id, the collapse key the notification id
+      // TODO: Retryable → requeue(message, attemptOf(message))
+      // TODO: commit this message (offset + 1) only after the outcome is recorded
+      throw new Error('not implemented');
+    },
+  });
+}
+`,
+      solution: `import {Kafka, type KafkaMessage} from 'kafkajs';
+
+import {getPrefs, quiet} from './preferences'; // step 4 — provided
+import {Retryable, sendPush} from './push_client'; // step 5 — provided: sendPush(token, title, body, collapseKey)
+import {allowed} from './rate_limit'; // step 3 — provided
+
+export const TOPIC = 'notifications';
+export const RETRY_TOPIC = 'notifications-retry';
+export const DLQ_TOPIC = 'notifications-dlq';
+export const MAX_ATTEMPTS = 5;
+
+const kafka = new Kafka({clientId: 'delivery', brokers: ['kafka:9092']});
+const consumer = kafka.consumer({groupId: 'delivery'});
+const producer = kafka.producer({idempotent: true});
+
+interface Notification {
+  id: string;
+  user_id: string;
+  title: string;
+  body: string;
+  priority: string;
+}
+
+/** The attempt header, 0 on first delivery (provided). */
+export function attemptOf(message: KafkaMessage): number {
+  const value = message.headers?.attempt;
+  return value === undefined ? 0 : Number(Buffer.from(value).toString());
+}
+
+export async function requeue(message: KafkaMessage, attempt: number): Promise<void> {
+  const nextAttempt = attempt + 1;
+  const topic = nextAttempt >= MAX_ATTEMPTS ? DLQ_TOPIC : RETRY_TOPIC;
+  // send resolves once the broker acknowledged the record: only then may the caller commit
+  await producer.send({
+    topic,
+    acks: -1,
+    messages: [{key: message.key, value: message.value, headers: {attempt: String(nextAttempt)}}],
+  });
+}
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await producer.connect();
+  await consumer.subscribe({topics: [TOPIC, RETRY_TOPIC], fromBeginning: true});
+  await consumer.run({
+    autoCommit: false,
+    eachMessage: async ({topic, partition, message}) => {
+      const n = JSON.parse(Buffer.from(message.value!).toString()) as Notification;
+      const prefs = await getPrefs(n.user_id);
+      const hour = new Date().getHours();
+      const deliver = (await allowed(n.user_id, n.id)) && prefs.push && (n.priority === 'high' || !quiet(prefs, hour));
+      if (deliver) {
+        try {
+          await sendPush(n.user_id, n.title, n.body, n.id); // one device per user: the token is the user id
+        } catch (e) {
+          if (!(e instanceof Retryable)) throw e;
+          console.warn(\`\${n.id}: \${e.message}, re-queueing\`);
+          await requeue(message, attemptOf(message));
+        }
+      }
+      await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
+    },
+  });
+}
 `,
     },
     go: {
@@ -814,6 +943,139 @@ def check_commit_after(ctx):
     assert second, f"the re-queued record on notifications-retry was never committed, commits were {at_commit}"
     assert second[0][3] == ["n1"], "the commit of the retried record came before send_push delivered it"
     assert ctx.kafka.lag("delivery", "notifications") == 0 and ctx.kafka.lag("delivery", "notifications-retry") == 0, "every record must end up committed"
+`,
+    typescript: `function seed(ctx, nid: string, {userId = 'u1', priority = 'normal', topic = 'notifications', attempt = null as number | null} = {}): string {
+  const value = JSON.stringify({id: nid, user_id: userId, channel: 'push', title: 'Shipped', body: 'On its way', priority});
+  ctx.kafka.seed(topic, {key: userId, value, headers: attempt === null ? {} : {attempt: String(attempt)}});
+  return value;
+}
+
+/**
+ * The worker with the real rate limit, preferences and push client of the previous steps behind it: the
+ * push gateway is a peer that delivers (recording the notification id) or answers DEADLINE_EXCEEDED
+ * while a notification has failures left; preferences rows are seeded so no user is in quiet hours
+ * unless a check says so.
+ */
+function worker(ctx) {
+  const sent: string[] = []; // notification ids the gateway delivered
+  const failures: Record<string, number> = {}; // notification id -> remaining DEADLINE_EXCEEDED answers
+  const pkg = ctx.proto('push.proto');
+  ctx.grpc.serve(pkg.notify.PushGateway.service, {
+    Send: (call, callback) => {
+      const {collapse_key, title, body, device_token} = call.request;
+      const id = [collapse_key, title, body, device_token].find(v => v in failures) ?? collapse_key;
+      if ((failures[id] ?? 0) > 0) {
+        failures[id] -= 1;
+        return callback({code: ctx.grpc.status.DEADLINE_EXCEEDED, details: 'deadline exceeded'});
+      }
+      sent.push(id);
+      callback(null, {message_id: \`m-\${sent.length}\`});
+    },
+  });
+  const db = ctx.load('/support/notify/db.ts').db;
+  const hour = new Date().getHours();
+  const awake = {push: true, quiet_start: (hour + 2) % 24, quiet_end: (hour + 3) % 24}; // never quiet right now
+  for (const user of ['u1', 'u2', 'u-ok', 'u-limited', 'u-off']) db.rows[user] = {...awake};
+  const m = ctx.load('delivery_worker');
+  return {m, sent, failures, db, hour, awake};
+}
+
+function header(record, name: string): string | null {
+  const value = record.headers?.[name];
+  return value === undefined ? null : Buffer.from(value).toString();
+}
+
+export async function check_group_topics(ctx) {
+  seed(ctx, 'n1');
+  seed(ctx, 'n2', {topic: 'notifications-retry', attempt: 1});
+  const {m, sent} = worker(ctx);
+  await ctx.drain(m.run());
+  const subscriptions = ctx.kafka.events.filter(e => e[0] === 'subscribe');
+  assert(subscriptions.length > 0, 'the consumer must subscribe to its topics');
+  const [, group, topics] = subscriptions[subscriptions.length - 1];
+  assert.equal(group, 'delivery', \`groupId must be delivery, got \${JSON.stringify(group)}\`);
+  assert(topics.includes('notifications') && topics.includes('notifications-retry'), \`the consumer must subscribe to notifications and notifications-retry, got \${JSON.stringify(topics)}\`);
+  assert.deepEqual([...sent].sort(), ['n1', 'n2'], \`records from both topics must be delivered, sent \${JSON.stringify(sent)}\`);
+}
+
+export async function check_manual_commit(ctx) {
+  seed(ctx, 'n1');
+  seed(ctx, 'n2', {userId: 'u2'});
+  const {m} = worker(ctx);
+  await ctx.drain(m.run());
+  const consumer = ctx.kafka.consumers[ctx.kafka.consumers.length - 1];
+  assert(consumer !== undefined && consumer.autoCommit === false, 'the consumer runs with autoCommit on: offsets would be committed on a timer, not after the outcome');
+  assert(!ctx.kafka.events.some(e => e[0] === 'auto-commit'), 'auto-commit is on: offsets were committed on a timer, before the outcome');
+  assert(ctx.kafka.events.some(e => e[0] === 'manual-commit'), 'no explicit commit happened');
+  assert.equal(ctx.kafka.lag('delivery', 'notifications'), 0, 'every processed record must be committed');
+}
+
+export async function check_gate(ctx) {
+  seed(ctx, 'n-ok', {userId: 'u-ok'});
+  seed(ctx, 'n-limited', {userId: 'u-limited'});
+  seed(ctx, 'n-off', {userId: 'u-off'});
+  seed(ctx, 'n-quiet', {userId: 'u-quiet'});
+  seed(ctx, 'n-urgent', {userId: 'u-quiet', priority: 'high'});
+  const {m, sent, db, hour, awake} = worker(ctx);
+  for (let i = 0; i < 20; i++) ctx.redis.zadd('rl:u-limited', Date.now(), \`earlier-\${i}\`); // the hourly budget is spent
+  db.rows['u-off'] = {...awake, push: false};
+  db.rows['u-quiet'] = {push: true, quiet_start: hour, quiet_end: hour + 1}; // quiet hours right now
+  await ctx.drain(m.run());
+  assert(ctx.redis.zscore('rl:u-ok', 'n-ok') !== null, \`allowed(userId, id) must be consulted for every record: rl:u-ok holds \${JSON.stringify(ctx.redis.zrange('rl:u-ok', 0, -1))}, expected n-ok\`);
+  assert(ctx.redis.get('prefs:u-ok') !== null, \`getPrefs(userId) must be consulted: prefs:u-ok was never cached, keys are \${JSON.stringify(ctx.redis.keys('prefs:*'))}\`);
+  assert(sent.includes('n-ok'), \`an allowed notification with push on outside quiet hours must be sent, sent \${JSON.stringify(sent)}\`);
+  assert(!sent.includes('n-limited'), 'a rate-limited notification must not be sent');
+  assert(!sent.includes('n-off'), 'a user with push off must not get a notification');
+  assert(!sent.includes('n-quiet'), \`a normal notification in quiet hours must not be sent: u-quiet's quiet window is the current hour (\${hour}), pass quiet(prefs, hour) the current hour (0-23)\`);
+  assert(sent.includes('n-urgent'), \`a high-priority notification ignores quiet hours, sent \${JSON.stringify(sent)}\`);
+  assert.equal(ctx.kafka.lag('delivery', 'notifications'), 0, 'skipped notifications are an outcome too: they must be committed');
+}
+
+export async function check_retry_topic(ctx) {
+  const original = seed(ctx, 'n1');
+  seed(ctx, 'n2', {userId: 'u2', topic: 'notifications-retry', attempt: 4});
+  const {m, sent, failures} = worker(ctx);
+  failures.n1 = 1;
+  failures.n2 = 1;
+  await ctx.drain(m.run());
+  const retried = ctx.kafka.records('notifications-retry');
+  const keys = ctx.kafka.keys('notifications-retry');
+  const requeued = retried.filter((_, i) => keys[i] === 'u1');
+  assert(requeued.length > 0, \`n1 failed once: it must be re-queued on notifications-retry, found keys \${JSON.stringify(keys)}\`);
+  assert.equal(requeued.length, 1, \`n1 failed once, yet it was re-queued \${requeued.length} times\`);
+  assert.equal(Buffer.from(requeued[0].value).toString(), original, \`the re-queued value must be the original record, got \${JSON.stringify(Buffer.from(requeued[0].value).toString())}\`);
+  assert.equal(header(requeued[0], 'attempt'), '1', \`the re-queued record must carry attempt=1, headers were \${JSON.stringify(Object.keys(requeued[0].headers))}\`);
+  assert.equal(sent.filter(id => id === 'n1').length, 1, \`the re-queued n1 must be delivered when it comes back, sent \${JSON.stringify(sent)}\`);
+  const dead = ctx.kafka.records('notifications-dlq');
+  assert(dead.length === 1 && ctx.kafka.keys('notifications-dlq')[0] === 'u2', \`n2 failing on attempt 4 must land on notifications-dlq, found keys \${JSON.stringify(ctx.kafka.keys('notifications-dlq'))}\`);
+  assert.equal(header(dead[0], 'attempt'), '5', \`the dead-lettered record must carry attempt=5, headers were \${JSON.stringify(Object.keys(dead[0].headers))}\`);
+  assert.equal(keys.filter(k => k === 'u2').length, 1, 'a record on its fifth attempt goes to the DLQ, not back to the retry topic');
+  assert(!sent.includes('n2'), 'a dead-lettered notification is not delivered');
+}
+
+export async function check_commit_after(ctx) {
+  seed(ctx, 'n1');
+  const {m, sent, failures} = worker(ctx);
+  failures.n1 = 1;
+  ctx.kafka.stall('notifications-retry', 1); // the retry topic's leader acknowledges after 1 s
+  const atCommit: {topics: string[]; retried: number; sent: string[]}[] = [];
+  ctx.kafka.onCommit((group, offsets) =>
+    atCommit.push({
+      topics: [...offsets.keys()].map((tp: string) => tp.split('|')[0]).sort(),
+      retried: ctx.kafka.records('notifications-retry').length,
+      sent: [...sent],
+    }),
+  );
+  await ctx.drain(m.run());
+  assert(atCommit.length > 0, 'the offset was never committed');
+  const first = atCommit.filter(c => c.topics.includes('notifications'));
+  assert(first.length > 0, \`the record on notifications was never committed, commits were \${JSON.stringify(atCommit)}\`);
+  assert.equal(first[0].retried, 1, 'the commit of the failed record came before its re-queue was acknowledged: at commit time nothing was on notifications-retry. Wait for the producer before you commit');
+  const second = atCommit.filter(c => c.topics.includes('notifications-retry'));
+  assert(second.length > 0, \`the re-queued record on notifications-retry was never committed, commits were \${JSON.stringify(atCommit)}\`);
+  assert.deepEqual(second[0].sent, ['n1'], 'the commit of the retried record came before sendPush delivered it');
+  assert(ctx.kafka.lag('delivery', 'notifications') === 0 && ctx.kafka.lag('delivery', 'notifications-retry') === 0, 'every record must end up committed');
+}
 `,
   },
   debrief: `A retry topic turns "this one failed" into a record like any other: the partition moves on, the failed notification comes back a little later with its attempt count in a header, and after five tries it lands in the DLQ where a human — or a replay tool — can look at it. The commit after the re-queue acknowledgement is what makes the whole thing at-least-once end to end. Real workers run several retry topics with growing delays (\`retry-1m\`, \`retry-10m\`), pause a partition instead of sleeping in it, honour the \`priority\` header with a separate high-priority group, and alert on the DLQ's depth.`,

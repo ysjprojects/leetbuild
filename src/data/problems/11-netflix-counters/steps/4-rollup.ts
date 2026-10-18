@@ -65,6 +65,9 @@ provided: the start of the event's minute bucket (\`WINDOW_S\` = 60).
             /"enable\.auto\.commit"\s*:\s*False/,
           ],
         },
+        typescript: {
+          all: [/groupId:\s*['"]rollup['"]/, /subscribe\(\{[^\n]*['"]counter-events['"]/, /autoCommit:\s*false/],
+        },
         go: {
           all: [/GroupID:\s*"rollup"/, /Topic:\s*"counter-events"/, /reader\.FetchMessage\(/],
           none: [/ReadMessage\(/],
@@ -95,6 +98,14 @@ provided: the start of the event's minute bucket (\`WINDOW_S\` = 60).
           all: [/f["']seen:\{/, /\.set\(\s*[^,\n]+,[^\n]*nx\s*=\s*True/, /\.set\(\s*[^,\n]+,[^\n]*ex\s*=\s*SEEN_TTL_S/],
           order: [/\.set\(\s*[^,\n]+,[^\n]*nx\s*=\s*True/, /\br\.hincrby\(/],
         },
+        typescript: {
+          all: [
+            /`seen:\$\{/,
+            /\.set\(\s*[^,\n]+,[^\n]*['"]NX['"]/,
+            /\.set\(\s*[^,\n]+,[^\n]*['"]EX['"]\s*,\s*SEEN_TTL_S/,
+          ],
+          order: [/\.set\(\s*[^,\n]+,[^\n]*['"]NX['"]/, /\bredis\.hincrby\(/],
+        },
         go: {
           all: [/"seen:"\s*\+/, /rdb\.SetNX\(\s*ctx\s*,\s*[^,\n]+,[^\n]*seenTTL\s*\)/],
           order: [/rdb\.SetNX\(/, /rdb\.HIncrBy\(/],
@@ -116,6 +127,7 @@ provided: the start of the event's minute bucket (\`WINDOW_S\` = 60).
         'Each event is `HINCRBY rollup:{ns}:{name} window(ts) delta`: one hash per counter, one field per minute.',
       match: {
         python: {all: [/f["']rollup:\{ns\}:\{name\}["']/, /\br\.hincrby\(/, /(?<!def )window\(/]},
+        typescript: {all: [/`rollup:\$\{ns\}:\$\{name\}`/, /\bredis\.hincrby\(/, /(?<!function )window\(/]},
         go: {
           all: [/"rollup:"\s*\+\s*ns\s*\+\s*":"\s*\+\s*name|"rollup:%s:%s"/, /rdb\.HIncrBy\(/, /(?<!func )window\(/],
         },
@@ -130,6 +142,7 @@ provided: the start of the event's minute bucket (\`WINDOW_S\` = 60).
         'The offset is committed once the `HINCRBY` ran: at-least-once delivery plus the claim is effectively once. A refused claim and a malformed record are committed as well, or they are redelivered forever.',
       match: {
         python: {order: [/\br\.hincrby\(/, /consumer\.commit\(/]},
+        typescript: {order: [/\bredis\.hincrby\(/, /consumer\.commitOffsets\(/]},
         go: {order: [/rdb\.HIncrBy\(/, /reader\.CommitMessages\(/]},
         scala: {order: [/jedis\.hincrBy\(/, /commit\(\s*\w+\s*\)/]},
         cpp: {order: [/redis\.hincrby\(/, /consumer->commitSync\(/]},
@@ -142,6 +155,7 @@ provided: the start of the event's minute bucket (\`WINDOW_S\` = 60).
         '`get_count` reads every field (`HVALS` / `HGETALL`) and sums them — 0 for an unknown counter; `clear_count` is a `DEL` of the hash.',
       match: {
         python: {all: [/\br\.hvals\(|\br\.hgetall\(/, /\bsum\(/, /\br\.delete\(/]},
+        typescript: {all: [/\bredis\.hvals\(|\bredis\.hgetall\(/, /\.reduce\(/, /\bredis\.del\(/]},
         go: {all: [/rdb\.HVals\(|rdb\.HGetAll\(/, /rdb\.Del\(/]},
         scala: {all: [/jedis\.hvals\(|jedis\.hgetAll\(/, /\.sum\b/, /jedis\.del\(/]},
         cpp: {all: [/redis\.hvals\(|redis\.hgetall\(/, /redis\.del\(/]},
@@ -259,6 +273,124 @@ def get_count(ns: str, name: str) -> int:
 
 def clear_count(ns: str, name: str) -> None:
     r.delete(f"rollup:{ns}:{name}")
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+const redis = new Redis({host: 'redis', port: 6379});
+const kafka = new Kafka({clientId: 'rollup', brokers: ['kafka:9092']});
+const consumer = kafka.consumer({groupId: 'rollup'});
+
+export const WINDOW_S = 60;
+export const SEEN_TTL_S = 86400; // a day: longer than any client retries, shorter than forever
+
+/** Start of the minute bucket an event belongs to (provided); \`ts\` in Unix seconds. */
+export function window(ts: number): number {
+  return Math.floor(ts / WINDOW_S) * WINDOW_S;
+}
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: 'counter-events', fromBeginning: true});
+  await consumer.run({
+    // TODO: disable auto-commit
+    eachMessage: async ({topic, partition, message}) => {
+      // TODO: parse the JSON event (malformed → log, commit, return)
+      // TODO: SET seen:{token} 1 NX EX SEEN_TTL_S; refused → a retry already folded: commit and return
+      // TODO: HINCRBY rollup:{ns}:{name} window(ts) delta; then commit this message
+      throw new Error('not implemented');
+    },
+  });
+}
+
+export async function getCount(ns: string, name: string): Promise<number> {
+  // TODO: sum of the hash's fields; 0 when there is no hash
+  throw new Error('not implemented');
+}
+
+export async function clearCount(ns: string, name: string): Promise<void> {
+  // TODO: DEL the hash
+  throw new Error('not implemented');
+}
+`,
+      solution: `import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+const redis = new Redis({host: 'redis', port: 6379});
+const kafka = new Kafka({clientId: 'rollup', brokers: ['kafka:9092']});
+const consumer = kafka.consumer({groupId: 'rollup'});
+
+export const WINDOW_S = 60;
+export const SEEN_TTL_S = 86400; // a day: longer than any client retries, shorter than forever
+
+interface CountEvent {
+  ns: string;
+  name: string;
+  delta: number;
+  token: string;
+  ts: number;
+}
+
+/** Start of the minute bucket an event belongs to (provided); \`ts\` in Unix seconds. */
+export function window(ts: number): number {
+  return Math.floor(ts / WINDOW_S) * WINDOW_S;
+}
+
+/** The event a record carries, or null when it is not one. */
+function parseEvent(value: Buffer | null): CountEvent | null {
+  if (value === null) return null;
+  let doc: unknown;
+  try {
+    doc = JSON.parse(value.toString());
+  } catch {
+    return null;
+  }
+  if (typeof doc !== 'object' || doc === null) return null;
+  const {ns, name, delta, token, ts} = doc as Record<string, unknown>;
+  if (typeof ns !== 'string' || typeof name !== 'string' || typeof token !== 'string') return null;
+  if (!Number.isInteger(delta) || typeof ts !== 'number') return null;
+  return {ns, name, delta: delta as number, token, ts};
+}
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: 'counter-events', fromBeginning: true});
+  await consumer.run({
+    autoCommit: false,
+    eachMessage: async ({topic, partition, message}) => {
+      const event = parseEvent(message.value);
+      if (event === null) {
+        console.warn(\`skipping malformed record at offset \${message.offset}\`);
+        await commit(topic, partition, message.offset);
+        return;
+      }
+      const claimed = await redis.set(\`seen:\${event.token}\`, 1, 'EX', SEEN_TTL_S, 'NX');
+      if (claimed === null) {
+        console.info(\`token \${event.token} already folded; skipping\`);
+        await commit(topic, partition, message.offset);
+        return;
+      }
+      await redis.hincrby(\`rollup:\${event.ns}:\${event.name}\`, String(window(event.ts)), event.delta);
+      await commit(topic, partition, message.offset);
+    },
+  });
+}
+
+/** Commit this record as done: the next offset to read is the one after it. */
+async function commit(topic: string, partition: number, offset: string): Promise<void> {
+  await consumer.commitOffsets([{topic, partition, offset: String(Number(offset) + 1)}]);
+}
+
+export async function getCount(ns: string, name: string): Promise<number> {
+  const buckets = await redis.hvals(\`rollup:\${ns}:\${name}\`);
+  return buckets.reduce((sum, v) => sum + Number(v), 0);
+}
+
+export async function clearCount(ns: string, name: string): Promise<void> {
+  await redis.del(\`rollup:\${ns}:\${name}\`);
+}
 `,
     },
     go: {
@@ -812,6 +944,145 @@ def check_get_clear(ctx):
     m.clear_count("plays", "stranger-things")
     assert ctx.redis.exists(KEY) == 0, f"clear_count must DEL {KEY}"
     assert m.get_count("plays", "stranger-things") == 0, "a cleared counter reads as 0"
+`,
+    typescript: `const TOPIC = 'counter-events';
+const KEY = 'rollup:plays:stranger-things';
+const TS = 1760616030; // inside the minute bucket starting at 1760616000
+const NEXT_MINUTE_TS = TS + 60;
+
+/** Events other producers put on the topic — [token, delta] or [token, delta, ts] — all for plays/stranger-things. */
+function seed(ctx, ...events: [string, number, number?][]) {
+  for (const [token, delta, ts = TS] of events) {
+    const value = {ns: 'plays', name: 'stranger-things', delta, token, ts};
+    ctx.kafka.seed(TOPIC, {key: 'plays:stranger-things', value: JSON.stringify(value)});
+  }
+}
+
+function total(ctx, key = KEY): number {
+  return ctx.redis.hvals(key).reduce((sum, v) => sum + Number(v), 0);
+}
+
+/** At every commit of group rollup: the committed offsets (by 'topic|partition') and the total the hash held at that instant. */
+function foldedAtCommits(ctx): {offsets: Map<string, number>; total: number}[] {
+  const seen = [];
+  ctx.kafka.onCommit((group, offsets) => {
+    if (group === 'rollup') seen.push({offsets: new Map(offsets), total: total(ctx)});
+  });
+  return seen;
+}
+
+export async function check_consumer_group(ctx) {
+  seed(ctx, ['t-1', 1], ['t-2', 2], ['t-3', 4]); // produced before the worker started
+  const deltas = ctx.kafka.values(TOPIC).map(v => JSON.parse(v).delta);
+  const partition = ctx.kafka.records(TOPIC)[0].partition;
+  const atCommit = foldedAtCommits(ctx);
+  const m = ctx.load('rollup');
+  await ctx.drain(m.run());
+  const others = [...new Set([...ctx.kafka.committed.keys()].map(k => k.split('|')[0]).filter(g => g !== 'rollup'))].sort();
+  assert(ctx.kafka.committedOffset('rollup', TOPIC, partition) !== null, \`consumer group rollup never committed an offset on \${TOPIC} (groups that did: \${JSON.stringify(others)}): the worker must join group rollup and subscribe to \${TOPIC}\`);
+  assert.equal(ctx.kafka.lag('rollup', TOPIC), 0, \`group rollup left \${ctx.kafka.lag('rollup', TOPIC)} event(s) of \${TOPIC} uncommitted: events produced before the worker started must be read from the earliest offset, folded and committed\`);
+  assert.equal(total(ctx), 7, \`the three events (+1, +2, +4) must fold to 7, the hash holds \${JSON.stringify(ctx.redis.hgetall(KEY))}\`);
+  for (const {offsets, total: held} of atCommit) {
+    const upto = offsets.get(\`\${TOPIC}|\${partition}\`);
+    if (upto === undefined) continue;
+    const expected = deltas.slice(0, upto).reduce((a, b) => a + b, 0);
+    assert(held >= expected, \`group rollup committed offset \${upto} (events up to +\${deltas[upto - 1]}) while the hash held \${held}, less than the \${expected} those events add up to: an offset is committed only once its event has been folded, never ahead of the work\`);
+  }
+  // The worker stalls 6 s right after claiming an event (longer than the auto-commit interval), then its
+  // fold fails for real: rollup:plays:broken is not a hash, so HINCRBY throws and the worker dies.
+  ctx.redis.set('rollup:plays:broken', 'not a hash');
+  ctx.kafka.seed(TOPIC, {key: 'plays:broken', value: JSON.stringify({ns: 'plays', name: 'broken', delta: 1, token: 't-x', ts: TS})});
+  const failed = ctx.kafka.records(TOPIC).at(-1);
+  let fired = false;
+  ctx.redisAfter('seen:t-x', () => {
+    fired = true;
+    ctx.clock.advance(6);
+  });
+  await ctx.drain(m.run()).catch(() => undefined); // the worker died on the failed fold, as it should: the event is not lost, it is redelivered
+  assert(fired, 'the worker never claimed seen:t-x before folding the event');
+  const committed = ctx.kafka.committedOffset('rollup', TOPIC, failed.partition) ?? 0;
+  assert(committed <= failed.offset, \`the fold of t-x failed and the worker died, yet group rollup has committed past it (offset \${committed}): the auto-commit timer committed the event while it was still being processed, so it is never redelivered. Turn autoCommit off and commit only after the fold\`);
+}
+
+export async function check_dedupe_first(ctx) {
+  seed(ctx, ['t-1', 1], ['t-1', 1], ['t-2', 5], ['t-1', 1]);
+  const m = ctx.load('rollup');
+  await ctx.drain(m.run());
+  assert.equal(total(ctx), 6, \`tokens t-1 (+1, redelivered twice) and t-2 (+5) must fold to 6, the hash holds \${JSON.stringify(ctx.redis.hgetall(KEY))}\`);
+  assert.equal(ctx.kafka.lag('rollup', TOPIC), 0, 'a skipped duplicate must still be committed, or it is redelivered forever');
+  let ttl = ctx.redis.ttl('seen:t-1');
+  assert(86400 - 60 <= ttl && ttl <= 86400, \`seen:t-1 expires in \${ttl} s, expected SEEN_TTL_S (86400): the claim must outlive any client retry, and not live forever\`);
+  // A redelivery 1000 s later is dropped, and does not extend the claim.
+  ctx.clock.advance(1000);
+  seed(ctx, ['t-1', 1]);
+  await ctx.drain(m.run());
+  assert.equal(total(ctx), 6, \`a redelivery of t-1 1000 s later must be dropped, the hash holds \${JSON.stringify(ctx.redis.hgetall(KEY))}\`);
+  ttl = ctx.redis.ttl('seen:t-1');
+  assert(ttl <= 86400 - 1000 + 5, \`a redelivery of t-1 re-armed its claim to \${ttl} s: the claim lives SEEN_TTL_S from the first time the token was seen\`);
+  ctx.clock.advance(86400 - 1000);
+  assert.equal(ctx.redis.exists('seen:t-1'), 0, 'seen:t-1 must be gone SEEN_TTL_S after it was claimed');
+  // Another rollup replica takes over the partition while this one is mid-event (its session timed out):
+  // it processes the uncommitted t-9 — claim, then fold — at the first moment this worker touches seen:t-9.
+  seed(ctx, ['t-9', 10]);
+  let fired = false;
+  ctx.redisAfter('seen:t-9', () => {
+    fired = true;
+    if (ctx.redis.set('seen:t-9', 1, 'EX', 86400, 'NX') !== null) ctx.redis.hincrby(KEY, String(m.window(TS)), 10);
+  });
+  await ctx.drain(m.run());
+  assert(fired, 'the worker never touched seen:t-9: every event must be claimed under seen:{token} before it is folded');
+  assert.equal(total(ctx), 16, \`t-9 (+10) was redelivered to a second replica right after this worker first touched seen:t-9, and the hash now holds \${total(ctx) - 6} for it instead of 10: claim the token atomically (SET NX) before folding, so whoever loses the claim skips the event\`);
+}
+
+export async function check_hincrby_window(ctx) {
+  seed(ctx, ['t-1', 1], ['t-2', 2], ['t-3', 4, NEXT_MINUTE_TS], ['t-4', -1, NEXT_MINUTE_TS]);
+  ctx.kafka.seed(TOPIC, {key: 'plays:the-crown', value: JSON.stringify({ns: 'plays', name: 'the-crown', delta: 7, token: 't-5', ts: TS})});
+  const m = ctx.load('rollup');
+  await ctx.drain(m.run());
+  assert.equal(ctx.redis.type(KEY), 'hash', \`\${KEY} is \${JSON.stringify(ctx.redis.type(KEY))}, expected a hash (keys: \${JSON.stringify(ctx.redis.keys('*'))})\`);
+  const first = String(m.window(TS));
+  const second = String(m.window(NEXT_MINUTE_TS));
+  assert.deepEqual(ctx.redis.hgetall(KEY), {[first]: '3', [second]: '3'}, \`expected one field per minute bucket {\${first}: 3, \${second}: 3}, got \${JSON.stringify(ctx.redis.hgetall(KEY))}\`);
+  assert.deepEqual(ctx.redis.hgetall('rollup:plays:the-crown'), {[first]: '7'}, \`each counter has its own hash, rollup:plays:the-crown holds \${JSON.stringify(ctx.redis.hgetall('rollup:plays:the-crown'))}\`);
+}
+
+export async function check_commit_after(ctx) {
+  seed(ctx, ['t-1', 1], ['t-2', 2]);
+  const [first, second] = ctx.kafka.records(TOPIC);
+  const atCommit = foldedAtCommits(ctx);
+  const m = ctx.load('rollup');
+  await ctx.drain(m.run());
+  assert(atCommit.length > 0, 'no offset was ever committed by group rollup');
+  for (const [record, expected, label] of [[first, 1, 't-1 (+1)'], [second, 3, 't-2 (+2)']] as const) {
+    const covering = atCommit.filter(c => (c.offsets.get(\`\${TOPIC}|\${record.partition}\`) ?? 0) > record.offset).map(c => c.total);
+    assert(covering.length > 0, \`the \${label} event was never committed\`);
+    assert.equal(covering[0], expected, \`the commit must come after the fold: when \${label} was committed the hash held \${covering[0]}, expected \${expected}\`);
+  }
+  // Records the worker skips are committed too — even when nothing follows them to commit past them.
+  ctx.kafka.seed(TOPIC, {key: 'plays:stranger-things', value: 'not json'});
+  ctx.kafka.seed(TOPIC, {key: 'plays:stranger-things', value: JSON.stringify({ns: 'plays', name: 'stranger-things'})});
+  await ctx.drain(m.run());
+  let lag = ctx.kafka.lag('rollup', TOPIC);
+  assert.equal(lag, 0, \`\${lag} malformed record(s) left uncommitted: skip them (log) and commit, or they are redelivered forever\`);
+  seed(ctx, ['t-1', 1]);
+  await ctx.drain(m.run());
+  lag = ctx.kafka.lag('rollup', TOPIC);
+  assert.equal(lag, 0, \`the redelivered t-1 was skipped but left uncommitted (\${lag} record(s) of lag): a duplicate is committed too, or it is redelivered forever\`);
+  assert.equal(total(ctx), 3, \`malformed records must not be folded and the duplicate t-1 only once: the hash holds \${JSON.stringify(ctx.redis.hgetall(KEY))}, expected a total of 3\`);
+}
+
+export async function check_get_clear(ctx) {
+  const m = ctx.load('rollup');
+  assert.equal(await m.getCount('plays', 'stranger-things'), 0, 'a counter without events reads as 0');
+  seed(ctx, ['t-1', 3], ['t-2', 4, NEXT_MINUTE_TS], ['t-3', -1, NEXT_MINUTE_TS + 60]);
+  await ctx.drain(m.run());
+  const count = await m.getCount('plays', 'stranger-things');
+  assert.equal(count, 6, \`getCount must sum every minute bucket (3 + 4 - 1 = 6) of \${JSON.stringify(ctx.redis.hgetall(KEY))}, got \${count}\`);
+  assert.equal(typeof count, 'number', 'getCount must return a number');
+  await m.clearCount('plays', 'stranger-things');
+  assert.equal(ctx.redis.exists(KEY), 0, \`clearCount must DEL \${KEY}\`);
+  assert.equal(await m.getCount('plays', 'stranger-things'), 0, 'a cleared counter reads as 0');
+}
 `,
   },
   debrief: `The rollup is where an event log becomes a number, and the two decisions that matter are both about duplicates. The claim comes first because the fold is not idempotent: HINCRBY twice is twice the delta, so the only safe order is claim, fold, commit — at-least-once delivery turned effectively once by a key in Redis. And the hash is bucketed by minute rather than kept as one total because a closed minute is immutable: Netflix's rollup aggregates in time windows for exactly that reason, so it can batch the work of a hot counter, store closed windows durably and cache them, and recompute only the window that is still open. This course keeps every window in one hash; the real pipeline queues counters that changed, aggregates them in a dedicated rollup tier, and persists the result to a rollup store before anyone reads it.`,

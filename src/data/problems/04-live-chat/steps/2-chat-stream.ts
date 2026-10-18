@@ -68,6 +68,9 @@ people say in the room, \`unsubscribe\` undoes it.
             /StatusCode\.(INVALID_ARGUMENT|FAILED_PRECONDITION)/,
           ],
         },
+        typescript: {
+          all: [/\.kind\s*[!=]==?\s*['"]join['"]|\.join\b/, /status\.(INVALID_ARGUMENT|FAILED_PRECONDITION)/],
+        },
         go: {all: [/GetJoin\(\)|ClientMsg_Join\b/, /codes\.(InvalidArgument|FailedPrecondition)/]},
         scala: {all: [/Kind\.Join\(|\.kind\.join/, /Status\.(INVALID_ARGUMENT|FAILED_PRECONDITION)/]},
         cpp: {all: [/has_join\(\)|kJoin\b/, /StatusCode::(INVALID_ARGUMENT|FAILED_PRECONDITION)/]},
@@ -80,6 +83,7 @@ people say in the room, \`unsubscribe\` undoes it.
         'A `say` becomes a `ServerMsg` handed to `publish(room, …)`; the bus, not the handler, delivers it to everyone (including this client).',
       match: {
         python: {all: [/HasField\(\s*"say"\s*\)|WhichOneof\(\s*"kind"\s*\)/, /\bpublish\(\s*room\s*,/]},
+        typescript: {all: [/\.kind\s*[!=]==?\s*['"]say['"]|\.say\b/, /\bpublish\(\s*room\s*,/]},
         go: {all: [/GetSay\(\)|ClientMsg_Say\b/, /\bpublish\(\s*ctx\s*,\s*room\s*,/]},
         scala: {all: [/Kind\.Say\(|\.kind\.say/, /\bpublish\(\s*room\s*,/]},
         cpp: {all: [/has_say\(\)|kSay\b/, /\bpublish\(\s*room\s*,/]},
@@ -91,6 +95,7 @@ people say in the room, \`unsubscribe\` undoes it.
       detail: 'After the join, `subscribe(room)` and write every message it yields to the response stream.',
       match: {
         python: {all: [/\bsubscribe\(\s*room\s*\)/, /context\.write\(/]},
+        typescript: {all: [/\bsubscribe\(\s*room\s*\)/, /call\.write\(/]},
         go: {all: [/\bsubscribe\(\s*room\s*\)/, /stream\.Send\(/]},
         scala: {all: [/\bsubscribe\(\s*room\s*,/, /out\.onNext\(|responseObserver\.onNext\(/]},
         cpp: {all: [/\bsubscribe\(\s*room\s*,/, /stream->Write\(/]},
@@ -103,6 +108,7 @@ people say in the room, \`unsubscribe\` undoes it.
         "Hook the call's cancellation (`add_done_callback`, `ctx.Done()`, `setOnCancelHandler`, `IsCancelled`) and `unsubscribe(room, …)` from it.",
       match: {
         python: {all: [/add_done_callback\(|add_callback\(/, /\bunsubscribe\(\s*room\s*,/]},
+        typescript: {all: [/on\(\s*['"]cancelled['"]/, /\bunsubscribe\(\s*room\s*,/]},
         go: {all: [/ctx\.Done\(\)|Context\(\)\.Done\(\)/, /\bunsubscribe\(\s*room\s*,/]},
         scala: {all: [/setOnCancelHandler\(|isCancelled/, /\bunsubscribe\(\s*room\s*,/]},
         cpp: {all: [/IsCancelled\(\)/, /\bunsubscribe\(\s*room\s*,/]},
@@ -193,6 +199,97 @@ async def serve() -> None:
 
 if __name__ == "__main__":
     asyncio.run(serve())
+`,
+    },
+    typescript: {
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import {type ServerMsg, type Subscription, subscribe, unsubscribe} from 'subscriptions'; // subscribe(room) -> Subscription
+
+import {publish} from './room_bus'; // built in step 3: produce to Kafka
+
+interface ClientMsg {
+  kind?: 'join' | 'say';
+  join?: {room: string; user: string};
+  say?: {text: string};
+}
+
+const chatProto = grpc.loadPackageDefinition(protoLoader.loadSync('chat.proto')) as unknown as {
+  chat: {Chat: {service: grpc.ServiceDefinition}};
+};
+
+/** One bidi stream per client: a join first, then says in and the room's messages out. */
+export function chat(call: grpc.ServerDuplexStream<ClientMsg, ServerMsg>): void {
+  // TODO: the first message must be a join → otherwise end the call with INVALID_ARGUMENT
+  // TODO: subscribe(room); unsubscribe from the call's 'cancelled' (and 'end') hook
+  // TODO: forward everything the subscription yields with call.write on its own loop
+  // TODO: publish(room, {room, user, text, ts}) for every say
+  call.emit('error', {code: grpc.status.UNIMPLEMENTED, details: 'not implemented'});
+}
+
+export function serve(): void {
+  const server = new grpc.Server();
+  server.addService(chatProto.chat.Chat.service, {Chat: chat});
+  server.bindAsync('0.0.0.0:9000', grpc.ServerCredentials.createInsecure(), () => server.start());
+}
+`,
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import {type ServerMsg, type Subscription, subscribe, unsubscribe} from 'subscriptions'; // subscribe(room) -> Subscription
+
+import {publish} from './room_bus'; // built in step 3: produce to Kafka
+
+interface ClientMsg {
+  kind?: 'join' | 'say';
+  join?: {room: string; user: string};
+  say?: {text: string};
+}
+
+const chatProto = grpc.loadPackageDefinition(protoLoader.loadSync('chat.proto')) as unknown as {
+  chat: {Chat: {service: grpc.ServiceDefinition}};
+};
+
+/** Write every message the subscription yields to the client; ends when the subscription is closed. */
+async function forward(sub: Subscription, call: grpc.ServerDuplexStream<ClientMsg, ServerMsg>): Promise<void> {
+  for await (const msg of sub) call.write(msg);
+}
+
+/** One bidi stream per client: a join first, then says in and the room's messages out. */
+export function chat(call: grpc.ServerDuplexStream<ClientMsg, ServerMsg>): void {
+  let room = '';
+  let user = '';
+  let sub: Subscription | null = null;
+  const done = (): void => {
+    if (sub !== null) unsubscribe(room, sub);
+    sub = null;
+  };
+  call.on('cancelled', done); // the client hung up or the connection dropped
+  call.on('end', () => {
+    done(); // the client closed its side normally
+    call.end();
+  });
+  call.on('data', (msg: ClientMsg) => {
+    if (sub === null) {
+      if (msg.kind !== 'join' || msg.join === undefined) {
+        call.emit('error', {code: grpc.status.INVALID_ARGUMENT, details: 'first message must be a join'});
+        return;
+      }
+      ({room, user} = msg.join);
+      sub = subscribe(room);
+      void forward(sub, call);
+      return;
+    }
+    if (msg.kind === 'say' && msg.say !== undefined) {
+      void publish(room, {room, user, text: msg.say.text, ts: Date.now()});
+    }
+  });
+}
+
+export function serve(): void {
+  const server = new grpc.Server();
+  server.addService(chatProto.chat.Chat.service, {Chat: chat});
+  server.bindAsync('0.0.0.0:9000', grpc.ServerCredentials.createInsecure(), () => server.start());
+}
 `,
     },
     go: {
@@ -603,6 +700,143 @@ async def check_cancel_cleanup(ctx):
     await _settle()
     n = subs.subscribers("room-7")
     assert n == 0, f"the client finished its stream but room-7 still has {n} subscription(s): the done callback runs however the call ends"
+`,
+    typescript: `const TOPIC = 'chat-messages';
+
+const join = (room, user) => ({join: {room, user}});
+const say = (text) => ({say: {text}});
+const serverMsg = (user, text, ts = 1) => ({room: 'room-7', user, text, ts});
+const statusName = (ctx, code) => Object.keys(ctx.grpc.status).find(k => ctx.grpc.status[k] === code) ?? String(code);
+
+/** A few turns of the event loop, for writes to reach the handler and the handler to react. */
+async function settle() {
+  for (let i = 0; i < 5; i++) {
+    const {promise, resolve} = Promise.withResolvers();
+    setTimeout(resolve, 0);
+    await promise;
+  }
+}
+
+/** The client side of one stream: what arrived, how it ended, and a read with a (virtual) 1 s patience. */
+function open(client) {
+  const call = client.Chat();
+  const inbox = [];
+  const waiters = [];
+  let status = null;
+  call.on('data', m => {
+    inbox.push(m);
+    waiters.splice(0).forEach(w => w());
+  });
+  call.on('status', s => {
+    status = s;
+    waiters.splice(0).forEach(w => w());
+  });
+  const read = async () => {
+    const started = Date.now();
+    while (inbox.length === 0) {
+      if (status !== null) return null;
+      if (Date.now() - started >= 1000) return null;
+      const {promise, resolve} = Promise.withResolvers();
+      waiters.push(resolve);
+      setTimeout(resolve, 200);
+      await promise;
+    }
+    return inbox.shift();
+  };
+  return {call, read, status: () => status};
+}
+
+/** What the stream handler published: the records on chat-messages, parsed back. */
+const published = ctx => ctx.kafka.records(TOPIC).map(r => [r.key.toString(), JSON.parse(r.value.toString())]);
+
+/** The learner's server, a client on it and the subscription table it shares with the room bus. */
+function start(ctx) {
+  const m = ctx.load('chat_service');
+  const subs = ctx.load('/support/subscriptions.ts');
+  m.serve();
+  const pkg = ctx.proto('chat.proto');
+  const client = new pkg.chat.Chat('chat-server:9000');
+  return {m, client, subs};
+}
+
+async function joined(ctx, room = 'room-7', user = 'ana') {
+  const {client, subs} = start(ctx);
+  const stream = open(client);
+  stream.call.write(join(room, user));
+  await settle();
+  const s = stream.status();
+  assert(s === null, \`the stream ended with \${s === null ? '' : statusName(ctx, s.code)} right after the join\${s !== null && s.code === ctx.grpc.status.UNAVAILABLE ? ' (serve() registered no Chat handler)' : ''}\`);
+  return {stream, subs};
+}
+
+export async function check_join_first(ctx) {
+  const {client, subs} = start(ctx);
+  const stream = open(client);
+  stream.call.write(say('hi'));
+  await settle();
+  const s = stream.status();
+  assert(s !== null, 'a stream whose first message is a say must end with INVALID_ARGUMENT, but it did not fail');
+  assert(s.code !== ctx.grpc.status.UNAVAILABLE, 'serve() registered no Chat handler');
+  assert([ctx.grpc.status.INVALID_ARGUMENT, ctx.grpc.status.FAILED_PRECONDITION].includes(s.code), \`a say before any join ended the call with \${statusName(ctx, s.code)}, expected INVALID_ARGUMENT\`);
+  assert.equal(subs.subscribers('room-7'), 0, 'a rejected first message must not leave a subscription behind');
+  assert.deepEqual(published(ctx), [], \`a rejected first message must not be published, got \${JSON.stringify(published(ctx))}\`);
+  const second = open(client);
+  second.call.write(join('room-7', 'ana'));
+  await settle();
+  assert(second.status() === null, \`a stream that starts with a join must stay open, but it ended with \${second.status() === null ? '' : statusName(ctx, second.status().code)}\`);
+}
+
+export async function check_say_publishes(ctx) {
+  const {stream, subs} = await joined(ctx);
+  stream.call.write(say('hi'));
+  stream.call.write(say('anyone here?'));
+  await settle();
+  const got = published(ctx);
+  assert.equal(got.length, 2, \`two says must publish exactly two messages, got \${got.length}: \${JSON.stringify(got)}\`);
+  ['hi', 'anyone here?'].forEach((text, i) => {
+    const [room, msg] = got[i];
+    assert.equal(room, 'room-7', \`published to room \${JSON.stringify(room)}, expected 'room-7'\`);
+    assert.deepEqual([msg.room, msg.user, msg.text], ['room-7', 'ana', text], \`published ServerMsg is \${JSON.stringify(msg)}, expected room 'room-7' user 'ana' text \${JSON.stringify(text)}\`);
+    assert(Math.abs(Number(msg.ts) - Date.now()) < 60000, \`ServerMsg.ts is \${JSON.stringify(msg.ts)}, expected the current time in milliseconds\`);
+  });
+  // Nothing is written back directly: the first thing this client reads is what the bus delivers.
+  subs.localDeliver('room-7', serverMsg('bo', 'hello ana'));
+  const got1 = await stream.read();
+  assert(got1 !== null, 'nothing reached the client after the bus delivered a message');
+  assert.deepEqual([got1.user, got1.text], ['bo', 'hello ana'], \`the client received \${JSON.stringify(got1)} before anything came from the bus: a say reaches its sender through publish, never through a direct write\`);
+}
+
+export async function check_subscribe_forward(ctx) {
+  const {stream, subs} = await joined(ctx);
+  const n = subs.subscribers('room-7');
+  assert.equal(n, 1, \`after the join, room-7 has \${n} subscription(s) on this instance, expected 1 (subscribe(room))\`);
+  subs.localDeliver('room-7', serverMsg('bo', 'hello ana', 1));
+  subs.localDeliver('room-7', serverMsg('cy', 'hi both', 2));
+  const first = await stream.read();
+  const second = await stream.read();
+  assert(first !== null && second !== null, \`the client received \${first === null ? 'nothing' : 'one message'} after the bus delivered two: forward every message the subscription yields\`);
+  assert.deepEqual([first.user, first.text], ['bo', 'hello ana'], \`first forwarded message is \${JSON.stringify(first)}, expected bo: 'hello ana'\`);
+  assert.deepEqual([second.user, second.text], ['cy', 'hi both'], \`second forwarded message is \${JSON.stringify(second)}, expected cy: 'hi both' (forward in order)\`);
+  assert.deepEqual(published(ctx), [], 'forwarding bus messages must not publish them again');
+}
+
+export async function check_cancel_cleanup(ctx) {
+  const {stream, subs} = await joined(ctx);
+  assert.equal(subs.subscribers('room-7'), 1, \`after the join, room-7 has \${subs.subscribers('room-7')} subscription(s), expected 1\`);
+  stream.call.cancel();
+  await settle();
+  let n = subs.subscribers('room-7');
+  assert.equal(n, 0, \`the client hung up but room-7 still has \${n} subscription(s) on this instance: unsubscribe from the call's cancelled hook\`);
+  // A client that closes its side normally must be cleaned up the same way.
+  const {client} = start(ctx);
+  const second = open(client);
+  second.call.write(join('room-7', 'bo'));
+  await settle();
+  second.call.end();
+  await settle();
+  n = subs.subscribers('room-7');
+  assert.equal(n, 0, \`the client finished its stream but room-7 still has \${n} subscription(s): clean up however the call ends\`);
+}
 `,
   },
   debrief: `A bidi stream is two independent half-duplex streams over one HTTP/2 stream, which is why the handler splits into a reader and a writer. The join-first rule turns a stateless RPC into a session with a validated first message, and the cancellation hook is what makes long-lived calls safe: every resource acquired for the call is released by the call's end, whatever caused it. Real chat gateways add flow control (drop or coalesce when a slow client cannot keep up), keep-alive pings, and resume tokens so a reconnecting client asks for "everything since sequence N" instead of rejoining blind.`,

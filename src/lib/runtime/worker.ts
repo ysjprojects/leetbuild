@@ -8,14 +8,8 @@ import type {PyodideInterface} from 'pyodide';
 
 import {createDbBridge} from './db';
 import {luaEval} from './lua';
-import {type BootPhase, type RunJob, type RunResult, bootPython, PYODIDE_INDEX_URL, runPython} from './python';
-
-export type WorkerIn = {type: 'boot'} | {type: 'run'; id: number; job: RunJob};
-export type WorkerOut =
-  | {type: 'phase'; phase: BootPhase}
-  | {type: 'ready'}
-  | {type: 'boot-failed'; message: string}
-  | {type: 'result'; id: number; result: RunResult};
+import {bootPython, PYODIDE_INDEX_URL, runPython} from './python';
+import type {WorkerIn, WorkerOut} from './types';
 
 /** Both come from the CDN at run time: they locate their own .wasm/.data next to their module URL. */
 const PYODIDE_MODULE_URL = `${PYODIDE_INDEX_URL}pyodide.mjs`;

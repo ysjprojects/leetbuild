@@ -4,8 +4,9 @@
  *   yarn protogen src/data/problems/00-image-cache     # compiles proto/*.proto → proto.ts
  *
  * `proto.ts` exports `protoModules`, a map of `<name>_pb2.py` / `<name>_pb2_grpc.py` to source,
- * which the course's `index.ts` puts in `support.python`. Needs `grpcio-tools==1.81.0` (its
- * gencode targets protobuf 6.33, which Pyodide's protobuf 7.34 runtime accepts):
+ * which the course's `index.ts` puts in `support.python`, and `protoFiles`, the .proto sources
+ * themselves for `support.typescript`. Needs `grpcio-tools==1.81.0` (its gencode targets protobuf
+ * 6.33, which Pyodide's protobuf 7.34 runtime accepts):
  *
  *   python3 -m pip install grpcio-tools==1.81.0
  */
@@ -34,9 +35,12 @@ try {
   );
   const modules: Record<string, string> = {};
   for (const file of readdirSync(out).sort()) modules[file] = readFileSync(join(out, file), 'utf8');
-  const entries = Object.entries(modules)
-    .map(([name, source]) => `  ${JSON.stringify(name)}: ${JSON.stringify(source)},`)
-    .join('\n');
+  const files: Record<string, string> = {};
+  for (const file of protos.sort()) files[file] = readFileSync(join(protoDir, file), 'utf8');
+  const record = (map: Record<string, string>): string =>
+    Object.entries(map)
+      .map(([name, source]) => `  ${JSON.stringify(name)}: ${JSON.stringify(source)},`)
+      .join('\n');
   const target = resolve(course, 'proto.ts');
   writeFileSync(
     target,
@@ -44,9 +48,11 @@ try {
       .map(p => `proto/${basename(p)}`)
       .join(', ')}. DO NOT EDIT.\n\n` +
       `/** Python modules compiled from this course's .proto files, for its runtime support. */\n` +
-      `export const protoModules: Record<string, string> = {\n${entries}\n};\n`,
+      `export const protoModules: Record<string, string> = {\n${record(modules)}\n};\n\n` +
+      `/** The .proto files themselves, which the TypeScript runtime's proto-loader parses at run time. */\n` +
+      `export const protoFiles: Record<string, string> = {\n${record(files)}\n};\n`,
   );
-  console.log(`${target}: ${Object.keys(modules).join(', ')}`);
+  console.log(`${target}: ${Object.keys(modules).join(', ')} + ${Object.keys(files).join(', ')}`);
 } finally {
   rmSync(out, {recursive: true, force: true});
 }

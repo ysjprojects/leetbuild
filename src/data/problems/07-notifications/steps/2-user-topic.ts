@@ -49,6 +49,7 @@ returns.
         '`acks=all` means a leader failover cannot lose an acknowledged record; the idempotent producer means client-side retries cannot duplicate one. (kafka-go: `RequiredAcks: kafka.RequireAll`.)',
       match: {
         python: {all: [/"acks"\s*:\s*"all"/, /"enable\.idempotence"\s*:\s*True/]},
+        typescript: {all: [/acks:\s*-1/, /idempotent:\s*true/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
         scala: {all: [/"acks"\s*,\s*"all"/, /"enable\.idempotence"\s*,\s*"true"/]},
         cpp: {all: [/"acks"\s*,\s*"all"/, /"enable\.idempotence"\s*,\s*"true"/]},
@@ -61,6 +62,7 @@ returns.
         'The record key is the user id so all of one user’s notifications share a partition and keep their order.',
       match: {
         python: {all: [/producer\.produce\(/, /key\s*=\s*notification\[["']user_id["']\]/]},
+        typescript: {all: [/producer\.send\(/, /key:\s*notification\.user_id/]},
         go: {all: [/writer\.WriteMessages\(/, /Key:\s*\[\]byte\(\s*\w+\.UserID\s*\)/]},
         scala: {all: [/producer\.send\(/, /new ProducerRecord\[[^\]]*\]\(\s*Topic\s*,\s*\w+\.userId\s*,/]},
         cpp: {all: [/producer->produce\(/, /(\w+)\.user_id\.(c_str|data)\(\)\s*,\s*\1\.user_id\.(size|length)\(\)/]},
@@ -73,6 +75,7 @@ returns.
         'A `priority` header lets the consumer route high-priority notifications without deserialising the value.',
       match: {
         python: {all: [/headers\s*=\s*[^\n]*["']priority["']/]},
+        typescript: {all: [/headers:\s*\{[^\n]*priority/]},
         go: {all: [/kafka\.Header\{\{?\s*Key:\s*"priority"/]},
         scala: {all: [/headers\(\)\.add\(\s*"priority"|new RecordHeader\(\s*"priority"/]},
         cpp: {all: [/->add\(\s*"priority"/]},
@@ -85,6 +88,7 @@ returns.
         'The request path blocks until the broker acknowledged the record, bounded by a 2 s timeout — the 202 is only true once the record is in Kafka.',
       match: {
         python: {all: [/producer\.flush\(\s*(timeout\s*=\s*)?(ACK_TIMEOUT_S|2(\.0)?)\s*\)/]},
+        typescript: {all: [/timeout:\s*(ACK_TIMEOUT_MS|2000)\b/]},
         go: {all: [/context\.WithTimeout\(\s*\w+\s*,\s*(ackTimeout|2\s*\*\s*time\.Second)\s*\)/]},
         scala: {all: [/\.get\(\s*(AckTimeoutMillis|2000L?)\s*,\s*TimeUnit\.MILLISECONDS\s*\)/]},
         cpp: {all: [/producer->flush\(\s*(kAckTimeoutMs|2000)\s*\)/]},
@@ -97,6 +101,7 @@ returns.
         'A timeout or a delivery error must surface as an exception/error from `enqueue`; swallowing it would let the API promise a notification nobody will send.',
       match: {
         python: {all: [/raise BusUnavailable\(/]},
+        typescript: {all: [/throw new BusUnavailable\(/]},
         go: {all: [/(?<!var )ErrBusUnavailable\b/]},
         scala: {all: [/throw new BusUnavailable\(/]},
         cpp: {all: [/throw BusUnavailable\(/]},
@@ -163,6 +168,72 @@ def enqueue(notification: dict) -> None:
     remaining = producer.flush(ACK_TIMEOUT_S)
     if remaining or not outcome or outcome[0] is not None:
         raise BusUnavailable(f"no ack for {notification['id']} within {ACK_TIMEOUT_S}s: {outcome[:1]}")
+`,
+    },
+    typescript: {
+      starter: `import {Kafka} from 'kafkajs';
+
+export const TOPIC = 'notifications';
+export const ACK_TIMEOUT_MS = 2000;
+
+export interface Notification {
+  id: string;
+  user_id: string;
+  channel: string;
+  title: string;
+  body: string;
+  priority: string;
+}
+
+const kafka = new Kafka({clientId: 'notify-api', brokers: ['kafka:9092']});
+// TODO: the idempotent producer (acks all is then mandatory)
+export const producer = kafka.producer();
+
+/** The broker did not acknowledge in time; the API turns this into a 503. */
+export class BusUnavailable extends Error {}
+
+export async function enqueue(notification: Notification): Promise<void> {
+  await producer.connect();
+  const value = JSON.stringify(notification);
+  // TODO: send to TOPIC keyed by user_id, with a priority header, acks all and a timeout of ACK_TIMEOUT_MS
+  // TODO: the send rejects (timeout or delivery error) → throw BusUnavailable
+  throw new Error('not implemented');
+}
+`,
+      solution: `import {Kafka} from 'kafkajs';
+
+export const TOPIC = 'notifications';
+export const ACK_TIMEOUT_MS = 2000;
+
+export interface Notification {
+  id: string;
+  user_id: string;
+  channel: string;
+  title: string;
+  body: string;
+  priority: string;
+}
+
+const kafka = new Kafka({clientId: 'notify-api', brokers: ['kafka:9092']});
+export const producer = kafka.producer({idempotent: true});
+
+/** The broker did not acknowledge in time; the API turns this into a 503. */
+export class BusUnavailable extends Error {}
+
+export async function enqueue(notification: Notification): Promise<void> {
+  await producer.connect();
+  const value = JSON.stringify(notification);
+  try {
+    await producer.send({
+      topic: TOPIC,
+      acks: -1,
+      timeout: ACK_TIMEOUT_MS,
+      messages: [{key: notification.user_id, value, headers: {priority: notification.priority}}],
+    });
+  } catch (e) {
+    throw new BusUnavailable(\`no ack for \${notification.id} within \${ACK_TIMEOUT_MS} ms: \${(e as Error).message}\`);
+  }
+}
 `,
     },
     go: {
@@ -520,6 +591,96 @@ def check_fail_loud(ctx):
         raise AssertionError("no acknowledgement within the timeout must raise BusUnavailable, enqueue returned normally")
     except m.BusUnavailable:
         pass
+`,
+    typescript: `function notification(id: string, userId: string, priority = 'normal') {
+  return {id, user_id: userId, channel: 'push', title: 'Shipped', body: 'On its way', priority};
+}
+
+function bus(ctx) {
+  return ctx.load('notification_bus');
+}
+
+function header(record, name: string): string | null {
+  const value = record.headers?.[name];
+  return value === undefined ? null : Buffer.from(value).toString();
+}
+
+function ids(ctx): string[] {
+  return ctx.kafka.values('notifications').map((v: string) => JSON.parse(v).id);
+}
+
+/** The error a promise rejected with, or null when it resolved. */
+async function thrown(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise;
+    return null;
+  } catch (e) {
+    return e;
+  }
+}
+
+export async function check_durable_producer(ctx) {
+  const m = bus(ctx);
+  await m.enqueue(notification('n1', 'u42'));
+  ctx.kafka.failover('notifications');
+  assert.equal(ctx.kafka.records('notifications').length, 1, 'enqueue returned (the API answered 202), then the partition leader failed and notifications is empty: the record had been acknowledged by the leader alone. The producer must wait for every in-sync replica (acks all)');
+  ctx.kafka.loseAcks('notifications');
+  await m.enqueue(notification('n2', 'u42'));
+  assert.deepEqual(ids(ctx), ['n1', 'n2'], \`the acknowledgement of n2 was lost and the producer retried: notifications holds \${JSON.stringify(ids(ctx))}, expected n1 and n2 once each — enable the idempotent producer\`);
+}
+
+export async function check_keyed(ctx) {
+  const m = bus(ctx);
+  await m.enqueue(notification('n1', 'u42'));
+  await m.enqueue(notification('n2', 'u42'));
+  await m.enqueue(notification('n3', 'u7'));
+  const produced = ctx.kafka.records('notifications');
+  assert.equal(produced.length, 3, \`expected 3 records on notifications, found \${produced.length}\`);
+  assert.deepEqual(ctx.kafka.keys('notifications'), ['u42', 'u42', 'u7'], \`records must be keyed by the user id, got \${JSON.stringify(ctx.kafka.keys('notifications'))}\`);
+  assert.equal(produced[0].partition, produced[1].partition, "one user's notifications must share a partition");
+  assert.equal(JSON.parse(Buffer.from(produced[0].value).toString()).id, 'n1', \`the value must be the notification as JSON, got \${JSON.stringify(Buffer.from(produced[0].value).toString())}\`);
+}
+
+export async function check_priority_header(ctx) {
+  const m = bus(ctx);
+  await m.enqueue(notification('n1', 'u42', 'high'));
+  await m.enqueue(notification('n2', 'u42', 'normal'));
+  const produced = ctx.kafka.records('notifications');
+  assert.equal(produced.length, 2, \`expected 2 records on notifications, found \${produced.length}\`);
+  assert.equal(header(produced[0], 'priority'), 'high', \`the first record must carry a priority=high header, headers were \${JSON.stringify(Object.keys(produced[0].headers))}\`);
+  assert.equal(header(produced[1], 'priority'), 'normal', \`the second record must carry a priority=normal header, headers were \${JSON.stringify(Object.keys(produced[1].headers))}\`);
+}
+
+export async function check_wait_ack(ctx) {
+  const m = bus(ctx);
+  await m.enqueue(notification('n1', 'u42'));
+  assert.equal(ctx.kafka.records('notifications').length, 1, 'the record must be in Kafka when enqueue returns');
+  ctx.kafka.stall('notifications', 1); // the broker is slow but answers within the timeout
+  const slow = await thrown(m.enqueue(notification('n2', 'u42')));
+  assert.equal(slow, null, \`the broker acknowledged after 1 s, within the 2 s wait, yet enqueue threw: \${slow}\`);
+  assert.equal(ctx.kafka.records('notifications').length, 2, 'the record must be in Kafka when enqueue returns');
+  ctx.kafka.stall('notifications'); // the broker is down for good
+  const started = ctx.clock.now();
+  const down = await thrown(m.enqueue(notification('n3', 'u42')));
+  const waited = (ctx.clock.now() - started) / 1000;
+  assert(down !== null, 'the broker never acknowledged, yet enqueue returned normally: the 202 was promised before the record was in Kafka');
+  assert(1 <= waited && waited <= 2.5, \`the acknowledgement wait must be bounded by about 2 s, enqueue gave up after \${waited} s\`);
+}
+
+export async function check_fail_loud(ctx) {
+  const m = bus(ctx);
+  ctx.kafka.failNext('notifications');
+  const failed = await thrown(m.enqueue(notification('n1', 'u42')));
+  assert(failed !== null, 'a delivery error must throw BusUnavailable, enqueue returned normally');
+  assert(failed instanceof m.BusUnavailable, \`a delivery error must throw BusUnavailable, got \${failed}\`);
+  assert.deepEqual(ctx.kafka.records('notifications'), [], 'the failed record must not be in the topic');
+  await m.enqueue(notification('n2', 'u42'));
+  assert.equal(ctx.kafka.records('notifications').length, 1, 'after the failure a new enqueue must work');
+  ctx.kafka.stall('notifications'); // no acknowledgement arrives before the timeout
+  const timedOut = await thrown(m.enqueue(notification('n3', 'u42')));
+  assert(timedOut !== null, 'no acknowledgement within the timeout must throw BusUnavailable, enqueue returned normally');
+  assert(timedOut instanceof m.BusUnavailable, \`no acknowledgement within the timeout must throw BusUnavailable, got \${timedOut}\`);
+}
 `,
   },
   debrief: `Same key → same partition → same order is the only ordering Kafka gives you, and keying by user is exactly the order a user notices. \`acks=all\` plus the idempotent producer make the acknowledged record durable *and* unique across the client's own retries; waiting for that ack is what gives the 202 its meaning. Real producers keep one future per record instead of flushing the whole buffer (so one slow partition does not stall unrelated requests), and set \`delivery.timeout.ms\` so the client's retries and the caller's deadline agree.`,

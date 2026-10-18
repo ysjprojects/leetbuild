@@ -61,6 +61,13 @@ next step): it hands the notification to Kafka and raises when the broker did no
         python: {
           all: [/not in CHANNELS|in CHANNELS/, /not in PRIORITIES|in PRIORITIES/, /status_code\s*=\s*400|HTTP_400/],
         },
+        typescript: {
+          all: [
+            /CHANNELS\.includes\(/,
+            /PRIORITIES\.includes\(/,
+            /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/,
+          ],
+        },
         go: {all: [/channels\[/, /priorities\[/, /http\.StatusBadRequest|\b400\b/]},
         scala: {
           all: [
@@ -79,6 +86,7 @@ next step): it hands the notification to Kafka and raises when the broker did no
         'Read the `Idempotency-Key` header and answer `400 Bad Request` when it is missing; without it the API cannot promise to dedupe anything.',
       match: {
         python: {all: [/idempotency-key/i, /status_code\s*=\s*400|HTTP_400/]},
+        typescript: {all: [/idempotency-key/i, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/]},
         go: {all: [/Idempotency-Key/i, /http\.StatusBadRequest|\b400\b/]},
         scala: {all: [/Idempotency-Key/i, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/Idempotency-Key/i, /status\s*=\s*400/]},
@@ -95,6 +103,13 @@ next step): it hands the notification to Kafka and raises when the broker did no
             /f["']idem:\{/,
             /\.set\(\s*\w+\s*,\s*[^,\n]+,[^\n]*nx\s*=\s*True/,
             /\.set\(\s*\w+\s*,\s*[^,\n]+,[^\n]*ex\s*=\s*(IDEM_TTL_S|86400)/,
+          ],
+        },
+        typescript: {
+          all: [
+            /`idem:\$\{/,
+            /\.set\(\s*\w+\s*,\s*[^,\n]+,[^\n]*['"]NX['"]/,
+            /\.set\(\s*\w+\s*,\s*[^,\n]+,[^\n]*['"]EX['"]\s*,\s*(IDEM_TTL_S|86400)\b/,
           ],
         },
         go: {
@@ -125,6 +140,7 @@ next step): it hands the notification to Kafka and raises when the broker did no
         'When the SET is refused, GET the id stored under the key and answer `200` with it; the notification is not enqueued a second time.',
       match: {
         python: {all: [/\br\.get\(/, /status_code\s*=\s*200/]},
+        typescript: {all: [/\bredis\.get\(/, /code\(\s*200\s*\)|status\(\s*200\s*\)/]},
         go: {all: [/rdb\.Get\(/, /http\.StatusOK|\b200\b/]},
         scala: {all: [/jedis\.get\(/, /StatusCodes\.OK|\b200\b/]},
         cpp: {all: [/redis\.get\(/, /status\s*=\s*200/]},
@@ -137,6 +153,7 @@ next step): it hands the notification to Kafka and raises when the broker did no
         'Only after the key is claimed does the notification go to `enqueue`, and the answer is `202 Accepted` — it is queued, not delivered.',
       match: {
         python: {order: [/\.set\([^\n]*nx\s*=\s*True/, /(?<!def )enqueue\(/, /status_code\s*=\s*202/]},
+        typescript: {order: [/\.set\([^\n]*['"]NX['"]/, /\benqueue\(/, /code\(\s*202\s*\)|status\(\s*202\s*\)/]},
         go: {order: [/rdb\.SetNX\(/, /(?<!func )enqueue\(/, /http\.StatusAccepted|\b202\b/]},
         scala: {order: [/\.nx\(\)/, /(?<!def )enqueue\(/, /StatusCodes\.Accepted|\b202\b/]},
         cpp: {order: [/UpdateType::NOT_EXIST/, /(?<!void )enqueue\(/, /status\s*=\s*202/]},
@@ -237,6 +254,90 @@ def notify(notification: Notification, request: Request) -> JSONResponse:
 
 
 # uvicorn notify_api:app --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem
+`,
+    },
+    typescript: {
+      starter: `import {randomUUID} from 'node:crypto';
+
+import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {type Notification, enqueue} from './notification_bus'; // step 2 — provided: throws when the broker did not ack
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const CHANNELS: readonly string[] = ['push', 'sms', 'email'];
+export const PRIORITIES: readonly string[] = ['high', 'normal'];
+export const IDEM_TTL_S = 86400;
+
+app.post('/notifications', async (request, reply) => {
+  const body = (request.body ?? {}) as Partial<Notification>;
+  const notification: Notification = {
+    id: '',
+    user_id: body.user_id ?? '',
+    channel: body.channel ?? '',
+    title: body.title ?? '',
+    body: body.body ?? '',
+    priority: body.priority ?? 'normal',
+  };
+  // TODO: 400 unless CHANNELS includes channel, PRIORITIES includes priority, user_id and title present
+  // TODO: 400 when the Idempotency-Key header is missing
+  // TODO: mint an id (randomUUID); SET idem:{key} id EX IDEM_TTL_S NX; refused → 200 with the stored id
+  // TODO: enqueue(notification) (DEL the key and answer 503 when it throws), then 202 {id}
+  return reply.code(501).send();
+});
+
+// node notify_api.js — listens on :8443 behind the TLS terminator
+`,
+      solution: `import {randomUUID} from 'node:crypto';
+
+import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {type Notification, enqueue} from './notification_bus'; // step 2 — provided: throws when the broker did not ack
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const CHANNELS: readonly string[] = ['push', 'sms', 'email'];
+export const PRIORITIES: readonly string[] = ['high', 'normal'];
+export const IDEM_TTL_S = 86400;
+
+app.post('/notifications', async (request, reply) => {
+  const body = (request.body ?? {}) as Partial<Notification>;
+  const notification: Notification = {
+    id: '',
+    user_id: body.user_id ?? '',
+    channel: body.channel ?? '',
+    title: body.title ?? '',
+    body: body.body ?? '',
+    priority: body.priority ?? 'normal',
+  };
+  if (!CHANNELS.includes(notification.channel) || !PRIORITIES.includes(notification.priority))
+    return reply.code(400).send({error: 'unknown channel or priority'});
+  if (!notification.user_id || !notification.title)
+    return reply.code(400).send({error: 'user_id and title are required'});
+  const idemKey = request.headers['idempotency-key'];
+  if (typeof idemKey !== 'string' || idemKey === '')
+    return reply.code(400).send({error: 'Idempotency-Key header is required'});
+  const key = \`idem:\${idemKey}\`;
+  notification.id = randomUUID();
+  const claimed = await redis.set(key, notification.id, 'EX', IDEM_TTL_S, 'NX');
+  if (claimed === null) {
+    const stored = await redis.get(key);
+    return reply.code(200).send({id: stored});
+  }
+  try {
+    await enqueue(notification);
+  } catch {
+    await redis.del(key); // the retry must be allowed to enqueue again
+    return reply.code(503).send({error: 'notification bus unavailable'});
+  }
+  return reply.code(202).send({id: notification.id});
+});
+
+// node notify_api.js — listens on :8443 behind the TLS terminator
 `,
     },
     go: {
@@ -726,6 +827,100 @@ async def check_accepted(ctx):
         r = await _post(c, key="k2")
         assert r.status_code == 202, f"the retry after a 503 answered {r.status_code}, expected 202"
         assert len(m.enqueued) == 2, "the retry after a 503 must enqueue the notification"
+`,
+    typescript: `const BODY = {user_id: 'u42', channel: 'push', title: 'Shipped', body: 'Your order is on its way', priority: 'normal'};
+
+/** The API with the real bus of step 2 behind it: what it enqueued is what the notifications topic holds. */
+function api(ctx) {
+  const m = ctx.load('notify_api');
+  return {m, c: ctx.client(m.app)};
+}
+
+function enqueued(ctx): Record<string, string>[] {
+  return ctx.kafka.values('notifications').map((v: string) => JSON.parse(v));
+}
+
+function post(c, body: Record<string, string> | null = null, key: string | null = 'k1') {
+  const headers = key === null ? {} : {'Idempotency-Key': key};
+  return c.post('/notifications', {json: body ?? BODY, headers});
+}
+
+export async function check_validate(ctx) {
+  const {c} = api(ctx);
+  const bad: [string, Record<string, string>][] = [
+    ['channel', {...BODY, channel: 'fax'}],
+    ['priority', {...BODY, priority: 'urgent'}],
+    ['user_id', {...BODY, user_id: ''}],
+    ['title', {...BODY, title: ''}],
+  ];
+  for (const [field, body] of bad) {
+    const r = await post(c, body, \`k-\${field}\`);
+    assert.equal(r.status, 400, \`an invalid \${field} answered \${r.status}, expected 400\`);
+  }
+  assert.deepEqual(ctx.redis.keys('idem:*'), [], \`a rejected request must not claim an idempotency key, found \${JSON.stringify(ctx.redis.keys('idem:*'))}\`);
+  assert.deepEqual(enqueued(ctx), [], 'a rejected request must not be enqueued');
+  const r = await post(c, {...BODY, channel: 'email', priority: 'high'}, 'k-ok');
+  assert.equal(r.status, 202, \`a valid request answered \${r.status}, expected 202\`);
+}
+
+export async function check_header_required(ctx) {
+  const {c} = api(ctx);
+  let r = await post(c, null, null);
+  assert.equal(r.status, 400, \`a request without Idempotency-Key answered \${r.status}, expected 400\`);
+  assert.deepEqual(enqueued(ctx), [], 'a request without Idempotency-Key must not be enqueued');
+  assert.deepEqual(ctx.redis.keys('idem:*'), [], 'a request without Idempotency-Key must not claim a key');
+  r = await post(c, null, 'k1');
+  assert.equal(r.status, 202, \`with the header the same request answered \${r.status}, expected 202\`);
+}
+
+export async function check_reserve_nx(ctx) {
+  const {c} = api(ctx);
+  ctx.redis.set('idem:k-taken', 'n-earlier');
+  let r = await post(c, null, 'k1');
+  assert.equal(r.status, 202, \`POST answered \${r.status}, expected 202\`);
+  const stored = ctx.redis.get('idem:k1');
+  assert(stored !== null, 'idem:k1 must be claimed in Redis');
+  assert.equal(stored, r.json().id, \`idem:k1 holds \${JSON.stringify(stored)} but the answer was \${r.text}: the stored value must be the id\`);
+  const ttl = ctx.redis.ttl('idem:k1');
+  assert(86000 <= ttl && ttl <= 86400, \`idem:k1 must expire after 86400 s, TTL is \${ttl}\`);
+  r = await post(c, null, 'k-taken');
+  assert.notEqual(r.status, 202, 'a key that already exists must not be claimed again');
+  assert.equal(ctx.redis.get('idem:k-taken'), 'n-earlier', 'SET without NX overwrote the id stored under an existing key');
+  assert.equal(ctx.redis.ttl('idem:k-taken'), -1, "a refused SET NX must not touch the existing key's expiry");
+}
+
+export async function check_replay(ctx) {
+  const {c} = api(ctx);
+  ctx.redis.set('idem:k-old', 'n-stored');
+  const first = await post(c, null, 'k1');
+  assert.equal(first.status, 202, \`first POST answered \${first.status}, expected 202\`);
+  const again = await post(c, null, 'k1');
+  assert.equal(again.status, 200, \`a retry with the same key answered \${again.status}, expected 200\`);
+  assert.equal(again.json().id, first.json().id, \`the replay answered \${again.text}, expected the original id \${first.text}\`);
+  assert.equal(enqueued(ctx).length, 1, \`enqueue ran \${enqueued(ctx).length} times for one key, expected once\`);
+  const old = await post(c, null, 'k-old');
+  assert(old.status === 200 && old.json().id === 'n-stored', \`a key stored earlier must replay its id with 200, got \${old.status} \${old.text}\`);
+  assert.equal(enqueued(ctx).length, 1, 'a replay must not enqueue again');
+}
+
+export async function check_accepted(ctx) {
+  const {c} = api(ctx);
+  let r = await post(c, null, 'k1');
+  assert.equal(r.status, 202, \`POST answered \${r.status}, expected 202 Accepted\`);
+  const nid = r.json().id;
+  assert(nid, \`the 202 body must carry the id, got \${r.text}\`);
+  assert.equal(enqueued(ctx).length, 1, \`enqueue ran \${enqueued(ctx).length} times, expected once\`);
+  const sent = enqueued(ctx)[0];
+  assert(sent.user_id === 'u42' && sent.id === nid, \`enqueue received \${JSON.stringify(sent)}: expected the notification with its minted id \${JSON.stringify(nid)}\`);
+  assert.equal(ctx.redis.get('idem:k1'), nid, 'the key must be claimed before enqueue runs, holding the id that was enqueued');
+  ctx.kafka.failNext('notifications'); // the broker does not acknowledge the next record
+  r = await post(c, null, 'k2');
+  assert.equal(r.status, 503, \`a failed enqueue answered \${r.status}, expected 503\`);
+  assert.equal(ctx.redis.exists('idem:k2'), 0, 'a failed enqueue must release idem:k2 so the retry can enqueue again');
+  r = await post(c, null, 'k2');
+  assert.equal(r.status, 202, \`the retry after a 503 answered \${r.status}, expected 202\`);
+  assert.equal(enqueued(ctx).length, 2, 'the retry after a 503 must enqueue the notification');
+}
 `,
   },
   debrief: `The intake endpoint is where "at least once" from the network becomes "at most once" into the system: the atomic \`SET NX EX\` is both the check and the claim, the stored id makes the replay identical, and releasing the key on a failed enqueue keeps the promise honest. The 202 matters too — the API answers as soon as Kafka has the record, so a slow push provider never slows the services calling it. Real intake APIs also fingerprint the body (same key, different payload → 422) and scope keys per caller so two teams cannot collide on \`order-123\`.`,

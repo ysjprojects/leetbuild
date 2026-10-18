@@ -75,6 +75,13 @@ and the two endpoints that read what it keeps. \`history_key(x, y)\` is provided
             /"enable\.auto\.commit"\s*:\s*False/,
           ],
         },
+        typescript: {
+          all: [
+            /groupId:\s*['"]leaderboard['"]/,
+            /subscribe\(\s*\{[^\n]*topic:\s*['"]placements['"]/,
+            /autoCommit:\s*false/,
+          ],
+        },
         go: {
           all: [/GroupID:\s*"leaderboard"/, /Topic:\s*"placements"/, /reader\.FetchMessage\(/],
           none: [/ReadMessage\(/],
@@ -101,6 +108,7 @@ and the two endpoints that read what it keeps. \`history_key(x, y)\` is provided
       detail: 'Each record is `ZINCRBY place:leaders 1 user` — atomic in Redis, and the set stays sorted by count.',
       match: {
         python: {all: [/\br\.zincrby\(\s*LEADERS_KEY\s*,\s*1(\.0)?\s*,/]},
+        typescript: {all: [/\bredis\.zincrby\(\s*LEADERS_KEY\s*,\s*1\s*,/]},
         go: {all: [/rdb\.ZIncrBy\(\s*ctx\s*,\s*leadersKey\s*,\s*1(\.0)?\s*,/]},
         scala: {all: [/jedis\.zincrby\(\s*LeadersKey\s*,\s*1(\.0|d)?\s*,/]},
         cpp: {all: [/redis\.zincrby\(\s*kLeadersKey\s*,\s*1(\.0)?\s*,/]},
@@ -117,6 +125,13 @@ and the two endpoints that read what it keeps. \`history_key(x, y)\` is provided
             /\br\.lpush\(/,
             /\br\.ltrim\(\s*\w+\s*,\s*0\s*,\s*(HISTORY_LEN\s*-\s*1|9)\s*\)/,
             /(?<!def )history_key\(/,
+          ],
+        },
+        typescript: {
+          all: [
+            /\bredis\.lpush\(/,
+            /\bredis\.ltrim\(\s*\w+\s*,\s*0\s*,\s*(HISTORY_LEN\s*-\s*1|9)\s*\)/,
+            /(?<!function )historyKey\(/,
           ],
         },
         go: {
@@ -149,6 +164,7 @@ and the two endpoints that read what it keeps. \`history_key(x, y)\` is provided
         'Commit the offset only once the sorted set and the history list have been updated: at-least-once, never at-most-once.',
       match: {
         python: {order: [/\br\.zincrby\(/, /\br\.ltrim\(/, /consumer\.commit\(/]},
+        typescript: {order: [/\bredis\.zincrby\(/, /\bredis\.ltrim\(/, /consumer\.commitOffsets\(/]},
         go: {order: [/rdb\.ZIncrBy\(/, /rdb\.LTrim\(/, /reader\.CommitMessages\(/]},
         scala: {order: [/jedis\.zincrby\(/, /jedis\.ltrim\(/, /consumer\.commitSync\(/]},
         cpp: {order: [/redis\.zincrby\(/, /redis\.ltrim\(/, /consumer->commitSync\(/]},
@@ -166,6 +182,14 @@ and the two endpoints that read what it keeps. \`history_key(x, y)\` is provided
             /\br\.lrange\(/,
             /"tiles"/,
             /status_code\s*=\s*400/,
+          ],
+        },
+        typescript: {
+          all: [
+            /\bredis\.zrevrange\([^\n]*['"]WITHSCORES['"]|\bredis\.zrange\([^\n]*['"]REV['"][^\n]*['"]WITHSCORES['"]/,
+            /\bredis\.lrange\(/,
+            /\btiles\b/,
+            /code\(\s*400\s*\)|status\(\s*400\s*\)/,
           ],
         },
         go: {
@@ -331,6 +355,133 @@ def history(x: int = -1, y: int = -1) -> list[dict]:
     if not (0 <= x < SIZE and 0 <= y < SIZE):
         raise HTTPException(status_code=400, detail=f"x and y must be in [0, {SIZE})")
     return [json.loads(item) for item in r.lrange(history_key(x, y), 0, HISTORY_LEN - 1)]
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const SIZE = 100;
+export const TOP_N = 10;
+export const HISTORY_LEN = 10;
+export const LEADERS_KEY = 'place:leaders';
+
+const kafka = new Kafka({clientId: 'leaderboard', brokers: ['kafka:9092']});
+
+/** history:{x}:{y} (provided). */
+export function historyKey(x: number, y: number): string {
+  return \`history:\${x}:\${y}\`;
+}
+
+/** The worker, started beside the API: one member of group leaderboard reading placements. */
+export async function run(): Promise<void> {
+  const consumer = kafka.consumer({groupId: 'leaderboard'});
+  await consumer.connect();
+  await consumer.subscribe({topic: 'placements', fromBeginning: true});
+  await consumer.run({
+    // TODO: disable auto-commit
+    eachMessage: async ({topic, partition, message}) => {
+      // TODO: parse JSON (skip + commit malformed records)
+      // TODO: ZINCRBY LEADERS_KEY 1 user; LPUSH historyKey(x, y) {user, color, ts}; LTRIM 0 HISTORY_LEN-1
+      // TODO: then commit this message: consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}])
+      throw new Error('not implemented');
+    },
+  });
+}
+
+app.get('/top', async () => {
+  // TODO: ZREVRANGE LEADERS_KEY 0 TOP_N-1 WITHSCORES → [{user, tiles}]
+  return [];
+});
+
+app.get('/history', async (request, reply) => {
+  // TODO: 400 unless 0 <= x, y < SIZE; LRANGE historyKey(x, y) 0 HISTORY_LEN-1 → [{user, color, ts}]
+  return [];
+});
+`,
+      solution: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const SIZE = 100;
+export const TOP_N = 10;
+export const HISTORY_LEN = 10;
+export const LEADERS_KEY = 'place:leaders';
+
+const kafka = new Kafka({clientId: 'leaderboard', brokers: ['kafka:9092']});
+
+/** history:{x}:{y} (provided). */
+export function historyKey(x: number, y: number): string {
+  return \`history:\${x}:\${y}\`;
+}
+
+interface Placement {
+  user: string;
+  x: number;
+  y: number;
+  color: number;
+  ts: number;
+}
+
+/** The placements event, or null when the record is not one. */
+function parse(value: Buffer | null): Placement | null {
+  try {
+    const event = JSON.parse(value?.toString() ?? '') as Partial<Placement>;
+    const {user, x, y, color, ts} = event;
+    if (typeof user !== 'string' || !Number.isInteger(x) || !Number.isInteger(y) || !Number.isInteger(color) || !Number.isInteger(ts)) return null;
+    return {user, x: x as number, y: y as number, color: color as number, ts: ts as number};
+  } catch {
+    return null;
+  }
+}
+
+/** The worker, started beside the API: one member of group leaderboard reading placements. */
+export async function run(): Promise<void> {
+  const consumer = kafka.consumer({groupId: 'leaderboard'});
+  await consumer.connect();
+  await consumer.subscribe({topic: 'placements', fromBeginning: true});
+  await consumer.run({
+    autoCommit: false, // commit when the record is counted, not on a timer
+    eachMessage: async ({topic, partition, message}) => {
+      const next = {topic, partition, offset: String(Number(message.offset) + 1)};
+      const event = parse(message.value);
+      if (event === null) {
+        console.warn(\`skipping malformed record at offset \${message.offset}\`);
+        await consumer.commitOffsets([next]);
+        return;
+      }
+      const key = historyKey(event.x, event.y);
+      await redis.zincrby(LEADERS_KEY, 1, event.user);
+      await redis.lpush(key, JSON.stringify({user: event.user, color: event.color, ts: event.ts}));
+      await redis.ltrim(key, 0, HISTORY_LEN - 1); // newest first, never more than 10
+      await consumer.commitOffsets([next]); // after the writes: at-least-once
+    },
+  });
+}
+
+app.get('/top', async () => {
+  const rows = await redis.zrevrange(LEADERS_KEY, 0, TOP_N - 1, 'WITHSCORES');
+  const top: {user: string; tiles: number}[] = [];
+  for (let i = 0; i + 1 < rows.length; i += 2) top.push({user: rows[i], tiles: Number(rows[i + 1])});
+  return top;
+});
+
+app.get('/history', async (request, reply) => {
+  const query = request.query as {x?: string; y?: string};
+  const x = Number(query.x ?? -1);
+  const y = Number(query.y ?? -1);
+  if (!(Number.isInteger(x) && Number.isInteger(y) && 0 <= x && x < SIZE && 0 <= y && y < SIZE))
+    return reply.code(400).send({error: \`x and y must be in [0, \${SIZE})\`});
+  const items = await redis.lrange(historyKey(x, y), 0, HISTORY_LEN - 1);
+  return items.map(item => JSON.parse(item));
+});
 `,
     },
     go: {
@@ -969,6 +1120,105 @@ async def check_endpoints(ctx):
         for bad in ({"x": -1, "y": 0}, {"x": 0, "y": m.SIZE}, {"x": m.SIZE, "y": 0}):
             r = await c.get("/history", params=bad)
             assert r.status_code == 400, f"GET /history with {bad} answered {r.status_code}, expected 400"
+`,
+    typescript: `const TS = 1700000000000;
+const LEADERS = 'place:leaders';
+
+/** placements: [user, x, y, color] tuples, or just user names (one tile each on (3, 7)). */
+function seed(ctx, ...placements: (string | [string, number, number, number])[]): void {
+  placements.forEach((p, i) => {
+    const [user, x, y, color] = typeof p === 'string' ? [p, 3, 7, 12] : p;
+    ctx.kafka.seed('placements', {key: \`\${x}:\${y}\`, value: {user, x, y, color, ts: TS + i}});
+  });
+}
+
+export async function check_consumer(ctx) {
+  seed(ctx, 'ana', ['bo', 4, 7, 5]);
+  const bo = ctx.kafka.records('placements')[1];
+  ctx.redis.set('history:4:7', 'corrupt'); // bo's pixel: the worker's write fails while it handles her tile
+  const m = ctx.load('leaderboard');
+  await ctx.drain(m.run()).catch(() => undefined); // the worker died on bo's placement; the process is stopped (deploy, SIGTERM)
+  const committed = ctx.kafka.committedOffset('leaderboard', 'placements', bo.partition);
+  assert(committed === null || committed <= bo.offset, \`bo's placement never reached her pixel's history, yet group leaderboard committed past it (offset \${committed}) by the time the worker stopped: offsets were acknowledged for what was delivered, not for what was processed. Turn auto-commit off and commit after the writes\`);
+  ctx.redis.del('history:4:7'); // the fault is repaired and the worker restarts
+  await ctx.drain(m.run());
+  const history: string[] = ctx.redis.lrange('history:4:7', 0, -1);
+  assert(history.length > 0 && JSON.parse(history[0]).user === 'bo', \`after the restart bo's placement must be replayed into history:4:7, which holds \${JSON.stringify(history)}: it was lost\`);
+  const lag = ctx.kafka.lag('leaderboard', 'placements');
+  assert.equal(lag, 0, \`group leaderboard on placements has \${lag} uncommitted record(s) after the worker processed everything: commit each record once it is counted\`);
+}
+
+export async function check_zincrby(ctx) {
+  seed(ctx, 'ana', 'bo', ['ana', 4, 7, 1], ['ana', 5, 7, 2], ['cy', 0, 0, 15]);
+  const m = ctx.load('leaderboard');
+  await ctx.drain(m.run());
+  assert.equal(ctx.redis.type(LEADERS), 'zset', \`\${LEADERS} is \${ctx.redis.type(LEADERS)}, expected a sorted set (keys: \${JSON.stringify(ctx.redis.keys('*'))})\`);
+  for (const [user, tiles] of [['ana', 3], ['bo', 1], ['cy', 1]] as const) {
+    const score = ctx.redis.zscore(LEADERS, user);
+    assert.equal(Number(score), tiles, \`\${user} in \${LEADERS} scores \${JSON.stringify(score)}, expected \${tiles}\`);
+  }
+}
+
+export async function check_history_capped(ctx) {
+  const users = Array.from({length: 12}, (_, i) => \`u\${String(i).padStart(2, '0')}\`);
+  seed(ctx, ...users.map((u, i): [string, number, number, number] => [u, 3, 7, i % 16]), ['zed', 4, 7, 5]);
+  const m = ctx.load('leaderboard');
+  await ctx.drain(m.run());
+  const key = m.historyKey(3, 7);
+  assert.equal(key, 'history:3:7', \`historyKey(3, 7) is \${JSON.stringify(key)}, expected history:3:7\`);
+  assert.equal(ctx.redis.type(key), 'list', \`\${key} is \${ctx.redis.type(key)}, expected a list (keys: \${JSON.stringify(ctx.redis.keys('*'))})\`);
+  const items: string[] = ctx.redis.lrange(key, 0, -1);
+  assert.equal(items.length, 10, \`\${key} holds \${items.length} entries after 12 placements, expected HISTORY_LEN = 10 (LPUSH + LTRIM 0 9)\`);
+  const entries = items.map(i => JSON.parse(i));
+  assert.deepEqual(entries.map(e => e.user), users.slice(2).reverse(), \`the list must be newest first and keep the last 10: \${JSON.stringify(entries.map(e => e.user))}\`);
+  assert(entries[0].color === 11 && entries[0].ts === TS + 11, \`each entry carries user, color and ts: \${JSON.stringify(entries[0])}\`);
+  const other: string[] = ctx.redis.lrange('history:4:7', 0, -1);
+  assert(other.length > 0 && JSON.parse(other[0]).user === 'zed', 'every pixel has its own list');
+}
+
+export async function check_commit_after(ctx) {
+  seed(ctx, 'ana');
+  ctx.kafka.seed('placements', {key: 'bad', value: 'not json'});
+  ctx.kafka.seed('placements', {key: 'bad', value: {user: 'ghost'}});
+  const placement = ctx.kafka.records('placements')[0];
+  const atCommit: [Record<string, number>, number | null, number][] = [];
+  ctx.kafka.onCommit((group: string, offsets: Map<string, number>) => {
+    const score = ctx.redis.zscore(LEADERS, 'ana');
+    atCommit.push([Object.fromEntries(offsets), score === null ? null : Number(score), ctx.redis.llen('history:3:7')]);
+  });
+  const m = ctx.load('leaderboard');
+  await ctx.drain(m.run());
+  assert(atCommit.length > 0, 'no offset was ever committed');
+  const covering = atCommit.filter(([offsets]) => (offsets[\`placements|\${placement.partition}\`] ?? 0) > placement.offset).map(([, score, hist]) => [score, hist]);
+  assert(covering.length > 0, "ana's placement was never committed");
+  assert.deepEqual(covering[0], [1, 1], \`the commit must come after ZINCRBY and LPUSH: when ana's placement was committed the score was \${JSON.stringify(covering[0][0])} and the history held \${covering[0][1]} entries\`);
+  assert.equal(ctx.kafka.lag('leaderboard', 'placements'), 0, 'malformed records must be skipped and committed, not left to replay forever');
+  assert.equal(ctx.redis.zcard(LEADERS), 1, \`malformed records must not be counted: \${JSON.stringify(ctx.redis.zrange(LEADERS, 0, -1))}\`);
+}
+
+export async function check_endpoints(ctx) {
+  const m = ctx.load('leaderboard');
+  const members = Array.from({length: 12}, (_, i) => [100 - i, \`user\${String(i).padStart(2, '0')}\`]).flat();
+  ctx.redis.zadd(LEADERS, ...members);
+  for (let i = 0; i < 3; i++) ctx.redis.lpush('history:3:7', JSON.stringify({user: \`u\${i}\`, color: i, ts: TS + i}));
+  const c = ctx.client(m.app);
+  let r = await c.get('/top');
+  assert.equal(r.status, 200, \`GET /top answered \${r.status}\`);
+  const rows = r.json();
+  assert(Array.isArray(rows) && rows.length === 10, \`expected the 10 top users, got \${JSON.stringify(rows)}\`);
+  assert.deepEqual(rows.map(row => row.user), Array.from({length: 10}, (_, i) => \`user\${String(i).padStart(2, '0')}\`), \`rows must be in descending score order: \${JSON.stringify(rows.map(row => row.user))}\`);
+  assert.deepEqual(rows.map(row => row.tiles), Array.from({length: 10}, (_, i) => 100 - i), \`each row carries the tile count as 'tiles': \${JSON.stringify(rows)}\`);
+  r = await c.get('/history', {query: {x: 3, y: 7}});
+  assert.equal(r.status, 200, \`GET /history?x=3&y=7 answered \${r.status}\`);
+  assert.deepEqual(r.json().map(e => e.user), ['u2', 'u1', 'u0'], \`history must be newest first with user, color and ts: \${r.text}\`);
+  assert.deepEqual(r.json()[0], {user: 'u2', color: 2, ts: TS + 2}, \`each entry is the stored document: \${JSON.stringify(r.json()[0])}\`);
+  r = await c.get('/history', {query: {x: 0, y: 0}});
+  assert(r.status === 200 && r.json().length === 0, \`a pixel nobody painted has an empty history, got \${r.status} \${r.text}\`);
+  for (const bad of [{x: -1, y: 0}, {x: 0, y: m.SIZE}, {x: m.SIZE, y: 0}]) {
+    r = await c.get('/history', {query: bad});
+    assert.equal(r.status, 400, \`GET /history with \${JSON.stringify(bad)} answered \${r.status}, expected 400\`);
+  }
+}
 `,
   },
   debrief: `Two read models from one stream. The sorted set is the leaderboard structure — \`ZINCRBY\` keeps it ordered on every write and the top 10 is one O(log n + 10) read, no scan, no sort at query time. The capped list is the history structure — \`LPUSH\` then \`LTRIM 0 9\` is the Redis idiom for "the last N, newest first", bounded memory with no cleanup job, and the per-pixel key is exactly the lookup the hover makes. Both are rebuilt by replaying the topic, so a lost Redis is an inconvenience, not a data loss. Where the commit sits decides the guarantee: process-then-commit is at-least-once, and a scoreboard that is occasionally one too high beats one that is quietly short. Reddit kept the full per-tile details in a wide Cassandra table for the same query and the same reason — the single-tile endpoint was the busiest uncached call they had; a tiny capped list in front of it is what they would have added with a week more.`,

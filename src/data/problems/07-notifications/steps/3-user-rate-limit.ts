@@ -47,6 +47,7 @@ set, that the delivery worker consults before sending.
       detail: 'ZADD the notification id into `rl:{user}` with the current time in milliseconds as its score.',
       match: {
         python: {all: [/f["']rl:\{user_id\}["']/, /\.zadd\(\s*\w+\s*,\s*\{\s*notification_id\s*:\s*now_ms\s*\}\s*\)/]},
+        typescript: {all: [/`rl:\$\{userId\}`/, /\.zadd\(\s*\w+\s*,\s*nowMs\s*,\s*notificationId\s*\)/]},
         go: {
           all: [
             /"rl:"\s*\+\s*\w+|"rl:%s"/,
@@ -65,6 +66,9 @@ set, that the delivery worker consults before sending.
       match: {
         python: {
           all: [/\.zremrangebyscore\(\s*\w+\s*,\s*["']-inf["']\s*,\s*now_ms\s*-\s*(WINDOW_MS|3_?600_?000)\s*\)/],
+        },
+        typescript: {
+          all: [/\.zremrangebyscore\(\s*\w+\s*,\s*['"]-inf['"]\s*,\s*nowMs\s*-\s*(WINDOW_MS|3_?600_?000)\s*\)/],
         },
         go: {all: [/\.ZRemRangeByScore\(\s*ctx\s*,\s*\w+\s*,\s*"-inf"\s*,[^\n]*nowMs\s*-\s*windowMs/]},
         scala: {
@@ -85,6 +89,14 @@ set, that the delivery worker consults before sending.
             /\.zcard\(\s*\w+\s*\)/,
             /\.expire\(\s*\w+\s*,\s*(WINDOW_S|3600)\s*\)/,
             /\.execute\(\)/,
+          ],
+        },
+        typescript: {
+          all: [
+            /\bredis\s*\.\s*(multi|pipeline)\(/,
+            /\.zcard\(\s*\w+\s*\)/,
+            /\.expire\(\s*\w+\s*,\s*(WINDOW_S|3600)\s*\)/,
+            /\.exec\(\)/,
           ],
         },
         go: {
@@ -119,6 +131,9 @@ set, that the delivery worker consults before sending.
       match: {
         python: {
           all: [/[\w.()[\]]+\s*>\s*(LIMIT|20)\b/, /\.incr\(\s*f["']dropped:\{user_id\}["']\s*\)/, /return False/],
+        },
+        typescript: {
+          all: [/[\w.()[\]]+\s*>\s*(LIMIT|20)\b/, /\.incr\(\s*`dropped:\$\{userId\}`\s*\)/, /return false/],
         },
         go: {
           all: [
@@ -178,6 +193,52 @@ def allowed(user_id: str, notification_id: str) -> bool:
         r.incr(f"dropped:{user_id}")
         return False
     return True
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const LIMIT = 20; // notifications per user per hour
+export const WINDOW_MS = 3_600_000;
+export const WINDOW_S = 3600;
+
+/** True when this notification fits the user's hourly budget; false → the worker skips delivery. */
+export async function allowed(userId: string, notificationId: string): Promise<boolean> {
+  const nowMs = Date.now();
+  const key = \`rl:\${userId}\`;
+  // TODO: one MULTI: ZADD key nowMs notificationId · ZREMRANGEBYSCORE key -inf nowMs-WINDOW_MS · ZCARD key · EXPIRE key WINDOW_S
+  // TODO: count > LIMIT → INCR dropped:{userId}, return false
+  throw new Error('not implemented');
+}
+`,
+      solution: `import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const LIMIT = 20; // notifications per user per hour
+export const WINDOW_MS = 3_600_000;
+export const WINDOW_S = 3600;
+
+/** True when this notification fits the user's hourly budget; false → the worker skips delivery. */
+export async function allowed(userId: string, notificationId: string): Promise<boolean> {
+  const nowMs = Date.now();
+  const key = \`rl:\${userId}\`;
+  const replies = await redis
+    .multi()
+    .zadd(key, nowMs, notificationId)
+    .zremrangebyscore(key, '-inf', nowMs - WINDOW_MS)
+    .zcard(key)
+    .expire(key, WINDOW_S)
+    .exec();
+  const count = Number(replies[2][1]);
+  if (count > LIMIT) {
+    await redis.incr(\`dropped:\${userId}\`);
+    return false;
+  }
+  return true;
+}
 `,
     },
     go: {
@@ -428,6 +489,63 @@ def check_over_limit(ctx):
     assert m.allowed("u7", "n-22") is True, "another user's budget is untouched"
     ctx.clock.advance(3601)
     assert m.allowed("u42", "n-23") is True, "an hour later the user's budget is back"
+`,
+    typescript: `function limiter(ctx) {
+  return ctx.load('rate_limit');
+}
+
+export async function check_zset_key(ctx) {
+  const m = limiter(ctx);
+  const before = Date.now();
+  assert.equal(await m.allowed('u42', 'n-1'), true, 'the first notification of the hour must be allowed');
+  const after = Date.now();
+  assert.equal(ctx.redis.type('rl:u42'), 'zset', \`rl:u42 must be a sorted set, found \${JSON.stringify(ctx.redis.type('rl:u42'))}\`);
+  const score = ctx.redis.zscore('rl:u42', 'n-1');
+  assert(score !== null, \`n-1 must be a member of rl:u42, members are \${JSON.stringify(ctx.redis.zrange('rl:u42', 0, -1))}\`);
+  assert(before <= Number(score) && Number(score) <= after, \`n-1 is scored \${score}, expected the current time in milliseconds (about \${before})\`);
+  await m.allowed('u7', 'n-2');
+  assert(ctx.redis.zcard('rl:u42') === 1 && ctx.redis.zcard('rl:u7') === 1, 'each user has their own rl:{user} set');
+}
+
+export async function check_trim_window(ctx) {
+  const m = limiter(ctx);
+  await m.allowed('u42', 'n-1');
+  await m.allowed('u42', 'n-2');
+  ctx.clock.advance(1800);
+  await m.allowed('u42', 'n-3');
+  assert.equal(ctx.redis.zcard('rl:u42'), 3, \`after 30 min all three events are still in the window, found \${ctx.redis.zcard('rl:u42')}\`);
+  ctx.clock.advance(1801);
+  assert.equal(await m.allowed('u42', 'n-4'), true);
+  const members = ctx.redis.zrange('rl:u42', 0, -1);
+  assert.deepEqual(members, ['n-3', 'n-4'], \`events older than an hour must be trimmed: rl:u42 holds \${JSON.stringify(members)}, expected ["n-3","n-4"]\`);
+}
+
+export async function check_pipeline(ctx) {
+  const m = limiter(ctx);
+  assert.equal(await m.allowed('u42', 'n-1'), true);
+  const trips = ctx.redisRoundTrips().map((t: string[]) => t.filter(c => c !== 'MULTI' && c !== 'EXEC'));
+  const ttl = ctx.redis.ttl('rl:u42');
+  assert(ttl > 0, 'rl:u42 has no expiry (TTL -1): an idle user would leave a sorted set behind forever');
+  assert(3500 <= ttl && ttl <= 3600, \`rl:u42 must expire after 3600 s, TTL is \${ttl}\`);
+  const four = trips.find((t: string[]) => ['ZADD', 'ZREMRANGEBYSCORE', 'ZCARD', 'EXPIRE'].every(c => t.includes(c)));
+  assert(four !== undefined, \`an allowed check must cost one round trip carrying ZADD, ZREMRANGEBYSCORE, ZCARD and EXPIRE together; the round trips were \${JSON.stringify(trips)}\`);
+  assert.equal(trips.length, 1, \`an allowed check must cost one round trip, it took \${trips.length}: \${JSON.stringify(trips)}\`);
+  ctx.clock.advance(3601);
+  assert.equal(ctx.redis.exists('rl:u42'), 0, "an idle user's set must expire with the window");
+}
+
+export async function check_over_limit(ctx) {
+  const m = limiter(ctx);
+  for (let i = 0; i < 20; i++) assert.equal(await m.allowed('u42', \`n-\${i}\`), true, \`notification \${i + 1} of 20 must be allowed\`);
+  assert.equal(ctx.redis.get('dropped:u42'), null, 'nothing was dropped yet: dropped:u42 must not exist');
+  assert.equal(await m.allowed('u42', 'n-20'), false, 'the 21st notification of the hour must be dropped');
+  assert.equal(ctx.redis.get('dropped:u42'), '1', \`dropped:u42 is \${JSON.stringify(ctx.redis.get('dropped:u42'))}, expected 1\`);
+  assert.equal(await m.allowed('u42', 'n-21'), false);
+  assert.equal(ctx.redis.get('dropped:u42'), '2', \`dropped:u42 is \${JSON.stringify(ctx.redis.get('dropped:u42'))}, expected 2\`);
+  assert.equal(await m.allowed('u7', 'n-22'), true, "another user's budget is untouched");
+  ctx.clock.advance(3601);
+  assert.equal(await m.allowed('u42', 'n-23'), true, "an hour later the user's budget is back");
+}
 `,
   },
   debrief: `A sorted set scored by time is a sliding window with no bookkeeping: add, trim, count, and the TTL cleans up after idle users. The four commands travel together so the check costs one round trip, and because the whole thing is per user it shards trivially. Real systems wrap the same four commands in a Lua script so the add-trim-count is atomic against concurrent workers, remove the member again when the decision is "drop" (so dropped pings do not eat the budget), and prefer a cheaper approximation — sliding log with coarse buckets, or a token bucket — once the limit is thousands per window instead of twenty.`,

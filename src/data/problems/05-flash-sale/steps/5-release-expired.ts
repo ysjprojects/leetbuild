@@ -64,6 +64,12 @@ every second, and the \`release(order_id)\` the API and the consumer call:
             /time\.sleep\(\s*SWEEP_INTERVAL_S\s*\)/,
           ],
         },
+        typescript: {
+          all: [
+            /\bredis\.zrangebyscore\(\s*['"]holds['"]\s*,\s*['"]-inf['"]\s*,[\s\S]{0,120}?['"]LIMIT['"]\s*,\s*0\s*,\s*BATCH/,
+            /await sleep\(\s*SWEEP_INTERVAL_MS\s*\)|setTimeout\([^\n]*SWEEP_INTERVAL_MS/,
+          ],
+        },
         go: {
           all: [
             /rdb\.ZRangeByScore\(\s*ctx\s*,\s*"holds"\s*,/,
@@ -93,6 +99,7 @@ every second, and the \`release(order_id)\` the API and the consumer call:
         '`INCRBY stock`, `DEL hold` and `ZREM holds` run inside one Lua script; done as three commands, a crash between them restores stock twice on the next tick.',
       match: {
         python: {all: [LUA_INCRBY, LUA_DEL, LUA_ZREM]},
+        typescript: {all: [LUA_INCRBY, LUA_DEL, LUA_ZREM]},
         go: {all: [LUA_INCRBY, LUA_DEL, LUA_ZREM]},
         scala: {all: [LUA_INCRBY, LUA_DEL, LUA_ZREM]},
         cpp: {all: [LUA_INCRBY, LUA_DEL, LUA_ZREM]},
@@ -105,6 +112,7 @@ every second, and the \`release(order_id)\` the API and the consumer call:
         'When `hold:{order_id}` no longer exists the order was confirmed (or released); the script must only `ZREM` the member and must not touch stock.',
       match: {
         python: {order: [LUA_EXISTS_GONE, LUA_ZREM, LUA_INCRBY]},
+        typescript: {order: [LUA_EXISTS_GONE, LUA_ZREM, LUA_INCRBY]},
         go: {order: [LUA_EXISTS_GONE, LUA_ZREM, LUA_INCRBY]},
         scala: {order: [LUA_EXISTS_GONE, LUA_ZREM, LUA_INCRBY]},
         cpp: {order: [LUA_EXISTS_GONE, LUA_ZREM, LUA_INCRBY]},
@@ -119,6 +127,11 @@ every second, and the \`release(order_id)\` the API and the consumer call:
         python: {
           all: [
             /def release\((?:(?!\ndef )[\s\S])*?\br\.get\(\s*f["']hold:\{order_id\}["']\s*\)(?:(?!\ndef )[\s\S])*?release_hold\(/,
+          ],
+        },
+        typescript: {
+          all: [
+            /async function release\((?:(?!\n\})[\s\S])*?\bredis\.get\(\s*`hold:\$\{orderId\}`\s*\)(?:(?!\n\})[\s\S])*?releaseHold\(/,
           ],
         },
         go: {
@@ -221,6 +234,98 @@ def sweep() -> None:
         for member in expired:
             release_hold(member.decode())
         time.sleep(SWEEP_INTERVAL_S)
+`,
+    },
+    typescript: {
+      starter: `import {setTimeout as sleep} from 'node:timers/promises';
+
+import Redis from 'ioredis';
+
+export const BATCH = 100;
+export const SWEEP_INTERVAL_MS = 1000;
+
+// KEYS[1] = stock:{sku}   KEYS[2] = hold:{order_id}   KEYS[3] = holds
+// ARGV[1] = qty   ARGV[2] = member "{order_id}:{sku}:{qty}"
+const RELEASE_LUA = \`
+return 0
+\`;
+
+/** The client with the release script registered as a command. */
+interface ReleasingRedis extends Redis {
+  release(stockKey: string, holdKey: string, holdsKey: string, qty: string, member: string): Promise<number>;
+}
+
+const redis = new Redis({host: 'redis', port: 6379}) as ReleasingRedis;
+redis.defineCommand('release', {numberOfKeys: 3, lua: RELEASE_LUA});
+
+/** Gives one hold back to stock; false when the hold was already gone (confirmed or released). */
+export async function releaseHold(member: string): Promise<boolean> {
+  const [orderId, sku, qty] = member.split(':');
+  const result = await redis.release(\`stock:\${sku}\`, \`hold:\${orderId}\`, 'holds', qty, member);
+  return result === 1;
+}
+
+/** Explicit release by the API (503 path) and the fulfilment consumer (no physical stock). */
+export async function release(orderId: string): Promise<void> {
+  // TODO: GET hold:{orderId}; when it exists, releaseHold(member)
+  throw new Error('not implemented');
+}
+
+export async function sweep(): Promise<void> {
+  // TODO: every SWEEP_INTERVAL_MS: ZRANGEBYSCORE holds -inf now LIMIT 0 BATCH, releaseHold each member
+  // TODO: the script: EXISTS hold == 0 → ZREM, 0; else INCRBY stock, DEL hold, ZREM, 1
+  throw new Error('not implemented');
+}
+`,
+      solution: `import {setTimeout as sleep} from 'node:timers/promises';
+
+import Redis from 'ioredis';
+
+export const BATCH = 100;
+export const SWEEP_INTERVAL_MS = 1000;
+
+// KEYS[1] = stock:{sku}   KEYS[2] = hold:{order_id}   KEYS[3] = holds
+// ARGV[1] = qty   ARGV[2] = member "{order_id}:{sku}:{qty}"
+const RELEASE_LUA = \`
+if redis.call('EXISTS', KEYS[2]) == 0 then
+  redis.call('ZREM', KEYS[3], ARGV[2])
+  return 0
+end
+redis.call('INCRBY', KEYS[1], ARGV[1])
+redis.call('DEL', KEYS[2])
+redis.call('ZREM', KEYS[3], ARGV[2])
+return 1
+\`;
+
+/** The client with the release script registered as a command. */
+interface ReleasingRedis extends Redis {
+  release(stockKey: string, holdKey: string, holdsKey: string, qty: string, member: string): Promise<number>;
+}
+
+const redis = new Redis({host: 'redis', port: 6379}) as ReleasingRedis;
+redis.defineCommand('release', {numberOfKeys: 3, lua: RELEASE_LUA});
+
+/** Gives one hold back to stock; false when the hold was already gone (confirmed or released). */
+export async function releaseHold(member: string): Promise<boolean> {
+  const [orderId, sku, qty] = member.split(':');
+  const result = await redis.release(\`stock:\${sku}\`, \`hold:\${orderId}\`, 'holds', qty, member);
+  return result === 1;
+}
+
+/** Explicit release by the API (503 path) and the fulfilment consumer (no physical stock). */
+export async function release(orderId: string): Promise<void> {
+  const member = await redis.get(\`hold:\${orderId}\`);
+  if (member !== null) await releaseHold(member);
+}
+
+export async function sweep(): Promise<void> {
+  for (;;) {
+    const now = Math.floor(Date.now() / 1000);
+    const expired = await redis.zrangebyscore('holds', '-inf', now, 'LIMIT', 0, BATCH);
+    for (const member of expired) await releaseHold(member);
+    await sleep(SWEEP_INTERVAL_MS);
+  }
+}
 `,
     },
     go: {
@@ -638,6 +743,107 @@ def check_release_by_order(ctx):
     assert ctx.redis.get(STOCK) == "5", "a second release(o1) must not give the units back again"
     m.release("never-reserved")
     assert ctx.redis.get(STOCK) == "5", "release of an unknown order must do nothing"
+`,
+    typescript: `const SKU = 'shoe-42';
+const STOCK = 'stock:shoe-42';
+
+/** A hold as step 1 writes it: the key with its safety-net TTL and the expiry-queue member. */
+function hold(ctx, orderId: string, qty = 2, expiresIn = 600, sku = SKU) {
+  const member = \`\${orderId}:\${sku}:\${qty}\`;
+  ctx.redis.set(\`hold:\${orderId}\`, member, 'EX', 2 * 600);
+  ctx.redis.zadd('holds', Math.floor(ctx.clock.now() / 1000) + expiresIn, member);
+  return member;
+}
+
+export async function check_expired_batch(ctx) {
+  ctx.redis.set(STOCK, 0);
+  const expired = new Set<string>();
+  for (let i = 0; i < 150; i++) expired.add(hold(ctx, \`e\${i}\`, 1, -10));
+  const future = hold(ctx, 'later', 2, 600);
+  const m = ctx.load('hold_sweeper');
+  // Each hold key is touched once, by the release that gives it back: note the tick it happened on.
+  const seen: {tick: number; at: number; member: string}[] = [];
+  for (const member of expired) {
+    const orderId = member.split(':')[0];
+    ctx.redisAfter(\`hold:\${orderId}\`, () => seen.push({tick: ctx.clock.sleeps, at: ctx.clock.now(), member}));
+  }
+  await ctx.drain(m.sweep());
+  assert(seen.length > 0, 'sweep() released nothing: 150 holds are past their expiry');
+  const firstTick = seen.filter(s => s.tick === 0);
+  assert(firstTick.length <= 100, \`the first tick released \${firstTick.length} holds; at most BATCH = 100 per tick\`);
+  assert.equal(firstTick.length, 100, \`the first tick released \${firstTick.length} holds, expected the full batch of 100\`);
+  const secondTick = seen.filter(s => s.tick === 1);
+  assert.equal(secondTick.length, 50, \`the second tick released \${secondTick.length} holds, expected the remaining 50\`);
+  const gap = secondTick[0].at - firstTick[0].at;
+  assert(900 <= gap && gap <= 1200, \`the loop slept \${gap} ms between ticks, expected SWEEP_INTERVAL_MS = 1000\`);
+  assert.equal(ctx.redis.get('hold:later'), future, 'a hold that expires in 600 s must not be released: only members with a score up to now');
+  assert.notEqual(ctx.redis.zscore('holds', future), null, 'the unexpired member must stay in holds');
+  const members = new Set(seen.map(s => s.member));
+  assert.equal(members.size, 150, \`after the sweep \${members.size} distinct expired holds were released, expected all 150\`);
+  assert.equal(ctx.redis.get(STOCK), '150', \`stock is \${JSON.stringify(ctx.redis.get(STOCK))} after releasing 150 holds of 1 on 0, expected 150: each hold goes back exactly once\`);
+}
+
+export async function check_atomic_release(ctx) {
+  ctx.redis.set(STOCK, 3);
+  const member = hold(ctx, 'o1', 2, -5);
+  const m = ctx.load('hold_sweeper');
+  assert.equal(await m.releaseHold(member), true, 'releasing an existing hold must return true');
+  assert.equal(ctx.redis.get(STOCK), '5', \`stock is \${JSON.stringify(ctx.redis.get(STOCK))} after releasing a hold of 2 on 3, expected 5\`);
+  assert.equal(ctx.redis.exists('hold:o1'), 0, 'hold:o1 must be deleted by the release');
+  assert.equal(ctx.redis.zscore('holds', member), null, 'the member must be removed from holds by the release');
+  assert.equal(await m.releaseHold(member), false, 'releasing the same hold again must return false');
+  assert.equal(ctx.redis.get(STOCK), '5', \`stock is \${JSON.stringify(ctx.redis.get(STOCK))} after a second release, expected still 5: units go back exactly once\`);
+
+  ctx.redis.set(STOCK, 0);
+  hold(ctx, 'a', 2, 600);
+  hold(ctx, 'b', 3, 600);
+  const c = hold(ctx, 'c', 1, 1800);
+  ctx.clock.advance(601);
+  await ctx.drain(m.sweep());
+  assert.equal(ctx.redis.get(STOCK), '5', \`stock is \${JSON.stringify(ctx.redis.get(STOCK))} after sweeping two expired holds of 2 and 3, expected 5\`);
+  assert.equal(ctx.redis.exists('hold:a', 'hold:b'), 0, 'the sweeper must delete the expired hold keys');
+  assert.deepEqual(ctx.redis.zrange('holds', 0, -1), [c], \`holds is \${JSON.stringify(ctx.redis.zrange('holds', 0, -1))}, expected only the unexpired member \${c}\`);
+  assert.equal(ctx.redis.get('hold:c'), c, 'an unexpired hold must be left alone');
+}
+
+export async function check_skip_fulfilled(ctx) {
+  ctx.redis.set(STOCK, 3);
+  const member = 'o1:shoe-42:2';
+  ctx.redis.zadd('holds', Math.floor(ctx.clock.now() / 1000) - 5, member);
+  const m = ctx.load('hold_sweeper');
+  assert.equal(await m.releaseHold(member), false, 'a member whose hold:o1 is gone (confirmed) must return false');
+  assert.equal(ctx.redis.get(STOCK), '3', \`stock is \${JSON.stringify(ctx.redis.get(STOCK))}: a confirmed order's units were given back, they were sold\`);
+  assert.equal(ctx.redis.zscore('holds', member), null, 'the stale member must be ZREMed so the sweeper never reads it again');
+
+  ctx.redis.zadd('holds', Math.floor(ctx.clock.now() / 1000) - 5, 'o2:shoe-42:1');
+  await ctx.drain(m.sweep());
+  assert.equal(ctx.redis.get(STOCK), '3', 'sweeping a confirmed order must not touch stock');
+  assert.equal(ctx.redis.zcard('holds'), 0, 'the sweeper must drop the stale member from holds');
+}
+
+export async function check_release_by_order(ctx) {
+  ctx.redis.set(STOCK, 3);
+  const member = hold(ctx, 'o1', 2, 600);
+  const m = ctx.load('hold_sweeper');
+  await m.release('o1');
+  assert.equal(ctx.redis.get(STOCK), '5', \`stock is \${JSON.stringify(ctx.redis.get(STOCK))} after release(o1), expected 5\`);
+  assert.equal(ctx.redis.exists('hold:o1'), 0, 'hold:o1 must be gone after release(o1)');
+  assert.equal(ctx.redis.zscore('holds', member), null, 'the member must leave holds after release(o1)');
+  await m.release('o1');
+  assert.equal(ctx.redis.get(STOCK), '5', 'a second release(o1) must not give the units back again');
+  await m.release('never-reserved');
+  assert.equal(ctx.redis.get(STOCK), '5', 'release of an unknown order must do nothing');
+
+  // The sweeper gets there first: right after release(o2) has read the member, the hold is swept.
+  const racing = hold(ctx, 'o2', 2, -5);
+  ctx.redisAfter('hold:o2', () => {
+    ctx.redis.incrby(STOCK, 2);
+    ctx.redis.del('hold:o2');
+    ctx.redis.zrem('holds', racing);
+  });
+  await m.release('o2');
+  assert.equal(ctx.redis.get(STOCK), '7', \`stock is \${JSON.stringify(ctx.redis.get(STOCK))} after release(o2) raced the sweeper, expected 7: the units went back twice — release must go through the same EXISTS-guarded script\`);
+}
 `,
   },
   debrief: `The sorted set is a priority queue keyed by time, and \`ZRANGEBYSCORE … LIMIT\` is the classic way to drain one in bounded slices. The \`EXISTS\` guard inside the script is what makes the sweeper, the API's 503 path and the consumer's no-stock path safe to run concurrently and to repeat: a hold is released at most once no matter who gets there first. Real systems run the sweeper on an elected leader (or shard the sorted set by SKU prefix), treat keyspace notifications only as a hint, and reconcile the Redis counter against the warehouse ledger after the drop — the oversell that any cache-fronted counter eventually produces is caught by accounting, not by more Lua.`,

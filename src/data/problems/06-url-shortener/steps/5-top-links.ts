@@ -56,6 +56,9 @@ keeps one sorted set per day, plus the endpoint that reads it. \`day_key(ts)\` i
             /"enable\.auto\.commit"\s*:\s*False/,
           ],
         },
+        typescript: {
+          all: [/groupId:\s*['"]top-links['"]/, /subscribe\(\s*\{[^\n]*topic:\s*['"]clicks['"]/, /autoCommit:\s*false/],
+        },
         go: {all: [/GroupID:\s*"top-links"/, /Topic:\s*"clicks"/, /reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
         scala: {
           all: [
@@ -76,6 +79,7 @@ keeps one sorted set per day, plus the endpoint that reads it. \`day_key(ts)\` i
         'Each click is `ZINCRBY top:{day} 1 code` on the key `day_key(ts)` gives you — atomic in Redis, and the set stays sorted by count.',
       match: {
         python: {all: [/\br\.zincrby\(\s*\w+\s*,\s*1(\.0)?\s*,/, /(?<!def )day_key\(/]},
+        typescript: {all: [/\bredis\.zincrby\(\s*\w+\s*,\s*1\s*,/, /(?<!function )dayKey\(/]},
         go: {all: [/rdb\.ZIncrBy\(\s*ctx\s*,\s*\w+\s*,\s*1(\.0)?\s*,/, /(?<!func )dayKey\(/]},
         scala: {all: [/jedis\.zincrby\(\s*\w+\s*,\s*1(\.0|d)?\s*,/, /(?<!def )dayKey\(/]},
         cpp: {all: [/redis\.zincrby\(\s*\w+\s*,\s*1(\.0)?\s*,/, /(?<!string )day_key\(/]},
@@ -87,6 +91,7 @@ keeps one sorted set per day, plus the endpoint that reads it. \`day_key(ts)\` i
       detail: 'Set a 7-day expiry (`RETENTION_S`) on the day key so the leaderboards do not accumulate forever.',
       match: {
         python: {all: [/\br\.expire\(\s*\w+\s*,\s*(RETENTION_S|604800|7\s*\*\s*24)/]},
+        typescript: {all: [/\bredis\.expire\(\s*\w+\s*,\s*(RETENTION_S|604800|7\s*\*\s*24)/]},
         go: {all: [/rdb\.Expire(NX)?\(\s*ctx\s*,\s*\w+\s*,\s*(retention|7\s*\*\s*24)/]},
         scala: {all: [/jedis\.expire\(\s*\w+\s*,\s*(RetentionSeconds|604800L?|7\s*\*\s*24)/]},
         cpp: {
@@ -102,6 +107,7 @@ keeps one sorted set per day, plus the endpoint that reads it. \`day_key(ts)\` i
       detail: 'Commit the offset only once the sorted set has been updated: at-least-once, never at-most-once.',
       match: {
         python: {order: [/\br\.zincrby\(/, /consumer\.commit\(/]},
+        typescript: {order: [/\bredis\.zincrby\(/, /consumer\.commitOffsets\(/]},
         go: {order: [/rdb\.ZIncrBy\(/, /reader\.CommitMessages\(/]},
         scala: {order: [/jedis\.zincrby\(/, /consumer\.commitSync\(/]},
         cpp: {order: [/redis\.zincrby\(/, /consumer->commitSync\(/]},
@@ -116,6 +122,12 @@ keeps one sorted set per day, plus the endpoint that reads it. \`day_key(ts)\` i
         python: {
           all: [
             /\br\.zrevrange\([^\n]*withscores\s*=\s*True|\br\.zrange\([^\n]*desc\s*=\s*True[^\n]*withscores\s*=\s*True/,
+            /TOP_N\s*-\s*1|\b9\b/,
+          ],
+        },
+        typescript: {
+          all: [
+            /\bredis\.zrevrange\([^\n]*['"]WITHSCORES['"]|\bredis\.zrange\([^\n]*['"]REV['"][^\n]*['"]WITHSCORES['"]/,
             /TOP_N\s*-\s*1|\b9\b/,
           ],
         },
@@ -252,6 +264,107 @@ def top(day: str | None = None) -> list[dict]:
     key = f"top:{day or date.today().isoformat()}"
     rows = r.zrevrange(key, 0, TOP_N - 1, withscores=True)
     return [{"code": code, "clicks": int(score)} for code, score in rows]
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const TOP_N = 10;
+export const RETENTION_S = 7 * 24 * 3600;
+
+const kafka = new Kafka({clientId: 'top-links', brokers: ['kafka:9092']});
+const consumer = kafka.consumer({groupId: 'top-links'});
+
+/** top:YYYY-MM-DD for a click timestamp in seconds (provided). */
+export function dayKey(ts: number): string {
+  return 'top:' + new Date(ts * 1000).toISOString().slice(0, 10);
+}
+
+/** The worker: lives beside the API and runs until the consumer stops. */
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: 'clicks', fromBeginning: true});
+  await consumer.run({
+    // TODO: disable auto-commit
+    eachMessage: async ({topic, partition, message}) => {
+      // TODO: parse JSON (skip + commit malformed records)
+      // TODO: ZINCRBY dayKey(ts) 1 code; EXPIRE the key to RETENTION_S; then commit offset + 1 for this message
+      throw new Error('not implemented');
+    },
+  });
+}
+
+app.get('/top', async request => {
+  const {day} = request.query as {day?: string};
+  const key = \`top:\${day ?? new Date().toISOString().slice(0, 10)}\`;
+  // TODO: ZREVRANGE key 0 TOP_N-1 WITHSCORES → [{code, clicks}]
+  return [];
+});
+`,
+      solution: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const TOP_N = 10;
+export const RETENTION_S = 7 * 24 * 3600;
+
+const kafka = new Kafka({clientId: 'top-links', brokers: ['kafka:9092']});
+const consumer = kafka.consumer({groupId: 'top-links'});
+
+/** top:YYYY-MM-DD for a click timestamp in seconds (provided). */
+export function dayKey(ts: number): string {
+  return 'top:' + new Date(ts * 1000).toISOString().slice(0, 10);
+}
+
+/** The click's code and timestamp, or null when the record is not a click event. */
+function parseClick(value: Buffer | null): {code: string; ts: number} | null {
+  try {
+    const event = JSON.parse(value?.toString() ?? '') as {code?: unknown; ts?: unknown};
+    if (typeof event.code !== 'string' || typeof event.ts !== 'number') return null;
+    return {code: event.code, ts: event.ts};
+  } catch {
+    return null;
+  }
+}
+
+/** The worker: lives beside the API and runs until the consumer stops. */
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: 'clicks', fromBeginning: true});
+  await consumer.run({
+    autoCommit: false,
+    eachMessage: async ({topic, partition, message}) => {
+      const next = [{topic, partition, offset: String(Number(message.offset) + 1)}];
+      const click = parseClick(message.value);
+      if (click === null) {
+        console.warn(\`skipping malformed record at offset \${message.offset}\`);
+        await consumer.commitOffsets(next);
+        return;
+      }
+      const key = dayKey(click.ts);
+      await redis.zincrby(key, 1, click.code);
+      await redis.expire(key, RETENTION_S);
+      await consumer.commitOffsets(next);
+    },
+  });
+}
+
+app.get('/top', async request => {
+  const {day} = request.query as {day?: string};
+  const key = \`top:\${day ?? new Date().toISOString().slice(0, 10)}\`;
+  const rows = await redis.zrevrange(key, 0, TOP_N - 1, 'WITHSCORES');
+  const top: {code: string; clicks: number}[] = [];
+  for (let i = 0; i < rows.length; i += 2) top.push({code: rows[i], clicks: Number(rows[i + 1])});
+  return top;
+});
 `,
     },
     go: {
@@ -795,6 +908,90 @@ async def check_top_endpoint(ctx):
     async with ctx.client(m.app) as c:
         r = await c.get("/top")
     assert [row.get("code") for row in r.json()] == ["today2", "today1"], f"without ?day the endpoint reads today's set ({today}), got {r.json()}"
+`,
+    typescript: `const DAY = '2026-10-05';
+const TS = Date.UTC(2026, 9, 5, 12) / 1000;
+const NEXT_DAY_TS = TS + 86400;
+const KEY = 'top:' + DAY;
+
+/** clicks: [code, ts] pairs, or just codes (clicked on DAY). */
+function seed(ctx, ...clicks: (string | [string, number])[]) {
+  for (const click of clicks) {
+    const [code, ts] = typeof click === 'string' ? [click, TS] : click;
+    ctx.kafka.seed('clicks', {key: code, value: JSON.stringify({code, ts, referrer: null, ua: null})});
+  }
+}
+
+export async function check_consumer(ctx) {
+  seed(ctx, 'g9Xc');
+  const m = ctx.load('top_links');
+  await ctx.drain(m.run());
+  const subscriptions = ctx.kafka.events.filter(e => e[0] === 'subscribe');
+  assert(subscriptions.length > 0, 'the consumer must subscribe to a topic');
+  const [, group, topics] = subscriptions.at(-1);
+  assert.equal(group, 'top-links', \`groupId must be top-links, got \${JSON.stringify(group)}\`);
+  assert(topics.includes('clicks'), \`the consumer must subscribe to clicks, got \${JSON.stringify(topics)}\`);
+  assert.equal(ctx.kafka.consumers.at(-1).autoCommit, false, 'autoCommit is on: offsets would be acknowledged on a timer, before the click is counted');
+  assert(!ctx.kafka.events.some(e => e[0] === 'auto-commit'), 'offsets were auto-committed');
+  assert(ctx.kafka.events.some(e => e[0] === 'manual-commit'), 'no explicit commit happened after processing');
+  assert.equal(ctx.kafka.lag('top-links', 'clicks'), 0, 'every processed record must be committed');
+}
+
+export async function check_zincrby(ctx) {
+  seed(ctx, 'g9Xc', 'zz12', 'g9Xc', ['g9Xc', NEXT_DAY_TS], 'g9Xc');
+  const m = ctx.load('top_links');
+  await ctx.drain(m.run());
+  assert.equal(ctx.redis.type(KEY), 'zset', \`\${KEY} is \${JSON.stringify(ctx.redis.type(KEY))}, expected a sorted set (keys: \${JSON.stringify(ctx.redis.keys('*'))})\`);
+  assert.equal(Number(ctx.redis.zscore(KEY, 'g9Xc')), 3, \`g9Xc in \${KEY} scores \${JSON.stringify(ctx.redis.zscore(KEY, 'g9Xc'))}, expected 3\`);
+  assert.equal(Number(ctx.redis.zscore(KEY, 'zz12')), 1, \`zz12 in \${KEY} scores \${JSON.stringify(ctx.redis.zscore(KEY, 'zz12'))}, expected 1\`);
+  const nextKey = m.dayKey(NEXT_DAY_TS);
+  assert.equal(Number(ctx.redis.zscore(nextKey, 'g9Xc')), 1, \`a click on the next day counts in \${nextKey}: g9Xc scores \${JSON.stringify(ctx.redis.zscore(nextKey, 'g9Xc'))}, expected 1\`);
+}
+
+export async function check_expire(ctx) {
+  seed(ctx, 'g9Xc');
+  const m = ctx.load('top_links');
+  await ctx.drain(m.run());
+  const ttl = ctx.redis.ttl(KEY);
+  assert(ttl > 0, \`\${KEY} has no expiry (TTL \${ttl}): day leaderboards would accumulate forever\`);
+  assert(604800 - 60 <= ttl && ttl <= 604800, \`\${KEY} expires in \${ttl} s, expected 7 days (604800)\`);
+  ctx.clock.advance(604801);
+  assert.equal(ctx.redis.exists(KEY), 0, \`\${KEY} must be gone after 7 days\`);
+}
+
+export async function check_commit_after(ctx) {
+  seed(ctx, 'g9Xc');
+  ctx.kafka.seed('clicks', {key: 'bad', value: 'not json'});
+  ctx.kafka.seed('clicks', {key: 'bad', value: JSON.stringify({referrer: null})});
+  const click = ctx.kafka.records('clicks')[0];
+  const atCommit: [Map<string, number>, number | null][] = [];
+  ctx.kafka.onCommit((group, offsets) => atCommit.push([new Map(offsets), ctx.redis.zscore(KEY, 'g9Xc')]));
+  const m = ctx.load('top_links');
+  await ctx.drain(m.run());
+  assert(atCommit.length > 0, 'no offset was ever committed');
+  const covering = atCommit.filter(([offsets]) => (offsets.get(\`clicks|\${click.partition}\`) ?? 0) > click.offset).map(([, score]) => score);
+  assert(covering.length > 0, 'the g9Xc click was never committed');
+  assert.equal(Number(covering[0]), 1, \`the commit must come after ZINCRBY: when the g9Xc click was committed it scored \${JSON.stringify(covering[0])}\`);
+  assert.equal(ctx.kafka.lag('top-links', 'clicks'), 0, 'malformed records must be skipped and committed, not left to replay forever');
+  assert.equal(ctx.redis.zcard(KEY), 1, \`malformed records must not be counted: \${JSON.stringify(ctx.redis.zrange(KEY, 0, -1))}\`);
+}
+
+export async function check_top_endpoint(ctx) {
+  const m = ctx.load('top_links');
+  const codes = Array.from({length: 12}, (_, i) => \`code\${String(i).padStart(2, '0')}\`);
+  ctx.redis.zadd(KEY, ...codes.flatMap((code, i) => [100 - i, code]));
+  const c = ctx.client(m.app);
+  let r = await c.get('/top', {query: {day: DAY}});
+  assert.equal(r.status, 200, \`GET /top?day=\${DAY} answered \${r.status}\`);
+  const rows = r.json();
+  assert(Array.isArray(rows) && rows.length === 10, \`expected the 10 top codes, got \${r.text}\`);
+  assert.deepEqual(rows.map(row => row.code), codes.slice(0, 10), \`rows must be in descending score order: \${JSON.stringify(rows.map(row => row.code))}\`);
+  assert.deepEqual(rows.map(row => row.clicks), codes.slice(0, 10).map((_, i) => 100 - i), \`each row carries the click count: \${r.text}\`);
+  const today = 'top:' + new Date().toISOString().slice(0, 10);
+  ctx.redis.zadd(today, 2, 'today1', 5, 'today2');
+  r = await c.get('/top');
+  assert.deepEqual(r.json().map(row => row.code), ['today2', 'today1'], \`without ?day the endpoint reads today's set (\${today}), got \${r.text}\`);
+}
 `,
   },
   debrief: `A sorted set is the leaderboard data structure: ZINCRBY keeps it ordered on every write, and the top 10 is one O(log n + 10) read — no scan, no sort at query time. Keying by day gives a natural partition and a natural expiry; a 7-day TTL bounds memory without any cleanup job. Where the commit sits relative to the increment decides the guarantee: process-then-commit is at-least-once, and a leaderboard can afford a rare duplicate. Real analytics pipelines also keep a hourly set, merge days with ZUNIONSTORE for "this week", and write the raw clicks to a warehouse for the questions a sorted set cannot answer (clicks by country, by referrer).`,

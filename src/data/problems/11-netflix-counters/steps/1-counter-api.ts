@@ -71,6 +71,13 @@ Implement the three routes:
             /@app\.delete\(\s*["']\/counters\/\{ns\}\/\{name\}["']/,
           ],
         },
+        typescript: {
+          all: [
+            /app\.post\(\s*['"]\/counters\/:ns\/:name\/add['"]/,
+            /app\.get\(\s*['"]\/counters\/:ns\/:name['"]/,
+            /app\.delete\(\s*['"]\/counters\/:ns\/:name['"]/,
+          ],
+        },
         go: {
           all: [
             /HandleFunc\(\s*"POST \/counters\/\{ns\}\/\{name\}\/add"/,
@@ -103,6 +110,7 @@ Implement the three routes:
         'Look the namespace up in `NAMESPACES` before anything else and answer `404 Not Found` when it is missing: counters only exist inside a configured namespace.',
       match: {
         python: {all: [/NAMESPACES\.get\(|in NAMESPACES/, /status_code\s*=\s*404/]},
+        typescript: {all: [/NAMESPACES\[/, /notFound\(|code\(\s*404\s*\)|HttpError\(\s*404/]},
         go: {all: [/namespaces\[/, /http\.StatusNotFound|\b404\b/]},
         scala: {all: [/Namespaces\.get\(|Namespaces\.contains\(/, /StatusCodes\.NotFound|\b404\b/]},
         cpp: {all: [/kNamespaces\.find\(|kNamespaces\.count\(/, /(status\s*=|fail\(\s*res\s*,)\s*404/]},
@@ -115,6 +123,7 @@ Implement the three routes:
         'The name must match `NAME_RE`, the delta must be non-zero and within `±MAX_DELTA`, and an eventually-consistent add must carry a token; each failure is a `400 Bad Request`.',
       match: {
         python: {all: [/NAME_RE\.(fullmatch|match)\(/, /MAX_DELTA/, /status_code\s*=\s*400/]},
+        typescript: {all: [/NAME_RE\.test\(/, /MAX_DELTA/, /badRequest\(|code\(\s*400\s*\)|HttpError\(\s*400/]},
         go: {all: [/nameRe\.MatchString\(/, /maxDelta/, /http\.StatusBadRequest|\b400\b/]},
         scala: {
           all: [
@@ -133,6 +142,7 @@ Implement the three routes:
         'A best-effort namespace calls `add_best_effort` and returns the new count with `200`; an eventually-consistent one calls `append_event` and answers `202 Accepted` — the count is not yet visible — or `503` when the event could not be made durable.',
       match: {
         python: {all: [/(?<!def )add_best_effort\(/, /(?<!def )append_event\(/, /status_code\s*=\s*202/, /"count"/]},
+        typescript: {all: [/\baddBestEffort\(/, /\bappendEvent\(/, /code\(\s*202\s*\)/, /count:/]},
         go: {all: [/(?<!func )addBestEffort\(/, /(?<!func )appendEvent\(/, /http\.StatusAccepted|\b202\b/, /"count"/]},
         scala: {
           all: [/(?<!def )addBestEffort\(/, /(?<!def )appendEvent\(/, /StatusCodes\.Accepted|\b202\b/, /"count"/],
@@ -153,6 +163,15 @@ Implement the three routes:
             /(?<!def )clear_best_effort\(/,
             /(?<!def )clear_rolled_up\(/,
             /status_code\s*=\s*204/,
+          ],
+        },
+        typescript: {
+          all: [
+            /\bgetBestEffort\(/,
+            /\bgetRolledUp\(/,
+            /\bclearBestEffort\(/,
+            /\bclearRolledUp\(/,
+            /code\(\s*204\s*\)/,
           ],
         },
         go: {
@@ -312,6 +331,128 @@ def clear(ns: str, name: str) -> Response:
 
 
 # uvicorn counter_api:app --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+
+import {addCount as addBestEffort, clearCount as clearBestEffort, getCount as getBestEffort} from './best_effort'; // built in step 2
+import {EventNotDurable, appendEvent} from './count_events'; // built in step 3: logs the add durably, or throws EventNotDurable
+import {clearCount as clearRolledUp, getCount as getRolledUp} from './rollup'; // built in step 4: the sum over the minute buckets
+
+export const app = Fastify();
+
+type Kind = 'best_effort' | 'eventually_consistent';
+
+// Namespaces and their counter type (provided): configured per use case, never chosen per request.
+export const NAMESPACES: Record<string, Kind> = {
+  views: 'best_effort',
+  plays: 'eventually_consistent',
+};
+export const NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+export const MAX_DELTA = 1_000_000;
+
+interface CounterParams {
+  ns: string;
+  name: string;
+}
+
+interface AddBody {
+  delta?: number;
+  token?: string;
+}
+
+app.post('/counters/:ns/:name/add', async (request, reply) => {
+  const {ns, name} = request.params as CounterParams;
+  const {delta = 0, token = ''} = (request.body ?? {}) as AddBody;
+  // TODO: 404 unless ns is in NAMESPACES; 400 unless NAME_RE matches name
+  // TODO: 400 when delta is 0 or beyond ±MAX_DELTA; eventually_consistent → 400 without a token
+  // TODO: best_effort → addBestEffort → 200 {count}
+  // TODO: eventually_consistent → appendEvent → 202 {accepted: true}; EventNotDurable → 503
+  return reply.code(501).send();
+});
+
+app.get('/counters/:ns/:name', async (request, reply) => {
+  const {ns, name} = request.params as CounterParams;
+  // TODO: same 404 / 400; best_effort → getBestEffort, else getRolledUp → 200 {count}
+  return reply.code(501).send();
+});
+
+app.delete('/counters/:ns/:name', async (request, reply) => {
+  const {ns, name} = request.params as CounterParams;
+  // TODO: same 404 / 400; clearBestEffort or clearRolledUp → 204
+  return reply.code(501).send();
+});
+`,
+      solution: `import Fastify from 'fastify';
+
+import {addCount as addBestEffort, clearCount as clearBestEffort, getCount as getBestEffort} from './best_effort'; // built in step 2
+import {EventNotDurable, appendEvent} from './count_events'; // built in step 3: logs the add durably, or throws EventNotDurable
+import {clearCount as clearRolledUp, getCount as getRolledUp} from './rollup'; // built in step 4: the sum over the minute buckets
+
+export const app = Fastify();
+
+type Kind = 'best_effort' | 'eventually_consistent';
+
+// Namespaces and their counter type (provided): configured per use case, never chosen per request.
+export const NAMESPACES: Record<string, Kind> = {
+  views: 'best_effort',
+  plays: 'eventually_consistent',
+};
+export const NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+export const MAX_DELTA = 1_000_000;
+
+interface CounterParams {
+  ns: string;
+  name: string;
+}
+
+interface AddBody {
+  delta?: number;
+  token?: string;
+}
+
+/** The namespace's counter type, or the 404 / 400 every route shares. */
+function resolve(ns: string, name: string): Kind {
+  const kind = NAMESPACES[ns];
+  if (kind === undefined) throw app.httpErrors.notFound('unknown namespace');
+  if (!NAME_RE.test(name)) throw app.httpErrors.badRequest('name must match [A-Za-z0-9_-]{1,64}');
+  return kind;
+}
+
+app.post('/counters/:ns/:name/add', async (request, reply) => {
+  const {ns, name} = request.params as CounterParams;
+  const kind = resolve(ns, name);
+  const {delta = 0, token = ''} = (request.body ?? {}) as AddBody;
+  if (!Number.isInteger(delta) || delta === 0 || Math.abs(delta) > MAX_DELTA)
+    throw app.httpErrors.badRequest('delta must be a non-zero integer within ±1000000');
+  if (kind === 'best_effort') return reply.code(200).send({count: await addBestEffort(ns, name, delta)});
+  if (typeof token !== 'string' || token === '')
+    throw app.httpErrors.badRequest('token is required: it is what makes a retry safe');
+  try {
+    await appendEvent(ns, name, delta, token);
+  } catch (e) {
+    if (e instanceof EventNotDurable)
+      throw app.httpErrors.serviceUnavailable('the event is not durable yet: retry with the same token');
+    throw e;
+  }
+  return reply.code(202).send({accepted: true});
+});
+
+app.get('/counters/:ns/:name', async (request, reply) => {
+  const {ns, name} = request.params as CounterParams;
+  const kind = resolve(ns, name);
+  const count = kind === 'best_effort' ? await getBestEffort(ns, name) : await getRolledUp(ns, name);
+  return reply.code(200).send({count});
+});
+
+app.delete('/counters/:ns/:name', async (request, reply) => {
+  const {ns, name} = request.params as CounterParams;
+  const kind = resolve(ns, name);
+  if (kind === 'best_effort') await clearBestEffort(ns, name);
+  else await clearRolledUp(ns, name);
+  return reply.code(204).send();
+});
 `,
     },
     go: {
@@ -1001,6 +1142,160 @@ async def check_read_clear_dispatch(ctx):
         assert ctx.redis.exists("rollup:plays:trailer-7") == 0, "DELETE /counters/plays/trailer-7 must clear the rolled-up buckets rollup:plays:trailer-7"
         count = await _count(c, "plays", "trailer-7")
         assert count == 0, f"after the clear plays/trailer-7 reads 0, got {count}"
+`,
+    typescript: `const TOPIC = 'counter-events';
+
+/** The API as it runs: on the best-effort counters (step 2), the event log (step 3) and the rollup (step 4). */
+function api(ctx) {
+  const m = ctx.load('counter_api');
+  const rollup = ctx.load('rollup'); // the rollup worker whose buckets the API reads eventually-consistent counts from
+  return {c: ctx.client(m.app), rollup};
+}
+
+/** [status, body] the API answered; body is null when it is not JSON. */
+async function call(c, method, url, json?) {
+  const r = await c.request(method, url, json === undefined ? {} : {json});
+  let body = null;
+  try {
+    body = r.json();
+  } catch {
+    body = null;
+  }
+  return [r.status, body];
+}
+
+async function count(c, ns, name) {
+  const [status, body] = await call(c, 'GET', \`/counters/\${ns}/\${name}\`);
+  assert.equal(status, 200, \`GET /counters/\${ns}/\${name} answered \${status}, expected 200 with the count\`);
+  return body?.count;
+}
+
+function untouched(ctx, what) {
+  const keys = ctx.redis.keys('*');
+  const events = ctx.kafka.records(TOPIC);
+  assert(keys.length === 0 && events.length === 0, \`\${what} must be refused before any store is touched, yet Redis holds \${JSON.stringify(keys)} and \${TOPIC} holds \${events.length} event(s)\`);
+}
+
+export async function check_routes(ctx) {
+  const {c} = api(ctx);
+  let [status] = await call(c, 'POST', '/counters/views/trailer-7/add', {delta: 1, token: 't-1'});
+  assert(![404, 405].includes(status), \`POST /counters/views/trailer-7/add answered \${status}: no handler is registered for it\`);
+  assert.equal(status, 200, \`a best-effort add answered \${status}, expected 200\`);
+  [status] = await call(c, 'GET', '/counters/views/trailer-7');
+  assert(![404, 405].includes(status), \`GET /counters/views/trailer-7 answered \${status}: no handler is registered for it\`);
+  assert.equal(status, 200, \`GET on a configured namespace answered \${status}, expected 200\`);
+  [status] = await call(c, 'DELETE', '/counters/views/trailer-7');
+  assert(![404, 405].includes(status), \`DELETE /counters/views/trailer-7 answered \${status}: no handler is registered for it\`);
+  assert.equal(status, 204, \`DELETE answered \${status}, expected 204\`);
+  [status] = await call(c, 'POST', '/counters/plays/stranger-things/add', {delta: 1, token: 't-2'});
+  assert.equal(status, 202, \`POST /counters/plays/stranger-things/add answered \${status}, expected 202\`);
+  [status] = await call(c, 'GET', '/counters/plays/stranger-things');
+  assert.equal(status, 200, \`GET /counters/plays/stranger-things answered \${status}, expected 200\`);
+  [status] = await call(c, 'DELETE', '/counters/plays/stranger-things');
+  assert.equal(status, 204, \`DELETE /counters/plays/stranger-things answered \${status}, expected 204\`);
+}
+
+export async function check_unknown_namespace(ctx) {
+  const {c} = api(ctx);
+  let [status] = await call(c, 'POST', '/counters/likes/trailer-7/add', {delta: 1, token: 't-1'});
+  assert.equal(status, 404, \`namespace 'likes' is not configured: expected 404, got \${status}\`);
+  [status] = await call(c, 'GET', '/counters/likes/trailer-7');
+  assert.equal(status, 404, \`GET on an unknown namespace answered \${status}, expected 404\`);
+  [status] = await call(c, 'DELETE', '/counters/likes/trailer-7');
+  assert.equal(status, 404, \`DELETE on an unknown namespace answered \${status}, expected 404\`);
+  [status] = await call(c, 'POST', '/counters/likes/bad%20name/add', {delta: 0});
+  assert.equal(status, 404, \`the namespace is checked first: an unknown namespace with a bad name and a bad delta is still a 404, got \${status}\`);
+  untouched(ctx, 'an add to an unknown namespace');
+}
+
+export async function check_validate(ctx) {
+  const {c} = api(ctx);
+  for (const bad of ['bad name', 'dots.are.out', 'a'.repeat(65), 'caf\\u00e9']) {
+    const path = encodeURIComponent(bad);
+    let [status] = await call(c, 'POST', \`/counters/views/\${path}/add\`, {delta: 1, token: 't-1'});
+    assert.equal(status, 400, \`name \${JSON.stringify(bad)} does not match NAME_RE: expected 400, got \${status}\`);
+    [status] = await call(c, 'POST', \`/counters/plays/\${path}/add\`, {delta: 1, token: 't-1'});
+    assert.equal(status, 400, \`name \${JSON.stringify(bad)} does not match NAME_RE: an eventually-consistent add answered \${status}, expected 400\`);
+    [status] = await call(c, 'GET', \`/counters/views/\${path}\`);
+    assert.equal(status, 400, \`GET with name \${JSON.stringify(bad)} answered \${status}, expected 400\`);
+  }
+  for (const delta of [0, 1_000_001, -1_000_001]) {
+    let [status] = await call(c, 'POST', '/counters/views/trailer-7/add', {delta, token: 't-1'});
+    assert.equal(status, 400, \`delta \${delta} is zero or beyond ±MAX_DELTA: expected 400, got \${status}\`);
+    [status] = await call(c, 'POST', '/counters/plays/stranger-things/add', {delta, token: 't-1'});
+    assert.equal(status, 400, \`delta \${delta} is zero or beyond ±MAX_DELTA: an eventually-consistent add answered \${status}, expected 400\`);
+  }
+  let [status] = await call(c, 'POST', '/counters/plays/stranger-things/add', {delta: 1});
+  assert.equal(status, 400, \`an eventually-consistent add without a token answered \${status}, expected 400: the token is the idempotency key\`);
+  [status] = await call(c, 'POST', '/counters/plays/stranger-things/add', {delta: 1, token: ''});
+  assert.equal(status, 400, \`an empty token is no token: expected 400, got \${status}\`);
+  untouched(ctx, 'a request with a bad name, delta or token');
+  [status] = await call(c, 'POST', '/counters/views/trailer-7/add', {delta: -1_000_000});
+  assert.equal(status, 200, \`a best-effort add of exactly -MAX_DELTA without a token is valid: expected 200, got \${status}\`);
+  [status] = await call(c, 'POST', '/counters/views/trailer_7-v2/add', {delta: 1_000_000, token: 't-1'});
+  assert.equal(status, 200, \`name 'trailer_7-v2' and delta MAX_DELTA are valid: expected 200, got \${status}\`);
+}
+
+export async function check_add_dispatch(ctx) {
+  const {c, rollup} = api(ctx);
+  let [status, body] = await call(c, 'POST', '/counters/views/trailer-7/add', {delta: 3, token: 't-1'});
+  assert.equal(status, 200, \`a best-effort add answered \${status}, expected 200\`);
+  assert.equal(body?.count, 3, \`the 200 body must carry the new count of the best-effort counter, got \${JSON.stringify(body)}\`);
+  [status, body] = await call(c, 'POST', '/counters/views/trailer-7/add', {delta: 4});
+  assert.equal(body?.count, 7, \`the second add must return the running count 7, got \${status} \${JSON.stringify(body)}\`);
+  assert.equal(ctx.redis.get('counter:views:trailer-7'), '7', \`best-effort adds move the cached counter counter:views:trailer-7 at once: it holds \${JSON.stringify(ctx.redis.get('counter:views:trailer-7'))}, expected 7\`);
+  assert.equal(ctx.kafka.records(TOPIC).length, 0, \`a best-effort add is not logged as an event, yet \${TOPIC} holds \${JSON.stringify(ctx.kafka.values(TOPIC))}\`);
+
+  [status, body] = await call(c, 'POST', '/counters/plays/stranger-things/add', {delta: 1, token: 't-9f3'});
+  assert.equal(status, 202, \`an eventually-consistent add answered \${status}, expected 202: the count is not visible yet\`);
+  assert(!('count' in (body ?? {})), \`a 202 must not claim a count the rollup has not computed, got \${JSON.stringify(body)}\`);
+  const seen = ctx.kafka.values(TOPIC).map(v => JSON.parse(v)).map(e => [e.ns, e.name, e.delta, e.token]);
+  assert.deepEqual(seen, [['plays', 'stranger-things', 1, 't-9f3']], \`an eventually-consistent add is one event on \${TOPIC} carrying the delta and the client's token, found \${JSON.stringify(seen)}\`);
+  assert.deepEqual(ctx.redis.keys('counter:*'), ['counter:views:trailer-7'], \`an eventually-consistent add must not touch a best-effort counter, Redis holds \${JSON.stringify(ctx.redis.keys('counter:*'))}\`);
+  let n = await count(c, 'plays', 'stranger-things');
+  assert.equal(n, 0, \`before the rollup has folded the event the count is not visible yet: GET answered \${n}, expected 0\`);
+  await ctx.drain(rollup.run());
+  n = await count(c, 'plays', 'stranger-things');
+  assert.equal(n, 1, \`once the rollup has folded the event GET must show it: expected 1, got \${n}\`);
+
+  ctx.kafka.stall(TOPIC); // the cluster stops acknowledging
+  const start = ctx.clock.now();
+  [status, body] = await call(c, 'POST', '/counters/plays/stranger-things/add', {delta: 2, token: 't-a1'});
+  const waited = (ctx.clock.now() - start) / 1000;
+  assert.notEqual(status, 202, 'with the broker down the event could not be made durable, yet the add answered 202: the client was promised a count that may never arrive');
+  assert.equal(status, 503, \`with the broker down the add answered \${status}: an event that is not durable (EventNotDurable) is a 503, which tells the client to retry with the same token\`);
+  assert(waited <= 1.5, \`with the broker down the add took \${waited.toFixed(0)} s to answer 503: it must fail as fast as appendEvent gives up (about 1 s)\`);
+  ctx.kafka.resume(TOPIC);
+  [status, body] = await call(c, 'POST', '/counters/plays/stranger-things/add', {delta: 2, token: 't-a1'});
+  assert.equal(status, 202, \`the client's retry with the same token, once the broker is back, answered \${status}, expected 202\`);
+  await ctx.drain(rollup.run());
+  n = await count(c, 'plays', 'stranger-things');
+  assert.equal(n, 3, \`the failed add and its retry carry the client's token t-a1, so the rollup counts the 2 once: expected 1 + 2 = 3, GET answered \${n}\`);
+}
+
+export async function check_read_clear_dispatch(ctx) {
+  const {c, rollup} = api(ctx);
+  await call(c, 'POST', '/counters/views/trailer-7/add', {delta: 5});
+  await call(c, 'POST', '/counters/plays/trailer-7/add', {delta: 1200, token: 't-1'});
+  await call(c, 'POST', '/counters/plays/trailer-7/add', {delta: 7, token: 't-2'});
+  await ctx.drain(rollup.run());
+  let n = await count(c, 'views', 'trailer-7');
+  assert.equal(n, 5, \`GET on the best-effort views/trailer-7 must answer its cached count 5, got \${n}\`);
+  n = await count(c, 'plays', 'trailer-7');
+  assert.equal(n, 1207, \`GET on the eventually-consistent plays/trailer-7 must answer the rolled-up 1207, got \${n}\`);
+  let [status] = await call(c, 'DELETE', '/counters/views/trailer-7');
+  assert.equal(status, 204, \`DELETE on a best-effort counter answered \${status}, expected 204\`);
+  assert.equal(ctx.redis.exists('counter:views:trailer-7'), 0, 'DELETE /counters/views/trailer-7 must clear the cached counter counter:views:trailer-7');
+  n = await count(c, 'views', 'trailer-7');
+  assert.equal(n, 0, \`after the clear views/trailer-7 reads 0, got \${n}\`);
+  n = await count(c, 'plays', 'trailer-7');
+  assert.equal(n, 1207, \`clearing views/trailer-7 must leave plays/trailer-7 alone: expected 1207, got \${n}\`);
+  [status] = await call(c, 'DELETE', '/counters/plays/trailer-7');
+  assert.equal(status, 204, \`DELETE on an eventually-consistent counter answered \${status}, expected 204\`);
+  assert.equal(ctx.redis.exists('rollup:plays:trailer-7'), 0, 'DELETE /counters/plays/trailer-7 must clear the rolled-up buckets rollup:plays:trailer-7');
+  n = await count(c, 'plays', 'trailer-7');
+  assert.equal(n, 0, \`after the clear plays/trailer-7 reads 0, got \${n}\`);
+}
 `,
   },
   debrief: `The API is the whole abstraction: callers see AddCount, GetCount and ClearCount, and the namespace — not the request — decides which machinery runs. That is why the namespace is checked first and why the two adds answer differently: a 200 with a count is a promise that the number moved, a 202 is a promise that it will, and the second promise is the only one a durable log can make synchronously. The token is required only where it has a consumer; asking a cache to honour it would be a lie. Netflix's real control plane also configures cardinality and TTL per namespace, offers AddAndGetCount, and treats a clear as just another event in the log rather than a direct delete.`,

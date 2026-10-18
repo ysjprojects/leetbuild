@@ -42,6 +42,7 @@ the redirect handler calls it right after answering — so each click produces o
       detail: 'The record goes to the `clicks` topic.',
       match: {
         python: {all: [/"clicks"/, /producer\.produce\(/]},
+        typescript: {all: [/['"]clicks['"]/, /producer\.send\(/]},
         go: {all: [/"clicks"/, /WriteMessages\(/]},
         scala: {all: [/"clicks"/, /producer\.send\(/]},
         cpp: {all: [/"clicks"/, /producer->produce\(/]},
@@ -53,6 +54,7 @@ the redirect handler calls it right after answering — so each click produces o
       detail: 'Setting the key to the code keeps all clicks of one link on one partition, in order.',
       match: {
         python: {all: [/produce\([^\n]*key\s*=\s*code/]},
+        typescript: {all: [/key:\s*code\b/]},
         go: {all: [/Key:\s*\[\]byte\(\s*code\s*\)/]},
         scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*Topic\s*,\s*code\s*,/]},
         cpp: {all: [/produce\([\s\S]{0,400}?code\.(c_str|data)\(\)\s*,\s*code\.(size|length)\(\)/]},
@@ -65,6 +67,10 @@ the redirect handler calls it right after answering — so each click produces o
         'Enqueue and return; serve delivery callbacks with `poll(0)` (or async writes) instead of blocking on an acknowledgement.',
       match: {
         python: {all: [/producer\.poll\(\s*0\s*\)/], none: [/def record_click(?:(?!\ndef )[\s\S])*?producer\.flush\(/]},
+        typescript: {
+          all: [/producer\.send\(/],
+          none: [/async function recordClick\b/, /function recordClick(?:(?!\n\})[\s\S])*?(await\s|producer\.send\()/],
+        },
         go: {all: [/Async:\s*true/], none: [/if err := writer\.WriteMessages/]},
         scala: {all: [/producer\.send\(\s*\w+\s*,/], none: [/\.send\([^\n]*\)\.get\(/]},
         cpp: {all: [/producer->poll\(\s*0\s*\)/], none: [/void record_click(?:(?!\n\})[\s\S])*?producer->flush\(/]},
@@ -76,6 +82,7 @@ the redirect handler calls it right after answering — so each click produces o
       detail: 'A delivery report callback logs failed records; nothing else needs to happen for a click.',
       match: {
         python: {all: [/on_delivery\s*=\s*on_delivery|callback\s*=\s*on_delivery/]},
+        typescript: {all: [/\.(catch|then)\([^\n]*onDelivery/]},
         go: {all: [/Completion:\s*func\(/]},
         scala: {all: [/onCompletion\(/]},
         cpp: {all: [/dr_cb\(|DeliveryReportCb/]},
@@ -87,6 +94,7 @@ the redirect handler calls it right after answering — so each click produces o
       detail: 'Buffered records are only sent when the producer flushes; do it once at shutdown.',
       match: {
         python: {all: [/def shutdown(?:(?!\ndef )[\s\S])*?producer\.flush\(/]},
+        typescript: {all: [/async function shutdown(?:(?!\n\})[\s\S])*?await [^\n]*(sendBatch\(\)|Promise\.all)/]},
         go: {all: [/func shutdown(?:(?!\n\})[\s\S])*?writer\.Close\(\)/]},
         scala: {all: [/def shutdown(?:(?!\n {2}def )[\s\S])*?producer\.(flush|close)\(/]},
         cpp: {all: [/void shutdown(?:(?!\n\})[\s\S])*?producer->flush\(/]},
@@ -149,6 +157,102 @@ def shutdown() -> None:
     remaining = producer.flush(timeout=5)
     if remaining:
         log.warning("%d clicks were not delivered", remaining)
+`,
+    },
+    typescript: {
+      starter: `import {Kafka, type Message} from 'kafkajs';
+
+export const TOPIC = 'clicks';
+const LINGER_MS = 5;
+
+const kafka = new Kafka({clientId: 'shortener', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+const ready = producer.connect();
+
+/** Logger (provided). */
+export const log = {
+  warn(message: string): void {
+    console.warn(message);
+  },
+};
+
+const buffered: Message[] = [];
+let linger: NodeJS.Timeout | null = null;
+const inflight = new Set<Promise<void>>();
+
+function onDelivery(err: Error, batch: Message[]): void {
+  // TODO: log a warning naming the clicks that were not delivered
+}
+
+/** Hands the buffered batch to the producer; failures are reported through onDelivery. */
+function sendBatch(): Promise<void> {
+  linger = null;
+  const batch = buffered.splice(0);
+  if (batch.length === 0) return Promise.resolve();
+  // TODO: producer.send the batch to TOPIC (acks: 1), .catch → onDelivery; track it in inflight
+  throw new Error('not implemented');
+}
+
+export function recordClick(code: string, referrer: string | null, ua: string | null): void {
+  const value = JSON.stringify({code, ts: Date.now() / 1000, referrer, ua});
+  // TODO: buffer {key: code, value}; start the linger timer (sendBatch) if none runs; never wait here
+  throw new Error('not implemented');
+}
+
+export async function shutdown(): Promise<void> {
+  // TODO: cancel the linger, send what is buffered and await every in-flight delivery, then disconnect
+  throw new Error('not implemented');
+}
+`,
+      solution: `import {Kafka, type Message} from 'kafkajs';
+
+export const TOPIC = 'clicks';
+const LINGER_MS = 5;
+
+const kafka = new Kafka({clientId: 'shortener', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+const ready = producer.connect();
+
+/** Logger (provided). */
+export const log = {
+  warn(message: string): void {
+    console.warn(message);
+  },
+};
+
+const buffered: Message[] = [];
+let linger: NodeJS.Timeout | null = null;
+const inflight = new Set<Promise<void>>();
+
+function onDelivery(err: Error, batch: Message[]): void {
+  log.warn(\`\${batch.length} click(s) not delivered (\${batch.map(m => m.key).join(', ')}): \${err.message}\`);
+}
+
+/** Hands the buffered batch to the producer; failures are reported through onDelivery. */
+function sendBatch(): Promise<void> {
+  linger = null;
+  const batch = buffered.splice(0);
+  if (batch.length === 0) return Promise.resolve();
+  const delivery = ready
+    .then(() => producer.send({topic: TOPIC, messages: batch, acks: 1}))
+    .then(() => undefined)
+    .catch((err: Error) => onDelivery(err, batch))
+    .finally(() => inflight.delete(delivery));
+  inflight.add(delivery);
+  return delivery;
+}
+
+export function recordClick(code: string, referrer: string | null, ua: string | null): void {
+  const value = JSON.stringify({code, ts: Date.now() / 1000, referrer, ua});
+  buffered.push({key: code, value});
+  if (linger === null) linger = setTimeout(sendBatch, LINGER_MS); // the batch goes out in the background
+}
+
+export async function shutdown(): Promise<void> {
+  if (linger !== null) clearTimeout(linger);
+  await Promise.all([...inflight, sendBatch()]);
+  await producer.disconnect();
+}
 `,
     },
     go: {
@@ -455,6 +559,84 @@ def check_flush(ctx):
     m.record_click("g9Xc", None, None)
     m.shutdown()
     assert ctx.kafka.flushes >= 1, "shutdown() must flush the producer"
+`,
+    typescript: `import {setTimeout as sleep} from 'node:timers/promises';
+
+function events(ctx) {
+  const m = ctx.load('click_events');
+  const warnings: string[] = [];
+  m.log.warn = (message: string) => {
+    warnings.push(message);
+  };
+  return {m, warnings};
+}
+
+/** Let the producer's linger pass and its deliveries settle. */
+async function settle(ctx) {
+  ctx.clock.advance(1);
+  await sleep(0);
+}
+
+export async function check_topic(ctx) {
+  const {m} = events(ctx);
+  m.recordClick('g9Xc', 'https://news.example/', 'Mozilla/5.0');
+  await settle(ctx);
+  const produced = ctx.kafka.records('clicks');
+  assert.equal(produced.length, 1, \`expected one record on clicks, found \${produced.length} (topics: \${JSON.stringify([...ctx.kafka.topics.keys()])})\`);
+  const event = JSON.parse(ctx.kafka.values('clicks')[0]);
+  assert.equal(event.code, 'g9Xc', \`the value must be JSON carrying the code: \${JSON.stringify(event)}\`);
+  assert(event.referrer === 'https://news.example/' && event.ua === 'Mozilla/5.0', \`the value must carry referrer and ua: \${JSON.stringify(event)}\`);
+  assert('ts' in event, 'the event must carry a timestamp');
+}
+
+export async function check_keyed(ctx) {
+  const {m} = events(ctx);
+  m.recordClick('g9Xc', null, null);
+  m.recordClick('g9Xc', 'https://other.example/', null);
+  m.recordClick('zz12', null, null);
+  await settle(ctx);
+  const produced = ctx.kafka.records('clicks');
+  assert.deepEqual(ctx.kafka.keys('clicks'), ['g9Xc', 'g9Xc', 'zz12'], \`records must be keyed by the code, got \${JSON.stringify(ctx.kafka.keys('clicks'))}\`);
+  assert.equal(produced[0].partition, produced[1].partition, 'the same code must land on the same partition');
+}
+
+/** recordClick while the broker sits on its acknowledgements for 2 s: whatever it returns must not sit with it. */
+async function clickWhileStalled(ctx, m) {
+  ctx.kafka.stall('clicks', 2);
+  const before = ctx.clock.now();
+  const returned = m.recordClick('g9Xc', null, null);
+  if (typeof returned?.then === 'function') await returned;
+  const waited = ctx.clock.now() - before;
+  assert(waited < 1000, \`recordClick took \${waited} ms while the broker was not acknowledging: the redirect would wait for the broker\`);
+}
+
+export async function check_non_blocking(ctx) {
+  const {m} = events(ctx);
+  await clickWhileStalled(ctx, m);
+  await settle(ctx);
+  assert.equal(ctx.kafka.records('clicks').length, 1, 'the click must still be handed to the producer');
+  await clickWhileStalled(ctx, m);
+  await settle(ctx);
+  assert.equal(ctx.kafka.records('clicks').length, 2);
+}
+
+export async function check_callback(ctx) {
+  const {m, warnings} = events(ctx);
+  ctx.kafka.failNext('clicks');
+  m.recordClick('g9Xc', null, null); // the failure arrives through the delivery callback, not as an exception
+  await settle(ctx);
+  m.recordClick('g9Xc', null, null);
+  await m.shutdown();
+  assert(warnings.length > 0, 'a failed delivery must be logged by the delivery callback');
+  assert.equal(ctx.kafka.records('clicks').length, 1, 'the second click must still be produced after the first one failed');
+}
+
+export async function check_flush(ctx) {
+  const {m} = events(ctx);
+  m.recordClick('g9Xc', null, null);
+  await m.shutdown();
+  assert.equal(ctx.kafka.records('clicks').length, 1, 'shutdown() must flush the buffered clicks to the broker');
+}
 `,
   },
   debrief: `A Kafka producer is a buffer with a background thread: \`produce\`/\`send\` costs microseconds, the network happens later in batches. That is what makes "one event per redirect" free — as long as nobody blocks on the acknowledgement. The key is the ordering and the partitioning contract at once: same code → same partition → the next step's consumer sees every click of a link in order, on one consumer. Real pipelines put the referrer through a domain allow-list before it reaches analytics, enrich the event with a geo lookup, and enable idempotent producers so their own retries cannot double-count a click.`,

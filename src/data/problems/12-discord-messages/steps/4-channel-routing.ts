@@ -75,6 +75,7 @@ Implement \`Ring\` and \`fetch_messages\`. \`_hash(key)\` (a 64-bit position), \
         'Each instance owns `VNODES` positions, hashed from `"{node}#{i}"`, so the split is even and a removal spreads over every survivor.',
       match: {
         python: {all: [/for \w+ in range\(\s*VNODES\s*\)/, /f"\{node\}#\{\w+\}"/, /insort\(|\.sort\(/]},
+        typescript: {all: [/for \(let \w+ = 0; \w+ < VNODES; \w+\+\+\)/, /`\$\{node\}#\$\{\w+\}`/, /\.sort\(/]},
         go: {all: [/for \w+ := 0; \w+ < vnodes; \w+\+\+/, /"%s#%d"/, /sort\.Slice\(/]},
         scala: {all: [/0 until VNodes/, /s"\$node#\$\w+"/, /points\.put\(/]},
         cpp: {
@@ -89,6 +90,7 @@ Implement \`Ring\` and \`fetch_messages\`. \`_hash(key)\` (a 64-bit position), \
         'Binary-search the sorted positions for the first one `>= _hash(str(key))`; past the end, wrap to the first point. An empty ring raises.',
       match: {
         python: {all: [/bisect_right\(|bisect_left\(|bisect\.bisect\(/, /%\s*len\(\s*self\._points\s*\)/, /raise /]},
+        typescript: {all: [/>=\s*h\b|<\s*h\b/, /%\s*this\.points\.length/, /throw /]},
         go: {all: [/sort\.Search\(/, /%\s*len\(\s*r\.points\s*\)/]},
         scala: {all: [/ceilingEntry\(/, /firstEntry\(\)/, /throw /]},
         cpp: {all: [/lower_bound\(/, /points_\.begin\(\)/, /throw /]},
@@ -101,6 +103,7 @@ Implement \`Ring\` and \`fetch_messages\`. \`_hash(key)\` (a 64-bit position), \
         'Points of the other instances stay where they are, so only the keys that mapped to the removed instance change homes.',
       match: {
         python: {all: [/def remove(?:(?!\n {4}def )[\s\S])*?(!= node|\.remove\()/]},
+        typescript: {all: [/remove\(node(?:(?!\n {2}[a-z])[\s\S])*?!==\s*node/]},
         go: {all: [/func \(r \*Ring\) Remove(?:(?!\n\})[\s\S])*?!= node/]},
         scala: {all: [/def remove(?:(?!\n {4}def )[\s\S])*?points\.remove\(/]},
         cpp: {all: [/void remove\([^\n]*\{(?:(?!\n {2}\})[\s\S])*?points_\.erase\(/]},
@@ -113,6 +116,7 @@ Implement \`Ring\` and \`fetch_messages\`. \`_hash(key)\` (a 64-bit position), \
         '`fetch_messages` asks `ring.pick(channel_id)` and uses that instance’s stub, so every request for one channel reaches the same data service.',
       match: {
         python: {all: [/ring\.pick\(\s*channel_id\s*\)/, /stubs\[\s*instance\s*\]\.GetMessages\(/]},
+        typescript: {all: [/ring\.pick\(\s*channelId\s*\)/, /stubs\[\s*instance\s*\]\.GetMessages\(/]},
         go: {all: [/ring\.Pick\(\s*strconv\.FormatInt\(\s*channelID/, /stubs\[\s*instance\s*\]\.GetMessages\(/]},
         scala: {all: [/ring\.pick\(\s*channelId\.toString\s*\)/, /stubs\(\s*instance\s*\)/]},
         cpp: {
@@ -127,6 +131,7 @@ Implement \`Ring\` and \`fetch_messages\`. \`_hash(key)\` (a 64-bit position), \
         'Every call carries `DEADLINE_S`; a data service that does not answer in time fails the request instead of holding the API thread.',
       match: {
         python: {all: [/GetMessages\([^\n]*timeout\s*=\s*DEADLINE_S/]},
+        typescript: {all: [/GetMessages\([^\n]*deadline:\s*(new Date\()?Date\.now\(\)\s*\+\s*DEADLINE_S\s*\*\s*1000/]},
         go: {all: [/context\.WithTimeout\(\s*ctx\s*,\s*deadline\s*\)/, /\.GetMessages\(\s*callCtx/]},
         scala: {all: [/withDeadlineAfter\(\s*DeadlineMillis\s*,\s*TimeUnit\.MILLISECONDS\s*\)/]},
         cpp: {all: [/set_deadline\([^\n]*kDeadline/]},
@@ -234,6 +239,132 @@ async def fetch_messages(channel_id: int, before: int, limit: int) -> list[messa
     request = messages_pb2.GetMessagesRequest(channel_id=channel_id, before=before, limit=limit)
     reply = await stubs[instance].GetMessages(request, timeout=DEADLINE_S)
     return list(reply.messages)
+`,
+    },
+    typescript: {
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import {createHash} from 'node:crypto';
+
+import type {GetMessagesReply, GetMessagesRequest, Message} from './data_service'; // the wire shapes (ids as decimal strings)
+
+export const INSTANCES = ['data-1:9000', 'data-2:9000', 'data-3:9000'];
+export const VNODES = 100;
+export const DEADLINE_S = 0.3;
+
+/** A 64-bit position on the ring (provided). */
+export function _hash(key: string): bigint {
+  return BigInt('0x' + createHash('md5').update(key).digest('hex').slice(0, 16));
+}
+
+/** Consistent hash ring: every instance owns VNODES points, a key goes to the first point clockwise. */
+export class Ring {
+  private points: [bigint, string][] = []; // [position, node], sorted by position
+
+  constructor(nodes: string[] = []) {
+    for (const node of nodes) this.add(node);
+  }
+
+  add(node: string): void {
+    // TODO: VNODES points at _hash(\`\${node}#\${i}\`), kept sorted by position
+  }
+
+  remove(node: string): void {
+    // TODO: drop this node's points, nothing else
+  }
+
+  pick(key: string | bigint): string {
+    // TODO: empty ring → throw; the node of the first point with position >= _hash(String(key)), wrapping around
+    throw new Error('not implemented');
+  }
+}
+
+interface MessageDataClient {
+  GetMessages(request: GetMessagesRequest, options: grpc.CallOptions): Promise<GetMessagesReply>;
+}
+
+const proto = grpc.loadPackageDefinition(protoLoader.loadSync('messages.proto', {longs: String})) as unknown as {
+  discord: {MessageData: grpc.ServiceClientConstructor};
+};
+
+export const ring = new Ring(INSTANCES);
+export const stubs: Record<string, MessageDataClient> = Object.fromEntries(
+  INSTANCES.map(node => [node, new proto.discord.MessageData(node, grpc.credentials.createInsecure()) as unknown as MessageDataClient]),
+);
+
+/** The page from the data service that owns the channel. */
+export async function fetch_messages(channelId: bigint, before: bigint, limit: number): Promise<Message[]> {
+  // TODO: instance = ring.pick(channelId); GetMessages on stubs[instance] with {deadline: Date.now() + DEADLINE_S * 1000}
+  // TODO: return reply.messages
+  throw new Error('not implemented');
+}
+`,
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import {createHash} from 'node:crypto';
+
+import type {GetMessagesReply, GetMessagesRequest, Message} from './data_service'; // the wire shapes (ids as decimal strings)
+
+export const INSTANCES = ['data-1:9000', 'data-2:9000', 'data-3:9000'];
+export const VNODES = 100;
+export const DEADLINE_S = 0.3;
+
+/** A 64-bit position on the ring (provided). */
+export function _hash(key: string): bigint {
+  return BigInt('0x' + createHash('md5').update(key).digest('hex').slice(0, 16));
+}
+
+/** Consistent hash ring: every instance owns VNODES points, a key goes to the first point clockwise. */
+export class Ring {
+  private points: [bigint, string][] = []; // [position, node], sorted by position
+
+  constructor(nodes: string[] = []) {
+    for (const node of nodes) this.add(node);
+  }
+
+  add(node: string): void {
+    for (let i = 0; i < VNODES; i++) this.points.push([_hash(\`\${node}#\${i}\`), node]);
+    this.points.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
+  }
+
+  remove(node: string): void {
+    this.points = this.points.filter(point => point[1] !== node); // every other point stays put
+  }
+
+  pick(key: string | bigint): string {
+    if (this.points.length === 0) throw new Error('no data-service instance is up');
+    const h = _hash(String(key));
+    let lo = 0; // binary search: the first point at or after the key's position
+    let hi = this.points.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (this.points[mid][0] < h) lo = mid + 1;
+      else hi = mid;
+    }
+    return this.points[lo % this.points.length][1];
+  }
+}
+
+interface MessageDataClient {
+  GetMessages(request: GetMessagesRequest, options: grpc.CallOptions): Promise<GetMessagesReply>;
+}
+
+const proto = grpc.loadPackageDefinition(protoLoader.loadSync('messages.proto', {longs: String})) as unknown as {
+  discord: {MessageData: grpc.ServiceClientConstructor};
+};
+
+export const ring = new Ring(INSTANCES);
+export const stubs: Record<string, MessageDataClient> = Object.fromEntries(
+  INSTANCES.map(node => [node, new proto.discord.MessageData(node, grpc.credentials.createInsecure()) as unknown as MessageDataClient]),
+);
+
+/** The page from the data service that owns the channel. */
+export async function fetch_messages(channelId: bigint, before: bigint, limit: number): Promise<Message[]> {
+  const instance = ring.pick(channelId);
+  const request: GetMessagesRequest = {channel_id: String(channelId), before: String(before), limit};
+  const reply = await stubs[instance].GetMessages(request, {deadline: Date.now() + DEADLINE_S * 1000});
+  return reply.messages;
+}
 `,
     },
     go: {
@@ -855,6 +986,176 @@ async def check_deadline(ctx):
         assert e.code() == grpc.StatusCode.DEADLINE_EXCEEDED, f"expected DEADLINE_EXCEEDED from the stalled instance, got {e.code()}"
     waited = ctx.clock.time() - started
     assert waited <= 0.5, f"the API waited {waited:.1f} s for a stalled instance, the deadline is 300 ms"
+`,
+    typescript: `import {status} from '@grpc/grpc-js';
+import {SCHEMA} from 'messages/db';
+
+const BUCKET_MS = 10 * 24 * 3600 * 1000;
+const INSERT = 'INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES ($1, $2, $3, $4, $5)';
+
+function sf(bucket: number, offsetMs = 0): bigint {
+  return (BigInt(bucket * BUCKET_MS + offsetMs) << 22n) | (1n << 17n);
+}
+
+const B = 430;
+const END = sf(B + 1, BUCKET_MS - 1);
+const CHANNELS = Array.from({length: 12}, (_, i) => sf(B, 1000 * i + 1)); // twelve channels created in bucket B
+
+/** What Postgres holds for CHANNELS[i], newest first. */
+function page(i: number): string[] {
+  return [\`\${i}:2\`, \`\${i}:1\`, \`\${i}:0\`];
+}
+
+/** The routing module, with step 3's data service — the real one, over Postgres — serving one instance at each of its INSTANCES. */
+async function cluster(ctx) {
+  await ctx.db.reset(SCHEMA);
+  for (const [i, channel] of CHANNELS.entries()) {
+    for (let j = 0; j < 3; j++) {
+      await ctx.db.execute(INSERT, [String(channel), B, String(sf(B, 1000 * i + 10 + j)), '7', \`\${i}:\${j}\`]);
+    }
+  }
+  const m = ctx.load('channel_routing');
+  const data = ctx.load('data_service');
+  assert(data.messageData !== undefined && typeof data.messageData.GetMessages === 'function', 'data_service (step 3) exports no messageData handlers to route to');
+  const service = ctx.proto('messages.proto').discord.MessageData.service;
+  for (const node of m.INSTANCES) ctx.grpc.serve(service, data.messageData, node);
+  return m;
+}
+
+/** fetch_messages for one channel: the contents it returned and the one GetMessages call it made. */
+async function fetch(ctx, m, channel: bigint) {
+  const n = ctx.grpc.callsTo('GetMessages').length;
+  const rows = await m.fetch_messages(channel, END, 50);
+  const calls = ctx.grpc.callsTo('GetMessages').slice(n);
+  assert.equal(calls.length, 1, \`fetch_messages for channel \${channel} made \${calls.length} GetMessages calls, expected one\`);
+  return {page: (rows as {content: string}[]).map(x => x.content), call: calls[0]};
+}
+
+/** The clockwise rule applied by hand: the first of the node#i points at or after _hash(String(key)). */
+function expected(m, nodes: string[], key: bigint): string {
+  const points: [bigint, string][] = nodes.flatMap(node => Array.from({length: m.VNODES as number}, (_, i): [bigint, string] => [m._hash(\`\${node}#\${i}\`), node]));
+  points.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  const h: bigint = m._hash(String(key));
+  for (const [position, node] of points) if (position >= h) return node;
+  return points[0][1];
+}
+
+const KEYS = (n: number): bigint[] => Array.from({length: n}, (_, i) => sf(425, i * 4096 * 7919));
+
+export async function check_virtual_nodes(ctx) {
+  const m = ctx.load('channel_routing');
+  assert(m.VNODES >= 50, \`VNODES is \${m.VNODES}: a handful of points per instance cannot split the ring evenly\`);
+  const ring = new m.Ring(m.INSTANCES);
+  const keys = KEYS(3000);
+  const shares = new Map<string, number>();
+  for (const k of keys) {
+    const node = ring.pick(k);
+    shares.set(node, (shares.get(node) ?? 0) + 1);
+  }
+  assert.deepEqual([...shares.keys()].sort(), [...m.INSTANCES].sort(), \`every instance must own part of the ring, picks landed on \${JSON.stringify([...shares.keys()])}\`);
+  for (const [node, n] of shares) {
+    assert(0.2 <= n / keys.length && n / keys.length <= 0.5, \`\${node} receives \${Math.round((100 * n) / keys.length)}% of 3000 channels; with VNODES points per instance the split should be close to a third each: \${JSON.stringify(Object.fromEntries(shares))}\`);
+  }
+  const only = new m.Ring(['data-9:9000']);
+  assert(keys.slice(0, 50).every(k => only.pick(k) === 'data-9:9000'), 'a ring with one instance picks it for every key');
+  assert.throws(() => new m.Ring([]).pick(CHANNELS[0]), 'pick on an empty ring must throw: there is no instance to route to');
+}
+
+export async function check_clockwise_pick(ctx) {
+  const m = ctx.load('channel_routing');
+  for (const nodes of [m.INSTANCES, m.INSTANCES.slice(0, 2), ['data-7:9000', 'data-8:9000', 'data-9:9000', 'data-10:9000']]) {
+    const ring = new m.Ring(nodes);
+    for (const key of KEYS(400)) {
+      const want = expected(m, nodes, key);
+      const got = ring.pick(key);
+      assert.equal(got, want, \`pick(\${key}) on \${JSON.stringify(nodes)} returned \${got}, expected \${want}: the first point at or after _hash(String(key)) among the VNODES points hashed from node#i, wrapping to the first point\`);
+    }
+  }
+  const a = new m.Ring(m.INSTANCES);
+  const b = new m.Ring([...m.INSTANCES].reverse());
+  assert(CHANNELS.every(k => a.pick(k) === b.pick(k)), 'the mapping must not depend on the order instances were added');
+}
+
+export async function check_remove_minimal(ctx) {
+  const m = ctx.load('channel_routing');
+  const ring = new m.Ring(m.INSTANCES);
+  const keys = KEYS(1500);
+  const before = new Map(keys.map(k => [k, ring.pick(k) as string]));
+  ring.remove('data-2:9000');
+  const after = new Map(keys.map(k => [k, ring.pick(k) as string]));
+  assert(![...after.values()].includes('data-2:9000'), 'a removed instance must receive nothing');
+  const stayed = keys.filter(k => before.get(k) !== 'data-2:9000');
+  const moved = stayed.filter(k => after.get(k) !== before.get(k));
+  assert.equal(moved.length, 0, \`\${moved.length} of \${stayed.length} channels that did not live on data-2 changed instance when data-2 left: removing a node must drop only its own points\`);
+  const orphans = keys.filter(k => before.get(k) === 'data-2:9000');
+  const homes = [...new Set(orphans.map(k => after.get(k)))].sort();
+  assert.deepEqual(homes, ['data-1:9000', 'data-3:9000'], \`data-2's channels must spread over both survivors, they went to \${JSON.stringify(homes)}\`);
+  ring.add('data-2:9000');
+  assert(keys.every(k => ring.pick(k) === before.get(k)), 'adding the instance back must restore the exact previous mapping');
+  ring.remove('data-1:9000');
+  ring.remove('data-3:9000');
+  assert(keys.slice(0, 20).every(k => ring.pick(k) === 'data-2:9000'), 'with one instance left every key goes to it');
+}
+
+export async function check_route_by_channel(ctx) {
+  const m = await cluster(ctx);
+  const homes = new Map<bigint, string>();
+  for (const [i, channel] of CHANNELS.entries()) {
+    const {page: got, call} = await fetch(ctx, m, channel);
+    const owner = m.ring.pick(channel);
+    assert.equal(call.target, owner, \`fetch_messages for channel \${channel} reached \${call.target}, but ring.pick says \${owner}: a channel's reads must go to the instance that owns it on the ring\`);
+    const request = call.request as {channel_id: unknown; before: unknown; limit: unknown};
+    assert.deepEqual([String(request.channel_id), String(request.before), Number(request.limit)], [String(channel), String(END), 50], \`the request must carry channel_id, before and limit as given, the data service received \${JSON.stringify(request)}\`);
+    assert.deepEqual(got, page(i), \`fetch_messages must return the data service's page for channel \${channel} (\${JSON.stringify(page(i))}), got \${JSON.stringify(got)}\`);
+    homes.set(channel, call.target);
+  }
+  assert(new Set(homes.values()).size >= 2, \`twelve channels all reached \${JSON.stringify([...new Set(homes.values())])}: the ring must spread channels over the instances\`);
+  for (let n = 0; n < 3; n++) {
+    const {call} = await fetch(ctx, m, CHANNELS[0]);
+    assert.equal(call.target, homes.get(CHANNELS[0]), \`repeated reads of one channel must all reach the same instance: \${homes.get(CHANNELS[0])} first, then \${call.target}\`);
+  }
+  const gone = homes.get(CHANNELS[0])!;
+  ctx.grpc.stop(gone); // the instance goes down; service discovery drops it from the ring
+  m.ring.remove(gone);
+  for (const [i, channel] of CHANNELS.entries()) {
+    let got: string[];
+    let call;
+    try {
+      ({page: got, call} = await fetch(ctx, m, channel));
+    } catch (e) {
+      if (e instanceof assert.AssertionError) throw e;
+      assert.fail(\`after \${gone} went down and left the ring, channel \${channel} failed with \${(e as {code?: number}).code}: its reads must follow the ring to a live instance\`);
+    }
+    assert.notEqual(call.target, gone, \`channel \${channel} still dialled \${gone} after it left the ring\`);
+    if (homes.get(channel) !== gone) {
+      assert.equal(call.target, homes.get(channel), \`channel \${channel} lived on \${homes.get(channel)}, which is still up, yet moved to \${call.target} when \${gone} left\`);
+    }
+    assert.equal(call.target, m.ring.pick(channel), \`channel \${channel} reached \${call.target}, but the ring now says \${m.ring.pick(channel)}\`);
+    assert.deepEqual(got, page(i), \`the new owner must answer channel \${channel}'s real page \${JSON.stringify(page(i))}, got \${JSON.stringify(got)}\`);
+  }
+}
+
+export async function check_deadline(ctx) {
+  const m = await cluster(ctx);
+  const channel = CHANNELS[1];
+  const {page: got, call} = await fetch(ctx, m, channel);
+  assert.deepEqual(got, page(1), \`expected channel \${channel}'s page \${JSON.stringify(page(1))}, got \${JSON.stringify(got)}\`);
+  assert(call.timeout !== null && call.timeout !== undefined, 'GetMessages carries no deadline: a stalled data service would hold the API request forever');
+  assert(0.25 <= call.timeout && call.timeout <= 0.35, \`the deadline must be 300 ms, the call carried \${call.timeout} s\`);
+  const owner = call.target;
+  ctx.grpc.setLatency('GetMessages', 2.0, owner); // that instance stalls for 2 s
+  const started = ctx.clock.now();
+  let rows: unknown[] | null = null;
+  try {
+    rows = await m.fetch_messages(channel, END, 50);
+  } catch (e) {
+    const code = (e as {code?: number}).code;
+    assert.equal(code, status.DEADLINE_EXCEEDED, \`expected DEADLINE_EXCEEDED from the stalled instance, got \${code}\`);
+  }
+  assert(rows === null, \`\${owner} took 2 s to answer and fetch_messages waited \${((ctx.clock.now() - started) / 1000).toFixed(1)} s for \${rows?.length} messages: a data service slower than the deadline must surface DEADLINE_EXCEEDED\`);
+  const waited = (ctx.clock.now() - started) / 1000;
+  assert(waited <= 0.5, \`the API waited \${waited.toFixed(1)} s for a stalled instance, the deadline is 300 ms\`);
+}
 `,
   },
   debrief: `Consistent hashing is the routing policy that makes coalescing worth having: the hash of the channel, not of the request, decides the instance, so the thousand clients opening one channel meet in one process and one of them pays for the database. Virtual nodes fix the two problems of a naive ring — three points split a circle very unevenly, and when one leaves its whole arc lands on a single neighbour; a hundred points per instance make the shares close to equal and spread a departure over every survivor. The guarantee that matters operationally is the minimal move: adding or losing an instance changes homes for only that instance's share of channels, so a deploy is a small cold spot rather than a cluster-wide one. Discord routes on the channel id for messages and on other keys for other services, each one chosen so that the requests that would coalesce share a key. Real routers get the instance list from service discovery, weight points by instance capacity, and hedge: when the owner fails fast with UNAVAILABLE, the next point clockwise is already the right fallback.`,

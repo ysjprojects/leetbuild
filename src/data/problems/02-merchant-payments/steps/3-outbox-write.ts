@@ -55,6 +55,12 @@ Rewrite \`record_capture(order, capture)\` as a **transactional outbox**:
             /with db\.transaction\(\) as cur:(?:(?!\n {4}\S)[\s\S])*?INSERT INTO outbox/,
           ],
         },
+        typescript: {
+          all: [
+            /query\(\s*['"]BEGIN['"]\s*\)(?:(?!['"]COMMIT['"])[\s\S])*?INSERT INTO orders/,
+            /query\(\s*['"]BEGIN['"]\s*\)(?:(?!['"]COMMIT['"])[\s\S])*?INSERT INTO outbox/,
+          ],
+        },
         go: {
           all: [
             /db\.Transaction\(\s*ctx\s*,\s*func\(tx \*sql\.Tx\) error \{(?:(?!\n\t\}\))[\s\S])*?INSERT INTO orders/,
@@ -87,6 +93,12 @@ Rewrite \`record_capture(order, capture)\` as a **transactional outbox**:
             /\(\s*event_id\s*,\s*TOPIC\s*,\s*order\[["']merchant_id["']\]\s*,\s*payload\s*\)/,
           ],
         },
+        typescript: {
+          all: [
+            /INSERT INTO outbox \(id, topic, key, payload\)/,
+            /\[\s*eventId\s*,\s*TOPIC\s*,\s*order\.merchant_id\s*,\s*payload\s*,?\s*\]/,
+          ],
+        },
         go: {
           all: [
             /INSERT INTO outbox \(id, topic, key, payload\)/,
@@ -117,6 +129,7 @@ Rewrite \`record_capture(order, capture)\` as a **transactional outbox**:
         'No producer call in this file: a produce after the commit can be lost, a produce before it can publish an order that rolls back. The relay publishes what the database committed.',
       match: {
         python: {none: [/producer\.produce\(/, /producer\.flush\(/, /Producer\(/]},
+        typescript: {none: [/producer\.send\(/, /\.producer\(/, /from ['"]kafkajs['"]/]},
         go: {none: [/WriteMessages\(/, /kafka\.Writer\{/]},
         scala: {none: [/producer\.send\(/, /new KafkaProducer/]},
         cpp: {none: [/->produce\(/, /RdKafka::Producer/]},
@@ -129,6 +142,7 @@ Rewrite \`record_capture(order, capture)\` as a **transactional outbox**:
         'Generate one UUID per event and put it in the payload as `event_id`; the ledger stores it to make its writes idempotent.',
       match: {
         python: {all: [/uuid\.uuid4\(\)/, /"event_id":\s*event_id/]},
+        typescript: {all: [/randomUUID\(\)/, /event_id:\s*eventId/]},
         go: {all: [/uuid\.NewString\(\)|uuid\.New\(\)\.String\(\)/, /EventID:\s*eventID/]},
         scala: {all: [/UUID\.randomUUID\(\)/, /"event_id":"\$eventId"/]},
         cpp: {all: [/new_uuid\(\)/, /\\"event_id\\":\\""\s*\+\s*event_id/]},
@@ -204,6 +218,111 @@ async def record_capture(order: dict, capture: dict) -> str:
             (event_id, TOPIC, order["merchant_id"], payload),
         )
     return event_id  # the relay publishes the row once the transaction is committed
+`,
+    },
+    typescript: {
+      starter: `import {Kafka} from 'kafkajs';
+
+import {pool} from 'payments/db'; // pool.connect() → client: BEGIN, your statements, COMMIT (ROLLBACK on error), release()
+
+export const TOPIC = 'payments';
+const producer = new Kafka({clientId: 'checkout', brokers: ['kafka:9092']}).producer({idempotent: true});
+
+export interface Order {
+  id: string;
+  merchant_id: string;
+}
+
+export interface Capture {
+  amount_cents: number;
+  currency: string;
+}
+
+/** Persist the order and publish payment.captured; returns the event id the ledger dedupes on. */
+export async function recordCapture(order: Order, capture: Capture): Promise<string> {
+  const eventId = ''; // TODO: randomUUID(), used as the outbox row id and as event_id in the payload
+  const event = {
+    event_id: eventId,
+    type: 'payment.captured',
+    merchant_id: order.merchant_id,
+    order_id: order.id,
+    amount_cents: capture.amount_cents,
+    currency: capture.currency,
+    captured_at: new Date().toISOString(),
+  };
+  const payload = JSON.stringify(event);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      "INSERT INTO orders (id, merchant_id, amount_cents, currency, status) VALUES ($1, $2, $3, $4, 'captured')",
+      [order.id, order.merchant_id, capture.amount_cents, capture.currency],
+    );
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+  // TODO: dual write — a crash right here loses the event. Replace it with an outbox row inside the transaction:
+  // TODO: INSERT INTO outbox (id, topic, key, payload) VALUES (eventId, TOPIC, merchant id, payload)
+  await producer.connect();
+  await producer.send({topic: TOPIC, messages: [{key: order.merchant_id, value: payload}]});
+  return eventId;
+}
+`,
+      solution: `import {randomUUID} from 'node:crypto';
+
+import {pool} from 'payments/db'; // pool.connect() → client: BEGIN, your statements, COMMIT (ROLLBACK on error), release()
+
+export const TOPIC = 'payments';
+
+export interface Order {
+  id: string;
+  merchant_id: string;
+}
+
+export interface Capture {
+  amount_cents: number;
+  currency: string;
+}
+
+/** Persist the order and the payment.captured event atomically; returns the event id the ledger dedupes on. */
+export async function recordCapture(order: Order, capture: Capture): Promise<string> {
+  const eventId = randomUUID();
+  const event = {
+    event_id: eventId,
+    type: 'payment.captured',
+    merchant_id: order.merchant_id,
+    order_id: order.id,
+    amount_cents: capture.amount_cents,
+    currency: capture.currency,
+    captured_at: new Date().toISOString(),
+  };
+  const payload = JSON.stringify(event);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      "INSERT INTO orders (id, merchant_id, amount_cents, currency, status) VALUES ($1, $2, $3, $4, 'captured')",
+      [order.id, order.merchant_id, capture.amount_cents, capture.currency],
+    );
+    await client.query('INSERT INTO outbox (id, topic, key, payload) VALUES ($1, $2, $3, $4)', [
+      eventId,
+      TOPIC,
+      order.merchant_id,
+      payload,
+    ]);
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+  return eventId; // the relay publishes the row once the transaction is committed
+}
 `,
     },
     go: {
@@ -587,6 +706,105 @@ async def check_event_id(ctx):
     assert ids == {first, second}, f"outbox row ids {ids} must be the returned event ids"
     for row in outbox:
         assert json.loads(row["payload"]).get("event_id") == row["id"], "payload.event_id must be the same UUID as the row id"
+`,
+    typescript: `const SCHEMA = \`
+CREATE TABLE orders (
+    id text PRIMARY KEY,
+    merchant_id text NOT NULL,
+    amount_cents bigint NOT NULL,
+    currency text NOT NULL,
+    status text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE outbox (
+    id text PRIMARY KEY,
+    topic text NOT NULL,
+    key text NOT NULL CHECK (key <> 'm-broken'),
+    payload text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    sent_at timestamptz
+);
+\`;
+
+const ORDER = {id: 'o-1', merchant_id: 'm-42'};
+const CAPTURE = {amount_cents: 4999, currency: 'EUR'};
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+async function writer(ctx) {
+  await ctx.db.reset(SCHEMA);
+  return ctx.load('outbox_writer');
+}
+
+const rows = (ctx, table: string) => ctx.db.execute(\`SELECT * FROM \${table} ORDER BY created_at, id\`);
+
+export async function check_atomic(ctx) {
+  const m = await writer(ctx);
+  await m.recordCapture(ORDER, CAPTURE);
+  const orders = await rows(ctx, 'orders');
+  const outbox = await rows(ctx, 'outbox');
+  assert.equal(orders.length, 1, \`expected one orders row, found \${orders.length}\`);
+  assert.equal(outbox.length, 1, \`expected one outbox row next to the order, found \${outbox.length}\`);
+  assert.deepEqual(ctx.db.events, ['BEGIN', 'COMMIT'], \`both rows must be written in one transaction; the database saw \${JSON.stringify(ctx.db.events)}\`);
+  // The outbox insert for merchant m-broken violates a constraint: the order must roll back with it.
+  let threw = false;
+  try {
+    await m.recordCapture({id: 'o-2', merchant_id: 'm-broken'}, CAPTURE);
+  } catch {
+    threw = true;
+  }
+  assert(threw, 'a failed outbox insert must propagate (the transaction rolls back), not be swallowed');
+  assert.equal(ctx.db.events[ctx.db.events.length - 1], 'ROLLBACK', \`the failed transaction must roll back, the database saw \${JSON.stringify(ctx.db.events)}\`);
+  const ids = (await rows(ctx, 'orders')).map(o => o.id);
+  assert.deepEqual(ids, ['o-1'], 'the outbox insert failed but the orders row o-2 was committed: the two writes are not in one transaction');
+}
+
+export async function check_outbox_row(ctx) {
+  const m = await writer(ctx);
+  const eventId = await m.recordCapture(ORDER, CAPTURE);
+  const outbox = await rows(ctx, 'outbox');
+  assert.equal(outbox.length, 1, \`expected one outbox row, found \${outbox.length}\`);
+  const row = outbox[0];
+  assert.equal(row.topic, 'payments', \`outbox.topic is \${JSON.stringify(row.topic)}, expected 'payments'\`);
+  assert.equal(row.key, 'm-42', \`outbox.key is \${JSON.stringify(row.key)}, expected the merchant id 'm-42'\`);
+  assert.equal(row.sent_at, null, 'a fresh outbox row is unsent');
+  let event;
+  try {
+    event = JSON.parse(row.payload);
+  } catch {
+    assert.fail(\`outbox.payload must be the event as JSON, got \${JSON.stringify(row.payload)}\`);
+  }
+  const expected = {type: 'payment.captured', merchant_id: 'm-42', order_id: 'o-1', amount_cents: 4999, currency: 'EUR'};
+  for (const [field, value] of Object.entries(expected)) {
+    assert.equal(event[field], value, \`payload.\${field} is \${JSON.stringify(event[field])}, expected \${JSON.stringify(value)}\`);
+  }
+  assert.equal(event.event_id, row.id, \`payload.event_id \${JSON.stringify(event.event_id)} must equal the row id \${JSON.stringify(row.id)}\`);
+  assert.equal(eventId, row.id, \`recordCapture returned \${JSON.stringify(eventId)}, expected the outbox row id \${JSON.stringify(row.id)}\`);
+}
+
+export async function check_no_dual_write(ctx) {
+  const m = await writer(ctx);
+  await m.recordCapture(ORDER, CAPTURE);
+  assert(!ctx.kafka.events.some(e => e[0] === 'producer' || e[0] === 'client'), 'this file must not create a Kafka client or producer: the relay publishes committed outbox rows');
+  const produced = ctx.kafka.records('payments').length;
+  assert.equal(produced, 0, \`recordCapture produced \${produced} record(s) to Kafka from the request path\`);
+  assert.equal((await rows(ctx, 'outbox')).length, 1, 'the event must be an outbox row instead');
+}
+
+export async function check_event_id(ctx) {
+  const m = await writer(ctx);
+  const first = await m.recordCapture(ORDER, CAPTURE);
+  const second = await m.recordCapture({id: 'o-2', merchant_id: 'm-42'}, CAPTURE);
+  for (const eventId of [first, second]) {
+    assert(UUID_V4.test(String(eventId)), \`the event id must be a random (version 4) UUID, got \${JSON.stringify(eventId)}\`);
+  }
+  assert.notEqual(first, second, 'every event needs its own UUID');
+  const outbox = await rows(ctx, 'outbox');
+  const ids = outbox.map(row => row.id).sort();
+  assert.deepEqual(ids, [first, second].sort(), \`outbox row ids \${JSON.stringify(ids)} must be the returned event ids\`);
+  for (const row of outbox) {
+    assert.equal(JSON.parse(row.payload).event_id, row.id, 'payload.event_id must be the same UUID as the row id');
+  }
+}
 `,
   },
   debrief: `A dual write has no atomicity: two systems, two failure points, and no way to make the second write conditional on the first surviving. The outbox borrows the database's transaction so the event is committed exactly when the order is; publishing becomes a separate, retryable job. Real systems either poll the table like the relay you build next or tail the write-ahead log with change data capture (Debezium), and they garbage-collect sent rows so the table does not grow forever.`,

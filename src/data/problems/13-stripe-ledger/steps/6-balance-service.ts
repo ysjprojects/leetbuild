@@ -72,6 +72,7 @@ A balance is the **sum of the account's entries** in that currency with \`posted
         'A `LedgerServiceServicer` registered on the server answers `GetBalance` with `SUM(amount)` of the entries in the requested currency; `as_of` 0 means now.',
       match: {
         python: {all: [/class \w+\(\s*ledger_pb2_grpc\.LedgerServiceServicer\s*\)/, /SUM\(amount\)/]},
+        typescript: {all: [/addService\(\s*[\w.]*LedgerService\.service\s*,/, /SUM\(amount\)/]},
         go: {all: [/pb\.UnimplementedLedgerServiceServer/, /SUM\(amount\)/]},
         scala: {all: [/LedgerServiceGrpc\.LedgerService/, /SUM\(amount\)/]},
         cpp: {all: [/ledger::LedgerService::Service/, /SUM\(amount\)/]},
@@ -84,6 +85,7 @@ A balance is the **sum of the account's entries** in that currency with \`posted
         'The currency must match `^[A-Z]{3}$` and the account must be non-empty; otherwise `INVALID_ARGUMENT` before Redis or Postgres is touched.',
       match: {
         python: {all: [/StatusCode\.INVALID_ARGUMENT/, /CURRENCY_RE\.(fullmatch|match)\(/]},
+        typescript: {all: [/status\.INVALID_ARGUMENT/, /CURRENCY_RE\.test\(/]},
         go: {all: [/codes\.InvalidArgument/, /currencyRe\.MatchString\(/]},
         scala: {all: [/Status\.INVALID_ARGUMENT/, /CurrencyRe\.matches\(/]},
         cpp: {all: [/StatusCode::INVALID_ARGUMENT/, /std::regex_match\([^\n]*kCurrencyRe/]},
@@ -96,6 +98,7 @@ A balance is the **sum of the account's entries** in that currency with \`posted
         "Count the account's entries in the same query as the sum: zero entries in any currency is `NOT_FOUND`; entries in another currency only means a balance of 0.",
       match: {
         python: {all: [/StatusCode\.NOT_FOUND/, /COUNT\(\*\)/]},
+        typescript: {all: [/status\.NOT_FOUND/, /COUNT\(\*\)/]},
         go: {all: [/codes\.NotFound/, /COUNT\(\*\)/]},
         scala: {all: [/Status\.NOT_FOUND/, /COUNT\(\*\)/]},
         cpp: {all: [/StatusCode::NOT_FOUND/, /COUNT\(\*\)/]},
@@ -108,6 +111,9 @@ A balance is the **sum of the account's entries** in that currency with \`posted
         'GET the key before the query, SET it with `EX 5` after; `invalidate` DELs it so the next read after a write hits the database.',
       match: {
         python: {all: [/f["']bal:\{/, /\br\.get\(/, /\.set\([^\n]*ex\s*=\s*BALANCE_TTL_S/, /\.delete\(/]},
+        typescript: {
+          all: [/`bal:\$\{/, /\bredis\.get\(/, /\.set\([^\n]*['"]EX['"]\s*,\s*BALANCE_TTL_S/, /\.del\(/],
+        },
         go: {all: [/"bal:"\s*\+/, /rdb\.Get\(/, /rdb\.Set\([^\n]*balanceTTL\s*\)/, /rdb\.Del\(/]},
         scala: {all: [/s"bal:\$/, /jedis\.get\(/, /jedis\.setex\([^\n]*BalanceTtlSeconds/, /jedis\.del\(/]},
         cpp: {all: [/"bal:"\s*\+/, /redis\.get\(/, /redis\.set\([^\n]*kBalanceTtl/, /redis\.del\(/]},
@@ -120,6 +126,7 @@ A balance is the **sum of the account's entries** in that currency with \`posted
         'With `as_of` > 0 the query is bounded by `posted_at <= as_of` and neither reads nor writes Redis; the reply carries that `as_of`.',
       match: {
         python: {all: [/posted_at <= %s/, /request\.as_of\s*==\s*0|not request\.as_of/]},
+        typescript: {all: [/posted_at <= \$\d/, /Number\(\s*(call\.)?request\.as_of\s*\)/, /===?\s*0\b/]},
         go: {all: [/posted_at <= \$\d/, /req\.(GetAsOf\(\)|AsOf)\s*==\s*0/]},
         scala: {all: [/posted_at <= \?/, /req(uest)?\.asOf\s*==\s*0/]},
         cpp: {all: [/posted_at <= \$\d/, /req(uest)?->as_of\(\)\s*==\s*0/]},
@@ -244,6 +251,151 @@ async def serve() -> None:
 
 if __name__ == "__main__":
     asyncio.run(serve())
+`,
+    },
+    typescript: {
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
+
+import {pool} from 'ledger/db'; // await pool.query(sql, [params]) runs one statement and returns {rows}
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const CURRENCY_RE = /^[A-Z]{3}$/;
+export const BALANCE_TTL_S = 5;
+
+/** int64 fields cross the wire as decimal strings: Number(request.as_of). */
+interface BalanceRequest {
+  account: string;
+  currency: string;
+  as_of: string;
+}
+
+interface Balance {
+  account: string;
+  currency: string;
+  amount: number;
+  as_of: number;
+}
+
+const nowMs = (): number => Date.now();
+
+const cacheKey = (account: string, currency: string): string => \`bal:\${account}:\${currency}\`;
+
+/** Called by the journal writer after every commit: the cached current balance is stale. */
+export async function invalidate(account: string, currency: string): Promise<void> {
+  // TODO: DEL bal:{account}:{currency}
+  throw new Error('not implemented');
+}
+
+export const ledgerService = {
+  async GetBalance(
+    call: grpc.ServerUnaryCall<BalanceRequest, Balance>,
+    callback: grpc.sendUnaryData<Balance>,
+  ): Promise<void> {
+    // TODO: empty account or currency not matching CURRENCY_RE → INVALID_ARGUMENT
+    // TODO: as_of 0 → GET bal:{account}:{currency}; hit → reply from the cache
+    // TODO: one query: SUM(amount) FILTER (WHERE currency = $1 AND posted_at <= $2) and COUNT(*) WHERE account = $3; n 0 → NOT_FOUND
+    // TODO: as_of 0 → SET the key EX BALANCE_TTL_S; reply {account, currency, amount, as_of}
+    callback({code: grpc.status.UNIMPLEMENTED, details: 'not implemented'});
+  },
+};
+
+const ledger = grpc.loadPackageDefinition(protoLoader.loadSync('ledger.proto')).ledger as grpc.GrpcObject;
+const LedgerService = ledger.LedgerService as grpc.ServiceClientConstructor;
+
+export const server = new grpc.Server();
+server.addService(LedgerService.service, ledgerService);
+
+export function serve(): void {
+  server.bindAsync('0.0.0.0:9100', grpc.ServerCredentials.createInsecure(), () => server.start());
+}
+`,
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
+
+import {pool} from 'ledger/db'; // await pool.query(sql, [params]) runs one statement and returns {rows}
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const CURRENCY_RE = /^[A-Z]{3}$/;
+export const BALANCE_TTL_S = 5;
+
+/** int64 fields cross the wire as decimal strings: Number(request.as_of). */
+interface BalanceRequest {
+  account: string;
+  currency: string;
+  as_of: string;
+}
+
+interface Balance {
+  account: string;
+  currency: string;
+  amount: number;
+  as_of: number;
+}
+
+const nowMs = (): number => Date.now();
+
+const cacheKey = (account: string, currency: string): string => \`bal:\${account}:\${currency}\`;
+
+/** Called by the journal writer after every commit: the cached current balance is stale. */
+export async function invalidate(account: string, currency: string): Promise<void> {
+  await redis.del(cacheKey(account, currency));
+}
+
+/** [balance in \`currency\` up to \`asOf\`, number of entries the account has at all]. */
+async function sumEntries(account: string, currency: string, asOf: number): Promise<[number, number]> {
+  const {rows} = await pool.query<{amount: string; n: string}>(
+    'SELECT COALESCE(SUM(amount) FILTER (WHERE currency = $1 AND posted_at <= $2), 0)::bigint AS amount, COUNT(*) AS n' +
+      ' FROM entries WHERE account = $3',
+    [currency, asOf, account],
+  );
+  return [Number(rows[0].amount), Number(rows[0].n)];
+}
+
+export const ledgerService = {
+  async GetBalance(
+    call: grpc.ServerUnaryCall<BalanceRequest, Balance>,
+    callback: grpc.sendUnaryData<Balance>,
+  ): Promise<void> {
+    const {account, currency} = call.request;
+    if (!account || !CURRENCY_RE.test(currency)) {
+      callback({code: grpc.status.INVALID_ARGUMENT, details: 'account is required and currency must match ^[A-Z]{3}$'});
+      return;
+    }
+    const key = cacheKey(account, currency);
+    const requested = Number(call.request.as_of);
+    const current = requested === 0;
+    if (current) {
+      const cached = await redis.get(key);
+      if (cached !== null) {
+        callback(null, {account, currency, amount: Number(cached), as_of: nowMs()});
+        return;
+      }
+    }
+    const asOf = current ? nowMs() : requested;
+    const [amount, n] = await sumEntries(account, currency, asOf);
+    if (n === 0) {
+      callback({code: grpc.status.NOT_FOUND, details: \`no entries for account \${account}\`});
+      return;
+    }
+    if (current) await redis.set(key, amount, 'EX', BALANCE_TTL_S); // a point-in-time balance is never cached: cheap to recompute and it never changes
+    callback(null, {account, currency, amount, as_of: asOf});
+  },
+};
+
+const ledger = grpc.loadPackageDefinition(protoLoader.loadSync('ledger.proto')).ledger as grpc.GrpcObject;
+const LedgerService = ledger.LedgerService as grpc.ServiceClientConstructor;
+
+export const server = new grpc.Server();
+server.addService(LedgerService.service, ledgerService);
+
+export function serve(): void {
+  server.bindAsync('0.0.0.0:9100', grpc.ServerCredentials.createInsecure(), () => server.start());
+}
 `,
     },
     go: {
@@ -767,6 +919,171 @@ async def check_as_of(ctx):
     historical = await _balance(stub, as_of=T0)
     assert historical.amount == 5099, f"a point-in-time balance must come from the database (5099 as of T0 after the correction), got {historical.amount}"
     assert str(ctx.redis.get(KEY)) == "3499", "a point-in-time balance must not overwrite the cached current balance"
+`,
+    typescript: `import * as grpc from '@grpc/grpc-js';
+
+const SCHEMA = \`
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL REFERENCES transactions (id),
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL CHECK (amount <> 0),
+    posted_at bigint NOT NULL
+);
+\`;
+
+const T0 = 1700000000000;
+const KEY = 'bal:cash:acquirer:EUR';
+
+const pair = (debit: string, credit: string, currency: string, amount: number) => [
+  {account: debit, currency, amount},
+  {account: credit, currency, amount: -amount},
+];
+
+// [event id, entries, posted_at]: a capture, a partial refund a second later, a USD capture.
+const JOURNAL = [
+  ['evt-capture', pair('cash:acquirer', 'clearing:payments', 'EUR', 4999), T0],
+  ['evt-refund', pair('clearing:payments', 'cash:acquirer', 'EUR', 1500), T0 + 1000],
+  ['evt-usd', pair('cash:acquirer', 'clearing:payments', 'USD', 700), T0 + 2000],
+] as const;
+
+const STATUS_NAME = Object.fromEntries(Object.entries(grpc.status).map(([k, v]) => [v, k]));
+
+/** The journal filled through the real writer (step 4), the learner's server up, and a client on it. */
+async function start(ctx) {
+  await ctx.db.reset(SCHEMA);
+  const writer = ctx.load('ledger_writer');
+  for (const [eventId, entries, postedAt] of JOURNAL) {
+    await writer.writeTransaction(entries, 'seed', {eventId, postedAt});
+  }
+  const service = ctx.load('balance_service');
+  service.serve();
+  const pkg = ctx.proto('ledger.proto');
+  const client = new pkg.ledger.LedgerService('ledger:9100', grpc.credentials.createInsecure());
+  return {writer, client};
+}
+
+/** A correction applied straight in SQL by an operator, outside the writer: nothing invalidates the cache. */
+async function correctInSql(ctx, name: string, account: string, amount: number, postedAt: number) {
+  await ctx.db.execute("INSERT INTO transactions (id, description, posted_at) VALUES ($1, 'correction', $2)", [name, postedAt]);
+  await ctx.db.execute("INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES ($1, $2, 'EUR', $3, $4)", [name, account, amount, postedAt]);
+  await ctx.db.execute("INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES ($1, 'revenue:adjustments', 'EUR', $2, $3)", [name, -amount, postedAt]);
+}
+
+/** Reads of the entries table in the database's query log. */
+const reads = (ctx): number =>
+  ctx.db.queries.filter(([sql]) => sql.trimStart().toLowerCase().startsWith('select') && sql.toLowerCase().includes('entries')).length;
+
+const call = (client, account = 'cash:acquirer', currency = 'EUR', asOf = 0) =>
+  client.GetBalance({account, currency, as_of: asOf}, {deadline: Date.now() + 2000});
+
+async function balance(client, account = 'cash:acquirer', currency = 'EUR', asOf = 0) {
+  let reply;
+  try {
+    reply = await call(client, account, currency, asOf);
+  } catch (e) {
+    assert.fail(\`GetBalance(\${account}, \${currency}, as_of=\${asOf}) failed with \${STATUS_NAME[e?.code] ?? e?.code}: \${e?.details ?? e?.message ?? e}\`);
+  }
+  assert(typeof reply === 'object' && reply !== null, \`GetBalance(\${account}, \${currency}, as_of=\${asOf}) must answer a Balance, got \${JSON.stringify(reply)}\`);
+  return {...reply, amount: Number(reply.amount), as_of: Number(reply.as_of)};
+}
+
+async function code(promise): Promise<string> {
+  try {
+    await promise;
+  } catch (e) {
+    return STATUS_NAME[e?.code] ?? String(e?.code);
+  }
+  return 'OK';
+}
+
+export async function check_serves_balance(ctx) {
+  const {client} = await start(ctx);
+  const reply = await balance(client);
+  assert(typeof reply === 'object' && reply !== null, \`GetBalance must answer a Balance, got \${typeof reply}\`);
+  assert.equal(reply.amount, 3499, \`cash:acquirer EUR is 4999 - 1500 = 3499, got \${reply.amount}\`);
+  assert.deepEqual([reply.account, reply.currency], ['cash:acquirer', 'EUR'], \`the reply must echo account and currency, got \${JSON.stringify(reply)}\`);
+  const now = Date.now();
+  assert(Math.abs(reply.as_of - now) < 5000, \`for as_of 0 the reply's as_of is now (\${now}), got \${reply.as_of}\`);
+  const usd = await balance(client, 'cash:acquirer', 'USD');
+  assert.equal(usd.amount, 700, \`cash:acquirer USD is 700, got \${usd.amount}\`);
+  const clearing = await balance(client, 'clearing:payments');
+  assert.equal(clearing.amount, -3499, \`clearing:payments EUR is -4999 + 1500 = -3499, got \${clearing.amount}\`);
+}
+
+export async function check_invalid_argument(ctx) {
+  const {client} = await start(ctx);
+  const before = reads(ctx);
+  for (const [account, currency] of [['cash:acquirer', 'eur'], ['cash:acquirer', 'EURO'], ['cash:acquirer', ''], ['', 'EUR']]) {
+    const got = await code(call(client, account, currency));
+    assert.equal(got, 'INVALID_ARGUMENT', \`account \${JSON.stringify(account)} currency \${JSON.stringify(currency)} answered \${got}, expected INVALID_ARGUMENT\`);
+  }
+  assert.equal(reads(ctx), before, 'a request rejected as INVALID_ARGUMENT must not query the database');
+  assert.deepEqual(ctx.redis.keys('bal:*'), [], \`a request rejected as INVALID_ARGUMENT must not touch the cache, found \${JSON.stringify(ctx.redis.keys('bal:*'))}\`);
+}
+
+export async function check_not_found(ctx) {
+  const {client} = await start(ctx);
+  let got = await code(call(client, 'cash:nowhere'));
+  assert.equal(got, 'NOT_FOUND', \`an account with no entries answered \${got}, expected NOT_FOUND\`);
+  assert.equal(ctx.redis.get('bal:cash:nowhere:EUR'), null, 'a NOT_FOUND must not be cached as a balance');
+  const gbp = await balance(client, 'cash:acquirer', 'GBP');
+  assert.equal(gbp.amount, 0, \`a known account with no GBP entries has a GBP balance of 0, got \${gbp.amount} (not NOT_FOUND)\`);
+  got = await code(call(client, 'cash:nowhere', 'EUR', T0));
+  assert.equal(got, 'NOT_FOUND', \`an unknown account is NOT_FOUND at any as_of, got \${got}\`);
+}
+
+export async function check_cache(ctx) {
+  const {writer, client} = await start(ctx);
+  const before = reads(ctx);
+  const first = await balance(client);
+  assert.equal(first.amount, 3499, \`cash:acquirer EUR is 3499, got \${first.amount}\`);
+  assert.equal(reads(ctx), before + 1, \`the first current balance is a cache miss: expected one query, saw \${reads(ctx) - before}\`);
+  const cached = ctx.redis.get(KEY);
+  assert(cached !== null, \`after a miss the balance must be stored under \${KEY}\`);
+  assert.equal(String(cached), '3499', \`\${KEY} holds \${JSON.stringify(cached)}, expected '3499'\`);
+  const ttl = ctx.redis.ttl(KEY);
+  assert(1 <= ttl && ttl <= 5, \`\${KEY} has TTL \${ttl}, expected 5 s\`);
+  // An operator books +100 straight in SQL: no invalidation, so for up to 5 s the cache still answers.
+  await correctInSql(ctx, 'fix-1', 'cash:acquirer', 100, T0 + 3000);
+  const second = await balance(client);
+  assert.equal(second.amount, 3499, \`within 5 s the current balance must come from the cache (3499), but the service answered \${second.amount} from the database\`);
+  assert.equal(reads(ctx), before + 1, 'the second current balance within 5 s must come from Redis, but the database was queried');
+  ctx.clock.advance(6);
+  const third = await balance(client);
+  assert.equal(third.amount, 3599, \`after the 5 s TTL the cached balance must have expired and be recomputed (3599), got \${third.amount}\`);
+  // A write through the journal writer invalidates: the very next read sees it.
+  await writer.writeTransaction(pair('cash:acquirer', 'revenue:fees', 'EUR', 1), 'fee', {eventId: 'evt-fee', postedAt: T0 + 4000});
+  assert.equal(ctx.redis.get(KEY), null, \`after a write to cash:acquirer EUR, invalidate(account, currency) must have deleted \${KEY}\`);
+  const fourth = await balance(client);
+  assert.equal(fourth.amount, 3600, \`right after a write the next read must hit the database (3600), got \${fourth.amount}\`);
+}
+
+export async function check_as_of(ctx) {
+  const {client} = await start(ctx);
+  const atT0 = await balance(client, 'cash:acquirer', 'EUR', T0);
+  assert.equal(atT0.amount, 4999, \`as of T0 only the capture is posted: expected 4999, got \${atT0.amount}\`);
+  assert.equal(atT0.as_of, T0, \`the reply's as_of must be the requested time \${T0}, got \${atT0.as_of}\`);
+  const before = await balance(client, 'cash:acquirer', 'EUR', T0 - 1);
+  assert.equal(before.amount, 0, \`as of T0 - 1 nothing is posted yet: expected 0, got \${before.amount}\`);
+  const later = await balance(client, 'cash:acquirer', 'EUR', T0 + 1000);
+  assert.equal(later.amount, 3499, \`as of T0 + 1 s the refund is posted too: expected 3499, got \${later.amount}\`);
+  assert.deepEqual(ctx.redis.keys('bal:*'), [], \`a point-in-time balance must not be cached, found \${JSON.stringify(ctx.redis.keys('bal:*'))}\`);
+  const current = await balance(client);
+  assert(current.amount === 3499 && ctx.redis.get(KEY) !== null, 'the current balance must be cached');
+  // A backdated correction straight in SQL: the history changes, the cached current balance does not know.
+  await correctInSql(ctx, 'fix-1', 'cash:acquirer', 100, T0 - 500);
+  const historical = await balance(client, 'cash:acquirer', 'EUR', T0);
+  assert.equal(historical.amount, 5099, \`a point-in-time balance must come from the database (5099 as of T0 after the correction), got \${historical.amount}\`);
+  assert.equal(String(ctx.redis.get(KEY)), '3499', 'a point-in-time balance must not overwrite the cached current balance');
+}
 `,
   },
   debrief: `The balance is a fold over the journal, which is why the read side can be cached so aggressively and so briefly: the five-second TTL only matters when an invalidation is lost, because every committed write deletes the key itself. The point-in-time branch bypasses the cache because its answer never changes — the journal is immutable, so "the balance as of Tuesday" is the same number whenever you ask, and caching it under the current key would poison the current balance. Returning NOT_FOUND from the same query that computes the sum avoids a second round trip and a race between them. Real balance services keep running balances per account as a materialised view updated by the writer, snapshot them nightly so a historical query folds a day of entries instead of years, and serve the gRPC streams of balance changes that dashboards subscribe to.`,

@@ -53,6 +53,7 @@ cheaply as possible and to promise only what it can keep:
       detail: 'A handler must be registered for `POST` on the `/checkout` path.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/checkout["']/]},
+        typescript: {all: [/app\.post\(\s*['"]\/checkout['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/checkout"/]},
         scala: {all: [/path\(\s*"checkout"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/checkout"/]},
@@ -65,6 +66,9 @@ cheaply as possible and to promise only what it can keep:
         'A missing `sku`/`user` or a `qty` outside 1..5 is answered with `400 Bad Request` before anything is touched.',
       match: {
         python: {all: [/(>|<=)\s*MAX_QTY\b|\bMAX_QTY\s*(<|>=)/, /status_code\s*=\s*400|HTTP_400/]},
+        typescript: {
+          all: [/(>|<=)\s*MAX_QTY\b|\bMAX_QTY\s*(<|>=)/, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/],
+        },
         go: {all: [/(>|<=)\s*maxQty\b|\bmaxQty\s*(<|>=)/, /http\.StatusBadRequest|\b400\b/]},
         scala: {all: [/(>|<=)\s*MaxQty\b|\bMaxQty\s*(<|>=)/, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/(>|<=)\s*kMaxQty\b|\bkMaxQty\s*(<|>=)/, /status\s*=\s*400/]},
@@ -83,6 +87,16 @@ cheaply as possible and to promise only what it can keep:
             /\br\.expire\(/,
             /==\s*1\b/,
             /status_code\s*=\s*429/,
+            /Retry-After/,
+          ],
+        },
+        typescript: {
+          all: [
+            /`attempts:\$\{|['"]attempts:['"]\s*\+/,
+            /\bredis\.incr\(/,
+            /\bredis\.expire\(/,
+            /===?\s*1\b/,
+            /code\(\s*429\s*\)|status\(\s*429\s*\)/,
             /Retry-After/,
           ],
         },
@@ -125,6 +139,7 @@ cheaply as possible and to promise only what it can keep:
         'A reservation that returns 0 is a conflict with the current state of stock, not a client error: `409` with `{"error": "SOLD_OUT"}`.',
       match: {
         python: {all: [/status_code\s*=\s*409/, /SOLD_OUT/]},
+        typescript: {all: [/code\(\s*409\s*\)|status\(\s*409\s*\)/, /SOLD_OUT/]},
         go: {all: [/http\.StatusConflict|\b409\b/, /SOLD_OUT/]},
         scala: {all: [/StatusCodes\.Conflict|\b409\b/, /SOLD_OUT/]},
         cpp: {all: [/status\s*=\s*409/, /SOLD_OUT/]},
@@ -139,6 +154,10 @@ cheaply as possible and to promise only what it can keep:
         python: {
           all: [/status_code\s*=\s*503/, /release\(\s*order_id\s*\)/],
           order: [/not reserve\(|=\s*reserve\(/, /enqueue_order\(\s*order\s*\)/, /status_code\s*=\s*202/],
+        },
+        typescript: {
+          all: [/code\(\s*503\s*\)|status\(\s*503\s*\)/, /release\(\s*orderId\s*\)/],
+          order: [/services\.reserve\(/, /enqueueOrder\(\s*order\s*\)/, /code\(\s*202\s*\)|status\(\s*202\s*\)/],
         },
         go: {
           all: [/http\.StatusServiceUnavailable|\b503\b/, /release\(\s*ctx\s*,\s*\w+(\.OrderID)?\s*\)/],
@@ -262,6 +281,125 @@ def checkout(body: CheckoutRequest) -> JSONResponse:
 
 
 # uvicorn checkout_api:app --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem
+`,
+    },
+    typescript: {
+      starter: `import {randomUUID} from 'node:crypto';
+
+import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const MAX_QTY = 5;
+export const MAX_ATTEMPTS = 20;
+export const WINDOW_S = 60;
+
+interface CheckoutRequest {
+  sku?: string;
+  qty?: number;
+  user?: string;
+}
+
+export interface Order {
+  order_id: string;
+  sku: string;
+  qty: number;
+  user: string;
+}
+
+/** Steps 1, 5 and 3 (provided). */
+export const services = {
+  /** Atomic stock reservation (step 1); false when sold out. */
+  async reserve(sku: string, orderId: string, qty: number): Promise<boolean> {
+    throw new Error('not implemented');
+  },
+  /** Gives a hold back to stock (step 5). */
+  async release(orderId: string): Promise<void> {
+    throw new Error('not implemented');
+  },
+  /** Durable intake through Kafka (step 3); rejects when the broker did not acknowledge. */
+  async enqueueOrder(order: Order): Promise<void> {
+    throw new Error('not implemented');
+  },
+};
+
+app.post('/checkout', async (request, reply) => {
+  const body = (request.body ?? {}) as CheckoutRequest;
+  // TODO: 400 unless sku, user and 1 <= qty <= MAX_QTY
+  // TODO: INCR attempts:{user}; EXPIRE WINDOW_S when it is the first; > MAX_ATTEMPTS → 429 + Retry-After
+  // TODO: orderId = randomUUID(); services.reserve() returned false → 409 SOLD_OUT
+  // TODO: services.enqueueOrder({order_id, sku, qty, user}) → 202; when it rejects, release() and 503
+  return reply.code(501).send();
+});
+
+// node checkout_api.js — behind TLS on :8443
+`,
+      solution: `import {randomUUID} from 'node:crypto';
+
+import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const MAX_QTY = 5;
+export const MAX_ATTEMPTS = 20;
+export const WINDOW_S = 60;
+
+interface CheckoutRequest {
+  sku?: string;
+  qty?: number;
+  user?: string;
+}
+
+export interface Order {
+  order_id: string;
+  sku: string;
+  qty: number;
+  user: string;
+}
+
+/** Steps 1, 5 and 3 (provided). */
+export const services = {
+  /** Atomic stock reservation (step 1); false when sold out. */
+  async reserve(sku: string, orderId: string, qty: number): Promise<boolean> {
+    throw new Error('not implemented');
+  },
+  /** Gives a hold back to stock (step 5). */
+  async release(orderId: string): Promise<void> {
+    throw new Error('not implemented');
+  },
+  /** Durable intake through Kafka (step 3); rejects when the broker did not acknowledge. */
+  async enqueueOrder(order: Order): Promise<void> {
+    throw new Error('not implemented');
+  },
+};
+
+app.post('/checkout', async (request, reply) => {
+  const {sku, qty, user} = (request.body ?? {}) as CheckoutRequest;
+  if (!sku || !user || typeof qty !== 'number' || qty < 1 || qty > MAX_QTY) {
+    return reply.code(400).send({error: \`sku, user and qty 1..\${MAX_QTY} are required\`});
+  }
+  const attempts = await redis.incr(\`attempts:\${user}\`);
+  if (attempts === 1) await redis.expire(\`attempts:\${user}\`, WINDOW_S);
+  if (attempts > MAX_ATTEMPTS) {
+    return reply.code(429).header('Retry-After', String(WINDOW_S)).send({error: 'TOO_MANY_ATTEMPTS'});
+  }
+  const orderId = randomUUID().replace(/-/g, '');
+  if (!(await services.reserve(sku, orderId, qty))) return reply.code(409).send({error: 'SOLD_OUT'});
+  const order: Order = {order_id: orderId, sku, qty, user};
+  try {
+    await services.enqueueOrder(order);
+  } catch {
+    await services.release(orderId);
+    return reply.code(503).send({error: 'TRY_AGAIN'});
+  }
+  return reply.code(202).send({order_id: orderId, status: 'reserved'});
+});
+
+// node checkout_api.js — behind TLS on :8443
 `,
     },
     go: {
@@ -792,6 +930,118 @@ async def check_accepted(ctx):
     reserved_id = _calls(log, "reserve")[0][2]
     releases = _calls(log, "release")
     assert releases == [("release", reserved_id)], f"the hold {reserved_id} must be released when the enqueue fails; release calls: {releases}"
+`,
+    typescript: `const BODY = {sku: 'shoe-42', qty: 2, user: 'ada'};
+
+type Entry = [string, ...unknown[]];
+
+/** The API with steps 1, 5 and 3 swapped for recording fakes on the provided services object. */
+function api(ctx, {soldOut = false, brokerDown = false} = {}) {
+  const m = ctx.load('checkout_api');
+  const log: Entry[] = [];
+  m.services.reserve = async (sku: string, orderId: string, qty: number) => {
+    log.push(['reserve', sku, orderId, qty]);
+    return !soldOut;
+  };
+  m.services.release = async (orderId: string) => {
+    log.push(['release', orderId]);
+  };
+  m.services.enqueueOrder = async (order: Record<string, unknown>) => {
+    log.push(['enqueue', {...order}]);
+    if (brokerDown) throw new Error('no ack within 2s');
+  };
+  return {m, log, c: ctx.client(m.app)};
+}
+
+const calls = (log: Entry[], kind: string) => log.filter(e => e[0] === kind);
+
+export async function check_route(ctx) {
+  const {c} = api(ctx);
+  const r = await c.post('/checkout', {json: BODY});
+  assert.notEqual(r.status, 404, 'no handler is registered for POST /checkout');
+  assert.equal(r.status, 202, \`POST /checkout with a valid body answered \${r.status}, expected 202\`);
+}
+
+export async function check_validate(ctx) {
+  const {c, log} = api(ctx);
+  const bad: [string, Record<string, unknown>][] = [
+    ['a missing sku', {qty: 2, user: 'ada'}],
+    ['a missing user', {sku: 'shoe-42', qty: 2}],
+    ['qty 0', {...BODY, qty: 0}],
+    ['qty 6', {...BODY, qty: 6}],
+  ];
+  for (const [label, body] of bad) {
+    const r = await c.post('/checkout', {json: body});
+    assert.equal(r.status, 400, \`\${label} answered \${r.status}, expected 400\`);
+  }
+  assert.equal(calls(log, 'reserve').length, 0, 'a 400 must be decided before stock is touched: reserve was called for a bad body');
+  assert.deepEqual(ctx.redis.keys('attempts:*'), [], 'a 400 must be decided before the attempt counter is touched');
+  let r = await c.post('/checkout', {json: {...BODY, qty: 5}});
+  assert.equal(r.status, 202, \`qty 5 is the maximum and must be accepted, got \${r.status}\`);
+  r = await c.post('/checkout', {json: {...BODY, qty: 1}});
+  assert.equal(r.status, 202, \`qty 1 is the minimum and must be accepted, got \${r.status}\`);
+}
+
+export async function check_attempt_limit(ctx) {
+  const {c, log} = api(ctx);
+  const body = {...BODY, user: 'bot'};
+  let r = await c.post('/checkout', {json: body});
+  assert.equal(r.status, 202, \`the first attempt answered \${r.status}, expected 202\`);
+  assert.equal(ctx.redis.get('attempts:bot'), '1', \`attempts:bot is \${JSON.stringify(ctx.redis.get('attempts:bot'))} after one request, expected 1\`);
+  const ttl = ctx.redis.ttl('attempts:bot');
+  assert(0 < ttl && ttl <= 60, \`attempts:bot has TTL \${ttl}; the window must be set to 60 s when the counter is created\`);
+  r = await c.post('/checkout', {json: body});
+  assert.equal(ctx.redis.get('attempts:bot'), '2', 'every request must INCR attempts:{user}');
+  const reserves = calls(log, 'reserve').length;
+  ctx.redis.set('attempts:bot', 20, 'KEEPTTL');
+  r = await c.post('/checkout', {json: body});
+  assert.equal(r.status, 429, \`the 21st attempt in the window answered \${r.status}, expected 429\`);
+  assert.equal(r.headers['retry-after'], '60', \`Retry-After is \${JSON.stringify(r.headers['retry-after'])}, expected 60\`);
+  assert.equal(calls(log, 'reserve').length, reserves, 'a 429 must be decided before reserve is called: a bot must not cost a Lua call');
+  ctx.clock.advance(61);
+  r = await c.post('/checkout', {json: body});
+  assert.equal(r.status, 202, \`after the 60 s window the counter must have expired; got \${r.status}\`);
+  r = await c.post('/checkout', {json: {...BODY, user: 'grace'}});
+  assert.equal(r.status, 202, 'the limit is per user: another user must not be throttled');
+}
+
+export async function check_sold_out(ctx) {
+  const {c, log} = api(ctx, {soldOut: true});
+  const r = await c.post('/checkout', {json: BODY});
+  assert.equal(r.status, 409, \`a reservation that returned false answered \${r.status}, expected 409\`);
+  const body = r.json();
+  assert.equal(body?.error, 'SOLD_OUT', \`the 409 body is \${JSON.stringify(body)}, expected error SOLD_OUT\`);
+  assert.equal(calls(log, 'enqueue').length, 0, 'a sold-out order must not be enqueued');
+  assert.equal(calls(log, 'release').length, 0, 'nothing was reserved, so nothing must be released');
+}
+
+export async function check_accepted(ctx) {
+  const {c, log} = api(ctx);
+  const r = await c.post('/checkout', {json: BODY});
+  assert.equal(r.status, 202, \`a reserved and enqueued order answered \${r.status}, expected 202\`);
+  const reserves = calls(log, 'reserve');
+  const enqueues = calls(log, 'enqueue');
+  assert.equal(reserves.length, 1, \`reserve was called \${reserves.length} times, expected once\`);
+  assert.equal(enqueues.length, 1, \`enqueueOrder was called \${enqueues.length} times, expected once\`);
+  assert(log.indexOf(reserves[0]) < log.indexOf(enqueues[0]), 'reserve must run before enqueueOrder');
+  const [, sku, orderId, qty] = reserves[0];
+  assert.deepEqual([sku, qty], ['shoe-42', 2], \`reserve was called with \${JSON.stringify([sku, qty])}, expected ['shoe-42', 2]\`);
+  assert(orderId, 'reserve must be called with a generated order id');
+  const order = enqueues[0][1];
+  const expected = {order_id: orderId, sku: 'shoe-42', qty: 2, user: 'ada'};
+  assert.deepEqual(order, expected, \`enqueueOrder received \${JSON.stringify(order)}, expected \${JSON.stringify(expected)}\`);
+  const body = r.json();
+  assert.equal(body?.order_id, orderId, \`the 202 body is \${JSON.stringify(body)}; order_id must be the id that was reserved (\${orderId})\`);
+  assert.equal(body?.status, 'reserved', \`the 202 body is \${JSON.stringify(body)}; status must be reserved, nothing is paid yet\`);
+  assert.equal(calls(log, 'release').length, 0, 'a successful enqueue must not release the hold');
+
+  const down = api(ctx, {brokerDown: true});
+  const r2 = await down.c.post('/checkout', {json: BODY});
+  assert.equal(r2.status, 503, \`when enqueueOrder rejects the endpoint answered \${r2.status}, expected 503\`);
+  const reservedId = calls(down.log, 'reserve')[0][2];
+  const releases = calls(down.log, 'release');
+  assert.deepEqual(releases, [['release', reservedId]], \`the hold \${reservedId} must be released when the enqueue fails; release calls: \${JSON.stringify(releases)}\`);
+}
 `,
   },
   debrief: `Every branch is ordered by what it costs: a 400 costs nothing, a 429 costs one INCR, a 409 costs the Lua script, and only a 202 pays for a Kafka round trip. The status codes carry meaning a client can act on — 429 says *wait*, 409 says *stop*, 503 says *try again* — and the 202 is honest: the order is accepted, not fulfilled. Real checkouts put a virtual waiting room in front of this endpoint, score requests for bot likelihood instead of counting them, and return a status URL the client polls.`,

@@ -59,6 +59,7 @@ event.
         'A handler on `GET /board` answers `application/octet-stream` with exactly `SIZE * SIZE` bytes read from the `board` key, zero-padded when the key is short or missing.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/board["']/, /application\/octet-stream/, /SIZE\s*\*\s*SIZE/]},
+        typescript: {all: [/app\.get\(\s*['"]\/board['"]/, /application\/octet-stream/, /SIZE\s*\*\s*SIZE/]},
         go: {all: [/HandleFunc\(\s*"GET \/board"/, /application\/octet-stream/, /size\s*\*\s*size/]},
         scala: {all: [/path\(\s*"board"\s*\)/, /application\/octet-stream/, /Size\s*\*\s*Size/]},
         cpp: {all: [/svr\.Get\(\s*"\/board"/, /application\/octet-stream/, /kSize\s*\*\s*kSize/]},
@@ -71,6 +72,15 @@ event.
         'The board response carries `Cache-Control: public, max-age=1, stale-while-revalidate=5` and an `ETag`; a request with a matching `If-None-Match` is answered `304 Not Modified` without a body.',
       match: {
         python: {all: [/max-age=1\b/, /stale-while-revalidate/, /ETag/, /if-none-match/i, /status_code\s*=\s*304/]},
+        typescript: {
+          all: [
+            /max-age=1\b/,
+            /stale-while-revalidate/,
+            /ETag/,
+            /if-none-match/i,
+            /code\(\s*304\s*\)|status\(\s*304\s*\)/,
+          ],
+        },
         go: {
           all: [/max-age=1\b/, /stale-while-revalidate/, /ETag/, /If-None-Match/, /http\.StatusNotModified|\b304\b/],
         },
@@ -93,6 +103,14 @@ event.
       match: {
         python: {
           all: [/[<>]=?\s*SIZE|SIZE\s*[<>]=?/, /[<>]=?\s*COLORS|COLORS\s*[<>]=?/, /\.user\b/, /status_code\s*=\s*400/],
+        },
+        typescript: {
+          all: [
+            /[<>]=?\s*SIZE\b|\bSIZE\s*[<>]=?/,
+            /[<>]=?\s*COLORS\b|\bCOLORS\s*[<>]=?/,
+            /\.user\b/,
+            /code\(\s*400\s*\)|status\(\s*400\s*\)/,
+          ],
         },
         go: {
           all: [
@@ -127,6 +145,7 @@ event.
         'When `place_tile` returns a positive number of seconds the answer is `429 Too Many Requests` with that number in `Retry-After`; nothing is recorded.',
       match: {
         python: {all: [/(?<!def )place_tile\(/, /status_code\s*=\s*429/, /Retry-After/]},
+        typescript: {all: [/(?<!function )placeTile\(/, /code\(\s*429\s*\)|status\(\s*429\s*\)/, /Retry-After/]},
         go: {all: [/(?<!func )placeTile\(/, /http\.StatusTooManyRequests|\b429\b/, /Retry-After/]},
         scala: {all: [/(?<!def )placeTile\(/, /StatusCodes\.TooManyRequests|\b429\b/, /Retry-After/]},
         cpp: {all: [/(?<!int )place_tile\(/, /status\s*=\s*429/, /Retry-After/]},
@@ -139,6 +158,7 @@ event.
         'On a zero from `place_tile` the handler calls `record_placement(user, x, y, color)` and answers `200` with `{"x", "y", "color", "user"}` — in that order: validate, place, record.',
       match: {
         python: {all: [/"color"/], order: [/(?<!def )place_tile\(/, /(?<!def )record_placement\(/]},
+        typescript: {all: [/\bcolor\b/], order: [/(?<!function )placeTile\(/, /(?<!function )recordPlacement\(/]},
         go: {all: [/"color"/], order: [/(?<!func )placeTile\(/, /(?<!func )recordPlacement\(/]},
         scala: {all: [/"color"/], order: [/(?<!def )placeTile\(/, /(?<!def )recordPlacement\(/]},
         cpp: {all: [/"color"/], order: [/(?<!int )place_tile\(/, /(?<!void )record_placement\(/]},
@@ -244,6 +264,98 @@ def place(body: Placement) -> JSONResponse:
 
 
 # uvicorn board_api:app --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem
+`,
+    },
+    typescript: {
+      starter: `import {createHash} from 'node:crypto';
+import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {placeTile} from './cooldown'; // built in step 2: seconds left on the user's cooldown, 0 = painted
+import {recordPlacement} from './placement_events'; // built in step 3: one event per painted tile
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const SIZE = 100; // the real board was 1000 × 1000; the shape is the same
+export const COLORS = 16;
+export const BOARD_KEY = 'board';
+export const CACHE_CONTROL = 'public, max-age=1, stale-while-revalidate=5';
+
+interface Placement {
+  x?: number;
+  y?: number;
+  color?: number;
+  user?: string;
+}
+
+app.get('/board', async (request, reply) => {
+  // TODO: GET BOARD_KEY as bytes (redis.getBuffer), pad with zeros to SIZE * SIZE
+  // TODO: ETag from the bytes (createHash); If-None-Match equal → 304 with the same headers and no body
+  // TODO: 200 application/octet-stream with Cache-Control: CACHE_CONTROL and the ETag
+  return reply.code(501).send();
+});
+
+app.post('/place', async (request, reply) => {
+  const body = (request.body ?? {}) as Placement;
+  // TODO: 400 unless 0 <= x, y < SIZE, 0 <= color < COLORS and user is non-empty
+  // TODO: wait = await placeTile(user, x, y, color); wait > 0 → 429 with Retry-After: wait
+  // TODO: recordPlacement(user, x, y, color); 200 {x, y, color, user}
+  return reply.code(501).send();
+});
+
+// app.listen({port: 8443, https: {cert, key}})
+`,
+      solution: `import {createHash} from 'node:crypto';
+import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {placeTile} from './cooldown'; // built in step 2: seconds left on the user's cooldown, 0 = painted
+import {recordPlacement} from './placement_events'; // built in step 3: one event per painted tile
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const SIZE = 100; // the real board was 1000 × 1000; the shape is the same
+export const COLORS = 16;
+export const BOARD_KEY = 'board';
+export const CACHE_CONTROL = 'public, max-age=1, stale-while-revalidate=5';
+
+interface Placement {
+  x?: number;
+  y?: number;
+  color?: number;
+  user?: string;
+}
+
+app.get('/board', async (request, reply) => {
+  const raw = (await redis.getBuffer(BOARD_KEY)) ?? Buffer.alloc(0); // one byte per pixel
+  const body = Buffer.alloc(SIZE * SIZE); // a missing or short key is padded with colour 0
+  raw.copy(body, 0, 0, SIZE * SIZE);
+  const etag = \`"\${createHash('sha1').update(body).digest('hex').slice(0, 16)}"\`;
+  reply.header('ETag', etag).header('Cache-Control', CACHE_CONTROL);
+  if (request.headers['if-none-match'] === etag) return reply.code(304).send();
+  return reply.type('application/octet-stream').send(body);
+});
+
+app.post('/place', async (request, reply) => {
+  const body = (request.body ?? {}) as Placement;
+  const x = body.x ?? -1;
+  const y = body.y ?? -1;
+  const color = body.color ?? -1;
+  const user = body.user ?? '';
+  if (!(Number.isInteger(x) && Number.isInteger(y) && 0 <= x && x < SIZE && 0 <= y && y < SIZE))
+    return reply.code(400).send({error: \`x and y must be in [0, \${SIZE})\`});
+  if (!(Number.isInteger(color) && 0 <= color && color < COLORS))
+    return reply.code(400).send({error: \`color must be in [0, \${COLORS})\`});
+  if (user === '') return reply.code(400).send({error: 'user is required'});
+  const wait = await placeTile(user, x, y, color);
+  if (wait > 0) return reply.code(429).header('Retry-After', String(wait)).send({error: 'cooldown', retry_after: wait});
+  recordPlacement(user, x, y, color);
+  return {x, y, color, user};
+});
+
+// app.listen({port: 8443, https: {cert, key}})
 `,
     },
     go: {
@@ -810,6 +922,123 @@ async def check_placed(ctx):
     assert len(events) == 1, f"one painted tile must put exactly one record on placements, found {len(events)}: {events}"
     got = {k: events[0].get(k) for k in ("user", "x", "y", "color")}
     assert got == {"user": "ana", "x": 3, "y": 7, "color": 12}, f"the placement recorded is {got}, expected the painted tile: record_placement(user, x, y, color)"
+`,
+    typescript: `const TILE = {x: 3, y: 7, color: 12, user: 'ana'};
+
+function pixel(ctx, m, x: number, y: number): number {
+  const board: Uint8Array = ctx.redis.getBuffer('board') ?? new Uint8Array();
+  const off = y * m.SIZE + x;
+  return off < board.length ? board[off] : 0;
+}
+
+function zeros(bytes: Uint8Array): number {
+  let n = 0;
+  for (const b of bytes) if (b === 0) n++;
+  return n;
+}
+
+function placements(ctx): Record<string, unknown>[] {
+  return ctx.kafka.values('placements').map((v: string) => JSON.parse(v));
+}
+
+export async function check_board_blob(ctx) {
+  const m = ctx.load('board_api'); // as deployed: POST /place runs the real cooldown (step 2) and the real producer (step 3)
+  const n = m.SIZE * m.SIZE;
+  // the body as bytes: a colour is one byte, 0–255, not a character
+  const get = async (): Promise<{status: number; headers: Record<string, string>; bytes: Uint8Array}> => {
+    const res = await m.app.inject({method: 'GET', url: '/board'});
+    return {status: res.statusCode, headers: res.headers, bytes: res.rawPayload};
+  };
+  let r = await get();
+  assert(![404, 405].includes(r.status), \`GET /board answered \${r.status}: no handler is registered for it\`);
+  assert.equal(r.status, 200, \`GET /board answered \${r.status}, expected 200\`);
+  assert((r.headers['content-type'] ?? '').startsWith('application/octet-stream'), \`Content-Type is \${JSON.stringify(r.headers['content-type'])}, expected application/octet-stream\`);
+  assert.equal(r.bytes.length, n, \`an untouched board is \${r.bytes.length} bytes, expected SIZE * SIZE = \${n} zero bytes\`);
+  assert.equal(zeros(r.bytes), n, 'an untouched board must be all colour 0');
+  ctx.redis.setrange('board', 7 * m.SIZE + 3, Buffer.from([12]));
+  r = await get();
+  assert.equal(r.bytes.length, n, \`after one SETRANGE the board is \${r.bytes.length} bytes, expected \${n}: pad a short key with zeros\`);
+  assert.equal(r.bytes[7 * m.SIZE + 3], 12, \`byte y * SIZE + x of the body is \${r.bytes[7 * m.SIZE + 3]}, expected the colour 12 written to Redis\`);
+  assert.equal(zeros(r.bytes), n - 1, 'every other pixel must still be colour 0');
+  ctx.redis.setrange('board', 9 * m.SIZE + 1, Buffer.from([200])); // a palette wider than 7 bits: every byte value must survive
+  r = await get();
+  assert.equal(r.bytes.length, n, \`after a byte above 127 the board is \${r.bytes.length} bytes, expected \${n}: the body must be the raw bytes, not text\`);
+  assert.equal(r.bytes[9 * m.SIZE + 1], 200, \`byte (1, 9) of the body is \${r.bytes[9 * m.SIZE + 1]}, expected 200: read and send the board as bytes, not as a string\`);
+}
+
+export async function check_cache_headers(ctx) {
+  const m = ctx.load('board_api');
+  const c = ctx.client(m.app);
+  let r = await c.get('/board');
+  const cache: string = r.headers['cache-control'] ?? '';
+  assert(cache.replace(/ /g, '').split(',').includes('max-age=1'), \`Cache-Control is \${JSON.stringify(cache)}, expected public, max-age=1, stale-while-revalidate=5\`);
+  assert(cache.includes('public') && cache.includes('stale-while-revalidate'), \`Cache-Control is \${JSON.stringify(cache)}, expected public, max-age=1, stale-while-revalidate=5\`);
+  const etag = r.headers['etag'];
+  assert(etag, 'GET /board must carry an ETag so caches can revalidate instead of re-downloading the board');
+  const again = await c.get('/board');
+  assert.equal(again.headers['etag'], etag, 'the same bytes must give the same ETag');
+  r = await c.get('/board', {headers: {'If-None-Match': etag}});
+  assert.equal(r.status, 304, \`If-None-Match with the current ETag answered \${r.status}, expected 304\`);
+  assert.equal(r.text, '', 'a 304 has no body');
+  assert.equal(r.headers['etag'], etag, 'the 304 must repeat the ETag');
+  assert((r.headers['cache-control'] ?? '').includes('max-age=1'), 'the 304 must repeat Cache-Control so the cache extends its entry');
+  ctx.redis.setrange('board', 0, Buffer.from([5]));
+  r = await c.get('/board', {headers: {'If-None-Match': etag}});
+  assert.equal(r.status, 200, \`after a tile changed the old ETag no longer matches: expected 200, got \${r.status}\`);
+  assert.notEqual(r.headers['etag'], etag, 'a changed board must change the ETag');
+}
+
+export async function check_validate(ctx) {
+  const m = ctx.load('board_api');
+  const size = m.SIZE;
+  const c = ctx.client(m.app);
+  for (const bad of [{x: -1}, {x: size}, {y: -1}, {y: size}, {color: -1}, {color: 16}, {user: ''}]) {
+    const r = await c.post('/place', {json: {...TILE, ...bad}});
+    assert.equal(r.status, 400, \`POST /place with \${JSON.stringify(bad)} answered \${r.status}, expected 400\`);
+  }
+  const cooling = ctx.redis.keys('cooldown:*');
+  assert.deepEqual(cooling, [], \`after only rejected requests Redis holds \${JSON.stringify(cooling)}: a rejected placement reached placeTile and cost a user their turn\`);
+  const board: Uint8Array = ctx.redis.getBuffer('board') ?? new Uint8Array();
+  assert.equal(zeros(board), board.length, 'a rejected placement changed the board');
+  assert.equal(ctx.kafka.records('placements').length, 0, \`a rejected placement must not be recorded, but placements holds \${JSON.stringify(placements(ctx))}\`);
+  const oks = [{x: size - 1, y: size - 1}, {x: 0, y: 0}, {color: 15}, {color: 0}];
+  for (const [i, ok] of oks.entries()) {
+    const tile = {...TILE, ...ok, user: \`user\${i}\`};
+    const r = await c.post('/place', {json: tile});
+    assert.equal(r.status, 200, \`POST /place with \${JSON.stringify(ok)} is within range: expected 200, got \${r.status}\`);
+    assert.equal(pixel(ctx, m, tile.x, tile.y), tile.color, \`after the accepted tile \${JSON.stringify(tile)} the board byte at (\${tile.x}, \${tile.y}) is \${pixel(ctx, m, tile.x, tile.y)}, expected \${tile.color}\`);
+  }
+}
+
+export async function check_cooldown_429(ctx) {
+  const m = ctx.load('board_api');
+  const c = ctx.client(m.app);
+  const first = await c.post('/place', {json: TILE});
+  assert.equal(first.status, 200, \`ana's first tile answered \${first.status}, expected 200\`);
+  ctx.clock.advance(113);
+  const r = await c.post('/place', {json: {...TILE, x: 4, color: 5}});
+  const ttl = ctx.redis.ttl('cooldown:ana');
+  assert.equal(r.status, 429, \`113 s after ana's first tile her second one answered \${r.status}, expected 429: her cooldown still has \${ttl} s to run\`);
+  assert.equal(r.headers['retry-after'], String(ttl), \`Retry-After is \${JSON.stringify(r.headers['retry-after'])}, expected the \${ttl} s left on ana's cooldown (what placeTile returned)\`);
+  assert.equal(pixel(ctx, m, 4, 7), 0, \`the refused tile was painted: the board byte at (4, 7) is \${pixel(ctx, m, 4, 7)}\`);
+  const events = placements(ctx);
+  assert.equal(events.length, 1, \`a tile refused by the cooldown is not a placement: expected only ana's first tile on placements, found \${JSON.stringify(events)}\`);
+}
+
+export async function check_placed(ctx) {
+  const m = ctx.load('board_api');
+  const r = await ctx.client(m.app).post('/place', {json: TILE});
+  assert.equal(r.status, 200, \`a painted tile answers 200, got \${r.status}\`);
+  const body = r.json();
+  assert.deepEqual({x: body.x, y: body.y, color: body.color, user: body.user}, TILE, \`the body must carry the tile \${JSON.stringify(TILE)}, got \${JSON.stringify(body)}\`);
+  assert.equal(pixel(ctx, m, 3, 7), 12, \`after POST /place of \${JSON.stringify(TILE)} the board byte at (3, 7) is \${pixel(ctx, m, 3, 7)}, expected 12: placeTile(user, x, y, color) paints it\`);
+  const ttl = ctx.redis.ttl('cooldown:ana');
+  assert(ttl > 0, \`after her tile was painted ana is not on cooldown (TTL of cooldown:ana is \${ttl}): placeTile(user, x, y, color) must run with her name\`);
+  const events = placements(ctx);
+  assert.equal(events.length, 1, \`one painted tile must put exactly one record on placements, found \${events.length}: \${JSON.stringify(events)}\`);
+  const got = {user: events[0].user, x: events[0].x, y: events[0].y, color: events[0].color};
+  assert.deepEqual(got, {user: 'ana', x: 3, y: 7, color: 12}, \`the placement recorded is \${JSON.stringify(got)}, expected the painted tile: recordPlacement(user, x, y, color)\`);
+}
 `,
   },
   debrief: `Two endpoints with opposite shapes. \`GET /board\` is the hot read: one Redis \`GET\`, a fixed-size body and headers written for the cache in front — \`max-age=1\` means the origin sees one request per edge node per second no matter how many clients refresh, \`stale-while-revalidate\` keeps that true at the moment the second rolls over, and the \`ETag\` turns a revalidation into a 304 instead of 10 000 bytes. \`POST /place\` is a funnel: three comparisons reject most bad input for free, the cooldown decides the rest, and only a painted tile becomes an event. Reddit's board was 1000 × 1000 with two 4-bit pixels per byte (500 KB per read, under 100 ms from Redis) and was served through Fastly with exactly this cache policy; the single-tile detail endpoint, which was not cached, was the one scrapers hammered.`,

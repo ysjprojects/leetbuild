@@ -50,6 +50,9 @@ tile was painted.
       detail: 'The key is `cooldown:{user}` and it expires after `COOLDOWN_S` (300) seconds.',
       match: {
         python: {all: [/f["']cooldown:\{user\}["']/, /COOLDOWN_S\s*=\s*300|ex\s*=\s*300/]},
+        typescript: {
+          all: [/`cooldown:\$\{user\}`|['"]cooldown:['"]\s*\+\s*user/, /COOLDOWN_S\s*=\s*300|['"]EX['"]\s*,\s*300/],
+        },
         go: {all: [/"cooldown:"\s*\+\s*user/, /cooldown\s*=\s*300\s*\*\s*time\.Second|300\s*\*\s*time\.Second/]},
         scala: {all: [/s"cooldown:\$\{?user\}?"/, /CooldownSeconds\s*=\s*300L?|\.ex\(\s*300/]},
         cpp: {all: [/"cooldown:"\s*\+\s*user/, /kCooldownS\{?\s*\(?\s*300|seconds\{?\(?\s*300/]},
@@ -67,6 +70,12 @@ tile was painted.
           ],
           none: [/\br\.(get|exists|mget)\(/],
         },
+        typescript: {
+          all: [
+            /\.set\([^\n]*['"]EX['"]\s*,\s*(COOLDOWN_S|300)[^\n]*['"]NX['"]|\.set\([^\n]*['"]NX['"][^\n]*['"]EX['"]\s*,\s*(COOLDOWN_S|300)/,
+          ],
+          none: [/\bredis\.(get|exists|mget)\(/],
+        },
         go: {all: [/rdb\.SetNX\(\s*ctx\s*,\s*key\s*,[^\n]*cooldown\)/], none: [/rdb\.(Get|Exists)\(/]},
         scala: {all: [/\.nx\(\)/, /\.ex\(\s*(CooldownSeconds|300)/], none: [/jedis\.(get|exists)\(/]},
         cpp: {all: [/UpdateType::NOT_EXIST/, /kCooldownS/], none: [/redis\.(get|exists)\(/]},
@@ -81,6 +90,11 @@ tile was painted.
         python: {
           all: [
             /\.setrange\(\s*BOARD_KEY\s*,\s*(y\s*\*\s*SIZE\s*\+\s*x|x\s*\+\s*y\s*\*\s*SIZE|SIZE\s*\*\s*y\s*\+\s*x|x\s*\+\s*SIZE\s*\*\s*y)\s*,\s*bytes\(\s*[[(]\s*color/,
+          ],
+        },
+        typescript: {
+          all: [
+            /\.setrange\(\s*BOARD_KEY\s*,\s*(y\s*\*\s*SIZE\s*\+\s*x|x\s*\+\s*y\s*\*\s*SIZE|SIZE\s*\*\s*y\s*\+\s*x|x\s*\+\s*SIZE\s*\*\s*y)\s*,\s*(Buffer\.from\(\s*\[\s*color|String\.fromCharCode\(\s*color)/,
           ],
         },
         go: {
@@ -107,6 +121,7 @@ tile was painted.
         'A refused placement returns the key’s `TTL` in seconds (at least 1), which the API turns into `Retry-After`.',
       match: {
         python: {all: [/\br\.ttl\(/, /max\(\s*1\s*,/]},
+        typescript: {all: [/\bredis\.ttl\(/, /Math\.max\(\s*1\s*,/]},
         go: {all: [/rdb\.TTL\(/, /math\.Max\(\s*1\s*,|Ceil\(/]},
         scala: {all: [/jedis\.ttl\(/, /math\.max\(\s*1L?\s*,/]},
         cpp: {all: [/redis\.ttl\(/, /std::max\(\s*(1L|1LL|1|\{1\})/]},
@@ -118,6 +133,7 @@ tile was painted.
       detail: 'The `SET NX` comes before the `SETRANGE`: a refused user never touches the board.',
       match: {
         python: {order: [/\.set\(/, /\.setrange\(/]},
+        typescript: {order: [/\.set\(/, /\.setrange\(/]},
         go: {order: [/rdb\.SetNX\(/, /rdb\.SetRange\(/]},
         scala: {order: [/jedis\.set\(/, /jedis\.setrange\(/]},
         cpp: {order: [/redis\.set\(/, /redis\.setrange\(/]},
@@ -158,6 +174,41 @@ def place_tile(user: str, x: int, y: int, color: int) -> int:
         return max(1, r.ttl(key))
     r.setrange(BOARD_KEY, y * SIZE + x, bytes([color]))  # one byte, in place, no read
     return 0
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const SIZE = 100;
+export const BOARD_KEY = 'board';
+export const COOLDOWN_S = 300; // one tile per user per five minutes
+
+/** Paint (x, y) for user unless they are on cooldown; returns the seconds left to wait, 0 = painted. */
+export async function placeTile(user: string, x: number, y: number, color: number): Promise<number> {
+  const key = \`cooldown:\${user}\`;
+  // TODO: SET key 1 EX COOLDOWN_S NX — a null reply → return Math.max(1, TTL key)
+  // TODO: SETRANGE BOARD_KEY (y * SIZE + x) Buffer.from([color]); return 0
+  throw new Error('not implemented');
+}
+`,
+      solution: `import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const SIZE = 100;
+export const BOARD_KEY = 'board';
+export const COOLDOWN_S = 300; // one tile per user per five minutes
+
+/** Paint (x, y) for user unless they are on cooldown; returns the seconds left to wait, 0 = painted. */
+export async function placeTile(user: string, x: number, y: number, color: number): Promise<number> {
+  const key = \`cooldown:\${user}\`;
+  const claimed = await redis.set(key, 1, 'EX', COOLDOWN_S, 'NX');
+  if (claimed === null) return Math.max(1, await redis.ttl(key)); // the key exists: still on cooldown
+  await redis.setrange(BOARD_KEY, y * SIZE + x, Buffer.from([color])); // one byte, in place, no read
+  return 0;
+}
 `,
     },
     go: {
@@ -422,6 +473,133 @@ async def check_claim_first(ctx):
         r = await c.post("/place", json={"x": 3, "y": 7, "color": 5, "user": "bo"})
         assert r.status_code == 200, f"another user may paint the same pixel: expected 200, got {r.status_code}"
     assert _pixel(ctx, api, 3, 7) == 5, "bo's tile must be painted"
+`,
+    typescript: `function board(ctx): Uint8Array {
+  return ctx.redis.getBuffer('board') ?? new Uint8Array();
+}
+
+function pixel(ctx, m, x: number, y: number): number {
+  const b = board(ctx);
+  const off = y * m.SIZE + x;
+  return off < b.length ? b[off] : 0;
+}
+
+function zeros(bytes: Uint8Array): number {
+  let n = 0;
+  for (const b of bytes) if (b === 0) n++;
+  return n;
+}
+
+/** A parallel request that lands right after the first command on \`key\`: await it once it started, its own error re-thrown. */
+function rival(ctx, key: string, fn: () => Promise<number>): (what: string) => Promise<number> {
+  let started: Promise<number> | undefined;
+  ctx.redisAfter(key, () => {
+    started = fn();
+  });
+  return (what: string) => {
+    assert(started !== undefined, \`placeTile never touched \${what}\`);
+    return started;
+  };
+}
+
+export async function check_cooldown_key(ctx) {
+  const m = ctx.load('cooldown');
+  assert.equal(await m.placeTile('ana', 3, 7, 12), 0, 'a user who never placed a tile is free: placeTile must return 0');
+  assert.equal(ctx.redis.exists('cooldown:ana'), 1, \`after a placement the key cooldown:ana must exist (keys: \${JSON.stringify(ctx.redis.keys('*'))})\`);
+  const ttl = ctx.redis.ttl('cooldown:ana');
+  assert(295 <= ttl && ttl <= 300, \`cooldown:ana expires in \${ttl} s, expected COOLDOWN_S = 300\`);
+  assert.equal(await m.placeTile('bo', 3, 8, 1), 0, "the cooldown is per user: bo is not affected by ana's tile");
+  ctx.clock.advance(299);
+  assert((await m.placeTile('ana', 4, 7, 1)) > 0, '299 s after her tile ana is still on cooldown: placeTile must refuse');
+  ctx.clock.advance(2);
+  assert.equal(ctx.redis.exists('cooldown:ana'), 0, 'cooldown:ana must be gone after 300 s');
+  assert.equal(await m.placeTile('ana', 3, 7, 12), 0, 'once the key expired the user is free again');
+}
+
+export async function check_atomic_nx(ctx) {
+  const m = ctx.load('cooldown');
+  // A bot fires two requests at once; they reach two app servers. The second one runs right after
+  // the first one's first command on cooldown:ana, the gap Reddit's check-then-write left open.
+  const settled = rival(ctx, 'cooldown:ana', () => m.placeTile('ana', 4, 7, 5));
+  const mine = await m.placeTile('ana', 3, 7, 12);
+  const theirs = await settled('cooldown:ana');
+  const painted = [mine === 0, theirs === 0];
+  assert.equal(
+    painted.filter(Boolean).length,
+    1,
+    \`two parallel placements by ana returned \${mine} and \${theirs}: \` +
+      (painted[0] && painted[1]
+        ? "both were painted. A check followed by a separate write lets every parallel request through — about 15 000 tiles slipped past r/place's cooldown that way; let one SET … NX decide"
+        : 'neither was painted, but one of them must win'),
+  );
+  const [won, lost] = painted[0] ? [[3, 7, 12], [4, 7]] : [[4, 7, 5], [3, 7]];
+  assert.equal(pixel(ctx, m, won[0], won[1]), won[2], \`the winning placement returned 0 but (\${won[0]}, \${won[1]}) shows \${pixel(ctx, m, won[0], won[1])}, expected \${won[2]}\`);
+  assert.equal(pixel(ctx, m, lost[0], lost[1]), 0, \`the refused placement painted (\${lost[0]}, \${lost[1]}) anyway\`);
+  const wait = await m.placeTile('ana', 5, 7, 1);
+  assert(wait > 0, \`a later tile from the same user within 300 s must be refused, but placeTile returned \${wait}\`);
+}
+
+export async function check_paint(ctx) {
+  const m = ctx.load('cooldown');
+  const off = 7 * m.SIZE + 3;
+  await m.placeTile('ana', 3, 7, 12);
+  let b = board(ctx);
+  assert(b.length > off, \`the board key is \${b.length} bytes after painting (3, 7): expected a write at offset y * SIZE + x = \${off}\`);
+  assert.equal(b[off], 12, \`byte \${off} of the board is \${b[off]}, expected the colour 12\`);
+  assert.equal(zeros(b), b.length - 1, 'painting one tile must change exactly one byte');
+  await m.placeTile('bo', m.SIZE - 1, m.SIZE - 1, 15);
+  b = board(ctx);
+  assert.equal(b.length, m.SIZE * m.SIZE, \`after painting the last pixel the board is \${b.length} bytes, expected SIZE * SIZE = \${m.SIZE * m.SIZE}\`);
+  assert.equal(b[b.length - 1], 15, \`the last byte is \${b[b.length - 1]}, expected 15\`);
+  await m.placeTile('cy', 3, 7, 3);
+  assert.equal(board(ctx)[off], 3, 'painting over a pixel replaces its colour');
+  assert.equal(ctx.redis.type('board'), 'string', \`board is a \${ctx.redis.type('board')}, expected one string\`);
+  // 200 placements a second: dee's tile is written while eve's is in progress.
+  const settled = rival(ctx, 'board', () => m.placeTile('dee', 50, 50, 7));
+  assert.equal(await m.placeTile('eve', 10, 10, 9), 0, 'eve is free: her tile must be painted');
+  assert.equal(await settled('the board'), 0, 'dee is free: her tile must be painted');
+  assert.equal(pixel(ctx, m, 10, 10), 9, \`eve's tile at (10, 10) is \${pixel(ctx, m, 10, 10)}, expected 9: dee's write, started while eve's was in progress, replaced the board with a copy read before eve painted. Write the one byte in place\`);
+  assert.equal(pixel(ctx, m, 50, 50), 7, \`dee's tile at (50, 50), painted while eve's was being written, is \${pixel(ctx, m, 50, 50)} instead of 7: eve's write replaced the board with a copy read before dee painted. Write the one byte in place\`);
+  assert(pixel(ctx, m, m.SIZE - 1, m.SIZE - 1) === 15 && pixel(ctx, m, 3, 7) === 3, 'earlier tiles must survive later ones');
+}
+
+export async function check_retry_after(ctx) {
+  const m = ctx.load('cooldown');
+  await m.placeTile('ana', 3, 7, 12);
+  ctx.clock.advance(100);
+  let wait = await m.placeTile('ana', 4, 7, 12);
+  assert(199 <= wait && wait <= 200, \`100 s into a 300 s cooldown placeTile returned \${wait}, expected the TTL (200)\`);
+  ctx.clock.advance(199.5);
+  wait = await m.placeTile('ana', 4, 7, 12);
+  assert.equal(wait, 1, \`half a second before the cooldown ends placeTile returned \${wait}, expected at least 1\`);
+  ctx.clock.advance(1);
+  assert.equal(await m.placeTile('ana', 4, 7, 12), 0, 'once the cooldown ended the tile must be painted');
+}
+
+export async function check_claim_first(ctx) {
+  const m = ctx.load('cooldown');
+  assert.equal(await m.placeTile('ana', 3, 7, 12), 0, 'ana is free: her tile must be painted');
+  const wait = await m.placeTile('ana', 3, 7, 5);
+  assert(wait > 0, 'the second tile within the cooldown must be refused');
+  assert.equal(pixel(ctx, m, 3, 7), 12, \`a refused placement painted the board: (3, 7) is \${pixel(ctx, m, 3, 7)}, expected the earlier 12. Claim the cooldown first, paint second\`);
+  // cy's two parallel requests on one pixel: the board must show the one that was accepted.
+  const settled = rival(ctx, 'cooldown:cy', () => m.placeTile('cy', 6, 7, 5));
+  const mine = await m.placeTile('cy', 6, 7, 9);
+  const theirs = await settled('cooldown:cy');
+  const outcomes: [number, number][] = [[9, mine], [5, theirs]];
+  const refused = outcomes.filter(([, w]) => w > 0).map(([c]) => c);
+  const accepted = outcomes.filter(([, w]) => w === 0).map(([c]) => c);
+  const shown = pixel(ctx, m, 6, 7);
+  assert(!refused.includes(shown) || accepted.includes(shown), \`two parallel tiles by cy on (6, 7): colour \${JSON.stringify(accepted)} was accepted, \${JSON.stringify(refused)} refused, and the board shows \${shown} — the refused tile was painted. Claim the cooldown first, paint second\`);
+  const api = ctx.load('board_api');
+  const c = ctx.client(api.app);
+  let r = await c.post('/place', {json: {x: 3, y: 7, color: 5, user: 'ana'}});
+  assert.equal(r.status, 429, \`through the API a user on cooldown gets 429, got \${r.status}\`);
+  assert(['299', '300'].includes(r.headers['retry-after']), \`Retry-After is \${JSON.stringify(r.headers['retry-after'])}, expected the TTL (300)\`);
+  r = await c.post('/place', {json: {x: 3, y: 7, color: 5, user: 'bo'}});
+  assert.equal(r.status, 200, \`another user may paint the same pixel: expected 200, got \${r.status}\`);
+  assert.equal(pixel(ctx, api, 3, 7), 5, "bo's tile must be painted");
+}
 `,
   },
   debrief: `The cooldown and the lock are the same key. \`SET NX EX\` answers "was this user free?" and makes them not free in one atomic step, so a thousand parallel requests from one bot produce exactly one tile — the race Reddit shipped with (check in Cassandra, then write, with nothing in between) is simply not expressible here. \`SETRANGE\` is the other half of the design: the board is a flat array in a string, a pixel is one byte at a computed offset, and Redis updates it in place with no read, no lock and no version check, which is why 200 placements per second never contended. Real deployments pack two 4-bit pixels per byte with \`BITFIELD SET u4 #offset\`, keep the per-tile author and timestamp in a wide table for "who placed this?", and make the cooldown adjustable at runtime — Reddit turned the knob several times during the event to shed load.`,

@@ -56,6 +56,13 @@ free, nearest first, each with its distance. \`driver_status(ids)\` is provided 
         python: {
           all: [/\br\.geosearch\(/, /longitude\s*=\s*lng\b/, /latitude\s*=\s*lat\b/, /radius\s*=\s*(?:RADIUS_KM|3)\b/],
         },
+        typescript: {
+          all: [
+            /\.geosearch\(/,
+            /['"]FROMLONLAT['"]\s*,\s*lng\b\s*,\s*lat\b/,
+            /['"]BYRADIUS['"]\s*,\s*(?:RADIUS_KM|3)\b/,
+          ],
+        },
         go: {
           all: [/GeoSearchLocation\(/, /Longitude:\s*lng\b/, /Latitude:\s*lat\b/, /Radius:\s*(?:radiusKm|3(?:\.0)?)\b/],
         },
@@ -82,6 +89,7 @@ free, nearest first, each with its distance. \`driver_status(ids)\` is provided 
         '`ASC COUNT 20 WITHDIST`: Redis sorts and bounds the result and returns the distance, so the service does neither.',
       match: {
         python: {all: [/sort\s*=\s*"ASC"/, /count\s*=\s*(?:CANDIDATES|20)\b/, /withdist\s*=\s*True/]},
+        typescript: {all: [/['"]ASC['"]/, /['"]COUNT['"]\s*,\s*(?:CANDIDATES|20)\b/, /['"]WITHDIST['"]/]},
         go: {all: [/Sort:\s*"ASC"/, /Count:\s*(?:candidates|20)\b/, /WithDist:\s*true/]},
         scala: {all: [/\.asc\(\)/, /\.count\(\s*(?:Candidates|20)\s*\)/, /\.withDist\(\)/]},
         cpp: {all: [/GeoUnit::KM\s*,\s*(?:kCandidates|20)\s*,\s*true/, /std::tuple<std::string,\s*double>/]},
@@ -94,6 +102,7 @@ free, nearest first, each with its distance. \`driver_status(ids)\` is provided 
         "A single `MGET` of every candidate's presence key, then keep the ones whose key still exists. No GET per driver.",
       match: {
         python: {all: [/\br\.mget\(/, /:seen/], none: [/\br\.get\(/]},
+        typescript: {all: [/\bredis\.mget\(/, /:seen/], none: [/\bredis\.get\(/]},
         go: {all: [/rdb\.MGet\(/, /:seen/], none: [/rdb\.Get\(/]},
         scala: {all: [/jedis\.mget\(/, /:seen/], none: [/jedis\.get\(/]},
         cpp: {all: [/redis\.mget\(/, /:seen/], none: [/redis\.get\(/]},
@@ -105,6 +114,7 @@ free, nearest first, each with its distance. \`driver_status(ids)\` is provided 
       detail: 'Call the provided `driver_status` with the surviving ids and keep those whose status is `available`.',
       match: {
         python: {all: [/(?<!def )\bdriver_status\(/, /"available"/]},
+        typescript: {all: [/\bstore\.driverStatus\(/, /['"]available['"]/]},
         go: {all: [/(?<!func )\bdriverStatus\(/, /"available"/]},
         scala: {all: [/(?<!def )\bdriverStatus\(/, /"available"/]},
         cpp: {all: [/\bdriver_status\(\s*(?!const\b)\w/, /"available"/]},
@@ -116,6 +126,7 @@ free, nearest first, each with its distance. \`driver_status(ids)\` is provided 
       detail: 'The caller asked for `k`; the twenty candidates were only there to survive the two filters.',
       match: {
         python: {all: [/\[\s*:\s*k\s*\]|len\(\s*\w+\s*\)\s*(?:==|>=)\s*k\b/]},
+        typescript: {all: [/\.slice\(\s*0\s*,\s*k\s*\)|\.length\s*(?:===?|>=)\s*k\b/]},
         go: {all: [/\[\s*:\s*k\s*\]|len\(\s*\w+\s*\)\s*(?:==|>=)\s*k\b/]},
         scala: {all: [/\.take\(\s*k\s*\)/]},
         cpp: {all: [/\.size\(\)\s*(?:==|>=|<)\s*k\b|\.resize\(\s*k\s*\)/]},
@@ -175,6 +186,74 @@ def nearest(city: str, lat: float, lng: float, k: int) -> list[tuple[str, float]
     live = [(driver_id, dist) for (driver_id, dist), ts in zip(found, seen) if ts is not None]
     status = driver_status([driver_id for driver_id, _dist in live])
     return [(driver_id, dist) for driver_id, dist in live if status.get(driver_id) == "available"][:k]
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const RADIUS_KM = 3;
+export const CANDIDATES = 20;
+
+/** One driver with its distance from the pickup, in km. */
+export type Candidate = [driverId: string, distanceKm: number];
+
+/** Driver store (provided): driver id → available / on_trip / offline. */
+export const store = {
+  async driverStatus(driverIds: string[]): Promise<Record<string, string>> {
+    throw new Error('not implemented');
+  },
+};
+
+/** The k closest available drivers as [driverId, distanceKm], nearest first. */
+export async function nearest(city: string, lat: number, lng: number, k: number): Promise<Candidate[]> {
+  // TODO: GEOSEARCH drivers:{city} FROMLONLAT lng lat BYRADIUS RADIUS_KM km ASC COUNT CANDIDATES WITHDIST
+  // TODO: one MGET over driver:{id}:seen; drop drivers whose presence key expired
+  // TODO: store.driverStatus(ids); keep the available ones; return the first k
+  throw new Error('not implemented');
+}
+`,
+      solution: `import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const RADIUS_KM = 3;
+export const CANDIDATES = 20;
+
+/** One driver with its distance from the pickup, in km. */
+export type Candidate = [driverId: string, distanceKm: number];
+
+/** Driver store (provided): driver id → available / on_trip / offline. */
+export const store = {
+  async driverStatus(driverIds: string[]): Promise<Record<string, string>> {
+    throw new Error('not implemented');
+  },
+};
+
+/** The k closest available drivers as [driverId, distanceKm], nearest first. */
+export async function nearest(city: string, lat: number, lng: number, k: number): Promise<Candidate[]> {
+  const found = (await redis.geosearch(
+    \`drivers:\${city}\`,
+    'FROMLONLAT',
+    lng,
+    lat,
+    'BYRADIUS',
+    RADIUS_KM,
+    'km',
+    'ASC',
+    'COUNT',
+    CANDIDATES,
+    'WITHDIST',
+  )) as [string, string][];
+  if (found.length === 0) return [];
+  const seen = await redis.mget(found.map(([driverId]) => \`driver:\${driverId}:seen\`));
+  const live: Candidate[] = found
+    .filter((_, i) => seen[i] !== null)
+    .map(([driverId, dist]) => [driverId, Number(dist)]);
+  const status = await store.driverStatus(live.map(([driverId]) => driverId));
+  return live.filter(([driverId]) => status[driverId] === 'available').slice(0, k);
+}
 `,
     },
     go: {
@@ -510,6 +589,104 @@ async def check_top_k(ctx):
     m, calls, commands = _dispatcher(ctx, {"d-7": "on_trip"})
     found = m.nearest("paris", PICKUP[0], PICKUP[1], 2)
     assert _ids(found) == ["d-2", "d-9"], f"with d-7 on a trip the top 2 are d-2 and d-9, got {_ids(found)}: filter first, then cut to k"
+`,
+    typescript: `const PICKUP: [number, number] = [48.85, 2.35]; // lat, lng
+
+type Seeded = [driverId: string, lat: number, lng: number];
+
+/** Writes the GEO member and, by default, a live presence key for every driver. */
+function seed(ctx, city: string, drivers: Seeded[], seen = true) {
+  for (const [driverId, lat, lng] of drivers) {
+    ctx.redis.geoadd(\`drivers:\${city}\`, lng, lat, driverId);
+    if (seen) ctx.redis.set(\`driver:\${driverId}:seen\`, '1000', 'EX', 30);
+  }
+}
+
+/** The learner's module with the provided driver store answering from \`statuses\` (default available). */
+function dispatcher(ctx, statuses: Record<string, string> = {}) {
+  const m = ctx.load('nearest');
+  const calls: string[][] = [];
+  m.store.driverStatus = async (driverIds: string[]) => {
+    calls.push([...driverIds]);
+    return Object.fromEntries(driverIds.map(d => [d, statuses[d] ?? 'available']));
+  };
+  return {m, calls};
+}
+
+const ids = (found: [string, number][]): string[] => found.map(row => row[0]);
+
+export async function check_geosearch(ctx) {
+  seed(ctx, 'paris', [['d-7', 48.852, 2.352], ['d-9', 48.86, 2.37], ['d-far', 48.9, 2.35]]);
+  seed(ctx, 'lyon', [['d-l', 45.76, 4.84]]);
+  const {m} = dispatcher(ctx);
+  let found = await m.nearest('paris', PICKUP[0], PICKUP[1], 10);
+  assert(Array.isArray(found), \`nearest must return an array, got \${typeof found}\`);
+  assert.deepEqual(ids(found), ['d-7', 'd-9'], \`nearest(paris) returned \${JSON.stringify(ids(found))}, expected [d-7, d-9]: within 3 km of (lat 48.85, lng 2.35), lng before lat in the search\`);
+  assert(!ids(found).includes('d-far'), 'd-far is 5.6 km away and must be outside the 3 km radius');
+  found = await m.nearest('lyon', 45.76, 4.84, 10);
+  assert.deepEqual(ids(found), ['d-l'], \`nearest(lyon) returned \${JSON.stringify(ids(found))}, expected [d-l]: the search is on drivers:{city}\`);
+}
+
+export async function check_sorted_bounded(ctx) {
+  // ~0.111 km apart, 25 within 3 km, seeded in a fixed shuffled order.
+  const drivers: Seeded[] = Array.from({length: 25}, (_, i) => [\`d-\${i + 1}\`, 48.85 + (i + 1) / 1000, 2.35]);
+  let state = 7;
+  for (let i = drivers.length - 1; i > 0; i--) {
+    state = (state * 1103515245 + 12345) % 2147483648;
+    const j = state % (i + 1);
+    [drivers[i], drivers[j]] = [drivers[j], drivers[i]];
+  }
+  seed(ctx, 'paris', drivers);
+  const {m} = dispatcher(ctx);
+  const found = await m.nearest('paris', PICKUP[0], PICKUP[1], 25);
+  assert.equal(found.length, 20, \`got \${found.length} drivers for k=25 with 25 in range; the search must ask Redis for COUNT 20 candidates\`);
+  const dists = found.map(row => Number(row[1]));
+  assert.deepEqual(dists, [...dists].sort((a, b) => a - b), \`results must be nearest first: distances \${JSON.stringify(dists)}\`);
+  assert.deepEqual(ids(found).slice(0, 3), ['d-1', 'd-2', 'd-3'], \`the nearest three are d-1, d-2, d-3, got \${JSON.stringify(ids(found).slice(0, 3))}\`);
+  assert(Math.abs(dists[0] - 0.111) < 0.02, \`distances must be in km from WITHDIST: d-1 is 0.11 km away, got \${found[0][1]}\`);
+  assert(Math.abs(dists[9] - 1.112) < 0.03, \`d-10 is 1.11 km away, got \${found[9][1]}\`);
+}
+
+export async function check_presence_mget(ctx) {
+  seed(ctx, 'paris', [['d-2', 48.857, 2.35]]);
+  ctx.clock.advance(31); // d-2 went silent: its presence key expired
+  seed(ctx, 'paris', [['d-7', 48.852, 2.352], ['d-9', 48.86, 2.37]]);
+  seed(ctx, 'paris', [['d-5', 48.83, 2.35]], false);
+  const {m, calls} = dispatcher(ctx);
+  const before = ctx.redisRoundTrips().length;
+  const found = await m.nearest('paris', PICKUP[0], PICKUP[1], 10);
+  const commands = ctx.redisRoundTrips().slice(before).flat();
+  const got = ids(found);
+  assert.deepEqual(got, ['d-7', 'd-9'], \`nearest returned \${JSON.stringify(got)}, expected [d-7, d-9]: d-2 and d-5 have no driver:{id}:seen key\`);
+  const mgets = commands.filter(c => c === 'MGET').length;
+  const gets = commands.filter(c => c === 'GET').length;
+  assert.equal(mgets, 1, \`presence must be one MGET over every candidate's seen key; MGET was sent \${mgets} times (commands: \${JSON.stringify(commands)})\`);
+  assert.equal(gets, 0, \`no GET per driver: \${gets} GETs were sent (commands: \${JSON.stringify(commands)})\`);
+  const asked = calls.flat();
+  assert(!asked.includes('d-2') && !asked.includes('d-5'), \`silent drivers must be dropped before asking the driver store, which saw \${JSON.stringify(calls)}\`);
+}
+
+export async function check_available_only(ctx) {
+  seed(ctx, 'paris', [['d-7', 48.852, 2.352], ['d-2', 48.857, 2.35], ['d-9', 48.86, 2.37], ['d-5', 48.83, 2.35]]);
+  const {m, calls} = dispatcher(ctx, {'d-7': 'on_trip', 'd-9': 'offline'});
+  const found = await m.nearest('paris', PICKUP[0], PICKUP[1], 10);
+  assert.deepEqual(ids(found), ['d-2', 'd-5'], \`nearest returned \${JSON.stringify(ids(found))}, expected [d-2, d-5]: d-7 is on_trip and d-9 offline\`);
+  assert.equal(calls.length, 1, \`the driver store must be asked once with every live candidate, it was called \${calls.length} times: \${JSON.stringify(calls)}\`);
+  assert.deepEqual([...calls[0]].sort(), ['d-2', 'd-5', 'd-7', 'd-9'], \`the driver store was asked about \${JSON.stringify(calls[0])}, expected the four live candidates\`);
+}
+
+export async function check_top_k(ctx) {
+  seed(ctx, 'paris', [['d-7', 48.852, 2.352], ['d-2', 48.857, 2.35], ['d-9', 48.86, 2.37], ['d-5', 48.83, 2.35], ['d-3', 48.87, 2.36]]);
+  let {m} = dispatcher(ctx);
+  let found = await m.nearest('paris', PICKUP[0], PICKUP[1], 2);
+  assert.equal(found.length, 2, \`k=2 but nearest returned \${found.length} drivers: \${JSON.stringify(ids(found))}\`);
+  assert.deepEqual(ids(found), ['d-7', 'd-2'], \`the two nearest are d-7 and d-2, got \${JSON.stringify(ids(found))}\`);
+  found = await m.nearest('paris', PICKUP[0], PICKUP[1], 10);
+  assert.equal(found.length, 5, \`k=10 with five drivers in range must return all five, got \${found.length}\`);
+  ({m} = dispatcher(ctx, {'d-7': 'on_trip'}));
+  found = await m.nearest('paris', PICKUP[0], PICKUP[1], 2);
+  assert.deepEqual(ids(found), ['d-2', 'd-9'], \`with d-7 on a trip the top 2 are d-2 and d-9, got \${JSON.stringify(ids(found))}: filter first, then cut to k\`);
+}
 `,
   },
   debrief: `Redis does the geometry — geohash-encoded sorted set, radius query, sort, distance — and the service does the two things Redis cannot know: who is still reporting and who is free. Asking for more candidates than you need (\`COUNT 20\` for \`k = 3\`) is what keeps the result full after the filters. Real dispatchers query several neighbouring cells instead of one radius, weight drivers by ETA rather than straight-line distance, include drivers about to finish a trip, and run the match as a batch over many riders instead of one at a time.`,

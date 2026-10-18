@@ -1,22 +1,23 @@
 /**
  * Checks every /leetbuild problem: the shape of the problem (steps, diagram, sequences, hints,
  * widgets), for every step in every language that the starter fails at least one static check
- * while the reference solution passes them all, and for every step with a Python harness that the
- * solution passes every runtime check while the starter does not (the harness runs in Pyodide,
- * here in Node). Run after editing problems:
+ * while the reference solution passes them all, and for every step with a Python or TypeScript
+ * harness that the solution passes every runtime check while the starter does not (the harnesses
+ * run in the browser runtimes, here in Node). Run after editing problems:
  *
  *   yarn verify                               # everything
  *   yarn verify --problem image-cache         # one problem (by id or NN- prefix)
  *   yarn verify --file src/data/problems/00-image-cache/index.ts   # one problem file, not via the index
  *   yarn verify --verbose                     # list every check result
  *   yarn verify --no-runtime                  # static checks only (no Pyodide boot)
+ *   yarn verify --runtime typescript          # execute only the TypeScript harnesses (no Pyodide boot)
  */
 import {resolve} from 'node:path';
 
 import {widgetsOf} from '../src/components/Markdown';
 import {describePattern, judge, matches, stripComments} from '../src/lib/judge';
-import {type NodeRuntime, createNodeRuntime} from '../src/lib/runtime/node';
-import {type RunJob, type RunResult} from '../src/lib/runtime/python';
+import {type NodeRuntime, createNodePythonRuntime, createNodeTypeScriptRuntime} from '../src/lib/runtime/node';
+import {type RunJob, type RunResult} from '../src/lib/runtime/types';
 import {COURSE_POINTS, STEP_POINTS} from '../src/lib/scoring';
 import {type Language, type Problem, type Step, CONCEPTS, fileName, LANGUAGES} from '../src/lib/types';
 import {WIDGETS} from '../src/lib/widgets';
@@ -30,6 +31,8 @@ const onlyProblem = flag('--problem');
 const onlyFile = flag('--file');
 const verbose = args.includes('--verbose');
 const withRuntime = !args.includes('--no-runtime');
+/** `--runtime typescript`: run only that language's harnesses (static checks still cover every language). */
+const onlyRuntime = flag('--runtime');
 
 const MIN_STEPS = 4;
 const MIN_CHECKS = 3;
@@ -237,17 +240,40 @@ const describeRun = (run: RunResult): string =>
         .map(c => `${c.id}${c.message ? ` (${c.message})` : ''}`)
         .join(', ');
 
-/** Runtime checks of one problem: harness shape, solution passes, starter does not. */
-async function verifyRuntime(problem: Problem, runtime: NodeRuntime): Promise<string[]> {
+/** Languages graded by execution, each with how a harness declares `check_<id>` and how its Node runtime boots. */
+const EXECUTING: {
+  language: Language;
+  declares: (harness: string, name: string) => boolean;
+  boot: () => Promise<NodeRuntime>;
+}[] = [
+  {
+    language: 'python',
+    declares: (harness, name) => new RegExp(`^(async )?def ${name}\\(`, 'm').test(harness),
+    boot: createNodePythonRuntime,
+  },
+  {
+    language: 'typescript',
+    declares: (harness, name) =>
+      new RegExp(`^export (async function ${name}\\b|const ${name}\\s*=)`, 'm').test(harness),
+    boot: async () => createNodeTypeScriptRuntime(),
+  },
+];
+
+/** Runtime checks of one problem in one language: harness shape, solution passes, starter does not. */
+async function verifyRuntime(
+  problem: Problem,
+  language: Language,
+  declares: (harness: string, name: string) => boolean,
+  runtime: NodeRuntime,
+): Promise<string[]> {
   const errors: string[] = [];
-  const language: Language = 'python';
   for (const step of problem.steps) {
     const harness = step.harness?.[language];
     if (harness === undefined) continue;
     const tag = `${problem.id}/${step.id} [${language} runtime]`;
     for (const check of step.checks) {
       const name = `check_${check.id.replace(/-/g, '_')}`;
-      if (!new RegExp(`^(async )?def ${name}\\(`, 'm').test(harness)) errors.push(`${tag}: harness defines no ${name}`);
+      if (!declares(harness, name)) errors.push(`${tag}: harness defines no ${name}`);
     }
     const solution = await runtime.run(runJob(problem, step, language, step.code[language].solution));
     if (solution.error !== undefined || !solution.checks.every(c => c.passed))
@@ -257,7 +283,7 @@ async function verifyRuntime(problem: Problem, runtime: NodeRuntime): Promise<st
       errors.push(`${tag}: the starter already passes every runtime check`);
     if (verbose) {
       console.log(
-        `    runtime  solution ${solution.checks.filter(c => c.passed).length}/${solution.checks.length} (${
+        `    ${language} runtime  solution ${solution.checks.filter(c => c.passed).length}/${solution.checks.length} (${
           solution.ms
         } ms) · starter ${starter.checks.filter(c => c.passed).length}/${starter.checks.length}`,
       );
@@ -273,23 +299,30 @@ async function main(): Promise<void> {
   const problems = await loadProblems();
   const ids = new Set<string>();
   let steps = 0;
-  let harnesses = 0;
+  const harnesses: Partial<Record<Language, number>> = {};
   const selected = problems.filter(p => onlyProblem === null || p.id === onlyProblem || onlyProblem.endsWith(p.id));
-  let runtime: NodeRuntime | null = null;
-  if (withRuntime && selected.some(p => p.steps.some(s => s.harness?.python !== undefined))) {
-    const started = Date.now();
-    runtime = await createNodeRuntime();
-    console.log(`✓ python runtime booted (${Date.now() - started} ms)`);
-  }
+  const runtimes: Partial<Record<Language, NodeRuntime>> = {};
+  if (withRuntime)
+    for (const {language, boot} of EXECUTING) {
+      if (onlyRuntime !== null && onlyRuntime !== language) continue;
+      if (!selected.some(p => p.steps.some(s => s.harness?.[language] !== undefined))) continue;
+      const started = Date.now();
+      runtimes[language] = await boot();
+      console.log(`✓ ${language} runtime booted (${Date.now() - started} ms)`);
+    }
   for (const problem of problems) {
     if (ids.has(problem.id)) errors.push(`duplicate problem id '${problem.id}'`);
     ids.add(problem.id);
     if (!selected.includes(problem)) continue;
     const started = Date.now();
     const e = verifyProblem(problem);
-    if (runtime !== null) e.push(...(await verifyRuntime(problem, runtime)));
+    for (const {language, declares} of EXECUTING) {
+      const runtime = runtimes[language];
+      if (runtime !== undefined) e.push(...(await verifyRuntime(problem, language, declares, runtime)));
+      harnesses[language] =
+        (harnesses[language] ?? 0) + problem.steps.filter(s => s.harness?.[language] !== undefined).length;
+    }
     steps += problem.steps.length;
-    harnesses += problem.steps.filter(s => s.harness?.python !== undefined).length;
     console.log(
       `${e.length === 0 ? '✓' : '✗'} ${problem.title} — ${problem.steps.length} steps (${Date.now() - started} ms)`,
     );
@@ -311,8 +344,11 @@ async function main(): Promise<void> {
     } else console.log(`✓ course totals ${COURSE_POINTS} points`);
   }
   const languages: Language[] = [...LANGUAGES];
+  const ran = EXECUTING.filter(({language}) => !withRuntime || runtimes[language] !== undefined)
+    .map(({language}) => `${harnesses[language] ?? 0} ${language}`)
+    .join(' + ');
   console.log(
-    `\n${steps} step(s) × ${languages.length} languages checked, ${harnesses} python harness(es)${
+    `\n${steps} step(s) × ${languages.length} languages checked, ${ran} harness(es)${
       withRuntime ? ' run' : ' skipped'
     }, ${errors.length} problem(s)`,
   );

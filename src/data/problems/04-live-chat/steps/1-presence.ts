@@ -57,6 +57,11 @@ presence functions the chat server calls:
             /\br\.set\(\s*f"presence:\{user\}"\s*,\s*server\s*,\s*ex\s*=\s*(?:PRESENCE_TTL_S|30)\s*\)|\br\.setex\(\s*f"presence:\{user\}"\s*,\s*(?:PRESENCE_TTL_S|30)\s*,\s*server\s*\)/,
           ],
         },
+        typescript: {
+          all: [
+            /\bredis\.set\(\s*`presence:\$\{user\}`\s*,\s*server\s*,\s*['"]EX['"]\s*,\s*(?:PRESENCE_TTL_S|30)\s*\)|\bredis\.setex\(\s*`presence:\$\{user\}`\s*,\s*(?:PRESENCE_TTL_S|30)\s*,\s*server\s*\)/,
+          ],
+        },
         go: {
           all: [
             /rdb\.Set\(\s*ctx\s*,\s*(?:"presence:"\s*\+\s*user|fmt\.Sprintf\(\s*"presence:%s"\s*,\s*user\s*\))\s*,\s*server\s*,\s*(?:presenceTTL|30\s*\*\s*time\.Second)\s*\)/,
@@ -85,6 +90,12 @@ presence functions the chat server calls:
             /\br\.srem\(\s*f"room:\{room\}:members"\s*,\s*user\s*\)/,
           ],
         },
+        typescript: {
+          all: [
+            /\bredis\.sadd\(\s*`room:\$\{room\}:members`\s*,\s*user\s*\)/,
+            /\bredis\.srem\(\s*`room:\$\{room\}:members`\s*,\s*user\s*\)/,
+          ],
+        },
         go: {
           all: [
             /rdb\.SAdd\(\s*ctx\s*,\s*(?:"room:"\s*\+\s*room\s*\+\s*":members"|fmt\.Sprintf\(\s*"room:%s:members"\s*,\s*room\s*\))\s*,\s*user\s*\)/,
@@ -111,6 +122,7 @@ presence functions the chat server calls:
       detail: 'After `SREM`, `DEL presence:{user}` so the user drops offline now instead of after the TTL.',
       match: {
         python: {order: [/\br\.srem\(/, /\br\.delete\(\s*f"presence:\{user\}"\s*\)/]},
+        typescript: {order: [/\bredis\.srem\(/, /\bredis\.del\(\s*`presence:\$\{user\}`\s*\)/]},
         go: {
           order: [
             /rdb\.SRem\(/,
@@ -129,6 +141,10 @@ presence functions the chat server calls:
         python: {
           all: [/\br\.smembers\(/, /\br\.mget\(|\.pipeline\(/],
           none: [/def online_members(?:(?!\ndef )[\s\S])*?\br\.get\(/],
+        },
+        typescript: {
+          all: [/\bredis\.smembers\(/, /\bredis\.mget\(|\.pipeline\(|\.multi\(/],
+          none: [/function onlineMembers(?:(?!\n\})[\s\S])*?\bredis\.get\(/],
         },
         go: {
           all: [/rdb\.SMembers\(/, /rdb\.MGet\(|Pipelined\(|Pipeline\(\)/],
@@ -203,6 +219,69 @@ def online_members(room: str) -> dict[str, str]:
         return {}
     servers = r.mget([f"presence:{u}" for u in members])
     return {u: s for u, s in zip(members, servers) if s is not None}
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const PRESENCE_TTL_S = 30; // clients heartbeat every 10 s: three missed beats and the user is gone
+
+/** Called every 10 s while the client's stream is open on \`server\`. */
+export async function heartbeat(user: string, server: string): Promise<void> {
+  // TODO: SET presence:{user} = server with a PRESENCE_TTL_S expiry
+  throw new Error('not implemented');
+}
+
+export async function joinRoom(room: string, user: string): Promise<void> {
+  // TODO: SADD room:{room}:members
+  throw new Error('not implemented');
+}
+
+export async function leave(room: string, user: string): Promise<void> {
+  // TODO: SREM from the room set, then DEL the presence key
+  throw new Error('not implemented');
+}
+
+/** Members whose presence key is alive, mapped to the server holding their stream. */
+export async function onlineMembers(room: string): Promise<Record<string, string>> {
+  // TODO: SMEMBERS, then one MGET of every presence:{user} — not one GET per member
+  throw new Error('not implemented');
+}
+`,
+      solution: `import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const PRESENCE_TTL_S = 30; // clients heartbeat every 10 s: three missed beats and the user is gone
+
+/** Called every 10 s while the client's stream is open on \`server\`. */
+export async function heartbeat(user: string, server: string): Promise<void> {
+  await redis.set(\`presence:\${user}\`, server, 'EX', PRESENCE_TTL_S);
+}
+
+export async function joinRoom(room: string, user: string): Promise<void> {
+  await redis.sadd(\`room:\${room}:members\`, user);
+}
+
+export async function leave(room: string, user: string): Promise<void> {
+  await redis.srem(\`room:\${room}:members\`, user);
+  await redis.del(\`presence:\${user}\`);
+}
+
+/** Members whose presence key is alive, mapped to the server holding their stream. */
+export async function onlineMembers(room: string): Promise<Record<string, string>> {
+  const members = (await redis.smembers(\`room:\${room}:members\`)).sort();
+  if (members.length === 0) return {};
+  const servers = await redis.mget(members.map(u => \`presence:\${u}\`));
+  const online: Record<string, string> = {};
+  members.forEach((u, i) => {
+    const s = servers[i];
+    if (s !== null) online[u] = s;
+  });
+  return online;
+}
 `,
     },
     go: {
@@ -507,6 +586,63 @@ def check_batched(ctx):
         cls.execute_command = real
     assert "GET" not in calls, f"online_members issued {calls}: resolve every presence key in one MGET or one pipeline, not a GET per member"
     assert "MGET" in calls or len(calls) <= 2, f"online_members issued {calls}: expected SMEMBERS then one MGET (or one pipeline)"
+`,
+    typescript: `export async function check_ttl(ctx) {
+  const m = ctx.load('presence');
+  await m.heartbeat('ana', 'srv-a');
+  assert.equal(ctx.redis.get('presence:ana'), 'srv-a', \`presence:ana is \${JSON.stringify(ctx.redis.get('presence:ana'))}, expected 'srv-a'\`);
+  let ttl = ctx.redis.ttl('presence:ana');
+  assert(25 <= ttl && ttl <= 30, \`presence:ana has TTL \${ttl}, expected 30 s\`);
+  ctx.clock.advance(20);
+  await m.heartbeat('ana', 'srv-a');
+  ttl = ctx.redis.ttl('presence:ana');
+  assert(25 <= ttl && ttl <= 30, \`a heartbeat must restart the 30 s lease; TTL after the second beat is \${ttl}\`);
+  ctx.clock.advance(31);
+  assert.equal(ctx.redis.get('presence:ana'), null, 'a user who stopped heartbeating must vanish after 30 s');
+}
+
+export async function check_membership(ctx) {
+  const m = ctx.load('presence');
+  await m.joinRoom('room-7', 'ana');
+  await m.joinRoom('room-7', 'bo');
+  await m.joinRoom('room-7', 'ana');
+  let members = [...ctx.redis.smembers('room:room-7:members')].sort();
+  assert.deepEqual(members, ['ana', 'bo'], \`room:room-7:members is \${JSON.stringify(members)}, expected ['ana', 'bo'] (a set: joining twice adds once)\`);
+  await m.leave('room-7', 'ana');
+  members = [...ctx.redis.smembers('room:room-7:members')].sort();
+  assert.deepEqual(members, ['bo'], \`after ana leaves, room:room-7:members is \${JSON.stringify(members)}, expected ['bo']\`);
+}
+
+export async function check_leave_clears(ctx) {
+  const m = ctx.load('presence');
+  await m.joinRoom('room-7', 'ana');
+  await m.heartbeat('ana', 'srv-a');
+  await m.leave('room-7', 'ana');
+  assert.equal(ctx.redis.get('presence:ana'), null, 'an explicit leave must DEL presence:{user} instead of waiting for the TTL');
+  assert.equal(ctx.redis.sismember('room:room-7:members', 'ana'), 0, 'leave must SREM the user from the room set');
+}
+
+export async function check_batched(ctx) {
+  const m = ctx.load('presence');
+  assert.deepEqual(await m.onlineMembers('empty-room'), {}, 'a room with no members has nobody online');
+  for (const user of ['ana', 'bo', 'cy']) await m.joinRoom('room-7', user);
+  await m.heartbeat('ana', 'srv-a');
+  await m.heartbeat('cy', 'srv-b');
+  await m.heartbeat('dee', 'srv-b'); // alive but not a member of room-7
+  let online = await m.onlineMembers('room-7');
+  assert.deepEqual(online, {ana: 'srv-a', cy: 'srv-b'}, \`onlineMembers('room-7') is \${JSON.stringify(online)}, expected {ana: 'srv-a', cy: 'srv-b'} (bo never heartbeat)\`);
+  ctx.clock.advance(31);
+  await m.heartbeat('ana', 'srv-a');
+  online = await m.onlineMembers('room-7');
+  assert.deepEqual(online, {ana: 'srv-a'}, \`after cy's lease expired onlineMembers('room-7') is \${JSON.stringify(online)}, expected {ana: 'srv-a'}\`);
+  // Round trips: one SMEMBERS plus one MGET (or one pipeline), never a GET per member.
+  const before = ctx.redisRoundTrips().length;
+  await m.onlineMembers('room-7');
+  const trips = ctx.redisRoundTrips().slice(before);
+  const calls = trips.flat();
+  assert(!calls.includes('GET'), \`onlineMembers issued \${JSON.stringify(trips)}: resolve every presence key in one MGET or one pipeline, not a GET per member\`);
+  assert(calls.includes('MGET') || trips.length <= 2, \`onlineMembers issued \${JSON.stringify(trips)}: expected SMEMBERS then one MGET (or one pipeline)\`);
+}
 `,
   },
   debrief: `Presence is the canonical use of a TTL as a *liveness lease*: the client renews it, and the absence of renewals is the failure signal — no health checker, no reaper job. Membership stays in a separate set because it outlives the connection. The MGET is the part that scales: one round trip per room view instead of one per member. Real systems shard presence by user, publish transitions (online → offline) instead of polling, and keep a "last seen" timestamp next to the lease so the UI can say "5 minutes ago".`,

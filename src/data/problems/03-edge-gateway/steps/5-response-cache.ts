@@ -47,6 +47,7 @@ proxy. \`upstream(request)\` is provided: it is the step-3 proxy and returns sta
         'The key is `resp:{sha256(path?query)}`: a fixed-length key that cannot collide across query strings or contain unsafe characters.',
       match: {
         python: {all: [/["']resp:["']\s*\+|f["']resp:\{/, /hashlib\.sha256\(/]},
+        typescript: {all: [/['"]resp:['"]\s*\+|`resp:\$\{/, /createHash\(\s*['"]sha256['"]\s*\)/]},
         go: {all: [/"resp:"\s*\+|"resp:%x"/, /sha256\.Sum256\(/]},
         scala: {all: [/"resp:"\s*\+/, /"SHA-256"/]},
         cpp: {all: [/"resp:"\s*\+/, /sha256_hex\(/]},
@@ -59,6 +60,7 @@ proxy. \`upstream(request)\` is provided: it is the step-3 proxy and returns sta
         'A client sending `Cache-Control: no-cache` must reach the upstream; check the request header before reading Redis.',
       match: {
         python: {all: [/cache-control/i, /no-cache/]},
+        typescript: {all: [/cache-control/i, /no-cache/]},
         go: {all: [/cache-control/i, /no-cache/]},
         scala: {all: [/cache-control/i, /no-cache/]},
         cpp: {all: [/cache-control/i, /no-cache/]},
@@ -71,6 +73,9 @@ proxy. \`upstream(request)\` is provided: it is the step-3 proxy and returns sta
         'Store the entry with `EX 10` (`SET key value EX ttl` / `SETEX`, using the file’s 10 s TTL constant); a response cache without expiry serves stale prices forever.',
       match: {
         python: {all: [/\.set\(\s*key\s*,[^\n]*ex\s*=\s*(TTL_S|10)\s*\)|\.setex\(\s*key\s*,\s*(TTL_S|10)\s*,/]},
+        typescript: {
+          all: [/\.set\(\s*key\s*,[^\n]*['"]EX['"]\s*,\s*(TTL_S|10)\s*\)|\.setex\(\s*key\s*,\s*(TTL_S|10)\s*,/],
+        },
         go: {all: [/rdb\.Set(Ex|EX)?\(\s*ctx\s*,\s*key\s*,[^\n]*,\s*(ttl|10\s*\*\s*time\.Second)\s*\)/]},
         scala: {all: [/jedis\.setex\(\s*key\s*,\s*(TtlSeconds|10L?)\s*,/]},
         cpp: {
@@ -87,6 +92,7 @@ proxy. \`upstream(request)\` is provided: it is the step-3 proxy and returns sta
         'The store must be guarded by a status check (`== 200`) that comes before the `SET`; caching a 404 or 503 makes an outage last the TTL.',
       match: {
         python: {order: [/status_code\s*==\s*200/, /\.set(ex)?\(\s*key/]},
+        typescript: {order: [/status\s*===?\s*200/, /\.set(ex)?\(\s*key/]},
         go: {order: [/StatusCode\s*==\s*(http\.StatusOK|200)/, /rdb\.Set(Ex|EX)?\(\s*ctx\s*,\s*key/]},
         scala: {order: [/status\s*==\s*StatusCodes\.OK|intValue\s*==\s*200/, /jedis\.setex\(\s*key/]},
         cpp: {order: [/status\s*==\s*200/, /redis\.set(ex)?\(\s*key/]},
@@ -99,6 +105,7 @@ proxy. \`upstream(request)\` is provided: it is the step-3 proxy and returns sta
         'Every response carries `X-Cache: HIT` or `X-Cache: MISS` so operators (and curl) can see what the cache is doing.',
       match: {
         python: {all: [/X-Cache/, /"HIT"/, /"MISS"/]},
+        typescript: {all: [/X-Cache/, /['"]HIT['"]/, /['"]MISS['"]/]},
         go: {all: [/X-Cache/, /"HIT"/, /"MISS"/]},
         scala: {all: [/X-Cache/, /"HIT"/, /"MISS"/]},
         cpp: {all: [/X-Cache/, /"HIT"/, /"MISS"/]},
@@ -171,6 +178,89 @@ def get_item(item_id: str, request: Request) -> Response:
         entry = json.dumps({"content_type": response.media_type, "body": response.body.decode()})
         r.set(key, entry, ex=TTL_S)
     return response
+`,
+    },
+    typescript: {
+      starter: `import {createHash} from 'node:crypto';
+import Fastify, {type FastifyRequest} from 'fastify';
+import Redis from 'ioredis';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const TTL_S = 10;
+
+export interface Upstream {
+  status: number;
+  contentType: string;
+  body: string;
+}
+
+/** The gRPC proxy from step 3 (provided): status, content type and body for this request. */
+export const proxy = {
+  async upstream(request: FastifyRequest): Promise<Upstream> {
+    throw new Error('not implemented');
+  },
+};
+
+export function cacheKey(request: FastifyRequest): string {
+  // TODO: 'resp:' + sha256 hex of path?query (request.url)
+  throw new Error('not implemented');
+}
+
+app.get('/items/:id', async (request, reply) => {
+  const key = cacheKey(request);
+  // TODO: unless the request says no-cache, GET key → hit: stored body + content type, X-Cache: HIT
+  // TODO: miss → proxy.upstream(); X-Cache: MISS; when status is 200 SET {content_type, body} EX TTL_S
+  const response = await proxy.upstream(request);
+  return reply.code(response.status).type(response.contentType).send(response.body);
+});
+`,
+      solution: `import {createHash} from 'node:crypto';
+import Fastify, {type FastifyRequest} from 'fastify';
+import Redis from 'ioredis';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const TTL_S = 10;
+
+export interface Upstream {
+  status: number;
+  contentType: string;
+  body: string;
+}
+
+/** The gRPC proxy from step 3 (provided): status, content type and body for this request. */
+export const proxy = {
+  async upstream(request: FastifyRequest): Promise<Upstream> {
+    throw new Error('not implemented');
+  },
+};
+
+export function cacheKey(request: FastifyRequest): string {
+  // request.url is path?query as the client sent it
+  return 'resp:' + createHash('sha256').update(request.url).digest('hex');
+}
+
+app.get('/items/:id', async (request, reply) => {
+  const key = cacheKey(request);
+  const bypass = (request.headers['cache-control'] ?? '').includes('no-cache');
+  if (!bypass) {
+    const hit = await redis.get(key);
+    if (hit !== null) {
+      const entry = JSON.parse(hit) as {content_type: string; body: string};
+      return reply.header('X-Cache', 'HIT').type(entry.content_type).send(entry.body);
+    }
+  }
+  const response = await proxy.upstream(request);
+  reply.header('X-Cache', 'MISS');
+  if (response.status === 200) {
+    const entry = JSON.stringify({content_type: response.contentType, body: response.body});
+    await redis.set(key, entry, 'EX', TTL_S);
+  }
+  return reply.code(response.status).type(response.contentType).send(response.body);
+});
 `,
     },
     go: {
@@ -546,6 +636,94 @@ async def check_x_cache(ctx):
     assert hit.headers.get("content-type", "").startswith("application/json"), f"a hit must replay the stored content type, got {hit.headers.get('content-type')!r}"
     assert plain_hit.headers.get("x-cache") == "HIT" and plain_hit.content == plain_miss.content, "text responses are cached like any other 200"
     assert plain_hit.headers.get("content-type", "").startswith("text/plain"), f"the hit for a text/plain upstream answered Content-Type {plain_hit.headers.get('content-type')!r}: store the content type with the body"
+`,
+    typescript: `import {createHash} from 'node:crypto';
+
+/** The step-3 proxy, swapped onto the learner's provided proxy object: counts every fetch, answers per item id. */
+function cache(ctx) {
+  const m = ctx.load('response_cache');
+  const calls: string[] = [];
+  m.proxy.upstream = async request => {
+    calls.push(request.url);
+    const {id} = request.params as {id: string};
+    if (id === 'ghost') return {status: 404, contentType: 'application/json', body: '{"error": "no such item"}'};
+    if (id === 'down') return {status: 503, contentType: 'text/plain', body: 'catalog unavailable'};
+    if (id === 'plain') return {status: 200, contentType: 'text/plain', body: \`plain item, fetch \${calls.length}\`};
+    const body = JSON.stringify({id, name: 'Kettle', price_cents: 3499, fetch: calls.length});
+    return {status: 200, contentType: 'application/json', body};
+  };
+  return {m, calls, c: ctx.client(m.app)};
+}
+
+const key = (target: string): string => 'resp:' + createHash('sha256').update(target).digest('hex');
+
+export async function check_key_hash(ctx) {
+  const {c} = cache(ctx);
+  const r = await c.get('/items/42?fields=name');
+  assert.equal(r.status, 200, \`GET /items/42?fields=name answered \${r.status}\`);
+  await c.get('/items/42');
+  const keys = ctx.redis.keys('*').sort();
+  for (const target of ['/items/42?fields=name', '/items/42']) {
+    assert(ctx.redis.exists(key(target)), \`no entry under resp:sha256(\${JSON.stringify(target)}) = \${JSON.stringify(key(target))}; Redis holds \${JSON.stringify(keys)}\`);
+  }
+  assert.equal(keys.length, 2, \`two distinct targets must make two distinct keys, Redis holds \${JSON.stringify(keys)}\`);
+}
+
+export async function check_bypass(ctx) {
+  const {c, calls} = cache(ctx);
+  await c.get('/items/42');
+  const second = await c.get('/items/42');
+  assert(second.headers['x-cache'] === 'HIT' && calls.length === 1, 'a second request within the TTL must be served from the cache');
+  const bypass = await c.get('/items/42', {headers: {'Cache-Control': 'no-cache'}});
+  assert.equal(calls.length, 2, 'Cache-Control: no-cache must reach the upstream, not the cached entry');
+  assert.equal(bypass.headers['x-cache'], 'MISS', \`a bypassed request reports X-Cache \${JSON.stringify(bypass.headers['x-cache'])}, expected MISS\`);
+  assert.equal(bypass.json().fetch, 2, 'the bypassed request must answer with the fresh upstream response');
+  const after = await c.get('/items/42');
+  assert(after.headers['x-cache'] === 'HIT' && calls.length === 2, 'the bypassed request still refreshes the entry: the next plain request is a hit');
+  assert.equal(after.json().fetch, 2, \`the entry was not refreshed by the bypassed request: served fetch \${after.json().fetch}, expected 2\`);
+}
+
+export async function check_ttl(ctx) {
+  const {c, calls} = cache(ctx);
+  await c.get('/items/42');
+  const ttl = ctx.redis.ttl(key('/items/42'));
+  assert(1 <= ttl && ttl <= 10, \`the entry's TTL is \${ttl} (-1 means no expiry), expected EX 10\`);
+  ctx.clock.advance(9.0);
+  const warm = await c.get('/items/42');
+  assert(warm.headers['x-cache'] === 'HIT' && calls.length === 1, '9 s after the store the entry is still fresh');
+  ctx.clock.advance(2.0);
+  const cold = await c.get('/items/42');
+  assert(cold.headers['x-cache'] === 'MISS' && calls.length === 2, '11 s after the store the entry has expired: the upstream must be asked again');
+}
+
+export async function check_only_200(ctx) {
+  const {c, calls} = cache(ctx);
+  const ghost = await c.get('/items/ghost');
+  assert.equal(ghost.status, 404, \`a 404 from the upstream answered \${ghost.status}\`);
+  assert.deepEqual(ctx.redis.keys('*'), [], \`a 404 was stored: \${JSON.stringify(ctx.redis.keys('*'))}\`);
+  const again = await c.get('/items/ghost');
+  assert(again.status === 404 && calls.length === 2, 'a 404 must be asked upstream again, never served from cache');
+  const down = await c.get('/items/down');
+  assert.equal(down.status, 503, \`a 503 from the upstream answered \${down.status}\`);
+  assert.deepEqual(ctx.redis.keys('*'), [], \`a 503 was stored: \${JSON.stringify(ctx.redis.keys('*'))}\`);
+  const ok = await c.get('/items/42');
+  assert(ok.status === 200 && ctx.redis.exists(key('/items/42')), 'a 200 must still be stored');
+}
+
+export async function check_x_cache(ctx) {
+  const {c, calls} = cache(ctx);
+  const miss = await c.get('/items/42');
+  const hit = await c.get('/items/42');
+  const plainMiss = await c.get('/items/plain');
+  const plainHit = await c.get('/items/plain');
+  assert.equal(miss.headers['x-cache'], 'MISS', \`the first request reports X-Cache \${JSON.stringify(miss.headers['x-cache'])}, expected MISS\`);
+  assert.equal(hit.headers['x-cache'], 'HIT', \`the second request reports X-Cache \${JSON.stringify(hit.headers['x-cache'])}, expected HIT\`);
+  assert.equal(calls.length, 2, \`the upstream was called \${calls.length} times for four requests, expected 2 (one per distinct target)\`);
+  assert(hit.status === 200 && hit.text === miss.text, 'a hit must replay the stored body');
+  assert((hit.headers['content-type'] ?? '').startsWith('application/json'), \`a hit must replay the stored content type, got \${JSON.stringify(hit.headers['content-type'])}\`);
+  assert(plainHit.headers['x-cache'] === 'HIT' && plainHit.text === plainMiss.text, 'text responses are cached like any other 200');
+  assert((plainHit.headers['content-type'] ?? '').startsWith('text/plain'), \`the hit for a text/plain upstream answered Content-Type \${JSON.stringify(plainHit.headers['content-type'])}: store the content type with the body\`);
+}
 `,
   },
   debrief: `A response cache is cache-aside applied to whole HTTP responses, which is why the entry has to carry its content type and why the status guard matters: a cached error is an outage that outlives its cause. Ten seconds is a *micro-cache* — it flattens hot-key bursts without making anyone see stale data for long. Real gateways honour \`Vary\` (per-\`Accept\`, per-tenant keys), respect the upstream's own \`Cache-Control\`, add stale-while-revalidate so a hot key is refreshed in the background, and single-flight concurrent misses as in the stampede step of the image cache.`,

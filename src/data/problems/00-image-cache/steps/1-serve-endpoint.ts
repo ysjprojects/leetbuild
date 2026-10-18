@@ -45,6 +45,7 @@ steps): it returns the resized JPEG bytes, or nothing when the image does not ex
       detail: 'A handler must be registered for `GET` on the `/img/{id}` path.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/img\/\{/]},
+        typescript: {all: [/app\.get\(\s*['"]\/img\/:/]},
         go: {all: [/Handle(Func)?\(\s*"GET \/img\/\{id\}"/]},
         scala: {all: [/path\(\s*"img"\s*\/\s*Segment\s*\)/, /\bget\s*\{/]},
         cpp: {all: [/svr\.Get\(\s*R?"\(?\/img\//]},
@@ -56,6 +57,7 @@ steps): it returns the resized JPEG bytes, or nothing when the image does not ex
       detail: 'Check `w` against the bounds before doing any work and answer `400 Bad Request`.',
       match: {
         python: {all: [/MIN_W/, /MAX_W/, /status_code\s*=\s*400|HTTP_400/]},
+        typescript: {all: [/MIN_W/, /MAX_W/, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/]},
         go: {all: [/minW/, /maxW/, /http\.StatusBadRequest|\b400\b/]},
         scala: {all: [/MinW/, /MaxW/, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/kMinW/, /kMaxW/, /status\s*=\s*400/]},
@@ -67,6 +69,7 @@ steps): it returns the resized JPEG bytes, or nothing when the image does not ex
       detail: 'When `get_thumb` reports no such image, respond `404 Not Found`.',
       match: {
         python: {all: [/status_code\s*=\s*404|HTTP_404/]},
+        typescript: {all: [/code\(\s*404\s*\)|status\(\s*404\s*\)|statusCode:\s*404/]},
         go: {all: [/http\.StatusNotFound|\b404\b/]},
         scala: {all: [/StatusCodes\.NotFound|\b404\b/]},
         cpp: {all: [/status\s*=\s*404/]},
@@ -78,6 +81,7 @@ steps): it returns the resized JPEG bytes, or nothing when the image does not ex
       detail: 'Browsers and CDNs cache by `Cache-Control: public, max-age=…`; the `ETag` lets them revalidate cheaply.',
       match: {
         python: {all: [/Cache-Control/i, /max-age=/, /ETag/i]},
+        typescript: {all: [/Cache-Control/i, /max-age=/, /ETag/i]},
         go: {all: [/Cache-Control/i, /max-age=/, /ETag/i]},
         scala: {all: [/Cache-Control/i, /max-age=/, /ETag/i]},
         cpp: {all: [/Cache-Control/i, /max-age=/, /ETag/i]},
@@ -89,6 +93,7 @@ steps): it returns the resized JPEG bytes, or nothing when the image does not ex
       detail: 'Compare the `If-None-Match` request header with the ETag and reply `304 Not Modified` without a body.',
       match: {
         python: {all: [/if-none-match/i, /status_code\s*=\s*304|HTTP_304/]},
+        typescript: {all: [/if-none-match/i, /code\(\s*304\s*\)|status\(\s*304\s*\)|statusCode:\s*304/]},
         go: {all: [/If-None-Match/i, /http\.StatusNotModified|\b304\b/]},
         scala: {all: [/If-None-Match/i, /StatusCodes\.NotModified|\b304\b/]},
         cpp: {all: [/If-None-Match/i, /status\s*=\s*304/]},
@@ -151,6 +156,69 @@ def serve(image_id: str, request: Request, w: int = DEFAULT_W) -> Response:
 
 
 # uvicorn thumb_server:app --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem
+`,
+    },
+    typescript: {
+      starter: `import {createHash} from 'node:crypto';
+import Fastify from 'fastify';
+
+export const app = Fastify();
+
+export const MIN_W = 16;
+export const MAX_W = 2048;
+export const DEFAULT_W = 256;
+
+/** Resized JPEG bytes, or null when the image does not exist (built in the next steps). */
+export const cache = {
+  async getThumb(imageId: string, width: number): Promise<Buffer | null> {
+    throw new Error('not implemented');
+  },
+};
+
+app.get('/img/:id', async (request, reply) => {
+  const {id} = request.params as {id: string};
+  const {w} = request.query as {w?: string};
+  const width = w === undefined ? DEFAULT_W : Number(w);
+  // TODO: 400 when width is outside MIN_W..MAX_W
+  // TODO: 404 when cache.getThumb returns null
+  // TODO: ETag from the bytes (createHash); If-None-Match → 304
+  // TODO: Content-Type image/jpeg, Cache-Control public, max-age=86400
+  return reply.code(501).send();
+});
+
+// app.listen({port: 8443}) — Fastify({https: {key, cert}}) terminates TLS itself
+`,
+      solution: `import {createHash} from 'node:crypto';
+import Fastify from 'fastify';
+
+export const app = Fastify();
+
+export const MIN_W = 16;
+export const MAX_W = 2048;
+export const DEFAULT_W = 256;
+
+/** Resized JPEG bytes, or null when the image does not exist (built in the next steps). */
+export const cache = {
+  async getThumb(imageId: string, width: number): Promise<Buffer | null> {
+    throw new Error('not implemented');
+  },
+};
+
+app.get('/img/:id', async (request, reply) => {
+  const {id} = request.params as {id: string};
+  const {w} = request.query as {w?: string};
+  const width = w === undefined ? DEFAULT_W : Number(w);
+  if (!Number.isInteger(width) || width < MIN_W || width > MAX_W)
+    return reply.code(400).send({error: \`w must be between \${MIN_W} and \${MAX_W}\`});
+  const data = await cache.getThumb(id, width);
+  if (data === null) return reply.code(404).send({error: 'no such image'});
+  const etag = \`"\${createHash('sha256').update(data).digest('hex').slice(0, 16)}"\`;
+  reply.header('ETag', etag).header('Cache-Control', 'public, max-age=86400');
+  if (request.headers['if-none-match'] === etag) return reply.code(304).send();
+  return reply.type('image/jpeg').send(data);
+});
+
+// app.listen({port: 8443}) — Fastify({https: {key, cert}}) terminates TLS itself
 `,
     },
     go: {
@@ -497,6 +565,71 @@ async def check_not_modified(ctx):
     assert same.content == b"", "a 304 must carry no body"
     assert same.headers.get("etag") == etag, "the 304 repeats the ETag so the client keeps its copy"
     assert other.status_code == 200, "a stale If-None-Match must get the full 200"
+`,
+    typescript: `/** The thumbnail cache (built in the next steps): knows cat, records every call. Swapped onto the learner's provided cache object. */
+function server(ctx) {
+  const m = ctx.load('thumb_server');
+  const calls: [string, number][] = [];
+  m.cache.getThumb = async (imageId: string, width: number) => {
+    calls.push([imageId, width]);
+    return imageId === 'cat' ? Buffer.from(\`JPEG-\${imageId}-\${width}\`) : null;
+  };
+  return {m, calls};
+}
+
+export async function check_route(ctx) {
+  const {m, calls} = server(ctx);
+  const r = await ctx.client(m.app).get('/img/cat?w=256');
+  assert.equal(r.status, 200, \`GET /img/cat?w=256 answered \${r.status}\`);
+  assert.equal(r.text, 'JPEG-cat-256', 'the body must be exactly the bytes getThumb returned');
+  assert((r.headers['content-type'] ?? '').startsWith('image/jpeg'), \`Content-Type was \${JSON.stringify(r.headers['content-type'])}, not image/jpeg\`);
+  assert.deepEqual(calls, [['cat', 256]], \`getThumb was called with \${JSON.stringify(calls)}, expected ['cat', 256]\`);
+}
+
+export async function check_validate(ctx) {
+  const {m, calls} = server(ctx);
+  const c = ctx.client(m.app);
+  assert.equal((await c.get('/img/cat?w=8')).status, 400, 'w=8 is below 16: expected 400');
+  assert.equal((await c.get('/img/cat?w=4096')).status, 400, 'w=4096 is above 2048: expected 400');
+  assert.deepEqual(calls, [], 'a rejected width must not reach getThumb');
+  assert.equal((await c.get('/img/cat?w=16')).status, 200, 'w=16 is the lower bound and valid');
+  assert.equal((await c.get('/img/cat')).status, 200, 'without w the default width (256) applies');
+  assert(calls.some(([id, w]) => id === 'cat' && w === 256), 'the default width is 256');
+}
+
+export async function check_not_found(ctx) {
+  const {m} = server(ctx);
+  const r = await ctx.client(m.app).get('/img/ghost?w=256');
+  assert.equal(r.status, 404, \`an image getThumb does not know answered \${r.status}, not 404\`);
+}
+
+export async function check_cache_headers(ctx) {
+  const {m} = server(ctx);
+  const c = ctx.client(m.app);
+  const r1 = await c.get('/img/cat?w=256');
+  const r2 = await c.get('/img/cat?w=256');
+  const r3 = await c.get('/img/cat?w=128');
+  const cacheControl = r1.headers['cache-control'] ?? '';
+  assert(cacheControl.includes('public') && cacheControl.includes('max-age=86400'), \`Cache-Control was \${JSON.stringify(cacheControl)}\`);
+  const etag = r1.headers['etag'];
+  assert(etag, 'the 200 response carries no ETag');
+  assert.equal(r2.headers['etag'], etag, 'the same bytes must get the same ETag');
+  assert.notEqual(r3.headers['etag'], etag, 'different bytes must get a different ETag');
+}
+
+export async function check_not_modified(ctx) {
+  const {m} = server(ctx);
+  const c = ctx.client(m.app);
+  const first = await c.get('/img/cat?w=256');
+  const etag = first.headers['etag'];
+  assert(etag, 'no ETag to revalidate against');
+  const same = await c.get('/img/cat?w=256', {headers: {'If-None-Match': etag}});
+  const other = await c.get('/img/cat?w=256', {headers: {'If-None-Match': '"stale"'}});
+  assert.equal(same.status, 304, \`If-None-Match with the current ETag answered \${same.status}, not 304\`);
+  assert.equal(same.text, '', 'a 304 must carry no body');
+  assert.equal(same.headers['etag'], etag, 'the 304 repeats the ETag so the client keeps its copy');
+  assert.equal(other.status, 200, 'a stale If-None-Match must get the full 200');
+}
 `,
   },
 };

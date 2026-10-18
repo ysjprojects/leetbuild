@@ -1,6 +1,6 @@
 import type {Problem} from '@/lib/types';
 
-import {protoModules} from './proto';
+import {protoFiles, protoModules} from './proto';
 import {serveEndpointStep} from './steps/1-serve-endpoint';
 import {cacheAsideStep} from './steps/2-cache-aside';
 import {stampedeStep} from './steps/3-stampede';
@@ -68,5 +68,5 @@ what transfers to every other cache you will build.`,
     ],
   },
   steps: [serveEndpointStep, cacheAsideStep, stampedeStep, resizeRpcStep, viewEventsStep, countViewsStep],
-  support: {python: protoModules},
+  support: {python: protoModules, typescript: protoFiles},
 };

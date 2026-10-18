@@ -84,6 +84,12 @@ returning the new transaction id — or \`None\` when the event was already in t
             /ON CONFLICT \(event_id\) DO NOTHING|SELECT[^\n]*FROM transactions WHERE event_id/,
           ],
         },
+        typescript: {
+          all: [
+            /INSERT INTO transactions/,
+            /ON CONFLICT \(event_id\) DO NOTHING|SELECT[^\n]*FROM transactions WHERE event_id/,
+          ],
+        },
         go: {
           all: [
             /INSERT INTO transactions/,
@@ -117,6 +123,13 @@ returning the new transaction id — or \`None\` when the event was already in t
             /INSERT INTO entries/,
           ],
         },
+        typescript: {
+          order: [
+            /rowCount\s*===?\s*0|SELECT[^\n]*FROM transactions WHERE event_id/,
+            /return null/,
+            /INSERT INTO entries/,
+          ],
+        },
         go: {order: [/RowsAffected\(\)/, /==\s*0/, /INSERT INTO entries/]},
         scala: {order: [/executeUpdate\(\)\s*==\s*0/, /INSERT INTO entries/]},
         cpp: {order: [/affected_rows\(\)\s*==\s*0/, /INSERT INTO entries/]},
@@ -129,6 +142,13 @@ returning the new transaction id — or \`None\` when the event was already in t
         '`posted_at` is the given event time for both the transaction and its entries, and now in milliseconds only when none is given; a late event lands on the date it happened.',
       match: {
         python: {all: [/if posted_at is None/, /now_ms\(\)/, /INSERT INTO entries[^\n]*posted_at/]},
+        typescript: {
+          all: [
+            /postedAt\s*\?\?\s*nowMs\(\)|postedAt\s*===?\s*null/,
+            /nowMs\(\)/,
+            /INSERT INTO entries[^\n]*posted_at/,
+          ],
+        },
         go: {all: [/postedAt\s*==\s*0/, /nowMs\(\)/, /INSERT INTO entries[^\n]*posted_at/]},
         scala: {all: [/postedAt\s*==\s*0/, /nowMs\(\)/, /INSERT INTO entries[^\n]*posted_at/]},
         cpp: {all: [/posted_at\s*==\s*0/, /now_ms\(\)/, /INSERT INTO entries[^\n]*posted_at/]},
@@ -144,6 +164,11 @@ returning the new transaction id — or \`None\` when the event was already in t
           all: [
             /with db\.transaction\(\) as cur:(?:(?!\n {4}\S)[\s\S])*?INSERT INTO transactions/,
             /with db\.transaction\(\) as cur:(?:(?!\n {4}\S)[\s\S])*?INSERT INTO entries/,
+          ],
+        },
+        typescript: {
+          all: [
+            /query\(\s*['"]BEGIN['"]\s*\)[\s\S]*?INSERT INTO transactions[\s\S]*?INSERT INTO entries[\s\S]*?query\(\s*['"]COMMIT['"]\s*\)/,
           ],
         },
         go: {
@@ -173,6 +198,7 @@ returning the new transaction id — or \`None\` when the event was already in t
         'Once the block committed, `track(transaction_id, posted_at, entries, settles)` runs once and `invalidate(account, currency)` once per entry; a skipped duplicate triggers neither.',
       match: {
         python: {order: [/async with db\.transaction\(\)/, /(?<!import )\btrack\(/, /(?<!import )\binvalidate\(/]},
+        typescript: {order: [/query\(\s*['"]COMMIT['"]\s*\)/, /(?<!\{)\btrack\(/, /(?<!\{)\binvalidate\(/]},
         go: {order: [/db\.Transaction\(/, /(?<!func )\btrack\(/, /(?<!func )\binvalidate\(/]},
         scala: {order: [/Db\.transaction \{/, /(?<!def )\btrack\(/, /(?<!def )\binvalidate\(/]},
         cpp: {order: [/db::transaction\(/, /(?<!void )\btrack\(/, /(?<!void )\binvalidate\(/]},
@@ -240,6 +266,110 @@ async def write_transaction(
     for entry in entries:
         invalidate(entry["account"], entry["currency"])
     return transaction_id
+`,
+    },
+    typescript: {
+      starter: `import {randomUUID} from 'node:crypto';
+
+import {pool} from 'ledger/db'; // pool.connect() → client: BEGIN, your statements, COMMIT (ROLLBACK on failure), release()
+
+import {invalidate} from './balance_service'; // built in step 6: DEL bal:{account}:{currency}
+import {track} from './clearing_tracker'; // built in step 5: ZADD / ZREM on clearing:open
+
+export interface Entry {
+  account: string;
+  currency: string;
+  amount: number;
+}
+
+export interface WriteOptions {
+  /** The event this transaction records; null on the API path — a NULL never conflicts. */
+  eventId?: string | null;
+  /** The event's own time in ms; now when omitted (the API path). */
+  postedAt?: number | null;
+  /** The transaction this one settles (step 5). */
+  settles?: string | null;
+}
+
+const nowMs = (): number => Date.now();
+
+/** Record one transaction and its entries; returns its id, or null when the event was already recorded. */
+export async function writeTransaction(
+  entries: Entry[],
+  description: string,
+  options: WriteOptions = {},
+): Promise<string | null> {
+  const transactionId = randomUUID();
+  const {eventId = null, settles = null} = options;
+  // TODO: postedAt defaults to nowMs() — the API path; the consumer passes the event's occurred_at
+  // TODO: one transaction on a pool client: INSERT INTO transactions … ON CONFLICT (event_id) DO NOTHING; rowCount 0 → return null
+  // TODO: INSERT INTO entries (transaction_id, account, currency, amount, posted_at) for every entry
+  // TODO: after the COMMIT: track(transactionId, postedAt, entries, settles) and invalidate(account, currency) per entry
+  throw new Error('not implemented');
+}
+`,
+      solution: `import {randomUUID} from 'node:crypto';
+
+import {pool} from 'ledger/db'; // pool.connect() → client: BEGIN, your statements, COMMIT (ROLLBACK on failure), release()
+
+import {invalidate} from './balance_service'; // built in step 6: DEL bal:{account}:{currency}
+import {track} from './clearing_tracker'; // built in step 5: ZADD / ZREM on clearing:open
+
+export interface Entry {
+  account: string;
+  currency: string;
+  amount: number;
+}
+
+export interface WriteOptions {
+  /** The event this transaction records; null on the API path — a NULL never conflicts. */
+  eventId?: string | null;
+  /** The event's own time in ms; now when omitted (the API path). */
+  postedAt?: number | null;
+  /** The transaction this one settles (step 5). */
+  settles?: string | null;
+}
+
+const nowMs = (): number => Date.now();
+
+/** Record one transaction and its entries; returns its id, or null when the event was already recorded. */
+export async function writeTransaction(
+  entries: Entry[],
+  description: string,
+  options: WriteOptions = {},
+): Promise<string | null> {
+  const transactionId = randomUUID();
+  const {eventId = null, settles = null} = options;
+  const postedAt = options.postedAt ?? nowMs();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const inserted = await client.query(
+      'INSERT INTO transactions (id, event_id, description, settles, posted_at) VALUES ($1, $2, $3, $4, $5)' +
+        ' ON CONFLICT (event_id) DO NOTHING',
+      [transactionId, eventId, description, settles, postedAt],
+    );
+    if (inserted.rowCount === 0) {
+      await client.query('COMMIT');
+      return null; // this event is already in the journal: a redelivery
+    }
+    for (const entry of entries) {
+      await client.query(
+        'INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES ($1, $2, $3, $4, $5)',
+        [transactionId, entry.account, entry.currency, entry.amount, postedAt],
+      );
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+  await track(transactionId, postedAt, entries, settles);
+  for (const entry of entries) await invalidate(entry.account, entry.currency);
+  return transactionId;
+}
 `,
     },
     go: {
@@ -681,6 +811,185 @@ async def check_after_commit_hooks(ctx):
     assert again is None, f"the duplicate must return None, got {again!r}"
     assert _open(ctx) == open_before, f"a skipped duplicate must not be tracked: clearing:open went from {open_before} to {_open(ctx)}"
     assert ctx.redis.exists("bal:cash:acquirer:EUR"), "a skipped duplicate changed no balance, yet the cached cash:acquirer EUR balance was dropped"
+`,
+    typescript: `import * as grpc from '@grpc/grpc-js';
+
+const SCHEMA = \`
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL,
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL CHECK (amount <> 0),
+    posted_at bigint NOT NULL
+);
+\`;
+
+const T0 = 1700000000000;
+const ENTRIES = [
+  {account: 'cash:acquirer', currency: 'EUR', amount: 4999},
+  {account: 'clearing:payments', currency: 'EUR', amount: -4999},
+];
+const PAYOUT = [
+  {account: 'clearing:payments', currency: 'EUR', amount: 4999},
+  {account: 'cash:bank', currency: 'EUR', amount: -4999},
+];
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The learner's writer on an empty ledger; its track (step 5) and invalidate (step 6) are the real ones. */
+async function writer(ctx) {
+  await ctx.db.reset(SCHEMA);
+  return ctx.load('ledger_writer');
+}
+
+/** The real balance service (step 6) — the reader whose cache the writer must invalidate — and a client on it. */
+function balances(ctx) {
+  const service = ctx.load('balance_service');
+  service.serve();
+  const pkg = ctx.proto('ledger.proto');
+  return new pkg.ledger.LedgerService('ledger:9100', grpc.credentials.createInsecure());
+}
+
+async function balance(client, account: string, currency = 'EUR'): Promise<number> {
+  const reply = await client.GetBalance({account, currency, as_of: 0}, {deadline: Date.now() + 2000});
+  return Number(reply.amount);
+}
+
+async function rows(ctx, table: string) {
+  const order = table === 'entries' ? 'posted_at, account, amount' : 'posted_at, id';
+  return ctx.db.execute(\`SELECT * FROM \${table} ORDER BY \${order}\`);
+}
+
+function open(ctx): Record<string, number> {
+  const flat = ctx.redis.zrange('clearing:open', 0, -1, 'WITHSCORES');
+  const out: Record<string, number> = {};
+  for (let i = 0; i + 1 < flat.length; i += 2) out[flat[i]] = Number(flat[i + 1]);
+  return out;
+}
+
+export async function check_unique_event_id(ctx) {
+  const m = await writer(ctx);
+  const first = await m.writeTransaction(ENTRIES, 'payment.captured', {eventId: 'evt_01', postedAt: T0});
+  assert(typeof first === 'string' && first, \`the first write must return the new transaction id, got \${JSON.stringify(first)}\`);
+  assert(UUID_RE.test(first), \`the transaction id must be a UUID, got \${JSON.stringify(first)}\`);
+  const again = await m.writeTransaction(ENTRIES, 'payment.captured', {eventId: 'evt_01', postedAt: T0});
+  assert.equal(again, null, \`a second write of evt_01 must return null (already recorded), got \${JSON.stringify(again)}\`);
+  const transactions = await rows(ctx, 'transactions');
+  assert.equal(transactions.length, 1, \`two writes of one event must leave one transactions row, found \${transactions.length}\`);
+  assert(transactions[0].id === first && transactions[0].event_id === 'evt_01', \`the row must be the first write's, got \${JSON.stringify(transactions[0])}\`);
+  const api1 = await m.writeTransaction(ENTRIES, 'manual adjustment');
+  const api2 = await m.writeTransaction(ENTRIES, 'manual adjustment');
+  assert(api1 && api2 && api1 !== api2, 'API-originated transactions have no event id and never conflict: both must be written');
+  assert.equal((await rows(ctx, 'transactions')).length, 3);
+}
+
+export async function check_no_double_entries(ctx) {
+  const m = await writer(ctx);
+  await m.writeTransaction(ENTRIES, 'payment.captured', {eventId: 'evt_01', postedAt: T0});
+  await m.writeTransaction(ENTRIES, 'payment.captured', {eventId: 'evt_01', postedAt: T0});
+  await m.writeTransaction(ENTRIES, 'payment.captured', {eventId: 'evt_01', postedAt: T0});
+  let entries = await rows(ctx, 'entries');
+  assert.equal(entries.length, 2, \`three deliveries of one event must leave exactly two entries, found \${entries.length}: the duplicate must return before the entries loop\`);
+  // End to end: the real step 3 consumer meets evt_02 twice (a producer retry: a second record with a new offset).
+  for (const eventId of ['evt_02', 'evt_03', 'evt_02']) {
+    const event = {event_id: eventId, type: 'payout.sent', amount: 120000, currency: 'USD', occurred_at: T0 + 10};
+    ctx.kafka.seed('money-events', {key: eventId, value: JSON.stringify(event)});
+  }
+  const consumer = ctx.load('event_consumer');
+  await ctx.drain(consumer.run());
+  const transactions = await rows(ctx, 'transactions');
+  entries = await rows(ctx, 'entries');
+  const eventIds = transactions.map(t => t.event_id).sort();
+  assert.deepEqual(eventIds, ['evt_01', 'evt_02', 'evt_03'], \`expected evt_01, evt_02, evt_03 once each, got \${JSON.stringify(transactions.map(t => t.event_id))}\`);
+  assert.equal(entries.length, 6, \`three events must leave six entries however often they are delivered, found \${entries.length}\`);
+  const total = entries.reduce((sum, e) => sum + Number(e.amount), 0);
+  assert.equal(total, 0, \`the journal must balance: entries sum to \${total}\`);
+  assert.equal(ctx.kafka.lag('ledger', 'money-events'), 0, 'the redelivered record must still be committed: it was handled (skipped)');
+}
+
+export async function check_event_time(ctx) {
+  const m = await writer(ctx);
+  const yesterday = Date.now() - 86400000;
+  const late = await m.writeTransaction(ENTRIES, 'payment.captured', {eventId: 'evt_late', postedAt: yesterday});
+  const nowId = await m.writeTransaction(ENTRIES, 'manual adjustment');
+  const transactions = Object.fromEntries((await rows(ctx, 'transactions')).map(t => [t.id, t]));
+  assert.equal(Number(transactions[late].posted_at), yesterday, \`a late event's transaction must carry its own occurred_at \${yesterday}, got \${transactions[late].posted_at}\`);
+  const entries = await rows(ctx, 'entries');
+  const lateEntries = entries.filter(e => e.transaction_id === late);
+  assert(lateEntries.length === 2 && lateEntries.every(e => Number(e.posted_at) === yesterday), \`the late event's entries must carry its occurred_at too, got \${JSON.stringify(lateEntries.map(e => e.posted_at))}\`);
+  const now = Date.now();
+  const at = Number(transactions[nowId].posted_at);
+  assert(Math.abs(at - now) < 5000, \`a write without postedAt is the API path: posted now (\${now}), got \${at}\`);
+  assert(entries.filter(e => e.transaction_id === nowId).every(e => Number(e.posted_at) === at), 'the entries must carry the same posted_at as their transaction');
+}
+
+export async function check_atomic(ctx) {
+  const m = await writer(ctx);
+  const first = await m.writeTransaction(ENTRIES, 'payment.captured', {eventId: 'evt_01', postedAt: T0});
+  assert.deepEqual(ctx.db.events, ['BEGIN', 'COMMIT'], \`the transaction row and its entries must be written in one database transaction; the database saw \${JSON.stringify(ctx.db.events)}\`);
+  const client = balances(ctx);
+  assert.equal(await balance(client, 'cash:acquirer'), 4999); // now cached by the balance service
+  assert(ctx.redis.exists('bal:cash:acquirer:EUR'), 'the balance service must have cached cash:acquirer EUR');
+  // The second entry violates entries.amount <> 0: the transaction row must roll back with it.
+  const broken = [
+    {account: 'cash:acquirer', currency: 'EUR', amount: 4999},
+    {account: 'clearing:payments', currency: 'EUR', amount: 0},
+  ];
+  await assert.rejects(
+    m.writeTransaction(broken, 'payment.captured', {eventId: 'evt_02', postedAt: T0 + 1}),
+    () => true,
+    'a failed entry insert must propagate (the transaction rolls back), not be swallowed',
+  );
+  assert.equal(ctx.db.events[ctx.db.events.length - 1], 'ROLLBACK', \`the failed write must roll back, the database saw \${JSON.stringify(ctx.db.events)}\`);
+  const transactions = await rows(ctx, 'transactions');
+  assert.deepEqual(transactions.map(t => t.event_id), ['evt_01'], \`evt_02's entry failed but its transactions row was committed: the two inserts are not in one transaction (\${JSON.stringify(transactions.map(t => t.event_id))})\`);
+  assert.equal((await rows(ctx, 'entries')).length, 2, 'no entry of the failed transaction may survive');
+  assert.deepEqual(open(ctx), {[first]: T0}, \`only evt_01 is in the journal, so only it may be open in clearing; clearing:open holds \${JSON.stringify(open(ctx))} — a rolled-back transaction must not be tracked\`);
+  assert(ctx.redis.exists('bal:cash:acquirer:EUR'), 'the rolled-back write changed no balance, yet the cached cash:acquirer EUR balance was dropped: the hooks must run only after a commit');
+}
+
+export async function check_after_commit_hooks(ctx) {
+  const m = await writer(ctx);
+  await m.writeTransaction(ENTRIES, 'payment.captured', {eventId: 'evt_00', postedAt: T0 - 1000});
+  const client = balances(ctx);
+  assert.equal(await balance(client, 'cash:acquirer'), 4999);
+  assert.equal(await balance(client, 'clearing:payments'), -4999);
+  const before = ctx.db.events.length;
+  // Snapshots of what the database had been through at the moment each Redis side effect happened.
+  let tracked: string[] | null = null;
+  let dropped: string[] | null = null;
+  ctx.redisAfter('clearing:open', () => {
+    tracked = ctx.db.events.slice(before);
+  });
+  ctx.redisAfter('bal:clearing:payments:EUR', () => {
+    dropped = ctx.db.events.slice(before);
+  });
+  const tx = await m.writeTransaction(ENTRIES, 'payment.captured', {eventId: 'evt_01', postedAt: T0});
+  assert(tracked !== null, 'the written transaction touches clearing:payments but clearing:open was never updated: call track after the commit');
+  assert.deepEqual(tracked, ['BEGIN', 'COMMIT'], \`clearing:open was updated when the database had seen only \${JSON.stringify(tracked)}: track must run after the commit\`);
+  assert(dropped !== null && !ctx.redis.exists('bal:clearing:payments:EUR'), 'the cached clearing:payments EUR balance survived the write: invalidate(account, currency) for every entry');
+  assert.deepEqual(dropped, ['BEGIN', 'COMMIT'], \`the cached balance was dropped when the database had seen only \${JSON.stringify(dropped)}: invalidate must run after the commit\`);
+  assert(!ctx.redis.exists('bal:cash:acquirer:EUR'), "the cached cash:acquirer EUR balance survived the write: invalidate every entry's account");
+  assert.equal(await balance(client, 'cash:acquirer'), 9998, 'right after the write the balance service must answer the new cash:acquirer balance 9998');
+  let opened = open(ctx);
+  assert.equal(opened[tx], T0, \`the transaction must be open in clearing:open at its posted_at \${T0}, clearing:open holds \${JSON.stringify(opened)}\`);
+  const payout = await m.writeTransaction(PAYOUT, 'payout.sent', {eventId: 'evt_02', postedAt: T0 + 5000, settles: tx});
+  opened = open(ctx);
+  assert(!(tx in opened) && !(payout in opened), \`the payout settles \${tx}: track must get settles, close that item and open none, clearing:open holds \${JSON.stringify(opened)}\`);
+  // A redelivery of evt_01 is skipped: nothing changed, so nothing may be tracked or invalidated.
+  assert.equal(await balance(client, 'cash:acquirer'), 9998);
+  const openBefore = open(ctx);
+  const again = await m.writeTransaction(ENTRIES, 'payment.captured', {eventId: 'evt_01', postedAt: T0});
+  assert.equal(again, null, \`the duplicate must return null, got \${JSON.stringify(again)}\`);
+  assert.deepEqual(open(ctx), openBefore, \`a skipped duplicate must not be tracked: clearing:open went from \${JSON.stringify(openBefore)} to \${JSON.stringify(open(ctx))}\`);
+  assert(ctx.redis.exists('bal:cash:acquirer:EUR'), 'a skipped duplicate changed no balance, yet the cached cash:acquirer EUR balance was dropped');
+}
 `,
   },
   debrief: `The unique index on \`event_id\` is the only exactly-once mechanism that survives everything: the consumer may crash after writing and before committing, two consumers may briefly own the same partition during a rebalance, a producer may publish twice — and the journal still holds one row per event, because the database refuses the second. Reading the affected row count turns that refusal into a decision instead of an error. The hooks run after the commit because Redis is not part of the transaction: a tracked clearing item for a rolled-back transaction would be a phantom the sweeper could never settle. Stripe's post describes Ledger as immutable — nothing is updated or deleted, corrections are new transactions — and the shape here is the same: the only write is an insert, and the only conflict resolution is "already there".`,

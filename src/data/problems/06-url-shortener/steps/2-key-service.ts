@@ -54,6 +54,7 @@ lock are provided.
       detail: 'Every RPC carries a deadline so a slow key service cannot stall every shorten request behind it.',
       match: {
         python: {all: [/stub\.ReserveBlock\([^\n]*timeout\s*=/]},
+        typescript: {all: [/stub\.ReserveBlock\([^\n]*deadline/]},
         go: {all: [/context\.WithTimeout\(/, /stub\.ReserveBlock\(/]},
         scala: {all: [/withDeadlineAfter\(/, /\.reserveBlock\(/]},
         cpp: {all: [/set_deadline\(/, /stub->ReserveBlock\(/]},
@@ -68,6 +69,10 @@ lock are provided.
         python: {
           all: [/StatusCode\.UNAVAILABLE/, /for \w+ in range\(\s*2\s*\)/],
           none: [/def reserve_block(?:(?!\ndef )[\s\S])*?while True/],
+        },
+        typescript: {
+          all: [/status\.UNAVAILABLE/, /for \(let \w+ = 0; \w+ < 2; \w+\+\+\)/],
+          none: [/function reserveBlock(?:(?!\n\})[\s\S])*?(for \(;;\)|while \(true\))/],
         },
         go: {
           all: [/codes\.Unavailable/, /for \w+ := 0; \w+ < 2; \w+\+\+/],
@@ -90,6 +95,7 @@ lock are provided.
         'A new block is reserved when `remaining` reaches 0 — not on every call, and not before the current block is used up.',
       match: {
         python: {all: [/block_remaining\s*(==|<=)\s*0|not block_remaining/, /=\s*reserve_block\(\)/]},
+        typescript: {all: [/remaining\s*(===?|<=)\s*0|!remaining/, /=\s*await reserveBlock\(\)/]},
         go: {all: [/remaining\s*(==|<=)\s*0/, /=\s*reserveBlock\(/]},
         scala: {all: [/remaining\s*(==|<=)\s*0/, /=\s*reserveBlock\(\)/]},
         cpp: {all: [/remaining\s*(==|<=)\s*0|!remaining/, /=\s*reserve_block\(\)/]},
@@ -102,6 +108,9 @@ lock are provided.
         'The code is the base62 encoding of the block counter; each call moves `start` up by one and `remaining` down by one.',
       match: {
         python: {all: [/(?<!def )base62\(\s*block_start\s*\)/, /block_start\s*\+=\s*1/, /block_remaining\s*-=\s*1/]},
+        typescript: {
+          all: [/(?<!function )base62\(\s*start\s*\)/, /start\+\+|start\s*\+=\s*1/, /remaining--|remaining\s*-=\s*1/],
+        },
         go: {all: [/(?<!func )base62\(\s*start\s*\)/, /start\+\+|start\s*\+=\s*1/, /remaining--|remaining\s*-=\s*1/]},
         scala: {all: [/(?<!def )base62\(\s*start\s*\)/, /start\s*\+=\s*1/, /remaining\s*-=\s*1/]},
         cpp: {
@@ -120,6 +129,7 @@ lock are provided.
         'Check, refill and advance happen under the lock; without it two threads can hand out the same code or both reserve a block.',
       match: {
         python: {all: [/with lock:/]},
+        typescript: {all: [/lock\.run\(/]},
         go: {all: [/mu\.Lock\(\)/, /mu\.Unlock\(\)/]},
         scala: {all: [/lock\.synchronized\s*\{|synchronized\s*\{/]},
         cpp: {all: [/std::(lock_guard|scoped_lock|unique_lock)[^\n]*\bmu\b/]},
@@ -221,6 +231,153 @@ def next_code() -> str:
         block_start += 1
         block_remaining -= 1
         return code
+`,
+    },
+    typescript: {
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+
+export const BLOCK_SIZE = 1000;
+export const DEADLINE_MS = 500;
+const ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+interface ReserveReply {
+  start: string; // uint64 crosses the wire as a decimal string
+  size: number;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('keys.proto')) as unknown as {
+  shortener: {KeyService: grpc.ServiceClientConstructor};
+};
+const stub = new pkg.shortener.KeyService('keys:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  ReserveBlock(request: {size: number}, options: grpc.CallOptions): Promise<ReserveReply>;
+};
+
+/** An async mutex (provided): await lock.run(async () => …) runs one caller at a time, in arrival order. */
+class Mutex {
+  locked = false;
+  private waiters: (() => void)[] = [];
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    while (this.locked) {
+      const {promise, resolve} = Promise.withResolvers<void>();
+      this.waiters.push(resolve);
+      await promise;
+    }
+    this.locked = true;
+    try {
+      return await fn();
+    } finally {
+      this.locked = false;
+      this.waiters.shift()?.();
+    }
+  }
+}
+
+export const lock = new Mutex();
+let start = 0;
+let remaining = 0;
+
+/** Encodes a counter as a short code (provided). */
+export function base62(n: number): string {
+  let out = '';
+  for (;;) {
+    out = ALPHABET[n % 62] + out;
+    n = Math.floor(n / 62);
+    if (n === 0) return out;
+  }
+}
+
+export async function reserveBlock(): Promise<[number, number]> {
+  const request = {size: BLOCK_SIZE};
+  // TODO: stub.ReserveBlock with a deadline of DEADLINE_MS → [Number(reply.start), reply.size]
+  // TODO: UNAVAILABLE → retry once; anything else → throw
+  throw new Error('not implemented');
+}
+
+export async function nextCode(): Promise<string> {
+  // TODO: under lock.run: refill from reserveBlock() when remaining === 0
+  // TODO: hand out base62(start), then advance start / remaining
+  throw new Error('not implemented');
+}
+`,
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+
+export const BLOCK_SIZE = 1000;
+export const DEADLINE_MS = 500;
+const ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+interface ReserveReply {
+  start: string; // uint64 crosses the wire as a decimal string
+  size: number;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('keys.proto')) as unknown as {
+  shortener: {KeyService: grpc.ServiceClientConstructor};
+};
+const stub = new pkg.shortener.KeyService('keys:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  ReserveBlock(request: {size: number}, options: grpc.CallOptions): Promise<ReserveReply>;
+};
+
+/** An async mutex (provided): await lock.run(async () => …) runs one caller at a time, in arrival order. */
+class Mutex {
+  locked = false;
+  private waiters: (() => void)[] = [];
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    while (this.locked) {
+      const {promise, resolve} = Promise.withResolvers<void>();
+      this.waiters.push(resolve);
+      await promise;
+    }
+    this.locked = true;
+    try {
+      return await fn();
+    } finally {
+      this.locked = false;
+      this.waiters.shift()?.();
+    }
+  }
+}
+
+export const lock = new Mutex();
+let start = 0;
+let remaining = 0;
+
+/** Encodes a counter as a short code (provided). */
+export function base62(n: number): string {
+  let out = '';
+  for (;;) {
+    out = ALPHABET[n % 62] + out;
+    n = Math.floor(n / 62);
+    if (n === 0) return out;
+  }
+}
+
+export async function reserveBlock(): Promise<[number, number]> {
+  const request = {size: BLOCK_SIZE};
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const reply = await stub.ReserveBlock(request, {deadline: Date.now() + DEADLINE_MS});
+      return [Number(reply.start), reply.size];
+    } catch (e) {
+      if ((e as grpc.ServiceError).code === grpc.status.UNAVAILABLE && attempt === 0) continue;
+      throw e;
+    }
+  }
+  throw new Error('key service unavailable');
+}
+
+export async function nextCode(): Promise<string> {
+  return lock.run(async () => {
+    if (remaining === 0) [start, remaining] = await reserveBlock();
+    const code = base62(start);
+    start += 1;
+    remaining -= 1;
+    return code;
+  });
+}
 `,
     },
     go: {
@@ -680,6 +837,116 @@ def check_locked(ctx):
     except grpc.RpcError:
         pass
     assert not m.lock.locked(), "a failed refill must release the lock, or every later request deadlocks"
+`,
+    typescript: `const FIRST = 3842000;
+
+/** The key service: hands out blocks of 'block' counters; successive blocks start 1000 apart, so a client that
+ * keeps minting past the end of a block produces a code the service never issued. */
+function client(ctx, block: number) {
+  const peer = {next: FIRST, sizes: [] as number[], lockedDuringCall: [] as boolean[], lock: null as {locked: boolean} | null};
+  const pkg = ctx.proto('keys.proto');
+  ctx.grpc.serve(pkg.shortener.KeyService.service, {
+    ReserveBlock(call, callback) {
+      peer.sizes.push(call.request.size);
+      if (peer.lock !== null) peer.lockedDuringCall.push(peer.lock.locked);
+      const start = peer.next;
+      peer.next += 1000;
+      callback(null, {start: String(start), size: Math.min(call.request.size, block)});
+    },
+  });
+  const m = ctx.load('key_client');
+  peer.lock = m.lock;
+  return {m, peer};
+}
+
+const rpcs = ctx => ctx.grpc.callsTo('ReserveBlock').length;
+
+/** The gRPC status code a rejected next_code() surfaced, or null when it resolved. */
+async function failure(ctx, m, resolvedMessage: string): Promise<{code: number; details?: string}> {
+  try {
+    await m.nextCode();
+  } catch (e) {
+    assert(typeof e.code === 'number', \`next_code failed with \${e}, expected a gRPC status error\`);
+    return e;
+  }
+  assert.fail(resolvedMessage);
+}
+
+const name = (ctx, code: number): string => Object.keys(ctx.grpc.status).find(k => ctx.grpc.status[k] === code) ?? String(code);
+
+export async function check_deadline(ctx) {
+  const {m} = client(ctx, 1);
+  assert.equal(await m.nextCode(), m.base62(FIRST), 'next_code must hand out the first counter of the reserved block');
+  const call = ctx.grpc.callsTo('ReserveBlock').at(-1);
+  assert(call.timeout !== null, 'ReserveBlock carries no deadline: a slow key service would stall every shorten request');
+  assert(0.4 <= call.timeout && call.timeout <= 0.6, \`the deadline must be 500 ms, got \${call.timeout} s\`);
+  ctx.grpc.setLatency('ReserveBlock', 3.0);
+  const e = await failure(ctx, m, 'a key service slower than the deadline must surface DEADLINE_EXCEEDED');
+  assert.equal(e.code, ctx.grpc.status.DEADLINE_EXCEEDED, \`a slow key service raised \${name(ctx, e.code)}, expected DEADLINE_EXCEEDED\`);
+  assert.equal(rpcs(ctx), 2, 'DEADLINE_EXCEEDED is not UNAVAILABLE: it must not be retried');
+}
+
+export async function check_retry_unavailable(ctx) {
+  const {m} = client(ctx, 1);
+  ctx.grpc.fail('ReserveBlock', ctx.grpc.status.UNAVAILABLE, 'key service restarting', 1);
+  assert.equal(await m.nextCode(), m.base62(FIRST), "one UNAVAILABLE must be retried and the second attempt's block used");
+  assert.equal(rpcs(ctx), 2, \`expected exactly one retry after UNAVAILABLE, saw \${rpcs(ctx)} calls\`);
+  ctx.grpc.fail('ReserveBlock', ctx.grpc.status.RESOURCE_EXHAUSTED, 'quota', 1);
+  let e = await failure(ctx, m, 'RESOURCE_EXHAUSTED must propagate, not be retried or swallowed');
+  assert.equal(e.code, ctx.grpc.status.RESOURCE_EXHAUSTED, \`expected RESOURCE_EXHAUSTED to propagate, got \${name(ctx, e.code)}\`);
+  assert.equal(rpcs(ctx), 3, 'only UNAVAILABLE is worth a second attempt');
+  ctx.grpc.fail('ReserveBlock', ctx.grpc.status.UNAVAILABLE, 'down', 50);
+  e = await failure(ctx, m, 'a key service that stays UNAVAILABLE must throw, not return a code');
+  assert.equal(e.code, ctx.grpc.status.UNAVAILABLE, \`expected UNAVAILABLE after the retries, got \${name(ctx, e.code)}\`);
+  const attempts = rpcs(ctx) - 3;
+  assert.equal(attempts, 2, \`made \${attempts} attempts against a down key service; retries must stop after the second\`);
+}
+
+export async function check_refill_when_empty(ctx) {
+  const {m, peer} = client(ctx, 3);
+  assert.equal(rpcs(ctx), 0, 'no block is reserved before the first code is needed');
+  for (let i = 0; i < 3; i++) {
+    await m.nextCode();
+    assert.equal(rpcs(ctx), 1, \`code \${i + 1} of a block of 3 reserved another block: refill only when remaining is 0\`);
+  }
+  await m.nextCode();
+  assert.equal(rpcs(ctx), 2, 'the 4th code needs a new block: expected a second ReserveBlock');
+  await m.nextCode();
+  await m.nextCode();
+  assert.equal(rpcs(ctx), 2, 'codes 5 and 6 come from the second block without an RPC');
+  await m.nextCode();
+  assert.equal(rpcs(ctx), 3, 'the 7th code needs a third block');
+  assert.deepEqual(peer.sizes, [m.BLOCK_SIZE, m.BLOCK_SIZE, m.BLOCK_SIZE], \`ReserveBlock must ask for BLOCK_SIZE (\${m.BLOCK_SIZE}) counters, asked for \${JSON.stringify(peer.sizes)}\`);
+}
+
+export async function check_base62_advance(ctx) {
+  const {m} = client(ctx, 3);
+  const codes: string[] = [];
+  for (let i = 0; i < 5; i++) codes.push(await m.nextCode());
+  const expected = [FIRST, FIRST + 1, FIRST + 2, FIRST + 1000, FIRST + 1001].map(n => m.base62(n));
+  assert.deepEqual(codes, expected, \`handed out \${JSON.stringify(codes)}, expected base62 of 3842000, 3842001, 3842002 then the next block 3843000, 3843001\`);
+  assert.equal(new Set(codes).size, 5, \`codes must be unique, got \${JSON.stringify(codes)}\`);
+}
+
+export async function check_locked(ctx) {
+  const {m, peer} = client(ctx, 2);
+  await m.nextCode();
+  assert.deepEqual(peer.lockedDuringCall, [true], 'the refill must happen under the lock: another request could reserve a second block meanwhile');
+  assert(!m.lock.locked, 'the lock must be released once the code is handed out');
+  await m.nextCode();
+  await m.nextCode();
+  assert.deepEqual(peer.lockedDuringCall, [true, true], 'every refill, not only the first, happens under the lock');
+  const concurrent = await Promise.all([m.nextCode(), m.nextCode(), m.nextCode()]);
+  assert.equal(rpcs(ctx), 3, \`three concurrent next_code() calls on a block of 2 reserved \${rpcs(ctx) - 2} blocks: without the lock every caller sees an empty block and reserves its own\`);
+  assert.deepEqual(concurrent, [FIRST + 1001, FIRST + 2000, FIRST + 2001].map(n => m.base62(n)), \`concurrent callers got \${JSON.stringify(concurrent)}, expected the last code of the block and then two consecutive codes of one new block\`);
+  ctx.grpc.fail('ReserveBlock', ctx.grpc.status.UNAVAILABLE, 'down', 50);
+  try {
+    await m.nextCode(); // the block is used up: this refill fails
+  } catch {
+    // what matters is the lock
+  }
+  assert(!m.lock.locked, 'a failed refill must release the lock, or every later request deadlocks');
+}
 `,
   },
   debrief: `Reserving a block turns a coordination problem into a local one: one RPC per thousand codes, and a key service outage only matters when the block runs dry. The codes are sequential, which is fine for a shortener (and is what a database sequence would give you) — a counter is unguessable only if you need it to be, and then you add a random prefix or encrypt it. Real key services pre-fetch the next block before the current one is empty, so the refill never sits on a request path, and survive their own restarts by persisting the high-water mark.`,

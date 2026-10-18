@@ -50,6 +50,7 @@ last few messages without a trip to the message store. Keep them in a Redis list
       detail: 'The key is `recent:{room}` and every message is `LPUSH`ed so the newest is at the head.',
       match: {
         python: {all: [/f"recent:\{room\}"/, /\.lpush\(\s*key\s*,/]},
+        typescript: {all: [/`recent:\$\{room\}`/, /\.lpush\(\s*key\s*,/]},
         go: {
           all: [/"recent:"\s*\+\s*room|fmt\.Sprintf\(\s*"recent:%s"\s*,\s*room\s*\)/, /\.LPush\(\s*ctx\s*,\s*key\s*,/],
         },
@@ -63,6 +64,7 @@ last few messages without a trip to the message store. Keep them in a Redis list
       detail: '`LTRIM recent:{room} 0 49` after every push bounds the list; without it every room grows forever.',
       match: {
         python: {all: [/\.ltrim\(\s*key\s*,\s*0\s*,\s*(?:RECENT_N\s*-\s*1|49)\s*\)/]},
+        typescript: {all: [/\.ltrim\(\s*key\s*,\s*0\s*,\s*(?:RECENT_N\s*-\s*1|49)\s*\)/]},
         go: {all: [/\.LTrim\(\s*ctx\s*,\s*key\s*,\s*0\s*,\s*(?:recentN\s*-\s*1|49)\s*\)/]},
         scala: {all: [/\.ltrim\(\s*key\s*,\s*0\s*,\s*(?:RecentN\s*-\s*1|49L?)\s*\)/]},
         cpp: {all: [/\.ltrim\(\s*key\s*,\s*0\s*,\s*(?:kRecentN\s*-\s*1|49)\s*\)/]},
@@ -75,6 +77,7 @@ last few messages without a trip to the message store. Keep them in a Redis list
         '`EXPIRE recent:{room} 3600` on every write: the TTL restarts per message, so only rooms nobody speaks in fall out.',
       match: {
         python: {all: [/\.expire\(\s*key\s*,\s*(?:RECENT_TTL_S|3600)\s*\)/]},
+        typescript: {all: [/\.expire\(\s*key\s*,\s*(?:RECENT_TTL_S|3600)\s*\)/]},
         go: {all: [/\.Expire\(\s*ctx\s*,\s*key\s*,\s*(?:recentTTL|time\.Hour|3600\s*\*\s*time\.Second)\s*\)/]},
         scala: {all: [/\.expire\(\s*key\s*,\s*(?:RecentTtlSeconds|3600L?)\s*\)/]},
         cpp: {
@@ -91,6 +94,7 @@ last few messages without a trip to the message store. Keep them in a Redis list
         'Open a MULTI (`pipeline(transaction=True)` / `TxPipelined` / `multi()` / `transaction()`), queue LPUSH → LTRIM → EXPIRE in that order, then execute once: one round trip, and no reader ever sees the list at 51.',
       match: {
         python: {order: [/\.pipeline\(/, /\.lpush\(/, /\.ltrim\(/, /\.expire\(/, /\.execute\(\)/]},
+        typescript: {order: [/\.multi\(/, /\.lpush\(/, /\.ltrim\(/, /\.expire\(/, /\.exec\(\)/]},
         go: {order: [/TxPipelined\(|Pipelined\(|TxPipeline\(\)|Pipeline\(\)/, /\.LPush\(/, /\.LTrim\(/, /\.Expire\(/]},
         scala: {
           order: [/\.pipelined\(\)|\.multi\(\)/, /\.lpush\(/, /\.ltrim\(/, /\.expire\(/, /\.sync\(\)|\.exec\(\)/],
@@ -105,6 +109,9 @@ last few messages without a trip to the message store. Keep them in a Redis list
       match: {
         python: {
           all: [/\.lrange\(\s*key\s*,\s*0\s*,\s*(?:RECENT_N\s*-\s*1|49)\s*\)/, /reversed\(|\[::-1\]|\.reverse\(\)/],
+        },
+        typescript: {
+          all: [/\.lrange\(\s*key\s*,\s*0\s*,\s*(?:RECENT_N\s*-\s*1|49)\s*\)/, /\.reverse\(\)|\.toReversed\(\)/],
         },
         go: {
           all: [
@@ -170,6 +177,52 @@ def recent(room: str) -> list[chat_pb2.ServerMsg]:
     key = f"recent:{room}"
     newest_first = r.lrange(key, 0, RECENT_N - 1)
     return [json_format.Parse(v, chat_pb2.ServerMsg()) for v in reversed(newest_first)]
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+import type {ServerMsg} from 'subscriptions';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const RECENT_N = 50;
+export const RECENT_TTL_S = 3600; // a room nobody has spoken in for an hour drops out of Redis
+
+/** Called by the room bus for every delivered message. */
+export async function remember(room: string, msg: ServerMsg): Promise<void> {
+  const key = ''; // TODO: recent:{room}
+  const value = JSON.stringify(msg);
+  // TODO: one MULTI: LPUSH key value · LTRIM key 0 RECENT_N-1 · EXPIRE key RECENT_TTL_S · exec
+  throw new Error('not implemented');
+}
+
+/** The last RECENT_N messages, oldest first: what a joining client sees before live messages flow. */
+export async function recent(room: string): Promise<ServerMsg[]> {
+  // TODO: LRANGE key 0 RECENT_N-1 is newest first; parse each value and return them reversed
+  throw new Error('not implemented');
+}
+`,
+      solution: `import Redis from 'ioredis';
+import type {ServerMsg} from 'subscriptions';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const RECENT_N = 50;
+export const RECENT_TTL_S = 3600; // a room nobody has spoken in for an hour drops out of Redis
+
+/** Called by the room bus for every delivered message. */
+export async function remember(room: string, msg: ServerMsg): Promise<void> {
+  const key = \`recent:\${room}\`;
+  const value = JSON.stringify(msg);
+  await redis.multi().lpush(key, value).ltrim(key, 0, RECENT_N - 1).expire(key, RECENT_TTL_S).exec();
+}
+
+/** The last RECENT_N messages, oldest first: what a joining client sees before live messages flow. */
+export async function recent(room: string): Promise<ServerMsg[]> {
+  const key = \`recent:\${room}\`;
+  const newestFirst = await redis.lrange(key, 0, RECENT_N - 1);
+  return newestFirst.reverse().map(v => JSON.parse(v) as ServerMsg);
+}
 `,
     },
     go: {
@@ -498,6 +551,78 @@ def check_chronological(ctx):
         m.remember("room-7", _msg(i))
     got = [s.text for s in m.recent("room-7")]
     assert got == [f"m{i}" for i in range(11, 61)], f"after 60 messages recent('room-7') must be m11 .. m60 oldest first, got {got[:3]} .. {got[-3:]} ({len(got)} entries)"
+`,
+    typescript: `const KEY = 'recent:room-7';
+
+const msg = (i, room = 'room-7') => ({room, user: i % 2 ? 'ana' : 'bo', text: \`m\${i}\`, ts: 1700000000000 + i});
+
+/** The list as Redis holds it, head first, parsed back into ServerMsgs. */
+const stored = (ctx, key = KEY) => ctx.redis.lrange(key, 0, -1).map(v => JSON.parse(v));
+
+export async function check_lpush(ctx) {
+  const m = ctx.load('recent_messages');
+  await m.remember('room-7', msg(1));
+  await m.remember('room-7', msg(2));
+  await m.remember('room-8', msg(3, 'room-8'));
+  assert.equal(ctx.redis.type(KEY), 'list', \`recent:room-7 is \${JSON.stringify(ctx.redis.type(KEY))} (keys: \${JSON.stringify(ctx.redis.keys('*'))}), expected a list\`);
+  const list = stored(ctx);
+  assert.deepEqual(list.map(s => s.text), ['m2', 'm1'], \`recent:room-7 holds \${JSON.stringify(list.map(s => s.text))} head first, expected ['m2', 'm1']: LPUSH puts the newest at the head\`);
+  assert.deepEqual(list[1], msg(1), \`the stored JSON parses back to \${JSON.stringify(list[1])}, expected \${JSON.stringify(msg(1))}\`);
+  const other = stored(ctx, 'recent:room-8').map(s => s.text);
+  assert.deepEqual(other, ['m3'], \`recent:room-8 holds \${JSON.stringify(other)}, expected ['m3']: one list per room\`);
+}
+
+export async function check_trim(ctx) {
+  const m = ctx.load('recent_messages');
+  for (let i = 1; i <= 55; i++) await m.remember('room-7', msg(i));
+  const n = ctx.redis.llen(KEY);
+  assert.equal(n, 50, \`after 55 messages recent:room-7 holds \${n} entries, expected 50 (LTRIM 0 49 after every push)\`);
+  const list = stored(ctx);
+  assert(list[0].text === 'm55' && list[list.length - 1].text === 'm6', \`the list runs \${list[0].text} .. \${list[list.length - 1].text}, expected m55 .. m6: trimming must drop the oldest, not the newest\`);
+}
+
+export async function check_expire(ctx) {
+  const m = ctx.load('recent_messages');
+  await m.remember('room-7', msg(1));
+  let ttl = ctx.redis.ttl(KEY);
+  assert(3500 <= ttl && ttl <= 3600, \`recent:room-7 has TTL \${ttl}, expected 3600 s\`);
+  ctx.clock.advance(1800);
+  await m.remember('room-7', msg(2));
+  ttl = ctx.redis.ttl(KEY);
+  assert(3500 <= ttl && ttl <= 3600, \`a new message must restart the hour: TTL is \${ttl} after the second remember, expected 3600\`);
+  ctx.clock.advance(3601);
+  assert.equal(ctx.redis.exists(KEY), 0, 'a room quiet for an hour must drop out of Redis');
+}
+
+export async function check_pipelined(ctx) {
+  const m = ctx.load('recent_messages');
+  const before = ctx.redisRoundTrips().length;
+  await m.remember('room-7', msg(1));
+  const trips = ctx.redisRoundTrips().slice(before);
+  const direct = trips.filter(t => t.length === 1).flat();
+  assert.deepEqual(direct, [], \`remember sent \${JSON.stringify(direct)} outside a pipeline: queue LPUSH, LTRIM and EXPIRE in one MULTI and exec once\`);
+  assert.equal(trips.length, 1, \`remember made \${trips.length} round trip(s) (\${JSON.stringify(trips)}), expected exactly one\`);
+  const [trip] = trips;
+  const commands = trip.filter(c => c !== 'MULTI' && c !== 'EXEC');
+  assert.deepEqual(commands, ['LPUSH', 'LTRIM', 'EXPIRE'], \`the pipeline queued \${JSON.stringify(commands)}, expected ['LPUSH', 'LTRIM', 'EXPIRE'] in that order\`);
+  assert(trip[0] === 'MULTI', 'the pipeline must be a MULTI (redis.multi()) so no reader ever sees the list at 51');
+  const list = stored(ctx);
+  assert(list.length === 1 && list[0].text === 'm1' && 3500 <= ctx.redis.ttl(KEY) && ctx.redis.ttl(KEY) <= 3600, 'after exec the list must hold the message with its TTL set');
+}
+
+export async function check_chronological(ctx) {
+  const m = ctx.load('recent_messages');
+  assert.deepEqual(await m.recent('room-7'), [], \`a quiet room must give an empty list, got \${JSON.stringify(await m.recent('room-7'))}\`);
+  for (let i = 1; i <= 3; i++) await m.remember('room-7', msg(i));
+  let got = await m.recent('room-7');
+  assert(got.every(s => s !== null && typeof s === 'object' && typeof s.text === 'string'), \`recent must return ServerMsg objects, got \${JSON.stringify(got)}\`);
+  assert.deepEqual(got.map(s => s.text), ['m1', 'm2', 'm3'], \`recent('room-7') is \${JSON.stringify(got.map(s => s.text))}, expected ['m1', 'm2', 'm3'] oldest first\`);
+  assert.deepEqual(got[0], msg(1), \`recent()[0] is \${JSON.stringify(got[0])}, expected \${JSON.stringify(msg(1))}\`);
+  for (let i = 4; i <= 60; i++) await m.remember('room-7', msg(i));
+  got = (await m.recent('room-7')).map(s => s.text);
+  const want = Array.from({length: 50}, (_, i) => \`m\${i + 11}\`);
+  assert.deepEqual(got, want, \`after 60 messages recent('room-7') must be m11 .. m60 oldest first, got \${JSON.stringify(got.slice(0, 3))} .. \${JSON.stringify(got.slice(-3))} (\${got.length} entries)\`);
+}
 `,
   },
   debrief: `LPUSH + LTRIM + EXPIRE is the Redis idiom for a bounded, self-cleaning recent-items list, and wrapping the three in MULTI/EXEC is what makes it one round trip *and* one atomic unit — a plain pipeline saves the round trips but another client's LRANGE can still slip in between the push and the trim. The list is maintained by the writer, so a miss is not a signal to load anything; it just means the client uses the history endpoint. Real systems store a sequence number with each entry so a reconnecting client can ask for "everything after N", and keep the list per shard when a single room is hot enough to make one Redis key a bottleneck.`,

@@ -41,6 +41,7 @@ so every request produces one record on the **\`image-views\`** topic:
       detail: 'The record goes to the `image-views` topic.',
       match: {
         python: {all: [/image-views/, /producer\.produce\(/]},
+        typescript: {all: [/image-views/, /producer\.send\(/]},
         go: {all: [/image-views/, /WriteMessages\(/]},
         scala: {all: [/image-views/, /producer\.send\(/]},
         cpp: {all: [/image-views/, /producer->produce\(/]},
@@ -52,6 +53,7 @@ so every request produces one record on the **\`image-views\`** topic:
       detail: 'Setting the key to the image id keeps all events of one image on one partition, in order.',
       match: {
         python: {all: [/produce\([^\n]*key\s*=\s*image_id/]},
+        typescript: {all: [/messages:\s*\[\s*\{[^\n]*key:\s*imageId/]},
         go: {all: [/Key:\s*\[\]byte\(\s*id\s*\)/]},
         scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*Topic\s*,\s*id\s*,/]},
         cpp: {all: [/produce\([\s\S]{0,400}?id\.c_str\(\)\s*,\s*id\.size\(\)/]},
@@ -64,6 +66,10 @@ so every request produces one record on the **\`image-views\`** topic:
         'Enqueue and return; serve delivery callbacks with `poll(0)` (or async writes) instead of blocking on an acknowledgement.',
       match: {
         python: {all: [/producer\.poll\(\s*0\s*\)/], none: [/def emit_view(?:(?!\ndef )[\s\S])*?producer\.flush\(/]},
+        typescript: {
+          all: [/producer\.send\(/],
+          none: [/function emitView(?:(?!\nexport )[\s\S])*?await\s+producer\.send\(/],
+        },
         go: {all: [/Async:\s*true/], none: [/if err := writer\.WriteMessages/]},
         scala: {all: [/producer\.send\(\s*record\s*,/], none: [/\.send\([^\n]*\)\.get\(/]},
         cpp: {all: [/producer->poll\(\s*0\s*\)/], none: [/void emit_view(?:(?!\n\})[\s\S])*?producer->flush\(/]},
@@ -75,6 +81,7 @@ so every request produces one record on the **\`image-views\`** topic:
       detail: 'A delivery report callback logs failed records; nothing else needs to happen for analytics events.',
       match: {
         python: {all: [/on_delivery\s*=\s*on_delivery|callback\s*=\s*on_delivery/]},
+        typescript: {all: [/\bonDelivery\b/, /\.catch\(|\.then\([^\n]*,/]},
         go: {all: [/Completion:\s*func\(/]},
         scala: {all: [/onCompletion\(/]},
         cpp: {all: [/dr_cb\(|DeliveryReportCb/]},
@@ -86,6 +93,7 @@ so every request produces one record on the **\`image-views\`** topic:
       detail: 'Buffered records are only sent when the producer flushes; do it once at shutdown.',
       match: {
         python: {all: [/def shutdown(?:(?!\ndef )[\s\S])*?producer\.flush\(/]},
+        typescript: {all: [/function shutdown(?:(?!\nexport )[\s\S])*?await Promise\.all\(/]},
         go: {all: [/func shutdown(?:(?!\n\})[\s\S])*?writer\.Close\(\)/]},
         scala: {all: [/def shutdown(?:(?!\n {2}def )[\s\S])*?producer\.(flush|close)\(/]},
         cpp: {all: [/void shutdown(?:(?!\n\})[\s\S])*?producer->flush\(/]},
@@ -148,6 +156,65 @@ def shutdown() -> None:
     remaining = producer.flush(timeout=5)
     if remaining:
         log.warning("%d view events were not delivered", remaining)
+`,
+    },
+    typescript: {
+      starter: `import {Kafka} from 'kafkajs';
+
+export const TOPIC = 'image-views';
+
+const kafka = new Kafka({clientId: 'thumbs', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+const ready = producer.connect();
+/** Deliveries handed to the producer and not yet acknowledged. */
+const inFlight = new Set<Promise<void>>();
+
+function onDelivery(imageId: string, err: Error): void {
+  // TODO: log a warning: the event was not delivered
+}
+
+export function emitView(imageId: string, width: number, hit: boolean): void {
+  const value = JSON.stringify({id: imageId, w: width, hit, ts: Date.now() / 1000});
+  // TODO: once ready, send keyed by imageId; report failures through onDelivery; track the delivery in inFlight
+  // TODO: never await the broker here
+  throw new Error('not implemented');
+}
+
+export async function shutdown(): Promise<void> {
+  // TODO: wait for every in-flight delivery, then disconnect
+  throw new Error('not implemented');
+}
+`,
+      solution: `import {Kafka} from 'kafkajs';
+
+export const TOPIC = 'image-views';
+
+const kafka = new Kafka({clientId: 'thumbs', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+const ready = producer.connect();
+/** Deliveries handed to the producer and not yet acknowledged. */
+const inFlight = new Set<Promise<void>>();
+
+function onDelivery(imageId: string, err: Error): void {
+  console.warn(\`view event for \${imageId} not delivered: \${err.message}\`);
+}
+
+export function emitView(imageId: string, width: number, hit: boolean): void {
+  const value = JSON.stringify({id: imageId, w: width, hit, ts: Date.now() / 1000});
+  const delivery: Promise<void> = ready
+    .then(() => producer.send({topic: TOPIC, messages: [{key: imageId, value}], acks: 1}))
+    .then(
+      () => undefined,
+      (err: Error) => onDelivery(imageId, err),
+    )
+    .finally(() => inFlight.delete(delivery));
+  inFlight.add(delivery);
+}
+
+export async function shutdown(): Promise<void> {
+  await Promise.all(inFlight);
+  await producer.disconnect();
+}
 `,
     },
     go: {
@@ -432,6 +499,73 @@ def check_flush(ctx):
     m.emit_view("cat", 256, True)
     m.shutdown()
     assert ctx.kafka.flushes >= 1, "shutdown() must flush the producer"
+`,
+    typescript: `import {setTimeout as sleep} from 'node:timers/promises';
+
+/** The learner's module plus everything it warns or errors about (the delivery reports). */
+function events(ctx) {
+  const m = ctx.load('view_events');
+  const warnings: string[] = [];
+  const record = (...args: unknown[]) => warnings.push(args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
+  console.warn = record;
+  console.error = record;
+  return {m, warnings};
+}
+
+export async function check_topic(ctx) {
+  const {m} = events(ctx);
+  m.emitView('cat', 256, true);
+  await sleep(10); // the producer's background work gets a turn
+  const produced = ctx.kafka.records('image-views');
+  assert.equal(produced.length, 1, \`expected one record on image-views, found \${produced.length}\`);
+  const event = JSON.parse(String(produced[0].value));
+  assert(event.id === 'cat' && event.w === 256 && event.hit === true, \`the value must be JSON with id, w, hit (and ts): \${JSON.stringify(event)}\`);
+  assert('ts' in event, 'the event must carry a timestamp');
+}
+
+export async function check_keyed(ctx) {
+  const {m} = events(ctx);
+  m.emitView('cat', 256, true);
+  m.emitView('cat', 64, false);
+  await sleep(10);
+  const produced = ctx.kafka.records('image-views');
+  const keys = produced.map(r => (r.key === null ? null : String(r.key)));
+  assert.deepEqual(keys, ['cat', 'cat'], \`records must be keyed by the image id, got \${JSON.stringify(keys)}\`);
+  assert.equal(produced[0].partition, produced[1].partition, 'the same image id must land on the same partition');
+}
+
+export async function check_non_blocking(ctx) {
+  const {m} = events(ctx);
+  ctx.kafka.stall('image-views', 2); // the broker answers 2 s later
+  const started = ctx.clock.now();
+  await m.emitView('cat', 256, true);
+  const waited = ctx.clock.now() - started;
+  assert(waited < 1000, \`emitView took \${waited} ms with the broker stalled: hand the record to the producer and return, do not wait for the ack\`);
+  assert.equal(ctx.kafka.records('image-views').length, 0, 'emitView returned only after the broker acknowledged the record: hand it to the producer and return, do not wait for the ack');
+  await m.shutdown();
+  assert.equal(ctx.kafka.records('image-views').length, 1, 'the event handed to the producer must still reach the broker');
+}
+
+export async function check_callback(ctx) {
+  const {m, warnings} = events(ctx);
+  ctx.kafka.failNext('image-views');
+  m.emitView('cat', 256, true); // the failure arrives through the delivery report, not as an exception
+  m.emitView('cat', 256, true);
+  await sleep(10);
+  assert(warnings.length > 0, 'a failed delivery must be logged by the delivery report (console.warn)');
+  assert.equal(ctx.kafka.records('image-views').length, 1, 'the second event must still be delivered after the first failed');
+}
+
+export async function check_flush(ctx) {
+  const {m} = events(ctx);
+  ctx.kafka.stall('image-views', 2); // the broker answers 2 s later
+  m.emitView('cat', 256, true);
+  m.emitView('dog', 256, true);
+  m.emitView('cat', 64, false);
+  await m.shutdown();
+  const delivered = ctx.kafka.records('image-views').length;
+  assert.equal(delivered, 3, \`shutdown() must flush: \${delivered} of 3 buffered events had reached the broker when it returned\`);
+}
 `,
   },
   debrief: `A Kafka producer is a buffer with a background thread: \`produce\`/\`send\` costs microseconds, the network happens later in batches. That is what makes "emit an event per request" free — as long as nobody blocks on the acknowledgement. The key is your ordering contract: same key → same partition → same order for that image. Real systems also set \`acks=all\` for events they cannot afford to lose, enable idempotent producers so retries do not duplicate, and never let the buffer grow unbounded (\`queue.buffering.max.messages\`, back-pressure).`,

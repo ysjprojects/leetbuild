@@ -1,13 +1,13 @@
 import type {Problem} from '@/lib/types';
 
-import {protoModules} from './proto';
+import {protoFiles, protoModules} from './proto';
 import {notifyEndpointStep} from './steps/1-notify-endpoint';
 import {userTopicStep} from './steps/2-user-topic';
 import {userRateLimitStep} from './steps/3-user-rate-limit';
 import {prefsCacheStep} from './steps/4-prefs-cache';
 import {pushGatewayStep} from './steps/5-push-gateway';
 import {retryConsumerStep} from './steps/6-retry-consumer';
-import {supportModules} from './support';
+import {supportModules, supportModulesTs} from './support';
 
 /**
  * Notification service: an idempotent intake API → a per-user ordered Kafka topic → a sliding-window
@@ -77,5 +77,5 @@ guarded RPC, and a consumer that never loses a record it has not finished with.`
     ],
   },
   steps: [notifyEndpointStep, userTopicStep, userRateLimitStep, prefsCacheStep, pushGatewayStep, retryConsumerStep],
-  support: {python: {...protoModules, ...supportModules}},
+  support: {python: {...protoModules, ...supportModules}, typescript: {...protoFiles, ...supportModulesTs}},
 };

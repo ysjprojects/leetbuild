@@ -60,6 +60,9 @@ anything minted so far, the cursor when the client sends none) is provided.
         'A missing `limit` means 50; `limit < 1` or `limit > MAX_LIMIT` (100) is a `400 Bad Request`, not a silent clamp.',
       match: {
         python: {all: [/limit\s*<\s*1|limit\s*>\s*MAX_LIMIT/, /status_code\s*=\s*400|HTTP_400/]},
+        typescript: {
+          all: [/limit\s*<\s*1|limit\s*>\s*MAX_LIMIT/, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/],
+        },
         go: {all: [/limit\s*<\s*1|limit\s*>\s*maxLimit/, /http\.StatusBadRequest|\b400\b/]},
         scala: {all: [/limit\s*<\s*1|limit\s*>\s*MaxLimit/, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/limit\s*<\s*1|limit\s*>\s*kMaxLimit/, /status\s*=\s*400/]},
@@ -73,6 +76,13 @@ anything minted so far, the cursor when the client sends none) is provided.
       match: {
         python: {
           all: [/WHERE channel_id = %s AND bucket = %s AND message_id < %s/, /ORDER BY message_id DESC/, /LIMIT %s/],
+        },
+        typescript: {
+          all: [
+            /WHERE channel_id = \$1 AND bucket = \$2 AND message_id < \$3/,
+            /ORDER BY message_id DESC/,
+            /LIMIT \$4/,
+          ],
         },
         go: {
           all: [
@@ -100,6 +110,7 @@ anything minted so far, the cursor when the client sends none) is provided.
         'Starting at `bucket_of(before)`, the bucket decreases by one per iteration while the page holds fewer than `limit` messages; each query asks only for what is still missing.',
       match: {
         python: {all: [/bucket\s*-=\s*1/, /len\(\s*page\s*\)\s*<\s*limit/, /limit\s*-\s*len\(\s*page\s*\)/]},
+        typescript: {all: [/bucket--|bucket\s*-=\s*1/, /page\.length\s*<\s*limit/, /limit\s*-\s*page\.length/]},
         go: {all: [/bucket--|bucket\s*-=\s*1/, /len\(\s*page\s*\)\s*<\s*limit/, /limit\s*-\s*len\(\s*page\s*\)/]},
         scala: {all: [/bucket\s*-=\s*1/, /page\.(size|length)\s*<\s*limit/, /limit\s*-\s*page\.(size|length)/]},
         cpp: {
@@ -118,6 +129,7 @@ anything minted so far, the cursor when the client sends none) is provided.
         'The channel id is a snowflake: `bucket_of(channel_id)` is the oldest bucket that can hold a message, and the walk never goes below it.',
       match: {
         python: {all: [/bucket_of\(\s*channel_id\s*\)/, /bucket\s*>=\s*first_bucket/]},
+        typescript: {all: [/bucket_of\(\s*channelId\s*\)/, /bucket\s*>=\s*firstBucket/]},
         go: {all: [/bucketOf\(\s*channelID\s*\)/, /bucket\s*>=\s*firstBucket/]},
         scala: {all: [/bucketOf\(\s*channelId\s*\)/, /bucket\s*>=\s*firstBucket/]},
         cpp: {all: [/bucket_of\(\s*channel_id\s*\)/, /bucket\s*>=\s*first_bucket/]},
@@ -130,6 +142,7 @@ anything minted so far, the cursor when the client sends none) is provided.
         'A bucket older than the starting one that returns no rows is recorded in `known_empty` for the channel and never queried again; the starting bucket is never recorded.',
       match: {
         python: {all: [/empty\.add\(\s*bucket\s*\)/, /bucket not in empty|bucket in empty/, /bucket\s*<\s*start/]},
+        typescript: {all: [/empty\.add\(\s*bucket\s*\)/, /empty\.has\(\s*bucket\s*\)/, /bucket\s*<\s*start/]},
         go: {
           all: [
             /markEmpty\(\s*channelID\s*,\s*bucket\s*\)/,
@@ -252,6 +265,121 @@ async def get_messages(channel_id: int, before: int | None = None, limit: int = 
         raise HTTPException(status_code=400, detail="limit must be between 1 and 100")
     cursor = before if before is not None else latest_snowflake()
     return JSONResponse(await read_page(channel_id, cursor, limit))
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+
+import {db} from 'messages/db'; // await db.execute(sql, params) -> rows; ids travel as text
+import {bucket_of, DISCORD_EPOCH_MS} from './post_message'; // built in step 1
+
+export const app = Fastify();
+
+export const DEFAULT_LIMIT = 50;
+export const MAX_LIMIT = 100;
+
+export interface PageMessage {
+  id: string;
+  author_id: string;
+  content: string;
+}
+
+export const known_empty = new Map<bigint, Set<number>>(); // channel id → buckets that came back empty, skipped on later reads
+
+/** An id newer than any message minted so far: the cursor when the client sends no \`before\` (provided). */
+export function latest_snowflake(): bigint {
+  return BigInt(Date.now() + 1 - DISCORD_EPOCH_MS) << 22n;
+}
+
+/** The newest \`limit\` messages of one (channel, bucket) partition older than \`before\`. */
+export async function fetch_bucket(channelId: bigint, bucket: number, before: bigint, limit: number): Promise<PageMessage[]> {
+  // TODO: SELECT message_id, author_id, content … WHERE channel_id, bucket, message_id < before ORDER BY message_id DESC LIMIT
+  // TODO: [{id, author_id, content}] (the id columns already come back as strings)
+  throw new Error('not implemented');
+}
+
+/** Walks from bucket_of(before) down to bucket_of(channel_id) until \`limit\` messages are collected. */
+export async function read_page(channelId: bigint, before: bigint, limit: number): Promise<PageMessage[]> {
+  // TODO: firstBucket = bucket_of(channelId); start = bucket_of(before); empty = known_empty for this channel
+  // TODO: while the page is short and bucket >= firstBucket: skip known-empty buckets, fetch limit - page.length
+  // TODO: an empty result in a bucket older than start → remember it; bucket -= 1
+  throw new Error('not implemented');
+}
+
+app.get('/channels/:channel_id/messages', async (request, reply) => {
+  const channelId = BigInt((request.params as {channel_id: string}).channel_id);
+  const query = request.query as {before?: string; limit?: string};
+  const limit = query.limit === undefined ? DEFAULT_LIMIT : Number(query.limit);
+  // TODO: 400 unless 1 <= limit <= MAX_LIMIT
+  // TODO: read_page(channelId, before ?? latest_snowflake(), limit)
+  return reply.code(501).send();
+});
+`,
+      solution: `import Fastify from 'fastify';
+
+import {db} from 'messages/db'; // await db.execute(sql, params) -> rows; ids travel as text
+import {bucket_of, DISCORD_EPOCH_MS} from './post_message'; // built in step 1
+
+export const app = Fastify();
+
+export const DEFAULT_LIMIT = 50;
+export const MAX_LIMIT = 100;
+
+export interface PageMessage {
+  id: string;
+  author_id: string;
+  content: string;
+}
+
+export const known_empty = new Map<bigint, Set<number>>(); // channel id → buckets that came back empty, skipped on later reads
+
+/** An id newer than any message minted so far: the cursor when the client sends no \`before\` (provided). */
+export function latest_snowflake(): bigint {
+  return BigInt(Date.now() + 1 - DISCORD_EPOCH_MS) << 22n;
+}
+
+/** The newest \`limit\` messages of one (channel, bucket) partition older than \`before\`. */
+export async function fetch_bucket(channelId: bigint, bucket: number, before: bigint, limit: number): Promise<PageMessage[]> {
+  const rows = await db.execute<{message_id: string; author_id: string; content: string}>(
+    'SELECT message_id, author_id, content FROM messages' +
+      ' WHERE channel_id = $1 AND bucket = $2 AND message_id < $3 ORDER BY message_id DESC LIMIT $4',
+    [channelId, bucket, before, limit],
+  );
+  return rows.map(row => ({id: row.message_id, author_id: row.author_id, content: row.content}));
+}
+
+/** Walks from bucket_of(before) down to bucket_of(channel_id) until \`limit\` messages are collected. */
+export async function read_page(channelId: bigint, before: bigint, limit: number): Promise<PageMessage[]> {
+  const firstBucket = bucket_of(channelId); // a channel id is a snowflake: nothing was sent before the channel existed
+  const start = bucket_of(before);
+  let empty = known_empty.get(channelId);
+  if (empty === undefined) {
+    empty = new Set();
+    known_empty.set(channelId, empty);
+  }
+  const page: PageMessage[] = [];
+  let bucket = start;
+  while (page.length < limit && bucket >= firstBucket) {
+    if (!empty.has(bucket)) {
+      const rows = await fetch_bucket(channelId, bucket, before, limit - page.length);
+      page.push(...rows);
+      if (rows.length === 0 && bucket < start) empty.add(bucket); // the cursor hid nothing here: the bucket really is empty
+    }
+    bucket -= 1;
+  }
+  return page;
+}
+
+app.get('/channels/:channel_id/messages', async (request, reply) => {
+  const channelId = BigInt((request.params as {channel_id: string}).channel_id);
+  const query = request.query as {before?: string; limit?: string};
+  const limit = query.limit === undefined ? DEFAULT_LIMIT : Number(query.limit);
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
+    return reply.code(400).send({error: 'limit must be between 1 and 100'});
+  }
+  const cursor = query.before !== undefined ? BigInt(query.before) : latest_snowflake();
+  return read_page(channelId, cursor, limit);
+});
 `,
     },
     go: {
@@ -953,6 +1081,152 @@ async def check_empty_memo(ctx):
     r, reads = await _get(m, ctx, before=END, limit=5)
     assert NOW_B in reads.buckets(), f"the starting bucket {NOW_B} returned nothing only because of the before cursor: it is not empty, yet the next read skipped it (Postgres was asked for {reads.buckets()})"
     assert _contents(r) == ["new", "old"], f"the starting bucket must not be remembered as empty: the newest page is new, old — got {_contents(r)}"
+`,
+    typescript: `import {SCHEMA} from 'messages/db';
+
+const EPOCH = 1420070400000;
+const BUCKET_MS = 10 * 24 * 3600 * 1000;
+const INSERT = 'INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES ($1, $2, $3, $4, $5)';
+const NOW_B = Math.floor((Date.now() - EPOCH) / BUCKET_MS); // the bucket a message sent now lands in
+
+/** A snowflake minted offsetMs into \`bucket\`. */
+function sf(bucket: number, offsetMs = 0): bigint {
+  return (BigInt(bucket * BUCKET_MS + offsetMs) << 22n) | (1n << 17n);
+}
+
+const CHANNEL = sf(NOW_B - 10, 5000); // a channel created ten buckets ago
+const END = sf(NOW_B, BUCKET_MS - 1); // a cursor at the very end of the current bucket
+const SIBLING = sf(NOW_B - 10, 6000); // another channel created ten buckets ago, with no memo yet
+
+type Row = [bucket: number, offsetMs: number, content: string];
+
+/** messages: (bucket, offsetMs, content) rows of \`channel\`, inserted before the module loads. */
+async function api(ctx, messages: Row[], channel = CHANNEL) {
+  await ctx.db.reset(SCHEMA);
+  for (const [bucket, offsetMs, content] of messages) {
+    await ctx.db.execute(INSERT, [String(channel), bucket, String(sf(bucket, offsetMs)), '7', content]);
+  }
+  return ctx.load('read_messages');
+}
+
+/** The value Postgres compared with in \`pattern\`: a $n parameter or an inline number. */
+function compared(sql: string, params: unknown[], pattern: string): number | null {
+  const found = new RegExp(pattern + ' ?(\\\\$[0-9]+|[0-9]+)').exec(sql);
+  if (found === null) return null;
+  const slot = found[1];
+  return Number(slot.startsWith('$') ? params[Number(slot.slice(1)) - 1] : slot);
+}
+
+/** The page walk as Postgres saw it: [bucket, limit] of every SELECT on messages since the request began. */
+class Reads {
+  private readonly since: number;
+  constructor(private readonly ctx) {
+    this.since = ctx.db.queries.length;
+  }
+  all(): [number, number | null][] {
+    const out: [number, number | null][] = [];
+    for (const [sql, params] of this.ctx.db.queries.slice(this.since)) {
+      const text = sql.split(/\\s+/).join(' ').toLowerCase();
+      if (!text.startsWith('select') || !text.includes('messages')) continue;
+      const bucket = compared(text, params, '(?<![a-z_])bucket ?=');
+      assert(bucket !== null, \`Postgres ran a read of messages that is not confined to one bucket: \${JSON.stringify(sql)} — each query must name one (channel_id, bucket) partition\`);
+      out.push([bucket, compared(text, params, 'limit')]);
+    }
+    return out;
+  }
+  buckets(): number[] {
+    return this.all().map(([bucket]) => bucket);
+  }
+}
+
+function contents(r): string[] {
+  assert.equal(r.status, 200, \`GET answered \${r.status}: \${r.text.slice(0, 120)}\`);
+  return (r.json() as {content: string}[]).map(x => x.content);
+}
+
+/** One GET; returns the response and the bucket reads Postgres ran for it. */
+async function get(m, ctx, params: Record<string, string | number> = {}, channel = CHANNEL) {
+  const reads = new Reads(ctx);
+  const r = await ctx.client(m.app).get(\`/channels/\${channel}/messages\`, {query: params});
+  return {r, reads};
+}
+
+export async function check_limit_bounds(ctx) {
+  const m = await api(ctx, Array.from({length: 60}, (_, i): Row => [NOW_B, 1000 * (i + 1), \`m\${i}\`]));
+  for (const bad of [0, 101, -5]) {
+    const {r} = await get(m, ctx, {limit: bad});
+    assert.equal(r.status, 400, \`limit=\${bad} is outside 1..100: expected 400, got \${r.status}\`);
+  }
+  let {r} = await get(m, ctx);
+  assert.equal(r.status, 200, \`GET without limit answered \${r.status}, expected 200\`);
+  assert.equal(r.json().length, 50, \`without ?limit the page holds DEFAULT_LIMIT (50) messages, got \${r.json().length}\`);
+  ({r} = await get(m, ctx, {limit: 100}));
+  assert.equal(r.json().length, 60, \`limit=100 on a channel with 60 messages returns all 60, got \${r.json().length}\`);
+  ({r} = await get(m, ctx, {limit: 1}));
+  assert.equal(r.json().length, 1, \`limit=1 returns one message, got \${r.json().length}\`);
+}
+
+export async function check_newest_first(ctx) {
+  const m = await api(ctx, [1, 2, 3, 4, 5].map((i): Row => [NOW_B, 1000 * i, \`m\${i}\`]));
+  const ids = [1, 2, 3, 4, 5].map(i => sf(NOW_B, 1000 * i));
+  const {r, reads} = await get(m, ctx, {limit: 3});
+  assert.equal(r.status, 200, \`GET answered \${r.status}\`);
+  const page = r.json() as Record<string, unknown>[];
+  assert.deepEqual(page.map(x => x.id), [ids[4], ids[3], ids[2]].map(String), \`limit=3 must return the three newest ids as strings, newest first: got \${JSON.stringify(page.map(x => x.id))}\`);
+  assert.deepEqual(page.map(x => x.content), ['m5', 'm4', 'm3'], \`each message carries its content: \${JSON.stringify(page)}\`);
+  assert(page.every(x => x.author_id === '7'), \`each message carries author_id (as a string): \${JSON.stringify(page)}\`);
+  assert.deepEqual(reads.all().slice(0, 1), [[NOW_B, 3]], \`the first query must read the current bucket \${NOW_B} bounded by the page size (LIMIT 3), Postgres ran \${JSON.stringify(reads.all().slice(0, 1))} as [bucket, limit]\`);
+  let got = (await get(m, ctx, {before: String(ids[3]), limit: 10})).r.json() as {id: string}[];
+  assert.deepEqual(got.map(x => x.id), [ids[2], ids[1], ids[0]].map(String), \`before=<id of m4> must return m3, m2, m1 (strictly older), got \${JSON.stringify(got.map(x => x.id))}\`);
+  got = (await get(m, ctx, {before: String(ids[0]), limit: 10})).r.json() as {id: string}[];
+  assert.deepEqual(got, [], \`nothing is older than the first message, got \${JSON.stringify(got)}\`);
+}
+
+export async function check_walk_back(ctx) {
+  const rows: Row[] = [[NOW_B, 1000, 'a'], [NOW_B, 2000, 'b'], [NOW_B - 2, 1000, 'c'], [NOW_B - 2, 2000, 'd'], [NOW_B - 5, 1000, 'e']];
+  const m = await api(ctx, rows);
+  let {r, reads} = await get(m, ctx, {before: String(END), limit: 3});
+  assert.deepEqual(contents(r), ['b', 'a', 'd'], \`a page of 3 spans buckets \${NOW_B} and \${NOW_B - 2}: expected b, a, d — got \${JSON.stringify(contents(r))}\`);
+  assert.deepEqual(reads.buckets(), [NOW_B, NOW_B - 1, NOW_B - 2], \`the walk must query buckets \${NOW_B}, \${NOW_B - 1}, \${NOW_B - 2} in that order and stop once the page is full; Postgres was asked for buckets \${JSON.stringify(reads.buckets())}\`);
+  const limits = reads.all().map(([, limit]) => limit);
+  assert.deepEqual(limits, [3, 1, 1], \`each bucket is asked only for what is still missing (LIMIT 3, then 1, then 1), Postgres ran LIMIT \${JSON.stringify(limits)}\`);
+  for (const [bucket, offsetMs, content] of rows) {
+    await ctx.db.execute(INSERT, [String(SIBLING), bucket, String(sf(bucket, offsetMs)), '7', content]);
+  }
+  ({r, reads} = await get(m, ctx, {before: String(END), limit: 10}, SIBLING));
+  assert.deepEqual(contents(r), ['b', 'a', 'd', 'c', 'e'], \`a page larger than the channel returns everything newest first, got \${JSON.stringify(contents(r))}\`);
+  assert.deepEqual(reads.buckets(), Array.from({length: 11}, (_, i) => NOW_B - i), \`with the page still short the walk continues down to the channel's bucket (\${NOW_B - 10}); Postgres was asked for buckets \${JSON.stringify(reads.buckets())}\`);
+}
+
+export async function check_channel_floor(ctx) {
+  const m = await api(ctx, [[NOW_B - 9, 1000, 'old']]);
+  let {r, reads} = await get(m, ctx, {before: String(END), limit: 50});
+  assert.deepEqual(contents(r), ['old'], \`the only message sits nine buckets back and must be found, got \${r.text}\`);
+  const buckets = reads.buckets();
+  assert(buckets.length > 0 && Math.min(...buckets) === NOW_B - 10, \`the walk must reach bucket_of(channel_id) = \${NOW_B - 10} and stop there; Postgres was asked for buckets down to \${buckets.length ? Math.min(...buckets) : null}\`);
+  assert.equal(buckets.length, 11, \`from \${NOW_B} down to \${NOW_B - 10} is 11 bucket queries, Postgres ran \${buckets.length}\`);
+  const young = sf(NOW_B - 1, 0);
+  ({r, reads} = await get(m, ctx, {before: String(END), limit: 50}, young));
+  assert.deepEqual(r.json(), [], 'a channel with no messages answers an empty page');
+  assert.deepEqual(reads.buckets(), [NOW_B, NOW_B - 1], \`a channel created in bucket \${NOW_B - 1} needs exactly two queries (\${NOW_B}, \${NOW_B - 1}), Postgres ran \${JSON.stringify(reads.buckets())}\`);
+}
+
+export async function check_empty_memo(ctx) {
+  const m = await api(ctx, [[NOW_B, 1000, 'new'], [NOW_B - 9, 1000, 'old']]);
+  let {r, reads} = await get(m, ctx, {before: String(END), limit: 5});
+  assert.deepEqual(contents(r), ['new', 'old'], \`expected new then old, got \${JSON.stringify(contents(r))}\`);
+  assert.equal(reads.buckets().length, 11, \`the first read of a quiet channel walks every bucket (11 queries), Postgres ran \${reads.buckets().length}\`);
+  ({r, reads} = await get(m, ctx, {before: String(END), limit: 5}));
+  assert.deepEqual(contents(r), ['new', 'old'], 'the second read must return the same page');
+  const second = reads.buckets();
+  assert(second.length <= 3, \`the second read must skip the buckets known to be empty: at most 3 queries (\${NOW_B}, \${NOW_B - 9}, \${NOW_B - 10}), Postgres ran \${second.length}: \${JSON.stringify(second)}\`);
+  assert(!second.includes(NOW_B - 5), \`bucket \${NOW_B - 5} came back empty on the first read and must not be queried again\`);
+  ({r} = await get(m, ctx, {before: String(sf(NOW_B, 1000)), limit: 5}));
+  assert.deepEqual(contents(r), ['old'], \`before=<id of new> hides new, got \${JSON.stringify(contents(r))}\`);
+  ({r, reads} = await get(m, ctx, {before: String(END), limit: 5}));
+  assert(reads.buckets().includes(NOW_B), \`the starting bucket \${NOW_B} returned nothing only because of the before cursor: it is not empty, yet the next read skipped it (Postgres was asked for \${JSON.stringify(reads.buckets())})\`);
+  assert.deepEqual(contents(r), ['new', 'old'], \`the starting bucket must not be remembered as empty: the newest page is new, old — got \${JSON.stringify(contents(r))}\`);
+}
 `,
   },
   debrief: `The read side is where the schema pays off and where it bites. Because the bucket is part of the partition key, each query touches exactly one partition and the walk from newest to oldest is a handful of sequential range scans — cheap for the busy channels that generate most reads, since their page fills from the first bucket. Quiet channels are the price: a server that talks twice a month spreads fifty messages over dozens of windows, and without a memo every page load re-reads every empty one. Discord's 2017 fix was that memo, after a channel with millions of deleted messages (and so millions of tombstones in otherwise empty buckets) took twenty seconds to load. The channel id as a floor is the other half: it is free, exact, and turns "walk back forever" into "walk back to creation". Real systems persist the memo rather than keeping it per process, invalidate it when old messages are imported, and cap the number of buckets one request may scan so a pathological channel cannot hold a connection for seconds.`,

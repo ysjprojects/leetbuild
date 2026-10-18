@@ -63,6 +63,7 @@ Implement \`validate(body)\` — the reason the body is not a double-entry trans
       detail: 'A handler must be registered for `POST` on the `/transactions` path.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/transactions["']/]},
+        typescript: {all: [/app\.post\(\s*['"]\/transactions['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/transactions"/]},
         scala: {all: [/path\(\s*"transactions"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/transactions"/]},
@@ -75,6 +76,7 @@ Implement \`validate(body)\` — the reason the body is not a double-entry trans
         'A transaction has at least two entries and its amounts sum to zero; otherwise `422 Unprocessable Entity` with a reason — no write happens.',
       match: {
         python: {all: [/len\(\s*entries\s*\)\s*<\s*2/, /sum\(/, /\b422\b/]},
+        typescript: {all: [/entries\.length\s*<\s*2/, /\.reduce\(/, /\b422\b/]},
         go: {all: [/len\(\s*\w*[eE]ntries\s*\)\s*<\s*2/, /sum\s*\+=/, /http\.StatusUnprocessableEntity|\b422\b/]},
         scala: {all: [/entries\.(size|length)\s*<\s*2/, /\.sum\b/, /StatusCodes\.UnprocessableEntity|\b422\b/]},
         cpp: {all: [/entries\.size\(\)\s*<\s*2/, /sum\s*\+=/, /\b422\b/]},
@@ -89,6 +91,9 @@ Implement \`validate(body)\` — the reason the body is not a double-entry trans
         python: {
           all: [/isinstance\(\s*amount\s*,\s*bool\s*\)/, /isinstance\(\s*amount\s*,\s*int\s*\)/, /amount\s*==\s*0/],
         },
+        typescript: {
+          all: [/typeof\s+amount\s*!==\s*['"]number['"]/, /Number\.isInteger\(\s*amount\s*\)/, /amount\s*===?\s*0/],
+        },
         go: {all: [/\(json\.Number\)/, /\.Int64\(\)/, /==\s*0/]},
         scala: {all: [/JsNumber\(/, /isWhole/, /==\s*0|Some\(0\)/]},
         cpp: {all: [/is_number_integer\(\)/, /==\s*0/]},
@@ -101,6 +106,7 @@ Implement \`validate(body)\` — the reason the body is not a double-entry trans
         'Every `currency` must match `^[A-Z]{3}$` (`CURRENCY_RE`) and all entries must share it; a mixed-currency transaction cannot balance and is a `422`.',
       match: {
         python: {all: [/CURRENCY_RE\.(fullmatch|match)\(/, /len\(\s*currencies\s*\)\s*(!=|>)\s*1/]},
+        typescript: {all: [/CURRENCY_RE\.test\(/, /currencies\.size\s*(!==?|>)\s*1/]},
         go: {all: [/currencyRe\.MatchString\(/, /len\(\s*currencies\s*\)\s*(!=|>)\s*1/]},
         scala: {all: [/CurrencyRe\.matches\(/, /currencies\.size\s*(!=|>)\s*1/]},
         cpp: {all: [/std::regex_match\([^\n]*kCurrencyRe/, /currencies\.size\(\)\s*(!=|>)\s*1/]},
@@ -113,6 +119,7 @@ Implement \`validate(body)\` — the reason the body is not a double-entry trans
         'A valid body reaches `write_transaction` once, with the cleaned entries, the description, `posted_at` now and `settles`; the answer is `201 Created` with `{transaction_id, posted_at, entries}` and `Location: /transactions/{id}`.',
       match: {
         python: {all: [/(?<!def )write_transaction\(/, /Location/], order: [/await write_transaction\(/, /\b201\b/]},
+        typescript: {all: [/(?<!\{)\bwriteTransaction\(/, /Location/], order: [/await writeTransaction\(/, /\b201\b/]},
         go: {
           all: [/(?<!func )writeTransaction\(/, /Location/],
           order: [/writeTransaction\(/, /http\.StatusCreated|\b201\b/],
@@ -236,6 +243,105 @@ async def create_transaction(request: Request) -> JSONResponse:
 
 
 # uvicorn ledger_api:app --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+
+import {type Entry, writeTransaction} from './ledger_writer'; // built in step 4: writes the rows, returns the transaction id
+
+export const app = Fastify();
+
+export const CURRENCY_RE = /^[A-Z]{3}$/;
+
+/** What posting a body comes to: [status, payload]. */
+export type Outcome = [number, Record<string, unknown>];
+
+const nowMs = (): number => Date.now();
+
+/** The reason \`body\` is not a double-entry transaction, or null when it is one. */
+export function validate(body: Record<string, unknown>): string | null {
+  const entries = body.entries;
+  // TODO: at least two entries, each with a non-empty account
+  // TODO: every amount a number that is an integer (not a string, not a boolean, not a float) and not 0: minor units
+  // TODO: every currency matches CURRENCY_RE and all entries share one currency
+  // TODO: debits and credits net to zero
+  return null;
+}
+
+/** The outcome of posting \`body\`: [status, payload]. Step 2 wraps this in an idempotency key. */
+export async function handle(body: Record<string, unknown>): Promise<Outcome> {
+  // TODO: validate → 422 {error: reason}
+  // TODO: writeTransaction(entries, description, {postedAt: nowMs(), settles: body.settles})
+  // TODO: 201 {transaction_id, posted_at, entries}
+  return [501, {error: 'not implemented'}];
+}
+
+app.post('/transactions', async (request, reply) => {
+  const body = request.body;
+  const [status, payload] = await handle(
+    typeof body === 'object' && body !== null && !Array.isArray(body) ? (body as Record<string, unknown>) : {},
+  );
+  // TODO: a Location header pointing at /transactions/{id} on 201
+  return reply.code(status).send(payload);
+});
+`,
+      solution: `import Fastify from 'fastify';
+
+import {type Entry, writeTransaction} from './ledger_writer'; // built in step 4: writes the rows, returns the transaction id
+
+export const app = Fastify();
+
+export const CURRENCY_RE = /^[A-Z]{3}$/;
+
+/** What posting a body comes to: [status, payload]. */
+export type Outcome = [number, Record<string, unknown>];
+
+const nowMs = (): number => Date.now();
+
+/** The reason \`body\` is not a double-entry transaction, or null when it is one. */
+export function validate(body: Record<string, unknown>): string | null {
+  const entries = body.entries;
+  if (!Array.isArray(entries) || entries.length < 2) return 'a transaction needs at least two entries';
+  const currencies = new Set<string>();
+  for (const entry of entries as Record<string, unknown>[]) {
+    if (typeof entry !== 'object' || entry === null || typeof entry.account !== 'string' || entry.account === '') {
+      return 'every entry needs an account';
+    }
+    const {amount, currency} = entry;
+    if (typeof amount !== 'number' || !Number.isInteger(amount)) return 'amount must be an integer in minor units';
+    if (amount === 0) return 'an entry must move money: amount 0 is not allowed';
+    if (typeof currency !== 'string' || !CURRENCY_RE.test(currency)) return 'currency must be a three-letter ISO code';
+    currencies.add(currency);
+  }
+  if (currencies.size !== 1) return 'all entries of a transaction share one currency';
+  if ((entries as Entry[]).reduce((sum, entry) => sum + entry.amount, 0) !== 0) {
+    return 'debits and credits must net to zero';
+  }
+  return null;
+}
+
+/** The outcome of posting \`body\`: [status, payload]. Step 2 wraps this in an idempotency key. */
+export async function handle(body: Record<string, unknown>): Promise<Outcome> {
+  const reason = validate(body);
+  if (reason !== null) return [422, {error: reason}];
+  const entries: Entry[] = (body.entries as Entry[]).map(e => ({account: e.account, currency: e.currency, amount: e.amount}));
+  const postedAt = nowMs();
+  const transactionId = await writeTransaction(entries, String(body.description ?? ''), {
+    postedAt,
+    settles: typeof body.settles === 'string' ? body.settles : null,
+  });
+  return [201, {transaction_id: transactionId, posted_at: postedAt, entries}];
+}
+
+app.post('/transactions', async (request, reply) => {
+  const body = request.body;
+  const [status, payload] = await handle(
+    typeof body === 'object' && body !== null && !Array.isArray(body) ? (body as Record<string, unknown>) : {},
+  );
+  if (status === 201) reply.header('Location', \`/transactions/\${payload.transaction_id}\`);
+  return reply.code(status).send(payload);
+});
 `,
     },
     go: {
@@ -862,6 +968,168 @@ async def check_created(ctx):
     assert payload.get("posted_at") == t["posted_at"], f"the body must carry the posted_at the journal got ({t['posted_at']}), got {payload.get('posted_at')!r}"
     assert payload.get("entries") == BALANCED["entries"], f"the body must echo the cleaned entries (account, currency, amount only), got {payload.get('entries')}"
     assert r.headers.get("location") == f"/transactions/{t['id']}", f"Location must be /transactions/{t['id']}, got {r.headers.get('location')!r}"
+`,
+    typescript: `const SCHEMA = \`
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL REFERENCES transactions (id),
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL,
+    posted_at bigint NOT NULL
+);
+\`;
+
+const EUR = 'EUR';
+const BALANCED = {
+  description: 'capture ch_1',
+  entries: [
+    {account: 'cash:acquirer', currency: EUR, amount: 4999},
+    {account: 'clearing:payments', currency: EUR, amount: -4999},
+  ],
+};
+
+function entriesOf(amounts: number[], currency = EUR) {
+  const accounts = ['cash:acquirer', 'clearing:payments', 'revenue:fees'];
+  return amounts.map((amount, i) => ({account: accounts[i], currency, amount}));
+}
+
+/** The learner's API in front of the real journal writer (step 4) and an empty ledger database. */
+async function api(ctx) {
+  await ctx.db.reset(SCHEMA);
+  return ctx.load('ledger_api');
+}
+
+async function post(c, body) {
+  const r = await c.post('/transactions', {json: body});
+  if (r.status === 500) {
+    assert.fail(\`POST /transactions with \${JSON.stringify(body)} crashed the service: \${r.text} — validate before writing: the journal only takes integer amounts in one currency\`);
+  }
+  return r;
+}
+
+async function journal(ctx) {
+  const transactions = await ctx.db.execute('SELECT * FROM transactions ORDER BY posted_at, id');
+  const entries = await ctx.db.execute('SELECT * FROM entries ORDER BY transaction_id, account');
+  return {transactions, entries};
+}
+
+async function assertNothingWritten(ctx, why: string) {
+  const {transactions, entries} = await journal(ctx);
+  assert(transactions.length === 0 && entries.length === 0, \`\${why}, yet the journal now holds \${transactions.length} transaction(s) and \${entries.length} entr(ies): \${JSON.stringify(entries.map(e => [e.account, Number(e.amount)]))}\`);
+}
+
+export async function check_route(ctx) {
+  const m = await api(ctx);
+  const c = ctx.client(m.app);
+  const r = await post(c, BALANCED);
+  assert(![404, 405].includes(r.status), \`POST /transactions answered \${r.status}: no handler is registered for it\`);
+  assert.equal(r.status, 201, \`POST /transactions with a balanced body answered \${r.status}: \${r.text}\`);
+  const {transactions} = await journal(ctx);
+  assert.equal(transactions.length, 1, \`a balanced POST must leave one transaction in the journal, found \${transactions.length}\`);
+  assert.equal(r.json()?.transaction_id, transactions[0].id, \`the answer must carry the id of the transaction written to the journal (\${transactions[0].id}), got \${r.text}\`);
+}
+
+export async function check_two_entries_balanced(ctx) {
+  const m = await api(ctx);
+  const c = ctx.client(m.app);
+  const cases: [unknown, string][] = [
+    [{entries: entriesOf([4999])}, 'a single entry'],
+    [{entries: []}, 'no entries'],
+    [{}, 'a body without entries'],
+    [{entries: [{currency: EUR, amount: 4999}, {account: 'clearing:payments', currency: EUR, amount: -4999}]}, 'an entry without an account'],
+    [{entries: entriesOf([4999, -4000])}, 'entries summing to 999'],
+    [{entries: entriesOf([4999, -4999, 1])}, 'three entries summing to 1'],
+  ];
+  for (const [body, why] of cases) {
+    const r = await post(c, body);
+    assert.equal(r.status, 422, \`\${why} is not double entry: expected 422, got \${r.status}\`);
+    const error = r.json()?.error;
+    assert(typeof error === 'string' && error !== '', \`a 422 must say why in {error: reason}, got \${r.text}\`);
+  }
+  await assertNothingWritten(ctx, 'every request so far was refused');
+  const r = await post(c, {entries: entriesOf([4999, -4850, -149])});
+  assert.equal(r.status, 201, \`three entries netting to zero are a valid transaction: expected 201, got \${r.status} \${r.text}\`);
+  const {transactions, entries} = await journal(ctx);
+  assert(transactions.length === 1 && entries.length === 3, \`the valid transaction must leave one transaction and its three entries, found \${transactions.length} and \${entries.length}\`);
+  const total = entries.reduce((sum, e) => sum + Number(e.amount), 0);
+  assert.equal(total, 0, \`the journal's entries must net to zero, they sum to \${total}\`);
+}
+
+export async function check_integer_amounts(ctx) {
+  const m = await api(ctx);
+  const c = ctx.client(m.app);
+  const cases: [unknown, string][] = [
+    [49.99, 'a float'],
+    ['4999', 'a string'],
+    [true, 'a boolean'],
+    [0, 'zero'],
+    [null, 'a missing amount'],
+  ];
+  for (const [bad, why] of cases) {
+    const body = {entries: [{account: 'cash:acquirer', currency: EUR, amount: bad}, {account: 'clearing:payments', currency: EUR, amount: -4999}]};
+    const r = await post(c, body);
+    assert.equal(r.status, 422, \`amount \${JSON.stringify(bad)} (\${why}) is not an integer in minor units: expected 422, got \${r.status}\`);
+  }
+  let r = await post(c, {entries: [{account: 'cash:acquirer', currency: EUR, amount: 49.99}, {account: 'clearing:payments', currency: EUR, amount: -49.99}]});
+  assert.equal(r.status, 422, \`49.99 against -49.99 nets to zero but is a float: expected 422, got \${r.status}\`);
+  r = await post(c, {entries: entriesOf([4999, 0, -4999])});
+  assert.equal(r.status, 422, \`an entry with amount 0 moves nothing and must be refused: expected 422, got \${r.status}\`);
+  await assertNothingWritten(ctx, 'every amount so far was refused');
+  r = await post(c, {entries: entriesOf([-250000, 250000])});
+  assert.equal(r.status, 201, \`a credit first and a debit second is fine: expected 201, got \${r.status} \${r.text}\`);
+  const {entries} = await journal(ctx);
+  const amounts = entries.map(e => Number(e.amount)).sort((a, b) => a - b);
+  assert.deepEqual(amounts, [-250000, 250000], \`the journal must hold the integer amounts -250000 and 250000, holds \${JSON.stringify(amounts)}\`);
+}
+
+export async function check_one_currency(ctx) {
+  const m = await api(ctx);
+  const c = ctx.client(m.app);
+  const mixed = {entries: [{account: 'cash:acquirer', currency: 'EUR', amount: 4999}, {account: 'clearing:payments', currency: 'USD', amount: -4999}]};
+  let r = await post(c, mixed);
+  assert.equal(r.status, 422, \`EUR against USD cannot balance: expected 422, got \${r.status}\`);
+  for (const bad of ['eur', 'EURO', 'E1R', '']) {
+    r = await post(c, {entries: entriesOf([4999, -4999], bad)});
+    assert.equal(r.status, 422, \`currency \${JSON.stringify(bad)} does not match ^[A-Z]{3}$: expected 422, got \${r.status}\`);
+  }
+  r = await post(c, {entries: [{account: 'a', amount: 1}, {account: 'b', amount: -1}]});
+  assert.equal(r.status, 422, \`entries without a currency: expected 422, got \${r.status}\`);
+  await assertNothingWritten(ctx, 'every currency so far was refused');
+  r = await post(c, {entries: entriesOf([4999, -4999], 'GBP')});
+  assert.equal(r.status, 201, \`GBP on every entry is valid: expected 201, got \${r.status} \${r.text}\`);
+  const {entries} = await journal(ctx);
+  assert.deepEqual(entries.map(e => e.currency), ['GBP', 'GBP'], \`the journal must hold two GBP entries, holds \${JSON.stringify(entries.map(e => e.currency))}\`);
+}
+
+export async function check_created(ctx) {
+  const m = await api(ctx);
+  const body = {...BALANCED, settles: 'tx-0', entries: BALANCED.entries.map(e => ({...e, note: 'ignored'}))};
+  const r = await post(ctx.client(m.app), body);
+  assert.equal(r.status, 201, \`expected 201 Created, got \${r.status} \${r.text}\`);
+  const {transactions, entries} = await journal(ctx);
+  assert.equal(transactions.length, 1, \`one valid POST must write exactly one transaction, the journal holds \${transactions.length}\`);
+  const t = transactions[0];
+  assert.equal(entries.length, 2, \`the transaction must have its two entries in the journal, found \${entries.length}\`);
+  const stored = entries.map(e => [e.account, e.currency, Number(e.amount)]).sort();
+  assert.deepEqual(stored, [['cash:acquirer', 'EUR', 4999], ['clearing:payments', 'EUR', -4999]], \`the journal holds the entries \${JSON.stringify(stored)}\`);
+  assert.equal(t.description, 'capture ch_1', \`the description must be passed through to the journal, it holds \${JSON.stringify(t.description)}\`);
+  assert.equal(t.settles, 'tx-0', \`the settles field must be passed through to the journal, it holds \${JSON.stringify(t.settles)}\`);
+  assert.equal(t.event_id, null, \`an API-originated transaction has no event id, the journal holds \${JSON.stringify(t.event_id)}\`);
+  const now = Date.now();
+  assert(Math.abs(Number(t.posted_at) - now) < 5000, \`posted_at must be now in milliseconds (\${now}), the journal holds \${t.posted_at}\`);
+  const payload = r.json();
+  assert.equal(payload?.transaction_id, t.id, \`the body must carry the journal's transaction id \${t.id}, got \${r.text}\`);
+  assert.equal(payload?.posted_at, Number(t.posted_at), \`the body must carry the posted_at the journal got (\${t.posted_at}), got \${JSON.stringify(payload?.posted_at)}\`);
+  assert.deepEqual(payload?.entries, BALANCED.entries, \`the body must echo the cleaned entries (account, currency, amount only), got \${JSON.stringify(payload?.entries)}\`);
+  assert.equal(r.headers['location'], \`/transactions/\${t.id}\`, \`Location must be /transactions/\${t.id}, got \${JSON.stringify(r.headers['location'])}\`);
+}
 `,
   },
   debrief: `The validation is the product: a ledger that accepts one unbalanced transaction is no longer a ledger, because every balance computed from it is now suspect. The rules are cheap and run before any I/O — count, types, currency, sum — and each failure names the rule in the body so the publishing team can fix their producer. Integers in minor units are not pedantry: 0.1 + 0.2 ≠ 0.3 in a float, and a ledger that sums floats drifts by cents until it fails a clearing check. Stripe's post treats every event as a transaction between accounts of a fund flow; the entries here are the same idea with the account names flattened to strings. Real ledgers also type the accounts (asset, liability, clearing), restrict which accounts a producer may post to, and version the fund-flow definitions so a transaction can be re-validated against the rules that applied when it was posted.`,

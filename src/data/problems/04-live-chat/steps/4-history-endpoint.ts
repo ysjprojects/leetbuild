@@ -56,6 +56,10 @@ Scrolling up in a room loads older messages over plain HTTPS, not the stream. Im
           all: [/@app\.get\(\s*["']\/rooms\/\{room\}\/messages["']/, /"messages"\s*:/],
           none: [/status_code\s*=\s*501/],
         },
+        typescript: {
+          all: [/app\.get\(\s*['"]\/rooms\/:room\/messages['"]/, /next_before\s*[:,}]/],
+          none: [/code\(\s*501\s*\)|status\(\s*501\s*\)/],
+        },
         go: {
           all: [
             /Handle(Func)?\(\s*"GET \/rooms\/\{room\}\/messages"/,
@@ -80,6 +84,10 @@ Scrolling up in a room loads older messages over plain HTTPS, not the stream. Im
           all: [/MIN_LIMIT/, /MAX_LIMIT/],
           order: [/status_code\s*=\s*400|HTTP_400/, /store\.(?:exists|list)\(/],
         },
+        typescript: {
+          all: [/MIN_LIMIT/, /MAX_LIMIT/],
+          order: [/code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/, /store\.(?:exists|list)\(/],
+        },
         go: {all: [/minLimit/, /maxLimit/], order: [/http\.StatusBadRequest|\b400\b/, /store\.(?:Exists|List)\(/]},
         scala: {all: [/MinLimit/, /MaxLimit/], order: [/StatusCodes\.BadRequest|\b400\b/, /store\.(?:exists|list)\(/]},
         cpp: {all: [/kMinLimit/, /kMaxLimit/], order: [/status\s*=\s*400/, /store\.(?:exists|list)\(/]},
@@ -91,6 +99,13 @@ Scrolling up in a room loads older messages over plain HTTPS, not the stream. Im
       detail: 'Ask `store.exists(room)` and respond `404 Not Found`; only then call `store.list`.',
       match: {
         python: {order: [/store\.exists\(\s*room\s*\)/, /status_code\s*=\s*404|HTTP_404/, /store\.list\(/]},
+        typescript: {
+          order: [
+            /store\.exists\(\s*room\s*\)/,
+            /code\(\s*404\s*\)|status\(\s*404\s*\)|statusCode:\s*404/,
+            /store\.list\(/,
+          ],
+        },
         go: {order: [/store\.Exists\(\s*room\s*\)/, /http\.StatusNotFound|\b404\b/, /store\.List\(/]},
         scala: {order: [/store\.exists\(\s*room\s*\)/, /StatusCodes\.NotFound|\b404\b/, /store\.list\(/]},
         cpp: {order: [/store\.exists\(\s*room\s*\)/, /status\s*=\s*404/, /store\.list\(/]},
@@ -108,6 +123,14 @@ Scrolling up in a room loads older messages over plain HTTPS, not the stream. Im
             /(?<!def )now_ms\(\)/,
             /len\(\s*messages\s*\)\s*(?:<|==|>=|!=)\s*limit/,
             /"next_before"/,
+          ],
+        },
+        typescript: {
+          all: [
+            /store\.list\(\s*room\s*,/,
+            /Date\.now\(\)/,
+            /messages\.length\s*(?:<|===?|>=|!==?)\s*limit/,
+            /next_before/,
           ],
         },
         go: {
@@ -143,6 +166,7 @@ Scrolling up in a room loads older messages over plain HTTPS, not the stream. Im
         '`private` keeps shared caches out of a per-user room; `max-age=5` lets the browser reuse its own copy briefly.',
       match: {
         python: {all: [/Cache-Control/i, /private,\s*max-age=5\b|max-age=5,\s*private/]},
+        typescript: {all: [/Cache-Control/i, /private,\s*max-age=5\b|max-age=5,\s*private/]},
         go: {all: [/Cache-Control/i, /private,\s*max-age=5\b|max-age=5,\s*private/]},
         scala: {
           all: [
@@ -233,6 +257,85 @@ def history(room: str, response: Response, before: int | None = None, limit: int
 
 
 # uvicorn history_api:app --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+
+export const app = Fastify();
+
+export const MIN_LIMIT = 1;
+export const MAX_LIMIT = 100;
+export const DEFAULT_LIMIT = 50;
+
+export interface Message {
+  user: string;
+  text: string;
+  ts: number;
+}
+
+/** Message store (provided): list() returns messages with ts < beforeMs, newest first. */
+export const store = {
+  async exists(room: string): Promise<boolean> {
+    throw new Error('not implemented');
+  },
+  async list(room: string, beforeMs: number, limit: number): Promise<Message[]> {
+    throw new Error('not implemented');
+  },
+};
+
+app.get('/rooms/:room/messages', async (request, reply) => {
+  const {room} = request.params as {room: string};
+  const query = request.query as {before?: string; limit?: string};
+  // TODO: 400 when limit is outside MIN_LIMIT..MAX_LIMIT (default DEFAULT_LIMIT)
+  // TODO: 404 when store.exists(room) is false
+  // TODO: before defaults to Date.now(); store.list newest-first
+  // TODO: next_before = ts of the last message, null when fewer than limit
+  // TODO: Cache-Control: private, max-age=5
+  return reply.code(501).send();
+});
+
+// app.listen({port: 8443, https: {cert, key}})
+`,
+      solution: `import Fastify from 'fastify';
+
+export const app = Fastify();
+
+export const MIN_LIMIT = 1;
+export const MAX_LIMIT = 100;
+export const DEFAULT_LIMIT = 50;
+
+export interface Message {
+  user: string;
+  text: string;
+  ts: number;
+}
+
+/** Message store (provided): list() returns messages with ts < beforeMs, newest first. */
+export const store = {
+  async exists(room: string): Promise<boolean> {
+    throw new Error('not implemented');
+  },
+  async list(room: string, beforeMs: number, limit: number): Promise<Message[]> {
+    throw new Error('not implemented');
+  },
+};
+
+app.get('/rooms/:room/messages', async (request, reply) => {
+  const {room} = request.params as {room: string};
+  const query = request.query as {before?: string; limit?: string};
+  const limit = query.limit === undefined ? DEFAULT_LIMIT : Number(query.limit);
+  if (!Number.isInteger(limit) || limit < MIN_LIMIT || limit > MAX_LIMIT) {
+    return reply.code(400).send({error: \`limit must be between \${MIN_LIMIT} and \${MAX_LIMIT}\`});
+  }
+  if (!(await store.exists(room))) return reply.code(404).send({error: 'no such room'});
+  const before = query.before === undefined ? Date.now() : Number(query.before);
+  const messages = await store.list(room, before, limit);
+  const nextBefore = messages.length < limit ? null : messages[messages.length - 1].ts;
+  return reply.header('Cache-Control', 'private, max-age=5').send({messages, next_before: nextBefore});
+});
+
+// app.listen({port: 8443, https: {cert, key}})
 `,
     },
     go: {
@@ -695,6 +798,104 @@ async def check_cache_control(ctx):
     assert value is not None, "the response carries no Cache-Control header"
     directives = sorted(d.strip().lower() for d in value.split(","))
     assert directives == ["max-age=5", "private"], f"Cache-Control is {value!r}, expected 'private, max-age=5'"
+`,
+    typescript: `const HOUR_MS = 3600 * 1000;
+
+/** The learner's app over a store holding 120 messages (ts = 1000 .. 120000) plus one dated an hour from now; every call recorded. */
+function app(ctx) {
+  const m = ctx.load('history_api');
+  const room7 = Array.from({length: 120}, (_, i) => ({user: (i + 1) % 2 ? 'ana' : 'bo', text: \`message \${i + 1}\`, ts: (i + 1) * 1000}));
+  room7.push({user: 'cy', text: 'from the future', ts: Date.now() + HOUR_MS});
+  const rooms = {'room-7': room7, quiet: []};
+  const calls = [];
+  m.store.exists = async room => {
+    calls.push(['exists', room]);
+    return room in rooms;
+  };
+  m.store.list = async (room, beforeMs, limit) => {
+    calls.push(['list', room, beforeMs, limit]);
+    return [...(rooms[room] ?? [])].sort((a, b) => b.ts - a.ts).filter(x => x.ts < beforeMs).slice(0, limit);
+  };
+  return {m, calls, client: ctx.client(m.app)};
+}
+
+async function get(ctx, path) {
+  const {calls, client} = app(ctx);
+  const r = await client.get(path);
+  return {r, calls};
+}
+
+export async function check_route(ctx) {
+  const {r} = await get(ctx, '/rooms/room-7/messages');
+  assert.equal(r.status, 200, \`GET /rooms/room-7/messages answered \${r.status}, expected 200\`);
+  assert((r.headers['content-type'] ?? '').startsWith('application/json'), \`content-type is \${JSON.stringify(r.headers['content-type'])}, expected JSON\`);
+  const body = r.json();
+  assert(body !== null && typeof body === 'object' && 'messages' in body && 'next_before' in body, \`the body must be {messages: [...], next_before: ...}, got \${r.text}\`);
+  assert.equal(body.messages.length, 50, \`the default page holds \${body.messages.length} messages, expected limit = 50\`);
+  const first = body.messages[0];
+  assert.deepEqual(first, {user: 'bo', text: 'message 120', ts: 120000}, \`the first message of the page is \${JSON.stringify(first)}, expected the newest one (ts 120000)\`);
+}
+
+export async function check_limit_bounds(ctx) {
+  for (const limit of [0, 101, -5]) {
+    const {r, calls} = await get(ctx, \`/rooms/room-7/messages?limit=\${limit}\`);
+    assert.equal(r.status, 400, \`limit=\${limit} answered \${r.status}, expected 400\`);
+    assert.deepEqual(calls, [], \`limit=\${limit} must be rejected before touching the store, but the store saw \${JSON.stringify(calls)}\`);
+  }
+  for (const [limit, n] of [[1, 1], [100, 100]]) {
+    const {r} = await get(ctx, \`/rooms/room-7/messages?limit=\${limit}\`);
+    assert.equal(r.status, 200, \`limit=\${limit} is within 1-100 but answered \${r.status}\`);
+    assert.equal(r.json().messages.length, n, \`limit=\${limit} returned \${r.json().messages.length} messages, expected \${n}\`);
+  }
+}
+
+export async function check_unknown_room(ctx) {
+  let {r, calls} = await get(ctx, '/rooms/nowhere/messages');
+  assert.equal(r.status, 404, \`an unknown room answered \${r.status}, expected 404\`);
+  assert(calls.some(c => c[0] === 'exists' && c[1] === 'nowhere'), \`the handler must ask store.exists('nowhere'); the store saw \${JSON.stringify(calls)}\`);
+  assert(!calls.some(c => c[0] === 'list'), \`an unknown room must not be listed, but the store saw \${JSON.stringify(calls)}\`);
+  ({r, calls} = await get(ctx, '/rooms/nowhere/messages?limit=0'));
+  assert.equal(r.status, 400, \`a bad limit on an unknown room answered \${r.status}, expected 400 (validate before the store lookup)\`);
+  assert.deepEqual(calls, [], \`a bad limit must be rejected before store.exists, but the store saw \${JSON.stringify(calls)}\`);
+  ({r} = await get(ctx, '/rooms/quiet/messages'));
+  assert.equal(r.status, 200, \`an existing but empty room answered \${r.status}, expected 200\`);
+  assert.deepEqual(r.json(), {messages: [], next_before: null}, \`an empty room must answer {messages: [], next_before: null}, got \${r.text}\`);
+}
+
+export async function check_next_before(ctx) {
+  const {calls, client} = app(ctx);
+  let r = await client.get('/rooms/room-7/messages?limit=10');
+  assert.equal(r.status, 200, \`GET ...?limit=10 answered \${r.status}\`);
+  const lists = calls.filter(c => c[0] === 'list');
+  assert(lists.length === 1 && lists[0][1] === 'room-7' && lists[0][3] === 10, \`expected one store.list('room-7', <now>, 10), the store saw \${JSON.stringify(calls)}\`);
+  const before = lists[0][2];
+  const now = Date.now();
+  assert(Math.abs(before - now) < 60000, \`without ?before the store was asked for ts < \${before}, expected about now (\${now} ms)\`);
+  let body = r.json();
+  let ts = body.messages.map(x => x.ts);
+  assert.deepEqual(ts, Array.from({length: 10}, (_, i) => (120 - i) * 1000), \`the first page holds ts \${JSON.stringify(ts)}, expected 120000 down to 111000 (newest first, 'from the future' excluded because before defaults to now)\`);
+  assert.equal(body.next_before, 111000, \`next_before is \${JSON.stringify(body.next_before)}, expected 111000, the ts of the last message on the page\`);
+  r = await client.get(\`/rooms/room-7/messages?before=\${body.next_before}&limit=10\`);
+  assert.equal(r.status, 200);
+  assert.deepEqual(calls[calls.length - 1], ['list', 'room-7', 111000, 10], \`the second page must list (room-7, 111000, 10); the store saw \${JSON.stringify(calls[calls.length - 1])}\`);
+  body = r.json();
+  ts = body.messages.map(x => x.ts);
+  assert.deepEqual(ts, Array.from({length: 10}, (_, i) => (110 - i) * 1000), \`the second page holds ts \${JSON.stringify(ts)}, expected 110000 down to 101000\`);
+  assert.equal(body.next_before, 101000, \`next_before of the second page is \${JSON.stringify(body.next_before)}, expected 101000\`);
+  r = await client.get('/rooms/room-7/messages?before=5000&limit=10');
+  body = r.json();
+  assert.equal(body.messages.length, 4, \`before=5000 leaves 4 messages, got \${body.messages.length}\`);
+  assert.equal(body.next_before, null, \`a page shorter than limit is the last one: next_before must be null, got \${JSON.stringify(body.next_before)}\`);
+}
+
+export async function check_cache_control(ctx) {
+  const {r} = await get(ctx, '/rooms/room-7/messages?limit=5');
+  assert.equal(r.status, 200, \`GET answered \${r.status}\`);
+  const value = r.headers['cache-control'];
+  assert(value !== undefined, 'the response carries no Cache-Control header');
+  const directives = value.split(',').map(d => d.trim().toLowerCase()).sort();
+  assert.deepEqual(directives, ['max-age=5', 'private'], \`Cache-Control is \${JSON.stringify(value)}, expected 'private, max-age=5'\`);
+}
 `,
   },
   debrief: `The endpoint is a cursor-paginated read: validate, authorise the resource (404), fetch one page, hand back the cursor for the next. \`next_before\` being derived from the data rather than from arithmetic is what makes it stable while new messages arrive. \`Cache-Control: private\` is the header people forget: without it a CDN or corporate proxy could happily serve one person's private room to the next. Real APIs sign or opaque-encode the cursor, cap the total scroll depth, and add \`ETag\`s so a repeated page costs a 304.`,

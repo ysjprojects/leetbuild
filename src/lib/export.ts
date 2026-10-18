@@ -24,7 +24,13 @@ import {WIDGETS} from './widgets';
 export const siteUrl = (): string =>
   process.env.NEXT_PUBLIC_SITE_URL ?? (typeof window === 'undefined' ? '' : window.location.origin);
 
-const FENCE_LANGUAGE: Record<Language, string> = {python: 'python', go: 'go', scala: 'scala', cpp: 'cpp'};
+const FENCE_LANGUAGE: Record<Language, string> = {
+  python: 'python',
+  typescript: 'ts',
+  go: 'go',
+  scala: 'scala',
+  cpp: 'cpp',
+};
 
 /** Mermaid node shape per component kind: `open` and `close` wrap the quoted label. */
 const SHAPE: Record<Diagram['nodes'][number]['kind'], [string, string]> = {

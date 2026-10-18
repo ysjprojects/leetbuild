@@ -53,6 +53,7 @@ when it does not — in an async handler keep that blocking call off the event l
         'Read the `X-Api-Key` header, look it up in the known keys, and answer `401 Unauthorized` before touching the body.',
       match: {
         python: {all: [/x-api-key/i, /status_code\s*=\s*401|HTTP_401/]},
+        typescript: {all: [/x-api-key/i, /code\(\s*401\s*\)|status\(\s*401\s*\)|statusCode:\s*401|unauthorized\(/]},
         go: {all: [/X-Api-Key/i, /http\.StatusUnauthorized|\b401\b/]},
         scala: {all: [/X-Api-Key/i, /StatusCodes\.Unauthorized|\b401\b/]},
         cpp: {all: [/X-Api-Key/i, /\b401\b/]},
@@ -65,6 +66,7 @@ when it does not — in an async handler keep that blocking call off the event l
         'Without an `Idempotency-Key` a retried request is a second order; answer `400 Bad Request` when the header is missing.',
       match: {
         python: {all: [/idempotency-key/i, /status_code\s*=\s*400|HTTP_400/]},
+        typescript: {all: [/idempotency-key/i, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400|badRequest\(/]},
         go: {all: [/Idempotency-Key/i, /http\.StatusBadRequest|\b400\b/]},
         scala: {all: [/Idempotency-Key/i, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/Idempotency-Key/i, /\b400\b/]},
@@ -78,6 +80,14 @@ when it does not — in an async handler keep that blocking call off the event l
       match: {
         python: {
           all: [/in SIDES\b/, /price\s*(<=\s*0|>\s*0)/, /qty\s*(<=\s*0|>\s*0)/, /status_code\s*=\s*400|HTTP_400/],
+        },
+        typescript: {
+          all: [
+            /SIDES\.includes\(/,
+            /price\s*(<=\s*0|>\s*0)/,
+            /qty\s*(<=\s*0|>\s*0)/,
+            /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400|badRequest\(/,
+          ],
         },
         go: {
           all: [
@@ -105,6 +115,10 @@ when it does not — in an async handler keep that blocking call off the event l
         'Call `publish_order` first, then respond `202 Accepted` with `{order_id, status: "accepted"}` — the order is durable but not yet matched.',
       match: {
         python: {order: [/(?<!def )\bpublish_order\s*[,(]/, /status_code\s*=\s*202|HTTP_202/], all: [/"accepted"/]},
+        typescript: {
+          order: [/publisher\.publishOrder\(/, /code\(\s*202\s*\)|status\(\s*202\s*\)|statusCode:\s*202/],
+          all: [/['"]accepted['"]/],
+        },
         go: {order: [/(?<!func )publishOrder\(/, /http\.StatusAccepted|\b202\b/], all: [/"accepted"/]},
         scala: {order: [/(?<!def )publishOrder\(/, /StatusCodes\.Accepted|\b202\b/], all: [/"accepted"/]},
         cpp: {order: [/(?<!void )publish_order\(/, /\b202\b/], all: [/"accepted"/]},
@@ -117,6 +131,12 @@ when it does not — in an async handler keep that blocking call off the event l
         'A `PublishFailed` means the broker never acknowledged the order: `503 Service Unavailable` tells the client to retry with the same `Idempotency-Key`.',
       match: {
         python: {all: [/except PublishFailed/, /status_code\s*=\s*503|HTTP_503/]},
+        typescript: {
+          all: [
+            /instanceof PublishFailed/,
+            /code\(\s*503\s*\)|status\(\s*503\s*\)|statusCode:\s*503|serviceUnavailable\(/,
+          ],
+        },
         go: {order: [/(?<!func )publishOrder\(/, /http\.StatusServiceUnavailable|\b503\b/]},
         scala: {all: [/case \w+: PublishFailed/, /StatusCodes\.ServiceUnavailable|\b503\b/]},
         cpp: {all: [/catch\s*\(\s*(const\s+)?PublishFailed\s*&/, /\b503\b/]},
@@ -228,6 +248,112 @@ async def place_order(request: Request) -> JSONResponse:
 
 
 # uvicorn order_gateway:app --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem
+`,
+    },
+    typescript: {
+      starter: `import {randomUUID} from 'node:crypto';
+import Fastify from 'fastify';
+
+export const app = Fastify();
+
+export const SIDES = ['BUY', 'SELL'];
+export const API_KEYS: Record<string, string> = {'k-1f9c': 'desk-a', 'k-77b2': 'desk-b'};
+
+export interface Order {
+  order_id: string;
+  symbol: string;
+  side: string;
+  price: number;
+  qty: number;
+  client_order_id: string;
+}
+
+/** Thrown by publisher.publishOrder when Kafka does not acknowledge the order. */
+export class PublishFailed extends Error {}
+
+/** Hands the order to the engine (built in the next step); provided. */
+export const publisher = {
+  async publishOrder(order: Order): Promise<void> {
+    throw new Error('not implemented');
+  },
+};
+
+app.post('/orders', async (request, reply) => {
+  // TODO: 401 unless X-Api-Key is one of API_KEYS — in an onRequest hook, before the body is parsed
+  // TODO: 400 unless an Idempotency-Key header is present
+  // TODO: request.body is the parsed JSON; 400 unless side in SIDES, price > 0, qty > 0, symbol and client_order_id present
+  // TODO: Order with a randomUUID() order_id; await publisher.publishOrder(order) — it waits for the broker's ack
+  // TODO: PublishFailed → 503; 202 {order_id, status: 'accepted'}
+  void randomUUID;
+  return reply.code(501).send();
+});
+
+// app.listen({port: 8443, https: {cert, key}})
+`,
+      solution: `import {randomUUID} from 'node:crypto';
+import Fastify, {type FastifyReply, type FastifyRequest} from 'fastify';
+
+export const app = Fastify();
+
+export const SIDES = ['BUY', 'SELL'];
+export const API_KEYS: Record<string, string> = {'k-1f9c': 'desk-a', 'k-77b2': 'desk-b'};
+
+export interface Order {
+  order_id: string;
+  symbol: string;
+  side: string;
+  price: number;
+  qty: number;
+  client_order_id: string;
+}
+
+/** Thrown by publisher.publishOrder when Kafka does not acknowledge the order. */
+export class PublishFailed extends Error {}
+
+/** Hands the order to the engine (built in the next step); provided. */
+export const publisher = {
+  async publishOrder(order: Order): Promise<void> {
+    throw new Error('not implemented');
+  },
+};
+
+/** Header checks run as an onRequest hook: the body is not even parsed for a rejected request. */
+async function authenticate(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+  const key = request.headers['x-api-key'];
+  if (typeof key !== 'string' || !(key in API_KEYS)) {
+    await reply.code(401).send({error: 'missing or unknown API key'});
+    return;
+  }
+  if (request.headers['idempotency-key'] === undefined) {
+    await reply.code(400).send({error: 'Idempotency-Key header is required'});
+  }
+}
+
+app.post('/orders', {onRequest: authenticate}, async (request, reply) => {
+  const body = request.body;
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return reply.code(400).send({error: 'body must be a JSON object'});
+  }
+  const {symbol, side, price, qty, client_order_id} = body as Record<string, unknown>;
+  if (typeof side !== 'string' || !SIDES.includes(side) || typeof price !== 'number' || price <= 0 || typeof qty !== 'number' || !Number.isInteger(qty) || qty <= 0) {
+    return reply.code(400).send({error: 'side must be BUY or SELL; price and qty must be positive'});
+  }
+  if (typeof symbol !== 'string' || typeof client_order_id !== 'string') {
+    return reply.code(400).send({error: 'symbol and client_order_id are required'});
+  }
+  const order: Order = {order_id: randomUUID(), symbol, side, price, qty, client_order_id};
+  try {
+    await publisher.publishOrder(order); // resolves only once the broker acknowledged the order
+  } catch (e) {
+    if (e instanceof PublishFailed) {
+      return reply.code(503).send({error: 'order not accepted; retry with the same Idempotency-Key'});
+    }
+    throw e;
+  }
+  return reply.code(202).send({order_id: order.order_id, status: 'accepted'});
+});
+
+// app.listen({port: 8443, https: {cert, key}})
 `,
     },
     go: {
@@ -649,6 +775,93 @@ async def check_unavailable(ctx):
     async with ctx.client(m.app) as c:
         r = await c.post("/orders", json=ORDER, headers=HEADERS)
     assert r.status_code == 503, f"PublishFailed answered {r.status_code}, expected 503"
+`,
+    typescript: `const HEADERS = {'X-Api-Key': 'k-1f9c', 'Idempotency-Key': 'idem-1'};
+const ORDER = {symbol: 'ACME', side: 'BUY', price: 10.05, qty: 100, client_order_id: 'c-1'};
+
+/** The module with publisher.publishOrder replaced by a recorder (the real one is built in step 2). */
+function gateway(ctx, fail = false) {
+  const m = ctx.load('order_gateway');
+  const published: Record<string, unknown>[] = [];
+  m.publisher.publishOrder = async (order: Record<string, unknown>) => {
+    if (fail) throw new m.PublishFailed('broker did not acknowledge');
+    published.push(order);
+  };
+  return {m, published};
+}
+
+export async function check_auth(ctx) {
+  const {m, published} = gateway(ctx);
+  const c = ctx.client(m.app);
+  let r = await c.post('/orders', {json: ORDER, headers: {'Idempotency-Key': 'idem-1'}});
+  assert.equal(r.status, 401, \`no X-Api-Key answered \${r.status}, expected 401\`);
+  r = await c.post('/orders', {json: ORDER, headers: {'X-Api-Key': 'nope', 'Idempotency-Key': 'idem-1'}});
+  assert.equal(r.status, 401, \`an unknown X-Api-Key answered \${r.status}, expected 401\`);
+  r = await c.post('/orders', {body: 'not json', headers: {'Content-Type': 'application/json'}});
+  assert.equal(r.status, 401, \`a request without a key and with a broken body answered \${r.status}: the key must be checked before the body is read\`);
+  assert.deepEqual(published, [], 'rejected requests must not reach publisher.publishOrder');
+  r = await c.post('/orders', {json: ORDER, headers: HEADERS});
+  assert.notEqual(r.status, 401, 'a known X-Api-Key must be accepted, got 401');
+}
+
+export async function check_idempotency_key(ctx) {
+  const {m, published} = gateway(ctx);
+  const c = ctx.client(m.app);
+  let r = await c.post('/orders', {json: ORDER, headers: {'X-Api-Key': 'k-1f9c'}});
+  assert.equal(r.status, 400, \`a request without Idempotency-Key answered \${r.status}, expected 400\`);
+  assert.deepEqual(published, [], 'a request without Idempotency-Key must not be published');
+  r = await c.post('/orders', {json: ORDER, headers: HEADERS});
+  assert.notEqual(r.status, 400, 'a request with Idempotency-Key and a valid body answered 400');
+}
+
+export async function check_validate(ctx) {
+  const {m, published} = gateway(ctx);
+  const {symbol: _symbol, ...noSymbol} = ORDER;
+  const {client_order_id: _cid, ...noClientOrderId} = ORDER;
+  const bad: [string, Record<string, unknown>][] = [
+    ['side', {...ORDER, side: 'HOLD'}],
+    ['price 0', {...ORDER, price: 0}],
+    ['negative price', {...ORDER, price: -1}],
+    ['qty 0', {...ORDER, qty: 0}],
+    ['missing symbol', noSymbol],
+    ['missing client_order_id', noClientOrderId],
+  ];
+  const c = ctx.client(m.app);
+  for (const [label, body] of bad) {
+    const r = await c.post('/orders', {json: body, headers: HEADERS});
+    assert.equal(r.status, 400, \`an order with a bad \${label} answered \${r.status}, expected 400\`);
+  }
+  assert.deepEqual(published, [], 'invalid orders must never reach publisher.publishOrder');
+  const r = await c.post('/orders', {json: ORDER, headers: HEADERS});
+  assert.notEqual(r.status, 400, 'a valid order (side BUY, price 10.05, qty 100) was rejected with 400');
+  assert.equal(published.length, 1, \`the valid order must reach publisher.publishOrder; it was called \${published.length} times\`);
+}
+
+export async function check_accepted(ctx) {
+  const {m, published} = gateway(ctx);
+  const c = ctx.client(m.app);
+  const r = await c.post('/orders', {json: ORDER, headers: HEADERS});
+  assert.equal(r.status, 202, \`a valid order answered \${r.status}, expected 202\`);
+  const body = r.json() as Record<string, unknown>;
+  assert.equal(body.status, 'accepted', \`the 202 body must say status accepted, got \${JSON.stringify(body)}\`);
+  assert.equal(published.length, 1, \`publisher.publishOrder must be called exactly once, was called \${published.length} times\`);
+  const order = published[0];
+  assert(typeof order === 'object' && order !== null, \`publisher.publishOrder must receive an Order, got \${typeof order}\`);
+  assert.deepEqual(
+    [order.symbol, order.side, order.price, order.qty, order.client_order_id],
+    ['ACME', 'BUY', 10.05, 100, 'c-1'],
+    \`the published Order does not carry the request's fields: \${JSON.stringify(order)}\`,
+  );
+  assert(typeof order.order_id === 'string' && order.order_id !== '' && body.order_id === order.order_id, \`the 202 must return the published order_id \${JSON.stringify(order.order_id)}, got \${JSON.stringify(body.order_id)}\`);
+  const r2 = await c.post('/orders', {json: ORDER, headers: HEADERS});
+  assert.notEqual((r2.json() as Record<string, unknown>).order_id, body.order_id, 'every order needs a fresh order_id');
+}
+
+export async function check_unavailable(ctx) {
+  const {m} = gateway(ctx, true);
+  const r = await ctx.client(m.app).post('/orders', {json: ORDER, headers: HEADERS});
+  assert.equal(r.status, 503, \`PublishFailed answered \${r.status}, expected 503\`);
+}
 `,
   },
   debrief: `The handler is a funnel: cheap rejections first (headers), then the body, then the one expensive call. \`202\` is the honest status for an exchange — the request is durably accepted, the outcome (a fill, a rest on the book) arrives later on another channel — and it only becomes honest because the gateway waits for Kafka before sending it. Real gateways store the \`Idempotency-Key\` and replay the original response for a duplicate, run pre-trade risk checks (position limits, price bands) before accepting, and speak FIX with session sequence numbers that make idempotency a protocol property rather than a header.`,

@@ -73,6 +73,7 @@ Implement \`GetMessages\` on the generated servicer; \`read_page\` (step 2) does
       detail: 'A `MessageDataServicer` subclass is registered on the server with `add_MessageDataServicer_to_server`.',
       match: {
         python: {all: [/class \w+\(messages_pb2_grpc\.MessageDataServicer\)/, /add_MessageDataServicer_to_server\(/]},
+        typescript: {all: [/new (grpc\.)?Server\(/, /addService\(\s*\w+\.discord\.MessageData\.service\s*,/]},
         go: {all: [/pb\.UnimplementedMessageDataServer/, /pb\.RegisterMessageDataServer\(/]},
         scala: {all: [/extends MessageDataGrpc\.MessageData/, /MessageDataGrpc\.bindService\(/]},
         cpp: {all: [/public MessageData::Service/, /RegisterService\(/]},
@@ -85,6 +86,9 @@ Implement \`GetMessages\` on the generated servicer; \`read_page\` (step 2) does
         'The data service holds no business logic: the page comes from step 2’s `read_page(channel_id, before, limit)`.',
       match: {
         python: {all: [/read_page\(\s*request\.channel_id\s*,\s*request\.before\s*,\s*request\.limit\s*\)/]},
+        typescript: {
+          all: [/read_page\(\s*BigInt\([^)]*channel_id\s*\)\s*,\s*BigInt\([^)]*before\s*\)\s*,\s*[\w.]*limit\s*\)/],
+        },
         go: {
           all: [
             /(?<!func )readPage\(/,
@@ -106,6 +110,7 @@ Implement \`GetMessages\` on the generated servicer; \`read_page\` (step 2) does
         python: {
           all: [/inflight\[\s*key\s*\]\s*=/, /inflight\.get\(\s*key\s*\)|key in inflight/, /asyncio\.create_task\(/],
         },
+        typescript: {all: [/inflight\.set\(\s*key\s*,/, /inflight\.get\(\s*key\s*\)|inflight\.has\(\s*key\s*\)/]},
         go: {all: [/inflight\[\s*key\s*\]/, /<-\s*c\.done/, /close\(\s*c\.done\s*\)/]},
         scala: {all: [/inflight\.getOrElseUpdate\(\s*key/, /Future\s*[({]/]},
         cpp: {all: [/inflight\.find\(\s*key\s*\)/, /inflight\.emplace\(\s*key/, /std::shared_future</]},
@@ -118,6 +123,7 @@ Implement \`GetMessages\` on the generated servicer; \`read_page\` (step 2) does
         'The key is popped from `inflight` once the task completes — in a done-callback or `finally` — so later requests read fresh data and a failed read is not served forever.',
       match: {
         python: {all: [/inflight\.pop\(\s*key|del inflight\[\s*key\s*\]/, /add_done_callback\(|finally:/]},
+        typescript: {all: [/inflight\.delete\(\s*key\s*\)/, /\.finally\(|finally\s*\{/]},
         go: {all: [/delete\(\s*inflight\s*,\s*key\s*\)/]},
         scala: {all: [/inflight\.remove\(\s*key\s*\)/, /onComplete/]},
         cpp: {all: [/inflight\.erase\(\s*key\s*\)/]},
@@ -130,6 +136,7 @@ Implement \`GetMessages\` on the generated servicer; \`read_page\` (step 2) does
         'Each row becomes a `Message{id, author_id, content}` (ids as 64-bit integers) inside a `GetMessagesReply`.',
       match: {
         python: {all: [/messages_pb2\.GetMessagesReply\(/, /messages_pb2\.Message\(\s*id\s*=\s*int\(/]},
+        typescript: {all: [/callback\(\s*null\s*,\s*\{\s*messages:/, /\{\s*id:\s*[\w.]+\s*,\s*author_id:/]},
         go: {all: [/&pb\.GetMessagesReply\{/, /&pb\.Message\{\s*Id:/]},
         scala: {all: [/GetMessagesReply\(/, /Message\(\s*id\s*=/]},
         cpp: {all: [/reply->add_messages\(\)/, /set_id\(/, /set_author_id\(/]},
@@ -209,6 +216,108 @@ async def serve() -> None:
 
 if __name__ == "__main__":
     asyncio.run(serve())
+`,
+    },
+    typescript: {
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+
+import {type PageMessage, read_page} from './read_messages'; // built in step 2: the bucket walk, [{id, author_id, content}] newest first
+
+const proto = grpc.loadPackageDefinition(protoLoader.loadSync('messages.proto', {longs: String})) as unknown as {
+  discord: {MessageData: grpc.ServiceClientConstructor};
+};
+
+export interface GetMessagesRequest {
+  channel_id: string; // uint64 on the wire: a decimal string here
+  before: string;
+  limit: number;
+}
+
+export interface Message {
+  id: string;
+  author_id: string;
+  content: string;
+}
+
+export interface GetMessagesReply {
+  messages: Message[];
+}
+
+export const inflight = new Map<string, Promise<PageMessage[]>>(); // "channel_id|before|limit" → the one database read in flight
+
+export const messageData = {
+  async GetMessages(call: grpc.ServerUnaryCall<GetMessagesRequest, GetMessagesReply>, callback: grpc.sendUnaryData<GetMessagesReply>) {
+    const {channel_id, before, limit} = call.request;
+    const key = \`\${channel_id}|\${before}|\${limit}\`;
+    // TODO: inflight.get(key) → missing: read_page(BigInt(channel_id), BigInt(before), limit) with a finally that deletes key; inflight.set(key, task)
+    // TODO: rows = await task; a failed read → callback({code: grpc.status.UNAVAILABLE, details})
+    // TODO: callback(null, {messages: rows.map(r => ({id: r.id, author_id: r.author_id, content: r.content}))})
+    callback({code: grpc.status.UNIMPLEMENTED, details: 'not implemented'});
+  },
+};
+
+export function serve(): grpc.Server {
+  const server = new grpc.Server();
+  server.addService(proto.discord.MessageData.service, messageData);
+  server.bindAsync('0.0.0.0:9000', grpc.ServerCredentials.createInsecure(), () => undefined);
+  return server;
+}
+`,
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+
+import {type PageMessage, read_page} from './read_messages'; // built in step 2: the bucket walk, [{id, author_id, content}] newest first
+
+const proto = grpc.loadPackageDefinition(protoLoader.loadSync('messages.proto', {longs: String})) as unknown as {
+  discord: {MessageData: grpc.ServiceClientConstructor};
+};
+
+export interface GetMessagesRequest {
+  channel_id: string; // uint64 on the wire: a decimal string here
+  before: string;
+  limit: number;
+}
+
+export interface Message {
+  id: string;
+  author_id: string;
+  content: string;
+}
+
+export interface GetMessagesReply {
+  messages: Message[];
+}
+
+export const inflight = new Map<string, Promise<PageMessage[]>>(); // "channel_id|before|limit" → the one database read in flight
+
+export const messageData = {
+  async GetMessages(call: grpc.ServerUnaryCall<GetMessagesRequest, GetMessagesReply>, callback: grpc.sendUnaryData<GetMessagesReply>) {
+    const {channel_id, before, limit} = call.request;
+    const key = \`\${channel_id}|\${before}|\${limit}\`;
+    let task = inflight.get(key);
+    if (task === undefined) {
+      // first caller for this key: start the read; everyone arriving meanwhile subscribes to it
+      task = read_page(BigInt(channel_id), BigInt(before), limit).finally(() => inflight.delete(key));
+      inflight.set(key, task);
+    }
+    let rows: PageMessage[];
+    try {
+      rows = await task; // a subscriber hanging up does not cancel the shared read: nobody owns it
+    } catch (e) {
+      callback({code: grpc.status.UNAVAILABLE, details: \`messages store: \${(e as Error).message}\`});
+      return;
+    }
+    callback(null, {messages: rows.map(r => ({id: r.id, author_id: r.author_id, content: r.content}))});
+  },
+};
+
+export function serve(): grpc.Server {
+  const server = new grpc.Server();
+  server.addService(proto.discord.MessageData.service, messageData);
+  server.bindAsync('0.0.0.0:9000', grpc.ServerCredentials.createInsecure(), () => undefined);
+  return server;
+}
 `,
     },
     go: {
@@ -670,6 +779,143 @@ async def check_reply(ctx):
     assert [(x.author_id, x.content) for x in reply.messages] == [(7, "b"), (7, "a")], f"author_id and content must be copied into each Message: {[(x.author_id, x.content) for x in reply.messages]}"
     reply = await stub.GetMessages(_req(before=sf(NOW_B, 1000)))
     assert len(reply.messages) == 0, "an empty page is an empty GetMessagesReply, not an error"
+`,
+    typescript: `import {credentials, status} from '@grpc/grpc-js';
+import {SCHEMA} from 'messages/db';
+
+const EPOCH = 1420070400000;
+const BUCKET_MS = 10 * 24 * 3600 * 1000;
+const INSERT = 'INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES ($1, $2, $3, $4, $5)';
+const NOW_B = Math.floor((Date.now() - EPOCH) / BUCKET_MS);
+
+function sf(bucket: number, offsetMs = 0): bigint {
+  return (BigInt(bucket * BUCKET_MS + offsetMs) << 22n) | (1n << 17n);
+}
+
+const CHANNEL = sf(NOW_B - 1, 5000); // created last bucket: a page walk reads two buckets
+const HOT = sf(NOW_B, 500); // created this bucket: one page walk is exactly one query on Postgres
+const END = sf(NOW_B, BUCKET_MS - 1);
+type Row = [bucket: number, offsetMs: number, content: string];
+const HOT_ROWS: Row[] = [[NOW_B, 1000, 'a'], [NOW_B, 2000, 'b'], [NOW_B, 3000, 'c']];
+
+interface Reply {
+  messages: {id: string; author_id: string; content: string}[];
+}
+
+/** Postgres with \`rows\` (bucket, offsetMs, content) of \`channel\`, and the data service serving over the real page walk (step 2). */
+async function start(ctx, rows: Row[] = [], channel = CHANNEL) {
+  await ctx.db.reset(SCHEMA);
+  for (const [bucket, offsetMs, content] of rows) {
+    await ctx.db.execute(INSERT, [String(channel), bucket, String(sf(bucket, offsetMs)), '7', content]);
+  }
+  const m = ctx.load('data_service');
+  m.serve();
+  const stub = new (ctx.proto('messages.proto').discord.MessageData)('data-1:9000', credentials.createInsecure());
+  return {m, stub};
+}
+
+function req(channel = CHANNEL, before = END, limit = 50) {
+  return {channel_id: String(channel), before: String(before), limit};
+}
+
+/** The reads of the messages table Postgres ran since \`since\` (its query log). */
+function selects(ctx, since: number): string[] {
+  return ctx.db.queries
+    .slice(since)
+    .map(([sql]) => sql as string)
+    .filter(sql => sql.split(/\\s+/).join(' ').toLowerCase().startsWith('select') && sql.toLowerCase().includes('messages'));
+}
+
+function contents(reply: Reply): string[] {
+  return reply.messages.map(x => x.content);
+}
+
+export async function check_servicer(ctx) {
+  const {stub} = await start(ctx, [[NOW_B, 1000, 'a'], [NOW_B, 2000, 'b']]);
+  const reply: Reply = await stub.GetMessages(req());
+  assert(reply !== null && typeof reply === 'object' && Array.isArray(reply.messages), \`GetMessages must answer a GetMessagesReply, got \${JSON.stringify(reply)}\`);
+  assert.equal(reply.messages.length, 2, \`two stored messages must come back, got \${reply.messages.length}\`);
+}
+
+export async function check_reads_page(ctx) {
+  const rows: Row[] = [[NOW_B - 1, 1000, 'old'], [NOW_B, 1000, 'a'], [NOW_B, 2000, 'b'], [NOW_B, 3000, 'c']];
+  const {stub} = await start(ctx, rows);
+  await ctx.db.execute(INSERT, [String(HOT), NOW_B, String(sf(NOW_B, 2500)), '9', 'another channel']);
+  let reply: Reply = await stub.GetMessages(req(CHANNEL, END, 2));
+  const got = reply.messages.map(x => [x.id, x.author_id, x.content]);
+  assert.deepEqual(got, [[String(sf(NOW_B, 3000)), '7', 'c'], [String(sf(NOW_B, 2000)), '7', 'b']], \`limit=2 must return the two newest rows of the channel, ids as exact 64-bit integers: got \${JSON.stringify(got)}\`);
+  reply = await stub.GetMessages(req(CHANNEL, sf(NOW_B, 2000), 5));
+  assert.deepEqual(contents(reply), ['a', 'old'], \`before=<id of b> must walk back to the channel's first bucket: expected a, old — got \${JSON.stringify(contents(reply))}\`);
+  reply = await stub.GetMessages(req(HOT, END, 5));
+  assert.deepEqual(contents(reply), ['another channel'], \`channel_id selects the channel: the other channel's page is its one message, got \${JSON.stringify(contents(reply))}\`);
+}
+
+export async function check_single_flight(ctx) {
+  const {stub} = await start(ctx, HOT_ROWS, HOT);
+  let since = ctx.db.queries.length;
+  const replies: Reply[] = await Promise.all([
+    ...Array.from({length: 5}, () => stub.GetMessages(req(HOT))),
+    stub.GetMessages(req(HOT, END, 10)),
+  ]);
+  const reads = selects(ctx, since);
+  assert(reads.length >= 1, 'no database read happened for the concurrent requests');
+  assert.equal(reads.length, 2, \`5 identical concurrent GetMessages plus one with another limit must cost Postgres 2 page reads (one query each here), it ran \${reads.length} queries: identical requests in flight together must share one read, a different key reads on its own\`);
+  for (const reply of replies) {
+    assert.deepEqual(contents(reply), ['c', 'b', 'a'], \`every coalesced caller gets the full page, one got \${JSON.stringify(contents(reply))}\`);
+  }
+  // One impatient subscriber must not cancel the read for the others.
+  since = ctx.db.queries.length;
+  const first = stub.GetMessages(req(HOT), () => undefined);
+  const second: Promise<Reply> = stub.GetMessages(req(HOT));
+  await new Promise(resolve => queueMicrotask(resolve)); // both callers are in and waiting on one read that has not finished
+  first.cancel();
+  let reply: Reply;
+  try {
+    reply = await second;
+  } catch (e) {
+    assert.fail(\`a subscriber hung up and the other caller's request failed with \${(e as Error).message}: the shared read was cancelled with it — nobody owns the in-flight read\`);
+  }
+  assert.deepEqual(contents(reply), ['c', 'b', 'a'], \`the remaining subscriber must still get the full page, got \${JSON.stringify(contents(reply))}\`);
+  assert.equal(selects(ctx, since).length, 1, \`the two callers must have shared one read, Postgres ran \${selects(ctx, since).length} queries\`);
+}
+
+export async function check_slot_cleared(ctx) {
+  const {stub} = await start(ctx, HOT_ROWS, HOT);
+  let reply: Reply = await stub.GetMessages(req(HOT));
+  assert.deepEqual(contents(reply), ['c', 'b', 'a'], \`expected the page c, b, a, got \${JSON.stringify(contents(reply))}\`);
+  await ctx.db.execute(INSERT, [String(HOT), NOW_B, String(sf(NOW_B, 4000)), '7', 'd']);
+  let since = ctx.db.queries.length;
+  reply = await stub.GetMessages(req(HOT));
+  assert(selects(ctx, since).length === 1 && JSON.stringify(contents(reply)) === JSON.stringify(['d', 'c', 'b', 'a']), \`an identical request after the first completed must read again (no stale result): message d was stored since, the reply was \${JSON.stringify(contents(reply))} and Postgres ran \${selects(ctx, since).length} queries\`);
+  await ctx.db.execute('ALTER TABLE messages RENAME TO messages_offline'); // the store goes away under the read
+  since = ctx.db.queries.length;
+  const outcomes = await Promise.allSettled([stub.GetMessages(req(HOT)), stub.GetMessages(req(HOT))]);
+  for (const outcome of outcomes) {
+    assert(outcome.status === 'rejected', \`a failed database read must fail the callers, one was answered \${JSON.stringify(outcome.status === 'fulfilled' ? outcome.value : null)}\`);
+    const code = (outcome.reason as {code?: number}).code;
+    assert.equal(code, status.UNAVAILABLE, \`a failed read must surface as UNAVAILABLE, got \${code}\`);
+  }
+  assert.equal(selects(ctx, since).length, 1, \`both callers must have shared the one failing read, Postgres was asked \${selects(ctx, since).length} times\`);
+  await ctx.db.execute('ALTER TABLE messages_offline RENAME TO messages');
+  since = ctx.db.queries.length;
+  try {
+    reply = await stub.GetMessages(req(HOT));
+  } catch (e) {
+    assert.fail(\`the store is back, yet the next identical request failed with \${(e as {code?: number}).code}: the failed read was kept as the answer instead of leaving inflight\`);
+  }
+  assert(JSON.stringify(contents(reply)) === JSON.stringify(['d', 'c', 'b', 'a']) && selects(ctx, since).length === 1, \`after a failure the next request must read fresh and succeed, got \${JSON.stringify(contents(reply))} from \${selects(ctx, since).length} queries\`);
+}
+
+export async function check_reply(ctx) {
+  const {stub} = await start(ctx, [[NOW_B, 1000, 'a'], [NOW_B, 2000, 'b']]);
+  let reply: Reply = await stub.GetMessages(req());
+  assert.equal(reply.messages.length, 2, \`expected 2 messages, got \${reply.messages.length}\`);
+  assert.deepEqual(reply.messages.map(x => x.id), [String(sf(NOW_B, 2000)), String(sf(NOW_B, 1000))], \`Message.id must carry the exact 64-bit snowflake, newest first: got \${JSON.stringify(reply.messages.map(x => x.id))}\`);
+  assert(reply.messages.every(x => BigInt(x.id) > 2n ** 53n), 'ids above 2**53 must survive: they are uint64 on the wire, not floats');
+  assert.deepEqual(reply.messages.map(x => [x.author_id, x.content]), [['7', 'b'], ['7', 'a']], \`author_id and content must be copied into each Message: \${JSON.stringify(reply.messages.map(x => [x.author_id, x.content]))}\`);
+  reply = await stub.GetMessages(req(CHANNEL, sf(NOW_B, 1000)));
+  assert.equal(reply.messages.length, 0, 'an empty page is an empty GetMessagesReply, not an error');
+}
 `,
   },
   debrief: `The data service does less than the API and that is its value: one endpoint per query, no business logic, and the single place where concurrency towards the database can be shaped. Coalescing is the shape that matters for a chat system, because the hot key is never a secret — it is the newest page of the channel everyone just opened — and because identical reads in flight at the same instant want the same answer, so sharing it costs no freshness. Discord's Rust services do exactly this: the first request spawns a worker task, later requests check for the task and subscribe, the worker queries once and fans the rows out. Removing the key on completion keeps the cache's lifetime at one request; shielding the task keeps one client's timeout from becoming everyone's error. Real deployments add a per-key concurrency limit for writes, hedge a slow read against a second replica, and export the coalescing ratio as the metric that tells you a partition is hot before the database does.`,

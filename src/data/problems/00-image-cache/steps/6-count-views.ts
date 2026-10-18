@@ -43,6 +43,7 @@ Implement the analytics consumer: a member of consumer group **\`view-counter\`*
       detail: 'The consumer must use `group.id` `view-counter` and subscribe to `image-views`.',
       match: {
         python: {all: [/"group\.id"\s*:\s*"view-counter"/, /subscribe\(\s*\[\s*"image-views"\s*\]\s*\)/]},
+        typescript: {all: [/groupId:\s*['"]view-counter['"]/, /subscribe\(\s*\{[^\n]*['"]image-views['"]/]},
         go: {all: [/GroupID:\s*"view-counter"/, /Topic:\s*"image-views"/]},
         scala: {
           all: [
@@ -59,6 +60,7 @@ Implement the analytics consumer: a member of consumer group **\`view-counter\`*
       detail: 'Offsets must be committed explicitly, after processing — not on a timer.',
       match: {
         python: {all: [/"enable\.auto\.commit"\s*:\s*False/]},
+        typescript: {all: [/autoCommit:\s*false/]},
         go: {all: [/reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
         scala: {all: [/"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/]},
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/]},
@@ -71,6 +73,7 @@ Implement the analytics consumer: a member of consumer group **\`view-counter\`*
         'Each event increments the per-image counter with `INCR views:{id}` — atomic in Redis, no read-modify-write.',
       match: {
         python: {all: [/\br\.incr\(\s*f"views:\{[^}]+\}"\s*\)/]},
+        typescript: {all: [/\bredis\.incr\(\s*`views:\$\{[^}]+\}`\s*\)/]},
         go: {all: [/rdb\.Incr\(\s*ctx\s*,\s*"views:"\s*\+/]},
         scala: {all: [/jedis\.incr\(\s*s"views:\$/]},
         cpp: {all: [/redis\.incr\(\s*"views:"\s*\+/]},
@@ -82,6 +85,7 @@ Implement the analytics consumer: a member of consumer group **\`view-counter\`*
       detail: 'Commit the offset only once the counter has been updated: at-least-once, never at-most-once.',
       match: {
         python: {order: [/\br\.incr\(/, /consumer\.commit\(/]},
+        typescript: {order: [/\bredis\.incr\(/, /consumer\.commitOffsets\(/]},
         go: {order: [/rdb\.Incr\(/, /reader\.CommitMessages\(/]},
         scala: {order: [/jedis\.incr\(/, /consumer\.commitSync\(/]},
         cpp: {order: [/redis\.incr\(/, /consumer->commitSync\(/]},
@@ -159,6 +163,58 @@ def run() -> None:
             continue
         r.incr(f"views:{image_id}")
         consumer.commit(message=msg, asynchronous=False)
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+const redis = new Redis({host: 'redis', port: 6379});
+const kafka = new Kafka({clientId: 'view-counter', brokers: ['kafka:9092']});
+const consumer = kafka.consumer({groupId: 'view-counter'});
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: 'image-views', fromBeginning: true});
+  await consumer.run({
+    // TODO: disable auto-commit (autoCommit: false)
+    eachMessage: async ({topic, partition, message}) => {
+      // TODO: parse JSON (skip + commit malformed records)
+      // TODO: INCR views:{id}, then commitOffsets for this message (offset + 1)
+      throw new Error('not implemented');
+    },
+  });
+}
+`,
+      solution: `import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+const redis = new Redis({host: 'redis', port: 6379});
+const kafka = new Kafka({clientId: 'view-counter', brokers: ['kafka:9092']});
+const consumer = kafka.consumer({groupId: 'view-counter'});
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: 'image-views', fromBeginning: true});
+  await consumer.run({
+    autoCommit: false,
+    eachMessage: async ({topic, partition, message}) => {
+      const next = [{topic, partition, offset: String(Number(message.offset) + 1)}];
+      let imageId: string;
+      try {
+        const event = JSON.parse(message.value?.toString() ?? '') as {id?: unknown};
+        if (event.id === undefined || event.id === null) throw new TypeError('event without id');
+        imageId = String(event.id);
+      } catch {
+        console.warn(\`skipping malformed record at offset \${message.offset}\`);
+        await consumer.commitOffsets(next);
+        return;
+      }
+      await redis.incr(\`views:\${imageId}\`);
+      await consumer.commitOffsets(next);
+    },
+  });
+}
 `,
     },
     go: {
@@ -445,6 +501,52 @@ def check_commit_after(ctx):
     assert at_commit, "the offset was never committed"
     assert at_commit[0] == "1", "the commit must come after INCR: at commit time views:cat was still unset"
     assert ctx.kafka.lag("view-counter", "image-views") == 0, "a malformed record must be skipped and committed, not left to replay forever"
+`,
+    typescript: `/** View events on one partition, so they are delivered in this order. */
+function seed(ctx, ...ids: string[]) {
+  for (const imageId of ids)
+    ctx.kafka.seed('image-views', {key: imageId, value: JSON.stringify({id: imageId, w: 256, hit: true}), partition: 0});
+}
+
+export async function check_group(ctx) {
+  seed(ctx, 'cat');
+  const m = ctx.load('view_counter');
+  await ctx.drain(m.run());
+  const subscriptions = ctx.kafka.events.filter(e => e[0] === 'subscribe');
+  assert(subscriptions.length > 0, 'the consumer must subscribe to a topic');
+  const [, group, topics] = subscriptions[subscriptions.length - 1];
+  assert.equal(group, 'view-counter', \`groupId must be view-counter, got \${JSON.stringify(group)}\`);
+  assert(topics.includes('image-views'), \`the consumer must subscribe to image-views, got \${JSON.stringify(topics)}\`);
+}
+
+export async function check_manual_commit(ctx) {
+  seed(ctx, 'cat', 'dog');
+  const m = ctx.load('view_counter');
+  await ctx.drain(m.run());
+  assert(!ctx.kafka.events.some(e => e[0] === 'auto-commit'), 'auto-commit is on: offsets were committed on a timer, before processing');
+  assert(ctx.kafka.events.some(e => e[0] === 'manual-commit'), 'no explicit commit happened');
+  assert.equal(ctx.kafka.lag('view-counter', 'image-views'), 0, 'every processed record must be committed');
+}
+
+export async function check_incr(ctx) {
+  seed(ctx, 'cat', 'cat', 'dog', 'cat');
+  const m = ctx.load('view_counter');
+  await ctx.drain(m.run());
+  assert.equal(ctx.redis.get('views:cat'), '3', \`views:cat is \${JSON.stringify(ctx.redis.get('views:cat'))}, expected 3\`);
+  assert.equal(ctx.redis.get('views:dog'), '1', \`views:dog is \${JSON.stringify(ctx.redis.get('views:dog'))}, expected 1\`);
+}
+
+export async function check_commit_after(ctx) {
+  seed(ctx, 'cat');
+  ctx.kafka.seed('image-views', {key: 'bad', value: 'not json', partition: 0});
+  const atCommit: (string | null)[] = [];
+  ctx.kafka.onCommit(() => atCommit.push(ctx.redis.get('views:cat')));
+  const m = ctx.load('view_counter');
+  await ctx.drain(m.run());
+  assert(atCommit.length > 0, 'the offset was never committed');
+  assert.equal(atCommit[0], '1', 'the commit must come after INCR: at commit time views:cat was still unset');
+  assert.equal(ctx.kafka.lag('view-counter', 'image-views'), 0, 'a malformed record must be skipped and committed, not left to replay forever');
+}
 `,
   },
   debrief: `Where the commit sits relative to the side effect decides the delivery guarantee: commit-then-process is at-most-once (crash → lost), process-then-commit is at-least-once (crash → replayed). A counter tolerates a rare duplicate; a payment does not, which is why the merchant problem stores the record id to make its writes idempotent. Real consumers commit in batches for throughput, handle rebalances (\`on_revoke\` → commit what you have), and send poison records to a dead-letter topic instead of just logging them.`,

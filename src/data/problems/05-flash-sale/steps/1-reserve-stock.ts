@@ -61,6 +61,7 @@ unit to two orders:
         'The script checks `EXISTS hold:{order_id}` before any arithmetic and returns 1 when the hold is already there.',
       match: {
         python: {order: [LUA_EXISTS_HOLD, LUA_DECRBY]},
+        typescript: {order: [LUA_EXISTS_HOLD, LUA_DECRBY]},
         go: {order: [LUA_EXISTS_HOLD, LUA_DECRBY]},
         scala: {order: [LUA_EXISTS_HOLD, LUA_DECRBY]},
         cpp: {order: [LUA_EXISTS_HOLD, LUA_DECRBY]},
@@ -73,6 +74,7 @@ unit to two orders:
         'The Lua script reads `stock:{sku}`, compares it with the quantity and only then `DECRBY`s — the check and the write are one atomic unit.',
       match: {
         python: {order: [LUA_GET_STOCK, LUA_COMPARE, LUA_DECRBY]},
+        typescript: {order: [LUA_GET_STOCK, LUA_COMPARE, LUA_DECRBY]},
         go: {order: [LUA_GET_STOCK, LUA_COMPARE, LUA_DECRBY]},
         scala: {order: [LUA_GET_STOCK, LUA_COMPARE, LUA_DECRBY]},
         cpp: {order: [LUA_GET_STOCK, LUA_COMPARE, LUA_DECRBY]},
@@ -85,6 +87,7 @@ unit to two orders:
         'A successful reservation `SET`s `hold:{order_id}` with `EX` (or `SETEX`); a hold key without a TTL would outlive every crash of the sweeper.',
       match: {
         python: {all: [LUA_SET_HOLD]},
+        typescript: {all: [LUA_SET_HOLD]},
         go: {all: [LUA_SET_HOLD]},
         scala: {all: [LUA_SET_HOLD]},
         cpp: {all: [LUA_SET_HOLD]},
@@ -97,6 +100,7 @@ unit to two orders:
         '`ZADD holds <expiry> <member>` is what lets the sweeper find expired holds by time instead of scanning keys.',
       match: {
         python: {all: [LUA_ZADD]},
+        typescript: {all: [LUA_ZADD]},
         go: {all: [LUA_ZADD]},
         scala: {all: [LUA_ZADD]},
         cpp: {all: [LUA_ZADD]},
@@ -111,6 +115,10 @@ unit to two orders:
         python: {
           all: [/\br\.register_script\(\s*RESERVE_LUA\s*\)/, /\bkeys\s*=\s*\[|\(\s*\[\s*f?["']stock:/],
           none: [/\br\.get\(/, /\br\.decrby\(/, /\br\.eval\(/],
+        },
+        typescript: {
+          all: [/\bredis\.defineCommand\(\s*['"]reserve['"]\s*,\s*\{[^}]*lua:\s*RESERVE_LUA/, /\bredis\.reserve\(/],
+          none: [/\bredis\.get\(/, /\bredis\.decrby\(/, /\bredis\.eval\(/],
         },
         go: {
           all: [/redis\.NewScript\(\s*reserveLua\s*\)/, /\.(Run|EvalSha)\(\s*ctx\s*,\s*rdb\s*,/],
@@ -188,6 +196,87 @@ def reserve(sku: str, order_id: str, qty: int) -> bool:
     keys = [f"stock:{sku}", f"hold:{order_id}", "holds"]
     args = [qty, member, 2 * HOLD_TTL_S, expires_at]
     return reserve_script(keys=keys, args=args) == 1
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+
+export const HOLD_TTL_S = 600;
+
+// KEYS[1] = stock:{sku}   KEYS[2] = hold:{order_id}   KEYS[3] = holds
+// ARGV[1] = qty   ARGV[2] = member "{order_id}:{sku}:{qty}"   ARGV[3] = key TTL   ARGV[4] = expiry timestamp
+const RESERVE_LUA = \`
+return 0
+\`;
+
+/** The client with the reservation script registered as a command. */
+interface ReservingRedis extends Redis {
+  reserve(
+    stockKey: string,
+    holdKey: string,
+    holdsKey: string,
+    qty: number,
+    member: string,
+    ttl: number,
+    expiresAt: number,
+  ): Promise<number>;
+}
+
+const redis = new Redis({host: 'redis', port: 6379}) as ReservingRedis;
+// TODO: register RESERVE_LUA once with defineCommand so every call is an EVALSHA, not a script upload
+
+/** Takes qty units of sku for orderId; false when the drop is sold out. */
+export async function reserve(sku: string, orderId: string, qty: number): Promise<boolean> {
+  const expiresAt = Math.floor(Date.now() / 1000) + HOLD_TTL_S;
+  const member = \`\${orderId}:\${sku}:\${qty}\`;
+  // TODO: the script: EXISTS hold → 1; GET stock < qty → 0; DECRBY, SET hold EX, ZADD holds → 1
+  // TODO: run it with the three keys and four args; never GET/DECRBY from here
+  throw new Error('not implemented');
+}
+`,
+      solution: `import Redis from 'ioredis';
+
+export const HOLD_TTL_S = 600;
+
+// KEYS[1] = stock:{sku}   KEYS[2] = hold:{order_id}   KEYS[3] = holds
+// ARGV[1] = qty   ARGV[2] = member "{order_id}:{sku}:{qty}"   ARGV[3] = key TTL   ARGV[4] = expiry timestamp
+const RESERVE_LUA = \`
+if redis.call('EXISTS', KEYS[2]) == 1 then
+  return 1
+end
+local stock = tonumber(redis.call('GET', KEYS[1]) or '0')
+if stock < tonumber(ARGV[1]) then
+  return 0
+end
+redis.call('DECRBY', KEYS[1], ARGV[1])
+redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
+redis.call('ZADD', KEYS[3], ARGV[4], ARGV[2])
+return 1
+\`;
+
+/** The client with the reservation script registered as a command. */
+interface ReservingRedis extends Redis {
+  reserve(
+    stockKey: string,
+    holdKey: string,
+    holdsKey: string,
+    qty: number,
+    member: string,
+    ttl: number,
+    expiresAt: number,
+  ): Promise<number>;
+}
+
+const redis = new Redis({host: 'redis', port: 6379}) as ReservingRedis;
+redis.defineCommand('reserve', {numberOfKeys: 3, lua: RESERVE_LUA});
+
+/** Takes qty units of sku for orderId; false when the drop is sold out. */
+export async function reserve(sku: string, orderId: string, qty: number): Promise<boolean> {
+  const expiresAt = Math.floor(Date.now() / 1000) + HOLD_TTL_S;
+  const member = \`\${orderId}:\${sku}:\${qty}\`;
+  const result = await redis.reserve(\`stock:\${sku}\`, \`hold:\${orderId}\`, 'holds', qty, member, 2 * HOLD_TTL_S, expiresAt);
+  return result === 1;
+}
 `,
     },
     go: {
@@ -494,6 +583,75 @@ def check_script_once(ctx):
     assert counts["evalsha"] >= 3, f"expected one EVALSHA per reserve call, saw {counts['evalsha']}"
     assert counts["script_load"] <= 1, f"the script was uploaded {counts['script_load']} times; once is enough"
     assert ctx.redis.get(STOCK) == "2", f"stock is {ctx.redis.get(STOCK)!r} after three reservations of 1, expected 2"
+`,
+    typescript: `const SKU = 'shoe-42';
+const STOCK = 'stock:shoe-42';
+
+function reservations(ctx, stock: number) {
+  ctx.redis.set(STOCK, stock);
+  return ctx.load('reservations');
+}
+
+export async function check_idempotent_retry(ctx) {
+  const m = reservations(ctx, 3);
+  assert(await m.reserve(SKU, 'o1', 2), '3 in stock must cover an order of 2: expected true');
+  assert.equal(ctx.redis.get(STOCK), '1', \`stock after reserving 2 of 3 is \${JSON.stringify(ctx.redis.get(STOCK))}, expected 1\`);
+  assert(await m.reserve(SKU, 'o1', 2), 'a retried order whose hold exists must return true');
+  assert.equal(ctx.redis.get(STOCK), '1', \`the retry decremented stock again: \${JSON.stringify(ctx.redis.get(STOCK))}, expected still 1\`);
+  assert.equal(ctx.redis.zcard('holds'), 1, \`holds has \${ctx.redis.zcard('holds')} members after a retry, expected 1\`);
+  assert.equal(ctx.redis.get('hold:o1'), 'o1:shoe-42:2', 'the retry must leave the existing hold in place');
+}
+
+export async function check_check_then_decrement(ctx) {
+  const m = reservations(ctx, 3);
+  assert(await m.reserve(SKU, 'o1', 2), '3 in stock must cover an order of 2: expected true');
+  assert.equal(ctx.redis.get(STOCK), '1', \`stock is \${JSON.stringify(ctx.redis.get(STOCK))} after reserving 2 of 3, expected 1\`);
+  assert(!(await m.reserve(SKU, 'o2', 2)), '1 left cannot cover an order of 2: expected false (sold out)');
+  assert.equal(ctx.redis.get(STOCK), '1', \`a refused reservation changed stock to \${JSON.stringify(ctx.redis.get(STOCK))}; it must stay 1\`);
+  assert.equal(ctx.redis.exists('hold:o2'), 0, 'a refused reservation must not write hold:o2');
+  assert(await m.reserve(SKU, 'o3', 1), '1 left must cover an order of 1');
+  assert.equal(ctx.redis.get(STOCK), '0', \`stock is \${JSON.stringify(ctx.redis.get(STOCK))}, expected 0\`);
+  assert(!(await m.reserve(SKU, 'o4', 1)), 'stock 0 must refuse every further order; the counter may never go negative');
+  assert.equal(ctx.redis.get(STOCK), '0', \`stock went to \${JSON.stringify(ctx.redis.get(STOCK))}: the script must not decrement below zero\`);
+  assert(!(await m.reserve('never-stocked', 'o5', 1)), 'a missing stock key counts as 0: expected false');
+}
+
+export async function check_hold_ttl(ctx) {
+  const m = reservations(ctx, 5);
+  assert(await m.reserve(SKU, 'o1', 2), '5 in stock must cover an order of 2');
+  assert.equal(ctx.redis.get('hold:o1'), 'o1:shoe-42:2', \`hold:o1 is \${JSON.stringify(ctx.redis.get('hold:o1'))}, expected the member o1:shoe-42:2\`);
+  const ttl = ctx.redis.ttl('hold:o1');
+  assert(ttl > 0, 'hold:o1 has no TTL: a crashed sweeper would leave it forever');
+  assert(1190 <= ttl && ttl <= 1200, \`hold:o1 TTL is \${ttl} s, expected 2 x HOLD_TTL_S = 1200 s\`);
+  ctx.clock.advance(1201);
+  assert.equal(ctx.redis.get('hold:o1'), null, 'hold:o1 must be gone once its TTL has passed');
+}
+
+export async function check_expiry_index(ctx) {
+  const m = reservations(ctx, 5);
+  const before = Math.floor(ctx.clock.now() / 1000);
+  assert(await m.reserve(SKU, 'o1', 2), '5 in stock must cover an order of 2');
+  const raw = ctx.redis.zscore('holds', 'o1:shoe-42:2');
+  assert(raw !== null, \`holds contains \${JSON.stringify(ctx.redis.zrange('holds', 0, -1))}, expected the member o1:shoe-42:2\`);
+  const score = Number(raw);
+  assert(before + 599 <= score && score <= ctx.clock.now() / 1000 + 601, \`the member's score is \${score}, expected now + 600 s (\${before + 600})\`);
+  assert(!(await m.reserve(SKU, 'o2', 9)), '9 of 3 left must be refused');
+  assert.equal(ctx.redis.zcard('holds'), 1, 'a refused reservation must not be indexed in holds');
+}
+
+export async function check_script_once(ctx) {
+  const m = reservations(ctx, 5);
+  for (let i = 0; i < 3; i++) assert(await m.reserve(SKU, \`o\${i}\`, 1), \`order o\${i} must be reserved\`);
+  assert.equal(ctx.redis.get(STOCK), '2', \`stock is \${JSON.stringify(ctx.redis.get(STOCK))} after three reservations of 1, expected 2\`);
+  // Another API replica takes the last unit right after the first command that touches stock:
+  // inside one script nothing can land there; a client-side GET then DECRBY goes negative.
+  ctx.redis.set(STOCK, 1);
+  ctx.redisAfter(STOCK, () => ctx.redis.set(STOCK, 0));
+  await m.reserve(SKU, 'o9', 1);
+  const stock = Number(ctx.redis.get(STOCK));
+  assert(stock >= 0, \`stock is \${stock} after another worker took the last unit between your read and your decrement: the check and the DECRBY must run inside one script\`);
+  assert.equal(ctx.redis.zcard('holds'), ctx.redis.keys('hold:*').length, \`holds has \${ctx.redis.zcard('holds')} members for \${ctx.redis.keys('hold:*').length} hold keys: the hold and its index must be written together\`);
+}
 `,
   },
   debrief: `The whole reservation is one round trip and one atomic unit: check, decrement, hold and expiry entry either all happen or none do, and the \`EXISTS\` guard makes a retry harmless. Real systems shard hot SKUs across several counters to spread one key's write load, cache the script SHA client-side with a \`NOSCRIPT\` fallback, and back the Redis counter with the allocation the warehouse makes in step 4 — Redis says "probably yours", the ledger says "yours".`,

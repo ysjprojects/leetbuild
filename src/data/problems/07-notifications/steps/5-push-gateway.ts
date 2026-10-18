@@ -57,6 +57,7 @@ Implement \`send_push(token, title, body, collapse_key)\` on top of the generate
       detail: 'Each RPC carries a deadline (3 s); without one a stalled provider stalls the whole partition.',
       match: {
         python: {all: [/stub\.Send\([^\n]*timeout\s*=\s*(DEADLINE_S|3(\.0)?)\b/]},
+        typescript: {all: [/\.Send\([^)]*\{\s*deadline:\s*Date\.now\(\)\s*\+\s*(DEADLINE_MS|3000)\b/]},
         go: {all: [/context\.WithTimeout\(\s*\w+\s*,\s*(deadline|3\s*\*\s*time\.Second)\s*\)/]},
         scala: {all: [/withDeadlineAfter\(\s*(DeadlineMillis|3000L?)\s*,/]},
         cpp: {all: [/set_deadline\([^\n]*kDeadline/]},
@@ -75,6 +76,15 @@ Implement \`send_push(token, title, body, collapse_key)\` on top of the generate
             /time\.sleep\(/,
             /(BASE_BACKOFF_S|0\.2)\s*\*\s*2\s*\*\*|2\s*\*\*\s*\w+|<<\s*\w+/,
             /random\.\w+\(/,
+          ],
+        },
+        typescript: {
+          all: [
+            /status\.UNAVAILABLE/,
+            /status\.RESOURCE_EXHAUSTED/,
+            /\bsleep\(|setTimeout\(/,
+            /(BASE_BACKOFF_MS|200)\s*\*\s*2\s*\*\*|2\s*\*\*\s*\w+|<<\s*\w+|Math\.pow\(/,
+            /Math\.random\(\)|randomInt\(/,
           ],
         },
         go: {
@@ -112,6 +122,10 @@ Implement \`send_push(token, title, body, collapse_key)\` on top of the generate
       detail: 'Never loop until success: a provider that is down would pin every worker forever.',
       match: {
         python: {all: [/for \w+ in range\(\s*(MAX_ATTEMPTS|3)\s*\)/], none: [/while True/]},
+        typescript: {
+          all: [/for \(let \w+ = 0; \w+ < (MAX_ATTEMPTS|3); (\+\+\w+|\w+\+\+)\)/],
+          none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
+        },
         go: {all: [/for \w+ := 0; \w+ < (maxAttempts|3); \w+\+\+/], none: [/for \{/]},
         scala: {
           all: [/\w+ < (MaxAttempts|3)\b|\w+ <= 2\b|0 until (MaxAttempts|3)\b/],
@@ -136,6 +150,9 @@ Implement \`send_push(token, title, body, collapse_key)\` on top of the generate
             /devices\.disable\(\s*token\s*\)/,
             /return None/,
           ],
+        },
+        typescript: {
+          all: [/status\.INVALID_ARGUMENT/, /status\.NOT_FOUND/, /devices\.disable\(\s*token\s*\)/, /return null/],
         },
         go: {
           all: [
@@ -163,6 +180,7 @@ Implement \`send_push(token, title, body, collapse_key)\` on top of the generate
         'The consumer needs to tell "try again later" from "give up": a deadline or three failed transient attempts raise the retryable error, which it turns into a record on the retry topic.',
       match: {
         python: {all: [/StatusCode\.DEADLINE_EXCEEDED/, /raise Retryable\(/]},
+        typescript: {all: [/status\.DEADLINE_EXCEEDED/, /throw new Retryable\(/]},
         go: {all: [/codes\.DeadlineExceeded/, /(?<!var )ErrRetryable\b/]},
         scala: {all: [/Code\.DEADLINE_EXCEEDED/, /throw new Retryable\(/]},
         cpp: {all: [/StatusCode::DEADLINE_EXCEEDED/, /throw Retryable\(/]},
@@ -242,6 +260,112 @@ def send_push(token: str, title: str, body: str, collapse_key: str) -> str | Non
                 continue
             raise
     return None
+`,
+    },
+    typescript: {
+      starter: `import {setTimeout as sleep} from 'node:timers/promises';
+
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+
+import {devices} from 'notify/devices'; // devices.disable(token): marks a device token stale — provided
+
+export const DEADLINE_MS = 3000;
+export const BASE_BACKOFF_MS = 200;
+export const MAX_ATTEMPTS = 3;
+
+interface SendRequest {
+  device_token: string;
+  title: string;
+  body: string;
+  collapse_key: string;
+}
+
+interface SendReply {
+  message_id: string;
+}
+
+interface PushGatewayClient {
+  Send(request: SendRequest, options: {deadline: number}): Promise<SendReply>;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('push.proto')) as unknown as {
+  notify: {PushGateway: new (target: string, credentials: grpc.ChannelCredentials) => PushGatewayClient};
+};
+const client = new pkg.notify.PushGateway('push-gateway:9000', grpc.credentials.createInsecure());
+
+/** The consumer re-queues the notification on the retry topic (step 6). */
+export class Retryable extends Error {}
+
+/** Message id from the gateway, or null when the device token is stale. */
+export async function sendPush(token: string, title: string, body: string, collapseKey: string): Promise<string | null> {
+  const request: SendRequest = {device_token: token, title, body, collapse_key: collapseKey};
+  // TODO: up to MAX_ATTEMPTS calls to client.Send, each with a deadline of Date.now() + DEADLINE_MS
+  // TODO: UNAVAILABLE / RESOURCE_EXHAUSTED → sleep BASE_BACKOFF_MS * 2 ** attempt plus jitter, try again
+  // TODO: INVALID_ARGUMENT / NOT_FOUND → devices.disable(token), return null
+  // TODO: DEADLINE_EXCEEDED, or retries exhausted → throw Retryable; anything else → rethrow
+  throw new Error('not implemented');
+}
+`,
+      solution: `import {setTimeout as sleep} from 'node:timers/promises';
+
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+
+import {devices} from 'notify/devices'; // devices.disable(token): marks a device token stale — provided
+
+export const DEADLINE_MS = 3000;
+export const BASE_BACKOFF_MS = 200;
+export const MAX_ATTEMPTS = 3;
+
+interface SendRequest {
+  device_token: string;
+  title: string;
+  body: string;
+  collapse_key: string;
+}
+
+interface SendReply {
+  message_id: string;
+}
+
+interface PushGatewayClient {
+  Send(request: SendRequest, options: {deadline: number}): Promise<SendReply>;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('push.proto')) as unknown as {
+  notify: {PushGateway: new (target: string, credentials: grpc.ChannelCredentials) => PushGatewayClient};
+};
+const client = new pkg.notify.PushGateway('push-gateway:9000', grpc.credentials.createInsecure());
+
+/** The consumer re-queues the notification on the retry topic (step 6). */
+export class Retryable extends Error {}
+
+/** Message id from the gateway, or null when the device token is stale. */
+export async function sendPush(token: string, title: string, body: string, collapseKey: string): Promise<string | null> {
+  const request: SendRequest = {device_token: token, title, body, collapse_key: collapseKey};
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    try {
+      const reply = await client.Send(request, {deadline: Date.now() + DEADLINE_MS});
+      return reply.message_id;
+    } catch (e) {
+      const {code, message} = e as grpc.ServiceError;
+      if (code === grpc.status.INVALID_ARGUMENT || code === grpc.status.NOT_FOUND) {
+        devices.disable(token);
+        return null;
+      }
+      if (code === grpc.status.DEADLINE_EXCEEDED) throw new Retryable('push gateway: deadline exceeded', {cause: e});
+      if (code === grpc.status.UNAVAILABLE || code === grpc.status.RESOURCE_EXHAUSTED) {
+        if (attempt === MAX_ATTEMPTS - 1)
+          throw new Retryable(\`push gateway: \${message} after \${MAX_ATTEMPTS} attempts\`, {cause: e});
+        await sleep(BASE_BACKOFF_MS * 2 ** attempt + Math.random() * BASE_BACKOFF_MS);
+        continue;
+      }
+      throw e;
+    }
+  }
+  return null;
+}
 `,
     },
     go: {
@@ -644,6 +768,123 @@ def check_retryable(ctx):
     except grpc.RpcError as e:
         assert e.code() == grpc.StatusCode.PERMISSION_DENIED
     assert m.devices.disabled == [], "only INVALID_ARGUMENT / NOT_FOUND disable the token"
+`,
+    typescript: `/** The push gateway peer: answers every token but 'stale' (NOT_FOUND), counts the calls that reached it. */
+function client(ctx) {
+  const pkg = ctx.proto('push.proto');
+  const peer = {calls: 0};
+  ctx.grpc.serve(pkg.notify.PushGateway.service, {
+    Send: (call, callback) => {
+      peer.calls += 1;
+      if (call.request.device_token === 'stale')
+        return callback({code: ctx.grpc.status.NOT_FOUND, details: 'unregistered device token'});
+      callback(null, {message_id: \`m-\${call.request.device_token}-\${peer.calls}\`});
+    },
+  });
+  const m = ctx.load('push_client');
+  const devices = ctx.load('/support/notify/devices.ts').devices;
+  return {m, peer, devices};
+}
+
+function send(m, token = 'tok-1') {
+  return m.sendPush(token, 'Shipped', 'On its way', 'order-1');
+}
+
+/** The error a promise rejected with, or null when it resolved. */
+async function thrown(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise;
+    return null;
+  } catch (e) {
+    return e;
+  }
+}
+
+/** Virtual seconds slept and sleeps taken by one sendPush that first meets the given failures. */
+async function waited(ctx, m, code: number, times: number) {
+  ctx.grpc.fail('Send', code, '', times);
+  const started = ctx.clock.now();
+  const sleeps = ctx.clock.sleeps;
+  const result = await send(m);
+  return {result, seconds: Math.round((ctx.clock.now() - started) / 1000 * 1e6) / 1e6, sleeps: ctx.clock.sleeps - sleeps};
+}
+
+export async function check_deadline(ctx) {
+  const {m} = client(ctx);
+  assert.equal(await send(m), 'm-tok-1-1', "sendPush must return the gateway's message_id");
+  ctx.grpc.fail('Send', ctx.grpc.status.UNAVAILABLE, '', 1);
+  assert.equal(await send(m), 'm-tok-1-2', 'one UNAVAILABLE must be retried and succeed');
+  const calls = ctx.grpc.callsTo('Send');
+  assert.equal(calls.length, 3, \`expected 3 calls (one success, one failure, one retry), saw \${calls.length}\`);
+  for (const call of calls) {
+    assert(call.timeout !== null, 'an RPC carries no deadline');
+    assert(2.5 <= call.timeout && call.timeout <= 3.0, \`every call must carry a deadline of about 3 s, got \${call.timeout} s\`);
+  }
+  const request = calls[0].request;
+  assert.deepEqual(
+    [request.device_token, request.title, request.body, request.collapse_key],
+    ['tok-1', 'Shipped', 'On its way', 'order-1'],
+    \`the request must carry token, title, body and collapse_key, got \${JSON.stringify(request)}\`,
+  );
+}
+
+export async function check_backoff(ctx) {
+  const {m} = client(ctx);
+  const one = await waited(ctx, m, ctx.grpc.status.UNAVAILABLE, 1);
+  assert.equal(one.result, 'm-tok-1-1', 'one UNAVAILABLE must be retried and succeed');
+  assert.equal(one.sleeps, 1, \`expected one backoff sleep between the two attempts, saw \${one.sleeps}\`);
+  assert(0.2 <= one.seconds && one.seconds <= 0.45, \`the first backoff must be about 200 ms plus jitter, it was \${one.seconds} s\`);
+  const two = await waited(ctx, m, ctx.grpc.status.RESOURCE_EXHAUSTED, 2);
+  assert.equal(two.result, 'm-tok-1-2', 'two RESOURCE_EXHAUSTED must be retried and the third attempt succeed');
+  assert.equal(two.sleeps, 2, \`expected two backoff sleeps before the third attempt, saw \${two.sleeps}\`);
+  assert(0.6 <= two.seconds && two.seconds <= 1.05, \`the two backoffs must be about 200 + 400 ms plus jitter, together they were \${two.seconds} s\`);
+  const seen = new Set([one.seconds]);
+  for (let i = 0; i < 6; i++) seen.add((await waited(ctx, m, ctx.grpc.status.UNAVAILABLE, 1)).seconds);
+  assert(seen.size > 1, \`every first backoff lasted exactly \${one.seconds} s: add jitter so retries do not synchronise\`);
+}
+
+export async function check_bounded(ctx) {
+  const {m, peer} = client(ctx);
+  ctx.grpc.fail('Send', ctx.grpc.status.UNAVAILABLE, '', 50);
+  const error = await thrown(send(m));
+  assert(error !== null, 'a gateway that stays UNAVAILABLE must throw, sendPush returned');
+  assert(error instanceof m.Retryable, \`a gateway that stays UNAVAILABLE must throw Retryable, got \${error}\`);
+  const attempts = ctx.grpc.callsTo('Send').length;
+  assert.equal(attempts, 3, \`made \${attempts} attempts against a down gateway, expected exactly 3\`);
+  assert.equal(peer.calls, 0, 'no attempt reached the gateway: every one was UNAVAILABLE');
+}
+
+export async function check_stale_token(ctx) {
+  const {m, devices} = client(ctx);
+  assert.equal(await send(m, 'stale'), null, 'NOT_FOUND means the token is unregistered: return null');
+  assert.deepEqual(devices.disabled, ['stale'], \`the stale token must be disabled, devices.disabled is \${JSON.stringify(devices.disabled)}\`);
+  assert.equal(ctx.grpc.callsTo('Send').length, 1, 'NOT_FOUND must not be retried');
+  ctx.grpc.fail('Send', ctx.grpc.status.INVALID_ARGUMENT, 'malformed token', 1);
+  assert.equal(await send(m, 'bad'), null, 'INVALID_ARGUMENT means the token is bad: return null');
+  assert.deepEqual(devices.disabled, ['stale', 'bad'], \`the bad token must be disabled, devices.disabled is \${JSON.stringify(devices.disabled)}\`);
+  assert.equal(ctx.grpc.callsTo('Send').length, 2, 'INVALID_ARGUMENT must not be retried');
+  assert.equal(ctx.clock.sleeps, 0, 'a stale token must not wait for a backoff');
+}
+
+export async function check_retryable(ctx) {
+  const {m, devices} = client(ctx);
+  ctx.grpc.setLatency('Send', 5.0);
+  const slow = await thrown(send(m));
+  assert(slow !== null, 'a gateway slower than the deadline must throw Retryable, sendPush returned');
+  assert(slow instanceof m.Retryable, \`a gateway slower than the deadline must throw Retryable, got \${slow}\`);
+  assert.equal(ctx.grpc.callsTo('Send').length, 1, 'DEADLINE_EXCEEDED must not be retried: the consumer re-queues the record instead');
+  ctx.grpc.setLatency('Send', 0.0);
+  ctx.grpc.fail('Send', ctx.grpc.status.RESOURCE_EXHAUSTED, '', 3);
+  const exhausted = await thrown(send(m));
+  assert(exhausted !== null, 'exhausted retries must throw Retryable, sendPush returned');
+  assert(exhausted instanceof m.Retryable, \`exhausted retries must throw Retryable, got \${exhausted}\`);
+  ctx.grpc.fail('Send', ctx.grpc.status.PERMISSION_DENIED, 'bad credentials', 1);
+  const denied = await thrown(send(m));
+  assert(denied !== null, 'PERMISSION_DENIED must propagate as an error, sendPush returned');
+  assert(!(denied instanceof m.Retryable), 'PERMISSION_DENIED is not transient: it must propagate as a plain error, not Retryable');
+  assert.equal(denied.code, ctx.grpc.status.PERMISSION_DENIED, \`PERMISSION_DENIED must propagate with its status code, got \${denied}\`);
+  assert.deepEqual(devices.disabled, [], 'only INVALID_ARGUMENT / NOT_FOUND disable the token');
+}
 `,
   },
   debrief: `Three decisions make a provider call safe to put inside a consumer: a deadline, so one stuck call cannot hold a partition; retries only for the statuses that mean "not right now", with backoff and jitter so a provider recovering from an outage is not hit by every worker at once; and a distinct retryable error, so the caller can park the work instead of blocking on it. Disabling a stale token on the spot is what keeps the gateway's error rate honest. Real clients also honour \`Retry-After\` metadata from the gateway, use a circuit breaker when the error rate stays high, and collapse duplicate notifications with the \`collapse_key\` on the device.`,

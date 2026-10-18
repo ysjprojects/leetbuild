@@ -49,6 +49,7 @@ Security wants every request on record. Implement \`audit(api_key, path, status,
         python: {
           all: [/gateway-audit/, /producer\.produce\(\s*(TOPIC|"gateway-audit")\s*,[\s\S]{0,200}?key\s*=\s*api_key/],
         },
+        typescript: {all: [/gateway-audit/, /\.send\(\s*\{[\s\S]{0,200}?key:\s*apiKey/]},
         go: {all: [/gateway-audit/, /Key:\s*\[\]byte\(\s*apiKey\s*\)/]},
         scala: {all: [/gateway-audit/, /new ProducerRecord(\[[^\]]*\])?\(\s*(Topic|"gateway-audit")\s*,\s*apiKey\s*,/]},
         cpp: {
@@ -66,6 +67,7 @@ Security wants every request on record. Implement \`audit(api_key, path, status,
         'A producer buffer without a bound turns a slow broker into an out-of-memory gateway; set `queue.buffering.max.messages`, `max.block.ms=0`, or a fixed-size channel.',
       match: {
         python: {all: [/["']queue\.buffering\.max\.messages["']\s*:/]},
+        typescript: {all: [/QUEUE_MAX/, /inflight\s*>=\s*QUEUE_MAX|QUEUE_MAX\s*<=\s*inflight/]},
         go: {all: [/make\(\s*chan kafka\.Message\s*,\s*(queueSize|\d+)\s*\)/]},
         scala: {all: [/"max\.block\.ms"\s*,\s*"0"/]},
         cpp: {all: [/"queue\.buffering\.max\.messages"/]},
@@ -78,6 +80,7 @@ Security wants every request on record. Implement \`audit(api_key, path, status,
         'The full-queue signal must be handled by incrementing `dropped` — not by retrying, sleeping or raising into the request.',
       match: {
         python: {all: [/except BufferError/, /dropped\s*\+=\s*1/]},
+        typescript: {all: [/dropped\s*(\+=\s*1|\+\+)/, /inflight\s*-=\s*1|inflight--/]},
         go: {all: [/select\s*\{[\s\S]{0,300}?default:/, /dropped\.Add\(\s*1\s*\)/]},
         scala: {all: [/case _: (BufferExhaustedException|TimeoutException)/, /dropped\.incrementAndGet\(\)/]},
         cpp: {all: [/ERR__QUEUE_FULL/, /\+\+dropped|dropped\+\+|dropped\.fetch_add\(/]},
@@ -90,6 +93,7 @@ Security wants every request on record. Implement \`audit(api_key, path, status,
         '`audit` enqueues and returns; no `flush`, no blocking `get()` on the send future, no synchronous `WriteMessages` on the request path.',
       match: {
         python: {all: [/producer\.poll\(\s*0\s*\)/], none: [/def audit(?:(?!\ndef )[\s\S])*?producer\.flush\(/]},
+        typescript: {all: [/producer\s*\.send\(/], none: [/await\s+producer\s*\.send\(/]},
         go: {all: [/case queue <- /], none: [/func audit(?:(?!\n\})[\s\S])*?WriteMessages\(/]},
         scala: {all: [/producer\.send\([\s\S]{0,200}?onDelivery\s*\)/], none: [/\.send\([^\n]*\)\.get\(/]},
         cpp: {all: [/producer->poll\(\s*0\s*\)/], none: [/void audit(?:(?!\n\})[\s\S])*?producer->flush\(/]},
@@ -159,6 +163,59 @@ def audit(api_key: str, path: str, status: int, latency_ms: float) -> None:
     except BufferError:
         dropped += 1  # the broker is behind: lose one audit line, not the request
     producer.poll(0)  # serve delivery callbacks; returns immediately
+`,
+    },
+    typescript: {
+      starter: `import {Kafka} from 'kafkajs';
+
+export const TOPIC = 'gateway-audit';
+/** Records handed to the producer and not yet acknowledged: past this, audit() drops. */
+export const QUEUE_MAX = 1000;
+
+const kafka = new Kafka({clientId: 'gateway', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+void producer.connect();
+
+export let dropped = 0; // exported as gateway_audit_dropped_total
+let inflight = 0;
+
+/** Called after the response is written; must never slow down or fail the request. */
+export function audit(apiKey: string, path: string, status: number, latencyMs: number): void {
+  const value = JSON.stringify({api_key: apiKey, path, status, latency_ms: Math.round(latencyMs * 10) / 10, ts: Date.now() / 1000});
+  // TODO: inflight >= QUEUE_MAX → dropped += 1 and return; the broker is behind, the request is not
+  // TODO: otherwise inflight += 1 and producer.send to TOPIC keyed by apiKey with acks: 1 — never awaited:
+  //       log a failed delivery, and release the slot (inflight -= 1) when the send settles
+  throw new Error('not implemented');
+}
+`,
+      solution: `import {Kafka} from 'kafkajs';
+
+export const TOPIC = 'gateway-audit';
+/** Records handed to the producer and not yet acknowledged: past this, audit() drops. */
+export const QUEUE_MAX = 1000;
+
+const kafka = new Kafka({clientId: 'gateway', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+void producer.connect();
+
+export let dropped = 0; // exported as gateway_audit_dropped_total
+let inflight = 0;
+
+/** Called after the response is written; must never slow down or fail the request. */
+export function audit(apiKey: string, path: string, status: number, latencyMs: number): void {
+  const value = JSON.stringify({api_key: apiKey, path, status, latency_ms: Math.round(latencyMs * 10) / 10, ts: Date.now() / 1000});
+  if (inflight >= QUEUE_MAX) {
+    dropped += 1; // the broker is behind: lose one audit line, not the request
+    return;
+  }
+  inflight += 1;
+  producer
+    .send({topic: TOPIC, messages: [{key: apiKey, value}], acks: 1})
+    .catch((err: Error) => console.warn(\`audit record not delivered: \${err.message}\`))
+    .finally(() => {
+      inflight -= 1;
+    });
+}
 `,
     },
     go: {
@@ -516,6 +573,95 @@ def check_non_blocking(ctx):
     assert ctx.clock.sleeps == 0, "audit() must not sleep or wait"
     pending = len(m.producer)
     assert pending <= 1, f"after three audit() calls the producer still holds {pending} unserved delivery callbacks: call producer.poll(0) so acknowledged records leave the queue"
+`,
+    typescript: `const TOPIC = 'gateway-audit';
+
+/** A real macrotask: every pending promise continuation has run (no learner timer is pending here). */
+const settle = (): Promise<void> => {
+  const {promise, resolve} = Promise.withResolvers<void>();
+  setTimeout(resolve, 0);
+  return promise;
+};
+
+/** The producer's bound, as the module declares it. */
+function bound(m): number {
+  const max = m.QUEUE_MAX;
+  assert(Number.isInteger(max) && max > 0, \`QUEUE_MAX is \${JSON.stringify(max)}, expected a positive bound on the records in flight\`);
+  assert(max <= 5000, \`QUEUE_MAX is \${max}: a bound that large is no bound for a gateway, keep it at 1000 or below\`);
+  return max;
+}
+
+export async function check_topic_key(ctx) {
+  const m = ctx.load('audit_log');
+  m.audit('k1', '/items/42', 200, 12.34);
+  m.audit('k2', '/items/7', 404, 3.0);
+  m.audit('k1', '/items/9', 200, 1.0);
+  await settle();
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 3, \`three audit() calls produced \${records.length} records on gateway-audit\`);
+  const keys = records.map(r => r.key?.toString() ?? null);
+  assert.deepStrictEqual(keys, ['k1', 'k2', 'k1'], \`records must be keyed by the API key, got \${JSON.stringify(keys)}\`);
+  assert.equal(records[0].partition, records[2].partition, "the same API key must land on the same partition so one caller's trail stays ordered");
+  const first = JSON.parse(records[0].value.toString());
+  assert(first.api_key === 'k1' && first.path === '/items/42' && first.status === 200, \`the value must be JSON with api_key, path, status, latency_ms, ts: \${records[0].value.toString()}\`);
+  assert.strictEqual(first.latency_ms, 12.3, \`latency_ms is \${JSON.stringify(first.latency_ms)}, expected 12.3\`);
+  assert('ts' in first, \`the record carries no ts: \${records[0].value.toString()}\`);
+}
+
+export async function check_bounded_queue(ctx) {
+  const m = ctx.load('audit_log');
+  const max = bound(m);
+  ctx.kafka.stall(TOPIC); // the broker stops acknowledging: nothing handed to the producer leaves the queue
+  for (let i = 0; i < max; i += 1) m.audit('k1', \`/items/\${i}\`, 200, 1.0);
+  assert.equal(m.dropped, 0, \`\${m.dropped} record(s) were dropped before the queue reached its bound of \${max}\`);
+  for (let i = 0; i < 3; i += 1) m.audit('k1', '/items/42', 200, 1.0);
+  assert(m.dropped > 0, \`\${max + 3} audit() calls on a stalled broker and nothing was dropped: the queue is unbounded, a slow broker grows it until the gateway runs out of memory\`);
+  assert.equal(m.dropped, 3, \`dropped is \${m.dropped} after \${max + 3} records on a stalled broker with a bound of \${max}, expected 3\`);
+  assert.equal(ctx.kafka.records(TOPIC).length, 0, 'nothing can reach the topic while the broker is stalled');
+}
+
+export async function check_drop_on_full(ctx) {
+  const m = ctx.load('audit_log');
+  const max = bound(m);
+  ctx.kafka.stall(TOPIC);
+  for (let i = 0; i < max; i += 1) m.audit('k1', \`/items/\${i}\`, 200, 1.0); // the queue is now full
+  for (let i = 0; i < 3; i += 1) {
+    try {
+      await m.audit('k1', '/items/42', 200, 1.0); // must neither throw nor wait
+    } catch (e) {
+      assert.fail(\`audit() failed the request when the queue was full: \${e}. Drop the record and count it instead\`);
+    }
+  }
+  assert.equal(ctx.kafka.records(TOPIC).length, 0, 'nothing can be produced while the queue is full');
+  assert.equal(m.dropped, 3, \`dropped is \${m.dropped} after three refused records, expected 3\`);
+  assert.equal(ctx.clock.sleeps, 0, 'a full queue must be handled by dropping, not by sleeping and retrying');
+  ctx.kafka.resume(TOPIC);
+  ctx.clock.advance(31); // the broker is back: the queued records are acknowledged
+  await settle();
+  assert.equal(ctx.kafka.records(TOPIC).length, max, \`once the broker answers again the \${max} queued records must be delivered, the topic holds \${ctx.kafka.records(TOPIC).length}\`);
+  m.audit('k1', '/items/after', 200, 1.0);
+  await settle();
+  const last = ctx.kafka.values(TOPIC).at(-1) ?? '';
+  assert(last.includes('/items/after'), 'once the queue has room, audit records flow again');
+  assert.equal(m.dropped, 3, \`dropped is \${m.dropped} after a successful produce, expected to stay at 3\`);
+}
+
+export async function check_non_blocking(ctx) {
+  const m = ctx.load('audit_log');
+  for (let i = 0; i < 3; i += 1) m.audit('k1', \`/items/\${i}\`, 200, 1.0);
+  await settle();
+  assert.equal(ctx.kafka.records(TOPIC).length, 3, \`three audit() calls produced \${ctx.kafka.records(TOPIC).length} records\`);
+  assert.equal(ctx.clock.sleeps, 0, 'audit() must not sleep or wait');
+  ctx.kafka.stall(TOPIC); // the broker stops answering: the request must not notice
+  const before = ctx.clock.now();
+  try {
+    await m.audit('k1', '/items/slow', 200, 1.0);
+  } catch (e) {
+    assert.fail(\`audit() failed the request because the broker was slow: \${e}. Hand the record to the producer and return\`);
+  }
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited < 1 && ctx.clock.sleeps === 0, \`audit() waited \${waited.toFixed(1)} s for a stalled broker's acknowledgement: the request thread never waits for a broker, hand the record to the producer and return\`);
+}
 `,
   },
   debrief: `Audit is a side channel: valuable, but never worth a slow or failed request. That priority decides everything here — an async hand-off, a bounded buffer, and an explicit drop with a counter you can alarm on. Blocking "just a little" when the queue is full is how a Kafka outage becomes an API outage. Real gateways ship audit through a local agent (Vector, Fluent Bit) so the process only ever writes to a socket on the same host, key by tenant rather than raw API key, and treat a rising \`dropped\` counter as a paging alert.`,

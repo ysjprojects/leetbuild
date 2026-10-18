@@ -50,6 +50,10 @@ Implement \`publish_order(order)\`: one record on the **\`orders\`** topic per a
           all: [/producer\.produce\(\s*(topic\s*=\s*)?TOPIC\s*,[^\n]*key\s*=\s*order\.symbol/],
           none: [/key\s*=\s*order\.order_id/],
         },
+        typescript: {
+          all: [/producer\.send\(\s*\{[^}]*topic:\s*TOPIC[\s\S]{0,300}?key:\s*order\.symbol/],
+          none: [/key:\s*order\.order_id/],
+        },
         go: {all: [/Key:\s*\[\]byte\(\s*order\.Symbol\s*\)/], none: [/Key:\s*\[\]byte\(\s*order\.OrderID\s*\)/]},
         scala: {
           all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*order\.symbol\s*,/],
@@ -70,6 +74,7 @@ Implement \`publish_order(order)\`: one record on the **\`orders\`** topic per a
         'With `acks=1` a leader crash right after the ack loses the order; `acks=all` makes the 202 mean what it says.',
       match: {
         python: {all: [/"acks"\s*:\s*"all"/]},
+        typescript: {all: [/acks:\s*(-1|['"]all['"])/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
         scala: {all: [/"acks"\s*,\s*"all"|ACKS_CONFIG\s*,\s*"all"/]},
         cpp: {all: [/"acks"\s*,\s*"all"/]},
@@ -82,6 +87,7 @@ Implement \`publish_order(order)\`: one record on the **\`orders\`** topic per a
         'Enable the idempotent producer so a retried batch is deduplicated by the broker; kafka-go lacks it, so tag the record with the `order_id` header for downstream deduplication.',
       match: {
         python: {all: [/"enable\.idempotence"\s*:\s*True/]},
+        typescript: {all: [/idempotent:\s*true/]},
         go: {all: [/Headers:\s*\[\]kafka\.Header\{[\s\S]{0,200}?"order_id"/]},
         scala: {all: [/"enable\.idempotence"\s*,\s*"true"|ENABLE_IDEMPOTENCE_CONFIG\s*,\s*"true"/]},
         cpp: {all: [/"enable\.idempotence"\s*,\s*"true"/]},
@@ -95,6 +101,9 @@ Implement \`publish_order(order)\`: one record on the **\`orders\`** topic per a
       match: {
         python: {
           all: [/def publish_order(?:(?!\ndef )[\s\S])*?producer\.flush\(\s*(timeout\s*=\s*)?ACK_TIMEOUT_S\s*\)/],
+        },
+        typescript: {
+          all: [/await producer\.send\(/, /timeout:\s*(ACK_TIMEOUT_S\s*\*\s*1000|ACK_TIMEOUT_MS|2000)\b/],
         },
         go: {
           all: [/context\.WithTimeout\(\s*ctx\s*,\s*ackTimeout\s*\)/, /err\s*:?=\s*writer\.WriteMessages\(/],
@@ -111,6 +120,7 @@ Implement \`publish_order(order)\`: one record on the **\`orders\`** topic per a
         'A record that was not acknowledged must surface as `PublishFailed` so the gateway answers 503 instead of a false 202.',
       match: {
         python: {all: [/raise PublishFailed\(/]},
+        typescript: {all: [/throw new PublishFailed\(/]},
         go: {order: [/writer\.WriteMessages\(/, /return\s+(fmt\.Errorf\([^\n]*%w|err\b)/]},
         scala: {all: [/throw new PublishFailed\(/]},
         cpp: {all: [/throw PublishFailed\(/]},
@@ -176,6 +186,59 @@ def publish_order(order: Order) -> None:
         raise PublishFailed(f"order {order.order_id}: no acknowledgement within {ACK_TIMEOUT_S}s")
     if outcome[0] is not None:
         raise PublishFailed(f"order {order.order_id}: {outcome[0]}")
+`,
+    },
+    typescript: {
+      starter: `import {Kafka} from 'kafkajs';
+
+import {type Order, PublishFailed} from './order_gateway';
+
+export const TOPIC = 'orders';
+export const ACK_TIMEOUT_S = 2.0;
+
+const kafka = new Kafka({clientId: 'gateway', brokers: ['kafka:9092']});
+// TODO: an idempotent producer (requires acks all): an accepted order is never lost or duplicated
+export const producer = kafka.producer();
+let connected: Promise<void> | null = null;
+
+export async function publishOrder(order: Order): Promise<void> {
+  connected ??= producer.connect();
+  await connected;
+  const value = JSON.stringify(order);
+  // TODO: send to TOPIC keyed by order.symbol (not order_id) with acks: -1 (all)
+  // TODO: await the send, bounded by timeout: ACK_TIMEOUT_S * 1000, so the ack is in before we return
+  // TODO: throw PublishFailed when the broker reports an error or never answers in time
+  void value;
+  throw new Error('not implemented');
+}
+`,
+      solution: `import {Kafka} from 'kafkajs';
+
+import {type Order, PublishFailed} from './order_gateway';
+
+export const TOPIC = 'orders';
+export const ACK_TIMEOUT_S = 2.0;
+
+const kafka = new Kafka({clientId: 'gateway', brokers: ['kafka:9092']});
+export const producer = kafka.producer({idempotent: true});
+let connected: Promise<void> | null = null;
+
+export async function publishOrder(order: Order): Promise<void> {
+  connected ??= producer.connect();
+  await connected;
+  const value = JSON.stringify(order);
+  try {
+    // Resolves only once every in-sync replica acknowledged the record, or rejects at the timeout.
+    await producer.send({
+      topic: TOPIC,
+      acks: -1,
+      timeout: ACK_TIMEOUT_S * 1000,
+      messages: [{key: order.symbol, value}],
+    });
+  } catch (e) {
+    throw new PublishFailed(\`order \${order.order_id}: \${e instanceof Error ? e.message : String(e)}\`);
+  }
+}
 `,
     },
     go: {
@@ -503,6 +566,90 @@ def check_raises(ctx):
         raise AssertionError("a delivery report that never arrives within ACK_TIMEOUT_S must raise PublishFailed")
     except m.PublishFailed:
         pass
+`,
+    typescript: `function publisher(ctx) {
+  const gateway = ctx.load('order_gateway');
+  const m = ctx.load('order_publisher');
+  return {m, PublishFailed: gateway.PublishFailed};
+}
+
+function order(orderId = 'o-1', symbol = 'ACME') {
+  return {order_id: orderId, symbol, side: 'BUY', price: 10.05, qty: 100, client_order_id: 'c-1'};
+}
+
+/** publishOrder must reject with PublishFailed; returns its message. */
+async function failsToPublish(ctx, m, PublishFailed, o, what: string): Promise<void> {
+  let error: unknown = null;
+  try {
+    await m.publishOrder(o);
+  } catch (e) {
+    error = e;
+  }
+  assert(error !== null, \`\${what} must reject with PublishFailed, publishOrder resolved normally\`);
+  assert(error instanceof PublishFailed, \`\${what} must reject with PublishFailed, got \${error instanceof Error ? error.constructor.name + ': ' + error.message : String(error)}\`);
+}
+
+export async function check_keyed_by_symbol(ctx) {
+  const {m} = publisher(ctx);
+  await m.publishOrder(order('o-1', 'ACME'));
+  await m.publishOrder(order('o-2', 'ACME'));
+  await m.publishOrder(order('o-3', 'BETA'));
+  const produced = ctx.kafka.records('orders');
+  assert.equal(produced.length, 3, \`expected three records on orders, found \${produced.length}\`);
+  const keys = ctx.kafka.keys('orders');
+  assert.deepEqual(keys, ['ACME', 'ACME', 'BETA'], \`records must be keyed by the symbol, got \${JSON.stringify(keys)}\`);
+  assert.equal(produced[0].partition, produced[1].partition, 'two ACME orders must land on the same partition');
+  const value = JSON.parse(ctx.kafka.values('orders')[0]);
+  assert(value.order_id === 'o-1' && value.symbol === 'ACME' && value.qty === 100, \`the value must be the JSON of the order, got \${JSON.stringify(value)}\`);
+}
+
+export async function check_acks_all(ctx) {
+  const {m} = publisher(ctx);
+  await m.publishOrder(order('o-1'));
+  // The partition leader fails right after it answered: a record acknowledged by the leader alone is gone.
+  ctx.kafka.failover('orders');
+  const held = ctx.kafka.records('orders').length;
+  assert.equal(held, 1, \`publishOrder resolved (the gateway would answer 202), then the partition leader failed and orders holds \${held} record(s) instead of the order: it had been acknowledged by the leader alone. The 202 is a durability promise and needs acks=all (-1)\`);
+}
+
+export async function check_idempotent(ctx) {
+  const {m} = publisher(ctx);
+  // The broker writes the order but its acknowledgement is lost on the way back: the producer retries.
+  ctx.kafka.loseAcks('orders');
+  await m.publishOrder(order('o-1'));
+  const ids = ctx.kafka.values('orders').map(v => JSON.parse(v).order_id);
+  assert.deepEqual(ids, ['o-1'], \`after a lost acknowledgement the retry must not duplicate the order, but orders holds \${JSON.stringify(ids)}: enable the idempotent producer\`);
+}
+
+export async function check_waits_for_ack(ctx) {
+  const {m, PublishFailed} = publisher(ctx);
+  // The broker is slow but answers within ACK_TIMEOUT_S: the call waits for the ack and resolves.
+  ctx.kafka.stall('orders', 0.5);
+  let start = ctx.clock.now();
+  await m.publishOrder(order('o-1'));
+  const waited = ctx.clock.now() - start;
+  assert.equal(ctx.kafka.records('orders').length, 1, 'the order must be on the topic once publishOrder resolved');
+  assert(waited >= 500, \`publishOrder resolved after \${waited} ms while the broker only answered after 500 ms: it returned without waiting for the acknowledgement\`);
+  // The broker never answers: the wait is bounded by ACK_TIMEOUT_S, not kafkajs's 30 s default.
+  ctx.kafka.stall('orders');
+  start = ctx.clock.now();
+  await failsToPublish(ctx, m, PublishFailed, order('o-2'), 'an acknowledgement that never arrives');
+  const gaveUp = ctx.clock.now() - start;
+  const limit = m.ACK_TIMEOUT_S * 1000;
+  assert(gaveUp >= limit - 1 && gaveUp <= limit + 1000, \`publishOrder gave up after \${gaveUp} ms, expected ACK_TIMEOUT_S (\${limit} ms)\`);
+}
+
+export async function check_raises(ctx) {
+  const {m, PublishFailed} = publisher(ctx);
+  ctx.kafka.failNext('orders');
+  await failsToPublish(ctx, m, PublishFailed, order('o-1'), 'a delivery error');
+  assert.deepEqual(ctx.kafka.records('orders'), [], 'the failed order must not be on the topic');
+  await m.publishOrder(order('o-2')); // the producer is still usable afterwards
+  assert.equal(ctx.kafka.records('orders').length, 1, 'the next order must be published normally');
+  // The broker never answers: the send times out with the record still pending.
+  ctx.kafka.stall('orders');
+  await failsToPublish(ctx, m, PublishFailed, order('o-3'), 'an acknowledgement that never arrives within ACK_TIMEOUT_S');
+}
 `,
   },
   debrief: `Same producer API as an analytics event, opposite trade-off: here latency is spent to buy durability, because the 202 already left the building as a promise. \`acks=all\` moves the failure from "lost silently" to "reported", idempotence keeps the broker's own retries from turning one order into two, and the symbol key is what lets the next step keep one book per partition with no locks at all. Real exchanges skip Kafka on the hot path — a sequencer assigns a global sequence number and replicates the input log to standbys synchronously — but the shape is identical: nothing is acknowledged to the client before it is on more than one machine, and everything downstream is a deterministic function of the sequenced log.`,

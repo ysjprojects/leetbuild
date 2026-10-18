@@ -56,6 +56,13 @@ and \`timeline.read(user, cursor, limit)\` returns a page of post ids (you build
             /status_code\s*=\s*400|HTTP_400/,
           ],
         },
+        typescript: {
+          all: [
+            /text\.length\s*>\s*(MAX_TEXT|280)/,
+            /(media_ids|mediaIds)\.length\s*>\s*(MAX_MEDIA|4)/,
+            /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/,
+          ],
+        },
         go: {
           all: [
             /\.Text\s*\)+\s*>\s*(maxText|280)/,
@@ -86,6 +93,7 @@ and \`timeline.read(user, cursor, limit)\` returns a page of post ids (you build
         'Read the `Idempotency-Key` header and answer `400` when it is missing; the store dedupes on it so client retries cannot double-post.',
       match: {
         python: {all: [/idempotency-key/i, /status_code\s*=\s*400|HTTP_400/]},
+        typescript: {all: [/idempotency-key/i, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/]},
         go: {all: [/Idempotency-Key/i, /http\.StatusBadRequest|\b400\b/]},
         scala: {all: [/Idempotency-Key/i, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/Idempotency-Key/i, /status\s*=\s*400/]},
@@ -98,6 +106,10 @@ and \`timeline.read(user, cursor, limit)\` returns a page of post ids (you build
       match: {
         python: {
           order: [/posts\.save\(/, /\bpublish\(\s*\w+\s*\)/, /status_code\s*=\s*201|HTTP_201/],
+          all: [/post_id/, /created_at/],
+        },
+        typescript: {
+          order: [/posts\.save\(/, /\bpublish\(\s*\w+\s*\)/, /code\(\s*201\s*\)|status\(\s*201\s*\)|statusCode:\s*201/],
           all: [/post_id/, /created_at/],
         },
         go: {
@@ -120,6 +132,12 @@ and \`timeline.read(user, cursor, limit)\` returns a page of post ids (you build
       detail: 'A page size of 0 or 500 is a bug or an abuse; check `limit` against `MAX_LIMIT` and answer `400`.',
       match: {
         python: {
+          all: [
+            /limit\s*<\s*1|limit\s*<=\s*0|1\s*<=\s*limit|0\s*<\s*limit/,
+            /limit\s*>\s*(MAX_LIMIT|50)|limit\s*<=\s*(MAX_LIMIT|50)|(MAX_LIMIT|50)\s*<\s*limit/,
+          ],
+        },
+        typescript: {
           all: [
             /limit\s*<\s*1|limit\s*<=\s*0|1\s*<=\s*limit|0\s*<\s*limit/,
             /limit\s*>\s*(MAX_LIMIT|50)|limit\s*<=\s*(MAX_LIMIT|50)|(MAX_LIMIT|50)\s*<\s*limit/,
@@ -152,6 +170,7 @@ and \`timeline.read(user, cursor, limit)\` returns a page of post ids (you build
         '`GET /feed` answers `{posts, next_cursor}` from `timeline.read` with `Cache-Control: private, no-store` — a feed is personal and must never be cached by a proxy.',
       match: {
         python: {all: [/timeline\.read\(/, /next_cursor/, /private, no-store/]},
+        typescript: {all: [/timeline\.read\(/, /next_cursor/, /private, no-store/]},
         go: {all: [/timeline\.Read\(/, /next_cursor/, /private, no-store/]},
         scala: {all: [/Timeline\.read\(/, /next_cursor/, /private, no-store/]},
         cpp: {all: [/timeline::read\(/, /next_cursor/, /private, no-store/]},
@@ -253,6 +272,101 @@ def feed(x_user_id: str = Header(), cursor: int | None = None, limit: int = DEFA
 
 
 # uvicorn post_api:app --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+
+import {publish} from 'feed/events'; // provided: publish(post) → Promise<void> (Kafka topic "posts")
+import {newId} from 'feed/ids'; // provided: newId(createdAtMs) → '<ms>-<suffix>'
+import {posts, timeline} from 'feed/store'; // provided: posts.save(post), timeline.read(userId, cursor, limit)
+
+export const app = Fastify();
+
+export const MAX_TEXT = 280;
+export const MAX_MEDIA = 4;
+export const MAX_LIMIT = 50;
+export const DEFAULT_LIMIT = 20;
+const NO_STORE = 'private, no-store';
+
+interface NewPost {
+  text?: string;
+  media_ids?: string[];
+}
+
+app.post('/posts', async (request, reply) => {
+  const body = (request.body ?? {}) as NewPost;
+  const author = request.headers['x-user-id'] as string;
+  // TODO: 400 when text is empty or longer than MAX_TEXT, or more than MAX_MEDIA media ids
+  // TODO: 400 when the Idempotency-Key header is missing
+  // TODO: build the post (post_id = newId(created_at), author, text, media_ids, created_at ms, idempotency_key)
+  // TODO: posts.save, publish, then 201 {post_id, created_at} with Cache-Control: NO_STORE
+  return reply.code(501).send();
+});
+
+app.get('/feed', async (request, reply) => {
+  const query = request.query as {cursor?: string; limit?: string};
+  const user = request.headers['x-user-id'] as string;
+  // TODO: limit defaults to DEFAULT_LIMIT; 400 when it is outside 1..MAX_LIMIT
+  // TODO: timeline.read(user, cursor, limit) → {posts, next_cursor} with Cache-Control: NO_STORE
+  return reply.code(501).send();
+});
+`,
+      solution: `import Fastify from 'fastify';
+
+import {publish} from 'feed/events'; // provided: publish(post) → Promise<void> (Kafka topic "posts")
+import {newId} from 'feed/ids'; // provided: newId(createdAtMs) → '<ms>-<suffix>'
+import {posts, timeline} from 'feed/store'; // provided: posts.save(post), timeline.read(userId, cursor, limit)
+
+export const app = Fastify();
+
+export const MAX_TEXT = 280;
+export const MAX_MEDIA = 4;
+export const MAX_LIMIT = 50;
+export const DEFAULT_LIMIT = 20;
+const NO_STORE = 'private, no-store';
+
+interface NewPost {
+  text?: string;
+  media_ids?: string[];
+}
+
+app.post('/posts', async (request, reply) => {
+  const body = (request.body ?? {}) as NewPost;
+  const author = request.headers['x-user-id'] as string;
+  const text = body.text ?? '';
+  const mediaIds = body.media_ids ?? [];
+  if (text.length === 0 || text.length > MAX_TEXT || mediaIds.length > MAX_MEDIA)
+    return reply.code(400).send({error: \`text 1..\${MAX_TEXT} chars, at most \${MAX_MEDIA} media\`});
+  const key = request.headers['idempotency-key'];
+  if (typeof key !== 'string' || key === '') return reply.code(400).send({error: 'Idempotency-Key header required'});
+  const createdAt = Date.now();
+  const post = {
+    post_id: newId(createdAt),
+    author,
+    text,
+    media_ids: mediaIds,
+    created_at: createdAt,
+    idempotency_key: key,
+  };
+  await posts.save(post);
+  await publish(post);
+  return reply
+    .code(201)
+    .header('Cache-Control', NO_STORE)
+    .send({post_id: post.post_id, created_at: post.created_at});
+});
+
+app.get('/feed', async (request, reply) => {
+  const query = request.query as {cursor?: string; limit?: string};
+  const user = request.headers['x-user-id'] as string;
+  const limit = query.limit === undefined ? DEFAULT_LIMIT : Number(query.limit);
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT)
+    return reply.code(400).send({error: \`limit must be between 1 and \${MAX_LIMIT}\`});
+  const cursor = query.cursor === undefined ? null : Number(query.cursor);
+  const [items, nextCursor] = await timeline.read(user, cursor, limit);
+  return reply.header('Cache-Control', NO_STORE).send({posts: items, next_cursor: nextCursor});
+});
 `,
     },
     go: {
@@ -801,6 +915,108 @@ async def check_feed_response(ctx):
     assert calls == [("alice", 1700000000500, 5)], f"timeline.read must get the user from X-User-Id, the cursor and the limit unchanged: {calls}"
     assert r.json() == {"posts": ["p3", "p2"], "next_cursor": 1700000000200}, f"the body must be the page from timeline.read as posts and next_cursor: {r.json()}"
     assert r.headers.get("cache-control") == "private, no-store", f"Cache-Control must be 'private, no-store', got {r.headers.get('cache-control')!r}"
+`,
+    typescript: `import {posts, timeline} from 'feed/store';
+
+const HEADERS = {'X-User-Id': 'alice', 'Idempotency-Key': 'k-1'};
+
+function post(c, body: unknown, headers: Record<string, string> = HEADERS) {
+  return c.post('/posts', {json: body, headers});
+}
+
+/** timeline.read swapped on the provided facade: records every call and answers a fixed page. */
+function fakeTimeline() {
+  const calls: [string, number | null, number][] = [];
+  timeline.read = async (userId, cursor, limit) => {
+    calls.push([userId, cursor, limit]);
+    return [['p3', 'p2'], 1700000000200];
+  };
+  return calls;
+}
+
+export async function check_validate(ctx) {
+  const m = ctx.load('post_api');
+  const c = ctx.client(m.app);
+  const bad: [unknown, string][] = [
+    [{text: ''}, 'empty text'],
+    [{text: 'x'.repeat(281)}, '281 characters of text'],
+    [{text: 'hi', media_ids: ['m1', 'm2', 'm3', 'm4', 'm5']}, '5 media ids'],
+  ];
+  for (const [body, why] of bad) {
+    const r = await post(c, body);
+    assert.equal(r.status, 400, \`\${why} must answer 400, got \${r.status}\`);
+  }
+  assert.deepEqual(ctx.redis.keys('*'), [], \`a rejected post must not reach the store, but Redis holds \${JSON.stringify(ctx.redis.keys('*'))}\`);
+  assert.equal(ctx.kafka.records('posts').length, 0, 'a rejected post must not be published');
+  const r = await post(c, {text: 'x'.repeat(280), media_ids: ['m1', 'm2', 'm3', 'm4']});
+  assert.equal(r.status, 201, \`280 characters and 4 media ids are valid: expected 201, got \${r.status}\`);
+}
+
+export async function check_idempotency_key(ctx) {
+  const m = ctx.load('post_api');
+  const c = ctx.client(m.app);
+  const r = await post(c, {text: 'hello'}, {'X-User-Id': 'alice'});
+  assert.equal(r.status, 400, \`a POST without Idempotency-Key must answer 400, got \${r.status}\`);
+  assert(ctx.redis.keys('*').length === 0 && ctx.kafka.records('posts').length === 0, 'a POST without Idempotency-Key must not be saved or published');
+  const first = await post(c, {text: 'hello'});
+  assert.equal(first.status, 201, \`a POST with Idempotency-Key must answer 201, got \${first.status}\`);
+  const retry = await post(c, {text: 'hello'});
+  assert.equal(retry.status, 201, \`a retried POST with the same key must answer 201, got \${retry.status}\`);
+  assert.equal(retry.json().post_id, first.json().post_id, 'a retry with the same Idempotency-Key must be the same post: the key must reach posts.save as idempotency_key');
+}
+
+export async function check_created(ctx) {
+  const m = ctx.load('post_api');
+  // posts.save reads idem:alice:k-1 first: what the posts topic held at that moment tells whether publish came before the save.
+  let publishedAtSave: number | null = null;
+  ctx.redisAfter('idem:alice:k-1', () => {
+    publishedAtSave = ctx.kafka.records('posts').length;
+  });
+  const r = await post(ctx.client(m.app), {text: 'hello', media_ids: ['m1']});
+  assert.equal(r.status, 201, \`a valid post must answer 201, got \${r.status}\`);
+  const body = r.json();
+  assert(body.post_id, \`the 201 body must carry post_id: \${r.text}\`);
+  assert(Number.isInteger(body.created_at), \`created_at must be an integer of milliseconds: \${r.text}\`);
+  assert(Math.abs(body.created_at - Date.now()) < 5000, \`created_at must be the current time in milliseconds, got \${body.created_at}\`);
+  const saved = await posts.get(body.post_id);
+  assert(saved !== null, 'the post must be in the store after the 201');
+  assert(saved.post_id === body.post_id && saved.author === 'alice', \`the saved post must carry the post_id and the author from X-User-Id: \${JSON.stringify(saved)}\`);
+  assert(saved.text === 'hello' && JSON.stringify(saved.media_ids) === '["m1"]', \`the saved post must carry text and media_ids: \${JSON.stringify(saved)}\`);
+  assert(publishedAtSave !== null, 'the post must reach posts.save with its idempotency_key');
+  assert.equal(publishedAtSave, 0, \`expected posts.save then publish, but the posts topic already held \${publishedAtSave} record(s) when the store was first asked\`);
+  const records = ctx.kafka.values('posts');
+  assert.equal(records.length, 1, \`expected one record on the posts topic, found \${records.length}\`);
+  assert.equal(JSON.parse(records[0]).post_id, body.post_id, 'the published record must be the saved post');
+  assert.equal(r.headers['cache-control'], 'private, no-store', \`Cache-Control must be 'private, no-store', got \${JSON.stringify(r.headers['cache-control'])}\`);
+}
+
+export async function check_feed_limit(ctx) {
+  const m = ctx.load('post_api');
+  const calls = fakeTimeline();
+  const c = ctx.client(m.app);
+  for (const limit of [0, 51, -1]) {
+    const r = await c.get(\`/feed?limit=\${limit}\`, {headers: HEADERS});
+    assert.equal(r.status, 400, \`limit=\${limit} must answer 400, got \${r.status}\`);
+  }
+  assert.equal(calls.length, 0, 'a rejected limit must not reach timeline.read');
+  for (const limit of [1, 50]) {
+    const r = await c.get(\`/feed?limit=\${limit}\`, {headers: HEADERS});
+    assert.equal(r.status, 200, \`limit=\${limit} is valid: expected 200, got \${r.status}\`);
+  }
+  const r = await c.get('/feed', {headers: HEADERS});
+  assert.equal(r.status, 200, \`GET /feed without limit must use the default, got \${r.status}\`);
+  assert.deepStrictEqual(calls.map(call => call[2]), [1, 50, 20], \`timeline.read must receive the limit as a number (default 20), got \${JSON.stringify(calls.map(call => call[2]))}\`);
+}
+
+export async function check_feed_response(ctx) {
+  const m = ctx.load('post_api');
+  const calls = fakeTimeline();
+  const r = await ctx.client(m.app).get('/feed?cursor=1700000000500&limit=5', {headers: HEADERS});
+  assert.equal(r.status, 200, \`GET /feed must answer 200, got \${r.status}\`);
+  assert.deepStrictEqual(calls, [['alice', 1700000000500, 5]], \`timeline.read must get the user from X-User-Id, the cursor and the limit as numbers, unchanged: \${JSON.stringify(calls)}\`);
+  assert.deepStrictEqual(r.json(), {posts: ['p3', 'p2'], next_cursor: 1700000000200}, \`the body must be the page from timeline.read as posts and next_cursor: \${r.text}\`);
+  assert.equal(r.headers['cache-control'], 'private, no-store', \`Cache-Control must be 'private, no-store', got \${JSON.stringify(r.headers['cache-control'])}\`);
+}
 `,
   },
   debrief: `The write path is validate → save → publish → 201, and the order matters: a rejected request costs nothing, and the Kafka record is only produced for a post that exists in the store, so the fan-out worker never pushes an id that cannot be hydrated. The \`Idempotency-Key\` turns a retried POST into the same post instead of two. \`private, no-store\` is the header people forget: a feed is per user, and a shared cache that ignored that would leak one user's timeline to the next. Real APIs add pagination tokens that are opaque (not a raw timestamp), request-size limits, and a 202 path for media that is still processing.`,

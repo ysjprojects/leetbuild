@@ -69,6 +69,7 @@ accepts). \`rides.get\` / \`rides.set_status\` are provided.
         '`acks=all` means a leader failover cannot lose an acknowledged event; the idempotent producer means its own retries cannot duplicate one. (kafka-go has no idempotent mode: `RequireAll` is what it can promise.)',
       match: {
         python: {all: [/"acks"\s*:\s*"all"/, /"enable\.idempotence"\s*:\s*True/]},
+        typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
         scala: {all: [/"acks"\s*,\s*"all"/, /"enable\.idempotence"\s*,\s*"true"/]},
         cpp: {all: [/"acks"\s*,\s*"all"/, /"enable\.idempotence"\s*,\s*"true"/]},
@@ -80,6 +81,7 @@ accepts). \`rides.get\` / \`rides.set_status\` are provided.
       detail: 'The record key is the ride id, so every event of one ride shares a partition and keeps its order.',
       match: {
         python: {all: [/producer\.produce\(\s*(?:TOPIC|"trip-events")\s*,[^\n]*\bkey\s*=\s*ride_id\b/]},
+        typescript: {all: [/\.send\(\s*\{[^\n]*topic:\s*(?:TOPIC|['"]trip-events['"])[\s\S]{0,200}?\bkey:\s*rideId\b/]},
         go: {all: [/writer\.WriteMessages\(/, /Key:\s*\[\]byte\(\s*rideID\s*\)/]},
         scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*(?:Topic|"trip-events")\s*,\s*rideId\s*,/]},
         cpp: {
@@ -96,6 +98,7 @@ accepts). \`rides.get\` / \`rides.set_status\` are provided.
         'Offsets are committed explicitly, after the status write — not on a timer that cannot know whether the write happened.',
       match: {
         python: {all: [/"enable\.auto\.commit"\s*:\s*False/]},
+        typescript: {all: [/autoCommit:\s*false/]},
         go: {all: [/reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
         scala: {all: [/"enable\.auto\.commit"\s*,\s*"false"/]},
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/]},
@@ -108,6 +111,7 @@ accepts). \`rides.get\` / \`rides.set_status\` are provided.
         'Ask `can_transition(current, event)` for every record; when it says no, log the record and do not write the status.',
       match: {
         python: {all: [/(?<!def )\bcan_transition\(/, /log\.\w+\(/]},
+        typescript: {all: [/(?<!function )\bcanTransition\(/, /console\.\w+\(/]},
         go: {all: [/(?<!func )\bcanTransition\(/, /log\.Printf\(/]},
         scala: {all: [/(?<!def )\bcanTransition\(/, /println\(/]},
         cpp: {all: [/\bcan_transition\(\s*(?!const\b)\w/, /std::cerr/]},
@@ -120,6 +124,7 @@ accepts). \`rides.get\` / \`rides.set_status\` are provided.
         'Commit the offset only once `set_status` ran: at-least-once, never at-most-once. A crash in between replays an event the state machine will now reject as a duplicate.',
       match: {
         python: {order: [/rides\.set_status\(/, /consumer\.commit\(/]},
+        typescript: {order: [/rides\.setStatus\(/, /\.commitOffsets\(/]},
         go: {order: [/(?<!func )\bsetStatus\(/, /reader\.CommitMessages\(/]},
         scala: {order: [/(?<!def )\bsetStatus\(/, /consumer\.commitSync\(/]},
         cpp: {order: [/\bset_status\(\s*(?!const\b)\w/, /consumer->commitSync\(/]},
@@ -250,6 +255,108 @@ def run() -> None:
             continue
         rides.set_status(ride_id, kind)
         consumer.commit(message=msg, asynchronous=False)
+`,
+    },
+    typescript: {
+      starter: `import {type EachMessagePayload, Kafka} from 'kafkajs';
+
+import {rides} from 'ride_store'; // provided: rides.get(rideId) -> Ride | null; rides.setStatus(rideId, status)
+
+export const TOPIC = 'trip-events';
+
+// event → the states it may follow; null is the state of a ride nobody has seen yet
+const TRANSITIONS: Record<string, (string | null)[]> = {
+  requested: [null],
+  matched: ['requested'],
+  started: ['matched'],
+  completed: ['started'],
+  cancelled: ['requested', 'matched'],
+};
+
+export function canTransition(current: string | null, event: string): boolean {
+  return (TRANSITIONS[event] ?? []).includes(current);
+}
+
+const kafka = new Kafka({clientId: 'dispatcher', brokers: ['kafka:9092']});
+const producer = kafka.producer(); // TODO: the idempotent producer (acks all)
+let connected: Promise<void> | null = null;
+
+export async function publishEvent(rideId: string, event: string): Promise<void> {
+  connected ??= producer.connect();
+  await connected;
+  const value = JSON.stringify({ride_id: rideId, event, ts: Date.now() / 1000});
+  // TODO: send to TOPIC with acks: -1, keyed by rideId
+  throw new Error(\`not implemented: \${value}\`);
+}
+
+const consumer = kafka.consumer({groupId: 'trip-state'});
+
+async function handle({topic, partition, message}: EachMessagePayload): Promise<void> {
+  const event = JSON.parse(message.value?.toString() ?? '{}') as {ride_id: string; event: string};
+  const rideId = event.ride_id;
+  const kind = event.event;
+  // TODO: current = status of rides.get(rideId) (null when unknown); not canTransition → log, commit, return
+  // TODO: rides.setStatus(rideId, kind), then commitOffsets this message (offset + 1) on topic/partition
+  throw new Error(\`not implemented: \${rideId} \${kind} \${topic}/\${partition}\`);
+}
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: TOPIC, fromBeginning: true});
+  await consumer.run({eachMessage: handle}); // TODO: disable auto-commit
+}
+`,
+      solution: `import {type EachMessagePayload, Kafka} from 'kafkajs';
+
+import {rides} from 'ride_store'; // provided: rides.get(rideId) -> Ride | null; rides.setStatus(rideId, status)
+
+export const TOPIC = 'trip-events';
+
+// event → the states it may follow; null is the state of a ride nobody has seen yet
+const TRANSITIONS: Record<string, (string | null)[]> = {
+  requested: [null],
+  matched: ['requested'],
+  started: ['matched'],
+  completed: ['started'],
+  cancelled: ['requested', 'matched'],
+};
+
+export function canTransition(current: string | null, event: string): boolean {
+  return (TRANSITIONS[event] ?? []).includes(current);
+}
+
+const kafka = new Kafka({clientId: 'dispatcher', brokers: ['kafka:9092']});
+const producer = kafka.producer({idempotent: true});
+let connected: Promise<void> | null = null;
+
+export async function publishEvent(rideId: string, event: string): Promise<void> {
+  connected ??= producer.connect();
+  await connected;
+  const value = JSON.stringify({ride_id: rideId, event, ts: Date.now() / 1000});
+  await producer.send({topic: TOPIC, acks: -1, messages: [{key: rideId, value}]});
+}
+
+const consumer = kafka.consumer({groupId: 'trip-state'});
+
+async function handle({topic, partition, message}: EachMessagePayload): Promise<void> {
+  const event = JSON.parse(message.value?.toString() ?? '{}') as {ride_id: string; event: string};
+  const rideId = event.ride_id;
+  const kind = event.event;
+  const current = rides.get(rideId)?.status ?? null;
+  if (!canTransition(current, kind)) {
+    console.warn(\`ride \${rideId}: illegal \${current} → \${kind} at offset \${message.offset}; skipping\`);
+    await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
+    return;
+  }
+  rides.setStatus(rideId, kind);
+  await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
+}
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: TOPIC, fromBeginning: true});
+  await consumer.run({autoCommit: false, eachMessage: handle});
+}
 `,
     },
     go: {
@@ -776,6 +883,122 @@ def check_set_then_commit(ctx):
         pass
     assert store.get("r-7") is None
     assert ctx.kafka.lag("trip-state", "trip-events") == 1, "set_status failed for r-7 but its offset was committed: the event is lost (at-most-once)"
+`,
+    typescript: `import {rides} from 'ride_store';
+
+function seed(ctx, events: [string, string][]) {
+  for (const [rideId, event] of events) {
+    ctx.kafka.seed('trip-events', {key: rideId, value: JSON.stringify({ride_id: rideId, event, ts: 0})});
+  }
+}
+
+/** The learner's module plus the provided store it imported; the learner's console output is collected. */
+function consumer(ctx) {
+  const m = ctx.load('trip_events');
+  const logged: string[] = [];
+  const real = {log: console.log, info: console.info, warn: console.warn, error: console.error, debug: console.debug};
+  const capture = (...args: unknown[]) => void logged.push(args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
+  console.log = console.info = console.warn = console.error = console.debug = capture;
+  return {m, store: rides, logged, restore: () => Object.assign(console, real)};
+}
+
+export async function check_durable_producer(ctx) {
+  const {m, restore} = consumer(ctx);
+  try {
+    // The broker writes the record but its acknowledgement is lost: a non-idempotent producer's retry writes it again.
+    ctx.kafka.loseAcks('trip-events');
+    await m.publishEvent('r-42', 'requested');
+    let n = ctx.kafka.records('trip-events').length;
+    assert(n >= 1, 'publishEvent must produce one record');
+    assert.equal(n, 1, \`a lost ack made the producer write the event \${n} times: the idempotent producer makes its own retries write once\`);
+    // A leader failover right after the ack: a record acknowledged by the leader alone (acks 0 or 1) is gone.
+    await m.publishEvent('r-42', 'matched');
+    ctx.kafka.failover('trip-events');
+    n = ctx.kafka.records('trip-events').length;
+    assert.equal(n, 2, \`a leader failover lost an acknowledged event (\${n} of 2 remain): wait for all in-sync replicas (acks: -1)\`);
+  } finally {
+    restore();
+  }
+}
+
+export async function check_keyed_by_ride(ctx) {
+  const {m, restore} = consumer(ctx);
+  try {
+    await m.publishEvent('r-42', 'requested');
+    await m.publishEvent('r-42', 'matched');
+    await m.publishEvent('r-7', 'requested');
+    const produced = ctx.kafka.records('trip-events');
+    assert.equal(produced.length, 3, \`expected three records on trip-events, found \${produced.length}\`);
+    const keys = ctx.kafka.keys('trip-events');
+    assert.deepEqual(keys, ['r-42', 'r-42', 'r-7'], \`records must be keyed by ride_id, got \${JSON.stringify(keys)}\`);
+    assert.equal(produced[0].partition, produced[1].partition, "one ride's events must share a partition");
+    const first = JSON.parse(String(produced[0].value));
+    assert(first.ride_id === 'r-42' && first.event === 'requested', \`the value must be JSON with ride_id and event: \${JSON.stringify(first)}\`);
+  } finally {
+    restore();
+  }
+}
+
+export async function check_manual_commit(ctx) {
+  seed(ctx, [['r-42', 'requested'], ['r-42', 'matched']]);
+  const {m, store, restore} = consumer(ctx);
+  try {
+    await ctx.drain(m.run());
+    const consumers = ctx.kafka.consumers;
+    assert(consumers.length > 0, 'no consumer joined the trip-state group');
+    assert.equal(consumers[consumers.length - 1].autoCommit, false, 'autoCommit must be false: offsets are committed explicitly, after the status write');
+    assert(!ctx.kafka.events.some(e => e[0] === 'auto-commit'), 'auto-commit is on: offsets were committed on a timer, not after the write');
+    assert(ctx.kafka.events.some(e => e[0] === 'manual-commit'), 'no explicit commit happened');
+    assert.equal(ctx.kafka.lag('trip-state', 'trip-events'), 0, 'every applied record must be committed');
+    assert.equal(store.get('r-42')?.status, 'matched', \`after requested, matched the ride must be matched, got \${JSON.stringify(store.get('r-42'))}\`);
+  } finally {
+    restore();
+  }
+}
+
+export async function check_illegal_skipped(ctx) {
+  seed(ctx, [['r-42', 'requested'], ['r-42', 'matched'], ['r-42', 'matched'], ['r-42', 'completed'], ['r-42', 'started'], ['r-99', 'started']]);
+  const {m, store, logged, restore} = consumer(ctx);
+  try {
+    await ctx.drain(m.run());
+    const ride = store.get('r-42');
+    assert(ride !== null && ride.status === 'started', \`r-42 should be started (requested → matched → started; the duplicate matched and the early completed are illegal), got \${JSON.stringify(ride)}\`);
+    assert.equal(store.get('r-99'), null, 'started on a ride nobody has seen is illegal and must not create r-99');
+    assert.equal(ctx.kafka.lag('trip-state', 'trip-events'), 0, 'illegal events must be committed too, or the partition replays them forever');
+    assert(logged.length >= 3, \`three illegal transitions were skipped but only \${logged.length} log lines were emitted\`);
+  } finally {
+    restore();
+  }
+}
+
+export async function check_set_then_commit(ctx) {
+  seed(ctx, [['r-42', 'requested']]);
+  const {m, store, restore} = consumer(ctx);
+  try {
+    const atCommit: unknown[] = [];
+    ctx.kafka.onCommit(() => atCommit.push(store.get('r-42')));
+    await ctx.drain(m.run());
+    assert(atCommit.length > 0, 'the offset was never committed');
+    const first = atCommit[0] as {status?: string} | null;
+    assert(first !== null && first.status === 'requested', \`the commit must come after setStatus: at commit time r-42 was \${JSON.stringify(first)}\`);
+    // A failing status write must not be committed: the record has to be redelivered.
+    seed(ctx, [['r-7', 'requested']]);
+    const realSetStatus = store.setStatus.bind(store);
+    store.setStatus = (rideId: string, status: string) => {
+      if (rideId === 'r-7') throw new Error('ride store unavailable');
+      realSetStatus(rideId, status);
+    };
+    try {
+      await ctx.drain(m.run());
+    } catch {
+      // the consumer loop surfaces the store's error; what matters is what was committed
+    }
+    assert.equal(store.get('r-7'), null);
+    assert.equal(ctx.kafka.lag('trip-state', 'trip-events'), 1, 'setStatus failed for r-7 but its offset was committed: the event is lost (at-most-once)');
+  } finally {
+    restore();
+  }
+}
 `,
   },
   debrief: `The topic is the ride's history and the consumer group is the projection of it: because one ride's events share a partition, the state machine sees them in the order they happened, and because the commit follows the write, a crash replays an event instead of losing it — and the transition table turns that replay into a harmless no-op. Skipping an illegal event *and committing* is the part people get wrong: refusing to commit would block the partition forever on one bad record. Real systems send skipped records to a dead-letter topic, version the event schema, and derive several projections (billing, analytics, the rider's live screen) from the same log.`,

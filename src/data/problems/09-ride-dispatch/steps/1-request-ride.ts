@@ -54,6 +54,7 @@ returns the stored ride, or nothing.
         'Check both points against the latitude and longitude bounds before anything else and answer `400 Bad Request`.',
       match: {
         python: {all: [/\b90\b/, /\b180\b/, /status_code\s*=\s*400|HTTP_400/]},
+        typescript: {all: [/\b90\b/, /\b180\b/, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/]},
         go: {all: [/\b90\b/, /\b180\b/, /http\.StatusBadRequest|\b400\b/]},
         scala: {all: [/\b90\b/, /\b180\b/, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/\b90\b/, /\b180\b/, /status\s*=\s*400/]},
@@ -66,6 +67,7 @@ returns the stored ride, or nothing.
         'Read the `Idempotency-Key` request header; a request without one is a `400` — the server cannot dedupe what it cannot identify.',
       match: {
         python: {all: [/idempotency-key/i, /status_code\s*=\s*400|HTTP_400/]},
+        typescript: {all: [/idempotency-key/i, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/]},
         go: {all: [/Idempotency-Key/i, /http\.StatusBadRequest|\b400\b/]},
         scala: {all: [/Idempotency-Key/i, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/Idempotency-Key/i, /status\s*=\s*400/]},
@@ -83,6 +85,12 @@ returns the stored ride, or nothing.
             /\.set\((?:[^\n]*\bnx\s*=\s*True[^\n]*\bex\s*=\s*(?:IDEM_TTL_S|3600)\b|[^\n]*\bex\s*=\s*(?:IDEM_TTL_S|3600)\b[^\n]*\bnx\s*=\s*True)/,
           ],
         },
+        typescript: {
+          all: [
+            /`idem:|['"]idem:/,
+            /\.set\((?:[^\n]*['"]EX['"]\s*,\s*(?:IDEM_TTL_S|3600)\b[^\n]*['"]NX['"]|[^\n]*['"]NX['"][^\n]*['"]EX['"]\s*,\s*(?:IDEM_TTL_S|3600)\b)/,
+          ],
+        },
         go: {all: [/"idem:/, /rdb\.SetNX\([^\n]*\b(?:idemTTL|time\.Hour)\b|rdb\.SetArgs\([\s\S]{0,200}?Mode:\s*"NX"/]},
         scala: {all: [/"idem:/, /\.nx\(\)/, /\.ex\(\s*(?:IdemTtlSeconds|3600L?)\s*\)/]},
         cpp: {all: [/"idem:/, /redis\.set\([^;]*?\bkIdemTtl\b[^;]*?UpdateType::NOT_EXIST/]},
@@ -95,6 +103,7 @@ returns the stored ride, or nothing.
         'A refused SET means a replay: read the stored ride id back and answer `200`. A new ride is `202 {ride_id, status: "matching"}` — accepted, the match comes later.',
       match: {
         python: {all: [/\br\.get\(/, /status_code\s*=\s*202|HTTP_202/, /"matching"/]},
+        typescript: {all: [/\bredis\.get\(/, /code\(\s*202\s*\)|status\(\s*202\s*\)/, /['"]matching['"]/]},
         go: {all: [/rdb\.Get\(/, /http\.StatusAccepted|\b202\b/, /"matching"/]},
         scala: {all: [/jedis\.get\(/, /StatusCodes\.Accepted|\b202\b/, /"matching"/]},
         cpp: {all: [/redis\.get\(/, /status\s*=\s*202/, /"matching"/]},
@@ -107,6 +116,7 @@ returns the stored ride, or nothing.
         'When the ride store has no such id, respond `404 Not Found`; otherwise return the status and, once matched, the driver id.',
       match: {
         python: {all: [/status_code\s*=\s*404|HTTP_404/]},
+        typescript: {all: [/code\(\s*404\s*\)|status\(\s*404\s*\)|statusCode:\s*404/]},
         go: {all: [/http\.StatusNotFound|\b404\b/]},
         scala: {all: [/StatusCodes\.NotFound|\b404\b/]},
         cpp: {all: [/status\s*=\s*404/]},
@@ -221,6 +231,103 @@ def get_ride(ride_id: str) -> JSONResponse:
 
 
 # uvicorn ride_api:app --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+import {randomUUID} from 'node:crypto';
+
+import {rides, startMatching} from 'dispatch'; // provided: rides.get(rideId) -> Ride | null; startMatching(ride) records it and finds a driver
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const IDEM_TTL_S = 3600;
+
+interface Point {
+  lat: number;
+  lng: number;
+}
+
+interface RideRequest {
+  rider_id: string;
+  pickup: Point;
+  dropoff: Point;
+}
+
+app.post('/rides', async (request, reply) => {
+  const body = request.body as RideRequest;
+  const rideId = randomUUID();
+  // TODO: 400 when a lat is outside [-90, 90] or a lng outside [-180, 180]
+  // TODO: 400 when the Idempotency-Key header is missing
+  // TODO: SET idem:{key} <rideId> NX EX IDEM_TTL_S; refused → 200 with the stored ride_id
+  // TODO: new ride → startMatching(ride), 202 {ride_id, status: "matching"}
+  return reply.code(501).send({error: 'not implemented', body, rideId});
+});
+
+app.get('/rides/:ride_id', async (request, reply) => {
+  const {ride_id} = request.params as {ride_id: string};
+  // TODO: 404 when rides.get returns null, else {status, driver_id?}
+  return reply.code(501).send({error: 'not implemented', ride_id});
+});
+`,
+      solution: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+import {randomUUID} from 'node:crypto';
+
+import {rides, startMatching} from 'dispatch'; // provided: rides.get(rideId) -> Ride | null; startMatching(ride) records it and finds a driver
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const IDEM_TTL_S = 3600;
+
+interface Point {
+  lat: number;
+  lng: number;
+}
+
+interface RideRequest {
+  rider_id: string;
+  pickup: Point;
+  dropoff: Point;
+}
+
+const valid = (p: Point): boolean => -90 <= p.lat && p.lat <= 90 && -180 <= p.lng && p.lng <= 180;
+
+app.post('/rides', async (request, reply) => {
+  const body = request.body as RideRequest;
+  if (!valid(body.pickup) || !valid(body.dropoff)) {
+    return reply.code(400).send({error: 'lat must be in [-90, 90], lng in [-180, 180]'});
+  }
+  const key = request.headers['idempotency-key'];
+  if (typeof key !== 'string' || key === '') {
+    return reply.code(400).send({error: 'Idempotency-Key header is required'});
+  }
+  const rideId = randomUUID();
+  const claimed = await redis.set(\`idem:\${key}\`, rideId, 'EX', IDEM_TTL_S, 'NX');
+  if (claimed === null) {
+    return reply.code(200).send({ride_id: await redis.get(\`idem:\${key}\`), status: 'matching'});
+  }
+  startMatching({
+    ride_id: rideId,
+    rider_id: body.rider_id,
+    pickup: body.pickup,
+    dropoff: body.dropoff,
+    status: 'matching',
+  });
+  return reply.code(202).send({ride_id: rideId, status: 'matching'});
+});
+
+app.get('/rides/:ride_id', async (request, reply) => {
+  const {ride_id} = request.params as {ride_id: string};
+  const ride = rides.get(ride_id);
+  if (ride === null) return reply.code(404).send({error: 'no such ride'});
+  const out: {status?: string; driver_id?: string} = {status: ride.status};
+  if (ride.driver_id) out.driver_id = ride.driver_id;
+  return out;
+});
 `,
     },
     go: {
@@ -740,6 +847,99 @@ async def check_not_found(ctx):
         r = await c.get(f"/rides/{ride_id}")
     assert r.status_code == 200
     assert r.json().get("driver_id") == "d-7", f"once matched the body must carry driver_id, got {r.json()}"
+`,
+    typescript: `import {matching, rides} from 'dispatch';
+
+const PICKUP = {lat: 48.85, lng: 2.35};
+const DROPOFF = {lat: 48.86, lng: 2.34};
+
+function body(pickup = PICKUP, dropoff = DROPOFF) {
+  return {rider_id: 'u-1', pickup, dropoff};
+}
+
+/** The learner's app plus the provided hand-off it imported: records rides, queues matching. */
+function api(ctx) {
+  const m = ctx.load('ride_api');
+  return {c: ctx.client(m.app), m};
+}
+
+export async function check_validate(ctx) {
+  const {c} = api(ctx);
+  const headers = {'Idempotency-Key': 'k-valid'};
+  const bad: [string, unknown][] = [
+    ['pickup lat 90.5', body({lat: 90.5, lng: 2.35})],
+    ['pickup lat -91', body({lat: -91, lng: 2.35})],
+    ['dropoff lng 180.5', body(PICKUP, {lat: 48.86, lng: 180.5})],
+    ['dropoff lng -181', body(PICKUP, {lat: 48.86, lng: -181})],
+  ];
+  for (const [what, json] of bad) {
+    const r = await c.post('/rides', {json, headers});
+    assert.equal(r.status, 400, \`POST /rides with \${what} answered \${r.status}, expected 400\`);
+  }
+  assert.deepEqual(ctx.redis.keys('idem:*'), [], 'a rejected request must not touch Redis: validation comes first');
+  assert.deepEqual(matching, [], 'a rejected request must not reach startMatching');
+  const r = await c.post('/rides', {json: body({lat: 90, lng: -180}), headers});
+  assert.equal(r.status, 202, \`lat 90 / lng -180 are the bounds and valid, got \${r.status}\`);
+}
+
+export async function check_idempotency_key(ctx) {
+  const {c} = api(ctx);
+  let r = await c.post('/rides', {json: body()});
+  assert.equal(r.status, 400, \`POST /rides without Idempotency-Key answered \${r.status}, expected 400\`);
+  assert.deepEqual(matching, [], 'a request without Idempotency-Key must not start matching');
+  r = await c.post('/rides', {json: body(), headers: {'Idempotency-Key': 'k-1'}});
+  assert.equal(r.status, 202, \`POST /rides with Idempotency-Key answered \${r.status}, expected 202\`);
+}
+
+export async function check_dedupe_nx(ctx) {
+  const {c} = api(ctx);
+  ctx.redis.set('idem:k-old', 'r-existing', 'EX', 3600);
+  let r = await c.post('/rides', {json: body(), headers: {'Idempotency-Key': 'k-new'}});
+  assert.equal(r.status, 202, \`a fresh key answered \${r.status}, expected 202\`);
+  const rideId = r.json<{ride_id?: string}>().ride_id;
+  const stored = ctx.redis.get('idem:k-new');
+  assert(stored !== null, 'idem:k-new was not written: SET idem:{key} <ride_id> NX EX 3600');
+  assert.equal(stored, rideId, \`idem:k-new holds \${JSON.stringify(stored)}, not the ride id \${JSON.stringify(rideId)} the response carries\`);
+  const ttl = ctx.redis.ttl('idem:k-new');
+  assert(3500 < ttl && ttl <= 3600, \`idem:k-new has TTL \${ttl}, expected EX 3600\`);
+  r = await c.post('/rides', {json: body(), headers: {'Idempotency-Key': 'k-old'}});
+  assert.equal(ctx.redis.get('idem:k-old'), 'r-existing', 'an existing idem key was overwritten: the SET must be NX');
+  assert.equal(r.status, 200, \`a key that already exists answered \${r.status}, expected 200\`);
+  assert.equal(r.json<{ride_id?: string}>().ride_id, 'r-existing', \`the replay must carry the stored ride id, got \${r.text}\`);
+  assert.deepEqual(matching, [rideId], \`startMatching ran for \${JSON.stringify(matching)}, expected only the new ride \${JSON.stringify(rideId)}\`);
+}
+
+export async function check_replay_or_accept(ctx) {
+  const {c} = api(ctx);
+  const first = await c.post('/rides', {json: body(), headers: {'Idempotency-Key': 'k-1'}});
+  assert.equal(first.status, 202, \`a new ride answered \${first.status}, expected 202 (accepted, not matched)\`);
+  const created = first.json<{ride_id?: string; status?: string}>();
+  assert(created.ride_id, \`the 202 body must carry ride_id, got \${first.text}\`);
+  assert.equal(created.status, 'matching', \`the 202 body must say status matching, got \${first.text}\`);
+  assert.deepEqual(matching, [created.ride_id], 'startMatching must run exactly once for a new ride');
+  const again = await c.post('/rides', {json: body(), headers: {'Idempotency-Key': 'k-1'}});
+  assert.equal(again.status, 200, \`the retry answered \${again.status}, expected 200 (replayed)\`);
+  assert.equal(again.json<{ride_id?: string}>().ride_id, created.ride_id, \`the retry must return the same ride id \${JSON.stringify(created.ride_id)}, got \${again.text}\`);
+  assert.deepEqual(matching, [created.ride_id], 'the retry must not start matching a second ride');
+}
+
+export async function check_not_found(ctx) {
+  const {c} = api(ctx);
+  let r = await c.get('/rides/nope');
+  assert.equal(r.status, 404, \`GET /rides/nope answered \${r.status}, expected 404\`);
+  const created = await c.post('/rides', {json: body(), headers: {'Idempotency-Key': 'k-1'}});
+  const rideId = created.json<{ride_id: string}>().ride_id;
+  r = await c.get(\`/rides/\${rideId}\`);
+  assert.equal(r.status, 200, \`GET /rides/\${rideId} answered \${r.status}, expected 200\`);
+  let ride = r.json<{status?: string; driver_id?: string}>();
+  assert.equal(ride.status, 'matching', \`expected status matching, got \${r.text}\`);
+  assert(!ride.driver_id, 'no driver yet: driver_id must be absent');
+  rides.setDriver(rideId, 'd-7');
+  r = await c.get(\`/rides/\${rideId}\`);
+  assert.equal(r.status, 200);
+  ride = r.json();
+  assert.equal(ride.driver_id, 'd-7', \`once matched the body must carry driver_id, got \${r.text}\`);
+}
 `,
   },
   debrief: `Validation, then the idempotency claim, then the expensive work: the handler never pays for a request it will refuse, and a retry is answered from the key instead of creating a second ride. The \`202\` is honest — the ride is accepted, not matched — and the client learns the rest from \`GET /rides/{id}\`. Real APIs store the whole first response under the key (so a replay is byte-identical), answer \`409\` while the first request is still in flight, and scope keys per rider so two users cannot collide on the same string.`,

@@ -59,6 +59,12 @@ counters move. None of that belongs on the request path. Implement both halves o
         'Every stored message is one record on `message-events` whose key is the channel id, so a channel’s events are ordered on one partition.',
       match: {
         python: {all: [/producer\.produce\(\s*TOPIC/, /key\s*=\s*str\(\s*message\[["']channel_id["']\]\s*\)/]},
+        typescript: {
+          all: [
+            /producer\s*\.send\(\s*\{\s*topic:\s*TOPIC/,
+            /key:\s*message\.channel_id|key:\s*String\(\s*message\.channel_id\s*\)/,
+          ],
+        },
         go: {all: [/Topic:\s*topic/, /Key:\s*\[\]byte\(\s*msg\.ChannelID\s*\)/]},
         scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*Topic\s*,\s*message\.channelId\s*,/]},
         cpp: {
@@ -75,6 +81,7 @@ counters move. None of that belongs on the request path. Implement both halves o
         'Enqueue and return; serve delivery callbacks with `poll(0)` (or async writes) instead of flushing or blocking on an acknowledgement.',
       match: {
         python: {all: [/producer\.poll\(\s*0\s*\)/], none: [/def publish(?:(?!\ndef )[\s\S])*?producer\.flush\(/]},
+        typescript: {all: [/producer\s*\.send\([\s\S]*?\.catch\(/], none: [/await\s+producer\s*\.send\(/]},
         go: {all: [/Async:\s*true/], none: [/if err := writer\.WriteMessages/]},
         scala: {all: [/producer\.send\(\s*\w+\s*,/], none: [/\.send\([^\n]*\)\.get\(/]},
         cpp: {all: [/producer->poll\(\s*0\s*\)/], none: [/void publish(?:(?!\n\})[\s\S])*?producer->flush\(/]},
@@ -91,6 +98,13 @@ counters move. None of that belongs on the request path. Implement both halves o
             /"group\.id"\s*:\s*GROUP|"group\.id"\s*:\s*"channel-state"/,
             /subscribe\(\s*\[\s*TOPIC\s*\]\s*\)/,
             /"enable\.auto\.commit"\s*:\s*False/,
+          ],
+        },
+        typescript: {
+          all: [
+            /groupId:\s*GROUP|groupId:\s*['"]channel-state['"]/,
+            /subscribe\(\s*\{\s*topic:\s*TOPIC/,
+            /autoCommit:\s*false/,
           ],
         },
         go: {all: [/GroupID:\s*"channel-state"/, /Topic:\s*topic/, /reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
@@ -123,6 +137,13 @@ counters move. None of that belongs on the request path. Implement both halves o
             /r\.hincrby\(\s*key\s*,\s*"messages"\s*,\s*1\s*\)/,
           ],
         },
+        typescript: {
+          all: [
+            /`channel:\$\{/,
+            /redis\.hset\(\s*key\s*,\s*['"]last_message_id['"]\s*,/,
+            /redis\.hincrby\(\s*key\s*,\s*['"]messages['"]\s*,\s*1\s*\)/,
+          ],
+        },
         go: {
           all: [
             /"channel:"\s*\+/,
@@ -152,6 +173,7 @@ counters move. None of that belongs on the request path. Implement both halves o
       detail: 'The offset is committed only once the hash has been updated: at-least-once, never at-most-once.',
       match: {
         python: {order: [/r\.hincrby\(/, /consumer\.commit\(/]},
+        typescript: {order: [/redis\.hincrby\(/, /consumer\.commitOffsets\(/]},
         go: {order: [/rdb\.HIncrBy\(/, /reader\.CommitMessages\(/]},
         scala: {order: [/jedis\.hincrBy\(/, /consumer\.commitSync\(/]},
         cpp: {order: [/redis\.hincrby\(/, /consumer->commitSync\(/]},
@@ -285,6 +307,140 @@ def run() -> None:
             continue
         apply(event)
         consumer.commit(message=msg, asynchronous=False)  # after the write: at-least-once
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+import {type EachMessagePayload, Kafka} from 'kafkajs';
+
+import type {StoredMessage} from './post_message'; // built in step 1: what store_message returns
+
+export const TOPIC = 'message-events';
+export const GROUP = 'channel-state';
+
+const kafka = new Kafka({clientId: 'messages-api', brokers: ['kafka:9092']});
+const producer = kafka.producer({idempotent: true}); // acks all
+const ready = producer.connect();
+const consumer = kafka.consumer({groupId: GROUP});
+const redis = new Redis({host: 'redis', port: 6379});
+
+export interface MessageEvent {
+  type: 'message.created';
+  channel_id: string;
+  id: string;
+  author_id: string;
+  content: string;
+}
+
+function on_delivery(key: string, err: Error): void {
+  console.error(\`message event \${key} not delivered: \${err.message}\`);
+}
+
+/** One message.created event per stored message (what store_message returns), keyed by the channel. */
+export async function publish(message: StoredMessage): Promise<void> {
+  const event: MessageEvent = {
+    type: 'message.created',
+    channel_id: message.channel_id,
+    id: message.id,
+    author_id: message.author_id,
+    content: message.content,
+  };
+  await ready;
+  // TODO: producer.send to TOPIC keyed by message.channel_id, failures to on_delivery through .catch; never await the broker here
+  throw new Error('not implemented');
+}
+
+/** Moves the channel's state in Redis for one message.created event. */
+export async function apply(event: MessageEvent): Promise<void> {
+  // TODO: key = \`channel:\${channel_id}\`; HSET key last_message_id <id>; HINCRBY key messages 1
+  throw new Error('not implemented');
+}
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: TOPIC, fromBeginning: true});
+  await consumer.run({
+    // TODO: disable auto-commit
+    eachMessage: async ({topic, partition, message}: EachMessagePayload) => {
+      // TODO: parse JSON; skip + commit anything that is not a message.created with channel_id and id
+      // TODO: apply(event), then commit offset + 1 of this message
+      throw new Error('not implemented');
+    },
+  });
+}
+`,
+      solution: `import Redis from 'ioredis';
+import {type EachMessagePayload, Kafka} from 'kafkajs';
+
+import type {StoredMessage} from './post_message'; // built in step 1: what store_message returns
+
+export const TOPIC = 'message-events';
+export const GROUP = 'channel-state';
+
+const kafka = new Kafka({clientId: 'messages-api', brokers: ['kafka:9092']});
+const producer = kafka.producer({idempotent: true}); // acks all
+const ready = producer.connect();
+const consumer = kafka.consumer({groupId: GROUP});
+const redis = new Redis({host: 'redis', port: 6379});
+
+export interface MessageEvent {
+  type: 'message.created';
+  channel_id: string;
+  id: string;
+  author_id: string;
+  content: string;
+}
+
+function on_delivery(key: string, err: Error): void {
+  console.error(\`message event \${key} not delivered: \${err.message}\`);
+}
+
+/** One message.created event per stored message (what store_message returns), keyed by the channel. */
+export async function publish(message: StoredMessage): Promise<void> {
+  const event: MessageEvent = {
+    type: 'message.created',
+    channel_id: message.channel_id,
+    id: message.id,
+    author_id: message.author_id,
+    content: message.content,
+  };
+  await ready;
+  // enqueue and return: the acknowledgement is the producer's business, failures reach on_delivery
+  void producer
+    .send({topic: TOPIC, messages: [{key: message.channel_id, value: JSON.stringify(event)}]})
+    .catch((err: Error) => on_delivery(message.channel_id, err));
+}
+
+/** Moves the channel's state in Redis for one message.created event. */
+export async function apply(event: MessageEvent): Promise<void> {
+  const key = \`channel:\${event.channel_id}\`;
+  await redis.hset(key, 'last_message_id', event.id);
+  await redis.hincrby(key, 'messages', 1);
+}
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: TOPIC, fromBeginning: true});
+  await consumer.run({
+    autoCommit: false,
+    eachMessage: async ({topic, partition, message}: EachMessagePayload) => {
+      const next = [{topic, partition, offset: String(Number(message.offset) + 1)}];
+      let event: MessageEvent;
+      try {
+        event = JSON.parse(message.value?.toString() ?? '') as MessageEvent;
+        if (event.type !== 'message.created' || !('channel_id' in event) || !('id' in event)) {
+          throw new Error('not a message.created event');
+        }
+      } catch {
+        console.warn(\`skipping malformed record at offset \${message.offset}\`);
+        await consumer.commitOffsets(next);
+        return;
+      }
+      await apply(event);
+      await consumer.commitOffsets(next); // after the write: at-least-once
+    },
+  });
+}
 `,
     },
     go: {
@@ -923,6 +1079,146 @@ def check_commit_after(ctx):
     assert ctx.kafka.lag("channel-state", "message-events") == 0, "malformed records must be skipped and committed, not left to replay forever"
     assert ctx.redis.keys("channel:*") == [key], f"malformed records must not touch Redis, found {ctx.redis.keys('channel:*')}"
     assert ctx.redis.hget(key, "messages") == "1", f"only the well-formed event counts, {key}.messages is {ctx.redis.hget(key, 'messages')!r}"
+`,
+    typescript: `const TOPIC = 'message-events';
+const CHANNEL = '1032000000000000001';
+const OTHER = '1032000000000000002';
+
+function event(channel: string, mid: string, content = 'hi'): string {
+  return JSON.stringify({type: 'message.created', channel_id: channel, id: mid, author_id: '7', content});
+}
+
+/** events: [channel, message id] pairs, produced in order. */
+function seed(ctx, ...events: [string, string][]): void {
+  for (const [channel, mid] of events) ctx.kafka.seed(TOPIC, {key: channel, value: event(channel, mid)});
+}
+
+/** What store_message (step 1) returns. */
+function stored(channel: string, mid: string, content = 'hi') {
+  return {id: mid, channel_id: channel, author_id: '7', content, bucket: 430};
+}
+
+/** The module, with everything it logs at warning level or above captured. */
+function module(ctx) {
+  const m = ctx.load('message_events');
+  const logged: string[] = [];
+  for (const level of ['warn', 'error'] as const) {
+    const original = console[level];
+    console[level] = (...args: unknown[]) => {
+      logged.push(args.map(String).join(' '));
+      original(...args);
+    };
+  }
+  return {m, logged};
+}
+
+const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+
+export async function check_keyed_by_channel(ctx) {
+  const {m} = module(ctx);
+  await m.publish(stored(CHANNEL, '1561000000000000001'));
+  await m.publish(stored(CHANNEL, '1561000000000000002', 'second'));
+  await m.publish(stored(OTHER, '1561000000000000003'));
+  await settle();
+  const produced = ctx.kafka.records(TOPIC);
+  assert.equal(produced.length, 3, \`three stored messages must be three records on message-events, found \${produced.length} (topics: \${JSON.stringify([...ctx.kafka.topics.keys()])})\`);
+  const keys = produced.map(r => r.key?.toString() ?? null);
+  assert.deepEqual(keys, [CHANNEL, CHANNEL, OTHER], \`records must be keyed by the channel id, got \${JSON.stringify(keys)}\`);
+  assert.equal(produced[0].partition, produced[1].partition, 'two events of one channel must land on the same partition');
+  const got = JSON.parse(produced[1].value.toString()) as Record<string, unknown>;
+  const expected = {type: 'message.created', channel_id: CHANNEL, id: '1561000000000000002', author_id: '7', content: 'second'};
+  for (const [field, value] of Object.entries(expected)) {
+    assert.equal(got[field], value, \`event.\${field} is \${JSON.stringify(got[field])}, expected \${JSON.stringify(value)}: \${JSON.stringify(got)}\`);
+  }
+}
+
+export async function check_non_blocking(ctx) {
+  const {m, logged} = module(ctx);
+  await m.publish(stored(CHANNEL, '1561000000000000001'));
+  await settle();
+  assert.equal(ctx.kafka.records(TOPIC).length, 1, 'the event must be handed to the producer');
+  ctx.kafka.stall(); // the brokers stop acknowledging, as a partitioned or overloaded cluster does
+  const started = ctx.clock.now();
+  await m.publish(stored(CHANNEL, '1561000000000000002'));
+  await m.publish(stored(CHANNEL, '1561000000000000003'));
+  const waited = (ctx.clock.now() - started) / 1000;
+  assert(waited < 0.1, \`with the broker not acknowledging, two publish calls took \${waited.toFixed(1)} s: publish waits for the broker (an awaited send on the request path), so every POST would hang with it\`);
+  ctx.kafka.resume();
+  ctx.kafka.failNext(TOPIC);
+  await m.publish(stored(CHANNEL, '1561000000000000004'));
+  await m.publish(stored(CHANNEL, '1561000000000000005'));
+  await settle();
+  assert(logged.length > 0, 'the broker failed to deliver a record and nothing was logged: publish must report delivery failures (the rejected send) through on_delivery');
+}
+
+export async function check_consumer_group(ctx) {
+  seed(ctx, [CHANNEL, '1561000000000000001'], [OTHER, '1561000000000000002'], [CHANNEL, '1561000000000000003']);
+  const records = ctx.kafka.records(TOPIC);
+  const commits: [string, Map<string, number>, Record<string, string | null>][] = [];
+  ctx.kafka.onCommit((group, offsets) =>
+    commits.push([group, new Map(offsets), Object.fromEntries([CHANNEL, OTHER].map(c => [c, ctx.redis.hget(\`channel:\${c}\`, 'messages')]))]),
+  );
+  const {m} = module(ctx);
+  await ctx.drain(m.run());
+  assert(commits.length > 0, 'no offset was ever committed: the consumer must commit what it processed');
+  const groups = [...new Set(commits.map(([group]) => group))].sort();
+  assert.deepEqual(groups, ['channel-state'], \`offsets were committed for group(s) \${JSON.stringify(groups)}, expected channel-state\`);
+  const seen: Record<string, number> = {};
+  for (const record of records) {
+    const channel = record.key.toString();
+    seen[channel] = (seen[channel] ?? 0) + 1;
+    const state = commits.find(([, offsets]) => (offsets.get(\`\${TOPIC}|\${record.partition}\`) ?? -1) > record.offset)?.[2];
+    assert(state !== undefined, \`the record at partition \${record.partition} offset \${record.offset} was processed but never committed by channel-state\`);
+    const counted = Number(state[channel] ?? 0);
+    assert(counted >= seen[channel], \`the record at partition \${record.partition} offset \${record.offset} was committed while channel:\${channel} counted \${counted} message(s), before its own event was written: commit after processing\`);
+  }
+  // A write that is slow and then fails: the record must stay uncommitted, to be redelivered.
+  const broken = '1032000000000000009';
+  ctx.redis.set(\`channel:\${broken}\`, 'not a hash'); // a corrupted key: HSET/HINCRBY fail with WRONGTYPE
+  ctx.redisAfter(\`channel:\${broken}\`, () => ctx.clock.advance(6));
+  seed(ctx, [broken, '1561000000000000009']);
+  const record = ctx.kafka.records(TOPIC).at(-1);
+  try {
+    await ctx.drain(m.run());
+  } catch {
+    // the worker crashed on the failed write; a restart would redeliver the record
+  }
+  const committed = ctx.kafka.committedOffset('channel-state', TOPIC, record.partition);
+  assert(committed === null || committed <= record.offset, \`the write for channel:\${broken} took 6 s and then failed, yet its record (partition \${record.partition} offset \${record.offset}) was committed: offsets were committed while the record was still being processed (auto-commit on a timer), so the event is lost\`);
+}
+
+export async function check_channel_state(ctx) {
+  seed(ctx, [CHANNEL, '1561000000000000001'], [OTHER, '1561000000000000002'], [CHANNEL, '1561000000000000003'], [CHANNEL, '1561000000000000005']);
+  const {m} = module(ctx);
+  await ctx.drain(m.run());
+  const key = \`channel:\${CHANNEL}\`;
+  assert.equal(ctx.redis.type(key), 'hash', \`\${key} is \${JSON.stringify(ctx.redis.type(key))}, expected a hash (keys: \${JSON.stringify(ctx.redis.keys('*'))})\`);
+  const state = ctx.redis.hgetall(key);
+  assert.equal(state.last_message_id, '1561000000000000005', \`\${key}.last_message_id is \${JSON.stringify(state.last_message_id)}, expected the newest id 1561000000000000005\`);
+  assert.equal(state.messages, '3', \`\${key}.messages is \${JSON.stringify(state.messages)}, expected 3 after three events\`);
+  const other = ctx.redis.hgetall(\`channel:\${OTHER}\`);
+  assert(other.last_message_id === '1561000000000000002' && other.messages === '1', \`channel:\${OTHER} must track its own single event, got \${JSON.stringify(other)}\`);
+}
+
+export async function check_commit_after(ctx) {
+  seed(ctx, [CHANNEL, '1561000000000000001']);
+  ctx.kafka.seed(TOPIC, {key: 'bad', value: 'not json'});
+  ctx.kafka.seed(TOPIC, {key: 'bad', value: JSON.stringify({type: 'channel.renamed', channel_id: OTHER})});
+  ctx.kafka.seed(TOPIC, {key: 'bad', value: JSON.stringify({type: 'message.created', content: 'no ids'})});
+  const record = ctx.kafka.records(TOPIC)[0];
+  const key = \`channel:\${CHANNEL}\`;
+  const atCommit: [Map<string, number>, string | null][] = [];
+  ctx.kafka.onCommit((_group, offsets) => atCommit.push([new Map(offsets), ctx.redis.hget(key, 'messages')]));
+  const {m} = module(ctx);
+  await ctx.drain(m.run());
+  assert(atCommit.length > 0, 'no offset was ever committed');
+  const covering = atCommit.filter(([offsets]) => (offsets.get(\`\${TOPIC}|\${record.partition}\`) ?? 0) > record.offset).map(([, count]) => count);
+  assert(covering.length > 0, 'the message.created record was never committed');
+  assert.equal(covering[0], '1', \`the commit must come after HINCRBY: when the record was committed the channel counted \${JSON.stringify(covering[0])} message(s)\`);
+  assert.equal(ctx.kafka.lag('channel-state', TOPIC), 0, 'malformed records must be skipped and committed, not left to replay forever');
+  assert.deepEqual(ctx.redis.keys('channel:*'), [key], \`malformed records must not touch Redis, found \${JSON.stringify(ctx.redis.keys('channel:*'))}\`);
+  assert.equal(ctx.redis.hget(key, 'messages'), '1', \`only the well-formed event counts, \${key}.messages is \${JSON.stringify(ctx.redis.hget(key, 'messages'))}\`);
+}
 `,
   },
   debrief: `The topic decouples storing a message from everything that reacts to it: the API's job ends when the row is in and the record is in the producer's buffer, and search, push and counters each become a consumer group that can fall behind, catch up or be rebuilt without touching the write path. The key is a design decision disguised as a parameter: keyed by channel, a channel's events share a partition and arrive in order, which is exactly what makes "last message id" a safe thing to overwrite. Commit-after-write is the honest guarantee for a counter in Redis: a crash between the two replays one record and over-counts by one, which the hash can tolerate and a lost event could not. Real pipelines make the counter idempotent too, by remembering the last applied id per channel and skipping anything not newer, and they size the partition count for the hottest channel rather than the average, because one World Cup final channel is one partition's worth of writes.`,

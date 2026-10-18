@@ -69,6 +69,9 @@ Implement the \`StreamTiles\` handler of **tile-stream**. The per-instance bus i
             /yield place_pb2\.Tile\(|context\.write\(\s*place_pb2\.Tile\(/,
           ],
         },
+        typescript: {
+          all: [/addService\(\s*\w+(\.\w+)*\.Place\.service/, /StreamTiles:|function streamTiles\(/, /call\.write\(/],
+        },
         go: {all: [/RegisterPlaceServer\(/, /func \(\w+ \*\w+\) StreamTiles\(/, /stream\.Send\(/]},
         scala: {all: [/PlaceGrpc\.bindService\(/, /def streamTiles\(/, /out\.onNext\(|responseObserver\.onNext\(/]},
         cpp: {all: [/RegisterService\(/, /grpc::Status StreamTiles\(/, /writer->Write\(/]},
@@ -83,6 +86,7 @@ Implement the \`StreamTiles\` handler of **tile-stream**. The per-instance bus i
         python: {
           all: [/tile_bus\.subscribe\(\)|(?<![\w.])subscribe\(\)/, /while True:|async for/, /user\s*=/, /\bts\s*=/],
         },
+        typescript: {all: [/(?<!function )subscribe\(\)/, /while\s*\(|for\s*\(;;\)/, /user:/, /\bts:/]},
         go: {all: [/(?<!func )subscribe\(\)/, /case \w+ := <-sub/, /User:/, /Ts:/]},
         scala: {all: [/(?<!def )subscribe\(\)/, /queue\.(take|poll)\(/, /while\s*\(/]},
         cpp: {all: [/(?<!Subscription )subscribe\(\)/, /sub->pop\(/, /while\s*\(/]},
@@ -95,6 +99,7 @@ Implement the \`StreamTiles\` handler of **tile-stream**. The per-instance bus i
         "Hook the call's end (`add_done_callback`, `ctx.Done()`, `setOnCancelHandler`, `IsCancelled`) and `unsubscribe` the queue from it — however the call ended.",
       match: {
         python: {all: [/add_done_callback\(|add_callback\(/, /unsubscribe\(\s*queue\s*\)/]},
+        typescript: {all: [/on\(\s*['"]cancelled['"]/, /unsubscribe\(\s*queue\s*\)/]},
         go: {all: [/ctx\.Done\(\)|Context\(\)\.Done\(\)/, /defer unsubscribe\(\s*sub\s*\)/]},
         scala: {all: [/setOnCancelHandler\(|isCancelled/, /unsubscribe\(\s*queue\s*\)/]},
         cpp: {all: [/IsCancelled\(\)/, /unsubscribe\(\s*sub\s*\)/]},
@@ -107,6 +112,7 @@ Implement the \`StreamTiles\` handler of **tile-stream**. The per-instance bus i
         'When the backlog queued for one client exceeds `MAX_LAG` (1000) the call ends with `RESOURCE_EXHAUSTED`; the server never buffers an unbounded backlog per reader.',
       match: {
         python: {all: [/qsize\(\)\s*>\s*MAX_LAG/, /StatusCode\.RESOURCE_EXHAUSTED/]},
+        typescript: {all: [/queue\.size\s*>\s*MAX_LAG/, /status\.RESOURCE_EXHAUSTED/]},
         go: {all: [/len\(\s*sub\s*\)\s*>\s*maxLag/, /codes\.ResourceExhausted/]},
         scala: {all: [/queue\.size\(?\)?\s*>\s*MaxLag/, /Status\.RESOURCE_EXHAUSTED/]},
         cpp: {all: [/sub->size\(\)\s*>\s*kMaxLag/, /StatusCode::RESOURCE_EXHAUSTED/]},
@@ -177,6 +183,93 @@ async def serve() -> None:
 
 if __name__ == "__main__":
     asyncio.run(serve())
+`,
+    },
+    typescript: {
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import {type TileQueue, subscribe, unsubscribe} from 'tile_bus'; // provided: subscribe() -> TileQueue, unsubscribe(queue)
+
+export const MAX_LAG = 1000; // tiles a client may fall behind before it is dropped
+
+interface Subscribe {
+  client: string;
+}
+
+interface Tile {
+  x: number;
+  y: number;
+  color: number;
+  user: string;
+  ts: number;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('place.proto')) as {
+  place: {Place: grpc.ServiceClientConstructor};
+};
+
+/** One server stream per connected client: every placement published on this instance, in order. */
+export async function streamTiles(call: grpc.ServerWritableStream<Subscribe, Tile>): Promise<void> {
+  // TODO: const queue: TileQueue = subscribe(); call.on('cancelled', () => unsubscribe(queue))
+  // TODO: loop: const tile = await queue.get(); queue.size > MAX_LAG → call.emit('error', {code: grpc.status.RESOURCE_EXHAUSTED, …})
+  // TODO: call.write({x, y, color, user, ts}) for every tile
+  call.emit('error', {code: grpc.status.UNIMPLEMENTED, details: 'not implemented'});
+}
+
+export const server = new grpc.Server();
+server.addService(pkg.place.Place.service, {StreamTiles: streamTiles});
+
+export function serve(): void {
+  server.bindAsync('0.0.0.0:9000', grpc.ServerCredentials.createInsecure(), () => server.start());
+}
+`,
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import {type TileQueue, subscribe, unsubscribe} from 'tile_bus'; // provided: subscribe() -> TileQueue, unsubscribe(queue)
+
+export const MAX_LAG = 1000; // tiles a client may fall behind before it is dropped
+
+interface Subscribe {
+  client: string;
+}
+
+interface Tile {
+  x: number;
+  y: number;
+  color: number;
+  user: string;
+  ts: number;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('place.proto')) as {
+  place: {Place: grpc.ServiceClientConstructor};
+};
+
+/** One server stream per connected client: every placement published on this instance, in order. */
+export async function streamTiles(call: grpc.ServerWritableStream<Subscribe, Tile>): Promise<void> {
+  const queue: TileQueue = subscribe();
+  call.on('cancelled', () => unsubscribe(queue)); // the client hung up: cancel, connection drop
+  try {
+    while (!call.cancelled) {
+      const tile = await queue.get();
+      if (queue.size > MAX_LAG) {
+        // the client is not reading: drop it, it will refetch /board
+        call.emit('error', {code: grpc.status.RESOURCE_EXHAUSTED, details: 'client too slow; reconnect and refetch /board'});
+        return;
+      }
+      call.write({x: tile.x, y: tile.y, color: tile.color, user: tile.user, ts: tile.ts});
+    }
+  } finally {
+    unsubscribe(queue); // however the call ended
+  }
+}
+
+export const server = new grpc.Server();
+server.addService(pkg.place.Place.service, {StreamTiles: streamTiles});
+
+export function serve(): void {
+  server.bindAsync('0.0.0.0:9000', grpc.ServerCredentials.createInsecure(), () => server.start());
+}
 `,
     },
     go: {
@@ -551,6 +644,141 @@ async def check_slow_client(ctx):
         raise AssertionError("a client more than MAX_LAG tiles behind must be dropped with RESOURCE_EXHAUSTED, but the stream stayed open")
     await _settle()
     assert place.bus.subscribers() == 0, f"a dropped client must be unsubscribed, the bus still has {place.bus.subscribers()} subscription(s)"
+`,
+    typescript: `import * as grpc from '@grpc/grpc-js';
+import {Kafka} from 'kafkajs';
+
+interface Tile {
+  x: number;
+  y: number;
+  color: number;
+  user: string;
+  ts: string;
+}
+
+/** Let the stream's microtasks (queue → handler → client) run to completion. */
+async function settle(): Promise<void> {
+  for (let i = 0; i < 3; i++) {
+    const {promise, resolve} = Promise.withResolvers<void>();
+    setTimeout(resolve, 0);
+    await promise;
+  }
+}
+
+/** One tile-stream instance as deployed: the learner's server, its bus fed from placements by the given pump in its own consumer group, and the real placement producer (step 3) upstream. */
+async function start(ctx) {
+  const m = ctx.load('tile_stream');
+  m.serve();
+  const bus = ctx.load('/support/tile_bus.ts');
+  const events = ctx.load('placement_events');
+  const feed = new Kafka({clientId: 'tile-stream-1', brokers: ['kafka:9092']}).consumer({groupId: 'tile-stream-1'});
+  await feed.connect();
+  await feed.subscribe({topic: 'placements', fromBeginning: true});
+  const pkg = ctx.proto('place.proto');
+  const stub = new pkg.place.Place('tile-stream:9000', grpc.credentials.createInsecure());
+  return {
+    m,
+    bus,
+    events,
+    stub,
+    /** The instance consumes everything on placements and publishes it on its bus. */
+    pump: async () => {
+      await ctx.drain(bus.pump(feed));
+      await settle();
+    },
+    placed: (): Record<string, unknown>[] => ctx.kafka.values('placements').map((v: string) => JSON.parse(v)),
+  };
+}
+
+/** An open StreamTiles call: what it received so far and how it ended (null while open). */
+async function open(stub, client = 'web') {
+  const call = stub.StreamTiles({client});
+  const got: Tile[] = [];
+  let status: {code: number; details: string} | null = null;
+  call.on('data', (tile: Tile) => got.push(tile));
+  call.on('error', () => undefined);
+  call.on('status', (s: {code: number; details: string}) => (status = s));
+  await settle();
+  assert(status === null || status.code !== grpc.status.UNAVAILABLE, 'serve() registered no StreamTiles handler');
+  return {
+    call,
+    got,
+    get status() {
+      return status;
+    },
+  };
+}
+
+const name = (code: number): string => Object.keys(grpc.status).find(k => grpc.status[k] === code) ?? String(code);
+
+export async function check_serve_stream(ctx) {
+  const place = await start(ctx);
+  const call = await open(place.stub);
+  assert.equal(call.status, null, \`a fresh StreamTiles call must stay open waiting for tiles, but it ended with \${call.status && name(call.status.code)}\`);
+  place.events.recordPlacement('ana', 3, 7, 12);
+  await place.pump();
+  const want = place.placed()[0];
+  assert.equal(call.got.length, 1, \`the client must receive the one placement published, got \${call.got.length} Tile(s)\`);
+  const got = call.got[0];
+  assert.deepEqual([got.x, got.y, got.color, got.user, Number(got.ts)], [3, 7, 12, 'ana', want.ts], \`the Tile is \${JSON.stringify(got)}, expected x=3 y=7 color=12 user='ana' ts=\${want.ts}\`);
+}
+
+export async function check_forward_order(ctx) {
+  const place = await start(ctx);
+  const call = await open(place.stub);
+  assert.equal(place.bus.subscribers(), 1, \`one open call must mean one subscription, found \${place.bus.subscribers()}\`);
+  const other = await open(place.stub, 'mobile');
+  assert.equal(place.bus.subscribers(), 2, \`two open calls must mean two subscriptions, found \${place.bus.subscribers()}\`);
+  for (const [i, user] of ['ana', 'bo', 'cy'].entries()) {
+    // three tiles on one pixel: one partition, one order
+    place.events.recordPlacement(user, 3, 7, i + 1);
+    ctx.clock.advance(1);
+  }
+  await place.pump();
+  const want = place.placed().map(e => [e.user, e.x, e.y, e.color, e.ts]);
+  for (const [stream, label] of [[call, 'web'], [other, 'mobile']] as const) {
+    const users = stream.got.map(t => t.user);
+    assert.deepEqual(users, ['ana', 'bo', 'cy'], \`client \${label} received \${JSON.stringify(users)}, expected ana, bo, cy in publish order\`);
+    const fields = stream.got.map(t => [t.user, t.x, t.y, t.color, Number(t.ts)]);
+    assert.deepEqual(fields, want, \`client \${label} received \${JSON.stringify(stream.got)}: every field of every tile must be forwarded, expected \${JSON.stringify(want)}\`);
+  }
+  assert.equal(place.bus.subscribers(), 2, \`after forwarding three tiles the bus has \${place.bus.subscribers()} subscription(s), expected still 2: subscribe once per call, not per tile\`);
+}
+
+export async function check_cancel_cleanup(ctx) {
+  const place = await start(ctx);
+  const call = await open(place.stub);
+  assert.equal(place.bus.subscribers(), 1, \`after the call opened the bus has \${place.bus.subscribers()} subscription(s), expected 1 (subscribe())\`);
+  call.call.cancel();
+  await settle();
+  const n = place.bus.subscribers();
+  assert.equal(n, 0, \`the client hung up but the bus still has \${n} subscription(s): unsubscribe from the call's cancelled event\`);
+  place.events.recordPlacement('ana', 3, 7, 12);
+  await place.pump(); // must not reach anyone, must not throw
+  const second = await open(place.stub, 'mobile');
+  assert.equal(place.bus.subscribers(), 1, 'a new call after a cancelled one subscribes afresh');
+  place.events.recordPlacement('bo', 4, 7, 1);
+  await place.pump();
+  assert.equal(second.got.length, 1, \`the new client must receive bo's tile, got \${second.got.length} Tile(s)\`);
+  assert.equal(second.got[0].user, 'bo', \`the new client must only see tiles published after it subscribed, got \${JSON.stringify(second.got[0])}\`);
+}
+
+export async function check_slow_client(ctx) {
+  const place = await start(ctx);
+  const call = await open(place.stub);
+  const lag: number = place.m.MAX_LAG;
+  // Tiles from the other place-api instances arrive in one burst while the stream server is busy.
+  for (let i = 0; i < lag; i++) place.bus.publish({user: 'ana', x: 3, y: 7, color: i % 16, ts: 1700000000000 + i});
+  await settle();
+  assert.deepEqual(call.got.map(t => Number(t.ts)), Array.from({length: lag}, (_, i) => 1700000000000 + i), 'a backlog of exactly MAX_LAG tiles is still delivered in order');
+  assert.equal(call.status, null, 'a client that caught up stays connected');
+  for (let i = 0; i < lag + 2; i++) place.bus.publish({user: 'ana', x: 3, y: 7, color: 12, ts: 1800000000000 + i});
+  await settle();
+  assert(call.status !== null, 'a client more than MAX_LAG tiles behind must be dropped with RESOURCE_EXHAUSTED, but the stream stayed open');
+  assert.equal(call.status.code, grpc.status.RESOURCE_EXHAUSTED, \`a client more than MAX_LAG tiles behind was ended with \${name(call.status.code)}, expected RESOURCE_EXHAUSTED\`);
+  await settle();
+  assert.equal(place.bus.subscribers(), 0, \`a dropped client must be unsubscribed, the bus still has \${place.bus.subscribers()} subscription(s)\`);
+}
 `,
   },
   debrief: `A server stream is the gRPC shape of "tell me everything from now on": one request, an open HTTP/2 stream, messages pushed as they happen. The handler is a loop around a queue, and the two rules around it are what make it survive at 80 000 clients: the done callback guarantees every subscription dies with its call, whatever killed it, and the lag cap turns a slow reader from a memory leak into a reconnect — cheap, because the catch-up path is a single cached \`GET /board\`. That is also why the client opens the stream before it fetches the board: a snapshot plus every change since before the snapshot is consistent, and nothing is lost in between. Reddit ran 24 websocket instances pushing 4 Gbps of tiny messages and found the boxes CPU-bound, not network-bound — per-message work, not bytes, is the cost of fan-out; real deployments batch tiles per 50 ms frame, exactly as the browser batched draws per animation frame.`,

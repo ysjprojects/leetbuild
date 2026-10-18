@@ -55,6 +55,7 @@ Implement \`hydrate(ids)\` on top of the generated stub and a Redis cache:
       detail: 'A single `MGET post:{id} …` for every id comes first; the post service is only asked afterwards.',
       match: {
         python: {all: [/f"post:\{/], order: [/\.mget\(/, /stub\.GetPosts\(/]},
+        typescript: {all: [/`post:\$\{/], order: [/\.mget\(/, /\.GetPosts\(/]},
         go: {all: [/"post:"\s*\+|"post:%s"/], order: [/\.MGet\(/, /stub\.GetPosts\(/]},
         scala: {all: [/s"post:\$/], order: [/\.mget\(/, /\.getPosts\(/]},
         cpp: {all: [/"post:"\s*\+/], order: [/\.mget\(/, /->GetPosts\(/]},
@@ -67,6 +68,10 @@ Implement \`hydrate(ids)\` on top of the generated stub and a Redis cache:
         'Build one `GetPostsRequest` whose `ids` are the cache misses; a call per id multiplies latency by the page size.',
       match: {
         python: {all: [/GetPostsRequest\(\s*ids\s*=\s*\w+/], none: [/for \w+ in \w+:\s*\n[^\n]*GetPosts\(/]},
+        typescript: {
+          all: [/GetPosts\(\s*\{\s*ids:\s*\w+/],
+          none: [/for \([^\n]*\)\s*\{?\s*\n?[^\n]*\.GetPosts\(/],
+        },
         go: {all: [/GetPostsRequest\{\s*Ids:\s*\w+/], none: [/for [^\n]*\{\s*\n[^\n]*\.GetPosts\(/]},
         scala: {
           all: [/GetPostsRequest\(\s*(ids\s*=\s*)?\w+/],
@@ -81,6 +86,7 @@ Implement \`hydrate(ids)\` on top of the generated stub and a Redis cache:
       detail: 'The RPC carries a deadline so a slow post service cannot hold the feed request open.',
       match: {
         python: {all: [/GetPosts\([^\n]*timeout\s*=/]},
+        typescript: {all: [/\bdeadline:\s*|\{\s*deadline\s*\}/]},
         go: {all: [/context\.WithTimeout\(/]},
         scala: {all: [/withDeadlineAfter\(/]},
         cpp: {all: [/set_deadline\(/]},
@@ -93,6 +99,9 @@ Implement \`hydrate(ids)\` on top of the generated stub and a Redis cache:
         'Every post the service returned is written with `SET post:{id} <json> EX 3600` through one pipeline so the next page does not miss again.',
       match: {
         python: {all: [/\.pipeline\(/, /\.set\([^\n]*ex\s*=\s*(TTL_S|3600)\s*\)|\.setex\([^\n]*(TTL_S|3600)/]},
+        typescript: {
+          all: [/\.pipeline\(/, /\.set\([^\n]*['"]EX['"]\s*,\s*(TTL_S|3600)\s*\)|\.setex\([^\n]*(TTL_S|3600)/],
+        },
         go: {all: [/\.Pipeline\(\)/, /\.Set\(\s*ctx\s*,[^\n]*,\s*(ttl|time\.Hour|3600\s*\*\s*time\.Second)\s*\)/]},
         scala: {all: [/\.pipelined\(\)/, /\.setex\([^\n]*(TtlSeconds|3600)/]},
         cpp: {all: [/\.pipeline\(/, /\.set\([^\n]*,\s*(kTtl|std::chrono::seconds[{(]\s*3600)/]},
@@ -105,6 +114,7 @@ Implement \`hydrate(ids)\` on top of the generated stub and a Redis cache:
         'Walk the input `ids`, look each up in what was found, and skip the ones that are missing — the page order comes from the timeline, not from Redis or the RPC.',
       match: {
         python: {all: [/for \w+ in ids\b/, /if \w+ in \w+/]},
+        typescript: {all: [/ids\.(filter|flatMap|map)\(|for \(const \w+ of ids\)/, /\w+ in \w+|\.has\(\s*\w+\s*\)/]},
         go: {all: [/range ids\b/, /, ok :=\s*\w+\[\s*\w+\s*\];\s*ok\b/]},
         scala: {all: [/ids\.flatMap\(|ids\.collect\b/]},
         cpp: {all: [/:\s*ids\s*\)/, /\.find\(\s*\w+\s*\)/]},
@@ -178,6 +188,117 @@ def hydrate(ids: list[str]) -> list[dict]:
             pipe.set(f"post:{post.id}", json.dumps(found[post.id]), ex=TTL_S)
         pipe.execute()
     return [found[pid] for pid in ids if pid in found]
+`,
+    },
+    typescript: {
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
+
+export const DEADLINE_MS = 800;
+export const TTL_S = 3600;
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export interface Post {
+  id: string;
+  author: string;
+  text: string;
+  media_ids: string[];
+  created_at: number;
+}
+
+/** A Post as it arrives over the wire: int64 created_at is a decimal string. */
+interface WirePost {
+  id: string;
+  author: string;
+  text: string;
+  media_ids: string[];
+  created_at: string;
+}
+
+interface PostServiceClient {
+  GetPosts(request: {ids: string[]}, options: {deadline: number}): Promise<{posts: WirePost[]}>;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('post.proto')) as unknown as {
+  feed: {PostService: new (target: string, credentials: grpc.ChannelCredentials) => PostServiceClient};
+};
+const stub = new pkg.feed.PostService('post-service:9000', grpc.credentials.createInsecure());
+
+export function toPost(post: WirePost): Post {
+  return {id: post.id, author: post.author, text: post.text, media_ids: [...post.media_ids], created_at: Number(post.created_at)};
+}
+
+/** Posts for the given ids, in the order given; ids of deleted posts are skipped. */
+export async function hydrate(ids: string[]): Promise<Post[]> {
+  if (ids.length === 0) return [];
+  // TODO: MGET post:{id} for all ids; parse hits into a map by id; collect the misses
+  // TODO: one stub.GetPosts({ids: misses}, {deadline: Date.now() + DEADLINE_MS}) when there are misses
+  // TODO: pipeline SET post:{id} json EX TTL_S for every fetched post
+  // TODO: return the found posts in the order of ids (skip missing)
+  throw new Error('not implemented');
+}
+`,
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
+
+export const DEADLINE_MS = 800;
+export const TTL_S = 3600;
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export interface Post {
+  id: string;
+  author: string;
+  text: string;
+  media_ids: string[];
+  created_at: number;
+}
+
+/** A Post as it arrives over the wire: int64 created_at is a decimal string. */
+interface WirePost {
+  id: string;
+  author: string;
+  text: string;
+  media_ids: string[];
+  created_at: string;
+}
+
+interface PostServiceClient {
+  GetPosts(request: {ids: string[]}, options: {deadline: number}): Promise<{posts: WirePost[]}>;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('post.proto')) as unknown as {
+  feed: {PostService: new (target: string, credentials: grpc.ChannelCredentials) => PostServiceClient};
+};
+const stub = new pkg.feed.PostService('post-service:9000', grpc.credentials.createInsecure());
+
+export function toPost(post: WirePost): Post {
+  return {id: post.id, author: post.author, text: post.text, media_ids: [...post.media_ids], created_at: Number(post.created_at)};
+}
+
+/** Posts for the given ids, in the order given; ids of deleted posts are skipped. */
+export async function hydrate(ids: string[]): Promise<Post[]> {
+  if (ids.length === 0) return [];
+  const cached = await redis.mget(ids.map(id => \`post:\${id}\`));
+  const found: Record<string, Post> = {};
+  cached.forEach((raw, i) => {
+    if (raw !== null) found[ids[i]] = JSON.parse(raw) as Post;
+  });
+  const misses = ids.filter(id => !(id in found));
+  if (misses.length > 0) {
+    const reply = await stub.GetPosts({ids: misses}, {deadline: Date.now() + DEADLINE_MS});
+    const pipe = redis.pipeline();
+    for (const post of reply.posts) {
+      found[post.id] = toPost(post);
+      pipe.set(\`post:\${post.id}\`, JSON.stringify(found[post.id]), 'EX', TTL_S);
+    }
+    await pipe.exec();
+  }
+  return ids.filter(id => id in found).map(id => found[id]);
+}
 `,
     },
     go: {
@@ -612,6 +733,113 @@ def check_order_kept(ctx):
     assert ids == ["c", "b", "a"], f"posts must come back in the input order with the deleted post d skipped, got {ids}"
     assert m.hydrate(["d"]) == [], "a page of only deleted posts is an empty list, not an error"
     assert m.hydrate([]) == [] and len(peer.calls) == 2, "an empty id list must not call the post service"
+`,
+    typescript: `interface Post {
+  id: string;
+  author: string;
+  text: string;
+  media_ids: string[];
+  created_at: number;
+}
+
+function post(id: string): Post {
+  return {id, author: 'ann', text: \`post \${id}\`, media_ids: [\`m-\${id}\`], created_at: 1700000000000 + id.charCodeAt(0)};
+}
+
+/** The post service: knows \`served\`, records the ids of every request; \`onCall\` runs as a request arrives. */
+function hydrator(ctx, served: string[], onCall: () => void = () => undefined) {
+  const known: Record<string, Post> = {};
+  for (const id of served) known[id] = post(id);
+  const calls: string[][] = [];
+  ctx.grpc.serve(ctx.proto('post.proto').feed.PostService.service, {
+    GetPosts(call, callback) {
+      const ids: string[] = [...call.request.ids];
+      calls.push(ids);
+      onCall();
+      callback(null, {posts: ids.filter(id => id in known).map(id => known[id])});
+    },
+  });
+  const m = ctx.load('post_hydrator');
+  return {m, calls};
+}
+
+function cache(ctx, ...ids: string[]) {
+  for (const id of ids) ctx.redis.set(\`post:\${id}\`, JSON.stringify(post(id)));
+}
+
+export async function check_mget_first(ctx) {
+  let tripsAtRpc: string[][] | null = null;
+  const {m, calls} = hydrator(ctx, ['a', 'b'], () => {
+    tripsAtRpc ??= ctx.redisRoundTrips();
+  });
+  cache(ctx, 'a');
+  let posts = await m.hydrate(['a', 'b']);
+  assert.deepStrictEqual(posts, [post('a'), post('b')], \`hydrate must return the cached post a and the fetched post b, got \${JSON.stringify(posts)}\`);
+  assert.deepStrictEqual(calls, [['b']], \`the cached post a must not be requested from the post service: GetPosts was asked for \${JSON.stringify(calls)}\`);
+  assert(tripsAtRpc !== null && tripsAtRpc.some(t => t.includes('MGET')), 'the cache must be read with one MGET before GetPosts is called');
+  const gets = ctx.redisRoundTrips().filter(t => t.includes('GET'));
+  assert.equal(gets.length, 0, \`read the cache with one MGET, not \${gets.length} GETs\`);
+  posts = await m.hydrate(['a']);
+  assert(JSON.stringify(posts) === JSON.stringify([post('a')]) && calls.length === 1, 'when every id is cached GetPosts must not be called at all');
+}
+
+export async function check_single_rpc(ctx) {
+  const {m} = hydrator(ctx, ['b', 'c', 'd']);
+  const posts = await m.hydrate(['b', 'c', 'd']);
+  assert.deepStrictEqual(posts, [post('b'), post('c'), post('d')], \`unexpected posts \${JSON.stringify(posts)}\`);
+  const calls = ctx.grpc.callsTo('GetPosts');
+  assert.equal(calls.length, 1, \`3 cache misses must be fetched with one GetPosts call, observed \${calls.length}\`);
+  assert.deepStrictEqual([...calls[0].request.ids], ['b', 'c', 'd'], \`the request must carry every missed id, got \${JSON.stringify(calls[0].request.ids)}\`);
+}
+
+export async function check_deadline(ctx) {
+  const {m} = hydrator(ctx, ['b', 'c']);
+  assert.deepStrictEqual(await m.hydrate(['b']), [post('b')]);
+  const calls = ctx.grpc.callsTo('GetPosts');
+  const call = calls[calls.length - 1];
+  assert(call.timeout !== null, 'the RPC carries no deadline');
+  assert(0.5 <= call.timeout && call.timeout <= 1.0, \`the deadline must be about 800 ms, got \${call.timeout} s\`);
+  ctx.grpc.setLatency('GetPosts', 3.0);
+  let error: {code?: number; message?: string} | null = null;
+  try {
+    await m.hydrate(['c']);
+  } catch (e) {
+    error = e;
+  }
+  assert(error !== null, 'a post service slower than the deadline must surface DEADLINE_EXCEEDED');
+  assert.equal(error.code, ctx.grpc.status.DEADLINE_EXCEEDED, \`a slow post service raised \${error.code ?? error.message}, expected DEADLINE_EXCEEDED\`);
+}
+
+export async function check_write_back(ctx) {
+  const {m, calls} = hydrator(ctx, ['b', 'c']);
+  await m.hydrate(['b', 'c']);
+  for (const id of ['b', 'c']) {
+    const raw = ctx.redis.get(\`post:\${id}\`);
+    assert(raw !== null, \`post:\${id} must be cached after it was fetched\`);
+    assert.deepStrictEqual(JSON.parse(raw), post(id), \`post:\${id} must hold the post as JSON, got \${JSON.stringify(raw)}\`);
+    const ttl = ctx.redis.ttl(\`post:\${id}\`);
+    assert(3000 < ttl && ttl <= 3600, \`post:\${id} must expire after an hour (EX 3600), its TTL is \${ttl}\`);
+  }
+  const trips = ctx.redisRoundTrips();
+  const sets = trips.filter(t => t.length === 1 && (t[0] === 'SET' || t[0] === 'SETEX'));
+  assert.equal(sets.length, 0, \`\${sets.length} SET(s) were sent one by one: write the fetched posts back through one pipeline\`);
+  const sizes = trips.filter(t => t.length > 1).map(t => t.length);
+  assert.deepStrictEqual(sizes, [2], \`expected one pipeline carrying the 2 SETs, observed pipeline command counts \${JSON.stringify(sizes)}\`);
+  await m.hydrate(['b', 'c']);
+  assert.equal(calls.length, 1, 'once written back, the next hydration of the same ids must not call GetPosts');
+  ctx.clock.advance(3601);
+  assert.equal(ctx.redis.get('post:b'), null, 'the cache entry must be gone an hour later');
+}
+
+export async function check_order_kept(ctx) {
+  const {m, calls} = hydrator(ctx, ['b']);
+  cache(ctx, 'a', 'c');
+  const posts = await m.hydrate(['d', 'c', 'b', 'a']);
+  const ids = posts.map(p => p.id);
+  assert.deepStrictEqual(ids, ['c', 'b', 'a'], \`posts must come back in the input order with the deleted post d skipped, got \${JSON.stringify(ids)}\`);
+  assert.deepStrictEqual(await m.hydrate(['d']), [], 'a page of only deleted posts is an empty list, not an error');
+  assert(JSON.stringify(await m.hydrate([])) === '[]' && calls.length === 2, 'an empty id list must not call the post service');
+}
 `,
   },
   debrief: `Hydration is where a feed's latency budget is really spent, and two decisions keep it flat: the cache is read with one \`MGET\` instead of N \`GET\`s, and the misses are fetched with one RPC instead of N. The write-back makes the cache fill itself from the long tail of pages, and the TTL bounds memory for posts nobody will ask for again. Returning in input order with missing ids skipped is what lets the timeline keep ids of deleted posts for a while without the client ever seeing a hole. Real hydrators add a per-request dedupe (the same id on two pages), negative caching for ids that keep missing, and a hedge: if the RPC exceeds a soft deadline, serve the page with the cached posts only.`,

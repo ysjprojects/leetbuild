@@ -49,6 +49,7 @@ is provided as \`store\` — \`store.exists(code)\` and \`store.save(code, url)\
       detail: 'A handler must be registered for `POST` on the `/shorten` path.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/shorten["']/]},
+        typescript: {all: [/app\.post\(\s*['"]\/shorten['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/shorten"/]},
         scala: {all: [/path\(\s*"shorten"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*"\/shorten"/]},
@@ -61,6 +62,14 @@ is provided as \`store\` — \`store.exists(code)\` and \`store.save(code, url)\
         'Parse the URL, accept only the `http` and `https` schemes, and cap the length at `MAX_URL_LEN`; answer `400 Bad Request` otherwise.',
       match: {
         python: {all: [/urlparse\(|urlsplit\(/, /\.scheme/, /MAX_URL_LEN|\b2048\b/, /status_code\s*=\s*400|HTTP_400/]},
+        typescript: {
+          all: [
+            /new URL\(/,
+            /\.protocol/,
+            /MAX_URL_LEN|\b2048\b/,
+            /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/,
+          ],
+        },
         go: {all: [/url\.Parse(RequestURI)?\(/, /\.Scheme/, /maxURLLen|\b2048\b/, /http\.StatusBadRequest|\b400\b/]},
         scala: {
           all: [/new URI\(|Uri\(/, /getScheme|\.scheme/, /MaxUrlLen|\b2048\b/, /StatusCodes\.BadRequest|\b400\b/],
@@ -74,6 +83,7 @@ is provided as \`store\` — \`store.exists(code)\` and \`store.save(code, url)\
       detail: 'A custom alias must match the provided `ALIAS_RE` (`^[A-Za-z0-9_-]{4,32}$`); otherwise `400`.',
       match: {
         python: {all: [/ALIAS_RE\.(fullmatch|match)\(/, /status_code\s*=\s*400|HTTP_400/]},
+        typescript: {all: [/ALIAS_RE\.test\(/, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/]},
         go: {all: [/aliasRe\.MatchString\(/, /http\.StatusBadRequest|\b400\b/]},
         scala: {
           all: [/AliasRe\.(matches|findFirstIn|unapplySeq)\(|matches\(\s*AliasRe/, /StatusCodes\.BadRequest|\b400\b/],
@@ -88,6 +98,7 @@ is provided as \`store\` — \`store.exists(code)\` and \`store.save(code, url)\
         'Ask the store whether the alias is taken (`store.exists`) and answer `409 Conflict`: the request was well-formed, the name is just not free.',
       match: {
         python: {all: [/store\.exists\(/, /status_code\s*=\s*409/]},
+        typescript: {all: [/store\.exists\(/, /code\(\s*409\s*\)|status\(\s*409\s*\)|statusCode:\s*409/]},
         go: {all: [/store\.Exists\(/, /http\.StatusConflict|\b409\b/]},
         scala: {all: [/store\.exists\(/, /StatusCodes\.Conflict|\b409\b/]},
         cpp: {all: [/store\.exists\(/, /status\s*=\s*409/]},
@@ -102,6 +113,10 @@ is provided as \`store\` — \`store.exists(code)\` and \`store.save(code, url)\
         python: {
           all: [/(?<!def )next_code\(\)/, /Location/, /short_url/],
           order: [/store\.save\(/, /status_code\s*=\s*201/],
+        },
+        typescript: {
+          all: [/keys\.nextCode\(\)/, /Location/, /short_url/],
+          order: [/store\.save\(/, /code\(\s*201\s*\)|status\(\s*201\s*\)/],
         },
         go: {
           all: [/(?<!func )nextCode\(/, /Location/, /short_url/],
@@ -224,6 +239,109 @@ def shorten(body: ShortenRequest) -> JSONResponse:
 
 
 # uvicorn shorten_api:app --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+
+export const app = Fastify();
+
+export const BASE_URL = 'https://sho.rt/';
+export const MAX_URL_LEN = 2048;
+export const ALIAS_RE = /^[A-Za-z0-9_-]{4,32}$/;
+
+/** Links table (provided). */
+export const store = {
+  async exists(code: string): Promise<boolean> {
+    throw new Error('not implemented');
+  },
+  async save(code: string, url: string): Promise<void> {
+    throw new Error('not implemented');
+  },
+};
+
+/** The key service client (provided; you build it in step 2). */
+export const keys = {
+  async nextCode(): Promise<string> {
+    throw new Error('not implemented');
+  },
+};
+
+interface ShortenRequest {
+  url?: string;
+  alias?: string | null;
+}
+
+app.post('/shorten', async (request, reply) => {
+  const body = (request.body ?? {}) as ShortenRequest;
+  const url = body.url ?? '';
+  // TODO: 400 unless the url parses (new URL) with protocol http:/https: and url.length <= MAX_URL_LEN
+  // TODO: alias given → 400 unless ALIAS_RE matches; 409 when store.exists(alias)
+  // TODO: no alias → keys.nextCode()
+  // TODO: store.save(code, url); 201 {code, short_url} with a Location header
+  return reply.code(501).send({error: 'not implemented', url});
+});
+
+// node --env-file .env dist/shorten_api.js  (TLS terminates at the edge proxy on :8443)
+`,
+      solution: `import Fastify from 'fastify';
+
+export const app = Fastify();
+
+export const BASE_URL = 'https://sho.rt/';
+export const MAX_URL_LEN = 2048;
+export const ALIAS_RE = /^[A-Za-z0-9_-]{4,32}$/;
+
+/** Links table (provided). */
+export const store = {
+  async exists(code: string): Promise<boolean> {
+    throw new Error('not implemented');
+  },
+  async save(code: string, url: string): Promise<void> {
+    throw new Error('not implemented');
+  },
+};
+
+/** The key service client (provided; you build it in step 2). */
+export const keys = {
+  async nextCode(): Promise<string> {
+    throw new Error('not implemented');
+  },
+};
+
+interface ShortenRequest {
+  url?: string;
+  alias?: string | null;
+}
+
+function validUrl(url: string): boolean {
+  if (url.length > MAX_URL_LEN) return false;
+  try {
+    const parsed = new URL(url);
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && parsed.host !== '';
+  } catch {
+    return false;
+  }
+}
+
+app.post('/shorten', async (request, reply) => {
+  const body = (request.body ?? {}) as ShortenRequest;
+  const url = body.url ?? '';
+  if (!validUrl(url)) return reply.code(400).send({error: 'url must be http(s) and at most 2048 characters'});
+  let code: string;
+  if (body.alias !== undefined && body.alias !== null) {
+    if (!ALIAS_RE.test(body.alias)) return reply.code(400).send({error: 'alias must match [A-Za-z0-9_-]{4,32}'});
+    if (await store.exists(body.alias)) return reply.code(409).send({error: 'alias already taken'});
+    code = body.alias;
+  } else {
+    code = await keys.nextCode();
+  }
+  await store.save(code, url);
+  const shortUrl = BASE_URL + code;
+  return reply.code(201).header('Location', shortUrl).send({code, short_url: shortUrl});
+});
+
+// node --env-file .env dist/shorten_api.js  (TLS terminates at the edge proxy on :8443)
 `,
     },
     go: {
@@ -678,6 +796,93 @@ async def check_created(ctx):
     assert body.get("code") == "g9Xc", f"the body must carry the code, got {body}"
     assert body.get("short_url") == m.BASE_URL + "g9Xc", f"short_url must be BASE_URL + code, got {body.get('short_url')!r}"
     assert r.headers.get("location") == body["short_url"], f"Location must point at the short url, got {r.headers.get('location')!r}"
+`,
+    typescript: `const URL_ = 'https://example.com/launch';
+
+/** The links table and the key service: remember what was saved, which names are taken, which codes were minted. */
+function api(ctx, taken: string[] = []) {
+  const m = ctx.load('shorten_api');
+  const takenSet = new Set(taken);
+  const saved: [string, string][] = [];
+  const existsCalls: string[] = [];
+  const codes: string[] = [];
+  m.store.exists = async (code: string) => {
+    existsCalls.push(code);
+    return takenSet.has(code);
+  };
+  m.store.save = async (code: string, url: string) => {
+    saved.push([code, url]);
+    takenSet.add(code);
+  };
+  m.keys.nextCode = async () => {
+    codes.push('g9Xc');
+    return 'g9Xc';
+  };
+  return {m, saved, existsCalls, codes};
+}
+
+export async function check_route(ctx) {
+  const {m} = api(ctx);
+  const r = await ctx.client(m.app).post('/shorten', {json: {url: URL_}});
+  assert(![404, 405].includes(r.status), \`POST /shorten answered \${r.status}: no handler is registered for it\`);
+  assert.equal(r.status, 201, \`POST /shorten with a valid url answered \${r.status}, expected 201\`);
+}
+
+export async function check_validate_url(ctx) {
+  const {m, saved, codes} = api(ctx);
+  const c = ctx.client(m.app);
+  for (const bad of ['ftp://example.com/file', 'example.com/no-scheme', 'javascript:alert(1)', '']) {
+    const r = await c.post('/shorten', {json: {url: bad}});
+    assert.equal(r.status, 400, \`url \${JSON.stringify(bad)} is not http(s): expected 400, got \${r.status}\`);
+  }
+  const tooLong = 'https://example.com/' + 'a'.repeat(2049 - 'https://example.com/'.length);
+  let r = await c.post('/shorten', {json: {url: tooLong}});
+  assert.equal(r.status, 400, \`a \${tooLong.length}-character url is over MAX_URL_LEN: expected 400, got \${r.status}\`);
+  assert(saved.length === 0 && codes.length === 0, 'a rejected url must be refused before any code is taken or anything is saved');
+  const limit = 'https://example.com/' + 'a'.repeat(2048 - 'https://example.com/'.length);
+  r = await c.post('/shorten', {json: {url: limit}});
+  assert.equal(r.status, 201, \`a url of exactly 2048 characters is allowed: expected 201, got \${r.status}\`);
+  r = await c.post('/shorten', {json: {url: 'http://example.com/plain'}});
+  assert.equal(r.status, 201, \`plain http is allowed: expected 201, got \${r.status}\`);
+}
+
+export async function check_alias_format(ctx) {
+  const {m, saved, existsCalls} = api(ctx);
+  const c = ctx.client(m.app);
+  for (const bad of ['abc', 'has space', 'a'.repeat(33), 'dots.are.out', 'sl/ash']) {
+    const r = await c.post('/shorten', {json: {url: URL_, alias: bad}});
+    assert.equal(r.status, 400, \`alias \${JSON.stringify(bad)} does not match ALIAS_RE: expected 400, got \${r.status}\`);
+  }
+  assert.deepEqual(existsCalls, [], 'a malformed alias is rejected before the store is asked whether it exists');
+  assert.deepEqual(saved, [], 'a malformed alias must not be saved');
+  const r = await c.post('/shorten', {json: {url: URL_, alias: 'launch_2026-v1'}});
+  assert.equal(r.status, 201, \`alias 'launch_2026-v1' is valid: expected 201, got \${r.status}\`);
+  assert.equal(r.json().code, 'launch_2026-v1', \`the custom alias must become the code, got \${r.text}\`);
+}
+
+export async function check_alias_taken(ctx) {
+  const {m, saved, codes} = api(ctx, ['launch']);
+  const c = ctx.client(m.app);
+  let r = await c.post('/shorten', {json: {url: URL_, alias: 'launch'}});
+  assert.equal(r.status, 409, \`alias 'launch' already exists: expected 409, got \${r.status}\`);
+  assert.deepEqual(saved, [], 'a taken alias must not be overwritten');
+  assert.deepEqual(codes, [], 'a taken alias is a client error: no code from keys.nextCode() is spent on it');
+  r = await c.post('/shorten', {json: {url: URL_, alias: 'launch2'}});
+  assert.equal(r.status, 201, \`a free alias must be accepted: expected 201, got \${r.status}\`);
+  assert(saved.some(([code, url]) => code === 'launch2' && url === URL_), \`expected ['launch2', url] to be saved, saved: \${JSON.stringify(saved)}\`);
+}
+
+export async function check_created(ctx) {
+  const {m, saved, codes} = api(ctx);
+  const r = await ctx.client(m.app).post('/shorten', {json: {url: URL_}});
+  assert.equal(r.status, 201, \`expected 201 Created, got \${r.status}\`);
+  assert.deepEqual(codes, ['g9Xc'], 'without an alias the code must come from keys.nextCode()');
+  assert.deepEqual(saved, [['g9Xc', URL_]], \`expected store.save('g9Xc', url), saved: \${JSON.stringify(saved)}\`);
+  const body = r.json();
+  assert.equal(body.code, 'g9Xc', \`the body must carry the code, got \${r.text}\`);
+  assert.equal(body.short_url, m.BASE_URL + 'g9Xc', \`short_url must be BASE_URL + code, got \${JSON.stringify(body.short_url)}\`);
+  assert.equal(r.headers['location'], body.short_url, \`Location must point at the short url, got \${JSON.stringify(r.headers['location'])}\`);
+}
 `,
   },
   debrief: `The endpoint is a funnel: free checks first (scheme, length, alias format), then one store lookup, then — only for the requests that earned it — a code and a write. The two alias failures get different codes because the client can act on them differently: a 400 means "never send that", a 409 means "pick another". Real shorteners add authentication and per-user quotas, screen the target against malware lists before saving, and return the same short link for the same URL from the same user instead of minting a new one.`,

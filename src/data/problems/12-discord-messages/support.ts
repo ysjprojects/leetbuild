@@ -57,3 +57,37 @@ db = _MessagesDb()
 __all__ = ["SCHEMA", "db"]
 `,
 };
+
+/** The TypeScript twin of `messages.db`: `messages/db.ts`, the runtime's pg pool with the schema beside it. */
+export const supportModulesTs: Record<string, string> = {
+  'messages/db.ts': `/**
+ * The messages table (provided). \`await db.execute(sql, params)\` runs one statement and returns rows
+ * as objects; \`pool\` is the node-postgres pool behind it (\`pool.connect()\` for a transaction).
+ * $1…$n placeholders.
+ *
+ * Ids are 64-bit snowflakes, wider than a JSON (or JavaScript) number: pass them as bigint or as
+ * strings, they travel as text; the numeric id columns come back as strings — \`BigInt(row.message_id)\`.
+ */
+import {Pool} from 'pg';
+
+export const SCHEMA = \`
+CREATE TABLE messages (
+    channel_id numeric(20, 0) NOT NULL,
+    bucket integer NOT NULL,
+    message_id numeric(20, 0) NOT NULL,
+    author_id numeric(20, 0) NOT NULL,
+    content text NOT NULL,
+    PRIMARY KEY (channel_id, bucket, message_id)
+);
+\`;
+
+export const pool = new Pool({connectionString: 'postgres://app@db/app'});
+
+export const db = {
+  async execute<R = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<R[]> {
+    const {rows} = await pool.query(sql, params);
+    return rows as R[];
+  },
+};
+`,
+};

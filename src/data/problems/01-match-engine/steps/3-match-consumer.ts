@@ -51,6 +51,7 @@ against the book of its symbol. \`Book\` is provided — a limit order book with
         'The consumer must use `group.id` `engine` and subscribe to `orders`; the group is what assigns each symbol’s partition to exactly one engine.',
       match: {
         python: {all: [/"group\.id"\s*:\s*"engine"/, /subscribe\(\s*\[\s*"orders"\s*\]\s*\)/]},
+        typescript: {all: [/groupId:\s*['"]engine['"]/, /subscribe\(\s*\{[^}]*topic:\s*['"]orders['"]/]},
         go: {all: [/GroupID:\s*"engine"/, /Topic:\s*"orders"/]},
         scala: {all: [/"group\.id"\s*,\s*"engine"|GROUP_ID_CONFIG\s*,\s*"engine"/, /subscribe\([^\n]*"orders"/]},
         cpp: {all: [/"group\.id"\s*,\s*"engine"/, /subscribe\([^\n]*"orders"/]},
@@ -62,6 +63,7 @@ against the book of its symbol. \`Book\` is provided — a limit order book with
       detail: 'Offsets must be committed explicitly, after the trades are out — not on a timer.',
       match: {
         python: {all: [/"enable\.auto\.commit"\s*:\s*False/]},
+        typescript: {all: [/autoCommit:\s*false/, /commitOffsets\(/]},
         go: {all: [/reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
         scala: {all: [/"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/]},
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/]},
@@ -74,6 +76,7 @@ against the book of its symbol. \`Book\` is provided — a limit order book with
         'Look up (or create) the book for `order.symbol` and let it match the order; the fills it returns are the trades.',
       match: {
         python: {all: [/books\[\s*order\.symbol\s*\]/, /\.match\(\s*order\s*\)/]},
+        typescript: {all: [/bookFor\(\s*order\.symbol\s*\)/, /\.match\(\s*order\s*\)/]},
         go: {all: [/bookFor\(\s*order\.Symbol\s*\)/, /\.Match\(\s*order\s*\)/]},
         scala: {all: [/books\.getOrElseUpdate\(\s*order\.symbol\s*,/, /\.matchOrder\(\s*order\s*\)/]},
         cpp: {all: [/books\[\s*order->symbol\s*\]/, /\.match\(\s*\*order\s*\)/]},
@@ -86,6 +89,9 @@ against the book of its symbol. \`Book\` is provided — a limit order book with
         'Every fill becomes its own record on `trades`, keyed by the symbol so a symbol’s trades stay in sequence for the market-data consumers.',
       match: {
         python: {all: [/for \w+ in fills:/, /producer\.produce\(\s*TRADES\s*,[^\n]*key\s*=\s*order\.symbol/]},
+        typescript: {
+          all: [/fills\.map\(|for \(const \w+ of fills\)/, /topic:\s*TRADES/, /key:\s*order\.symbol/],
+        },
         go: {all: [/for _, \w+ := range fills/, /Key:\s*\[\]byte\(\s*order\.Symbol\s*\)/, /trades\.WriteMessages\(/]},
         scala: {
           all: [
@@ -110,6 +116,7 @@ against the book of its symbol. \`Book\` is provided — a limit order book with
         python: {
           order: [/\.match\(\s*order\s*\)/, /producer\.produce\(\s*TRADES/, /producer\.flush\(/, /consumer\.commit\(/],
         },
+        typescript: {order: [/\.match\(\s*order\s*\)/, /await producer\.send\(/, /commitOffsets\(/]},
         go: {order: [/\.Match\(\s*order\s*\)/, /trades\.WriteMessages\(/, /reader\.CommitMessages\(/]},
         scala: {order: [/\.matchOrder\(\s*order\s*\)/, /producer\.send\(/, /\.get\(\)/, /consumer\.commitSync\(/]},
         cpp: {
@@ -207,6 +214,108 @@ def run() -> None:
             producer.produce(TRADES, key=order.symbol, value=json.dumps(asdict(fill)))
         producer.flush()  # every trade is on the broker before the offset moves
         consumer.commit(message=msg, asynchronous=False)
+`,
+    },
+    typescript: {
+      starter: `import {Kafka} from 'kafkajs';
+
+import {Book, type Order} from 'book'; // price-time priority: new Book().match(order) -> Fill[]
+
+export const TRADES = 'trades';
+
+const books = new Map<string, Book>();
+
+function bookFor(symbol: string): Book {
+  let book = books.get(symbol);
+  if (book === undefined) {
+    book = new Book();
+    books.set(symbol, book);
+  }
+  return book;
+}
+
+const kafka = new Kafka({clientId: 'engine', brokers: ['kafka:9092']});
+export const producer = kafka.producer({idempotent: true});
+export const consumer = kafka.consumer({groupId: 'engine'});
+
+export async function run(): Promise<void> {
+  await producer.connect();
+  await consumer.connect();
+  // TODO: subscribe to orders (fromBeginning); run with autoCommit: false
+  // TODO: per message: order = JSON.parse(message.value); malformed → log, commitOffsets, return
+  // TODO: fills = bookFor(order.symbol).match(order); one TRADES record per fill, keyed by order.symbol
+  // TODO: await the send (acks all), then commitOffsets this message's offset + 1
+  void bookFor;
+  throw new Error('not implemented');
+}
+`,
+      solution: `import {Kafka} from 'kafkajs';
+
+import {Book, type Order} from 'book'; // price-time priority: new Book().match(order) -> Fill[]
+
+export const TRADES = 'trades';
+
+const books = new Map<string, Book>();
+
+function bookFor(symbol: string): Book {
+  let book = books.get(symbol);
+  if (book === undefined) {
+    book = new Book();
+    books.set(symbol, book);
+  }
+  return book;
+}
+
+const kafka = new Kafka({clientId: 'engine', brokers: ['kafka:9092']});
+export const producer = kafka.producer({idempotent: true});
+export const consumer = kafka.consumer({groupId: 'engine'});
+
+function parseOrder(value: Buffer | null): Order {
+  const o = JSON.parse(value?.toString('utf8') ?? '') as Partial<Order>;
+  if (
+    typeof o !== 'object' ||
+    o === null ||
+    typeof o.order_id !== 'string' ||
+    typeof o.symbol !== 'string' ||
+    typeof o.side !== 'string' ||
+    typeof o.price !== 'number' ||
+    typeof o.qty !== 'number' ||
+    typeof o.client_order_id !== 'string'
+  ) {
+    throw new TypeError('not an order');
+  }
+  return o as Order;
+}
+
+export async function run(): Promise<void> {
+  await producer.connect();
+  await consumer.connect();
+  await consumer.subscribe({topic: 'orders', fromBeginning: true});
+  await consumer.run({
+    autoCommit: false,
+    eachMessage: async ({topic, partition, message}) => {
+      const next = [{topic, partition, offset: String(Number(message.offset) + 1)}];
+      let order: Order;
+      try {
+        order = parseOrder(message.value);
+      } catch {
+        console.warn(\`skipping malformed order at offset \${message.offset}\`);
+        await consumer.commitOffsets(next);
+        return;
+      }
+      const fills = bookFor(order.symbol).match(order);
+      if (fills.length > 0) {
+        // Resolves once every trade is acknowledged by the broker: only then may the offset move.
+        await producer.send({
+          topic: TRADES,
+          acks: -1,
+          messages: fills.map(fill => ({key: order.symbol, value: JSON.stringify(fill)})),
+        });
+      }
+      await consumer.commitOffsets(next);
+    },
+  });
+}
 `,
     },
     go: {
@@ -624,6 +733,95 @@ def check_commit_after(ctx):
     committed = next(i for i, e in enumerate(events) if i > produced and e[0] == "commit")
     assert any(e[0] == "flush" for e in events[produced:committed]), "no flush between producing the trade and committing its order: the trade could still sit in the producer buffer"
     assert ctx.kafka.lag("engine", "orders") == 0, "the malformed record must be skipped and committed so the partition does not stall"
+`,
+    typescript: `type Seed = [string, string, string, number, number];
+
+function orderJson(orderId: string, symbol: string, side: string, price: number, qty: number): string {
+  return JSON.stringify({order_id: orderId, symbol, side, price, qty, client_order_id: 'c-' + orderId});
+}
+
+function seed(ctx, ...orders: Seed[]) {
+  for (const [orderId, symbol, side, price, qty] of orders)
+    ctx.kafka.seed('orders', {key: symbol, value: orderJson(orderId, symbol, side, price, qty)});
+}
+
+/** Load the engine after seeding and drain the orders topic. */
+async function run(ctx) {
+  const m = ctx.load('match_engine');
+  await ctx.drain(m.run());
+  return m;
+}
+
+function trades(ctx): Record<string, unknown>[] {
+  return ctx.kafka.values('trades').map((v: string) => JSON.parse(v));
+}
+
+export async function check_group(ctx) {
+  seed(ctx, ['o-1', 'ACME', 'BUY', 10.05, 100]);
+  await run(ctx);
+  const subscriptions = ctx.kafka.events.filter(e => e[0] === 'subscribe');
+  assert(subscriptions.length > 0, 'the consumer never subscribed');
+  const [, group, topics] = subscriptions[subscriptions.length - 1];
+  assert.equal(group, 'engine', \`the consumer joined group \${JSON.stringify(group)}, expected engine\`);
+  assert.deepEqual(topics, ['orders'], \`the consumer subscribed to \${JSON.stringify(topics)}, expected ['orders']\`);
+  const delivered = ctx.kafka.events.filter(e => e[0] === 'deliver' && e[1] === 'engine');
+  assert(delivered.length > 0, 'group engine consumed nothing from orders');
+}
+
+export async function check_manual_commit(ctx) {
+  seed(ctx, ['o-1', 'ACME', 'BUY', 10.05, 100]);
+  await run(ctx);
+  assert(!ctx.kafka.events.some(e => e[0] === 'auto-commit'), 'offsets were auto-committed: run with autoCommit: false, the offset moves only when the engine says so');
+  assert(ctx.kafka.events.some(e => e[0] === 'manual-commit'), 'the engine never committed the offset explicitly');
+  assert.equal(ctx.kafka.lag('engine', 'orders'), 0, \`after draining, the engine still has \${ctx.kafka.lag('engine', 'orders')} uncommitted orders\`);
+}
+
+export async function check_match(ctx) {
+  seed(
+    ctx,
+    ['o-1', 'ACME', 'BUY', 10.05, 100],
+    ['o-2', 'BETA', 'SELL', 9.0, 100], // another symbol: must not cross with ACME
+    ['o-3', 'ACME', 'SELL', 10.0, 60], // crosses o-1 at the resting price
+  );
+  await run(ctx);
+  const fills = trades(ctx);
+  assert.equal(fills.length, 1, \`expected exactly one fill (ACME 60 @ 10.05), found \${fills.length} trades: \${JSON.stringify(fills)}\`);
+  const fill = fills[0];
+  assert(fill.symbol === 'ACME' && fill.qty === 60 && fill.price === 10.05, \`the fill must be 60 ACME at the resting price 10.05, got \${JSON.stringify(fill)}\`);
+  assert(fill.buy_order_id === 'o-1' && fill.sell_order_id === 'o-3', \`the fill must name o-1 (buy) and o-3 (sell), got \${JSON.stringify(fill)}\`);
+}
+
+export async function check_trades(ctx) {
+  seed(
+    ctx,
+    ['o-1', 'ACME', 'SELL', 10.05, 50],
+    ['o-2', 'ACME', 'SELL', 10.06, 50],
+    ['o-3', 'ACME', 'BUY', 10.1, 80], // fills 50 @ 10.05 then 30 @ 10.06
+  );
+  await run(ctx);
+  const records = ctx.kafka.records('trades');
+  assert.equal(records.length, 2, \`two fills must become two trades records, found \${records.length}\`);
+  const keys = ctx.kafka.keys('trades');
+  assert(keys.every(k => k === 'ACME'), \`trades must be keyed by the symbol, got \${JSON.stringify(keys)}\`);
+  assert.equal(records[0].partition, records[1].partition, "one symbol's trades must stay on one partition");
+  const fills = trades(ctx).map(t => [t.price, t.qty]);
+  assert.deepEqual(fills, [[10.05, 50], [10.06, 30]], \`expected fills [[10.05, 50], [10.06, 30]] in price-time order, got \${JSON.stringify(fills)}\`);
+}
+
+export async function check_commit_after(ctx) {
+  seed(ctx, ['o-1', 'ACME', 'BUY', 10.05, 100], ['o-2', 'ACME', 'SELL', 10.0, 40]);
+  ctx.kafka.seed('orders', {key: 'ACME', value: 'this is not an order'});
+  // The trades topic's leader is slow to acknowledge: a trade is on the broker only once the send resolved.
+  ctx.kafka.stall('trades', 0.2);
+  const seen: number[] = []; // trades on the broker at the moment of each commit
+  ctx.kafka.onCommit(() => seen.push(ctx.kafka.records('trades').length));
+  const m = ctx.load('match_engine');
+  await ctx.drain(m.run());
+  assert.equal(seen.length, 3, \`expected one commit per record (two orders and one malformed), found \${seen.length}\`);
+  assert.equal(seen[1], 1, "the offset of the crossing order was committed while its trade was still waiting for the broker's acknowledgement: await the send before committing");
+  assert.equal(trades(ctx).length, 1, \`expected one fill, found \${trades(ctx).length}\`);
+  assert.equal(ctx.kafka.lag('engine', 'orders'), 0, 'the malformed record must be skipped and committed so the partition does not stall');
+}
 `,
   },
   debrief: `The consumer group turns the partition key into ownership: whoever holds the \`ACME\` partition holds the \`ACME\` book, so the hottest structure in the system runs single-threaded with no lock. Producing the trades before committing keeps the offset honest — but with an in-memory book, a replay is not idempotent, which is the gap that separates this exercise from a real engine. Real engines close it by making the book a pure function of the sequenced input: on restart they rebuild from a snapshot plus the log (the commit is just a bookmark), and they deduplicate by sequence number so a replayed order is recognised, not re-matched. Add to that a warm standby consuming the same partition a few messages behind, and you have the failover story of every exchange.`,

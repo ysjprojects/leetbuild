@@ -61,6 +61,7 @@ several relays can run without publishing the same row.
         '`acks=all` means a leader failover cannot lose an acknowledged record; the idempotent producer means the client-side retries that `acks=all` makes likely cannot duplicate one. (kafka-go has no idempotent mode: `RequireAll` is what it can promise.)',
       match: {
         python: {all: [/"acks"\s*:\s*"all"/, /"enable\.idempotence"\s*:\s*True/]},
+        typescript: {all: [/\.producer\(\{[^}\n]*idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
         scala: {all: [/"acks"\s*,\s*"all"/, /"enable\.idempotence"\s*,\s*"true"/]},
         cpp: {all: [/"acks"\s*,\s*"all"/, /"enable\.idempotence"\s*,\s*"true"/]},
@@ -78,6 +79,7 @@ several relays can run without publishing the same row.
             /producer\.produce\(\s*topic\s*,[^\n]*\bvalue\s*=\s*payload\b|producer\.produce\(\s*topic\s*,\s*payload\b/,
           ],
         },
+        typescript: {all: [/topic:\s*\w+\.topic/, /key:\s*\w+\.key/, /value:\s*\w+\.payload/]},
         go: {
           all: [
             /kafka\.Message\{[^\n]*Topic:\s*\w+\.Topic/,
@@ -96,6 +98,10 @@ several relays can run without publishing the same row.
         'Produce, then block until every acknowledgement is in, then UPDATE: marking first would turn a lost record into a lost payment.',
       match: {
         python: {order: [/producer\.produce\(/, /producer\.flush\(/, /UPDATE outbox SET sent_at/]},
+        typescript: {
+          all: [/await (producer\.send\(|Promise\.all(Settled)?\()/],
+          order: [/producer\.send\(/, /UPDATE outbox SET sent_at/],
+        },
         go: {order: [/writer\.WriteMessages\(/, /UPDATE outbox SET sent_at/], none: [/Async:\s*true/]},
         scala: {order: [/producer\.send\(/, /\.get\(\)/, /UPDATE outbox SET sent_at/]},
         cpp: {order: [/producer->produce\(/, /producer->flush\(/, /UPDATE outbox SET sent_at/]},
@@ -108,6 +114,7 @@ several relays can run without publishing the same row.
         'The UPDATE uses the ids whose delivery succeeded; a failed record leaves its row unsent so the next pass retries it.',
       match: {
         python: {all: [/UPDATE outbox SET sent_at = now\(\) WHERE id = ANY\(%s\)"\s*,\s*\(\s*\w+\s*,\s*\)/]},
+        typescript: {all: [/UPDATE outbox SET sent_at = now\(\) WHERE id = ANY\(\$1\)['"]\s*,\s*\[\s*\w+\s*\]/]},
         go: {all: [/UPDATE outbox SET sent_at = now\(\) WHERE id = ANY\(\$1\)/, /pq\.Array\(\s*\w+\s*\)/]},
         scala: {
           all: [
@@ -128,6 +135,7 @@ several relays can run without publishing the same row.
         'An empty pass sleeps briefly before the next poll; a tight loop over an empty table is a denial of service against your own database.',
       match: {
         python: {all: [/async def run\(\)(?:(?!\ndef )[\s\S])*?await asyncio\.sleep\(\s*IDLE_SLEEP_S\s*\)/]},
+        typescript: {all: [/async function run\(\)(?:(?!\nexport )[\s\S])*?await sleep\(\s*IDLE_SLEEP_MS\s*\)/]},
         go: {all: [/func run\((?:(?!\n\})[\s\S])*?time\.Sleep\(\s*idleSleep\s*\)/]},
         scala: {all: [/def run\(\)(?:(?!\n {2}def )[\s\S])*?Thread\.sleep\(\s*IdleSleepMillis\s*\)/]},
         cpp: {all: [/void run\(\)(?:(?!\n\})[\s\S])*?sleep_for\(\s*kIdleSleep\s*\)/]},
@@ -227,6 +235,124 @@ async def run() -> None:
     while True:
         if await relay_once() == 0:
             await asyncio.sleep(IDLE_SLEEP_S)  # nothing to send: do not hammer the database
+`,
+    },
+    typescript: {
+      starter: `import {Kafka} from 'kafkajs';
+import {setTimeout as sleep} from 'node:timers/promises';
+import type {PoolClient} from 'pg';
+
+import {pool} from 'payments/db'; // pool.connect() → client: BEGIN, your statements, COMMIT (ROLLBACK on error), release()
+
+export const BATCH = 100;
+export const IDLE_SLEEP_MS = 500;
+
+const kafka = new Kafka({clientId: 'outbox-relay', brokers: ['kafka:9092']});
+export const producer = kafka.producer(); // TODO: the idempotent producer (which requires acks all)
+
+export interface OutboxRow {
+  id: string;
+  topic: string;
+  key: string;
+  payload: string;
+}
+
+/** Up to BATCH unsent rows, locked for this transaction. */
+export async function fetchUnsent(client: PoolClient): Promise<OutboxRow[]> {
+  const {rows} = await client.query<OutboxRow>(
+    'SELECT id, topic, key, payload FROM outbox WHERE sent_at IS NULL ORDER BY created_at LIMIT $1 FOR UPDATE SKIP LOCKED',
+    [BATCH],
+  );
+  return rows;
+}
+
+/** Publishes one batch of outbox rows; returns how many were delivered. */
+export async function relayOnce(): Promise<number> {
+  await producer.connect();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const rows = await fetchUnsent(client);
+    // TODO: producer.send each row to its topic keyed by key with acks: -1; a resolved send is a delivered row id
+    // TODO: wait for every send to settle — the acknowledgements — BEFORE touching the table
+    // TODO: UPDATE outbox SET sent_at = now() WHERE id = ANY($1) for the delivered ids only
+    await client.query('COMMIT');
+    return 0;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function run(): Promise<void> {
+  // TODO: loop relayOnce(); sleep IDLE_SLEEP_MS when it delivered nothing
+  throw new Error('not implemented');
+}
+`,
+      solution: `import {Kafka} from 'kafkajs';
+import {setTimeout as sleep} from 'node:timers/promises';
+import type {PoolClient} from 'pg';
+
+import {pool} from 'payments/db'; // pool.connect() → client: BEGIN, your statements, COMMIT (ROLLBACK on error), release()
+
+export const BATCH = 100;
+export const IDLE_SLEEP_MS = 500;
+
+const kafka = new Kafka({clientId: 'outbox-relay', brokers: ['kafka:9092']});
+export const producer = kafka.producer({idempotent: true}); // the idempotent producer requires acks all
+
+export interface OutboxRow {
+  id: string;
+  topic: string;
+  key: string;
+  payload: string;
+}
+
+/** Up to BATCH unsent rows, locked for this transaction. */
+export async function fetchUnsent(client: PoolClient): Promise<OutboxRow[]> {
+  const {rows} = await client.query<OutboxRow>(
+    'SELECT id, topic, key, payload FROM outbox WHERE sent_at IS NULL ORDER BY created_at LIMIT $1 FOR UPDATE SKIP LOCKED',
+    [BATCH],
+  );
+  return rows;
+}
+
+/** Publishes one batch of outbox rows; returns how many were delivered. */
+export async function relayOnce(): Promise<number> {
+  await producer.connect();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const rows = await fetchUnsent(client);
+    const delivered: string[] = [];
+    for (const row of rows) {
+      try {
+        await producer.send({topic: row.topic, messages: [{key: row.key, value: row.payload}], acks: -1});
+        delivered.push(row.id); // acknowledged by every in-sync replica
+      } catch (e) {
+        console.warn(\`outbox \${row.id} not delivered: \${e instanceof Error ? e.message : String(e)}\`);
+      }
+    }
+    if (delivered.length > 0) {
+      await client.query('UPDATE outbox SET sent_at = now() WHERE id = ANY($1)', [delivered]);
+    }
+    await client.query('COMMIT');
+    return delivered.length;
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+export async function run(): Promise<void> {
+  for (;;) {
+    if ((await relayOnce()) === 0) await sleep(IDLE_SLEEP_MS); // nothing to send: do not hammer the database
+  }
+}
 `,
     },
     go: {
@@ -735,6 +861,139 @@ async def check_idle_sleep(ctx):
     await ctx.drain_async(m.run())
     assert (await _sent(ctx))["e1"] is True, "run() must relay a pending row before it sleeps"
     assert len(ctx.kafka.records("payments")) == 1
+`,
+    typescript: `const SCHEMA = \`
+CREATE TABLE outbox (
+    id text PRIMARY KEY,
+    topic text NOT NULL,
+    key text NOT NULL,
+    payload text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    sent_at timestamptz
+);
+\`;
+
+async function seed(ctx, rowId: string, merchant: string, topic = 'payments') {
+  const payload = JSON.stringify({event_id: rowId, type: 'payment.captured', merchant_id: merchant});
+  await ctx.db.execute('INSERT INTO outbox (id, topic, key, payload) VALUES ($1, $2, $3, $4)', [rowId, topic, merchant, payload]);
+}
+
+/** Reset the outbox, seed (id, merchant) rows on the payments topic, load the relay. */
+async function relay(ctx, ...rows: [string, string][]) {
+  await ctx.db.reset(SCHEMA);
+  for (const [rowId, merchant] of rows) await seed(ctx, rowId, merchant);
+  return ctx.load('outbox_relay');
+}
+
+/** row id → marked sent? */
+async function sent(ctx): Promise<Record<string, boolean>> {
+  const rows = await ctx.db.execute('SELECT id, sent_at FROM outbox ORDER BY id');
+  return Object.fromEntries(rows.map(row => [row.id, row.sent_at !== null]));
+}
+
+export async function check_durable_producer(ctx) {
+  const m = await relay(ctx, ['e1', 'm-1']);
+  ctx.kafka.loseAcks('payments', 1); // the broker wrote e1 but its acknowledgement never arrived: the producer retries
+  assert.equal(await m.relayOnce(), 1, 'relayOnce must return how many rows it delivered');
+  let records = ctx.kafka.records('payments');
+  assert.equal(records.length, 1, \`after one lost acknowledgement the topic holds \${records.length} records of e1: the producer's own retry duplicated the event — enable the idempotent producer\`);
+  await seed(ctx, 'e2', 'm-2');
+  assert.equal(await m.relayOnce(), 1);
+  ctx.kafka.failover('payments'); // the partition leader dies right after acknowledging e2
+  records = ctx.kafka.records('payments');
+  assert.equal(records.length, 2, \`a leader failover right after the acknowledgement left \${records.length} record(s) on payments: e2 was acknowledged by the leader alone — produce with acks all\`);
+}
+
+export async function check_keyed(ctx) {
+  const m = await relay(ctx, ['e1', 'm-1'], ['e2', 'm-2'], ['e3', 'm-1']);
+  await seed(ctx, 'e4', 'm-1', 'refunds');
+  assert.equal(await m.relayOnce(), 4, 'relayOnce must return how many rows it delivered');
+  const records = ctx.kafka.records('payments');
+  assert.equal(records.length, 3, \`expected 3 records on payments, found \${records.length}\`);
+  const byId = Object.fromEntries(records.map(r => [JSON.parse(String(r.value)).event_id, r]));
+  assert.deepEqual(Object.keys(byId).sort(), ['e1', 'e2', 'e3'], \`the record value must be the row's payload, got \${JSON.stringify(Object.keys(byId).sort())}\`);
+  for (const [eventId, merchant] of [['e1', 'm-1'], ['e2', 'm-2'], ['e3', 'm-1']]) {
+    const key = byId[eventId].key === null ? null : String(byId[eventId].key);
+    assert.equal(key, merchant, \`record \${eventId} is keyed \${JSON.stringify(key)}, expected the merchant id \${JSON.stringify(merchant)}\`);
+  }
+  assert.equal(byId.e1.partition, byId.e3.partition, "one merchant's events must share a partition");
+  const refunds = ctx.kafka.records('refunds');
+  assert(refunds.length === 1 && JSON.parse(String(refunds[0].value)).event_id === 'e4', 'each row goes to its own topic column');
+}
+
+export async function check_ack_before_mark(ctx) {
+  const m = await relay(ctx, ['e1', 'm-1'], ['e2', 'm-2']);
+  ctx.kafka.failNext('payments', 1); // the first produce is refused by the broker (the send rejects)
+  const delivered = await m.relayOnce();
+  const marks = await sent(ctx);
+  const marked = Object.keys(marks).filter(id => marks[id]).sort();
+  const unmarked = Object.keys(marks).filter(id => !marks[id]).sort();
+  assert.equal(marked.length, 1, \`one of two records was acknowledged; rows marked sent: \${JSON.stringify(marked)} - only acknowledged rows may be marked, and acknowledged rows must be\`);
+  assert.equal(unmarked.length, 1, \`the record whose delivery failed must stay unsent, rows unsent: \${JSON.stringify(unmarked)}\`);
+  assert.equal(delivered, 1, \`relayOnce returned \${delivered}, expected 1 delivered row\`);
+  assert.deepEqual(ctx.db.events, ['BEGIN', 'COMMIT'], \`select, produce, await the acknowledgements and update belong to one transaction; the database saw \${JSON.stringify(ctx.db.events)}\`);
+}
+
+export async function check_mark_delivered(ctx) {
+  const m = await relay(ctx, ['e1', 'm-1'], ['e2', 'm-2'], ['e3', 'm-3']);
+  assert.equal(await m.relayOnce(), 3);
+  const marks = await sent(ctx);
+  assert(Object.values(marks).every(Boolean), \`every delivered row must be marked sent_at, got \${JSON.stringify(marks)}\`);
+  assert.equal(await m.relayOnce(), 0, 'a second pass must find nothing: sent rows are not re-published');
+  assert.equal(ctx.kafka.records('payments').length, 3, 'sent rows were produced again');
+  await seed(ctx, 'e4', 'm-4');
+  ctx.kafka.failNext('payments', 1);
+  assert.equal(await m.relayOnce(), 0, 'a refused delivery is not a delivered row');
+  assert.equal((await sent(ctx)).e4, false, 'a row whose delivery failed must stay unsent for the next pass');
+  assert.equal(await m.relayOnce(), 1, 'the next pass must pick the unsent row up again');
+  assert.equal((await sent(ctx)).e4, true, 'the retried row must be marked once delivered');
+  assert.equal(ctx.kafka.records('payments').length, 4);
+}
+
+export async function check_idle_sleep(ctx) {
+  const m = await relay(ctx);
+  const start = ctx.clock.now();
+  // Resolves once the sleep budget stops the loop; a loop that never sleeps is never stopped, so bound it by its passes.
+  let stopped = false;
+  let failure: unknown = null;
+  const running = ctx.drain(m.run()).then(
+    () => (stopped = true),
+    e => {
+      failure = e;
+      stopped = true;
+    },
+  );
+  // A pass in progress is followed through the connection queue; a loop parked in a sleep (no progress across
+  // several queued queries) gets a real macrotask so the virtual clock can fire it — a loop that never sleeps
+  // would starve the clock otherwise.
+  for (let seen = -1, idle = 0; !stopped && ctx.db.events.length < 3000; ) {
+    idle = ctx.db.events.length === seen ? idle + 1 : 0;
+    seen = ctx.db.events.length;
+    if (idle < 5) {
+      await ctx.db.execute('SELECT 1');
+      continue;
+    }
+    const turn = Promise.withResolvers<void>();
+    setTimeout(turn.resolve, 0);
+    await turn.promise;
+    idle = 0;
+  }
+  if (failure !== null) throw failure;
+  assert(stopped && ctx.clock.sleeps >= 2, \`run() made \${ctx.db.events.length / 2} passes over an empty outbox without sleeping: sleep between passes instead of polling in a tight loop\`);
+  await running;
+  const elapsed = (ctx.clock.now() - start) / 1000;
+  const perSleep = elapsed / ctx.clock.sleeps;
+  assert(0.05 <= perSleep && perSleep <= 5.0, \`\${ctx.clock.sleeps} idle sleeps advanced the clock by \${elapsed.toFixed(1)} s; the idle sleep should be brief (IDLE_SLEEP_MS)\`);
+  // A row arrives: a fresh run() must relay it before it ever sleeps (no sleep resolves any more).
+  await seed(ctx, 'e1', 'm-1');
+  m.run().catch(e => (failure = e));
+  for (let i = 0; i < 100 && !(await sent(ctx)).e1 && failure === null; i++) {
+    await ctx.db.execute('SELECT 1');
+  }
+  if (failure !== null) throw failure;
+  assert.equal((await sent(ctx)).e1, true, 'run() must relay a pending row before it sleeps');
+  assert.equal(ctx.kafka.records('payments').length, 1);
+}
 `,
   },
   debrief: `The relay is where "durable" is decided: \`acks=all\` plus the idempotent producer make the broker side safe, and marking rows only after the acknowledgement makes the database side honest about what was published. Everything else is throughput: batches of 100, \`SKIP LOCKED\` so relays scale out, an idle sleep so an empty table costs nothing. Production relays add a \`sent_at\` sweeper that deletes old rows, back off on broker errors, and are usually replaced by change data capture once volume grows.`,

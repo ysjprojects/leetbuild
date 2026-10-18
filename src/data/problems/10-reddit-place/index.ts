@@ -1,13 +1,13 @@
 import {REDDIT} from '@/data/companies';
 import type {Problem} from '@/lib/types';
 
-import {protoModules} from './proto';
+import {protoFiles, protoModules} from './proto';
 import {boardEndpointStep} from './steps/1-board-endpoint';
 import {cooldownStep} from './steps/2-cooldown';
 import {placementEventsStep} from './steps/3-placement-events';
 import {tileStreamStep} from './steps/4-tile-stream';
 import {leaderboardStep} from './steps/5-leaderboard';
-import {supportModules} from './support';
+import {supportModules, supportModulesTs} from './support';
 
 /**
  * r/place, after Reddit's own write-up of the 2017 experiment: the board as one Redis string served
@@ -107,5 +107,5 @@ whiteboard or map.`,
     ],
   },
   steps: [boardEndpointStep, cooldownStep, placementEventsStep, tileStreamStep, leaderboardStep],
-  support: {python: {...protoModules, ...supportModules}},
+  support: {python: {...protoModules, ...supportModules}, typescript: {...protoFiles, ...supportModulesTs}},
 };

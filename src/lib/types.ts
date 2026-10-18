@@ -9,21 +9,28 @@
  * over (idempotency, deadlines, partition keys, TTLs…) instead of framework trivia.
  */
 
-export type Language = 'python' | 'go' | 'scala' | 'cpp';
+export type Language = 'python' | 'typescript' | 'go' | 'scala' | 'cpp';
 
-export const LANGUAGES: readonly Language[] = ['python', 'go', 'scala', 'cpp'];
+export const LANGUAGES: readonly Language[] = ['python', 'typescript', 'go', 'scala', 'cpp'];
 
-export const LANGUAGE_LABEL: Record<Language, string> = {python: 'Python', go: 'Go', scala: 'Scala', cpp: 'C++'};
+export const LANGUAGE_LABEL: Record<Language, string> = {
+  python: 'Python',
+  typescript: 'TypeScript',
+  go: 'Go',
+  scala: 'Scala',
+  cpp: 'C++',
+};
 
 /** Libraries the reference solutions use; shown next to the editor so the learner knows the target API. */
 export const LANGUAGE_STACK: Record<Language, Record<Concept, string>> = {
   python: {http: 'FastAPI + uvicorn', grpc: 'grpcio (grpc.aio)', kafka: 'confluent-kafka', redis: 'redis-py'},
+  typescript: {http: 'Fastify', grpc: '@grpc/grpc-js + proto-loader', kafka: 'kafkajs', redis: 'ioredis'},
   go: {http: 'net/http', grpc: 'google.golang.org/grpc', kafka: 'segmentio/kafka-go', redis: 'go-redis v9'},
   scala: {http: 'Pekko HTTP', grpc: 'ScalaPB + grpc-java', kafka: 'kafka-clients (Java)', redis: 'Jedis'},
   cpp: {http: 'cpp-httplib', grpc: 'grpc++', kafka: 'librdkafka (C++ API)', redis: 'redis-plus-plus'},
 };
 
-const FILE_EXTENSION: Record<Language, string> = {python: 'py', go: 'go', scala: 'scala', cpp: 'cpp'};
+const FILE_EXTENSION: Record<Language, string> = {python: 'py', typescript: 'ts', go: 'go', scala: 'scala', cpp: 'cpp'};
 
 /** File name shown on the editor tab: `order_gateway` → `order_gateway.py` / `OrderGateway.scala`. */
 export function fileName(stem: string, language: Language): string {
@@ -139,10 +146,11 @@ export interface Step {
   /** Shown once the step is accepted or revealed: why the solution is shaped this way, what real systems add. */
   debrief: string;
   /**
-   * Runtime harness per language: a Python module with one `check_<id>(ctx)` per entry of `checks`
-   * (`-` in the id becomes `_`), run against the learner's files in the browser runtime. Its results
-   * decide acceptance; the static matchers become advisory. See public/py/runtime/leetbuild/harness.py
-   * for `ctx`. Python only today.
+   * Runtime harness per language, run against the learner's files in the browser runtime; its
+   * results decide acceptance and the static matchers become advisory. Python: a module with one
+   * `check_<id>(ctx)` per entry of `checks` (`-` in the id becomes `_`), see
+   * public/py/runtime/leetbuild/harness.py for `ctx`. TypeScript: a module exporting one
+   * `check_<id>(ctx)` the same way, see src/lib/runtime/ts/harness.ts. Go, Scala and C++ have none.
    */
   harness?: Partial<Record<Language, string>>;
 }

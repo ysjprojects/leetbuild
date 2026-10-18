@@ -55,6 +55,7 @@ message Item { string id = 1; string name = 2; int64 price_cents = 3; }
       detail: 'The `/items/{id}` handler must invoke `GetItem` on the generated stub with the path id and answer JSON.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/items\/\{/, /stub\.GetItem\(/]},
+        typescript: {all: [/\.get\(\s*['"]\/items\/:/, /stub\.GetItem\(/]},
         go: {all: [/"GET \/items\/\{id\}"/, /stub\.GetItem\(/, /json\.(NewEncoder|Marshal)\(/]},
         scala: {all: [/path\(\s*"items"\s*\/\s*Segment\s*\)/, /\.getItem\(/, /application\/json/]},
         cpp: {all: [/svr\.Get\(\s*R?"\(?\/items\//, /stub->GetItem\(/, /"application\/json"/]},
@@ -67,6 +68,7 @@ message Item { string id = 1; string name = 2; int64 price_cents = 3; }
         'Every RPC must carry the 2 s deadline; without it a stalled catalog holds gateway connections open indefinitely.',
       match: {
         python: {all: [/stub\.GetItem\([\s\S]{0,200}?timeout\s*=\s*(DEADLINE_S|2(\.0)?)\b/]},
+        typescript: {all: [/stub\.GetItem\([\s\S]{0,200}?deadline:/, /DEADLINE_MS|\b2000\b/]},
         go: {all: [/context\.WithTimeout\([^\n]*(deadline|2\s*\*\s*time\.Second)\s*\)/]},
         scala: {all: [/withDeadlineAfter\(\s*(DeadlineMillis|2000|2\s*,\s*TimeUnit\.SECONDS)/]},
         cpp: {all: [/set_deadline\([^\n]*(kDeadline|std::chrono::seconds[({]\s*2\s*[)}]|2s\b)/]},
@@ -83,6 +85,13 @@ message Item { string id = 1; string name = 2; int64 price_cents = 3; }
             /stub\.GetItem\([\s\S]{0,200}?metadata\s*=/,
             /["']x-request-id["']/,
             /headers(\.get\(|\[)\s*["']x-request-id["']/i,
+          ],
+        },
+        typescript: {
+          all: [
+            /stub\.GetItem\([\s\S]{0,200}?metadata/,
+            /['"]x-request-id['"]/,
+            /headers\[\s*['"]x-request-id['"]\s*\]/i,
           ],
         },
         go: {all: [/metadata\.(AppendToOutgoingContext|NewOutgoingContext)\(/, /"x-request-id"/, /X-Request-Id/]},
@@ -102,6 +111,14 @@ message Item { string id = 1; string name = 2; int64 price_cents = 3; }
       detail: '404, 400, 504 and 503 respectively — the client must be able to tell "does not exist" from "try later".',
       match: {
         python: {
+          all: [
+            /NOT_FOUND[^\n]*\b404\b/,
+            /INVALID_ARGUMENT[^\n]*\b400\b/,
+            /DEADLINE_EXCEEDED[^\n]*\b504\b/,
+            /UNAVAILABLE[^\n]*\b503\b/,
+          ],
+        },
+        typescript: {
           all: [
             /NOT_FOUND[^\n]*\b404\b/,
             /INVALID_ARGUMENT[^\n]*\b400\b/,
@@ -142,6 +159,7 @@ message Item { string id = 1; string name = 2; int64 price_cents = 3; }
         'Unknown upstream failures (INTERNAL, UNKNOWN, PERMISSION_DENIED…) are the gateway’s `502 Bad Gateway`, never a leaked 500 with a stack trace.',
       match: {
         python: {all: [/\b502\b/]},
+        typescript: {all: [/\b502\b/]},
         go: {all: [/http\.StatusBadGateway|\b502\b/]},
         scala: {all: [/StatusCodes\.BadGateway|\b502\b/]},
         cpp: {all: [/\b502\b/]},
@@ -205,6 +223,82 @@ def get_item(item_id: str, request: Request) -> dict:
     except grpc.RpcError as e:
         raise HTTPException(status_code=HTTP_STATUS.get(e.code(), 502), detail=e.details())
     return {"id": item.id, "name": item.name, "price_cents": item.price_cents}
+`,
+    },
+    typescript: {
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Fastify from 'fastify';
+
+export const app = Fastify();
+
+export const DEADLINE_MS = 2000;
+
+interface Item {
+  id: string;
+  name: string;
+  price_cents: string; // int64 crosses the wire as a decimal string
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('catalog.proto')) as unknown as {
+  gateway: {Catalog: grpc.ServiceClientConstructor};
+};
+const stub = new pkg.gateway.Catalog('catalog:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  GetItem(request: {id: string}, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<Item>;
+};
+
+// TODO: gRPC status → HTTP status (NOT_FOUND 404, INVALID_ARGUMENT 400, DEADLINE_EXCEEDED 504, UNAVAILABLE 503)
+const HTTP_STATUS: Partial<Record<grpc.status, number>> = {};
+
+app.get('/items/:id', async (request, reply) => {
+  const {id} = request.params as {id: string};
+  // TODO: forward X-Request-Id as metadata x-request-id
+  // TODO: stub.GetItem({id}, metadata, {deadline: now + DEADLINE_MS})
+  // TODO: a ServiceError → HTTP_STATUS[code] ?? 502; success → {id, name, price_cents}
+  return reply.code(501).send();
+});
+`,
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Fastify from 'fastify';
+
+export const app = Fastify();
+
+export const DEADLINE_MS = 2000;
+
+interface Item {
+  id: string;
+  name: string;
+  price_cents: string; // int64 crosses the wire as a decimal string
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('catalog.proto')) as unknown as {
+  gateway: {Catalog: grpc.ServiceClientConstructor};
+};
+const stub = new pkg.gateway.Catalog('catalog:9000', grpc.credentials.createInsecure()) as grpc.Client & {
+  GetItem(request: {id: string}, metadata: grpc.Metadata, options: grpc.CallOptions): Promise<Item>;
+};
+
+const HTTP_STATUS: Partial<Record<grpc.status, number>> = {
+  [grpc.status.NOT_FOUND]: 404,
+  [grpc.status.INVALID_ARGUMENT]: 400,
+  [grpc.status.DEADLINE_EXCEEDED]: 504,
+  [grpc.status.UNAVAILABLE]: 503,
+};
+
+app.get('/items/:id', async (request, reply) => {
+  const {id} = request.params as {id: string};
+  const metadata = new grpc.Metadata();
+  const requestId = request.headers['x-request-id'];
+  if (typeof requestId === 'string') metadata.set('x-request-id', requestId);
+  try {
+    const item = await stub.GetItem({id}, metadata, {deadline: Date.now() + DEADLINE_MS});
+    return {id: item.id, name: item.name, price_cents: Number(item.price_cents)};
+  } catch (e) {
+    const {code, details} = e as grpc.ServiceError;
+    return reply.code(HTTP_STATUS[code] ?? 502).send({error: details});
+  }
+});
 `,
     },
     go: {
@@ -556,6 +650,86 @@ async def check_fallback_502(ctx):
         assert r.status_code == 502, f"{code.name} from the catalog answered {r.status_code}, expected 502 Bad Gateway"
     ok = await _get(ctx, m, "42")
     assert ok.status_code == 200, f"after the failures a healthy catalog must answer 200, got {ok.status_code}"
+`,
+    typescript: `/** The internal catalog: knows every id but ghost (NOT_FOUND) and bad (INVALID_ARGUMENT). */
+function proxy(ctx) {
+  const pkg = ctx.proto('catalog.proto');
+  ctx.grpc.serve(pkg.gateway.Catalog.service, {
+    GetItem(call, callback) {
+      const {id} = call.request;
+      if (id === 'ghost') return callback({code: ctx.grpc.status.NOT_FOUND, details: 'no item ghost'});
+      if (id === 'bad') return callback({code: ctx.grpc.status.INVALID_ARGUMENT, details: 'ids are numeric'});
+      callback(null, {id, name: 'Kettle', price_cents: '3499'});
+    },
+  });
+  const m = ctx.load('catalog_proxy');
+  return {m, c: ctx.client(m.app)};
+}
+
+const name = (ctx, code: number): string => Object.keys(ctx.grpc.status).find(k => ctx.grpc.status[k] === code) ?? String(code);
+
+export async function check_route_call(ctx) {
+  const {c} = proxy(ctx);
+  const r = await c.get('/items/42');
+  assert.equal(r.status, 200, \`GET /items/42 answered \${r.status}: \${r.text}\`);
+  const calls = ctx.grpc.callsTo('GetItem');
+  assert.equal(calls.length, 1, \`GET /items/42 made \${calls.length} GetItem calls, expected exactly one\`);
+  assert.equal(calls[0].request.id, '42', \`GetItem was called with id \${JSON.stringify(calls[0].request.id)}, expected the path id 42\`);
+  assert((r.headers['content-type'] ?? '').startsWith('application/json'), \`the answer must be JSON, got Content-Type \${JSON.stringify(r.headers['content-type'])}\`);
+  const body = r.json();
+  assert.deepStrictEqual(body, {id: '42', name: 'Kettle', price_cents: 3499}, \`GET /items/42 answered \${r.text}, expected the item as id, name, price_cents (price_cents is an int64: it arrives as a decimal string, answer a number)\`);
+}
+
+export async function check_deadline(ctx) {
+  const {c} = proxy(ctx);
+  const r = await c.get('/items/42');
+  assert.equal(r.status, 200, \`GET /items/42 answered \${r.status}: \${r.text}\`);
+  const call = ctx.grpc.callsTo('GetItem').at(-1);
+  assert(call.timeout !== null, 'the GetItem call carries no deadline: a stalled catalog would hold the gateway open forever');
+  assert(1.5 <= call.timeout && call.timeout <= 2.5, \`the deadline must be about 2 s, got \${call.timeout} s\`);
+  ctx.grpc.setLatency('GetItem', 5.0);
+  const slow = await c.get('/items/42');
+  assert.equal(slow.status, 504, \`a catalog slower than the deadline answered \${slow.status}, expected 504 (DEADLINE_EXCEEDED)\`);
+  assert.equal(ctx.grpc.callsTo('GetItem').length, 2, 'a timed-out call must not be retried: the client decides');
+}
+
+export async function check_request_id(ctx) {
+  const {c} = proxy(ctx);
+  const r = await c.get('/items/42', {headers: {'X-Request-Id': 'r-9'}});
+  assert.equal(r.status, 200, \`GET /items/42 answered \${r.status}: \${r.text}\`);
+  const metadata = ctx.grpc.callsTo('GetItem').at(-1).metadata.getMap();
+  assert('x-request-id' in metadata, \`the GetItem call carried metadata \${JSON.stringify(metadata)}, expected x-request-id: r-9 (metadata keys are lowercase on the wire)\`);
+  assert.equal(metadata['x-request-id'], 'r-9', \`x-request-id metadata is \${JSON.stringify(metadata['x-request-id'])}, expected the incoming X-Request-Id r-9\`);
+  const plain = await c.get('/items/42');
+  assert.equal(plain.status, 200, \`a request without X-Request-Id answered \${plain.status}, expected 200\`);
+}
+
+export async function check_status_map(ctx) {
+  const {c} = proxy(ctx);
+  let r = await c.get('/items/ghost');
+  assert.equal(r.status, 404, \`NOT_FOUND from the catalog answered \${r.status}, expected 404\`);
+  r = await c.get('/items/bad');
+  assert.equal(r.status, 400, \`INVALID_ARGUMENT from the catalog answered \${r.status}, expected 400\`);
+  ctx.grpc.fail('GetItem', ctx.grpc.status.UNAVAILABLE, 'catalog restarting', 1);
+  r = await c.get('/items/42');
+  assert.equal(r.status, 503, \`UNAVAILABLE from the catalog answered \${r.status}, expected 503\`);
+  ctx.grpc.setLatency('GetItem', 5.0);
+  r = await c.get('/items/42');
+  assert.equal(r.status, 504, \`DEADLINE_EXCEEDED answered \${r.status}, expected 504\`);
+  const calls = ctx.grpc.callsTo('GetItem').length;
+  assert.equal(calls, 4, \`the four failing requests made \${calls} GetItem calls: the gateway must not retry on the client's behalf\`);
+}
+
+export async function check_fallback_502(ctx) {
+  const {c} = proxy(ctx);
+  for (const code of [ctx.grpc.status.INTERNAL, ctx.grpc.status.PERMISSION_DENIED, ctx.grpc.status.UNKNOWN]) {
+    ctx.grpc.fail('GetItem', code, 'upstream broke', 1);
+    const r = await c.get('/items/42');
+    assert.equal(r.status, 502, \`\${name(ctx, code)} from the catalog answered \${r.status}, expected 502 Bad Gateway\`);
+  }
+  const ok = await c.get('/items/42');
+  assert.equal(ok.status, 200, \`after the failures a healthy catalog must answer 200, got \${ok.status}\`);
+}
 `,
   },
   debrief: `The proxy is a translation layer and nothing more: it turns a path into a request message, a header into metadata, and a status code into another status code. The deadline is what makes it safe to sit in front of a service you do not control, and the 502 default is what keeps upstream internals from leaking to clients. Real gateways generate this code from the proto (grpc-gateway, Envoy's gRPC-JSON transcoder), propagate the *caller's* remaining deadline instead of a fixed 2 s, and copy a whole allow-list of headers (trace context, tenant) into metadata.`,

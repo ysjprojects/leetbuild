@@ -57,6 +57,7 @@ Implement \`add_count(ns, name, delta)\`, \`get_count(ns, name)\` and \`clear_co
       detail: 'Every operation addresses `counter:{ns}:{name}`, so one namespace cannot collide with another.',
       match: {
         python: {all: [/f["']counter:\{ns\}:\{name\}["']/]},
+        typescript: {all: [/`counter:\$\{ns\}:\$\{name\}`/]},
         go: {all: [/"counter:"\s*\+\s*ns\s*\+\s*":"\s*\+\s*name|"counter:%s:%s"/]},
         scala: {all: [/s"counter:\$ns:\$name"|s"counter:\$\{ns\}:\$\{name\}"/]},
         cpp: {all: [/"counter:"\s*\+\s*ns\s*\+\s*":"\s*\+\s*name/]},
@@ -69,6 +70,7 @@ Implement \`add_count(ns, name, delta)\`, \`get_count(ns, name)\` and \`clear_co
         '`INCRBY key delta` is atomic and answers the value after the add; that reply is what `add_count` returns.',
       match: {
         python: {all: [/\.incrby\(\s*\w+\s*,\s*delta\s*\)/]},
+        typescript: {all: [/\.incrby\(\s*\w+\s*,\s*delta\s*\)/]},
         go: {all: [/\.IncrBy\(\s*ctx\s*,\s*\w+\s*,\s*delta\s*\)/]},
         scala: {all: [/\.incrBy\(\s*\w+\s*,\s*delta\s*\)/]},
         cpp: {all: [/\.incrby\(\s*\w+\s*,\s*delta\s*\)/]},
@@ -85,6 +87,11 @@ Implement \`add_count(ns, name, delta)\`, \`get_count(ns, name)\` and \`clear_co
             /\.set\(\s*\w+\s*,\s*0\s*,[^\n]*nx\s*=\s*True[^\n]*ex\s*=\s*TTL_S|\.set\(\s*\w+\s*,\s*0\s*,[^\n]*ex\s*=\s*TTL_S[^\n]*nx\s*=\s*True|\.expire\(\s*\w+\s*,\s*TTL_S\s*,\s*nx\s*=\s*True/,
           ],
         },
+        typescript: {
+          all: [
+            /\.set\(\s*\w+\s*,\s*0\s*,[^\n]*['"]NX['"][^\n]*['"]EX['"]\s*,\s*TTL_S|\.set\(\s*\w+\s*,\s*0\s*,[^\n]*['"]EX['"]\s*,\s*TTL_S[^\n]*['"]NX['"]|\.expire\(\s*\w+\s*,\s*TTL_S\s*,\s*['"]NX['"]/,
+          ],
+        },
         go: {all: [/\.SetNX\(\s*ctx\s*,\s*\w+\s*,\s*0\s*,\s*ttl\s*\)|\.ExpireNX\(\s*ctx\s*,\s*\w+\s*,\s*ttl\s*\)/]},
         scala: {all: [/\.nx\(\)/, /\.ex\(\s*TtlSeconds\s*\)|expire\(\s*\w+\s*,\s*TtlSeconds\s*,\s*ExpiryOption\.NX/]},
         cpp: {all: [/\.set\(\s*\w+\s*,\s*"0"\s*,\s*kTtl\s*,\s*sw::redis::UpdateType::NOT_EXIST\s*\)/]},
@@ -97,6 +104,7 @@ Implement \`add_count(ns, name, delta)\`, \`get_count(ns, name)\` and \`clear_co
         'Both commands go to Redis in one round trip; a plain `EXPIRE` after the add would turn a fixed lifetime into a sliding one.',
       match: {
         python: {all: [/\.pipeline\(/, /\.execute\(\)/], none: [/\.expire\(\s*\w+\s*,\s*TTL_S\s*\)/]},
+        typescript: {all: [/\.(multi|pipeline)\(\)/, /\.exec\(\)/], none: [/\.expire\(\s*\w+\s*,\s*TTL_S\s*\)/]},
         go: {
           all: [/\.(Tx)?Pipeline\(\)|\.(Tx)?Pipelined\(/, /\.Exec\(\s*ctx\s*\)/],
           none: [/\.Expire\(\s*ctx\s*,\s*\w+\s*,\s*ttl\s*\)/],
@@ -111,6 +119,7 @@ Implement \`add_count(ns, name, delta)\`, \`get_count(ns, name)\` and \`clear_co
       detail: '`get_count` converts the `GET` reply to an integer and treats nil as 0; `clear_count` deletes the key.',
       match: {
         python: {all: [/\br\.get\(/, /int\(/, /\br\.delete\(/]},
+        typescript: {all: [/\bredis\.get\(/, /Number\(|parseInt\(/, /\bredis\.del\(/]},
         go: {all: [/rdb\.Get\(/, /redis\.Nil/, /rdb\.Del\(/]},
         scala: {all: [/jedis\.get\(/, /\.toLong|getOrElse\(\s*0L?\s*\)/, /jedis\.del\(/]},
         cpp: {all: [/redis\.get\(/, /std::stoll\(|value_or\(/, /redis\.del\(/]},
@@ -173,6 +182,65 @@ def get_count(ns: str, name: str) -> int:
 
 def clear_count(ns: str, name: str) -> None:
     r.delete(key_of(ns, name))
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const TTL_S = 3600; // a best-effort counter lives an hour from its creation, however busy it is
+
+export function keyOf(ns: string, name: string): string {
+  return ''; // TODO: counter:{ns}:{name}
+}
+
+export async function addCount(ns: string, name: string, delta: number): Promise<number> {
+  const key = keyOf(ns, name);
+  // TODO: one MULTI/EXEC pipeline: SET key 0 NX EX TTL_S, then INCRBY key delta; return the INCRBY reply
+  // TODO: never EXPIRE on every add: the TTL is armed once, when the key is created
+  throw new Error('not implemented');
+}
+
+export async function getCount(ns: string, name: string): Promise<number> {
+  // TODO: GET; a missing or expired key reads as 0
+  throw new Error('not implemented');
+}
+
+export async function clearCount(ns: string, name: string): Promise<void> {
+  // TODO: DEL
+  throw new Error('not implemented');
+}
+`,
+      solution: `import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const TTL_S = 3600; // a best-effort counter lives an hour from its creation, however busy it is
+
+export function keyOf(ns: string, name: string): string {
+  return \`counter:\${ns}:\${name}\`;
+}
+
+export async function addCount(ns: string, name: string, delta: number): Promise<number> {
+  const key = keyOf(ns, name);
+  const replies = await redis
+    .multi()
+    .set(key, 0, 'EX', TTL_S, 'NX') // arms the TTL on the add that creates the key; a no-op afterwards
+    .incrby(key, delta)
+    .exec();
+  const [, count] = replies![1];
+  return Number(count);
+}
+
+export async function getCount(ns: string, name: string): Promise<number> {
+  const value = await redis.get(keyOf(ns, name));
+  return value === null ? 0 : Number(value);
+}
+
+export async function clearCount(ns: string, name: string): Promise<void> {
+  await redis.del(keyOf(ns, name));
+}
 `,
     },
     go: {
@@ -437,6 +505,77 @@ def check_get_clear(ctx):
     assert ctx.redis.exists(KEY) == 0, f"clear_count must DEL {KEY}"
     assert m.get_count("views", "trailer-7") == 0, "a cleared counter reads as 0"
     m.clear_count("views", "never-existed")  # clearing an unknown counter is not an error
+`,
+    typescript: `const KEY = 'counter:views:trailer-7';
+
+export async function check_key(ctx) {
+  const m = ctx.load('best_effort');
+  assert.equal(await m.addCount('views', 'trailer-7', 3), 3, 'the first add of 3 must return 3');
+  assert.equal(ctx.redis.get(KEY), '3', \`the counter must live under \${KEY}, keys are \${JSON.stringify(ctx.redis.keys('*'))}\`);
+  await m.addCount('views', 'trailer-8', 1);
+  assert(ctx.redis.get('counter:views:trailer-8') === '1' && ctx.redis.get(KEY) === '3', 'each counter has its own key');
+}
+
+export async function check_incrby(ctx) {
+  const m = ctx.load('best_effort');
+  assert.equal(await m.addCount('views', 'trailer-7', 3), 3);
+  assert.equal(await m.addCount('views', 'trailer-7', 4), 7, 'the second add returns the running count 7');
+  assert.equal(await m.addCount('views', 'trailer-7', -2), 5, 'a negative delta decrements: expected 5');
+  assert.equal(ctx.redis.get(KEY), '5', \`after +3 +4 -2 the key holds 5, got \${JSON.stringify(ctx.redis.get(KEY))}\`);
+}
+
+export async function check_ttl_on_create(ctx) {
+  const m = ctx.load('best_effort');
+  await m.addCount('views', 'trailer-7', 1);
+  const ttl = ctx.redis.ttl(KEY);
+  assert(ttl > 0, \`\${KEY} has no expiry (TTL \${ttl}): a best-effort counter must leave the cache on its own\`);
+  assert(3600 - 5 <= ttl && ttl <= 3600, \`\${KEY} expires in \${ttl} s, expected TTL_S (3600)\`);
+  ctx.clock.advance(3601);
+  assert.equal(ctx.redis.exists(KEY), 0, \`\${KEY} must be gone after TTL_S\`);
+  assert.equal(await m.getCount('views', 'trailer-7'), 0, 'an expired counter reads as 0');
+  assert.equal(await m.addCount('views', 'trailer-7', 2), 2, 'an add after expiry starts a fresh counter at the delta');
+  const fresh = ctx.redis.ttl(KEY);
+  assert(3600 - 5 <= fresh && fresh <= 3600, 'the fresh counter gets a fresh TTL');
+}
+
+export async function check_pipelined(ctx) {
+  const m = ctx.load('best_effort');
+  await m.addCount('views', 'trailer-7', 1);
+  ctx.clock.advance(1200);
+  await m.addCount('views', 'trailer-7', 1);
+  let ttl = ctx.redis.ttl(KEY);
+  assert(ttl <= 3600 - 1200 + 5, \`20 minutes after creation a second add left the TTL at \${ttl} s: the expiry was re-armed, so a busy counter would never expire\`);
+  assert(ttl >= 3600 - 1200 - 5, \`TTL is \${ttl} s, expected about \${3600 - 1200}\`);
+  assert.equal(ctx.redis.get(KEY), '2', 'both adds must count');
+  ctx.clock.advance(2401);
+  assert.equal(ctx.redis.exists(KEY), 0, 'the counter expires 3600 s after its creation, regardless of later adds');
+  // The counter's hour runs out in the middle of an add: only an add whose SET NX and INCRBY reach
+  // Redis as one unit (a MULTI/EXEC pipeline) cannot leave a counter behind without an expiry.
+  await m.addCount('views', 'trailer-7', 1);
+  ctx.clock.advance(3599);
+  let fired = false;
+  ctx.redisAfter(KEY, () => {
+    fired = true;
+    ctx.clock.advance(2);
+  });
+  await m.addCount('views', 'trailer-7', 1);
+  assert(fired, \`addCount never touched \${KEY}\`);
+  ttl = ctx.redis.ttl(KEY);
+  assert(ttl !== -1, \`the counter's hour ran out between the SET NX and the INCRBY of one add, and the INCRBY recreated \${KEY} without any expiry (it now holds \${JSON.stringify(ctx.redis.get(KEY))} forever): send both in one MULTI/EXEC pipeline so nothing lands between them\`);
+}
+
+export async function check_get_clear(ctx) {
+  const m = ctx.load('best_effort');
+  assert.equal(await m.getCount('views', 'trailer-7'), 0, 'a counter that was never added to reads as 0, not null and not an error');
+  await m.addCount('views', 'trailer-7', 5);
+  const count = await m.getCount('views', 'trailer-7');
+  assert.equal(count, 5, 'getCount returns the current count as a number');
+  assert.equal(typeof count, 'number', 'getCount must return a number, not the raw string reply');
+  await m.clearCount('views', 'trailer-7');
+  assert.equal(ctx.redis.exists(KEY), 0, \`clearCount must DEL \${KEY}\`);
+  assert.equal(await m.getCount('views', 'trailer-7'), 0, 'a cleared counter reads as 0');
+  await m.clearCount('views', 'never-existed'); // clearing an unknown counter is not an error
+}
 `,
   },
   debrief: `A best-effort counter is the cheapest thing that can be called a counter: one key, one atomic INCRBY, no log and no reconciliation. The subtle part is the lifetime. Memcached's incr (what Netflix's EVCache sits on) never touches a key's expiry, and this step reproduces that deliberately: the TTL is a configuration of the namespace, not a side effect of traffic, so a counter nobody reads anymore disappears on schedule and a counter everybody hits does too — the next add simply starts it again. Pipelining the SET NX with the INCRBY keeps the add at one round trip. Real deployments replicate the cache across regions, accept that replicas may disagree briefly, and reach for the eventually consistent kind the moment a number has to be right.`,

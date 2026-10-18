@@ -59,6 +59,7 @@ as \`(status, payload)\`; wrap it:
         'Read the `Idempotency-Key` header and answer `400 Bad Request` when it is missing; without it the ledger can promise nothing about retries.',
       match: {
         python: {all: [/idempotency-key/i, /status_code\s*=\s*400|HTTP_400/]},
+        typescript: {all: [/idempotency-key/i, /code\(\s*400\s*\)|status\(\s*400\s*\)/]},
         go: {all: [/Idempotency-Key/i, /http\.StatusBadRequest|\b400\b/]},
         scala: {all: [/Idempotency-Key/i, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/Idempotency-Key/i, /status\s*=\s*400/]},
@@ -76,6 +77,14 @@ as \`(status, payload)\`; wrap it:
             /hashlib\.sha256\(/,
             /\.set\(\s*\w+\s*,\s*\w+\s*,[^\n]*nx\s*=\s*True/,
             /\.set\(\s*\w+\s*,\s*\w+\s*,[^\n]*ex\s*=\s*IDEM_TTL_S/,
+          ],
+        },
+        typescript: {
+          all: [
+            /`idem:\$\{/,
+            /createHash\(\s*['"]sha256['"]\s*\)/,
+            /\.set\(\s*\w+\s*,\s*\w+\s*,[^\n]*['"]NX['"]/,
+            /\.set\(\s*\w+\s*,\s*\w+\s*,[^\n]*['"]EX['"]\s*,\s*IDEM_TTL_S/,
           ],
         },
         go: {
@@ -105,6 +114,7 @@ as \`(status, payload)\`; wrap it:
         "When the stored fingerprint differs from this request's, the client is reusing a key for a new request: `409 Conflict`, and `handle` must not run.",
       match: {
         python: {all: [/\br\.get\(\s*key\s*\)\s*!=\s*digest/, /status_code\s*=\s*409/]},
+        typescript: {all: [/\bredis\.get\(\s*key\s*\)\)?\s*!==\s*digest/, /code\(\s*409\s*\)|status\(\s*409\s*\)/]},
         go: {all: [/rdb\.Get\(/, /!=\s*digest/, /http\.StatusConflict|\b409\b/]},
         scala: {all: [/jedis\.get\(/, /!=\s*digest/, /StatusCodes\.Conflict|\b409\b/]},
         cpp: {all: [/redis\.get\(/, /!=\s*digest/, /status\s*=\s*409/]},
@@ -117,6 +127,7 @@ as \`(status, payload)\`; wrap it:
         'A retry with the same fingerprint gets the stored status and body back from `idem:{key}:response` and an `Idempotent-Replayed: true` header; `handle` never runs again.',
       match: {
         python: {all: [/\.hgetall\(/, /Idempotent-Replayed/]},
+        typescript: {all: [/\.hgetall\(/, /Idempotent-Replayed/]},
         go: {all: [/rdb\.HGetAll\(/, /Idempotent-Replayed/]},
         scala: {all: [/jedis\.hgetAll\(/, /Idempotent-Replayed/]},
         cpp: {all: [/redis\.hgetall\(/, /Idempotent-Replayed/]},
@@ -131,6 +142,10 @@ as \`(status, payload)\`; wrap it:
         python: {
           order: [/= await handle\(/, /\.hset\(/, /\.expire\(\s*\w+\s*,\s*IDEM_TTL_S\s*\)/],
           all: [/\.delete\(\s*key\s*\)/],
+        },
+        typescript: {
+          order: [/= await handle\(/, /\.hset\(/, /\.expire\(\s*\w+\s*,\s*IDEM_TTL_S\s*\)/],
+          all: [/\.del\(\s*key\s*\)/],
         },
         go: {order: [/:= handle\(/, /\.HSet\(/, /\.Expire\(\s*ctx\s*,\s*\w+\s*,\s*idemTTL\s*\)/], all: [/rdb\.Del\(/]},
         scala: {
@@ -224,6 +239,105 @@ async def create_transaction(request: Request) -> JSONResponse:
 
 
 # uvicorn idempotent_api:app --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem
+`,
+    },
+    typescript: {
+      starter: `import {createHash} from 'node:crypto';
+
+import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {handle} from './ledger_api'; // built in step 1: [status, payload] of posting a body
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const IDEM_TTL_S = 86400;
+
+/** Canonical JSON: keys sorted at every level, no whitespace. */
+export function canonical(value: unknown): string {
+  if (Array.isArray(value)) return \`[\${value.map(canonical).join(',')}]\`;
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).sort();
+    return \`{\${keys.map(k => \`\${JSON.stringify(k)}:\${canonical(record[k])}\`).join(',')}}\`;
+  }
+  return JSON.stringify(value);
+}
+
+/** SHA-256 hex digest of the canonical JSON of the body. */
+export function fingerprint(body: unknown): string {
+  throw new Error('not implemented'); // TODO: createHash('sha256').update(canonical(body)).digest('hex')
+}
+
+app.post('/transactions', async (request, reply) => {
+  const body = request.body as Record<string, unknown>;
+  // TODO: 400 when the Idempotency-Key header is missing
+  // TODO: SET idem:{key} fingerprint EX IDEM_TTL_S NX
+  // TODO: refused → stored fingerprint differs: 409; same: replay idem:{key}:response (status, body) with Idempotent-Replayed: true, or 409 while in progress
+  // TODO: handle(body) (DEL the key and rethrow on failure), HSET idem:{key}:response status/body + EXPIRE IDEM_TTL_S, answer with the outcome
+  return reply.code(501).send();
+});
+`,
+      solution: `import {createHash} from 'node:crypto';
+
+import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {handle} from './ledger_api'; // built in step 1: [status, payload] of posting a body
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const IDEM_TTL_S = 86400;
+
+/** Canonical JSON: keys sorted at every level, no whitespace. */
+export function canonical(value: unknown): string {
+  if (Array.isArray(value)) return \`[\${value.map(canonical).join(',')}]\`;
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record).sort();
+    return \`{\${keys.map(k => \`\${JSON.stringify(k)}:\${canonical(record[k])}\`).join(',')}}\`;
+  }
+  return JSON.stringify(value);
+}
+
+/** SHA-256 hex digest of the canonical JSON of the body. */
+export function fingerprint(body: unknown): string {
+  return createHash('sha256').update(canonical(body)).digest('hex');
+}
+
+app.post('/transactions', async (request, reply) => {
+  const body = request.body as Record<string, unknown>;
+  const idemKey = request.headers['idempotency-key'];
+  if (typeof idemKey !== 'string' || idemKey === '') {
+    return reply.code(400).send({error: 'Idempotency-Key header is required'});
+  }
+  const key = \`idem:\${idemKey}\`;
+  const digest = fingerprint(body);
+  const reserved = await redis.set(key, digest, 'EX', IDEM_TTL_S, 'NX');
+  if (reserved === null) {
+    if ((await redis.get(key)) !== digest) {
+      return reply.code(409).send({error: 'Idempotency-Key reused with a different request body'});
+    }
+    const stored = await redis.hgetall(\`\${key}:response\`);
+    if (stored.status === undefined) {
+      return reply.code(409).send({error: 'a request with this Idempotency-Key is in progress'});
+    }
+    return reply.code(Number(stored.status)).header('Idempotent-Replayed', 'true').send(JSON.parse(stored.body));
+  }
+  let status: number;
+  let payload: Record<string, unknown>;
+  try {
+    [status, payload] = await handle(body);
+  } catch (error) {
+    await redis.del(key); // let the client retry with the same key
+    throw error;
+  }
+  const responseKey = \`\${key}:response\`;
+  await redis.multi().hset(responseKey, {status, body: JSON.stringify(payload)}).expire(responseKey, IDEM_TTL_S).exec();
+  return reply.code(status).send(payload);
+});
 `,
     },
     go: {
@@ -817,6 +931,183 @@ async def check_store_outcome(ctx):
         retry = await _post(c, "k4")
     assert retry.status_code == 201, f"once the database is back, the client's retry with the same key must go through, got {retry.status_code} {retry.text}"
     assert len(await _transactions(ctx)) == 3, "the retry must post the k4 transaction exactly once"
+`,
+    typescript: `import {createHash} from 'node:crypto';
+
+const SCHEMA = \`
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL REFERENCES transactions (id),
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL,
+    posted_at bigint NOT NULL
+);
+\`;
+
+const BODY = {
+  description: 'capture ch_1',
+  entries: [
+    {account: 'cash:acquirer', currency: 'EUR', amount: 4999},
+    {account: 'clearing:payments', currency: 'EUR', amount: -4999},
+  ],
+};
+const REORDERED = {
+  entries: [
+    {amount: 4999, currency: 'EUR', account: 'cash:acquirer'},
+    {amount: -4999, currency: 'EUR', account: 'clearing:payments'},
+  ],
+  description: 'capture ch_1',
+};
+const UNBALANCED = {
+  description: 'oops',
+  entries: [
+    {account: 'cash:acquirer', currency: 'EUR', amount: 4999},
+    {account: 'clearing:payments', currency: 'EUR', amount: -4000},
+  ],
+};
+const OTHER = {...BODY, description: 'capture ch_2'};
+const DAY = 86400;
+
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return \`[\${value.map(canonical).join(',')}]\`;
+  if (value !== null && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return \`{\${Object.keys(record).sort().map(k => \`\${JSON.stringify(k)}:\${canonical(record[k])}\`).join(',')}}\`;
+  }
+  return JSON.stringify(value);
+}
+
+const digestOf = (body: unknown): string => createHash('sha256').update(canonical(body)).digest('hex');
+
+/** The learner's idempotency layer over the real step 1 handler and the real journal writer, on an empty ledger. */
+async function api(ctx) {
+  await ctx.db.reset(SCHEMA);
+  return ctx.load('idempotent_api');
+}
+
+const post = (c, key: string | null = null, body: unknown = BODY) =>
+  c.post('/transactions', {json: body, headers: key === null ? {} : {'Idempotency-Key': key}});
+
+const transactions = (ctx) => ctx.db.execute('SELECT id, description FROM transactions ORDER BY posted_at, id');
+
+export async function check_header_required(ctx) {
+  const m = await api(ctx);
+  const c = ctx.client(m.app);
+  let r = await post(c);
+  assert.equal(r.status, 400, \`POST /transactions without Idempotency-Key answered \${r.status}, expected 400\`);
+  assert.deepEqual(await transactions(ctx), [], 'a request without a key must not reach the journal, but a transaction was written');
+  r = await post(c, 'k1');
+  assert.equal(r.status, 201, \`POST /transactions with a fresh key answered \${r.status}, expected 201\`);
+  const rows = await transactions(ctx);
+  assert(rows.length === 1 && r.json()?.transaction_id === rows[0].id, \`a fresh key must post the transaction once: the journal holds \${JSON.stringify(rows)}, the answer was \${r.text}\`);
+}
+
+export async function check_fingerprint_nx(ctx) {
+  const m = await api(ctx);
+  const c = ctx.client(m.app);
+  // A retry from the client's other connection lands on another app server right after this
+  // request's first Redis command on idem:k1 — the window a check-then-set leaves open.
+  let fired = false;
+  let racer: Promise<{status: number}> | null = null;
+  ctx.redisAfter('idem:k1', () => {
+    fired = true;
+    racer = post(c, 'k1');
+  });
+  const first = await post(c, 'k1');
+  assert(fired, 'idem:k1 was never touched: the key must be reserved in Redis as idem:{Idempotency-Key}');
+  const other = await racer;
+  const rows = await transactions(ctx);
+  assert.equal(rows.length, 1, \`two requests with key k1 arrived together and the journal booked \${rows.length} transactions: reserving the key must be one atomic SET NX, so only one of them can win\`);
+  const statuses = [first.status, other.status].sort();
+  assert.deepEqual(statuses, [201, 409], \`the two concurrent requests answered \${JSON.stringify(statuses)}: one creates the transaction (201), the other finds the key reserved with no outcome yet (409)\`);
+  const stored = ctx.redis.get('idem:k1');
+  assert(stored !== null, 'after the request idem:k1 must hold the fingerprint of the body');
+  assert.equal(stored, digestOf(BODY), \`idem:k1 holds \${JSON.stringify(stored)}, expected the SHA-256 hex digest of the canonical JSON body (keys sorted, no whitespace)\`);
+  const ttl = ctx.redis.ttl('idem:k1');
+  assert(DAY - 400 <= ttl && ttl <= DAY, \`the reservation TTL was \${ttl}, expected \${DAY} s\`);
+  ctx.clock.advance(DAY - 60);
+  assert.equal(ctx.redis.get('idem:k1'), stored, 'the reservation must still be there just under 24 h later');
+  ctx.clock.advance(120);
+  assert.equal(ctx.redis.get('idem:k1'), null, '24 h after the request the reservation must have expired');
+}
+
+export async function check_mismatch_409(ctx) {
+  const m = await api(ctx);
+  const c = ctx.client(m.app);
+  const first = await post(c, 'k1');
+  assert.equal(first.status, 201, \`the first request answered \${first.status}, expected 201\`);
+  const r = await post(c, 'k1', OTHER);
+  assert.equal(r.status, 409, \`the same key with a different body answered \${r.status}, expected 409\`);
+  const rows = await transactions(ctx);
+  assert.deepEqual(rows.map(t => t.description), ['capture ch_1'], \`a mismatching body must not be posted, the journal holds \${JSON.stringify(rows.map(t => t.description))}\`);
+  assert.equal(ctx.redis.get('idem:k1'), digestOf(BODY), 'the mismatching request must not overwrite the stored fingerprint');
+  const again = await post(c, 'k1');
+  assert(again.status === 201 && again.text === first.text, \`after the 409 the original request must still replay under its key, got \${again.status} \${again.text}\`);
+}
+
+export async function check_replay(ctx) {
+  const m = await api(ctx);
+  const c = ctx.client(m.app);
+  const first = await post(c, 'k1');
+  assert.equal(first.status, 201, \`the first request answered \${first.status}, expected 201\`);
+  assert.equal(first.headers['idempotent-replayed'], undefined, 'the first response is not a replay');
+  const again = await post(c, 'k1');
+  assert.equal(again.status, 201, \`the retry answered \${again.status}, expected the stored 201\`);
+  assert.deepEqual(again.json(), first.json(), \`the replay must return the same body: \${again.text} != \${first.text}\`);
+  assert.equal(again.headers['idempotent-replayed'], 'true', \`a replay carries Idempotent-Replayed: true, got \${JSON.stringify(again.headers)}\`);
+  let rows = await transactions(ctx);
+  assert.equal(rows.length, 1, \`a retry must not post again: the journal holds \${rows.length} transactions after one request and its retry\`);
+  const reordered = await post(c, 'k1', REORDERED);
+  assert(reordered.status === 201 && reordered.headers['idempotent-replayed'] === 'true', 'the same body with its keys in another order is the same request: canonical JSON before hashing');
+  assert.deepEqual(reordered.json(), first.json(), 'the reordered retry must replay the first outcome');
+  assert.equal((await transactions(ctx)).length, 1, 'the reordered retry must not post again');
+  const other = await post(c, 'k2');
+  assert(other.status === 201 && other.json()?.transaction_id !== first.json()?.transaction_id, 'a different key is a new transaction');
+  rows = await transactions(ctx);
+  assert.equal(rows.length, 2, 'a different key must post a second transaction');
+}
+
+export async function check_store_outcome(ctx) {
+  const m = await api(ctx);
+  const c = ctx.client(m.app);
+  let r = await post(c, 'k1');
+  assert.equal(r.status, 201, \`POST /transactions with a fresh key answered \${r.status}, expected 201\`);
+  const stored = ctx.redis.hgetall('idem:k1:response');
+  assert(Object.keys(stored).length > 0, 'after the response idem:k1:response must hold the outcome as a hash');
+  assert.equal(stored.status, '201', \`idem:k1:response.status is \${JSON.stringify(stored.status)}, expected '201'\`);
+  assert.deepEqual(JSON.parse(stored.body ?? 'null'), r.json(), \`idem:k1:response.body \${JSON.stringify(stored.body)} differs from the response body\`);
+  const ttl = ctx.redis.ttl('idem:k1:response');
+  assert(DAY - 400 <= ttl && ttl <= DAY, \`the stored outcome has TTL \${ttl}, expected \${DAY} s (same as the reservation)\`);
+  r = await post(c, 'k2', UNBALANCED);
+  assert.equal(r.status, 422, \`an unbalanced body must be answered 422, got \${r.status}\`);
+  const again = await post(c, 'k2', UNBALANCED);
+  assert.equal(again.status, 422, \`the retry of a rejected request must replay the stored 422, got \${again.status}\`);
+  assert.equal(again.headers['idempotent-replayed'], 'true', 'the replayed 422 is a replay too: error outcomes are stored as well');
+  assert.deepEqual(again.json(), r.json(), \`the replayed 422 must carry the stored reason, got \${again.text} != \${r.text}\`);
+  // Two first requests with one key at once: the second finds the key reserved and no outcome yet.
+  const both = await Promise.all([post(c, 'k3'), post(c, 'k3')]);
+  const statuses = both.map(x => x.status).sort();
+  assert.deepEqual(statuses, [201, 409], \`two simultaneous first requests with key k3 answered \${JSON.stringify(statuses)}: one posts (201), the other is still in progress (409)\`);
+  assert.equal((await transactions(ctx)).length, 2, 'k1 and k3 must have posted one transaction each');
+  // The journal breaks mid-write: from now on an entry of 4999 violates a constraint and the database rolls back.
+  await ctx.db.execute('ALTER TABLE entries ADD CONSTRAINT journal_down CHECK (amount <> 4999) NOT VALID');
+  r = await post(c, 'k4');
+  assert(r.status >= 500, \`a write that failed in the database answered \${r.status}, expected a 5xx\`);
+  assert.equal((await transactions(ctx)).length, 2, 'the failed write must leave nothing in the journal');
+  assert.equal(ctx.redis.get('idem:k4'), null, 'when the write fails the reservation must be released (DEL), or every retry gets 409 for a day');
+  assert(!ctx.redis.exists('idem:k4:response'), 'a failure is not an outcome: nothing may be stored for k4');
+  await ctx.db.execute('ALTER TABLE entries DROP CONSTRAINT journal_down');
+  const retry = await post(c, 'k4');
+  assert.equal(retry.status, 201, \`once the database is back, the client's retry with the same key must go through, got \${retry.status} \${retry.text}\`);
+  assert.equal((await transactions(ctx)).length, 3, 'the retry must post the k4 transaction exactly once');
+}
 `,
   },
   debrief: `The key turns the network's at-least-once into exactly-once at the API, and the fingerprint turns the key into a *promise about a request* rather than a promise about a string: a mismatch is refused instead of silently returning somebody else's transaction. Storing the outcome whatever the status matters for a ledger in particular — a rejected posting that is re-run on retry might pass a second time if the rules or the data changed in between, and the caller would never learn it had been rejected. Stripe's post scopes keys per API key, answers a mismatched body with a 400 rather than a 409, and keeps keys for 24 hours; it also recommends that clients retry with exponential backoff and jitter, and that the key be generated once per *intent* (a UUID stored next to the order), not per attempt.`,

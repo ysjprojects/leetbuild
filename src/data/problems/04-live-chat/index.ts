@@ -1,12 +1,12 @@
 import type {Problem} from '@/lib/types';
 
-import {protoModules} from './proto';
+import {protoFiles, protoModules} from './proto';
 import {presenceStep} from './steps/1-presence';
 import {chatStreamStep} from './steps/2-chat-stream';
 import {fanOutTopicStep} from './steps/3-fan-out-topic';
 import {historyEndpointStep} from './steps/4-history-endpoint';
 import {recentCacheStep} from './steps/5-recent-cache';
-import {supportModules} from './support';
+import {supportModules, supportModulesTs} from './support';
 
 /**
  * Live chat fan-out: presence with TTL heartbeats in Redis → one gRPC bidirectional stream per
@@ -73,5 +73,5 @@ are what every live fan-out system — chat, collaborative editing, live dashboa
     ],
   },
   steps: [presenceStep, chatStreamStep, fanOutTopicStep, historyEndpointStep, recentCacheStep],
-  support: {python: {...protoModules, ...supportModules}},
+  support: {python: {...protoModules, ...supportModules}, typescript: {...protoFiles, ...supportModulesTs}},
 };

@@ -63,6 +63,7 @@ Implement \`UpdateLocations\` on the servicer skeleton:
         'Each update is written to the per-city GEO set as `GEOADD drivers:{city} lng lat driver_id` — longitude first, as Redis expects.',
       match: {
         python: {all: [/["']drivers:/, /\.geoadd\([^\n]*\blng\b[^\n]*\blat\b/]},
+        typescript: {all: [/`drivers:|['"]drivers:/, /\.geoadd\([^\n]*\blng\b[^\n]*\blat\b/]},
         go: {
           all: [
             /"drivers:/,
@@ -82,6 +83,9 @@ Implement \`UpdateLocations\` on the servicer skeleton:
         'Every update `SET`s `driver:{id}:seen` with `EX 30`: a silent driver expires out of the search without a delete.',
       match: {
         python: {all: [/:seen/, /\.set\([^\n]*\bex\s*=\s*(?:SEEN_TTL_S|30)\b|\.setex\([^\n]*\b(?:SEEN_TTL_S|30)\b/]},
+        typescript: {
+          all: [/:seen/, /\.set\([^\n]*['"]EX['"]\s*,\s*(?:SEEN_TTL_S|30)\b|\.setex\([^\n]*\b(?:SEEN_TTL_S|30)\b/],
+        },
         go: {all: [/:seen/, /\.Set(?:Ex)?\(\s*ctx\s*,[^\n]*\b(?:seenTTL|30\s*\*\s*time\.Second)\b/]},
         scala: {all: [/:seen/, /\.setex\([^\n]*\b(?:SeenTtlSeconds|30L?)\b|\.ex\(\s*(?:SeenTtlSeconds|30L?)\s*\)/]},
         cpp: {all: [/:seen/, /\.set(?:ex)?\([^\n]*\bkSeenTtl\b/]},
@@ -94,6 +98,7 @@ Implement \`UpdateLocations\` on the servicer skeleton:
         'The GEOADD and the SET travel together — a pipeline executed once per update (or per small batch) — instead of two round trips per position.',
       match: {
         python: {all: [/\.pipeline\(/, /\.execute\(\)/]},
+        typescript: {all: [/\.pipeline\(\)|\.multi\(\)/, /\.exec\(\)/]},
         go: {all: [/\.(?:Tx)?Pipeline\(\)|\.Pipelined\(/, /\.Exec\(\s*ctx\s*\)|\.Pipelined\(/]},
         scala: {all: [/\.pipelined\(\)/, /\.sync\(\)/]},
         cpp: {all: [/redis\.pipeline\(/, /\.exec\(\)/]},
@@ -106,6 +111,7 @@ Implement \`UpdateLocations\` on the servicer skeleton:
         'When the client half-closes, the single response is `Ack{count}` — the client can compare it with what it sent.',
       match: {
         python: {all: [/Ack\(\s*count\s*=/]},
+        typescript: {all: [/callback\(\s*null\s*,\s*\{\s*count\b/]},
         go: {all: [/SendAndClose\(\s*&pb\.Ack\{\s*Count:/]},
         scala: {all: [/onNext\(\s*Ack\(/]},
         cpp: {all: [/ack->set_count\(/]},
@@ -118,6 +124,7 @@ Implement \`UpdateLocations\` on the servicer skeleton:
         'A cancelled stream ends the loop without an Ack: catch the cancellation (`CancelledError`, a non-EOF `Recv` error, `onError` with `CANCELLED`, `IsCancelled()`), log the count and return.',
       match: {
         python: {all: [/CancelledError|context\.cancelled\(\)|add_done_callback\(/]},
+        typescript: {all: [/\.cancelled\b|['"]cancelled['"]/]},
         go: {all: [/io\.EOF/, /return err\b/]},
         scala: {all: [/Status\.fromThrowable\(|Code\.CANCELLED/]},
         cpp: {all: [/IsCancelled\(\)/]},
@@ -202,6 +209,105 @@ async def serve() -> None:
 
 if __name__ == "__main__":
     asyncio.run(serve())
+`,
+    },
+    typescript: {
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const SEEN_TTL_S = 30;
+
+/** One message of the client stream; int64 ts crosses the wire as a decimal string. */
+interface LocationUpdate {
+  driver_id: string;
+  city: string;
+  lat: number;
+  lng: number;
+  ts: string;
+}
+
+interface Ack {
+  count: number;
+}
+
+export function updateLocations(
+  call: grpc.ServerReadableStream<LocationUpdate, Ack>,
+  callback: grpc.sendUnaryData<Ack>,
+): void {
+  let count = 0;
+  // TODO: on every 'data' update, one pipeline: GEOADD drivers:{city} (lng, lat, driver_id) and SET driver:{id}:seen ts EX SEEN_TTL_S
+  // TODO: on 'cancelled' (the client went away): log the count, send nothing
+  // TODO: on 'end' (the client finished its side, every write applied): callback(null, {count})
+  count += 0;
+  callback({code: grpc.status.UNIMPLEMENTED, details: 'not implemented'});
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('locations.proto')) as {
+  dispatch: {Locations: grpc.ServiceClientConstructor};
+};
+
+export const server = new grpc.Server();
+server.addService(pkg.dispatch.Locations.service, {UpdateLocations: updateLocations});
+server.bindAsync('0.0.0.0:9000', grpc.ServerCredentials.createInsecure(), () => server.start());
+`,
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const SEEN_TTL_S = 30;
+
+/** One message of the client stream; int64 ts crosses the wire as a decimal string. */
+interface LocationUpdate {
+  driver_id: string;
+  city: string;
+  lat: number;
+  lng: number;
+  ts: string;
+}
+
+interface Ack {
+  count: number;
+}
+
+export function updateLocations(
+  call: grpc.ServerReadableStream<LocationUpdate, Ack>,
+  callback: grpc.sendUnaryData<Ack>,
+): void {
+  let count = 0;
+  let applied = Promise.resolve();
+  call.on('data', (u: LocationUpdate) => {
+    // Updates are applied in order, each as one round trip: the GEOADD and the SET travel together.
+    applied = applied.then(async () => {
+      await redis
+        .pipeline()
+        .geoadd(\`drivers:\${u.city}\`, u.lng, u.lat, u.driver_id) // longitude first
+        .set(\`driver:\${u.driver_id}:seen\`, u.ts, 'EX', SEEN_TTL_S)
+        .exec();
+      count += 1;
+    });
+  });
+  call.on('cancelled', () => {
+    console.log(\`client cancelled after \${count} updates\`);
+  });
+  call.on('end', () => {
+    void applied.then(() => {
+      if (!call.cancelled) callback(null, {count});
+    });
+  });
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('locations.proto')) as {
+  dispatch: {Locations: grpc.ServiceClientConstructor};
+};
+
+export const server = new grpc.Server();
+server.addService(pkg.dispatch.Locations.service, {UpdateLocations: updateLocations});
+server.bindAsync('0.0.0.0:9000', grpc.ServerCredentials.createInsecure(), () => server.start());
 `,
     },
     go: {
@@ -601,6 +707,131 @@ async def check_cancel(ctx):
         root.setLevel(level)
     ack = await _push(stub, [_update("d-9", 48.84, 2.37, 1002)])
     assert ack.count == 1, "the server must keep serving new streams after a cancel"
+`,
+    typescript: `import * as grpc from '@grpc/grpc-js';
+
+interface Update {
+  driver_id: string;
+  city: string;
+  lat: number;
+  lng: number;
+  ts: number;
+}
+
+function update(driver_id: string, lat: number, lng: number, ts: number, city = 'paris'): Update {
+  return {driver_id, city, lat, lng, ts};
+}
+
+/** Load the learner's server (its addService installs the handler) and open a client to it. */
+function serve(ctx) {
+  const m = ctx.load('location_service');
+  const pkg = ctx.proto('locations.proto');
+  const client = new pkg.dispatch.Locations('location:9000', grpc.credentials.createInsecure());
+  return {m, client};
+}
+
+/** One client stream: write every update, half-close, await the single Ack. */
+function push(client, updates: Update[]): Promise<{count: number}> {
+  const {promise, resolve, reject} = Promise.withResolvers<{count: number}>();
+  const call = client.UpdateLocations((err, ack) => (err ? reject(err) : resolve(ack)));
+  for (const u of updates) call.write(u);
+  call.end();
+  return promise;
+}
+
+/** Let every queued microtask and the server's pending writes run. */
+const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+
+function pos(ctx, city: string, driverId: string): [number, number] | null {
+  const found = ctx.redis.geopos(\`drivers:\${city}\`, driverId);
+  if (!Array.isArray(found) || found[0] === null || found[0] === undefined) return null;
+  return [Number(found[0][0]), Number(found[0][1])];
+}
+
+export async function check_geoadd_lng_lat(ctx) {
+  const {client} = serve(ctx);
+  await push(client, [update('d-7', 48.85, 2.35, 1000), update('d-2', 48.86, 2.3, 1000), update('d-l', 45.76, 4.84, 1000, 'lyon')]);
+  const d7 = pos(ctx, 'paris', 'd-7');
+  assert(d7 !== null, \`drivers:paris has no member d-7 after an update (members: \${JSON.stringify(ctx.redis.zrange('drivers:paris', 0, -1))})\`);
+  let [lng, lat] = d7;
+  assert(Math.abs(lng - 2.35) < 1e-3 && Math.abs(lat - 48.85) < 1e-3, \`d-7 is stored at lng=\${lng.toFixed(4)} lat=\${lat.toFixed(4)}, expected lng=2.35 lat=48.85 (GEOADD takes longitude first)\`);
+  const d2 = pos(ctx, 'paris', 'd-2');
+  assert(d2 !== null, 'drivers:paris has no member d-2 after an update');
+  [lng, lat] = d2;
+  assert(Math.abs(lng - 2.3) < 1e-3 && Math.abs(lat - 48.86) < 1e-3, \`d-2 is stored at lng=\${lng.toFixed(4)} lat=\${lat.toFixed(4)}, expected lng=2.30 lat=48.86\`);
+  assert(pos(ctx, 'lyon', 'd-l') !== null, 'an update for city lyon must land in drivers:lyon');
+  assert(pos(ctx, 'paris', 'd-l') === null, 'a lyon driver must not be added to drivers:paris: the GEO key is per city');
+}
+
+export async function check_presence_ttl(ctx) {
+  const {client} = serve(ctx);
+  await push(client, [update('d-7', 48.85, 2.35, 1000)]);
+  const seen = ctx.redis.get('driver:d-7:seen');
+  assert(seen !== null, 'driver:d-7:seen was not written');
+  assert.equal(seen, '1000', \`driver:d-7:seen holds \${JSON.stringify(seen)}, expected the update's ts 1000\`);
+  let ttl = ctx.redis.ttl('driver:d-7:seen');
+  assert(0 < ttl && ttl <= 30, \`driver:d-7:seen has TTL \${ttl}, expected EX 30\`);
+  ctx.clock.advance(20);
+  await push(client, [update('d-7', 48.851, 2.351, 1020)]);
+  ttl = ctx.redis.ttl('driver:d-7:seen');
+  assert(ttl > 25, \`a new update must refresh the presence key: TTL is \${ttl} after the second update\`);
+  assert.equal(ctx.redis.get('driver:d-7:seen'), '1020', 'the presence value must be the latest ts');
+  ctx.clock.advance(31);
+  assert.equal(ctx.redis.get('driver:d-7:seen'), null, '31 s after the last update the presence key must have expired');
+  assert(pos(ctx, 'paris', 'd-7') !== null, 'the GEO member stays (only the presence key expires)');
+}
+
+export async function check_pipelined(ctx) {
+  const {client} = serve(ctx);
+  const updates = [update('d-7', 48.85, 2.35, 1000), update('d-2', 48.86, 2.3, 1001), update('d-9', 48.84, 2.37, 1002)];
+  const before = ctx.redisRoundTrips().length;
+  await push(client, updates);
+  const trips = ctx.redisRoundTrips().slice(before);
+  for (const u of updates) {
+    assert(pos(ctx, 'paris', u.driver_id) !== null, \`\${u.driver_id} was not GEOADDed (was the pipeline executed?)\`);
+    assert.equal(ctx.redis.get(\`driver:\${u.driver_id}:seen\`), String(u.ts), \`driver:\${u.driver_id}:seen is \${JSON.stringify(ctx.redis.get(\`driver:\${u.driver_id}:seen\`))}\`);
+  }
+  const direct = trips.filter(t => t.length === 1 && t[0] !== 'MULTI').length;
+  const pipelines = trips.filter(t => t.length > 1).length;
+  assert.equal(direct, 0, \`\${direct} commands were sent outside a pipeline: GEOADD and SET must travel together in one round trip (round trips: \${JSON.stringify(trips)})\`);
+  assert(1 <= pipelines && pipelines <= updates.length, \`\${pipelines} pipelines executed for \${updates.length} updates; expected one per update (or per small batch)\`);
+}
+
+export async function check_ack_count(ctx) {
+  const {client} = serve(ctx);
+  let ack = await push(client, [0, 1, 2, 3].map(i => update(\`d-\${i}\`, 48.85 + i / 1000, 2.35, 1000 + i)));
+  assert(ack !== null && typeof ack === 'object', \`the stream must end with an Ack, got \${JSON.stringify(ack)}\`);
+  assert.equal(ack.count, 4, \`Ack.count is \${ack.count} after 4 updates, expected 4\`);
+  ack = await push(client, [update('d-7', 48.85, 2.35, 2000), update('d-7', 48.851, 2.35, 2004)]);
+  assert.equal(ack.count, 2, \`a second stream of 2 updates was acknowledged with count \${ack.count}: the count is per stream\`);
+  ack = await push(client, []);
+  assert.equal(ack.count, 0, \`a stream that sent nothing must be acknowledged with count 0, got \${ack.count}\`);
+}
+
+export async function check_cancel(ctx) {
+  const {client} = serve(ctx);
+  const logged: string[] = [];
+  const real = {log: console.log, info: console.info, warn: console.warn, error: console.error, debug: console.debug};
+  const capture = (...args: unknown[]) => void logged.push(args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
+  console.log = console.info = console.warn = console.error = console.debug = capture;
+  try {
+    let outcome: {code: number} | {ack: unknown} | null = null;
+    const call = client.UpdateLocations((err, ack) => (outcome = err ? {code: err.code} : {ack}));
+    call.write(update('d-7', 48.85, 2.35, 1000));
+    call.write(update('d-2', 48.86, 2.3, 1001));
+    await settle();
+    assert(pos(ctx, 'paris', 'd-2') !== null, 'updates must be applied as they arrive, not only when the stream ends');
+    call.cancel();
+    await settle();
+    assert(outcome !== null && 'code' in outcome && outcome.code === ctx.grpc.status.CANCELLED, \`after a client cancel the call ended with \${JSON.stringify(outcome)}, expected CANCELLED (no Ack)\`);
+    assert.equal(ctx.redis.zcard('drivers:paris'), 2, 'the two updates before the cancel stay applied');
+    assert(logged.some(line => line.includes('2')), \`a cancelled stream must log how many updates were applied (2); logged: \${JSON.stringify(logged)}\`);
+  } finally {
+    Object.assign(console, real);
+  }
+  const ack = await push(client, [update('d-9', 48.84, 2.37, 1002)]);
+  assert.equal(ack.count, 1, 'the server must keep serving new streams after a cancel');
+}
 `,
   },
   debrief: `A client stream turns thousands of tiny unary calls into one long-lived HTTP/2 stream per driver: no per-message connection setup, back-pressure for free, and one place to notice the driver went away. The write path is deliberately two keys — a GEO set for *where* and a TTL key for *still here* — because a sorted set cannot expire its members. Real location services batch updates per pipeline, shard GEO sets per city cell to spread the write load, map-match the raw GPS onto roads before indexing, and keep a short history per driver to estimate heading and speed.`,

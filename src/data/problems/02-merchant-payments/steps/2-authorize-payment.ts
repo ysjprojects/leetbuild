@@ -62,6 +62,7 @@ Implement \`authorize(amount_cents, currency, card_token, idempotency_key)\` on 
         'Each RPC must carry the deadline (a timeout argument, a context with timeout, or a stub option), otherwise a hung provider hangs checkout.',
       match: {
         python: {all: [/stub\.Authorize\([^\n]*timeout\s*=\s*DEADLINE_S/]},
+        typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {all: [/context\.WithTimeout\(\s*ctx\s*,\s*deadline\s*\)/]},
         scala: {all: [/withDeadlineAfter\(\s*DeadlineMillis/]},
         cpp: {all: [/set_deadline\([^\n]*kDeadline/]},
@@ -74,6 +75,7 @@ Implement \`authorize(amount_cents, currency, card_token, idempotency_key)\` on 
         'The request must carry `idempotency_key` so the provider recognises a retry of the same authorization instead of creating a second one.',
       match: {
         python: {all: [/AuthorizeRequest\([^)]*idempotency_key\s*=\s*idempotency_key/]},
+        typescript: {all: [/idempotency_key:\s*idempotencyKey/]},
         go: {all: [/IdempotencyKey:\s*idempotencyKey/]},
         scala: {all: [/idempotencyKey\s*=\s*idempotencyKey/]},
         cpp: {all: [/set_idempotency_key\(\s*idempotency_key\s*\)/]},
@@ -86,6 +88,10 @@ Implement \`authorize(amount_cents, currency, card_token, idempotency_key)\` on 
         'A bounded loop over the attempts that continues only on `UNAVAILABLE`; an unbounded loop would pin a checkout thread on a provider that is down.',
       match: {
         python: {all: [/StatusCode\.UNAVAILABLE/, /for \w+ in range\([^)\n]*MAX_ATTEMPTS/], none: [/while True/]},
+        typescript: {
+          all: [/status\.UNAVAILABLE/, /for \(let \w+ = \d+; \w+ <=? MAX_ATTEMPTS; (\+\+\w+|\w+\+\+)\)/],
+          none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
+        },
         go: {all: [/codes\.Unavailable/, /for \w+ := \d+; \w+ <=? maxAttempts; \w+\+\+/], none: [/for \{/]},
         scala: {
           all: [/Code\.UNAVAILABLE/, /\w+ < MaxAttempts|\w+ <- \d+ (until|to) MaxAttempts/],
@@ -108,6 +114,13 @@ Implement \`authorize(amount_cents, currency, card_token, idempotency_key)\` on 
             /BASE_BACKOFF_S\s*\*\s*\(?\s*2\s*\*\*|2\s*\*\*[^\n]*\*\s*BASE_BACKOFF_S/,
             /random\.uniform\(|random\.random\(\)/,
             /time\.sleep\(/,
+          ],
+        },
+        typescript: {
+          all: [
+            /BASE_BACKOFF_MS\s*\*\s*\(?\s*2\s*\*\*|2\s*\*\*[^\n]*\*\s*BASE_BACKOFF_MS|BASE_BACKOFF_MS\s*<<|BASE_BACKOFF_MS\s*\*\s*Math\.pow\(\s*2/,
+            /Math\.random\(\)/,
+            /await sleep\(|await setTimeout\(/,
           ],
         },
         go: {all: [/baseBackoff\s*(<<|\*)|\*\s*baseBackoff/, /rand\.(N|Int64N|IntN|Float64)\(/, /time\.Sleep\(/]},
@@ -139,6 +152,14 @@ Implement \`authorize(amount_cents, currency, card_token, idempotency_key)\` on 
             /AuthResult\(\s*"PENDING"/,
             /StatusCode\.INVALID_ARGUMENT/,
             /AuthResult\(\s*"DECLINED"/,
+          ],
+        },
+        typescript: {
+          all: [
+            /status\.DEADLINE_EXCEEDED/,
+            /status:\s*['"]PENDING['"]/,
+            /status\.INVALID_ARGUMENT/,
+            /status:\s*['"]DECLINED['"]/,
           ],
         },
         go: {all: [/codes\.DeadlineExceeded/, /Status:\s*Pending/, /codes\.InvalidArgument/, /Status:\s*Declined/]},
@@ -240,6 +261,115 @@ def authorize(amount_cents: int, currency: str, card_token: str, idempotency_key
             if code != grpc.StatusCode.UNAVAILABLE:
                 raise
     raise ProviderUnavailable(f"provider unavailable after {MAX_ATTEMPTS} attempts")
+`,
+    },
+    typescript: {
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import {setTimeout as sleep} from 'node:timers/promises';
+
+export const DEADLINE_MS = 3000;
+export const MAX_ATTEMPTS = 3;
+export const BASE_BACKOFF_MS = 200;
+
+interface AuthorizeRequest {
+  amount_cents: number;
+  currency: string;
+  card_token: string;
+  idempotency_key?: string;
+}
+
+interface ProviderClient {
+  Authorize(request: AuthorizeRequest, options: {deadline: number}): Promise<{authorization_id: string}>;
+}
+
+// proto-loader's package object is untyped; this is the generated stub's shape.
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('provider.proto')) as unknown as {
+  payments: {PaymentProvider: new (target: string, credentials: grpc.ChannelCredentials) => ProviderClient};
+};
+const client = new pkg.payments.PaymentProvider('provider:9443', grpc.credentials.createSsl());
+
+export interface AuthResult {
+  status: 'APPROVED' | 'DECLINED' | 'PENDING';
+  authorization_id?: string;
+  reason?: string;
+}
+
+export class ProviderUnavailable extends Error {}
+
+export async function authorize(
+  amountCents: number,
+  currency: string,
+  cardToken: string,
+  idempotencyKey: string,
+): Promise<AuthResult> {
+  const request = {amount_cents: amountCents, currency, card_token: cardToken};
+  // TODO: put idempotency_key in the request so the provider dedupes retries
+  // TODO: client.Authorize with a deadline of DEADLINE_MS; up to MAX_ATTEMPTS attempts on UNAVAILABLE only
+  // TODO: sleep BASE_BACKOFF_MS doubled per attempt, plus random jitter, before each retry
+  // TODO: DEADLINE_EXCEEDED → PENDING (the charge may have happened); INVALID_ARGUMENT → DECLINED; else throw
+  throw new Error('not implemented');
+}
+`,
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import {setTimeout as sleep} from 'node:timers/promises';
+
+export const DEADLINE_MS = 3000;
+export const MAX_ATTEMPTS = 3;
+export const BASE_BACKOFF_MS = 200;
+
+interface AuthorizeRequest {
+  amount_cents: number;
+  currency: string;
+  card_token: string;
+  idempotency_key?: string;
+}
+
+interface ProviderClient {
+  Authorize(request: AuthorizeRequest, options: {deadline: number}): Promise<{authorization_id: string}>;
+}
+
+// proto-loader's package object is untyped; this is the generated stub's shape.
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('provider.proto')) as unknown as {
+  payments: {PaymentProvider: new (target: string, credentials: grpc.ChannelCredentials) => ProviderClient};
+};
+const client = new pkg.payments.PaymentProvider('provider:9443', grpc.credentials.createSsl());
+
+export interface AuthResult {
+  status: 'APPROVED' | 'DECLINED' | 'PENDING';
+  authorization_id?: string;
+  reason?: string;
+}
+
+export class ProviderUnavailable extends Error {}
+
+export async function authorize(
+  amountCents: number,
+  currency: string,
+  cardToken: string,
+  idempotencyKey: string,
+): Promise<AuthResult> {
+  const request = {amount_cents: amountCents, currency, card_token: cardToken, idempotency_key: idempotencyKey};
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    if (attempt > 0) {
+      const backoff = BASE_BACKOFF_MS * 2 ** (attempt - 1);
+      await sleep(backoff + Math.random() * backoff); // jitter: spread retries across servers
+    }
+    try {
+      const reply = await client.Authorize(request, {deadline: Date.now() + DEADLINE_MS});
+      return {status: 'APPROVED', authorization_id: reply.authorization_id};
+    } catch (e) {
+      const {code, details} = e as grpc.ServiceError;
+      if (code === grpc.status.DEADLINE_EXCEEDED) {
+        return {status: 'PENDING', reason: 'no answer within the deadline; the charge may exist'};
+      }
+      if (code === grpc.status.INVALID_ARGUMENT) return {status: 'DECLINED', reason: details};
+      if (code !== grpc.status.UNAVAILABLE) throw e;
+    }
+  }
+  throw new ProviderUnavailable(\`provider unavailable after \${MAX_ATTEMPTS} attempts\`);
+}
 `,
     },
     go: {
@@ -666,6 +796,129 @@ def check_status_mapping(ctx):
     assert len(_calls(ctx)) == 2, "INVALID_ARGUMENT must not be retried"
     result = _authorize(m, key="k3")
     assert result.status == "APPROVED" and result.authorization_id == "auth-k3"
+`,
+    typescript: `/** The provider: approves everything but tok_expired (INVALID_ARGUMENT), records every request it saw. */
+function provider(ctx) {
+  const requests: Record<string, unknown>[] = [];
+  const pkg = ctx.proto('provider.proto');
+  ctx.grpc.serve(pkg.payments.PaymentProvider.service, {
+    Authorize: (call, callback) => {
+      requests.push(call.request);
+      if (call.request.card_token === 'tok_expired') {
+        callback({code: ctx.grpc.status.INVALID_ARGUMENT, details: 'card expired'});
+        return;
+      }
+      callback(null, {authorization_id: 'auth-' + call.request.idempotency_key});
+    },
+  });
+  return {m: ctx.load('provider_client'), requests};
+}
+
+const authorize = (m, token = 'tok_visa', key = 'k1') => m.authorize(4999, 'EUR', token, key);
+const calls = ctx => ctx.grpc.callsTo('Authorize');
+
+/** Runs the authorization expecting it to throw; AssertionErrors pass through. */
+async function mustThrow(fn: () => Promise<unknown>, message: (result: unknown) => string) {
+  let result: unknown;
+  try {
+    result = await fn();
+  } catch (e) {
+    if (e instanceof assert.AssertionError) throw e;
+    return;
+  }
+  assert.fail(message(result));
+}
+
+export async function check_deadline(ctx) {
+  const {m} = provider(ctx);
+  let result = await authorize(m);
+  assert.equal(result.status, 'APPROVED', \`a provider that answers must give APPROVED, got \${JSON.stringify(result.status)}\`);
+  assert.equal(result.authorization_id, 'auth-k1', \`authorization_id must be the provider's, got \${JSON.stringify(result.authorization_id)}\`);
+  const call = calls(ctx)[calls(ctx).length - 1];
+  assert(call.timeout !== null, 'the RPC carries no deadline: a hung provider would hang checkout');
+  assert(2.5 <= call.timeout && call.timeout <= 3.5, \`the deadline must be about 3 s, got \${call.timeout} s\`);
+  ctx.grpc.setLatency('Authorize', 30.0);
+  result = await authorize(m, 'tok_visa', 'k2');
+  assert.notEqual(result.status, 'APPROVED', 'a provider slower than the deadline cannot have answered');
+  assert.equal(calls(ctx).length, 2, \`a DEADLINE_EXCEEDED attempt must not be retried, saw \${calls(ctx).length - 1} calls for it\`);
+  const last = calls(ctx)[calls(ctx).length - 1];
+  assert(last.timeout !== null && last.timeout <= 3.5, 'every attempt carries the deadline');
+}
+
+export async function check_idempotency_key(ctx) {
+  const {m, requests} = provider(ctx);
+  await authorize(m, 'tok_visa', 'k1');
+  assert(requests.length > 0, 'the provider was never called');
+  const req = requests[requests.length - 1];
+  assert.equal(req.idempotency_key, 'k1', \`the request carried idempotency_key \${JSON.stringify(req.idempotency_key)}, expected 'k1'\`);
+  assert.deepEqual([String(req.amount_cents), req.currency, req.card_token], ['4999', 'EUR', 'tok_visa'], 'amount, currency and card token must be in the request');
+  ctx.grpc.fail('Authorize', ctx.grpc.status.UNAVAILABLE, 'restarting', 1);
+  const result = await authorize(m, 'tok_visa', 'k2');
+  assert.equal(result.status, 'APPROVED');
+  const keys = calls(ctx).slice(1).map(c => c.request.idempotency_key);
+  assert.deepEqual(keys, ['k2', 'k2'], \`every attempt of one authorization must carry the same key, saw \${JSON.stringify(keys)}\`);
+}
+
+export async function check_retry_unavailable(ctx) {
+  const {m} = provider(ctx);
+  ctx.grpc.fail('Authorize', ctx.grpc.status.UNAVAILABLE, 'restarting', 1);
+  const result = await authorize(m);
+  assert.equal(result.status, 'APPROVED', \`one UNAVAILABLE must be retried and succeed, got \${JSON.stringify(result.status)}\`);
+  assert.equal(calls(ctx).length, 2, \`expected 2 attempts after one UNAVAILABLE, saw \${calls(ctx).length}\`);
+  // Down for exactly the three allowed attempts: a fourth attempt would reach a provider that is back.
+  ctx.grpc.fail('Authorize', ctx.grpc.status.UNAVAILABLE, 'down', 3);
+  await mustThrow(
+    () => authorize(m, 'tok_visa', 'k2'),
+    r => \`a provider that stays UNAVAILABLE must throw after the last attempt, got \${JSON.stringify(r)}\`,
+  );
+  const attempts = calls(ctx).length - 2;
+  assert.equal(attempts, 3, \`made \${attempts} attempts against a down provider, expected exactly 3\`);
+  ctx.grpc.fail('Authorize', ctx.grpc.status.PERMISSION_DENIED, 'bad api key', 5);
+  await mustThrow(
+    () => authorize(m, 'tok_visa', 'k3'),
+    r => \`PERMISSION_DENIED must propagate as an error, got \${JSON.stringify(r)}\`,
+  );
+  assert.equal(calls(ctx).length, 6, 'only UNAVAILABLE is retried; PERMISSION_DENIED must be thrown after one attempt');
+}
+
+export async function check_backoff_jitter(ctx) {
+  const {m} = provider(ctx);
+  const gaps: [number, number][] = [];
+  const slept: number[] = []; // virtual ms each authorization slept in total (sleeps are the only thing advancing the clock here)
+  for (let n = 0; n < 4; n++) {
+    ctx.grpc.fail('Authorize', ctx.grpc.status.UNAVAILABLE, 'restarting', 2);
+    const before = calls(ctx).length;
+    const start = ctx.clock.now();
+    const result = await authorize(m, 'tok_visa', \`k\${n}\`);
+    assert.equal(result.status, 'APPROVED', \`two UNAVAILABLE then success must be APPROVED, got \${JSON.stringify(result.status)}\`);
+    const attempts = calls(ctx).slice(before);
+    assert.equal(attempts.length, 3, \`expected 3 attempts, saw \${attempts.length}\`);
+    gaps.push([attempts[1].started - attempts[0].started, attempts[2].started - attempts[1].started]);
+    slept.push(ctx.clock.now() - start);
+  }
+  assert(ctx.clock.sleeps >= 8, 'the client must sleep before each retry');
+  for (const [first, second] of gaps) {
+    assert(200 <= first && first <= 450, \`the wait before the 2nd attempt was \${Math.round(first)} ms, expected 200 ms base plus up to 200 ms jitter\`);
+    assert(400 <= second && second <= 850, \`the wait before the 3rd attempt was \${Math.round(second)} ms, expected 400 ms (doubled) plus up to 400 ms jitter\`);
+  }
+  const distinct = new Set(slept.map(s => Math.round(s / 5)));
+  assert(distinct.size > 1, \`every authorization waited about \${Math.round(slept[0])} ms before its retries: add random jitter so a fleet does not retry in lockstep\`);
+}
+
+export async function check_status_mapping(ctx) {
+  const {m} = provider(ctx);
+  ctx.grpc.setLatency('Authorize', 30.0);
+  let result = await authorize(m, 'tok_visa', 'k1');
+  assert.equal(result.status, 'PENDING', \`a timed-out authorization must be PENDING (the charge may exist), got \${JSON.stringify(result.status)}\`);
+  assert.equal(calls(ctx).length, 1, 'DEADLINE_EXCEEDED must not be retried: a second attempt could charge twice');
+  ctx.grpc.setLatency('Authorize', 0.0);
+  result = await authorize(m, 'tok_expired', 'k2');
+  assert.equal(result.status, 'DECLINED', \`INVALID_ARGUMENT must be DECLINED, got \${JSON.stringify(result.status)}\`);
+  assert(typeof result.reason === 'string' && result.reason.includes('card expired'), \`DECLINED must carry the provider's message, got reason=\${JSON.stringify(result.reason)}\`);
+  assert.equal(calls(ctx).length, 2, 'INVALID_ARGUMENT must not be retried');
+  result = await authorize(m, 'tok_visa', 'k3');
+  assert(result.status === 'APPROVED' && result.authorization_id === 'auth-k3');
+}
 `,
   },
   debrief: `Three ideas, each of which fails on its own: the deadline bounds *your* latency, the idempotency key makes the retry safe, and PENDING is the honest answer when a call that moves money times out. Retrying without the key charges twice; treating a timeout as a failure makes the merchant charge twice with a new key. Production clients use the gRPC retry policy in the service config instead of hand-written loops, propagate the caller's deadline, and reconcile PENDING authorizations later through a provider status query or webhook.`,

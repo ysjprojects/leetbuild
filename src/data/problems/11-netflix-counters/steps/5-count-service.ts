@@ -82,6 +82,7 @@ message GetCountReply   { int64 count = 1; int64 as_of = 2; }
       detail: 'Look the namespace up in `NAMESPACES` and end the call with `NOT_FOUND` when it is not configured.',
       match: {
         python: {all: [/NAMESPACES\.get\(|in NAMESPACES/, /StatusCode\.NOT_FOUND/]},
+        typescript: {all: [/NAMESPACES\[/, /status\.NOT_FOUND/]},
         go: {all: [/namespaces\[/, /codes\.NotFound/]},
         scala: {all: [/Namespaces\.get\(|Namespaces\.contains\(/, /Status\.NOT_FOUND/]},
         cpp: {all: [/kNamespaces\.find\(|kNamespaces\.count\(/, /StatusCode::NOT_FOUND/]},
@@ -94,6 +95,7 @@ message GetCountReply   { int64 count = 1; int64 as_of = 2; }
         'A name that does not match `NAME_RE` ends the call with `INVALID_ARGUMENT`; no store is consulted for it.',
       match: {
         python: {all: [/NAME_RE\.(fullmatch|match)\(/, /StatusCode\.INVALID_ARGUMENT/]},
+        typescript: {all: [/NAME_RE\.test\(/, /status\.INVALID_ARGUMENT/]},
         go: {all: [/nameRe\.MatchString\(/, /codes\.InvalidArgument/]},
         scala: {all: [/NameRe\.(matches|findFirstIn|unapplySeq)\(|matches\(\s*NameRe/, /Status\.INVALID_ARGUMENT/]},
         cpp: {all: [/std::regex_match\([^\n]*kNameRe/, /StatusCode::INVALID_ARGUMENT/]},
@@ -105,6 +107,9 @@ message GetCountReply   { int64 count = 1; int64 as_of = 2; }
       detail: 'The computed `{count, as_of}` is stored as JSON under `total:{ns}:{name}` with `EX CACHE_TTL_S` (2 s).',
       match: {
         python: {all: [/f["']total:\{ns\}:\{name\}["']/, /\.set\([^\n]*ex\s*=\s*CACHE_TTL_S/, /json\.dumps\(/]},
+        typescript: {
+          all: [/`total:\$\{ns\}:\$\{name\}`/, /\.set\([^\n]*['"]EX['"]\s*,\s*CACHE_TTL_S/, /JSON\.stringify\(/],
+        },
         go: {
           all: [
             /"total:"\s*\+\s*ns\s*\+\s*":"\s*\+\s*name|"total:%s:%s"/,
@@ -129,6 +134,7 @@ message GetCountReply   { int64 count = 1; int64 as_of = 2; }
         'Cache-aside: `GET` first; `get_rolled_up` runs only when the key is missing, and its result is what gets cached.',
       match: {
         python: {order: [/\br\.get\(/, /(?<!def )get_rolled_up\(/, /\br\.set\(/]},
+        typescript: {order: [/\bredis\.get\(/, /(?<!as )getRolledUp\(/, /\bredis\.set\(/]},
         go: {order: [/rdb\.Get\(/, /(?<!func )getRolledUp\(/, /rdb\.Set\(/]},
         scala: {order: [/jedis\.get\(/, /(?<!def )getRolledUp\(/, /jedis\.setex\(/]},
         cpp: {order: [/redis\.get\(/, /(?<!long )get_rolled_up\(/, /redis\.set\(/]},
@@ -141,6 +147,7 @@ message GetCountReply   { int64 count = 1; int64 as_of = 2; }
         'The reply carries `count` and `as_of`; a best-effort namespace reads `get_best_effort` with `as_of` = now, an eventually-consistent one returns the cached pair.',
       match: {
         python: {all: [/GetCountReply\(\s*count\s*=/, /as_of\s*=/, /(?<!def )get_best_effort\(/]},
+        typescript: {all: [/count:/, /as_of:/, /(?<!as )getBestEffort\(/]},
         go: {all: [/&pb\.GetCountReply\{\s*Count:/, /AsOf:/, /(?<!func )getBestEffort\(/]},
         scala: {all: [/GetCountReply\(\s*count\s*=/, /asOf\s*=/, /(?<!def )getBestEffort\(/]},
         cpp: {all: [/reply->set_count\(/, /reply->set_as_of\(/, /(?<!long )get_best_effort\(/]},
@@ -258,6 +265,129 @@ def serve() -> None:
 
 if __name__ == "__main__":
     serve()
+`,
+    },
+    typescript: {
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
+
+import {getCount as getBestEffort} from './best_effort'; // built in step 2: the cached counter, 0 when missing
+import {getCount as getRolledUp} from './rollup'; // built in step 4: the sum over the minute buckets
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+// The namespaces of step 1 (provided).
+export const NAMESPACES: Record<string, 'best_effort' | 'eventually_consistent'> = {
+  views: 'best_effort',
+  plays: 'eventually_consistent',
+};
+export const NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+export const CACHE_TTL_S = 2;
+
+interface GetCountRequest {
+  namespace: string;
+  name: string;
+}
+
+interface GetCountReply {
+  count: number;
+  as_of: number;
+}
+
+/** [count, as_of] for an eventually-consistent counter, cache-aside through total:{ns}:{name}. */
+export async function cachedTotal(ns: string, name: string): Promise<[number, number]> {
+  // TODO: GET total:{ns}:{name}; a hit is the cached [count, as_of]
+  // TODO: miss → getRolledUp, as_of = now; SET the pair as JSON with EX CACHE_TTL_S; return it
+  throw new Error('not implemented');
+}
+
+const counters = grpc.loadPackageDefinition(protoLoader.loadSync('counters.proto', {keepCase: true})).counters as grpc.GrpcObject;
+const CounterService = counters.CounterService as grpc.ServiceClientConstructor;
+
+export const server = new grpc.Server();
+server.addService(CounterService.service, {
+  GetCount: async (
+    call: grpc.ServerUnaryCall<GetCountRequest, GetCountReply>,
+    callback: grpc.sendUnaryData<GetCountReply>,
+  ): Promise<void> => {
+    // TODO: unknown namespace → NOT_FOUND; name not matching NAME_RE → INVALID_ARGUMENT
+    // TODO: best_effort → {count: await getBestEffort(...), as_of: now}
+    // TODO: eventually_consistent → {count, as_of} from cachedTotal
+    callback({code: grpc.status.UNIMPLEMENTED, details: 'not implemented'});
+  },
+});
+server.bindAsync('0.0.0.0:9000', grpc.ServerCredentials.createInsecure(), () => server.start());
+`,
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
+
+import {getCount as getBestEffort} from './best_effort'; // built in step 2: the cached counter, 0 when missing
+import {getCount as getRolledUp} from './rollup'; // built in step 4: the sum over the minute buckets
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+// The namespaces of step 1 (provided).
+export const NAMESPACES: Record<string, 'best_effort' | 'eventually_consistent'> = {
+  views: 'best_effort',
+  plays: 'eventually_consistent',
+};
+export const NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+export const CACHE_TTL_S = 2;
+
+interface GetCountRequest {
+  namespace: string;
+  name: string;
+}
+
+interface GetCountReply {
+  count: number;
+  as_of: number;
+}
+
+/** [count, as_of] for an eventually-consistent counter, cache-aside through total:{ns}:{name}. */
+export async function cachedTotal(ns: string, name: string): Promise<[number, number]> {
+  const key = \`total:\${ns}:\${name}\`;
+  const cached = await redis.get(key);
+  if (cached !== null) {
+    const doc = JSON.parse(cached) as GetCountReply;
+    return [Number(doc.count), Number(doc.as_of)];
+  }
+  const count = await getRolledUp(ns, name);
+  const asOf = Math.floor(Date.now() / 1000);
+  await redis.set(key, JSON.stringify({count, as_of: asOf}), 'EX', CACHE_TTL_S);
+  return [count, asOf];
+}
+
+const counters = grpc.loadPackageDefinition(protoLoader.loadSync('counters.proto', {keepCase: true})).counters as grpc.GrpcObject;
+const CounterService = counters.CounterService as grpc.ServiceClientConstructor;
+
+export const server = new grpc.Server();
+server.addService(CounterService.service, {
+  GetCount: async (
+    call: grpc.ServerUnaryCall<GetCountRequest, GetCountReply>,
+    callback: grpc.sendUnaryData<GetCountReply>,
+  ): Promise<void> => {
+    const {namespace, name} = call.request;
+    const kind = NAMESPACES[namespace];
+    if (kind === undefined) {
+      callback({code: grpc.status.NOT_FOUND, details: \`unknown namespace \${JSON.stringify(namespace)}\`});
+      return;
+    }
+    if (!NAME_RE.test(name)) {
+      callback({code: grpc.status.INVALID_ARGUMENT, details: 'name must match [A-Za-z0-9_-]{1,64}'});
+      return;
+    }
+    if (kind === 'best_effort') {
+      callback(null, {count: await getBestEffort(namespace, name), as_of: Math.floor(Date.now() / 1000)});
+      return;
+    }
+    const [count, asOf] = await cachedTotal(namespace, name);
+    callback(null, {count, as_of: asOf});
+  },
+});
+server.bindAsync('0.0.0.0:9000', grpc.ServerCredentials.createInsecure(), () => server.start());
 `,
     },
     go: {
@@ -746,6 +876,106 @@ def check_reply(ctx):
     _plays(ctx, count_events, rollup, ("t-1", 1200), ("t-2", 7))
     reply = _get(stub, "plays", "stranger-things")
     assert reply.count == 1207 and abs(reply.as_of - int(time.time())) <= 1, f"an eventually-consistent reply carries the rolled-up 1207 and a current as_of, got {(reply.count, reply.as_of)}"
+`,
+    typescript: `const KEY = 'total:plays:stranger-things';
+
+/** The learner's CounterService (its handlers are live once the module loaded), a client on it, and the real steps behind it. */
+function service(ctx) {
+  ctx.load('count_service');
+  const bestEffort = ctx.load('best_effort'); // step 2: the best-effort counters GetCount reads
+  const countEvents = ctx.load('count_events'); // step 3: how eventually-consistent adds become events
+  const rollup = ctx.load('rollup'); // step 4: the worker that folds them into the buckets GetCount sums
+  const stub = new (ctx.proto('counters.proto').counters.CounterService)('counters:9000', null);
+  return {stub, bestEffort, countEvents, rollup};
+}
+
+/** Eventually-consistent adds to plays/stranger-things as production makes them: logged, then rolled up. */
+async function plays(ctx, countEvents, rollup, ...adds: [string, number][]) {
+  for (const [token, delta] of adds) await countEvents.appendEvent('plays', 'stranger-things', delta, token);
+  await ctx.drain(rollup.run());
+}
+
+/** The reply as numbers (int64 crosses the wire as decimal strings). */
+async function get(stub, ns, name): Promise<{count: number; as_of: number}> {
+  const reply = await stub.GetCount({namespace: ns, name}, {deadline: Date.now() + 1000});
+  return {count: Number(reply.count), as_of: Number(reply.as_of)};
+}
+
+async function failsWith(ctx, stub, ns, name, code) {
+  const nameOf = c => Object.keys(ctx.grpc.status).find(k => ctx.grpc.status[k] === c) ?? String(c);
+  let reply;
+  try {
+    reply = await get(stub, ns, name);
+  } catch (e) {
+    assert.equal(e.code, code, \`GetCount(\${JSON.stringify(ns)}, \${JSON.stringify(name)}) failed with \${nameOf(e.code)}, expected \${nameOf(code)}\`);
+    return;
+  }
+  assert.fail(\`GetCount(\${JSON.stringify(ns)}, \${JSON.stringify(name)}) answered \${reply.count} instead of failing with \${nameOf(code)}\`);
+}
+
+export async function check_not_found(ctx) {
+  const {stub} = service(ctx);
+  await failsWith(ctx, stub, 'likes', 'stranger-things', ctx.grpc.status.NOT_FOUND);
+  await failsWith(ctx, stub, '', 'stranger-things', ctx.grpc.status.NOT_FOUND);
+  assert.deepEqual(ctx.redis.keys('*'), [], \`an unknown namespace must not leave anything in the cache, Redis holds \${JSON.stringify(ctx.redis.keys('*'))}\`);
+}
+
+export async function check_invalid_argument(ctx) {
+  const {stub} = service(ctx);
+  for (const bad of ['bad name', '', 'a'.repeat(65), 'dots.are.out']) {
+    await failsWith(ctx, stub, 'plays', bad, ctx.grpc.status.INVALID_ARGUMENT);
+    await failsWith(ctx, stub, 'views', bad, ctx.grpc.status.INVALID_ARGUMENT);
+  }
+  assert.deepEqual(ctx.redis.keys('*'), [], \`a bad name must be refused before any store is consulted, yet Redis holds \${JSON.stringify(ctx.redis.keys('*'))}\`);
+  await failsWith(ctx, stub, 'likes', 'bad name', ctx.grpc.status.NOT_FOUND); // the namespace is checked first
+}
+
+export async function check_cache_key_ttl(ctx) {
+  const {stub, countEvents, rollup} = service(ctx);
+  await plays(ctx, countEvents, rollup, ['t-1', 1200], ['t-2', 7]);
+  const reply = await get(stub, 'plays', 'stranger-things');
+  assert.equal(reply.count, 1207, \`GetCount answered \${reply.count}, expected the rolled-up 1207\`);
+  const cached = ctx.redis.get(KEY);
+  assert(cached !== null, \`the total must be cached under \${KEY}, keys are \${JSON.stringify(ctx.redis.keys('*'))}\`);
+  const doc = JSON.parse(cached);
+  assert(Number(doc.count) === 1207 && Number(doc.as_of) === reply.as_of, \`\${KEY} must hold JSON {count, as_of} matching the reply, got \${JSON.stringify(cached)}\`);
+  const ttl = ctx.redis.ttl(KEY);
+  assert(1 <= ttl && ttl <= 2, \`\${KEY} expires in \${ttl} s, expected CACHE_TTL_S (2)\`);
+  ctx.clock.advance(3);
+  assert.equal(ctx.redis.exists(KEY), 0, \`\${KEY} must be gone after 2 s\`);
+}
+
+export async function check_cache_aside(ctx) {
+  const {stub, countEvents, rollup} = service(ctx);
+  await plays(ctx, countEvents, rollup, ['t-1', 1200], ['t-2', 7]);
+  const first = await get(stub, 'plays', 'stranger-things');
+  assert.equal(first.count, 1207, \`GetCount answered \${first.count}, expected the rolled-up 1207\`);
+  await plays(ctx, countEvents, rollup, ['t-3', 93]); // the buckets move on to 1300
+  ctx.clock.advance(1);
+  const second = await get(stub, 'plays', 'stranger-things');
+  assert.deepEqual([second.count, second.as_of], [first.count, first.as_of], \`1 s after the first read the buckets moved to 1300, but a read within CACHE_TTL_S is served from \${KEY}: expected the cached pair [\${first.count}, \${first.as_of}], got [\${second.count}, \${second.as_of}]\`);
+  ctx.clock.advance(1.5);
+  const third = await get(stub, 'plays', 'stranger-things');
+  assert.equal(third.count, 1300, \`2.5 s after the total was cached the entry has expired and the next read must sum the buckets again: expected the new total 1300, got \${third.count}\`);
+  assert(third.as_of >= first.as_of + 2, \`as_of must be the time of the recomputation (\${first.as_of + 2} or later), got \${third.as_of}\`);
+}
+
+export async function check_reply(ctx) {
+  const {stub, bestEffort, countEvents, rollup} = service(ctx);
+  await bestEffort.addCount('views', 'trailer-7', 42);
+  let reply = await get(stub, 'views', 'trailer-7');
+  assert.equal(reply.count, 42, \`a best-effort namespace answers the counter's 42, got \${reply.count}\`);
+  let now = Math.floor(Date.now() / 1000);
+  assert(Math.abs(reply.as_of - now) <= 1, \`a best-effort reply's as_of is now (\${now}), got \${reply.as_of}\`);
+  assert.equal(ctx.redis.exists('total:views:trailer-7'), 0, 'best-effort counters are not cached: they are already one GET away');
+  await bestEffort.addCount('views', 'trailer-7', 8);
+  reply = await get(stub, 'views', 'trailer-7');
+  assert.equal(reply.count, 50, \`a best-effort read goes straight to the counter: right after another add of 8 GetCount must answer 50, got \${reply.count}\`);
+  await plays(ctx, countEvents, rollup, ['t-1', 1200], ['t-2', 7]);
+  reply = await get(stub, 'plays', 'stranger-things');
+  now = Math.floor(Date.now() / 1000);
+  assert(reply.count === 1207 && Math.abs(reply.as_of - now) <= 1, \`an eventually-consistent reply carries the rolled-up 1207 and a current as_of, got [\${reply.count}, \${reply.as_of}]\`);
+}
 `,
   },
   debrief: `GetCount is the read side of the abstraction, and it is served from a cache for the same reason the write side is a log: a popular counter is read far more often than its total changes, and summing buckets on every read would make the rollup store the hot spot. Two seconds of TTL is nothing on a number that is already eventually consistent, and as_of makes the staleness honest — a caller can see exactly how old the figure is instead of guessing. The status codes mirror the API's: NOT_FOUND and INVALID_ARGUMENT are the same two failures in gRPC's vocabulary, which is what lets one abstraction serve HTTPS clients and internal services alike. Netflix caches rolled-up values in EVCache in front of its rollup store and, for the counters that must be exact, offers a read that waits for the rollup instead of reading the cache.`,

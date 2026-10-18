@@ -6,6 +6,7 @@
 import {defaultKeymap, history, historyKeymap, indentWithTab} from '@codemirror/commands';
 import {cpp} from '@codemirror/lang-cpp';
 import {go} from '@codemirror/lang-go';
+import {javascript} from '@codemirror/lang-javascript';
 import {python} from '@codemirror/lang-python';
 import {
   type LanguageSupport,
@@ -36,6 +37,7 @@ import type {Language} from './types';
 
 const grammars: Record<Language, LanguageSupport | StreamLanguage<unknown>> = {
   python: python(),
+  typescript: javascript({typescript: true}),
   go: go(),
   scala: StreamLanguage.define(scala),
   cpp: cpp(),
@@ -51,6 +53,7 @@ export const INDENT: Record<Language, {unit: string; tabSize: number}> = {
   cpp: {unit: '  ', tabSize: 2},
   go: {unit: '\t', tabSize: 4},
   python: {unit: '    ', tabSize: 4},
+  typescript: {unit: '  ', tabSize: 2},
   scala: {unit: '  ', tabSize: 2},
 };
 

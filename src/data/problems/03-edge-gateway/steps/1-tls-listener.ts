@@ -45,6 +45,7 @@ Stand up the gateway process itself: the TLS listener every other step plugs int
         'A `GET /healthz` route must return the JSON document `{"ok": true}` so the load balancer can probe the process.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/healthz["']\s*\)/, /"ok":\s*True/]},
+        typescript: {all: [/\.get\(\s*['"]\/healthz['"]/, /ok:\s*true/]},
         go: {all: [/HandleFunc\(\s*"GET \/healthz"/, /"ok":\s*true/]},
         scala: {all: [/path\(\s*"healthz"\s*\)/, /"ok":\s*true/]},
         cpp: {all: [/svr\.Get\(\s*"\/healthz"/, /"ok":\s*true/]},
@@ -57,6 +58,7 @@ Stand up the gateway process itself: the TLS listener every other step plugs int
         'The TLS context must set a minimum protocol version of TLS 1.2; TLS 1.0/1.1 are deprecated and fail compliance scans.',
       match: {
         python: {all: [/minimum_version\s*=\s*ssl\.TLSVersion\.TLSv1_2/]},
+        typescript: {all: [/minVersion:\s*['"]TLSv1\.2['"]/]},
         go: {all: [/MinVersion:\s*tls\.VersionTLS12/]},
         scala: {all: [/setEnabledProtocols\([^\n]*"TLSv1\.2"/], none: [/"TLSv1"|"TLSv1\.1"|"SSLv3"/]},
         cpp: {all: [/SSL_CTX_set_min_proto_version\([^\n]*TLS1_2_VERSION/]},
@@ -69,6 +71,7 @@ Stand up the gateway process itself: the TLS listener every other step plugs int
         '`Strict-Transport-Security: max-age=63072000` must be added centrally (middleware / post-routing hook), not per route.',
       match: {
         python: {all: [/@app\.middleware\(\s*["']http["']\s*\)/, /Strict-Transport-Security/i, /max-age=63072000/]},
+        typescript: {all: [/addHook\(\s*['"]onSend['"]/, /Strict-Transport-Security/i, /max-age=63072000/]},
         go: {all: [/Handler:\s*hsts\(\s*mux\s*\)/, /Strict-Transport-Security/i, /max-age=63072000/]},
         scala: {all: [/respondWithHeaders?\(/, /Strict-Transport-Security/i, /max-age=63072000/]},
         cpp: {all: [/set_post_routing_handler\(/, /Strict-Transport-Security/i, /max-age=63072000/]},
@@ -81,6 +84,7 @@ Stand up the gateway process itself: the TLS listener every other step plugs int
         'A SIGTERM handler must call the server’s graceful shutdown (close the listener, let in-flight requests finish) instead of letting the process die mid-request.',
       match: {
         python: {all: [/signal\.SIGTERM/, /handle_exit/]},
+        typescript: {all: [/process\.(on|once)\(\s*['"]SIGTERM['"]/, /app\.close\(\)/]},
         go: {all: [/signal\.Notify(Context)?\([^\n]*syscall\.SIGTERM/, /srv\.Shutdown\(/]},
         scala: {all: [/addToCoordinatedShutdown\(|sys\.addShutdownHook/]},
         cpp: {all: [/SIGTERM/, /svr\.stop\(\)/]},
@@ -93,6 +97,7 @@ Stand up the gateway process itself: the TLS listener every other step plugs int
         'The drain must have a deadline (10 s): a client holding a connection open must not be able to keep the old process alive forever.',
       match: {
         python: {all: [/timeout_graceful_shutdown\s*=\s*(DRAIN_S|10)\b/]},
+        typescript: {all: [/setTimeout\([^\n]*(DRAIN_MS|10_?000)\s*\)/]},
         go: {all: [/context\.WithTimeout\([^\n]*(drainTimeout|10\s*\*\s*time\.Second)\s*\)/]},
         scala: {
           all: [
@@ -181,6 +186,61 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+import {cert, key} from 'gateway/tls';
+
+export const PORT = 8443;
+export const DRAIN_MS = 10_000;
+
+// TODO: https with cert, key and a TLS 1.2 floor (minVersion)
+export const app = Fastify();
+
+// TODO: a hook that adds Strict-Transport-Security: max-age=63072000 to every response
+
+app.get('/healthz', async (request, reply) => {
+  // TODO: {ok: true}
+  return reply.code(501).send();
+});
+
+/** The process entry point: listen, then hand SIGTERM to a bounded graceful stop. */
+export async function main(): Promise<void> {
+  await app.listen({port: PORT, host: '0.0.0.0'});
+  // TODO: on SIGTERM app.close() drains in-flight requests, then process.exit(0)
+  // TODO: a DRAIN_MS timer calls process.exit(1) if the drain takes longer
+}
+`,
+      solution: `import Fastify from 'fastify';
+import {cert, key} from 'gateway/tls';
+
+export const PORT = 8443;
+export const DRAIN_MS = 10_000;
+
+export const app = Fastify({
+  https: {cert, key, minVersion: 'TLSv1.2'},
+});
+
+// A hook, not a per-route header: no route can forget it.
+app.addHook('onSend', async (request, reply) => {
+  reply.header('Strict-Transport-Security', 'max-age=63072000');
+});
+
+app.get('/healthz', async () => ({ok: true}));
+
+/** The process entry point: listen, then hand SIGTERM to a bounded graceful stop. */
+export async function main(): Promise<void> {
+  await app.listen({port: PORT, host: '0.0.0.0'});
+  process.once('SIGTERM', () => {
+    // the listener closes at once; open connections get DRAIN_MS to finish, then the process exits anyway
+    const deadline = setTimeout(() => process.exit(1), DRAIN_MS);
+    void app.close().then(() => {
+      clearTimeout(deadline);
+      process.exit(0);
+    });
+  });
+}
 `,
     },
     go: {
@@ -507,6 +567,96 @@ async def check_drain_bound(ctx):
     drain = cfg.timeout_graceful_shutdown
     assert drain is not None, "the Config has no timeout_graceful_shutdown: a client holding a connection open could keep the old process alive forever"
     assert drain == 10, f"timeout_graceful_shutdown is {drain!r}, expected 10 s"
+`,
+    typescript: `/**
+ * No sockets and no real signals here: the runtime's \`process\` records handlers and exits, and the
+ * harness delivers SIGTERM through \`ctx.process.emit\`. The app's listen() and close() are wrapped so
+ * the check sees the configured port and decides when the "in-flight" connections are gone.
+ */
+
+/** Let the handler's promise chain run without a macrotask turn (a turn would jump the clock to the next timer). */
+const tick = async (): Promise<void> => {
+  for (let i = 0; i < 20; i += 1) await Promise.resolve();
+};
+
+/** Run main(): records what the listener was configured with and lets the check decide when the drain ends. */
+async function booted(ctx) {
+  const m = ctx.load('gateway_server');
+  const listens: {port?: number}[] = [];
+  const drain = Promise.withResolvers<void>();
+  const server = {closed: false, release: drain.resolve};
+  const listen = m.app.listen.bind(m.app);
+  m.app.listen = async (opts, cb) => {
+    listens.push(typeof opts === 'number' ? {port: opts} : opts ?? {});
+    return listen(opts, cb);
+  };
+  m.app.close = async () => {
+    server.closed = true;
+    await drain.promise;
+  };
+  assert.equal(typeof m.main, 'function', 'gateway_server must export main()');
+  await m.main();
+  assert(listens.length > 0, 'main() never called app.listen(): nothing is serving');
+  return {m, listens, server};
+}
+
+export async function check_healthz(ctx) {
+  const m = ctx.load('gateway_server');
+  const r = await ctx.client(m.app).get('/healthz');
+  assert.equal(r.status, 200, \`GET /healthz answered \${r.status}, expected 200\`);
+  assert((r.headers['content-type'] ?? '').startsWith('application/json'), \`GET /healthz must answer JSON, got Content-Type \${JSON.stringify(r.headers['content-type'])}\`);
+  assert.deepEqual(r.json(), {ok: true}, \`GET /healthz body is \${JSON.stringify(r.text)}, expected {"ok": true}\`);
+}
+
+export async function check_tls_min(ctx) {
+  const {m, listens} = await booted(ctx);
+  const port = listens[listens.length - 1].port;
+  assert.equal(port, 8443, \`the listener is configured on port \${port}, expected 8443\`);
+  const https = m.app.initialConfig.https as {cert?: unknown; key?: unknown; minVersion?: unknown} | undefined;
+  assert(https !== undefined && https !== null, 'the app was built without an https option: pass {https: {cert, key, minVersion}} to Fastify so it terminates TLS');
+  assert(https.cert && https.key, 'the https option must carry the cert and key from gateway/tls');
+  const floor = https.minVersion;
+  assert(floor !== undefined, 'https.minVersion is not set: Node still accepts TLS 1.0 and 1.1 by default, the floor must be TLSv1.2');
+  assert.equal(floor, 'TLSv1.2', \`https.minVersion is \${JSON.stringify(floor)}: the floor must be 'TLSv1.2'\`);
+}
+
+export async function check_hsts(ctx) {
+  const m = ctx.load('gateway_server');
+  const c = ctx.client(m.app);
+  const ok = await c.get('/healthz');
+  const missing = await c.get('/no-such-route');
+  for (const [name, r] of [['/healthz', ok], ['/no-such-route', missing]] as const) {
+    const value = r.headers['strict-transport-security'];
+    assert(value !== undefined, \`\${name} (\${r.status}) carries no Strict-Transport-Security header: add it in an onSend hook so every response has it\`);
+    assert(value.replace(/ /g, '').includes('max-age=63072000'), \`\${name}: Strict-Transport-Security is \${JSON.stringify(value)}, expected max-age=63072000\`);
+  }
+}
+
+export async function check_sigterm(ctx) {
+  const {server} = await booted(ctx);
+  assert(ctx.process.listenerCount('SIGTERM') > 0, 'main() installed no SIGTERM handler: the process would die mid-request when the orchestrator stops it');
+  assert(!server.closed, 'the server must keep serving until SIGTERM arrives');
+  ctx.process.emit('SIGTERM');
+  await tick();
+  assert(server.closed, 'the SIGTERM handler ran but the server was not told to stop: call app.close() so the listener closes and in-flight requests drain');
+  assert.equal(ctx.process.exited, null, \`the process exited with \${ctx.process.exited} while requests were still in flight: wait for app.close() to resolve before process.exit\`);
+  server.release();
+  await tick();
+  assert(ctx.process.exited !== null, 'the drain finished but the process is still running: process.exit(0) once app.close() has resolved');
+}
+
+export async function check_drain_bound(ctx) {
+  await booted(ctx);
+  assert(ctx.process.listenerCount('SIGTERM') > 0, 'main() installed no SIGTERM handler');
+  ctx.process.emit('SIGTERM');
+  await tick();
+  ctx.clock.advance(9);
+  await tick();
+  assert.equal(ctx.process.exited, null, \`9 s into the drain, with a request still in flight, the process already exited with \${ctx.process.exited}: give open connections the full 10 s\`);
+  ctx.clock.advance(2);
+  await tick();
+  assert(ctx.process.exited !== null, '11 s after SIGTERM the process is still alive with a connection held open: bound the drain to DRAIN_MS (10 s) with a timer that exits anyway');
+}
 `,
   },
   debrief: `The listener is where three cross-cutting policies live, because it is the one place every request passes: the TLS floor (a property of the context, checked once per handshake), HSTS (a middleware, so a new route cannot forget it) and graceful shutdown (close the accept socket first, then wait with a deadline). Real gateways add OCSP stapling, certificate hot-reload, ALPN for HTTP/2, and health checks that go *unhealthy* a few seconds before the drain starts so the load balancer stops sending traffic first.`,

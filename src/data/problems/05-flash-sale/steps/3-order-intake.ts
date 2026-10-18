@@ -53,6 +53,7 @@ the API answers:
         'The record goes to the `orders` topic with the SKU as its key so all orders for one product share a partition and an order.',
       match: {
         python: {all: [/producer\.produce\(\s*(topic\s*=\s*)?TOPIC\s*,[\s\S]{0,300}?key\s*=\s*order\[["']sku["']\]/]},
+        typescript: {all: [/producer\.send\(\s*\{[\s\S]{0,300}?topic:\s*TOPIC[\s\S]{0,300}?key:\s*order\.sku/]},
         go: {all: [/Balancer:\s*&kafka\.Hash\{\}/, /Key:\s*\[\]byte\(\s*order\.SKU\s*\)/]},
         scala: {all: [/new ProducerRecord(\[[^\]]*\])?\(\s*Topic\s*,\s*order\.sku\s*,/]},
         cpp: {
@@ -67,6 +68,7 @@ the API answers:
         'The record must be replicated before it counts as sent, and a producer retry must not duplicate it (kafka-go: `RequireAll` and bounded `MaxAttempts`; the consumer dedupes by order id).',
       match: {
         python: {all: [/"acks"\s*:\s*"all"/, /"enable\.idempotence"\s*:\s*(True|"true")/]},
+        typescript: {all: [/\.producer\(\s*\{[^}]*idempotent:\s*true/, /acks:\s*-1/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/, /MaxAttempts:\s*\d+/]},
         scala: {
           all: [
@@ -87,6 +89,7 @@ the API answers:
           all: [/producer\.flush\(\s*(?:timeout\s*=\s*)?ACK_TIMEOUT_S\s*\)/],
           order: [/producer\.produce\(/, /producer\.flush\(/],
         },
+        typescript: {all: [/await producer\.send\(/, /timeout:\s*ACK_TIMEOUT_MS/]},
         go: {
           all: [/context\.WithTimeout\(\s*ctx\s*,\s*ackTimeout\s*\)/, /writer\.WriteMessages\(/],
           none: [/Async:\s*true/],
@@ -107,6 +110,7 @@ the API answers:
         'A timeout or a delivery error must reach the API as `OrderNotAcknowledged` so it can release the hold and answer 503; logging it is not enough.',
       match: {
         python: {all: [/def enqueue_order(?:(?!\ndef )[\s\S])*?raise OrderNotAcknowledged\(/]},
+        typescript: {all: [/async function enqueueOrder(?:(?!\n\})[\s\S])*?throw new OrderNotAcknowledged\(/]},
         go: {all: [/func enqueueOrder(?:(?!\n\})[\s\S])*?errNotAcknowledged/]},
         scala: {all: [/def enqueueOrder(?:(?!\n {2}def )[\s\S])*?throw new OrderNotAcknowledged\(/]},
         cpp: {all: [/void enqueue_order(?:(?!\n\})[\s\S])*?throw OrderNotAcknowledged\(/]},
@@ -178,6 +182,73 @@ def enqueue_order(order: dict) -> None:
     if remaining or failures:
         reason = str(failures[0]) if failures else f"no ack within {ACK_TIMEOUT_S}s"
         raise OrderNotAcknowledged(f"order {order['order_id']}: {reason}")
+`,
+    },
+    typescript: {
+      starter: `import {Kafka} from 'kafkajs';
+
+import type {Order} from './checkout_api';
+
+export const TOPIC = 'orders';
+export const ACK_TIMEOUT_MS = 2000;
+
+/** The broker did not confirm the order in time; the caller must release the hold. */
+export class OrderNotAcknowledged extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OrderNotAcknowledged';
+  }
+}
+
+const kafka = new Kafka({clientId: 'checkout', brokers: ['kafka:9092']});
+// TODO: an idempotent producer (acks all is then the only option)
+export const producer = kafka.producer();
+const connected = producer.connect();
+
+/** Resolves once the order record is acknowledged; rejects with OrderNotAcknowledged otherwise. */
+export async function enqueueOrder(order: Order): Promise<void> {
+  await connected;
+  const value = JSON.stringify(order);
+  // TODO: send to TOPIC keyed by order.sku with acks -1 and a timeout of ACK_TIMEOUT_MS, and await the ack
+  // TODO: a rejected send (error or timeout) → OrderNotAcknowledged naming the order
+  throw new Error('not implemented');
+}
+`,
+      solution: `import {Kafka} from 'kafkajs';
+
+import type {Order} from './checkout_api';
+
+export const TOPIC = 'orders';
+export const ACK_TIMEOUT_MS = 2000;
+
+/** The broker did not confirm the order in time; the caller must release the hold. */
+export class OrderNotAcknowledged extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'OrderNotAcknowledged';
+  }
+}
+
+const kafka = new Kafka({clientId: 'checkout', brokers: ['kafka:9092']});
+export const producer = kafka.producer({idempotent: true});
+const connected = producer.connect();
+
+/** Resolves once the order record is acknowledged; rejects with OrderNotAcknowledged otherwise. */
+export async function enqueueOrder(order: Order): Promise<void> {
+  await connected;
+  const value = JSON.stringify(order);
+  try {
+    await producer.send({
+      topic: TOPIC,
+      messages: [{key: order.sku, value}],
+      acks: -1,
+      timeout: ACK_TIMEOUT_MS,
+    });
+  } catch (e) {
+    const reason = e instanceof Error ? e.message : String(e);
+    throw new OrderNotAcknowledged(\`order \${order.order_id}: \${reason}\`);
+  }
+}
 `,
     },
     go: {
@@ -546,6 +617,82 @@ def check_fails_loud(ctx):
     assert ctx.kafka.records("orders") == [], "a failed delivery must not leave a record on the topic"
     m.enqueue_order(dict(ORDER, order_id="o2"))
     assert len(ctx.kafka.records("orders")) == 1, "after the failure the next order must be acknowledged normally"
+`,
+    typescript: `const ORDER = {order_id: 'o1', sku: 'shoe-42', qty: 2, user: 'ada'};
+
+const keysOf = (ctx) => ctx.kafka.records('orders').map(r => r.key?.toString() ?? null);
+
+export async function check_topic_keyed(ctx) {
+  const m = ctx.load('order_intake');
+  await m.enqueueOrder(ORDER);
+  let produced = ctx.kafka.records('orders');
+  assert.equal(produced.length, 1, \`expected one record on the orders topic, found \${produced.length}\`);
+  assert.equal(produced[0].key?.toString(), 'shoe-42', \`the record key is \${JSON.stringify(produced[0].key?.toString() ?? null)}, expected the sku 'shoe-42'\`);
+  assert.deepEqual(JSON.parse(produced[0].value.toString()), ORDER, \`the record value is \${JSON.stringify(produced[0].value.toString())}, expected the JSON of the order\`);
+  await m.enqueueOrder({...ORDER, order_id: 'o2', user: 'grace'});
+  await m.enqueueOrder({...ORDER, order_id: 'o3', sku: 'hat-7'});
+  produced = ctx.kafka.records('orders');
+  assert.deepEqual(keysOf(ctx), ['shoe-42', 'shoe-42', 'hat-7'], \`records must be keyed by sku, got \${JSON.stringify(keysOf(ctx))}\`);
+  assert.equal(produced[0].partition, produced[1].partition, 'two orders for one sku must land on the same partition');
+}
+
+export async function check_durable_producer(ctx) {
+  const m = ctx.load('order_intake');
+  // The broker writes the record but its acknowledgement is lost: the producer retries.
+  ctx.kafka.loseAcks('orders');
+  await m.enqueueOrder(ORDER);
+  let n = ctx.kafka.records('orders').length;
+  assert.equal(n, 1, \`after a lost acknowledgement the topic holds \${n} copies of o1, expected 1: a retried send must not duplicate the order (idempotent producer)\`);
+  // The partition leader fails right after the write: only a record replicated to the ISR (acks all) survives.
+  await m.enqueueOrder({...ORDER, order_id: 'o2'});
+  ctx.kafka.failover('orders');
+  n = ctx.kafka.records('orders').length;
+  assert.equal(n, 2, \`after a leader failover the topic holds \${n} record(s), expected 2: with acks all the record is replicated before it counts as sent\`);
+}
+
+export async function check_awaits_ack(ctx) {
+  const m = ctx.load('order_intake');
+  // A dead broker: the request path must give up after at most 2 s, never return early, never hang.
+  ctx.kafka.stall('orders');
+  const started = ctx.clock.now();
+  let failed = false;
+  try {
+    await m.enqueueOrder(ORDER);
+  } catch (e) {
+    failed = true;
+    assert(e instanceof m.OrderNotAcknowledged, \`a broker that never acknowledges must surface as OrderNotAcknowledged, got \${e?.constructor?.name}: \${e?.message}\`);
+  }
+  const waited = ctx.clock.now() - started;
+  assert(failed || waited >= 1900, 'enqueueOrder returned without waiting for the acknowledgement: the 202 would be a guess, not a fact');
+  assert(failed, 'the broker never acknowledged but enqueueOrder resolved: it must reject with OrderNotAcknowledged');
+  assert(waited >= 1900, \`enqueueOrder gave up after \${waited} ms, expected to wait up to 2 s for the acknowledgement\`);
+  assert(waited <= 2600, \`enqueueOrder waited \${waited} ms on a dead broker, expected at most 2 s (ACK_TIMEOUT_MS)\`);
+  ctx.kafka.resume('orders');
+  // A broker that answers within the window: the send blocks until the ack and succeeds.
+  ctx.kafka.stall('orders', 1);
+  const before = ctx.clock.now();
+  await m.enqueueOrder({...ORDER, order_id: 'o2'});
+  assert(ctx.clock.now() - before >= 900, 'enqueueOrder resolved before the broker acknowledged the record');
+  assert.equal(ctx.kafka.records('orders').length, 1, 'once the broker answers again the order must be on the topic');
+}
+
+export async function check_fails_loud(ctx) {
+  const m = ctx.load('order_intake');
+  assert(m.OrderNotAcknowledged.prototype instanceof Error, 'OrderNotAcknowledged must stay an Error so the API can catch it');
+  ctx.kafka.failNext('orders');
+  let error: unknown = null;
+  try {
+    await m.enqueueOrder(ORDER);
+  } catch (e) {
+    error = e;
+  }
+  assert(error !== null, 'the broker reported a delivery error but enqueueOrder resolved normally; it must reject with OrderNotAcknowledged');
+  assert(error instanceof m.OrderNotAcknowledged, \`the delivery error surfaced as \${(error as Error)?.constructor?.name}, expected OrderNotAcknowledged\`);
+  assert((error as Error).message.includes('o1'), \`the error should name the order: \${JSON.stringify((error as Error).message)}\`);
+  assert.equal(ctx.kafka.records('orders').length, 0, 'a failed delivery must not leave a record on the topic');
+  await m.enqueueOrder({...ORDER, order_id: 'o2'});
+  assert.equal(ctx.kafka.records('orders').length, 1, 'after the failure the next order must be acknowledged normally');
+}
 `,
   },
   debrief: `Two knobs decide what an acknowledged write means: \`acks=all\` makes it "replicated", idempotence makes it "exactly one copy per send". Blocking on that ack is what turns the API's 202 from a hope into a fact, and bounding both the wait and the delivery timeout keeps the two sides of the promise consistent — a record can never sneak in after the hold was released. Real intakes go one step further with the transactional outbox: the order and its event are written in one database transaction and a relay publishes them, so even a crash between "reserved" and "produced" cannot lose an order.`,

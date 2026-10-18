@@ -48,6 +48,12 @@ follower's timeline. \`graph.followers(author)\` is provided and returns the fol
       detail: 'The consumer must use `group.id` `fanout` and subscribe to `posts`.',
       match: {
         python: {all: [/"group\.id"\s*:\s*"fanout"/, /subscribe\(\s*\[\s*"posts"\s*\]\s*\)/]},
+        typescript: {
+          all: [
+            /groupId:\s*['"]fanout['"]/,
+            /subscribe\(\s*\{[^\n]*(topic:\s*['"]posts['"]|topics:\s*\[[^\n]*['"]posts['"])/,
+          ],
+        },
         go: {all: [/GroupID:\s*"fanout"/, /Topic:\s*"posts"/]},
         scala: {all: [/"group\.id"\s*,\s*"fanout"|GROUP_ID_CONFIG\s*,\s*"fanout"/, /subscribe\([^\n]*"posts"/]},
         cpp: {all: [/"group\.id"\s*,\s*"fanout"/, /subscribe\([^\n]*"posts"/]},
@@ -59,6 +65,7 @@ follower's timeline. \`graph.followers(author)\` is provided and returns the fol
       detail: 'Offsets must be committed explicitly after the pushes — not on a timer, before you know they happened.',
       match: {
         python: {all: [/"enable\.auto\.commit"\s*:\s*False/]},
+        typescript: {all: [/autoCommit:\s*false/]},
         go: {all: [/reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
         scala: {all: [/"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/]},
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/]},
@@ -71,6 +78,7 @@ follower's timeline. \`graph.followers(author)\` is provided and returns the fol
         'Fetch the followers with `graph.followers` and do nothing when there are more than `CELEBRITY_FOLLOWERS` of them — those posts are pulled at read time.',
       match: {
         python: {all: [/graph\.followers\(/, /len\(\s*\w+\s*\)\s*>=?\s*(CELEBRITY_FOLLOWERS|10_?000)/]},
+        typescript: {all: [/graph\.followers\(/, /\.length\s*>=?\s*(CELEBRITY_FOLLOWERS|10_?000)/]},
         go: {all: [/graph\.Followers\(/, /len\(\s*\w+\s*\)\s*>=?\s*(celebrityFollowers|10000)/]},
         scala: {all: [/Graph\.followers\(/, /\.(size|length)\s*>=?\s*(CelebrityFollowers|10000)/]},
         cpp: {all: [/graph::followers\(/, /\.size\(\)\s*>=?\s*(kCelebrityFollowers|10000)/]},
@@ -83,6 +91,9 @@ follower's timeline. \`graph.followers(author)\` is provided and returns the fol
         '`LPUSH timeline:{follower} post_id` followed by `LTRIM timeline:{follower} 0 999` keeps timelines newest-first and bounded.',
       match: {
         python: {all: [/\.lpush\(/, /f"timeline:\{/, /\.ltrim\([^\n]*,\s*0\s*,\s*(TIMELINE_LEN\s*-\s*1|999)\s*\)/]},
+        typescript: {
+          all: [/\.lpush\(/, /`timeline:\$\{/, /\.ltrim\([^\n]*,\s*0\s*,\s*(TIMELINE_LEN\s*-\s*1|999)\s*\)/],
+        },
         go: {
           all: [
             /\.LPush\(/,
@@ -103,6 +114,10 @@ follower's timeline. \`graph.followers(author)\` is provided and returns the fol
         python: {
           all: [/range\(\s*0\s*,\s*len\([^\n]*,\s*(BATCH|500)\s*\)/],
           order: [/\.execute\(\)/, /consumer\.commit\(/],
+        },
+        typescript: {
+          all: [/\+=\s*(BATCH|500)\b/, /\.slice\(\s*\w+\s*,\s*\w+\s*\+\s*(BATCH|500)\s*\)/],
+          order: [/\.exec\(\)/, /commitOffsets\(/],
         },
         go: {all: [/\+=\s*(batch|500)\b/], order: [/\.Exec\(\s*ctx\s*\)/, /reader\.CommitMessages\(/]},
         scala: {all: [/\.grouped\(\s*(Batch|500)\s*\)/], order: [/\.sync\(\)/, /consumer\.commitSync\(/]},
@@ -206,6 +221,92 @@ def run() -> None:
         post = json.loads(msg.value())
         fan_out(post["post_id"], post["author"])
         consumer.commit(message=msg, asynchronous=False)
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+import {graph} from 'feed/graph'; // provided: graph.followers(authorId) → string[]
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const CELEBRITY_FOLLOWERS = 10_000;
+export const TIMELINE_LEN = 1000;
+export const BATCH = 500;
+
+const kafka = new Kafka({clientId: 'fanout', brokers: ['kafka:9092']});
+const consumer = kafka.consumer({groupId: 'fanout'});
+
+interface PostRecord {
+  post_id: string;
+  author: string;
+}
+
+export async function fanOut(postId: string, author: string): Promise<void> {
+  // TODO: graph.followers(author); more than CELEBRITY_FOLLOWERS → return (pulled at read time)
+  // TODO: per BATCH followers: one pipeline of LPUSH timeline:{f} postId + LTRIM timeline:{f} 0 TIMELINE_LEN-1
+  throw new Error('not implemented');
+}
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: 'posts', fromBeginning: true});
+  await consumer.run({
+    // TODO: disable auto-commit
+    eachMessage: async ({topic, partition, message}) => {
+      const post = JSON.parse(message.value?.toString() ?? '') as PostRecord;
+      // TODO: fanOut(post.post_id, post.author), then commit this message's offset
+      throw new Error('not implemented');
+    },
+  });
+}
+`,
+      solution: `import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+import {graph} from 'feed/graph'; // provided: graph.followers(authorId) → string[]
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const CELEBRITY_FOLLOWERS = 10_000;
+export const TIMELINE_LEN = 1000;
+export const BATCH = 500;
+
+const kafka = new Kafka({clientId: 'fanout', brokers: ['kafka:9092']});
+const consumer = kafka.consumer({groupId: 'fanout'});
+
+interface PostRecord {
+  post_id: string;
+  author: string;
+}
+
+export async function fanOut(postId: string, author: string): Promise<void> {
+  const fans = graph.followers(author);
+  if (fans.length > CELEBRITY_FOLLOWERS) return; // celebrity: followers pull posts:{author} at read time (step 3)
+  for (let i = 0; i < fans.length; i += BATCH) {
+    const pipe = redis.pipeline();
+    for (const follower of fans.slice(i, i + BATCH)) {
+      const key = \`timeline:\${follower}\`;
+      pipe.lpush(key, postId);
+      pipe.ltrim(key, 0, TIMELINE_LEN - 1);
+    }
+    await pipe.exec();
+  }
+}
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: 'posts', fromBeginning: true});
+  await consumer.run({
+    autoCommit: false,
+    eachMessage: async ({topic, partition, message}) => {
+      const post = JSON.parse(message.value?.toString() ?? '') as PostRecord;
+      await fanOut(post.post_id, post.author);
+      await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
+    },
+  });
+}
 `,
     },
     go: {
@@ -654,6 +755,85 @@ def check_batched_commit(ctx):
     assert max(sizes) <= 1000 and sum(sizes) == 2480, f"each pipeline carries LPUSH + LTRIM for at most 500 followers, observed command counts {sizes}"
     assert at_commit, "the offset was never committed"
     assert at_commit[0] == (3, 1), f"the commit must come after the last pipeline executed: at commit time {at_commit[0][0]} pipeline(s) had run and timeline:f1239 had {at_commit[0][1]} entries"
+`,
+    typescript: `import {FOLLOWERS} from 'feed/graph';
+
+function post(ctx, postId: string, author: string) {
+  const value = {post_id: postId, author, text: 'hi', media_ids: [], created_at: 1700000000000};
+  ctx.kafka.seed('posts', {key: author, value: JSON.stringify(value)});
+}
+
+function worker(ctx, followers: Record<string, string[]>) {
+  const m = ctx.load('fanout_worker');
+  Object.assign(FOLLOWERS, followers);
+  return m;
+}
+
+export async function check_group(ctx) {
+  post(ctx, 'p1', 'ann');
+  const m = worker(ctx, {ann: ['bob']});
+  await ctx.drain(m.run());
+  const subscriptions = ctx.kafka.events.filter(e => e[0] === 'subscribe');
+  assert(subscriptions.length > 0, 'the consumer must subscribe to a topic');
+  const [, group, topics] = subscriptions[subscriptions.length - 1];
+  assert.equal(group, 'fanout', \`groupId must be fanout, got \${JSON.stringify(group)}\`);
+  assert(topics.includes('posts'), \`the consumer must subscribe to posts, got \${JSON.stringify(topics)}\`);
+  assert.deepEqual(ctx.redis.lrange('timeline:bob', 0, -1), ['p1'], \`after consuming p1 by ann, timeline:bob is \${JSON.stringify(ctx.redis.lrange('timeline:bob', 0, -1))}, expected ['p1']\`);
+}
+
+export async function check_manual_commit(ctx) {
+  post(ctx, 'p1', 'ann');
+  post(ctx, 'p2', 'ann');
+  const m = worker(ctx, {ann: ['bob', 'cat']});
+  await ctx.drain(m.run());
+  const consumer = ctx.kafka.consumers[ctx.kafka.consumers.length - 1];
+  assert(consumer !== undefined && consumer.autoCommit === false, 'autoCommit must be false: offsets would be committed on a timer, before the pushes');
+  assert(!ctx.kafka.events.some(e => e[0] === 'auto-commit'), 'auto-commit is on: offsets were committed on a timer, before processing');
+  assert(ctx.kafka.events.some(e => e[0] === 'manual-commit'), 'no explicit commit happened');
+  assert.equal(ctx.kafka.lag('fanout', 'posts'), 0, 'every processed record must be committed');
+}
+
+export async function check_celebrity(ctx) {
+  post(ctx, 'p1', 'taylor');
+  post(ctx, 'p2', 'ann');
+  const m = worker(ctx, {taylor: Array.from({length: 10_001}, (_, i) => \`fan\${i}\`), ann: ['bob', 'cat']});
+  await ctx.drain(m.run());
+  assert.deepEqual(ctx.redis.lrange('timeline:bob', 0, -1), ['p2'], \`ann has 2 followers: her post must be pushed, timeline:bob is \${JSON.stringify(ctx.redis.lrange('timeline:bob', 0, -1))}\`);
+  const pushed = ctx.redis.keys('timeline:fan*');
+  assert.equal(pushed.length, 0, \`taylor has 10 001 followers: her post must not be fanned out, but \${pushed.length} fan timelines were written\`);
+  assert.equal(ctx.kafka.lag('fanout', 'posts'), 0, 'a skipped celebrity post must still have its offset committed');
+}
+
+export async function check_push_trim(ctx) {
+  ctx.redis.rpush('timeline:bob', ...Array.from({length: 1000}, (_, i) => \`old\${i}\`));
+  post(ctx, 'p1', 'ann');
+  post(ctx, 'p2', 'ann');
+  const m = worker(ctx, {ann: ['bob', 'cat']});
+  await ctx.drain(m.run());
+  const bob = ctx.redis.lrange('timeline:bob', 0, -1);
+  assert.deepEqual(bob.slice(0, 2), ['p2', 'p1'], \`timeline:bob must start with the newest post (LPUSH), got \${JSON.stringify(bob.slice(0, 3))}\`);
+  assert.equal(bob.length, 1000, \`timeline:bob has \${bob.length} entries, expected it trimmed to 1000\`);
+  assert.equal(bob[bob.length - 1], 'old997', \`LTRIM must drop the oldest entries: the tail is \${JSON.stringify(bob[bob.length - 1])}, expected 'old997'\`);
+  assert.deepEqual(ctx.redis.lrange('timeline:cat', 0, -1), ['p2', 'p1'], \`timeline:cat is \${JSON.stringify(ctx.redis.lrange('timeline:cat', 0, -1))}, expected ['p2', 'p1']\`);
+}
+
+export async function check_batched_commit(ctx) {
+  const fans = Array.from({length: 1240}, (_, i) => \`f\${i}\`);
+  post(ctx, 'p1', 'ann');
+  const m = worker(ctx, {ann: fans});
+  const pipelines = () => ctx.redisRoundTrips().filter(t => t.length > 1);
+  const atCommit: [number, number][] = [];
+  ctx.kafka.onCommit(() => atCommit.push([pipelines().length, ctx.redis.llen('timeline:f1239')]));
+  await ctx.drain(m.run());
+  assert.deepEqual(ctx.redis.lrange('timeline:f1239', 0, -1), ['p1'], 'every one of the 1240 followers must receive the post');
+  const writes = ctx.redisRoundTrips().filter(t => t.length === 1 && (t[0] === 'LPUSH' || t[0] === 'LTRIM'));
+  assert.equal(writes.length, 0, \`\${writes.length} LPUSH/LTRIM were sent one by one: queue them on a pipeline per batch of 500 followers\`);
+  const sizes = pipelines().map(t => t.length);
+  assert.equal(sizes.length, 3, \`1240 followers must take 3 pipelines (500, 500, 240 followers), observed \${sizes.length} pipeline exec(s)\`);
+  assert(Math.max(...sizes) <= 1000 && sizes.reduce((a, b) => a + b, 0) === 2480, \`each pipeline carries LPUSH + LTRIM for at most 500 followers, observed command counts \${JSON.stringify(sizes)}\`);
+  assert(atCommit.length > 0, 'the offset was never committed');
+  assert.deepStrictEqual(atCommit[0], [3, 1], \`the commit must come after the last pipeline executed: at commit time \${atCommit[0][0]} pipeline(s) had run and timeline:f1239 had \${atCommit[0][1]} entries\`);
+}
 `,
   },
   debrief: `Fan-out on write moves the cost from every read to the one write: a post costs one Redis command pair per follower, after which every follower's feed is a single \`LRANGE\`. The celebrity threshold is what keeps that bounded — one account with 50 million followers would otherwise turn a post into 50 million writes and a minutes-long delay for everyone else on the same partition. Pipelining matters as much as the threshold: 500 commands in one round trip versus 500 round trips is the difference between milliseconds and seconds. Real systems also skip inactive followers (they rebuild the timeline on their next login instead), shard timelines across Redis clusters, and run several worker groups so one hot author cannot stall the rest.`,

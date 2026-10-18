@@ -10,6 +10,7 @@
 import type {PyodideInterface} from 'pyodide';
 
 import type {DbBridge} from './db';
+import type {RunJob, RunResult, RuntimeCheckResult} from './types';
 
 export const PYODIDE_VERSION = '314.0.7';
 export const PYODIDE_INDEX_URL = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`;
@@ -48,33 +49,6 @@ export interface Assets {
 export interface HostBridges {
   luaEval(script: string, keysJson: string, argvJson: string, redisCall: (argsJson: string) => string): string;
   db: DbBridge;
-}
-
-export interface RunJob {
-  /** The learner's files by file name (`thumb_server.py`). */
-  files: Record<string, string>;
-  /** The course's support modules by path (`payments/db.py`, `resizer_pb2.py`). */
-  support: Record<string, string>;
-  /** The step's harness module (`check_<id>(ctx)` functions). */
-  harness: string;
-  /** Check ids to run, in verdict order. */
-  checks: string[];
-}
-
-export interface RuntimeCheckResult {
-  id: string;
-  passed: boolean;
-  /** Why it failed: the assertion message, or the exception and where in the learner's code it was raised. */
-  message?: string;
-}
-
-export interface RunResult {
-  checks: RuntimeCheckResult[];
-  stdout: string;
-  stderr: string;
-  /** The run could not complete (runtime failure, timeout); `checks` is then empty. */
-  error?: string;
-  ms: number;
 }
 
 const mkdirTree = (pyodide: PyodideInterface, path: string): void => {

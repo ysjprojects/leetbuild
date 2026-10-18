@@ -17,8 +17,8 @@ import {downloadCertificate} from '@/lib/certificate';
 import {downloadMarkdown, exportFileName, problemToMarkdown, problemUrl, siteUrl} from '@/lib/export';
 import {type Badge, badgeOf, dayKey, earnedBadges, streakOf} from '@/lib/gamify';
 import {type Verdict, judge, withRuntime} from '@/lib/judge';
-import {type RuntimeStatus, getPythonRunner} from '@/lib/runtime/client';
-import type {RunJob} from '@/lib/runtime/python';
+import {type RuntimeStatus, getRunner} from '@/lib/runtime/client';
+import type {RunJob} from '@/lib/runtime/types';
 import {
   type StepAttempt,
   type Submission,
@@ -407,8 +407,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   const [verdict, setVerdict] = useState<Verdict | null>(null);
   const [verdictCode, setVerdictCode] = useState('');
   const [earned, setEarned] = useState<number | null>(null);
-  const runner = useMemo(() => getPythonRunner(), []);
-  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>(runner.status);
+  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>({state: 'idle'});
   /** A submission is executing in the runtime; its result is still to come. */
   const [running, setRunning] = useState(false);
   /** Bumped per submit and on every mount: a run that finishes after the step changed must not show its verdict. */
@@ -446,6 +445,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     problem === null ? null : resolveStep(problem, progress.attempts, stepId ?? progress.lastStep[problem.id]);
   const stepIndex = problem === null || step === null ? -1 : problem.steps.indexOf(step);
   const language = progress.language;
+  const runner = useMemo(() => getRunner(language), [language]);
   const attemptKey = problem !== null && step !== null ? stepKey(problem.id, step.id) : null;
   const attempt: StepAttempt = attemptKey === null ? OPEN_ATTEMPT : progress.attempts[attemptKey] ?? OPEN_ATTEMPT;
   /** The step's own file — what Submit judges and the solution diffs against, whichever tab is open. */
@@ -794,11 +794,18 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   );
 
   // Judging ----------------------------------------------------------------------------------------
-  useEffect(() => runner.onStatus(setRuntimeStatus), [runner]);
+  useEffect(() => {
+    if (runner === null) {
+      setRuntimeStatus({state: 'idle'});
+      return undefined;
+    }
+    setRuntimeStatus(runner.status);
+    return runner.onStatus(setRuntimeStatus);
+  }, [runner]);
 
   // A step that runs in the browser boots the runtime as soon as it opens, so Submit does not wait for the download.
   useEffect(() => {
-    if (loaded && step?.harness?.[language] !== undefined) runner.prewarm();
+    if (loaded && step?.harness?.[language] !== undefined) runner?.prewarm();
   }, [loaded, step, language, runner]);
 
   /** Record a decided verdict: the attempt, the submission history, the score, the celebration. */
@@ -874,6 +881,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       harness,
       checks: step.checks.map(c => c.id),
     };
+    if (runner === null) return;
     setVerdict(null);
     setRunning(true);
     void runner.run(job).then(run => {

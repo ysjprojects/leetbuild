@@ -41,6 +41,7 @@ Implement \`get_thumb(id, width)\` as a **cache-aside** lookup in Redis. \`rende
       detail: 'Use `thumb:{id}:{width}` so every rendered size is its own entry.',
       match: {
         python: {all: [/f["']thumb:\{image_id\}:\{width\}["']/]},
+        typescript: {all: [/`thumb:\$\{imageId\}:\$\{width\}`/]},
         go: {all: [/"thumb:%s:%d"/]},
         scala: {all: [/s"thumb:\$\{?id\}?:\$\{?width\}?"/]},
         cpp: {all: [/"thumb:"\s*\+\s*id\s*\+\s*":"\s*\+\s*std::to_string\(\s*width\s*\)/]},
@@ -52,6 +53,7 @@ Implement \`get_thumb(id, width)\` as a **cache-aside** lookup in Redis. \`rende
       detail: 'Cache-aside means GET first and only render on a miss.',
       match: {
         python: {order: [/\br\.get\(\s*key\s*\)/, /render\(/]},
+        typescript: {order: [/\bredis\.get(Buffer)?\(\s*key\s*\)/, /render\(/]},
         go: {order: [/rdb\.Get\(\s*ctx\s*,\s*key\s*\)/, /render\(/]},
         scala: {order: [/jedis\.get\(\s*key(\.getBytes)?\s*\)/, /render\(/]},
         cpp: {order: [/redis\.get\(\s*key\s*\)/, /render\(/]},
@@ -64,6 +66,9 @@ Implement \`get_thumb(id, width)\` as a **cache-aside** lookup in Redis. \`rende
       match: {
         python: {
           all: [/\.set\(\s*key\s*,\s*data\s*,\s*ex\s*=\s*TTL_S\s*\)|\.setex\(\s*key\s*,\s*TTL_S\s*,\s*data\s*\)/],
+        },
+        typescript: {
+          all: [/\.set\(\s*key\s*,\s*data[^\n]*['"]EX['"]\s*,\s*TTL_S\s*\)|\.setex\(\s*key\s*,\s*TTL_S\s*,\s*data/],
         },
         go: {all: [/rdb\.Set\(\s*ctx\s*,\s*key\s*,\s*data\s*,\s*ttl\s*\)/]},
         scala: {all: [/jedis\.setex\(\s*key\.getBytes[^\n]*TtlSeconds|jedis\.setex\(\s*key\s*,\s*TtlSeconds/]},
@@ -80,6 +85,12 @@ Implement \`get_thumb(id, width)\` as a **cache-aside** lookup in Redis. \`rende
           all: [
             /\.set\(\s*key\s*,\s*MISSING\s*,\s*ex\s*=\s*MISSING_TTL_S\s*\)|\.setex\(\s*key\s*,\s*MISSING_TTL_S\s*,\s*MISSING\s*\)/,
             /==\s*MISSING/,
+          ],
+        },
+        typescript: {
+          all: [
+            /\.set\(\s*key\s*,\s*MISSING\s*,\s*['"]EX['"]\s*,\s*MISSING_TTL_S\s*\)|\.setex\(\s*key\s*,\s*MISSING_TTL_S\s*,\s*MISSING\s*\)/,
+            /===?\s*MISSING/,
           ],
         },
         go: {all: [/rdb\.Set\(\s*ctx\s*,\s*key\s*,\s*missing\s*,\s*missingTTL\s*\)/, /==\s*missing/]},
@@ -145,6 +156,60 @@ def get_thumb(image_id: str, width: int) -> bytes | None:
         return None
     r.set(key, data, ex=TTL_S)
     return data
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const TTL_S = 86400;
+export const MISSING_TTL_S = 60;
+export const MISSING = '__missing__';
+
+/** The resizer (built in step 4): the JPEG bytes, or null when the origin has no such image. */
+export const resizer = {
+  async render(imageId: string, width: number): Promise<Buffer | null> {
+    throw new Error('not implemented');
+  },
+};
+
+/** Thumbnails are bytes: read them with getBuffer, never as a UTF-8 string. */
+export async function getThumb(imageId: string, width: number): Promise<Buffer | null> {
+  const key = ''; // TODO: thumb:{id}:{width}
+  // TODO: GET first; a hit returns the bytes (or null when it is the MISSING sentinel)
+  // TODO: miss → resizer.render(); null → SET MISSING with MISSING_TTL_S; bytes → SET with TTL_S
+  throw new Error('not implemented');
+}
+`,
+      solution: `import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const TTL_S = 86400;
+export const MISSING_TTL_S = 60;
+export const MISSING = '__missing__';
+
+/** The resizer (built in step 4): the JPEG bytes, or null when the origin has no such image. */
+export const resizer = {
+  async render(imageId: string, width: number): Promise<Buffer | null> {
+    throw new Error('not implemented');
+  },
+};
+
+/** Thumbnails are bytes: read them with getBuffer, never as a UTF-8 string. */
+export async function getThumb(imageId: string, width: number): Promise<Buffer | null> {
+  const key = \`thumb:\${imageId}:\${width}\`;
+  const cached = await redis.getBuffer(key);
+  if (cached !== null) return cached.toString() === MISSING ? null : cached;
+  const data = await resizer.render(imageId, width);
+  if (data === null) {
+    await redis.set(key, MISSING, 'EX', MISSING_TTL_S);
+    return null;
+  }
+  await redis.set(key, data, 'EX', TTL_S);
+  return data;
+}
 `,
     },
     go: {
@@ -388,6 +453,65 @@ def check_negative(ctx):
     ctx.clock.advance(61)
     m.get_thumb("ghost", 256)
     assert len(calls) == 2, "once the sentinel expires the image is rendered again"
+`,
+    typescript: `/** Fake JPEG bytes: the real SOI marker (FF D8 FF, not valid UTF-8) and a label. */
+const jpeg = (label: string) => Buffer.concat([Buffer.from([0xff, 0xd8, 0xff]), Buffer.from(label)]);
+const hex = (b: Buffer | null) => (b === null ? 'null' : b.toString('hex'));
+
+/** The resizer (step 4): knows cat, records every call. Swapped onto the learner's provided resizer object. */
+function cache(ctx, calls: [string, number][]) {
+  const m = ctx.load('thumb_cache');
+  m.resizer.render = async (imageId: string, width: number) => {
+    calls.push([imageId, width]);
+    return imageId === 'cat' ? jpeg(\`JPEG-\${imageId}\`) : null;
+  };
+  return m;
+}
+
+export async function check_key(ctx) {
+  const m = cache(ctx, []);
+  const got = await m.getThumb('cat', 256);
+  assert(got !== null && jpeg('JPEG-cat').equals(got), \`a miss must return the rendered bytes: got \${hex(got)}, expected \${hex(jpeg('JPEG-cat'))}\`);
+  assert(ctx.redis.exists('thumb:cat:256'), \`after a miss the bytes must be stored under thumb:cat:256, keys are \${JSON.stringify(ctx.redis.keys('*'))}\`);
+  const stored = ctx.redis.getBuffer('thumb:cat:256');
+  assert(jpeg('JPEG-cat').equals(stored), \`the cached value must be the rendered bytes, verbatim: stored \${hex(stored)}, expected \${hex(jpeg('JPEG-cat'))}\`);
+  await m.getThumb('cat', 64);
+  assert(ctx.redis.exists('thumb:cat:64'), 'every width is its own entry: thumb:cat:64');
+}
+
+export async function check_read_first(ctx) {
+  const calls: [string, number][] = [];
+  const m = cache(ctx, calls);
+  ctx.redis.set('thumb:cat:256', jpeg('CACHED'));
+  const hit = await m.getThumb('cat', 256);
+  assert(hit !== null && jpeg('CACHED').equals(hit), \`a hit must return the cached bytes verbatim (read them as bytes, not as a UTF-8 string): got \${hex(hit)}, expected \${hex(jpeg('CACHED'))}\`);
+  assert.deepEqual(calls, [], 'render() must not run on a hit');
+  const miss = await m.getThumb('cat', 128);
+  assert(miss !== null && jpeg('JPEG-cat').equals(miss));
+  assert.deepEqual(calls, [['cat', 128]], 'a miss renders exactly once');
+}
+
+export async function check_ttl(ctx) {
+  const m = cache(ctx, []);
+  await m.getThumb('cat', 256);
+  const ttl = ctx.redis.ttl('thumb:cat:256');
+  assert(86000 <= ttl && ttl <= 86400, \`expected a TTL of 86400 s on thumb:cat:256, got \${ttl}\`);
+  ctx.clock.advance(86401);
+  assert.equal(ctx.redis.get('thumb:cat:256'), null, 'the entry must be gone once the TTL passes');
+}
+
+export async function check_negative(ctx) {
+  const calls: [string, number][] = [];
+  const m = cache(ctx, calls);
+  assert.equal(await m.getThumb('ghost', 256), null, 'a missing image returns nothing');
+  assert.equal(await m.getThumb('ghost', 256), null, 'a missing image still returns nothing on the second call');
+  assert.equal(calls.length, 1, \`render ran \${calls.length} times for a missing image; the second call must hit the negative cache\`);
+  const ttl = ctx.redis.ttl('thumb:ghost:256');
+  assert(0 < ttl && ttl <= 60, \`the negative entry must expire within 60 s, got TTL \${ttl}\`);
+  ctx.clock.advance(61);
+  await m.getThumb('ghost', 256);
+  assert.equal(calls.length, 2, 'once the sentinel expires the image is rendered again');
+}
 `,
   },
   debrief: `Cache-aside keeps the cache a pure optimisation: if Redis is flushed the service still works, only slower. The TTL bounds staleness and memory; the sentinel turns a class of expensive repeated misses into cheap hits. Real caches add jittered TTLs so entries written together do not expire together, and size limits with an eviction policy (\`allkeys-lru\`).`,

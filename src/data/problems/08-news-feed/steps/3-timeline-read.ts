@@ -60,6 +60,12 @@ celebrities the user follows, **pulled** from their \`posts:{celebrity}\` sorted
             /\.lrange\([^\n]*,\s*0\s*,\s*(2\s*\*\s*limit|limit\s*\*\s*2|TIMELINE_LEN\s*-\s*1|999)/,
           ],
         },
+        typescript: {
+          all: [
+            /`timeline:\$\{userId\}`|['"]timeline:['"]\s*\+\s*userId/,
+            /\.lrange\([^\n]*,\s*0\s*,\s*(2\s*\*\s*limit|limit\s*\*\s*2|TIMELINE_LEN\s*-\s*1|999)/,
+          ],
+        },
         go: {
           all: [
             /"timeline:"\s*\+\s*userID|"timeline:%s"/,
@@ -93,6 +99,9 @@ celebrities the user follows, **pulled** from their \`posts:{celebrity}\` sorted
             /\.zrevrangebyscore\(|\.zrange\([^\n]*byscore\s*=\s*True/,
           ],
         },
+        typescript: {
+          all: [/graph\.celebritiesFollowed\(/, /`posts:\$\{/, /\.zrevrangebyscore\(|\.zrange\([^\n]*['"]REV['"]/],
+        },
         go: {all: [/graph\.CelebritiesFollowed\(/, /"posts:"\s*\+|"posts:%s"/, /\.ZRevRangeByScore\(|Rev:\s*true/]},
         scala: {all: [/Graph\.celebritiesFollowed\(/, /s"posts:\$/, /\.zrevrangeByScore\(|\.rev\(\)/]},
         cpp: {all: [/graph::celebrities_followed\(/, /"posts:"\s*\+/, /\.zrevrangebyscore\(/]},
@@ -107,6 +116,10 @@ celebrities the user follows, **pulled** from their \`posts:{celebrity}\` sorted
         python: {
           all: [/\br\.pipeline\(/, /\.execute\(\)/],
           none: [/\br\.lrange\(|\br\.zrevrangebyscore\(|\br\.zrange\(/],
+        },
+        typescript: {
+          all: [/\bredis\.pipeline\(/, /\.exec\(\)/],
+          none: [/\bredis\.lrange\(|\bredis\.zrevrangebyscore\(|\bredis\.zrange\(/],
         },
         go: {
           all: [/rdb\.Pipeline\(\)/, /\.Exec\(\s*ctx\s*\)/],
@@ -125,6 +138,7 @@ celebrities the user follows, **pulled** from their \`posts:{celebrity}\` sorted
       detail: 'Sort the union of both sources by `created_at` descending and keep the first `limit` ids.',
       match: {
         python: {all: [/(sorted|\.sort)\([^\n]*created_at[^\n]*\)/, /reverse\s*=\s*True/, /\[\s*:\s*limit\s*\]/]},
+        typescript: {all: [/\.sort\([^\n]*createdAt/, /\.slice\(\s*0\s*,\s*limit\s*\)/]},
         go: {all: [/sort\.Slice\(|slices\.SortFunc\(/, /CreatedAt\(/, /\[\s*:\s*limit\s*\]/]},
         scala: {all: [/\.sortBy\(|\.sortWith\(|\.sorted\b/, /createdAt\(/, /\.take\(\s*limit\s*\)/]},
         cpp: {all: [/std::(stable_)?sort\(/, /created_at\(/, /\.resize\(\s*limit\s*\)|\.erase\([^\n]*\+\s*limit/]},
@@ -137,6 +151,12 @@ celebrities the user follows, **pulled** from their \`posts:{celebrity}\` sorted
         'Pushed ids at or after the cursor are dropped (`created_at(id) < cursor`), and `next_cursor` is the `created_at` of the last post of the page.',
       match: {
         python: {all: [/created_at\(\s*\w+\s*\)\s*(<|>=)\s*cursor/, /created_at\(\s*\w+\[\s*-1\s*\]\s*\)/]},
+        typescript: {
+          all: [
+            /createdAt\(\s*\w+\s*\)\s*(<|>=)\s*cursor/,
+            /createdAt\(\s*\w+\[\s*\w+\.length\s*-\s*1\s*\]\s*\)|createdAt\(\s*\w+\.at\(\s*-1\s*\)\s*\)/,
+          ],
+        },
         go: {
           all: [
             /CreatedAt\(\s*\w+\s*\)\s*(<|>=)\s*\*?cursor/,
@@ -198,6 +218,50 @@ def read(user_id: str, cursor: int | None, limit: int) -> tuple[list[str], int |
     page = sorted(candidates, key=created_at, reverse=True)[:limit]
     next_cursor = created_at(page[-1]) if page else None
     return page, next_cursor
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+
+import {graph} from 'feed/graph'; // provided: graph.celebritiesFollowed(userId) → string[]
+import {createdAt} from 'feed/ids'; // provided: createdAt(postId) → ms (the id carries its timestamp)
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const TIMELINE_LEN = 1000;
+
+/** Post ids for the home timeline, newest first, and the cursor of the next page. */
+export async function read(userId: string, cursor: number | null, limit: number): Promise<[string[], number | null]> {
+  const celebrities = graph.celebritiesFollowed(userId);
+  // TODO: one pipeline: LRANGE timeline:{userId} 0 2*limit-1, then ZREVRANGEBYSCORE posts:{c} (cursor -inf LIMIT 0 limit per celebrity
+  // TODO: keep pushed ids with createdAt < cursor; merge, dedupe, sort by createdAt desc, cut to limit
+  // TODO: next_cursor = createdAt of the last id, or null
+  throw new Error('not implemented');
+}
+`,
+      solution: `import Redis from 'ioredis';
+
+import {graph} from 'feed/graph'; // provided: graph.celebritiesFollowed(userId) → string[]
+import {createdAt} from 'feed/ids'; // provided: createdAt(postId) → ms (the id carries its timestamp)
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const TIMELINE_LEN = 1000;
+
+/** Post ids for the home timeline, newest first, and the cursor of the next page. */
+export async function read(userId: string, cursor: number | null, limit: number): Promise<[string[], number | null]> {
+  const celebrities = graph.celebritiesFollowed(userId);
+  const maxScore = cursor === null ? '+inf' : \`(\${cursor}\`;
+  const pipe = redis.pipeline();
+  pipe.lrange(\`timeline:\${userId}\`, 0, 2 * limit - 1);
+  for (const celebrity of celebrities) pipe.zrevrangebyscore(\`posts:\${celebrity}\`, maxScore, '-inf', 'LIMIT', 0, limit);
+  const [[, pushed], ...pulled] = (await pipe.exec()) as [Error | null, string[]][];
+  const candidates = new Set(pushed.filter(id => cursor === null || createdAt(id) < cursor));
+  for (const [, ids] of pulled) for (const id of ids) candidates.add(id);
+  const page = [...candidates].sort((a, b) => createdAt(b) - createdAt(a)).slice(0, limit);
+  const nextCursor = page.length === 0 ? null : createdAt(page[page.length - 1]);
+  return [page, nextCursor];
+}
 `,
     },
     go: {
@@ -544,6 +608,95 @@ def check_cursor(ctx):
     page, next_cursor = m.read("alice", 100, 3)
     assert page == [], f"nothing is older than 100: expected an empty page, got {page}"
     assert next_cursor is None, f"an empty page has no next_cursor, got {next_cursor!r}"
+`,
+    typescript: `import {CELEBRITIES_FOLLOWED} from 'feed/graph';
+
+/** Ids carry their timestamp: '<created_at ms>-<suffix>' (feed/ids createdAt parses the prefix). */
+const pid = (ms: number, tag = 'a'): string => \`\${ms}-\${tag}\`;
+
+function reader(ctx, celebrities: Record<string, string[]> = {}) {
+  const m = ctx.load('timeline');
+  for (const [user, list] of Object.entries(celebrities)) CELEBRITIES_FOLLOWED[user] = list;
+  return m;
+}
+
+/** Fan-out writes: ids given oldest first end up newest first in the list. */
+function push(ctx, user: string, ...ids: string[]) {
+  for (const id of ids) ctx.redis.lpush(\`timeline:\${user}\`, id);
+}
+
+function pull(ctx, author: string, ...ids: string[]) {
+  for (const id of ids) ctx.redis.zadd(\`posts:\${author}\`, Number(id.split('-', 1)[0]), id);
+}
+
+export async function check_pushed(ctx) {
+  const ids = Array.from({length: 10}, (_, i) => pid(100 + i));
+  push(ctx, 'alice', ...ids);
+  const m = reader(ctx);
+  let [page, nextCursor] = await m.read('alice', null, 3);
+  assert.deepEqual(page, [pid(109), pid(108), pid(107)], \`with 10 pushed ids and limit 3 the page must be the 3 newest, got \${JSON.stringify(page)}\`);
+  assert.equal(nextCursor, 107, \`next_cursor must be the created_at of the last id of the page (107), got \${JSON.stringify(nextCursor)}\`);
+  [page] = await m.read('alice', null, 20);
+  assert.deepEqual(page, [...ids].reverse(), \`with limit 20 every pushed id must be returned newest first, got \${JSON.stringify(page)}\`);
+}
+
+export async function check_pulled(ctx) {
+  const taylor = Array.from({length: 5}, (_, i) => pid(200 + i, 't'));
+  const nasa = [pid(150, 'n'), pid(151, 'n')];
+  pull(ctx, 'taylor', ...taylor);
+  pull(ctx, 'nasa', ...nasa);
+  const m = reader(ctx, {alice: ['taylor', 'nasa']});
+  let [page, nextCursor] = await m.read('alice', null, 4);
+  assert.deepEqual(page, [pid(204, 't'), pid(203, 't'), pid(202, 't'), pid(201, 't')], \`nothing was pushed: the page must be the 4 newest celebrity posts, got \${JSON.stringify(page)}\`);
+  assert.equal(nextCursor, 201, \`next_cursor must be 201, got \${JSON.stringify(nextCursor)}\`);
+  [page] = await m.read('alice', null, 10);
+  assert.deepEqual(page, [...taylor].reverse().concat([...nasa].reverse()), \`every post of every followed celebrity must be pulled, newest first: \${JSON.stringify(page)}\`);
+  [page] = await m.read('bob', null, 10);
+  assert.deepEqual(page, [], \`bob follows no celebrity and has no timeline: expected an empty page, got \${JSON.stringify(page)}\`);
+}
+
+export async function check_single_pipeline(ctx) {
+  push(ctx, 'alice', pid(100), pid(300));
+  pull(ctx, 'taylor', pid(200, 't'));
+  pull(ctx, 'nasa', pid(400, 'n'));
+  const m = reader(ctx, {alice: ['taylor', 'nasa']});
+  const [page] = await m.read('alice', null, 10);
+  assert.deepEqual(page, [pid(400, 'n'), pid(300), pid(200, 't'), pid(100)], \`unexpected page \${JSON.stringify(page)}\`);
+  const trips = ctx.redisRoundTrips();
+  const reads = trips.filter(t => t.length === 1 && ['LRANGE', 'ZREVRANGEBYSCORE', 'ZRANGE'].includes(t[0]));
+  assert.equal(reads.length, 0, \`\${reads.length} Redis read(s) were sent outside a pipeline (\${JSON.stringify(reads.flat())}): queue the LRANGE and every ZREVRANGEBYSCORE on one pipeline\`);
+  const pipelines = trips.filter(t => t.length > 1);
+  assert.equal(pipelines.length, 1, \`a page must cost one round trip: observed \${pipelines.length} pipeline exec(s)\`);
+  assert.equal(pipelines[0].length, 3, \`the pipeline must carry the LRANGE and one ZREVRANGEBYSCORE per celebrity (3 commands for 2 celebrities), got \${pipelines[0].length}\`);
+}
+
+export async function check_merged(ctx) {
+  push(ctx, 'alice', pid(100), pid(300), pid(500));
+  pull(ctx, 'taylor', pid(200, 't'), pid(400, 't'), pid(600, 't'));
+  pull(ctx, 'nasa', pid(500)); // the same post also arrived through fan-out
+  const m = reader(ctx, {alice: ['taylor', 'nasa']});
+  let [page, nextCursor] = await m.read('alice', null, 4);
+  assert.deepEqual(page, [pid(600, 't'), pid(500), pid(400, 't'), pid(300)], \`pushed and pulled ids must be merged newest first and cut to limit, got \${JSON.stringify(page)}\`);
+  assert.equal(nextCursor, 300, \`next_cursor must be 300, got \${JSON.stringify(nextCursor)}\`);
+  [page] = await m.read('alice', null, 10);
+  assert.equal(page.filter(id => id === pid(500)).length, 1, \`an id present in both sources must appear once, got \${JSON.stringify(page)}\`);
+  assert.deepEqual(page, [pid(600, 't'), pid(500), pid(400, 't'), pid(300), pid(200, 't'), pid(100)], \`the full merge must be every distinct id newest first, got \${JSON.stringify(page)}\`);
+}
+
+export async function check_cursor(ctx) {
+  push(ctx, 'alice', ...Array.from({length: 10}, (_, i) => pid(100 + 2 * i))); // 100, 102, ..., 118; LRANGE 0 5 sees 118..108
+  pull(ctx, 'taylor', pid(109, 't'), pid(113, 't'), pid(115, 't'), pid(121, 't'));
+  const m = reader(ctx, {alice: ['taylor']});
+  let [page, nextCursor] = await m.read('alice', 115, 3);
+  assert.deepEqual(page, [pid(114), pid(113, 't'), pid(112)], \`with cursor 115 only ids created before 115 may appear (the bound is exclusive, from both sources), got \${JSON.stringify(page)}\`);
+  assert.equal(nextCursor, 112, \`next_cursor must be 112, got \${JSON.stringify(nextCursor)}\`);
+  [page, nextCursor] = await m.read('alice', nextCursor, 3);
+  assert.deepEqual(page, [pid(110), pid(109, 't'), pid(108)], \`the next page must continue below the cursor without overlap, got \${JSON.stringify(page)}\`);
+  assert.equal(nextCursor, 108, \`next_cursor must be 108, got \${JSON.stringify(nextCursor)}\`);
+  [page, nextCursor] = await m.read('alice', 100, 3);
+  assert.deepEqual(page, [], \`nothing is older than 100: expected an empty page, got \${JSON.stringify(page)}\`);
+  assert.equal(nextCursor, null, \`an empty page has no next_cursor, got \${JSON.stringify(nextCursor)}\`);
+}
 `,
   },
   debrief: `The read is where the hybrid pays off: one pipeline, a handful of replies, a sort of at most a few dozen ids — regardless of how many followers the celebrities have. Both sources answer the same question ("posts older than the cursor, newest first") and the merge hides which one each id came from. The honest limitation: a plain list cannot seek by time, so deep pagination over the pushed ids degrades — real feeds keep the timeline itself as a sorted set scored by \`created_at\` (or a time-sortable id such as a Snowflake), apply ranking after this candidate step, and cache the hydrated first page per user for a few seconds.`,

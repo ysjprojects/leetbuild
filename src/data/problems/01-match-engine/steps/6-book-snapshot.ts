@@ -48,6 +48,10 @@ Not every client wants a stream. Implement \`GET /book/{symbol}\` on the gateway
           all: [/status_code\s*=\s*400|HTTP_400/],
           order: [/SYMBOL_RE\.(fullmatch|match)\(\s*symbol\s*\)/, /\.hgetall\(/],
         },
+        typescript: {
+          all: [/code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400|badRequest\(/],
+          order: [/SYMBOL_RE\.test\(\s*symbol\s*\)/, /\.hgetall\(/],
+        },
         go: {all: [/http\.StatusBadRequest|\b400\b/], order: [/symbolRe\.MatchString\(\s*symbol\s*\)/, /\.HGetAll\(/]},
         scala: {
           all: [/StatusCodes\.BadRequest|\b400\b/],
@@ -62,6 +66,7 @@ Not every client wants a stream. Implement \`GET /book/{symbol}\` on the gateway
       detail: 'The endpoint reads the same hash the engine writes: `HGETALL book:{symbol}`.',
       match: {
         python: {all: [/f"book:\{symbol\}"/, /\.hgetall\(/]},
+        typescript: {all: [/`book:\$\{symbol\}`|['"]book:['"]\s*\+\s*symbol/, /\.hgetall\(/]},
         go: {all: [/"book:"\s*\+\s*symbol/, /\.HGetAll\(\s*ctx\s*,/]},
         scala: {all: [/s"book:\$symbol"/, /\.hgetAll\(/]},
         cpp: {all: [/"book:"\s*\+\s*symbol/, /\.hgetall\(/]},
@@ -73,6 +78,7 @@ Not every client wants a stream. Implement \`GET /book/{symbol}\` on the gateway
       detail: 'An empty hash means the symbol has never traded here: `404 Not Found`, not an empty 200.',
       match: {
         python: {all: [/status_code\s*=\s*404|HTTP_404/]},
+        typescript: {all: [/code\(\s*404\s*\)|status\(\s*404\s*\)|statusCode:\s*404|notFound\(/]},
         go: {all: [/http\.StatusNotFound|\b404\b/]},
         scala: {all: [/StatusCodes\.NotFound|\b404\b/]},
         cpp: {all: [/\b404\b/]},
@@ -84,6 +90,7 @@ Not every client wants a stream. Implement \`GET /book/{symbol}\` on the gateway
       detail: 'Prices must never be served from a cache: the 200 carries `Cache-Control: no-store`.',
       match: {
         python: {all: [/Cache-Control/i, /no-store/]},
+        typescript: {all: [/Cache-Control/i, /no-store/]},
         go: {all: [/Cache-Control/i, /no-store/]},
         scala: {all: [/Cache-Control/i, /no-store/]},
         cpp: {all: [/Cache-Control/i, /no-store/]},
@@ -137,6 +144,46 @@ def book(symbol: str) -> JSONResponse:
 
 
 # uvicorn book_endpoint:app --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const SYMBOL_RE = /^[A-Z]{1,6}$/;
+
+app.get('/book/:symbol', async (request, reply) => {
+  const {symbol} = request.params as {symbol: string};
+  // TODO: 400 unless SYMBOL_RE matches the symbol
+  // TODO: HGETALL book:{symbol}; empty → 404
+  // TODO: 200 {symbol, bid, ask, last} with Cache-Control: no-store
+  void symbol;
+  void redis;
+  return reply.code(501).send();
+});
+
+// app.listen({port: 8443, https: {cert, key}})
+`,
+      solution: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const SYMBOL_RE = /^[A-Z]{1,6}$/;
+
+app.get('/book/:symbol', async (request, reply) => {
+  const {symbol} = request.params as {symbol: string};
+  if (!SYMBOL_RE.test(symbol)) return reply.code(400).send({error: 'symbol must be 1–6 upper-case letters'});
+  const fields = await redis.hgetall(\`book:\${symbol}\`);
+  if (Object.keys(fields).length === 0) return reply.code(404).send({error: \`no book for \${symbol}\`});
+  return reply.header('Cache-Control', 'no-store').send({symbol, ...fields});
+});
+
+// app.listen({port: 8443, https: {cert, key}})
 `,
     },
     go: {
@@ -434,6 +481,58 @@ async def check_no_store(ctx):
     assert r.status_code == 200, f"GET /book/ACME answered {r.status_code}, expected 200"
     cache_control = r.headers.get("cache-control", "")
     assert "no-store" in cache_control.lower(), f"the 200 carries Cache-Control {cache_control!r}, expected no-store"
+`,
+    typescript: `const BOOK = ['bid', '10.05', 'ask', '10.06', 'last', '10.05'];
+
+export async function check_validate(ctx) {
+  const m = ctx.load('book_endpoint');
+  ctx.redis.hset('book:ACME', ...BOOK);
+  const c = ctx.client(m.app);
+  // A probe on each invalid symbol's key: it fires if any Redis command ever touches it.
+  const touched: string[] = [];
+  for (const symbol of ['acme', 'ACME1', 'TOOLONGX', 'AC-ME']) {
+    ctx.redisAfter('book:' + symbol, () => touched.push('book:' + symbol));
+    const r = await c.get('/book/' + symbol);
+    assert.equal(r.status, 400, \`GET /book/\${symbol} answered \${r.status}, expected 400\`);
+  }
+  assert.deepEqual(touched, [], \`an invalid symbol must be rejected before any Redis call, but \${JSON.stringify(touched)} were read\`);
+  const r = await c.get('/book/ACME');
+  assert.equal(r.status, 200, \`GET /book/ACME answered \${r.status}, expected 200\`);
+}
+
+export async function check_hash(ctx) {
+  const m = ctx.load('book_endpoint');
+  ctx.redis.hset('book:ACME', ...BOOK);
+  ctx.redis.hset('book:BETA', 'bid', '1', 'ask', '2', 'last', '1.5');
+  const c = ctx.client(m.app);
+  const r = await c.get('/book/ACME');
+  assert.equal(r.status, 200, \`GET /book/ACME answered \${r.status}, expected 200\`);
+  const body = r.json() as Record<string, unknown>;
+  assert.equal(body.symbol, 'ACME', \`the body must name the symbol, got \${r.text}\`);
+  const got = Object.fromEntries(['bid', 'ask', 'last'].map(k => [k, Number(body[k] ?? -1)]));
+  assert.deepEqual(got, {bid: 10.05, ask: 10.06, last: 10.05}, \`the body must carry bid/ask/last from book:ACME, got \${r.text}\`);
+  const r2 = await c.get('/book/BETA');
+  assert(r2.status === 200 && Number((r2.json() as Record<string, unknown>).last ?? -1) === 1.5, \`GET /book/BETA must read book:BETA, got \${r2.status} \${r2.text}\`);
+}
+
+export async function check_not_found(ctx) {
+  const m = ctx.load('book_endpoint');
+  const c = ctx.client(m.app);
+  let r = await c.get('/book/GHOST');
+  assert.equal(r.status, 404, \`GET /book/GHOST with no hash answered \${r.status}, expected 404\`);
+  ctx.redis.hset('book:GHOST', ...BOOK);
+  r = await c.get('/book/GHOST');
+  assert.equal(r.status, 200, \`once book:GHOST exists the endpoint answered \${r.status}, expected 200\`);
+}
+
+export async function check_no_store(ctx) {
+  const m = ctx.load('book_endpoint');
+  ctx.redis.hset('book:ACME', ...BOOK);
+  const r = await ctx.client(m.app).get('/book/ACME');
+  assert.equal(r.status, 200, \`GET /book/ACME answered \${r.status}, expected 200\`);
+  const cacheControl = r.headers['cache-control'] ?? '';
+  assert(cacheControl.toLowerCase().includes('no-store'), \`the 200 carries Cache-Control \${JSON.stringify(cacheControl)}, expected no-store\`);
+}
 `,
   },
   debrief: `The same three-exit shape as the first HTTPS step — validate, look up, represent — with the cache policy flipped: \`no-store\` because the resource's truth has a lifetime of one trade. Validating the path segment before the Redis call is not pedantry; it is what keeps \`GET /book/../../admin\`-style input from ever reaching a key. Real market-data APIs add \`ETag\`s made from the tick sequence number (so a poll can be cheap when nothing changed), rate limits per API key, and serve depth (the full ladder) from a snapshot log rather than one hash.`,

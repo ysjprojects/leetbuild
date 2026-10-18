@@ -73,6 +73,9 @@ Implement the tracker, called by the journal writer after every commit, and the 
             /\.zadd\(\s*OPEN_KEY\s*,\s*\{\s*transaction_id\s*:\s*posted_at\s*\}\s*\)/,
           ],
         },
+        typescript: {
+          all: [/startsWith\(\s*['"]clearing:['"]\s*\)/, /\.zadd\(\s*OPEN_KEY\s*,\s*postedAt\s*,\s*transactionId\s*\)/],
+        },
         go: {
           all: [
             /strings\.HasPrefix\(\s*[\w.]+\s*,\s*"clearing:"\s*\)/,
@@ -100,6 +103,7 @@ Implement the tracker, called by the journal writer after every commit, and the 
         'With `settles` given, `ZREM clearing:open settles` and return — the settling transaction touches a clearing account too, but it is the closing side of the flow.',
       match: {
         python: {all: [/\.zrem\(\s*OPEN_KEY\s*,\s*settles\s*\)/], order: [/if settles/, /\.zrem\(/, /\.zadd\(/]},
+        typescript: {all: [/\.zrem\(\s*OPEN_KEY\s*,\s*settles\s*\)/], order: [/if \(settles/, /\.zrem\(/, /\.zadd\(/]},
         go: {
           all: [/rdb\.ZRem\(\s*ctx\s*,\s*openKey\s*,\s*\*settles\s*\)/],
           order: [/settles != nil/, /rdb\.ZRem\(/, /rdb\.ZAdd\(/],
@@ -123,6 +127,9 @@ Implement the tracker, called by the journal writer after every commit, and the 
         python: {
           all: [/\.zrangebyscore\(\s*OPEN_KEY\s*,\s*["']-inf["']\s*,/, /STUCK_AFTER_MS/, /withscores\s*=\s*True/],
         },
+        typescript: {
+          all: [/\.zrangebyscore\(\s*OPEN_KEY\s*,\s*['"]-inf['"]\s*,/, /STUCK_AFTER_MS/, /['"]WITHSCORES['"]/],
+        },
         go: {all: [/rdb\.ZRangeByScoreWithScores\(\s*ctx\s*,\s*openKey\s*,/, /Min:\s*"-inf"/, /stuckAfter/]},
         scala: {all: [/jedis\.zrangeByScoreWithScores\(\s*OpenKey\s*,\s*"-inf"\s*,/, /StuckAfterMs/]},
         cpp: {all: [/redis\.zrangebyscore\(\s*kOpenKey\s*,/, /RightBoundedInterval<double>/, /kStuckAfterMs/]},
@@ -135,6 +142,7 @@ Implement the tracker, called by the journal writer after every commit, and the 
         'The endpoint answers `200` with `[{transaction_id, opened_at, age_s}]` from `stuck()`; reading the report never changes the set.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/clearing\/stuck["']/, /age_s/, /opened_at/]},
+        typescript: {all: [/app\.get\(\s*['"]\/clearing\/stuck['"]/, /age_s/, /opened_at/]},
         go: {all: [/HandleFunc\(\s*"GET \/clearing\/stuck"/, /age_s/, /opened_at/]},
         scala: {all: [/path\(\s*"clearing"\s*\/\s*"stuck"\s*\)/, /age_s/, /opened_at/]},
         cpp: {all: [/svr\.Get\(\s*"\/clearing\/stuck"/, /age_s/, /opened_at/]},
@@ -221,6 +229,107 @@ def clearing_stuck() -> list[dict]:
 
 
 # uvicorn clearing_tracker:app --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const OPEN_KEY = 'clearing:open';
+export const STUCK_AFTER_MS = 24 * 3600 * 1000;
+
+export interface Entry {
+  account: string;
+  currency: string;
+  amount: number;
+}
+
+export interface StuckItem {
+  transaction_id: string;
+  opened_at: number;
+  age_s: number;
+}
+
+const nowMs = (): number => Date.now();
+
+/** Called by the journal writer after every commit: close the item this transaction settles, or open one. */
+export async function track(
+  transactionId: string,
+  postedAt: number,
+  entries: Entry[],
+  settles: string | null = null,
+): Promise<void> {
+  // TODO: settles given → ZREM OPEN_KEY settles, and nothing else
+  // TODO: any entry on a clearing:* account → ZADD OPEN_KEY postedAt transactionId
+  throw new Error('not implemented');
+}
+
+/** Open items older than STUCK_AFTER_MS as [{transaction_id, opened_at, age_s}], oldest first. */
+export async function stuck(now: number = nowMs()): Promise<StuckItem[]> {
+  // TODO: ZRANGEBYSCORE OPEN_KEY -inf (now - STUCK_AFTER_MS) WITHSCORES → age_s = floor((now - score) / 1000)
+  return [];
+}
+
+app.get('/clearing/stuck', async () => {
+  // TODO: 200 with stuck()
+  return [];
+});
+`,
+      solution: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const OPEN_KEY = 'clearing:open';
+export const STUCK_AFTER_MS = 24 * 3600 * 1000;
+
+export interface Entry {
+  account: string;
+  currency: string;
+  amount: number;
+}
+
+export interface StuckItem {
+  transaction_id: string;
+  opened_at: number;
+  age_s: number;
+}
+
+const nowMs = (): number => Date.now();
+
+/** Called by the journal writer after every commit: close the item this transaction settles, or open one. */
+export async function track(
+  transactionId: string,
+  postedAt: number,
+  entries: Entry[],
+  settles: string | null = null,
+): Promise<void> {
+  if (settles) {
+    await redis.zrem(OPEN_KEY, settles); // the closing side of a flow; a no-op if the opening side has not arrived yet
+    return;
+  }
+  if (entries.some(entry => entry.account.startsWith('clearing:'))) {
+    await redis.zadd(OPEN_KEY, postedAt, transactionId); // scored by the transaction's own time, not the arrival time
+  }
+}
+
+/** Open items older than STUCK_AFTER_MS as [{transaction_id, opened_at, age_s}], oldest first. */
+export async function stuck(now: number = nowMs()): Promise<StuckItem[]> {
+  const cutoff = now - STUCK_AFTER_MS;
+  const flat = await redis.zrangebyscore(OPEN_KEY, '-inf', cutoff, 'WITHSCORES');
+  const items: StuckItem[] = [];
+  for (let i = 0; i + 1 < flat.length; i += 2) {
+    const openedAt = Number(flat[i + 1]);
+    items.push({transaction_id: flat[i], opened_at: openedAt, age_s: Math.floor((now - openedAt) / 1000)});
+  }
+  return items;
+}
+
+app.get('/clearing/stuck', async () => stuck());
 `,
     },
     go: {
@@ -734,6 +843,141 @@ async def check_stuck_endpoint(ctx):
         assert set(item) >= {"transaction_id", "opened_at", "age_s"}, f"every item carries transaction_id, opened_at and age_s, got {item}"
     assert abs(body[0]["age_s"] - 30 * 3600) <= 2, f"the 30 h one's age_s should be about {30 * 3600}, got {body[0]['age_s']}"
     assert len(_open(ctx)) == 3, "reading the report must not change clearing:open"
+`,
+    typescript: `const SCHEMA = \`
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL REFERENCES transactions (id),
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL,
+    posted_at bigint NOT NULL
+);
+\`;
+
+const H = 3600 * 1000;
+const CAPTURE = [
+  {account: 'cash:acquirer', currency: 'EUR', amount: 4999},
+  {account: 'clearing:payments', currency: 'EUR', amount: -4999},
+];
+const PAYOUT = [
+  {account: 'clearing:payments', currency: 'EUR', amount: 4999},
+  {account: 'clearing:payouts', currency: 'EUR', amount: -4999},
+];
+const CASH_ONLY = [
+  {account: 'cash:bank', currency: 'EUR', amount: 100},
+  {account: 'cash:acquirer', currency: 'EUR', amount: -100},
+];
+
+/** The real journal writer (step 4) on an empty ledger, calling the learner's tracker after every commit. */
+async function world(ctx) {
+  await ctx.db.reset(SCHEMA);
+  const writer = ctx.load('ledger_writer');
+  const tracker = ctx.load('clearing_tracker');
+  return {writer, tracker};
+}
+
+/** A real transaction through the journal, posted at its own time; returns its id. */
+async function write(writer, entries, postedAt: number, settles: string | null = null): Promise<string> {
+  return writer.writeTransaction(entries, 'flow', {postedAt, settles});
+}
+
+function open(ctx): Record<string, number> {
+  const flat = ctx.redis.zrange('clearing:open', 0, -1, 'WITHSCORES');
+  const out: Record<string, number> = {};
+  for (let i = 0; i + 1 < flat.length; i += 2) out[flat[i]] = Number(flat[i + 1]);
+  return out;
+}
+
+const score = (ctx, member: string): number | null => {
+  const s = ctx.redis.zscore('clearing:open', member);
+  return s === null ? null : Number(s);
+};
+
+export async function check_opens_item(ctx) {
+  const {writer} = await world(ctx);
+  const t0 = Date.now() - 3 * H;
+  const a = await write(writer, CAPTURE, t0);
+  assert.equal(ctx.redis.type('clearing:open'), 'zset', \`clearing:open must be a sorted set, found \${JSON.stringify(ctx.redis.type('clearing:open'))}\`);
+  const s = score(ctx, a);
+  assert(s !== null, 'a transaction crediting clearing:payments must be added to clearing:open under its transaction id');
+  assert.equal(s, t0, \`the score must be the transaction's own posted_at (\${t0}), got \${s}: a late event must already be overdue\`);
+  const b = await write(writer, CASH_ONLY, Date.now());
+  assert.equal(score(ctx, b), null, 'a transaction between cash accounts touches no clearing account and must not be tracked');
+  const c = await write(writer, PAYOUT, t0 + 1);
+  assert.deepEqual(open(ctx), {[a]: t0, [c]: t0 + 1}, \`clearing:open should hold the capture and the payout, holds \${JSON.stringify(open(ctx))}\`);
+}
+
+export async function check_settles_closes(ctx) {
+  const {writer} = await world(ctx);
+  const t0 = Date.now() - 3 * H;
+  const a = await write(writer, CAPTURE, t0);
+  const b = await write(writer, PAYOUT, t0 + 2 * H, a);
+  assert.equal(score(ctx, a), null, 'the transaction that settles the capture must ZREM it from clearing:open');
+  assert.equal(score(ctx, b), null, 'the settling transaction is the closing side of the flow: it must not open an item of its own');
+  try {
+    await write(writer, PAYOUT, t0, 'tx-unknown');
+  } catch (e) {
+    assert.fail(\`settling an id that is not open must be a no-op, but the write failed in track with \${e instanceof Error ? e.name : typeof e}: \${e instanceof Error ? e.message : String(e)}\`);
+  }
+  assert.deepEqual(open(ctx), {}, \`clearing:open should be empty, holds \${JSON.stringify(open(ctx))}\`);
+  const c = await write(writer, CAPTURE, t0);
+  const d = await write(writer, CAPTURE, t0 + 1);
+  await write(writer, PAYOUT, t0 + 2, c);
+  assert.deepEqual(open(ctx), {[d]: t0 + 1}, \`only the first of two captures was settled: clearing:open should hold the second, holds \${JSON.stringify(open(ctx))}\`);
+}
+
+export async function check_stuck_window(ctx) {
+  const {writer, tracker} = await world(ctx);
+  const now = Date.now();
+  const ids: Record<string, string> = {};
+  for (const [name, hours] of [['48h', 48], ['23h', 23], ['25h', 25], ['1h', 1]] as const) {
+    ids[await write(writer, CAPTURE, now - hours * H)] = name;
+  }
+  const items = await tracker.stuck();
+  assert(Array.isArray(items), \`stuck() must return a list, got \${typeof items}\`);
+  assert.equal(Object.keys(open(ctx)).length, 4, 'stuck() reports; it must not remove anything from clearing:open');
+  let got = items.map(i => ids[i?.transaction_id] ?? i?.transaction_id);
+  assert.deepEqual(got, ['48h', '25h'], \`of transactions posted 48 h, 23 h, 25 h and 1 h ago, the ones older than 24 h, oldest first, are ['48h', '25h']; got \${JSON.stringify(got)}\`);
+  for (const item of items) {
+    assert.equal(item.opened_at, score(ctx, item.transaction_id), \`opened_at must be the item's score, got \${JSON.stringify(item)}\`);
+  }
+  const ages = Object.fromEntries(items.map(i => [ids[i.transaction_id], i.age_s]));
+  assert(Math.abs(ages['48h'] - 48 * 3600) <= 2 && Math.abs(ages['25h'] - 25 * 3600) <= 2, \`age_s must be the age in seconds, got \${JSON.stringify(ages)}\`);
+  ctx.clock.advance(2 * 3600);
+  got = (await tracker.stuck()).map(i => ids[i.transaction_id] ?? i.transaction_id);
+  assert.deepEqual(got, ['48h', '25h', '23h'], \`two hours later the 23 h one has crossed 24 h and must be reported: got \${JSON.stringify(got)}\`);
+  // A late event: posted 30 h ago, journaled just now — stuck immediately, because the score is its own time.
+  const late = await write(writer, CAPTURE, Date.now() - 30 * H);
+  assert((await tracker.stuck()).some(i => i.transaction_id === late), 'a transaction posted 30 h ago that reaches the journal now is already stuck');
+}
+
+export async function check_stuck_endpoint(ctx) {
+  const {writer, tracker} = await world(ctx);
+  const now = Date.now();
+  const ids: Record<string, string> = {};
+  for (const [name, hours] of [['27h', 27], ['2h', 2], ['30h', 30]] as const) {
+    ids[await write(writer, CAPTURE, now - hours * H)] = name;
+  }
+  const r = await ctx.client(tracker.app).get('/clearing/stuck');
+  assert.equal(r.status, 200, \`GET /clearing/stuck answered \${r.status}\`);
+  assert((r.headers['content-type'] ?? '').startsWith('application/json'), \`the report must be JSON, got Content-Type \${JSON.stringify(r.headers['content-type'])}\`);
+  const body = r.json();
+  assert(Array.isArray(body), \`the report is a JSON list, got \${r.text}\`);
+  const got = body.map(i => ids[i?.transaction_id] ?? i?.transaction_id);
+  assert.deepEqual(got, ['30h', '27h'], \`expected the two transactions older than 24 h, oldest first (['30h', '27h']); got \${JSON.stringify(got)}\`);
+  for (const item of body) {
+    assert(['transaction_id', 'opened_at', 'age_s'].every(k => k in item), \`every item carries transaction_id, opened_at and age_s, got \${JSON.stringify(item)}\`);
+  }
+  assert(Math.abs(body[0].age_s - 30 * 3600) <= 2, \`the 30 h one's age_s should be about \${30 * 3600}, got \${body[0].age_s}\`);
+  assert.equal(Object.keys(open(ctx)).length, 3, 'reading the report must not change clearing:open');
+}
 `,
   },
   debrief: `A sorted set keyed by the transaction's own time turns "which money has been in transit too long" into one range query, and the 24-hour cutoff is the timeliness window from Stripe's post expressed as a score. The rule that a settling transaction closes rather than opens is what makes the set converge: every flow adds exactly one item on its way in and removes it on its way out. The report is deliberately read-only — someone has to decide whether a stuck item is a missing event, a mislabelled one or a real operational problem, and Stripe's post describes tooling that attributes each one to a team and generates the investigation query. Real systems track clearing per account and per currency with the open *balance* as well as the open items, alert on the aged balance rather than on the count, and let an item be re-opened when a correction reverses the transaction that settled it.`,

@@ -55,6 +55,7 @@ Implement \`render(id, width)\` on top of the generated stub:
       detail: 'Every RPC must carry a deadline (800 ms) so a slow resizer cannot hold the request open.',
       match: {
         python: {all: [/stub\.Resize\([^\n]*timeout\s*=/]},
+        typescript: {all: [/\.Resize\([^\n]*deadline\s*:/]},
         go: {all: [/context\.WithTimeout\(/]},
         scala: {all: [/withDeadlineAfter\(/]},
         cpp: {all: [/set_deadline\(/]},
@@ -66,6 +67,7 @@ Implement \`render(id, width)\` on top of the generated stub:
       detail: 'A `NOT_FOUND` status is a normal outcome, not an error: return nothing so the caller caches the miss.',
       match: {
         python: {all: [/StatusCode\.NOT_FOUND/, /return None/]},
+        typescript: {all: [/status\.NOT_FOUND/, /return null/]},
         go: {all: [/codes\.NotFound/, /return nil, nil/]},
         scala: {all: [/Status\.Code\.NOT_FOUND|Code\.NOT_FOUND/, /\bNone\b/]},
         cpp: {all: [/grpc::StatusCode::NOT_FOUND|StatusCode::NOT_FOUND/, /std::nullopt/]},
@@ -78,6 +80,7 @@ Implement \`render(id, width)\` on top of the generated stub:
         'Only `UNAVAILABLE` is worth a second attempt; other statuses either already spent the budget or will fail again.',
       match: {
         python: {all: [/StatusCode\.UNAVAILABLE/, /\battempts?\b|\bretr(y|ies)\b/]},
+        typescript: {all: [/status\.UNAVAILABLE/, /\battempts?\b|\bretr(y|ies)\b/]},
         go: {all: [/codes\.Unavailable/, /\battempts?\b|\bretr(y|ies)\b/]},
         scala: {all: [/Code\.UNAVAILABLE/, /\battempts?\b|\bretr(y|ies)\b/]},
         cpp: {all: [/StatusCode::UNAVAILABLE/, /\battempts?\b|\bretr(y|ies)\b/]},
@@ -89,6 +92,10 @@ Implement \`render(id, width)\` on top of the generated stub:
       detail: 'Never loop until success: a resizer that is down would pin every request thread.',
       match: {
         python: {all: [/for \w+ in range\(\s*2\s*\)/], none: [/while True/]},
+        typescript: {
+          all: [/for \(let \w+ = 0; \w+ < 2; (\+\+\w+|\w+\+\+)\)/],
+          none: [/while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/],
+        },
         go: {all: [/for \w+ := 0; \w+ < 2; \w+\+\+/], none: [/for \{/]},
         scala: {all: [/\w+ <- 0 until 2|\w+ < 2|\w+ <= 1/], none: [/while\s*\(\s*true\s*\)/]},
         cpp: {
@@ -140,6 +147,75 @@ def render(image_id: str, width: int) -> bytes | None:
                 continue
             raise
     return None
+`,
+    },
+    typescript: {
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+
+interface ResizeRequest {
+  image_id: string;
+  width: number;
+}
+interface ResizeReply {
+  jpeg: Buffer;
+}
+interface ResizerClient {
+  Resize(request: ResizeRequest, options: {deadline: number | Date}): Promise<ResizeReply>;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('resizer.proto')) as unknown as {
+  thumbs: {Resizer: new (target: string, credentials: grpc.ChannelCredentials) => ResizerClient};
+};
+
+export const DEADLINE_MS = 800;
+
+const stub = new pkg.thumbs.Resizer('resizer:9000', grpc.credentials.createInsecure());
+
+export async function render(imageId: string, width: number): Promise<Buffer | null> {
+  const request: ResizeRequest = {image_id: imageId, width};
+  // TODO: stub.Resize with a deadline of DEADLINE_MS from now
+  // TODO: NOT_FOUND → null; UNAVAILABLE → retry once; anything else → throw
+  throw new Error('not implemented');
+}
+`,
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+
+interface ResizeRequest {
+  image_id: string;
+  width: number;
+}
+interface ResizeReply {
+  jpeg: Buffer;
+}
+interface ResizerClient {
+  Resize(request: ResizeRequest, options: {deadline: number | Date}): Promise<ResizeReply>;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('resizer.proto')) as unknown as {
+  thumbs: {Resizer: new (target: string, credentials: grpc.ChannelCredentials) => ResizerClient};
+};
+
+export const DEADLINE_MS = 800;
+
+const stub = new pkg.thumbs.Resizer('resizer:9000', grpc.credentials.createInsecure());
+
+export async function render(imageId: string, width: number): Promise<Buffer | null> {
+  const request: ResizeRequest = {image_id: imageId, width};
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const reply = await stub.Resize(request, {deadline: Date.now() + DEADLINE_MS});
+      return reply.jpeg;
+    } catch (e) {
+      const {code} = e as grpc.ServiceError;
+      if (code === grpc.status.NOT_FOUND) return null;
+      if (code === grpc.status.UNAVAILABLE && attempt === 0) continue;
+      throw e;
+    }
+  }
+  return null;
+}
 `,
     },
     go: {
@@ -394,6 +470,80 @@ def check_bounded(ctx):
         assert e.code() == grpc.StatusCode.UNAVAILABLE
     attempts = len(ctx.grpc.calls_to("Resize"))
     assert attempts == 2, f"made {attempts} attempts against a down resizer; retries must stop after the second"
+`,
+    typescript: `/** The resizer peer: knows every image but ghost, counts its calls. */
+function client(ctx) {
+  const peer = {calls: 0};
+  const {thumbs} = ctx.proto('resizer.proto');
+  ctx.grpc.serve(thumbs.Resizer.service, {
+    Resize: (call, callback) => {
+      peer.calls += 1;
+      const {image_id, width} = call.request;
+      if (image_id === 'ghost') return callback({code: ctx.grpc.status.NOT_FOUND, details: 'no such image'});
+      callback(null, {jpeg: Buffer.from(\`JPEG-\${image_id}-\${width}\`)});
+    },
+  });
+  return {m: ctx.load('resizer_client'), peer};
+}
+
+const statusName = (ctx, code: number) => Object.keys(ctx.grpc.status).find(k => ctx.grpc.status[k] === code) ?? String(code);
+
+export async function check_deadline(ctx) {
+  const {m} = client(ctx);
+  assert.equal(String(await m.render('cat', 256)), 'JPEG-cat-256', "render must return the resizer's bytes");
+  const calls = ctx.grpc.callsTo('Resize');
+  const call = calls[calls.length - 1];
+  assert(call.timeout !== null, 'the RPC carries no deadline');
+  assert(0.5 <= call.timeout && call.timeout <= 1.0, \`the deadline must be about 800 ms, got \${call.timeout} s\`);
+  ctx.grpc.setLatency('Resize', 3.0);
+  await assert.rejects(
+    m.render('cat', 128),
+    e => {
+      assert.equal(e.code, ctx.grpc.status.DEADLINE_EXCEEDED, \`a slow resizer raised \${statusName(ctx, e.code)}, expected DEADLINE_EXCEEDED\`);
+      return true;
+    },
+    'a resizer slower than the deadline must surface DEADLINE_EXCEEDED',
+  );
+  assert.equal(ctx.grpc.callsTo('Resize').length, 2, 'DEADLINE_EXCEEDED must not be retried');
+}
+
+export async function check_not_found(ctx) {
+  const {m, peer} = client(ctx);
+  assert.equal(await m.render('ghost', 256), null, 'NOT_FOUND means the origin has no such image: return null');
+  assert.equal(peer.calls, 1, 'NOT_FOUND must not be retried');
+}
+
+export async function check_retry_unavailable(ctx) {
+  const {m} = client(ctx);
+  ctx.grpc.fail('Resize', ctx.grpc.status.UNAVAILABLE, '', 1);
+  assert.equal(String(await m.render('cat', 256)), 'JPEG-cat-256', 'one UNAVAILABLE must be retried and succeed');
+  assert.equal(ctx.grpc.callsTo('Resize').length, 2, 'exactly one retry after UNAVAILABLE');
+  ctx.grpc.fail('Resize', ctx.grpc.status.INVALID_ARGUMENT, 'width', 1);
+  await assert.rejects(
+    m.render('cat', 256),
+    e => {
+      assert.equal(e.code, ctx.grpc.status.INVALID_ARGUMENT, \`INVALID_ARGUMENT must propagate as is, got \${statusName(ctx, e.code)}\`);
+      return true;
+    },
+    'INVALID_ARGUMENT must propagate, not be retried or swallowed',
+  );
+  assert.equal(ctx.grpc.callsTo('Resize').length, 3, 'INVALID_ARGUMENT must not be retried');
+}
+
+export async function check_bounded(ctx) {
+  const {m} = client(ctx);
+  ctx.grpc.fail('Resize', ctx.grpc.status.UNAVAILABLE, '', 50);
+  await assert.rejects(
+    m.render('cat', 256),
+    e => {
+      assert.equal(e.code, ctx.grpc.status.UNAVAILABLE, \`a resizer that stays down must surface UNAVAILABLE, got \${statusName(ctx, e.code)}\`);
+      return true;
+    },
+    'a resizer that stays UNAVAILABLE must throw, not return',
+  );
+  const attempts = ctx.grpc.callsTo('Resize').length;
+  assert.equal(attempts, 2, \`made \${attempts} attempts against a down resizer; retries must stop after the second\`);
+}
 `,
   },
   debrief: `Deadlines are the single most important thing a client sets: without one, a slow dependency turns into a slow *you*. Retrying only \`UNAVAILABLE\` — and only a bounded number of times — is what keeps a retry from becoming a retry storm. Production clients add jittered backoff between attempts, honour the server's retry policy, and propagate the caller's deadline instead of picking their own (\`ctx\` in Go, \`grpc-timeout\` on the wire).`,

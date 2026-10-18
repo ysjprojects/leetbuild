@@ -58,6 +58,7 @@ answers **202**:
         'The record goes to the `counter-events` topic with `{ns}:{name}` as its key, so one counter is one partition.',
       match: {
         python: {all: [/"counter-events"/, /f["']\{ns\}:\{name\}["']/, /producer\.produce\(/]},
+        typescript: {all: [/['"]counter-events['"]/, /`\$\{ns\}:\$\{name\}`/, /producer\.send\(/]},
         go: {all: [/"counter-events"/, /Key:\s*\[\]byte\(\s*ns\s*\+\s*":"\s*\+\s*name\s*\)/, /WriteMessages\(/]},
         scala: {all: [/"counter-events"/, /s"\$ns:\$name"|s"\$\{ns\}:\$\{name\}"/, /producer\.send\(/]},
         cpp: {all: [/"counter-events"/, /ns\s*\+\s*":"\s*\+\s*name/, /producer->produce\(/]},
@@ -70,6 +71,7 @@ answers **202**:
         'The event is a JSON document with the five fields; the token must travel with the event for the rollup to dedupe on it.',
       match: {
         python: {all: [/json\.dumps\(/, /"delta"/, /"token"/, /"ts"/]},
+        typescript: {all: [/JSON\.stringify\(/, /\bdelta\b/, /\btoken\b/, /\bts\s*[:,}]/]},
         go: {all: [/json\.Marshal\(/, /json:"delta"/, /json:"token"/, /json:"ts"/]},
         scala: {all: [/"delta"\s*->/, /"token"\s*->/, /"ts"\s*->/, /compactPrint/]},
         cpp: {all: [/\{"delta",/, /\{"token",/, /\{"ts",/, /\.dump\(\)/]},
@@ -82,6 +84,7 @@ answers **202**:
         'A 202 promises durability; `acks=all` means every in-sync replica has the record, and idempotence keeps the producer’s own retries from doubling it.',
       match: {
         python: {all: [/"acks"\s*:\s*"all"/, /"enable\.idempotence"\s*:\s*True/]},
+        typescript: {all: [/idempotent:\s*true/], none: [/acks:\s*[01]\b/]},
         go: {all: [/RequiredAcks:\s*kafka\.RequireAll/]},
         scala: {
           all: [
@@ -102,6 +105,7 @@ answers **202**:
           all: [/def append_event(?:(?!\ndef )[\s\S])*?producer\.flush\(\s*(timeout\s*=\s*)?FLUSH_TIMEOUT_S\s*\)/],
           none: [/producer\.flush\(\s*\)/],
         },
+        typescript: {all: [/producer\.send\(/, /(timeout|messageTimeoutMs):\s*FLUSH_TIMEOUT_MS/]},
         go: {
           all: [/context\.WithTimeout\(\s*ctx\s*,\s*flushTimeout\s*\)/, /writer\.WriteMessages\(/],
           none: [/Async:\s*true/],
@@ -117,6 +121,7 @@ answers **202**:
         'A delivery error reported through the callback, or a record still pending after the flush, raises `EventNotDurable` so the API answers 503 and the client retries with the same token.',
       match: {
         python: {all: [/on_delivery\s*=|callback\s*=/, /raise EventNotDurable\(/]},
+        typescript: {all: [/catch\s*(\(\s*\w+\s*\))?\s*\{/, /throw new EventNotDurable\(/]},
         go: {all: [/return ErrNotDurable|errors\.Join\(\s*ErrNotDurable|fmt\.Errorf\([^\n]*ErrNotDurable/]},
         scala: {all: [/throw new EventNotDurable\(/]},
         cpp: {all: [/dr_cb\(/, /throw EventNotDurable\(/]},
@@ -172,6 +177,55 @@ def append_event(ns: str, name: str, delta: int, token: str) -> None:
     pending = producer.flush(timeout=FLUSH_TIMEOUT_S)
     if pending or outcome.get("err") is not None:
         raise EventNotDurable(f"counter event {token} not acknowledged: {outcome.get('err') or 'timed out'}")
+`,
+    },
+    typescript: {
+      starter: `import {Kafka} from 'kafkajs';
+
+export const TOPIC = 'counter-events';
+export const FLUSH_TIMEOUT_MS = 1000;
+
+const kafka = new Kafka({clientId: 'counters', brokers: ['kafka:9092']});
+const producer = kafka.producer(); // TODO: acks all with idempotence
+const connected = producer.connect();
+
+/** The broker did not acknowledge the event in time; the API answers 503 and the client retries with the same token. */
+export class EventNotDurable extends Error {}
+
+export async function appendEvent(ns: string, name: string, delta: number, token: string): Promise<void> {
+  const value = JSON.stringify({ns, name, delta, token, ts: Date.now() / 1000});
+  await connected;
+  // TODO: send to TOPIC keyed by {ns}:{name}, waiting for the ack no longer than FLUSH_TIMEOUT_MS
+  // TODO: a delivery error or a timed-out ack → throw EventNotDurable
+  throw new Error('not implemented');
+}
+`,
+      solution: `import {Kafka} from 'kafkajs';
+
+export const TOPIC = 'counter-events';
+export const FLUSH_TIMEOUT_MS = 1000;
+
+const kafka = new Kafka({clientId: 'counters', brokers: ['kafka:9092']});
+const producer = kafka.producer({idempotent: true}); // idempotence implies acks: -1 (all)
+const connected = producer.connect();
+
+/** The broker did not acknowledge the event in time; the API answers 503 and the client retries with the same token. */
+export class EventNotDurable extends Error {}
+
+export async function appendEvent(ns: string, name: string, delta: number, token: string): Promise<void> {
+  const value = JSON.stringify({ns, name, delta, token, ts: Date.now() / 1000});
+  await connected;
+  try {
+    await producer.send({
+      topic: TOPIC,
+      messages: [{key: \`\${ns}:\${name}\`, value}],
+      acks: -1,
+      timeout: FLUSH_TIMEOUT_MS, // the ack is awaited, but never longer than this
+    });
+  } catch (e) {
+    throw new EventNotDurable(\`counter event \${token} not acknowledged: \${(e as Error).message}\`);
+  }
+}
 `,
     },
     go: {
@@ -517,6 +571,91 @@ def check_not_durable_raises(ctx):
         raise AssertionError("the broker did not acknowledge the record within the flush (it is still pending) but append_event returned normally: the API would answer 202 for an event that may never be written")
     except m.EventNotDurable:
         pass
+`,
+    typescript: `const TOPIC = 'counter-events';
+const FLUSH_TIMEOUT_S = 1;
+
+/** Whether appendEvent returned normally or threw EventNotDurable; anything else propagates. */
+async function attempt(m, ...args) {
+  try {
+    await m.appendEvent(...args);
+    return {returned: true, error: null};
+  } catch (e) {
+    if (e instanceof m.EventNotDurable) return {returned: false, error: e};
+    throw e;
+  }
+}
+
+export async function check_topic_key(ctx) {
+  const m = ctx.load('count_events');
+  await m.appendEvent('plays', 'stranger-things', 1, 't-9f3');
+  await m.appendEvent('plays', 'stranger-things', 2, 't-9f4');
+  await m.appendEvent('plays', 'the-crown', 1, 't-9f5');
+  const produced = ctx.kafka.records(TOPIC);
+  assert.equal(produced.length, 3, \`expected three records on \${TOPIC}, found \${produced.length} (topics: \${JSON.stringify([...ctx.kafka.topics.keys()])})\`);
+  const keys = ctx.kafka.keys(TOPIC);
+  assert.deepEqual(keys, ['plays:stranger-things', 'plays:stranger-things', 'plays:the-crown'], \`records must be keyed by ns:name, got \${JSON.stringify(keys)}\`);
+  assert.equal(produced[0].partition, produced[1].partition, 'the same counter must land on the same partition');
+}
+
+export async function check_event_shape(ctx) {
+  const m = ctx.load('count_events');
+  await m.appendEvent('plays', 'stranger-things', -2, 't-9f3');
+  const produced = ctx.kafka.values(TOPIC);
+  assert.equal(produced.length, 1, \`expected one record on \${TOPIC}, found \${produced.length}\`);
+  const event = JSON.parse(produced[0]);
+  assert(event.ns === 'plays' && event.name === 'stranger-things', \`the value must carry ns and name: \${produced[0]}\`);
+  assert(event.delta === -2, \`the value must carry the delta as an integer: \${produced[0]}\`);
+  assert.equal(event.token, 't-9f3', \`the value must carry the client's token unchanged — the rollup dedupes on it: \${produced[0]}\`);
+  assert(typeof event.ts === 'number' && Math.abs(event.ts - Date.now() / 1000) < 60, \`the value must carry a current timestamp in seconds: \${produced[0]}\`);
+}
+
+export async function check_acks_all(ctx) {
+  const m = ctx.load('count_events');
+  // The partition leader fails right after acknowledging: only an event every in-sync replica has survives.
+  await m.appendEvent('plays', 'stranger-things', 1, 't-9f3');
+  ctx.kafka.failover(TOPIC);
+  const held = ctx.kafka.records(TOPIC).length;
+  assert.equal(held, 1, \`appendEvent returned (the API would answer 202), then the partition leader failed and \${TOPIC} holds \${held} record(s) instead of the event: it had been acknowledged by the leader alone. A durability promise needs acks all\`);
+  // The broker writes the next event but its acknowledgement is lost: the producer retries it.
+  ctx.kafka.loseAcks(TOPIC);
+  await m.appendEvent('plays', 'stranger-things', 2, 't-9f4');
+  const copies = ctx.kafka.records(TOPIC).length - 1;
+  assert.equal(copies, 1, \`the broker wrote the second event, its acknowledgement was lost and the producer retried: \${TOPIC} now holds it \${copies} times. With an idempotent producer the broker recognises the retry and writes the event once\`);
+}
+
+export async function check_bounded_flush(ctx) {
+  const m = ctx.load('count_events');
+  // The broker is slow but answers within FLUSH_TIMEOUT_S: the add waits for the ack and succeeds.
+  ctx.kafka.stall(TOPIC, 0.8);
+  const slow = await attempt(m, 'plays', 'stranger-things', 1, 't-9f3');
+  assert(slow.returned, \`the broker acknowledged after 0.8 s, within FLUSH_TIMEOUT_S (1 s), but appendEvent threw EventNotDurable (\${slow.error?.message}): it must wait for the acknowledgement up to the bound\`);
+  let held = ctx.kafka.records(TOPIC).length;
+  assert.equal(held, 1, \`appendEvent returned while the event was still unacknowledged (\${TOPIC} holds \${held} record(s)): it must not return — and the API must not answer 202 — before the broker has the event, exactly once\`);
+  // The broker is down: the add gives up after FLUSH_TIMEOUT_S instead of hanging the request.
+  ctx.kafka.stall(TOPIC);
+  const start = ctx.clock.now();
+  const down = await attempt(m, 'plays', 'stranger-things', 1, 't-9f4');
+  const waited = (ctx.clock.now() - start) / 1000;
+  assert(waited <= FLUSH_TIMEOUT_S + 0.05, \`with the broker down appendEvent waited \${waited.toFixed(0)} s before giving up — an unbounded send waits for the whole message timeout while the client's request hangs: bound it with FLUSH_TIMEOUT_MS (1 s)\`);
+  assert(!down.returned, \`with the broker down appendEvent returned normally after \${waited.toFixed(1)} s without an acknowledgement: the API would answer 202 for an event that may never be written\`);
+  held = ctx.kafka.records(TOPIC).length;
+  assert.equal(held, 1, \`nothing can be written while the broker is down, yet \${TOPIC} holds \${held} record(s)\`);
+}
+
+export async function check_not_durable_raises(ctx) {
+  const m = ctx.load('count_events');
+  ctx.kafka.failNext(TOPIC);
+  const refused = await attempt(m, 'plays', 'stranger-things', 1, 't-9f3');
+  assert(!refused.returned, 'the broker refused the record (delivery error) but appendEvent returned normally: the API would answer 202 for an event that was lost');
+  assert.equal(ctx.kafka.records(TOPIC).length, 0);
+  await m.appendEvent('plays', 'stranger-things', 1, 't-9f3'); // the client's retry, same token
+  const tokens = ctx.kafka.values(TOPIC).map(v => JSON.parse(v).token);
+  assert.deepEqual(tokens, ['t-9f3'], \`after the failure the retry must be produced normally, carrying the same token, which is what makes it safe: \${TOPIC} holds \${JSON.stringify(tokens)}\`);
+  ctx.kafka.stall(TOPIC);
+  const pending = await attempt(m, 'plays', 'stranger-things', 1, 't-9f4');
+  assert(!pending.returned, 'the broker did not acknowledge the record within the flush (it is still pending) but appendEvent returned normally: the API would answer 202 for an event that may never be written');
+}
 `,
   },
   debrief: `The eventually consistent counter does not exist as a number at write time; it exists as a durable fact — "add 1 to plays/stranger-things, token t-9f3, at this time" — and that fact is what the 202 vouches for. Everything about the producer follows from that: acks=all because a leader-only ack can vanish with the leader, idempotence because the producer's own retries must not double a fact, a bounded flush because a promise you cannot keep in a second is better refused than kept late. The token is the other half of the design: the API cannot know whether a 503 was returned before or after the record landed, so instead of guessing it lets the client retry and the rollup dedupe. Netflix logs these events to its TimeSeries abstraction with the same idea — write durably, dedupe downstream — and partitions them by time bucket as well as by counter.`,

@@ -57,6 +57,10 @@ the hash fields; the tick JSON published in the previous step maps 1:1 onto \`Ti
           all: [/f"book:\{symbol\}"/],
           order: [/\.hgetall\(/, /yield to_tick\(/, /\.subscribe\(/],
         },
+        typescript: {
+          all: [/`book:\$\{symbol\}`|['"]book:['"]\s*\+\s*symbol/],
+          order: [/\.hgetall\(/, /call\.write\(\s*toTick\(/, /\.subscribe\(/],
+        },
         go: {
           all: [/"book:"\s*\+\s*symbol/],
           order: [/rdb\.HGetAll\(\s*ctx\s*,/, /stream\.Send\(\s*toTick\(/, /rdb\.Subscribe\(/],
@@ -78,6 +82,7 @@ the hash fields; the tick JSON published in the previous step maps 1:1 onto \`Ti
         'An empty hash means no such book; the call must end with the `NOT_FOUND` status rather than an empty stream.',
       match: {
         python: {all: [/StatusCode\.NOT_FOUND/]},
+        typescript: {all: [/status\.NOT_FOUND/]},
         go: {all: [/codes\.NotFound/]},
         scala: {all: [/Status\.NOT_FOUND/, /onError\(/]},
         cpp: {all: [/StatusCode::NOT_FOUND/]},
@@ -89,6 +94,9 @@ the hash fields; the tick JSON published in the previous step maps 1:1 onto \`Ti
       detail: 'Subscribe to `ticks:{symbol}` and turn each message into a Tick on the stream.',
       match: {
         python: {all: [/f"ticks:\{symbol\}"/, /\.subscribe\(/, /get_message\(|\.listen\(\)/]},
+        typescript: {
+          all: [/`ticks:\$\{symbol\}`|['"]ticks:['"]\s*\+\s*symbol/, /\.subscribe\(/, /on\(\s*['"]message['"]/],
+        },
         go: {all: [/"ticks:"\s*\+\s*symbol/, /rdb\.Subscribe\(\s*ctx\s*,/, /sub\.Channel\(\)|sub\.ReceiveMessage\(/]},
         scala: {all: [/s"ticks:\$symbol"/, /jedis\.subscribe\(/, /onMessage\(/]},
         cpp: {all: [/"ticks:"\s*\+\s*symbol/, /sub\.subscribe\(/, /on_message\(/, /sub\.consume\(\)/]},
@@ -101,6 +109,7 @@ the hash fields; the tick JSON published in the previous step maps 1:1 onto \`Ti
         'Check the call’s cancellation on every iteration and unsubscribe on the way out; otherwise every disconnected client leaks a Redis connection.',
       match: {
         python: {all: [/context\.cancelled\(\)|context\.done\(\)/, /\.unsubscribe\(/]},
+        typescript: {all: [/call\.on\(\s*['"]cancelled['"]|call\.cancelled/, /\.unsubscribe\(/]},
         go: {all: [/<-ctx\.Done\(\)/, /sub\.Close\(\)|sub\.Unsubscribe\(/]},
         scala: {all: [/observer\.isCancelled/, /unsubscribe\(\)/]},
         cpp: {all: [/context->IsCancelled\(\)/, /sub\.unsubscribe\(/]},
@@ -184,6 +193,106 @@ async def serve() -> None:
     server.add_insecure_port("[::]:9100")
     await server.start()
     await server.wait_for_termination()
+`,
+    },
+    typescript: {
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+interface SubscribeRequest {
+  symbol: string;
+}
+
+export interface Tick {
+  symbol: string;
+  bid: number;
+  ask: number;
+  last: number;
+}
+
+/** A Tick from the hash fields (or a tick's JSON): missing fields read as 0. */
+export function toTick(symbol: string, fields: Record<string, unknown>): Tick {
+  const price = (name: string): number => Number(fields[name] ?? 0);
+  return {symbol, bid: price('bid'), ask: price('ask'), last: price('last')};
+}
+
+export async function subscribeTicks(call: grpc.ServerWritableStream<SubscribeRequest, Tick>): Promise<void> {
+  const symbol = call.request.symbol;
+  // TODO: HGETALL book:{symbol}; empty → call.emit('error', {code: grpc.status.NOT_FOUND, …}) and return
+  // TODO: call.write(toTick(symbol, snapshot)) first
+  // TODO: sub = redis.duplicate(); sub.on('message', …) writes a Tick per message; subscribe ticks:{symbol}
+  // TODO: wait for call.on('cancelled') (or call.cancelled), then unsubscribe, quit the subscriber and end the call
+  void symbol;
+  call.emit('error', {code: grpc.status.UNIMPLEMENTED, details: 'not implemented'});
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('ticks.proto')) as {
+  exchange: {TickService: grpc.ServiceClientConstructor};
+};
+
+export const server = new grpc.Server();
+server.addService(pkg.exchange.TickService.service, {SubscribeTicks: subscribeTicks});
+server.bindAsync('0.0.0.0:9100', grpc.ServerCredentials.createInsecure(), () => server.start());
+`,
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+interface SubscribeRequest {
+  symbol: string;
+}
+
+export interface Tick {
+  symbol: string;
+  bid: number;
+  ask: number;
+  last: number;
+}
+
+/** A Tick from the hash fields (or a tick's JSON): missing fields read as 0. */
+export function toTick(symbol: string, fields: Record<string, unknown>): Tick {
+  const price = (name: string): number => Number(fields[name] ?? 0);
+  return {symbol, bid: price('bid'), ask: price('ask'), last: price('last')};
+}
+
+export async function subscribeTicks(call: grpc.ServerWritableStream<SubscribeRequest, Tick>): Promise<void> {
+  const symbol = call.request.symbol;
+  const snapshot = await redis.hgetall(\`book:\${symbol}\`);
+  if (Object.keys(snapshot).length === 0) {
+    call.emit('error', {code: grpc.status.NOT_FOUND, details: \`unknown symbol \${symbol}\`});
+    return;
+  }
+  call.write(toTick(symbol, snapshot));
+  const sub = redis.duplicate(); // a subscribed connection can do nothing else
+  sub.on('message', (_channel: string, message: string) => {
+    call.write(toTick(symbol, JSON.parse(message) as Record<string, unknown>));
+  });
+  await sub.subscribe(\`ticks:\${symbol}\`);
+  const gone = Promise.withResolvers<void>();
+  if (call.cancelled) gone.resolve();
+  else call.on('cancelled', gone.resolve);
+  try {
+    // The stream lives as long as the client: the call ends when it goes away.
+    await gone.promise;
+  } finally {
+    await sub.unsubscribe(\`ticks:\${symbol}\`);
+    await sub.quit();
+    call.end();
+  }
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('ticks.proto')) as {
+  exchange: {TickService: grpc.ServiceClientConstructor};
+};
+
+export const server = new grpc.Server();
+server.addService(pkg.exchange.TickService.service, {SubscribeTicks: subscribeTicks});
+server.bindAsync('0.0.0.0:9100', grpc.ServerCredentials.createInsecure(), () => server.start());
 `,
     },
     go: {
@@ -593,6 +702,118 @@ async def check_cancel(ctx):
     assert call.done(), "the handler kept running after the client cancelled"
     leaked = _subscribers(ctx, "ACME") - before
     assert leaked == 0, f"the client went away but ticks:ACME still has {leaked} subscriber(s) from this call: unsubscribe on the way out"
+`,
+    typescript: `import * as grpc from '@grpc/grpc-js';
+
+const BOOK = ['bid', '10.05', 'ask', '10.06', 'last', '10.05'];
+
+type Item = {tick: Record<string, unknown>} | {error: {code: number; details: string}} | {end: true};
+
+/** The learner's server (addService installs the handler at load) and a client talking to it. */
+function stub(ctx) {
+  ctx.redis.hset('book:ACME', ...BOOK);
+  ctx.load('tick_stream');
+  const pkg = ctx.proto('ticks.proto');
+  return new pkg.exchange.TickService('ticks:9100', grpc.credentials.createInsecure());
+}
+
+/** Let every queued microtask and the server's pending writes run. */
+function settle(ms = 0): Promise<void> {
+  const {promise, resolve} = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  return promise;
+}
+
+/** One SubscribeTicks call, read item by item: a tick, the end of the stream, or its error status. */
+function open(client, symbol: string) {
+  const call = client.SubscribeTicks({symbol});
+  const items: Item[] = [];
+  const waiters: (() => void)[] = [];
+  const push = (item: Item) => {
+    items.push(item);
+    for (const w of waiters.splice(0)) w();
+  };
+  call.on('data', (tick: Record<string, unknown>) => push({tick}));
+  call.on('error', (e: {code: number; details: string}) => push({error: e}));
+  call.on('end', () => push({end: true}));
+  let i = 0;
+  const read = async (what: string): Promise<Item> => {
+    if (i >= items.length) {
+      const next = Promise.withResolvers<void>();
+      waiters.push(next.resolve);
+      await Promise.race([next.promise, settle(500)]);
+    }
+    assert(i < items.length, \`the stream sent nothing within 0.5s: expected \${what}\`);
+    return items[i++];
+  };
+  return {call, read};
+}
+
+function assertTick(item: Item, what: string, bid: number, ask: number, last: number) {
+  assert(!('end' in item), \`the stream ended before sending \${what}\`);
+  assert(!('error' in item), \`the call failed with \${'error' in item ? JSON.stringify(item.error) : ''} before sending \${what}\`);
+  const tick = item.tick;
+  assert.equal(tick.symbol, 'ACME', \`\${what} names symbol \${JSON.stringify(tick.symbol)}, expected ACME\`);
+  assert.deepEqual([tick.bid, tick.ask, tick.last], [bid, ask, last], \`\${what} is bid=\${tick.bid} ask=\${tick.ask} last=\${tick.last}, expected \${bid}/\${ask}/\${last}\`);
+}
+
+/** Subscribers of ticks:{symbol}. Compared as deltas: a subscription leaked by an earlier call stays on the server. */
+function subscribers(ctx, symbol: string): number {
+  return Number(ctx.redis.pubsub('NUMSUB', 'ticks:' + symbol)[1]);
+}
+
+/** Wait (loop turns only) for the handler to add its subscription on top of the count before the call. */
+async function subscribed(ctx, symbol: string, before: number): Promise<number> {
+  for (let i = 0; i < 50 && subscribers(ctx, symbol) <= before; i++) await settle();
+  return subscribers(ctx, symbol) - before;
+}
+
+export async function check_snapshot_first(ctx) {
+  const client = stub(ctx);
+  ctx.redis.publish('ticks:ACME', JSON.stringify({symbol: 'ACME', bid: 1, ask: 2, last: 3})); // before this client subscribed: must not reach it
+  // The engine publishes a tick the moment the handler has read the hash: a handler that subscribed first forwards it before its snapshot.
+  ctx.redisAfter('book:ACME', () => ctx.redis.publish('ticks:ACME', JSON.stringify({symbol: 'ACME', bid: 1, ask: 2, last: 3})));
+  const {call, read} = open(client, 'ACME');
+  const first = await read('the snapshot of book:ACME');
+  assertTick(first, 'the first tick (the snapshot from the hash, before any Pub/Sub message)', 10.05, 10.06, 10.05);
+  call.cancel();
+}
+
+export async function check_not_found(ctx) {
+  const client = stub(ctx);
+  const before = subscribers(ctx, 'GHOST');
+  const {read} = open(client, 'GHOST');
+  const item = await read('a NOT_FOUND status');
+  assert('error' in item, \`an unknown symbol must end the call with NOT_FOUND; the stream \${'end' in item ? 'ended normally' : 'sent a tick'}\`);
+  assert.equal(item.error.code, ctx.grpc.status.NOT_FOUND, \`an unknown symbol ended the call with status \${item.error.code} (\${item.error.details}), expected NOT_FOUND\`);
+  await settle();
+  assert.equal(subscribers(ctx, 'GHOST'), before, 'nothing must be subscribed for a symbol that does not exist');
+}
+
+export async function check_forward(ctx) {
+  const client = stub(ctx);
+  const before = subscribers(ctx, 'ACME');
+  const {call, read} = open(client, 'ACME');
+  await read('the snapshot');
+  assert.equal(await subscribed(ctx, 'ACME', before), 1, 'after the snapshot the handler must SUBSCRIBE to ticks:ACME');
+  ctx.redis.publish('ticks:ACME', JSON.stringify({symbol: 'ACME', bid: 10.07, ask: 10.08, last: 10.07}));
+  assertTick(await read('the published tick'), 'the forwarded tick', 10.07, 10.08, 10.07);
+  ctx.redis.publish('ticks:ACME', JSON.stringify({symbol: 'ACME', bid: 10.09, ask: 10.1, last: 10.09}));
+  assertTick(await read('the second published tick'), 'the second forwarded tick', 10.09, 10.1, 10.09);
+  call.cancel();
+}
+
+export async function check_cancel(ctx) {
+  const client = stub(ctx);
+  const before = subscribers(ctx, 'ACME');
+  const {call, read} = open(client, 'ACME');
+  await read('the snapshot');
+  assert.equal(await subscribed(ctx, 'ACME', before), 1, 'the handler must be subscribed to ticks:ACME while the client is connected');
+  call.cancel();
+  for (let i = 0; i < 20 && subscribers(ctx, 'ACME') > before; i++) await settle();
+  const leaked = subscribers(ctx, 'ACME') - before;
+  assert.equal(leaked, 0, \`the client went away but ticks:ACME still has \${leaked} subscriber(s) from this call: unsubscribe on the way out\`);
+}
 `,
   },
   debrief: `Snapshot-then-stream is the shape of every subscription API: the stream alone cannot tell a new client the current state, and the snapshot alone goes stale in a millisecond. The gap between them is the classic race — a tick published between HGETALL and SUBSCRIBE is lost — which real feeds close with sequence numbers (subscribe first, then snapshot, then drop buffered ticks older than the snapshot's sequence). Checking cancellation on a timer instead of only when a message arrives is what keeps a quiet symbol from pinning a connection forever; at scale, one Redis subscription per process fanning out to all its gRPC streams replaces one connection per client.`,

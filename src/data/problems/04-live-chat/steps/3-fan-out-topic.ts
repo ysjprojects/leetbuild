@@ -55,6 +55,9 @@ message to every stream on *this* instance subscribed to the room.
           all: [/"chat-messages"/, /producer\.produce\(\s*TOPIC\s*,[^\n]*key\s*=\s*room/],
           none: [/producer\.flush\(/],
         },
+        typescript: {
+          all: [/'chat-messages'|"chat-messages"/, /producer\.send\(\s*\{[^}]*topic:\s*TOPIC[\s\S]{0,200}?key:\s*room/],
+        },
         go: {all: [/"chat-messages"/, /WriteMessages\(/, /Key:\s*\[\]byte\(\s*room\s*\)/], none: [/Async:\s*false/]},
         scala: {
           all: [/"chat-messages"/, /new ProducerRecord\[[^(]*\]\(\s*Topic\s*,\s*room\s*,/],
@@ -76,6 +79,12 @@ message to every stream on *this* instance subscribed to the room.
         'The `group.id` must contain something unique per process (`chat-server-{hostname}-{uuid|pid}`); a shared group would split the topic between instances instead of broadcasting.',
       match: {
         python: {all: [/"group\.id"\s*:\s*GROUP_ID/, /GROUP_ID\s*=\s*f"chat-server-\{[^\n]*(gethostname|uuid)/]},
+        typescript: {
+          all: [
+            /groupId:\s*GROUP_ID/,
+            /GROUP_ID\s*=\s*`chat-server-\$\{[^\n]*hostname\(\)[^\n]*(randomUUID|randomBytes|pid)/,
+          ],
+        },
         go: {
           all: [
             /GroupID:\s*groupID/,
@@ -93,6 +102,7 @@ message to every stream on *this* instance subscribed to the room.
         'A new group has no committed offset; `auto.offset.reset=latest` (kafka-go: `StartOffset: kafka.LastOffset`) keeps a restarted instance from replaying history into live streams.',
       match: {
         python: {all: [/"auto\.offset\.reset"\s*:\s*"latest"/]},
+        typescript: {all: [/fromBeginning:\s*false/]},
         go: {all: [/StartOffset:\s*kafka\.LastOffset/]},
         scala: {all: [/"auto\.offset\.reset"\s*,\s*"latest"|AUTO_OFFSET_RESET_CONFIG\s*,\s*"latest"/]},
         cpp: {all: [/"auto\.offset\.reset"\s*,\s*"latest"/]},
@@ -105,6 +115,7 @@ message to every stream on *this* instance subscribed to the room.
         'The consumer subscribes to the topic and calls `local_deliver(room, msg)` with the decoded message for every record.',
       match: {
         python: {all: [/consumer\.subscribe\(\s*\[\s*TOPIC\s*\]\s*\)/, /local_deliver\(\s*[^\n]*,\s*msg\s*\)/]},
+        typescript: {all: [/consumer\.subscribe\(\s*\{[^}]*topic:\s*TOPIC/, /localDeliver\(\s*[^\n]*,\s*msg\s*\)/]},
         go: {all: [/reader\.(Read|Fetch)Message\(/, /localDeliver\(\s*[^\n]*,\s*msg\s*\)/]},
         scala: {all: [/consumer\.subscribe\([^\n]*Topic/, /localDeliver\(\s*[^\n]*,\s*msg\s*\)/]},
         cpp: {all: [/consumer->subscribe\([^\n]*kTopic/, /local_deliver\(\s*[^\n]*,\s*msg\s*\)/]},
@@ -189,6 +200,64 @@ def run_consumer() -> None:
 
 if __name__ == "__main__":
     threading.Thread(target=run_consumer, name="room-bus", daemon=True).start()
+`,
+    },
+    typescript: {
+      starter: `import {randomUUID} from 'node:crypto';
+import {hostname} from 'node:os';
+
+import {Kafka} from 'kafkajs';
+import {type ServerMsg, localDeliver} from 'subscriptions'; // provided: hands msg to every local stream in the room
+
+export const TOPIC = 'chat-messages';
+export const GROUP_ID = 'chat-server'; // TODO: unique per instance: chat-server-{hostname}-{uuid}
+
+const kafka = new Kafka({clientId: 'chat-server', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+const producerReady = producer.connect();
+const consumer = kafka.consumer({groupId: GROUP_ID});
+
+export async function publish(room: string, msg: ServerMsg): Promise<void> {
+  // TODO: send JSON.stringify(msg) to TOPIC keyed by room; the stream handler must not wait on the broker
+  throw new Error('not implemented');
+}
+
+export async function runConsumer(): Promise<void> {
+  // TODO: subscribe to TOPIC from the latest offset (fromBeginning: false — a restarted instance must not
+  // replay history to live clients); for every record decode a ServerMsg and localDeliver(room, msg)
+  throw new Error('not implemented');
+}
+`,
+      solution: `import {randomUUID} from 'node:crypto';
+import {hostname} from 'node:os';
+
+import {Kafka} from 'kafkajs';
+import {type ServerMsg, localDeliver} from 'subscriptions'; // provided: hands msg to every local stream in the room
+
+export const TOPIC = 'chat-messages';
+export const GROUP_ID = \`chat-server-\${hostname()}-\${randomUUID().slice(0, 8)}\`; // every instance is its own group
+
+const kafka = new Kafka({clientId: 'chat-server', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+const producerReady = producer.connect();
+const consumer = kafka.consumer({groupId: GROUP_ID});
+
+export async function publish(room: string, msg: ServerMsg): Promise<void> {
+  await producerReady;
+  await producer.send({topic: TOPIC, messages: [{key: room, value: JSON.stringify(msg)}]});
+}
+
+export async function runConsumer(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: TOPIC, fromBeginning: false}); // latest: no replay into live streams
+  await consumer.run({
+    eachMessage: async ({message}) => {
+      if (message.key === null || message.value === null) return;
+      const msg = JSON.parse(message.value.toString()) as ServerMsg;
+      localDeliver(message.key.toString(), msg);
+    },
+  });
+}
 `,
     },
     go: {
@@ -628,6 +697,108 @@ def check_deliver(ctx):
     assert got == want, f"local_deliver received {got}, expected {want} (room = the record key, msg = the decoded value)"
     room7 = [msg.text for room, msg in delivered if room == "room-7"]
     assert room7 == ["hi", "hey"], f"room-7's messages were delivered as {room7}, expected ['hi', 'hey'] in production order"
+`,
+    typescript: `const TOPIC = 'chat-messages';
+
+const msg = (room, user, text, ts = 1700000000000) => ({room, user, text, ts});
+
+/** Everything localDeliver hands to \`room\` on this instance: a real subscription on the shared table. */
+function recording(ctx, room = 'room-7', into = []) {
+  const subs = ctx.load('/support/subscriptions.ts');
+  const inbox = subs.subscribe(room);
+  void (async () => {
+    for await (const m of inbox) into.push([room, m]);
+  })();
+  return into;
+}
+
+/**
+ * Run \`fn(group)\` the moment a consumer subscribes to the topic — before its run loop polls — the way
+ * another instance's message lands between a subscription and its first poll. A record seeded there
+ * is what the learner's own publish produces: the JSON ServerMsg keyed by the room.
+ */
+function onSubscribe(ctx, fn) {
+  ctx.kafka.onSubscribe((group, topics) => {
+    if (topics.includes(TOPIC)) fn(group);
+  });
+}
+
+const seed = (ctx, room, m) => ctx.kafka.seed(TOPIC, {key: room, value: JSON.stringify(m)});
+const subscribeEvents = ctx => ctx.kafka.events.filter(e => e[0] === 'subscribe');
+
+export async function check_topic_keyed(ctx) {
+  const m = ctx.load('room_bus');
+  const hi = msg('room-7', 'ana', 'hi');
+  await m.publish('room-7', hi);
+  await m.publish('room-8', msg('room-8', 'bo', 'yo'));
+  await m.publish('room-7', msg('room-7', 'cy', 'hey'));
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 3, \`three publish calls produced \${records.length} record(s) to '\${TOPIC}'; topics seen: \${JSON.stringify([...ctx.kafka.topics.keys()])}\`);
+  const keys = ctx.kafka.keys(TOPIC);
+  assert.deepEqual(keys, ['room-7', 'room-8', 'room-7'], \`record keys are \${JSON.stringify(keys)}, expected the room ids ['room-7', 'room-8', 'room-7']\`);
+  const parsed = JSON.parse(records[0].value.toString());
+  assert.deepEqual(parsed, hi, \`the record value must be the JSON-serialized ServerMsg; parsed back: \${JSON.stringify(parsed)}\`);
+  const parts = new Set(records.filter(r => r.key.toString() === 'room-7').map(r => r.partition));
+  assert.equal(parts.size, 1, \`room-7's messages landed on partitions \${JSON.stringify([...parts].sort())}: keyed by room they stay on one partition\`);
+}
+
+export async function check_unique_group(ctx) {
+  const a = ctx.load('room_bus');
+  const da = recording(ctx);
+  ctx.modules.purge(); // a second process: fresh module instances, its own subscription table
+  const b = ctx.load('room_bus');
+  const db = recording(ctx);
+  const [ga, gb] = [a.GROUP_ID, b.GROUP_ID];
+  const host = 'app-7f3c9d';
+  assert(typeof ga === 'string' && ga.startsWith('chat-server-'), \`GROUP_ID is \${JSON.stringify(ga)}, expected chat-server-{hostname}-{uuid or pid}\`);
+  assert(ga.includes(host), \`GROUP_ID \${JSON.stringify(ga)} does not contain the hostname \${JSON.stringify(host)}\`);
+  assert(ga.length > 'chat-server-'.length + host.length + 1, \`GROUP_ID \${JSON.stringify(ga)} needs a per-process part (uuid or pid) after the hostname\`);
+  assert.notEqual(ga, gb, \`two instances on this host computed the same group id \${JSON.stringify(ga)}: with a shared group the topic is split between them instead of broadcast\`);
+  const seeded = new Set();
+  onSubscribe(ctx, group => {
+    // each instance's first subscription is answered by one new message
+    if (seeded.has(group)) return;
+    seeded.add(group);
+    seed(ctx, 'room-7', msg('room-7', 'ana', 'hello from ' + (group === ga ? 'A' : 'B')));
+  });
+  await ctx.drain(a.runConsumer()); // A joins and sees 'hello from A'
+  await ctx.drain(b.runConsumer()); // B joins; 'hello from B' is produced while both groups exist
+  await ctx.drain(a.runConsumer()); // A resumes from its committed offset
+  const groups = ctx.kafka.consumers.map(c => c.groupId);
+  assert(groups.includes(ga) && groups.includes(gb), \`the broker saw consumer groups \${JSON.stringify([...new Set(groups)].sort())}, expected the consumers to use groupId: GROUP_ID (\${JSON.stringify(ga)}, \${JSON.stringify(gb)})\`);
+  const textsA = da.map(([, x]) => x.text);
+  const textsB = db.map(([, x]) => x.text);
+  assert.deepEqual(textsB, ['hello from B'], \`instance B delivered \${JSON.stringify(textsB)}, expected ['hello from B']\`);
+  assert.deepEqual(textsA, ['hello from A', 'hello from B'], \`instance A delivered \${JSON.stringify(textsA)}, expected ['hello from A', 'hello from B']: with one group per instance every instance receives every message\`);
+}
+
+export async function check_latest(ctx) {
+  const m = ctx.load('room_bus');
+  const delivered = recording(ctx);
+  seed(ctx, 'room-7', msg('room-7', 'ana', 'yesterday'));
+  onSubscribe(ctx, () => seed(ctx, 'room-7', msg('room-7', 'bo', 'now')));
+  await ctx.drain(m.runConsumer());
+  assert(subscribeEvents(ctx).length > 0, \`the consumer never subscribed to '\${TOPIC}'\`);
+  const texts = delivered.map(([, x]) => x.text);
+  assert.deepEqual(texts, ['now'], \`a freshly started instance delivered \${JSON.stringify(texts)}, expected ['now']: a new group must start at the latest offset (fromBeginning: false), not replay 'yesterday'\`);
+}
+
+export async function check_deliver(ctx) {
+  const m = ctx.load('room_bus');
+  const delivered = recording(ctx);
+  recording(ctx, 'room-8', delivered);
+  const expected = [['room-7', msg('room-7', 'ana', 'hi', 1)], ['room-8', msg('room-8', 'bo', 'yo', 2)], ['room-7', msg('room-7', 'cy', 'hey', 3)]];
+  onSubscribe(ctx, () => expected.forEach(([room, x]) => seed(ctx, room, x)));
+  await ctx.drain(m.runConsumer());
+  assert(subscribeEvents(ctx).some(e => e[2].includes(TOPIC)), \`the consumer never subscribed to '\${TOPIC}' (subscribe events: \${JSON.stringify(subscribeEvents(ctx))})\`);
+  assert.equal(delivered.length, 3, \`three records were produced but localDeliver was called \${delivered.length} time(s)\`);
+  const shape = ([room, x]) => [room, x.user, x.text, x.ts];
+  const got = delivered.map(shape).sort();
+  const want = expected.map(shape).sort();
+  assert.deepEqual(got, want, \`localDeliver received \${JSON.stringify(got)}, expected \${JSON.stringify(want)} (room = the record key, msg = the decoded value)\`);
+  const room7 = delivered.filter(([room]) => room === 'room-7').map(([, x]) => x.text);
+  assert.deepEqual(room7, ['hi', 'hey'], \`room-7's messages were delivered as \${JSON.stringify(room7)}, expected ['hi', 'hey'] in production order\`);
+}
 `,
   },
   debrief: `Kafka's consumer group is a *work-sharing* primitive: partitions are divided among the members. Fan-out wants the opposite, so each instance becomes a group of one and reads the whole topic — the same topic serves both patterns depending on how you name your groups. Keying by room keeps each room's messages ordered without ordering the whole world, and \`latest\` plus auto-commit is the honest choice for live delivery: what matters is now, and history has its own store. Real systems put a sequence number in each message so clients can detect gaps, use Redis Pub/Sub or a dedicated pub/sub layer when Kafka's per-partition latency is too high, and cap fan-out with room sharding for very large rooms.`,

@@ -44,6 +44,7 @@ Implement \`resolve(code)\` as a **cache-aside** lookup and the \`GET /{code}\` 
       detail: 'Use `url:{code}` so the redirect is one GET on a key derived from the path.',
       match: {
         python: {all: [/f["']url:\{code\}["']|["']url:["']\s*\+\s*code/]},
+        typescript: {all: [/`url:\$\{code\}`|['"]url:['"]\s*\+\s*code/]},
         go: {all: [/"url:"\s*\+\s*code|"url:%s"/]},
         scala: {all: [/s"url:\$\{?code\}?"|"url:"\s*\+\s*code/]},
         cpp: {all: [/"url:"\s*\+\s*code/]},
@@ -55,6 +56,7 @@ Implement \`resolve(code)\` as a **cache-aside** lookup and the \`GET /{code}\` 
       detail: 'Cache-aside means GET first and only `store.lookup` on a miss.',
       match: {
         python: {order: [/\br\.get\(/, /store\.lookup\(/]},
+        typescript: {order: [/\bredis\.get\(/, /store\.lookup\(/]},
         go: {order: [/rdb\.Get\(/, /store\.Lookup\(/]},
         scala: {order: [/jedis\.get\(/, /store\.lookup\(/]},
         cpp: {order: [/redis\.get\(/, /store\.lookup\(/]},
@@ -66,6 +68,7 @@ Implement \`resolve(code)\` as a **cache-aside** lookup and the \`GET /{code}\` 
       detail: 'Store the URL with an expiry (`TTL_S`, 86400 s); a cache without TTLs only grows.',
       match: {
         python: {all: [/\.set\([^\n]*ex\s*=\s*(TTL_S|86400)|\.setex\([^\n]*(TTL_S|86400)/]},
+        typescript: {all: [/\.set\([^\n]*['"]EX['"]\s*,\s*(TTL_S|86400)|\.setex\([^\n]*(TTL_S|86400)/]},
         go: {all: [/rdb\.Set\([^\n]*,\s*(ttl|24\s*\*\s*time\.Hour)\s*\)/]},
         scala: {all: [/jedis\.setex\([^\n]*(TtlSeconds|86400)/]},
         cpp: {all: [/redis\.set\([^\n]*(kTtl|86400)|redis\.setex\([^\n]*(kTtl|86400)/]},
@@ -78,6 +81,9 @@ Implement \`resolve(code)\` as a **cache-aside** lookup and the \`GET /{code}\` 
         'An unknown code is stored as the `MISSING` sentinel with a short TTL (60 s) and answered with `404 Not Found`; a hit on the sentinel never touches the store.',
       match: {
         python: {all: [/MISSING_TTL_S|\b60\b/, /==\s*MISSING/, /status_code\s*=\s*404|HTTP_404/]},
+        typescript: {
+          all: [/MISSING_TTL_S|\b60\b/, /===?\s*MISSING/, /code\(\s*404\s*\)|status\(\s*404\s*\)|statusCode:\s*404/],
+        },
         go: {all: [/missingTTL|time\.Minute/, /==\s*missing/, /http\.StatusNotFound|\b404\b/]},
         scala: {all: [/MissingTtlSeconds|\b60L?\b/, /==\s*Missing/, /StatusCodes\.NotFound|\b404\b/]},
         cpp: {all: [/kMissingTtl|\b60\b/, /==\s*kMissing/, /status\s*=\s*404/]},
@@ -92,6 +98,14 @@ Implement \`resolve(code)\` as a **cache-aside** lookup and the \`GET /{code}\` 
         python: {
           all: [/status_code\s*=\s*30[27]/, /Location|RedirectResponse\(/, /private, max-age=0/],
           none: [/status_code\s*=\s*30[18]/],
+        },
+        typescript: {
+          all: [
+            /redirect\([^\n]*30[27]|code\(\s*30[27]\s*\)|status\(\s*30[27]\s*\)/,
+            /Location|redirect\(/,
+            /private, max-age=0/,
+          ],
+          none: [/redirect\([^\n]*30[18]|code\(\s*30[18]\s*\)/],
         },
         go: {
           all: [
@@ -190,6 +204,76 @@ def redirect(code: str) -> Response:
     if url is None:
         raise HTTPException(status_code=404, detail="no such link")
     return RedirectResponse(url, status_code=302, headers={"Cache-Control": "private, max-age=0"})
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const TTL_S = 86400;
+export const MISSING_TTL_S = 60;
+export const MISSING = '__missing__';
+
+/** Links table (provided). */
+export const store = {
+  async lookup(code: string): Promise<string | null> {
+    throw new Error('not implemented');
+  },
+};
+
+export async function resolve(code: string): Promise<string | null> {
+  const key = ''; // TODO: url:{code}
+  // TODO: GET first; a hit returns the URL (or null when it is the MISSING sentinel)
+  // TODO: miss → store.lookup(); null → SET MISSING with MISSING_TTL_S; URL → SET with TTL_S
+  throw new Error('not implemented');
+}
+
+app.get('/:code', async (request, reply) => {
+  const {code} = request.params as {code: string};
+  const url = await resolve(code);
+  // TODO: null → 404; otherwise 302 with Location and Cache-Control: private, max-age=0
+  return reply.code(501).send();
+});
+`,
+      solution: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const TTL_S = 86400;
+export const MISSING_TTL_S = 60;
+export const MISSING = '__missing__';
+
+/** Links table (provided). */
+export const store = {
+  async lookup(code: string): Promise<string | null> {
+    throw new Error('not implemented');
+  },
+};
+
+export async function resolve(code: string): Promise<string | null> {
+  const key = \`url:\${code}\`;
+  const cached = await redis.get(key);
+  if (cached !== null) return cached === MISSING ? null : cached;
+  const url = await store.lookup(code);
+  if (url === null) {
+    await redis.set(key, MISSING, 'EX', MISSING_TTL_S);
+    return null;
+  }
+  await redis.set(key, url, 'EX', TTL_S);
+  return url;
+}
+
+app.get('/:code', async (request, reply) => {
+  const {code} = request.params as {code: string};
+  const url = await resolve(code);
+  if (url === null) return reply.code(404).send({error: 'no such link'});
+  return reply.header('Cache-Control', 'private, max-age=0').redirect(url, 302);
+});
 `,
     },
     go: {
@@ -578,6 +662,81 @@ async def check_redirect(ctx):
     assert r.headers.get("location") == URL, f"Location is {r.headers.get('location')!r}, expected the long url"
     cache_control = r.headers.get("cache-control", "")
     assert "private" in cache_control and "max-age=0" in cache_control, f"Cache-Control is {cache_control!r}, expected 'private, max-age=0'"
+`,
+    typescript: `const URL_ = 'https://example.com/launch';
+
+/** The links table: knows g9Xc, records every lookup. Swapped onto the learner's provided store object. */
+function redirect(ctx) {
+  const m = ctx.load('redirect');
+  const links: Record<string, string> = {g9Xc: URL_};
+  const lookups: string[] = [];
+  m.store.lookup = async (code: string) => {
+    lookups.push(code);
+    return links[code] ?? null;
+  };
+  return {m, links, lookups};
+}
+
+export async function check_key(ctx) {
+  const {m} = redirect(ctx);
+  assert.equal(await m.resolve('g9Xc'), URL_, 'resolve must return the long url the store knows');
+  assert.equal(ctx.redis.get('url:g9Xc'), URL_, \`after a miss the url must be cached under url:g9Xc, keys are \${JSON.stringify(ctx.redis.keys('*'))}\`);
+  ctx.redis.set('url:abcd', 'https://example.com/cached');
+  assert.equal(await m.resolve('abcd'), 'https://example.com/cached', 'a value cached under url:{code} must be returned as the long url');
+}
+
+export async function check_read_first(ctx) {
+  const {m, links, lookups} = redirect(ctx);
+  ctx.redis.set('url:g9Xc', URL_);
+  assert.equal(await m.resolve('g9Xc'), URL_);
+  assert.deepEqual(lookups, [], \`a cache hit is the whole request: the store was asked for \${JSON.stringify(lookups)}\`);
+  links.zz12 = 'https://example.com/z';
+  assert.equal(await m.resolve('zz12'), 'https://example.com/z', 'a miss must fall through to the store');
+  assert.deepEqual(lookups, ['zz12'], \`the store must be asked once on a miss, lookups: \${JSON.stringify(lookups)}\`);
+  assert.equal(await m.resolve('zz12'), 'https://example.com/z');
+  assert.deepEqual(lookups, ['zz12'], 'the second resolve must be served from the cache, not the store again');
+}
+
+export async function check_ttl(ctx) {
+  const {m, lookups} = redirect(ctx);
+  await m.resolve('g9Xc');
+  const ttl = ctx.redis.ttl('url:g9Xc');
+  assert(ttl > 0, 'url:g9Xc was cached without an expiry (TTL -1): the cache would only grow');
+  assert(86000 <= ttl && ttl <= 86400, \`url:g9Xc expires in \${ttl} s, expected 86400\`);
+  ctx.clock.advance(86401);
+  assert.equal(ctx.redis.get('url:g9Xc'), null);
+  assert.equal(await m.resolve('g9Xc'), URL_);
+  assert.deepEqual(lookups, ['g9Xc', 'g9Xc'], 'once the entry has expired the next resolve goes back to the store');
+}
+
+export async function check_negative(ctx) {
+  const {m, lookups} = redirect(ctx);
+  assert.equal(await m.resolve('ghost'), null, 'an unknown code resolves to nothing');
+  assert.deepEqual(lookups, ['ghost']);
+  const sentinel = ctx.redis.get('url:ghost');
+  assert(sentinel !== null, 'an unknown code must be cached as the MISSING sentinel');
+  assert.equal(sentinel, m.MISSING, \`url:ghost holds \${JSON.stringify(sentinel)}, expected the MISSING sentinel\`);
+  const ttl = ctx.redis.ttl('url:ghost');
+  assert(1 <= ttl && ttl <= 60, \`the sentinel expires in \${ttl} s, expected 60\`);
+  assert.equal(await m.resolve('ghost'), null);
+  assert.deepEqual(lookups, ['ghost'], 'a hit on the sentinel must not touch the store');
+  const r = await ctx.client(m.app).get('/ghost');
+  assert.equal(r.status, 404, \`GET /ghost answered \${r.status}, expected 404\`);
+  assert.deepEqual(lookups, ['ghost'], 'the 404 is answered from the sentinel, not from a store lookup');
+  ctx.clock.advance(61);
+  assert.equal(await m.resolve('ghost'), null);
+  assert.deepEqual(lookups, ['ghost', 'ghost'], 'after 60 s the sentinel is gone and the store is asked again');
+}
+
+export async function check_redirect(ctx) {
+  const {m} = redirect(ctx);
+  const r = await ctx.client(m.app).get('/g9Xc');
+  assert(![301, 308].includes(r.status), \`GET /g9Xc answered \${r.status}: a permanent redirect is cached by the browser and later clicks never come back\`);
+  assert([302, 307].includes(r.status), \`GET /g9Xc answered \${r.status}, expected 302\`);
+  assert.equal(r.headers['location'], URL_, \`Location is \${JSON.stringify(r.headers['location'])}, expected the long url\`);
+  const cacheControl = r.headers['cache-control'] ?? '';
+  assert(cacheControl.includes('private') && cacheControl.includes('max-age=0'), \`Cache-Control is \${JSON.stringify(cacheControl)}, expected 'private, max-age=0'\`);
+}
 `,
   },
   debrief: `The redirect is the hot path of a shortener — reads outnumber writes by a hundred to one — so it is shaped to be one Redis round trip and nothing else. Negative caching matters more here than in most caches: unknown codes are *the* abuse pattern (scanners walking the key space), and each one would otherwise be a database query. The 302 is deliberate: a 301 would be cached by the browser forever and the next step would never see the click. Real shorteners add a local in-process cache in front of Redis for the top links, and jitter the TTL so a popular link's entry does not expire on every replica at once.`,

@@ -57,6 +57,7 @@ are imported.
         'Without a cursor the newest page is read from the channel’s list, `LRANGE recent:{channel_id} 0 limit-1`, before any data-service call.',
       match: {
         python: {all: [/f"recent:\{/, /r\.lrange\(\s*\w+\s*,\s*0\s*,\s*limit\s*-\s*1\s*\)/]},
+        typescript: {all: [/`recent:\$\{/, /redis\.lrange\(\s*\w+\s*,\s*0\s*,\s*limit\s*-\s*1\s*\)/]},
         go: {all: [/"recent:"\s*\+/, /rdb\.LRange\(\s*ctx\s*,\s*\w+\s*,\s*0\s*,\s*int64\(\s*limit\s*\)\s*-\s*1\s*\)/]},
         scala: {all: [/s"recent:\$/, /jedis\.lrange\(\s*\w+\s*,\s*0L?\s*,\s*limit\s*-\s*1L?\s*\)/]},
         cpp: {all: [/"recent:"\s*\+/, /redis\.lrange\(\s*\w+\s*,\s*0\s*,\s*limit\s*-\s*1\s*,/]},
@@ -69,6 +70,7 @@ are imported.
         'The cached page is used only when there is no `before` and the list holds at least `limit` items; anything less is not a page.',
       match: {
         python: {all: [/before is None/, /len\(\s*cached\s*\)\s*>=\s*limit/]},
+        typescript: {all: [/before\s*===?\s*undefined|before\s*==\s*null/, /cached\.length\s*>=\s*limit/]},
         go: {all: [/before\s*==\s*""/, /len\(\s*cached\s*\)\s*>=\s*limit/]},
         scala: {all: [/before\.isEmpty/, /cached\.size\s*>=\s*limit/]},
         cpp: {
@@ -85,6 +87,10 @@ are imported.
         python: {
           all: [/await fetch_messages\(\s*channel_id\s*,/, /latest_snowflake\(\)/],
           none: [/def get_messages(?:(?!\n@app)[\s\S])*?\.(lpush|rpush|set)\(/],
+        },
+        typescript: {
+          all: [/await fetch_messages\(\s*channelId\s*,/, /latest_snowflake\(\)/],
+          none: [/app\.get\((?:(?!\napp\.)[\s\S])*?\.(lpush|rpush|set)\(/],
         },
         go: {
           all: [/fetchMessages\(\s*ctx\s*,\s*channelID\s*,/, /latestSnowflake\(\)/],
@@ -107,6 +113,14 @@ are imported.
         'After `store_message` and `publish`, the message is pushed to the head of `recent:{channel_id}` and the list is trimmed to `RECENT_N` (100) items.',
       match: {
         python: {
+          order: [
+            /await store_message\(/,
+            /publish\(\s*message\s*\)/,
+            /\.lpush\(/,
+            /\.ltrim\(\s*\w+\s*,\s*0\s*,\s*RECENT_N\s*-\s*1\s*\)/,
+          ],
+        },
+        typescript: {
           order: [
             /await store_message\(/,
             /publish\(\s*message\s*\)/,
@@ -147,6 +161,7 @@ are imported.
         'Each POST sets `EXPIRE recent:{channel_id} 300` (`RECENT_TTL_S`), so a channel that goes quiet leaves memory on its own.',
       match: {
         python: {all: [/\.expire\(\s*\w+\s*,\s*RECENT_TTL_S\s*\)/]},
+        typescript: {all: [/\.expire\(\s*\w+\s*,\s*RECENT_TTL_S\s*\)/]},
         go: {all: [/\.Expire\(\s*ctx\s*,\s*\w+\s*,\s*recentTTL\s*\)/]},
         scala: {all: [/\.expire\(\s*\w+\s*,\s*RecentTtlSeconds\s*\)/]},
         cpp: {all: [/\.expire\(\s*\w+\s*,\s*kRecentTtl\s*\)/]},
@@ -232,6 +247,91 @@ async def post_message(channel_id: int, body: NewMessage) -> JSONResponse:
     pipe.expire(key, RECENT_TTL_S)
     pipe.execute()
     return JSONResponse(message, status_code=201)
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {fetch_messages} from './channel_routing'; // built in step 4: the ring and the 300 ms deadline
+import {publish} from './message_events'; // built in step 5: one message-events record per stored message
+import {type NewMessage, store_message, valid_content} from './post_message'; // built in step 1
+import {DEFAULT_LIMIT, latest_snowflake, MAX_LIMIT, type PageMessage} from './read_messages'; // built in step 2
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const RECENT_N = 100;
+export const RECENT_TTL_S = 300;
+
+app.get('/channels/:channel_id/messages', async (request, reply) => {
+  const channelId = BigInt((request.params as {channel_id: string}).channel_id);
+  const {before, limit: rawLimit} = request.query as {before?: string; limit?: string};
+  const limit = rawLimit === undefined ? DEFAULT_LIMIT : Number(rawLimit);
+  // TODO: 400 unless 1 <= limit <= MAX_LIMIT
+  // TODO: no before → cached = LRANGE recent:{channelId} 0 limit-1; a full page (cached.length >= limit) → answer it
+  // TODO: otherwise fetch_messages(channelId, before ?? latest_snowflake(), limit) → [{id, author_id, content}] as PageMessage[]
+  return reply.code(501).send();
+});
+
+app.post('/channels/:channel_id/messages', async (request, reply) => {
+  const channelId = BigInt((request.params as {channel_id: string}).channel_id);
+  const body = request.body as NewMessage;
+  // TODO: 400 unless valid_content; message = await store_message(...); await publish(message)
+  // TODO: LPUSH recent:{channelId} json of {id, author_id, content}; LTRIM 0 RECENT_N-1; EXPIRE RECENT_TTL_S
+  // TODO: 201 with the message
+  return reply.code(501).send();
+});
+`,
+      solution: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {fetch_messages} from './channel_routing'; // built in step 4: the ring and the 300 ms deadline
+import {publish} from './message_events'; // built in step 5: one message-events record per stored message
+import {type NewMessage, store_message, valid_content} from './post_message'; // built in step 1
+import {DEFAULT_LIMIT, latest_snowflake, MAX_LIMIT, type PageMessage} from './read_messages'; // built in step 2
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const RECENT_N = 100;
+export const RECENT_TTL_S = 300;
+
+app.get('/channels/:channel_id/messages', async (request, reply) => {
+  const channelId = BigInt((request.params as {channel_id: string}).channel_id);
+  const {before, limit: rawLimit} = request.query as {before?: string; limit?: string};
+  const limit = rawLimit === undefined ? DEFAULT_LIMIT : Number(rawLimit);
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_LIMIT) {
+    return reply.code(400).send({error: 'limit must be between 1 and 100'});
+  }
+  if (before === undefined) {
+    // the newest page is the only one the list can answer
+    const key = \`recent:\${channelId}\`;
+    const cached = await redis.lrange(key, 0, limit - 1);
+    if (cached.length >= limit) return cached.map(item => JSON.parse(item) as PageMessage); // a shorter list is not a page: fall through
+  }
+  const rows = await fetch_messages(channelId, before !== undefined ? BigInt(before) : latest_snowflake(), limit);
+  const page: PageMessage[] = rows.map(m => ({id: String(m.id), author_id: String(m.author_id), content: m.content}));
+  return page;
+});
+
+app.post('/channels/:channel_id/messages', async (request, reply) => {
+  const channelId = BigInt((request.params as {channel_id: string}).channel_id);
+  const body = request.body as NewMessage;
+  if (!valid_content(body.content ?? '')) {
+    return reply.code(400).send({error: 'content must be 1 to 2000 characters'});
+  }
+  const message = await store_message(channelId, BigInt(body.author_id), body.content ?? '');
+  await publish(message);
+  const key = \`recent:\${channelId}\`;
+  await redis
+    .pipeline()
+    .lpush(key, JSON.stringify({id: message.id, author_id: message.author_id, content: message.content}))
+    .ltrim(key, 0, RECENT_N - 1)
+    .expire(key, RECENT_TTL_S)
+    .exec();
+  return reply.code(201).send(message);
+});
 `,
     },
     go: {
@@ -906,6 +1006,173 @@ async def check_ttl(ctx):
     page, reads = await _get(m, ctx, limit=50)
     assert len(reads.calls()) == 1, f"once the list expired the newest page comes from the data service again, it was called {len(reads.calls())} time(s)"
     assert [x["content"] for x in page] == ["again", "hello"], f"the page after expiry is read from Postgres: again, hello — got {[x.get('content') for x in page]}"
+`,
+    typescript: `import {SCHEMA} from 'messages/db';
+
+const EPOCH = 1420070400000;
+const BUCKET_MS = 10 * 24 * 3600 * 1000;
+const INSERT = 'INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES ($1, $2, $3, $4, $5)';
+const NOW_B = Math.floor((Date.now() - EPOCH) / BUCKET_MS);
+
+function sf(bucket: number, offsetMs = 0): bigint {
+  return (BigInt(bucket * BUCKET_MS + offsetMs) << 22n) | (1n << 17n);
+}
+
+const CHANNEL = sf(NOW_B - 1, 5000); // created last bucket
+const KEY = \`recent:\${CHANNEL}\`;
+
+interface Entry {
+  id: string;
+  author_id: string;
+  content: string;
+}
+
+/**
+ * The API over the real stack: Postgres holds \`stored\` messages of CHANNEL (db0 the oldest), the newest
+ * \`cached\` of them sit in recent:{CHANNEL} as POST left them, and step 3's data service serves at every
+ * instance step 4's ring routes to. Returns the app module and the stored messages, newest first.
+ */
+async function api(ctx, stored = 0, cached = 0) {
+  await ctx.db.reset(SCHEMA);
+  const entries: Entry[] = [];
+  for (let i = 0; i < stored; i++) {
+    const mid = sf(NOW_B - 1, 10000 + 1000 * i);
+    await ctx.db.execute(INSERT, [String(CHANNEL), NOW_B - 1, String(mid), '7', \`db\${i}\`]);
+    entries.unshift({id: String(mid), author_id: '7', content: \`db\${i}\`});
+  }
+  if (cached > 0) ctx.redis.rpush(KEY, ...entries.slice(0, cached).map(e => JSON.stringify(e)));
+  const m = ctx.load('hot_channels');
+  const routing = ctx.load('channel_routing');
+  const data = ctx.load('data_service');
+  assert(data.messageData !== undefined && typeof data.messageData.GetMessages === 'function', 'data_service (step 3) exports no messageData handlers to read through');
+  const service = ctx.proto('messages.proto').discord.MessageData.service;
+  for (const node of routing.INSTANCES) ctx.grpc.serve(service, data.messageData, node);
+  return {m, entries};
+}
+
+/** What reached the data path since it was made: GetMessages calls (to any instance) and the reads Postgres ran. */
+class Reads {
+  private readonly callsFrom: number;
+  private readonly queriesFrom: number;
+  constructor(private readonly ctx) {
+    this.callsFrom = ctx.grpc.callsTo('GetMessages').length;
+    this.queriesFrom = ctx.db.queries.length;
+  }
+  calls() {
+    return this.ctx.grpc.callsTo('GetMessages').slice(this.callsFrom);
+  }
+  selects(): string[] {
+    return this.ctx.db.queries
+      .slice(this.queriesFrom)
+      .map(([sql]) => sql as string)
+      .filter(sql => sql.split(/\\s+/).join(' ').toLowerCase().startsWith('select'));
+  }
+  none(): boolean {
+    return this.calls().length === 0 && this.selects().length === 0;
+  }
+  toString(): string {
+    return \`\${this.calls().length} GetMessages call(s) and \${this.selects().length} SELECT(s) on Postgres\`;
+  }
+}
+
+async function get(m, ctx, params: Record<string, string | number> = {}) {
+  const reads = new Reads(ctx);
+  const r = await ctx.client(m.app).get(\`/channels/\${CHANNEL}/messages\`, {query: params});
+  assert.equal(r.status, 200, \`GET answered \${r.status}: \${r.text.slice(0, 120)}\`);
+  return {page: r.json() as Entry[], reads};
+}
+
+async function post(m, ctx, content: string) {
+  return ctx.client(m.app).post(\`/channels/\${CHANNEL}/messages\`, {json: {author_id: 7, content}});
+}
+
+export async function check_cache_read(ctx) {
+  const {m, entries} = await api(ctx, 60, 60);
+  let {page, reads} = await get(m, ctx, {limit: 50});
+  assert.deepEqual(page, entries.slice(0, 50), \`with 60 cached entries limit=50 must be the first 50 of the list, newest first; got \${page.length} entries starting \${JSON.stringify(page.slice(0, 2))}\`);
+  assert(reads.none(), \`the page was in the list, yet the read cost \${reads}: a cache hit touches neither the data service nor the database\`);
+  ({page, reads} = await get(m, ctx));
+  assert(page.length === 50 && reads.none(), \`without ?limit the default page of 50 comes from the list too; got \${page.length} entries for \${reads}\`);
+  ({page, reads} = await get(m, ctx, {limit: 60}));
+  assert(JSON.stringify(page) === JSON.stringify(entries) && reads.none(), \`limit=60 is covered by 60 entries: the whole list, no data path; got \${page.length} entries for \${reads}\`);
+  for (const bad of [0, 101]) {
+    const r = await ctx.client(m.app).get(\`/channels/\${CHANNEL}/messages\`, {query: {limit: bad}});
+    assert.equal(r.status, 400, \`limit=\${bad} is outside 1..100: expected 400, got \${r.status}\`);
+  }
+}
+
+export async function check_full_page_only(ctx) {
+  const {m, entries} = await api(ctx, 12, 10);
+  let {page, reads} = await get(m, ctx, {limit: 50});
+  let calls = reads.calls();
+  assert.equal(calls.length, 1, \`10 cached entries cannot answer a page of 50: the data service must be asked once, it was asked \${calls.length} time(s)\`);
+  assert(String(calls[0].request.channel_id) === String(CHANNEL) && Number(calls[0].request.limit) === 50, \`the fallback must ask for this channel and limit, asked \${JSON.stringify(calls[0].request)}\`);
+  assert.deepEqual(page, entries, \`the list holds only 10 of the channel's 12 messages: the page must be all 12 from the data service, got \${page.length}: \${JSON.stringify(page.map(x => x.content))}\`);
+  assert.deepEqual(ctx.redis.lrange(KEY, 0, -1), entries.slice(0, 10).map(e => JSON.stringify(e)), 'reads never write the list: after the fallback it must hold exactly the 10 entries POST left there');
+  ({page, reads} = await get(m, ctx, {limit: 10}));
+  assert(reads.none(), \`10 cached entries do answer a page of 10, yet the read cost \${reads}\`);
+  assert.deepEqual(page, entries.slice(0, 10), \`limit=10 must be served from the list, got \${JSON.stringify(page)}\`);
+  ({page, reads} = await get(m, ctx, {limit: 5, before: entries[7].id}));
+  calls = reads.calls();
+  assert.equal(calls.length, 1, 'a request with ?before is never the newest page: it must go to the data service even though the list holds enough entries');
+  assert.equal(String(calls[0].request.before), entries[7].id, \`the before cursor must be passed through, the data service saw \${calls[0].request.before}\`);
+  assert.deepEqual(page, entries.slice(8), \`the page older than db4 is db3..db0 from the data service, got \${JSON.stringify(page.map(x => x.content))}\`);
+}
+
+export async function check_fallback(ctx) {
+  const {m, entries} = await api(ctx, 3);
+  let {page, reads} = await get(m, ctx, {limit: 50});
+  const calls = reads.calls();
+  assert.equal(calls.length, 1, \`an empty list must fall back to the data service once, it was called \${calls.length} time(s)\`);
+  assert(BigInt(calls[0].request.before) > BigInt(entries[0].id), \`without ?before the fallback must pass latest_snowflake(), an id newer than anything stored; it passed \${calls[0].request.before}\`);
+  assert(reads.selects().length > 0, 'the fallback page must come from Postgres through the data service, no query reached it');
+  assert.deepEqual(page, entries, \`the data service's messages must be answered as {id, author_id, content} with string ids, newest first: expected \${JSON.stringify(entries)}, got \${JSON.stringify(page)}\`);
+  assert.equal(ctx.redis.exists(KEY), 0, 'reads never fill the list: it is written only by POST, otherwise an old page could shadow a newer message');
+  ({page, reads} = await get(m, ctx, {limit: 50}));
+  assert.equal(reads.calls().length, 1, \`a second miss is a second data-service call (nothing was cached by the read), it made \${reads.calls().length}\`);
+  assert(JSON.stringify(page) === JSON.stringify(entries) && ctx.redis.exists(KEY) === 0, 'the second miss answers the same page and still leaves the list alone');
+}
+
+export async function check_write_through(ctx) {
+  const {m, entries} = await api(ctx, 99, 99);
+  let r = await post(m, ctx, '');
+  assert.equal(r.status, 400, \`empty content must be a 400, got \${r.status}\`);
+  assert.equal(ctx.redis.llen(KEY), 99, 'a rejected message must not touch the list');
+  const ids: string[] = [];
+  for (const content of ['first', 'second', 'third']) {
+    r = await post(m, ctx, content);
+    assert.equal(r.status, 201, \`POST answered \${r.status}, expected 201\`);
+    ids.push((r.json() as {id: string}).id);
+  }
+  const rows = await ctx.db.execute('SELECT message_id, content FROM messages ORDER BY message_id DESC LIMIT 3');
+  assert.deepEqual(rows.map(row => row.message_id), [...ids].reverse(), \`every message must be stored (store_message), the newest rows are \${JSON.stringify(rows.map(row => row.content))}\`);
+  const produced = ctx.kafka.records('message-events');
+  assert(produced.length === 3 && produced.every(rec => rec.key?.toString() === String(CHANNEL)), \`every stored message must be published once, keyed by the channel; produced \${JSON.stringify(produced.map(rec => [rec.key?.toString() ?? null, rec.offset]))}\`);
+  assert.equal(ctx.redis.llen(KEY), 100, \`99 cached + 3 pushed must be trimmed to 100 (LTRIM 0 99), the list holds \${ctx.redis.llen(KEY)}\`);
+  const head = ctx.redis.lrange(KEY, 0, 2).map(x => JSON.parse(x));
+  assert.deepEqual(head, [{id: ids[2], author_id: '7', content: 'third'}, {id: ids[1], author_id: '7', content: 'second'}, {id: ids[0], author_id: '7', content: 'first'}], \`the three posts must sit at the head of the list, newest first, as {id, author_id, content}: \${JSON.stringify(head)}\`);
+  assert.deepEqual(ctx.redis.lrange(KEY, -1, -1).map(x => JSON.parse(x)), [entries[96]], 'the two oldest cached entries must have been trimmed away');
+  const {page, reads} = await get(m, ctx, {limit: 50});
+  assert(reads.none(), \`the newest page is in the list now, yet the read cost \${reads}\`);
+  assert(JSON.stringify(page.slice(0, 3)) === JSON.stringify(head) && JSON.stringify(page.slice(3)) === JSON.stringify(entries.slice(0, 47)), 'the newest page comes from the list and starts with the messages just posted');
+}
+
+export async function check_ttl(ctx) {
+  const {m} = await api(ctx);
+  const r = await post(m, ctx, 'hello');
+  assert.equal(r.status, 201, \`POST answered \${r.status}\`);
+  const ttl = ctx.redis.ttl(KEY);
+  assert(ttl > 0, \`\${KEY} has no expiry (TTL \${ttl}): quiet channels would stay in memory forever\`);
+  assert(290 <= ttl && ttl <= 300, \`\${KEY} expires in \${ttl} s, expected 300\`);
+  ctx.clock.advance(200);
+  await post(m, ctx, 'again');
+  assert(ctx.redis.ttl(KEY) > 250, \`a new message must re-arm the expiry, 200 s later the TTL is \${ctx.redis.ttl(KEY)} s\`);
+  ctx.clock.advance(301);
+  assert.equal(ctx.redis.exists(KEY), 0, \`\${KEY} must be gone 300 s after the last message\`);
+  const {page, reads} = await get(m, ctx, {limit: 50});
+  assert.equal(reads.calls().length, 1, \`once the list expired the newest page comes from the data service again, it was called \${reads.calls().length} time(s)\`);
+  assert.deepEqual(page.map(x => x.content), ['again', 'hello'], \`the page after expiry is read from Postgres: again, hello — got \${JSON.stringify(page.map(x => x.content))}\`);
+}
 `,
   },
   debrief: `The list is the cheapest cache in the system because it has exactly one writer and one shape: the request that stored the message pushes it, so the head of the list is the newest message by construction, and a read that finds a full page can trust it without a version or a timestamp. Refusing to answer from a short list is what keeps that trust — a list that holds 30 items says nothing about item 31, which may well exist in the database. Not filling on a miss is the same discipline from the other side: a read-populated list would race the write that happened between the database read and the push, and could shadow a newer message until the TTL rescued it. Write-through costs one pipeline per post, which is nothing next to the write itself, and the TTL only decides when a cold channel stops paying rent. Discord's note that they "do not want to have to cache messages in Redis" is about the database being fast enough for the long tail; the hot head of a popular channel is a different workload, and a bounded list per channel is the usual answer to it. Real systems invalidate the list on edits and deletes, store a compact encoding instead of JSON, and keep the per-channel hash from the previous step beside it so "is there anything new since id X" is one HGET.`,

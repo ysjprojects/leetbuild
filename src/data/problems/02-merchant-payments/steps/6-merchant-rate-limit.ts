@@ -52,6 +52,7 @@ the merchant id from the verified API key.
         'The key is `rl:{merchant}:{minute}` with the minute derived from the current time: one counter per merchant per window, and the next window starts from zero without any reset logic.',
       match: {
         python: {all: [/f["']rl:\{merchant\}:\{minute\}["']/, /now\s*\/\/\s*WINDOW_S/]},
+        typescript: {all: [/`rl:\$\{merchant\}:\$\{minute\}`/, /Math\.floor\(\s*now\s*\/\s*WINDOW_S\s*\)/]},
         go: {all: [/"rl:%s:%d"/, /now\s*\/\s*windowSeconds/]},
         scala: {all: [/s"rl:\$merchant:\$minute"/, /now\s*\/\s*WindowSeconds/]},
         cpp: {all: [/"rl:"\s*\+\s*merchant\s*\+\s*":"\s*\+\s*std::to_string\(\s*minute\s*\)/, /now\s*\/\s*kWindow/]},
@@ -64,6 +65,10 @@ the merchant id from the verified API key.
         'INCR is atomic and returns the count; when it returns 1 the key was just created and gets `EXPIRE 120` so it cleans itself up.',
       match: {
         python: {all: [/count == 1/], order: [/\br\.incr\(\s*\w+\s*\)/, /\.expire\(\s*\w+\s*,\s*KEY_TTL_S\s*\)/]},
+        typescript: {
+          all: [/count === 1/],
+          order: [/\bredis\.incr\(\s*\w+\s*\)/, /\.expire\(\s*\w+\s*,\s*KEY_TTL_S\s*\)/],
+        },
         go: {
           all: [/count == 1/],
           order: [/rdb\.Incr\(\s*[\w.()]+\s*,\s*\w+\s*\)/, /rdb\.Expire\(\s*[\w.()]+\s*,\s*\w+\s*,\s*keyTTL\s*\)/],
@@ -82,6 +87,7 @@ the merchant id from the verified API key.
         'When the count is over the limit answer `429 Too Many Requests`; the limit is checked against the value INCR returned, not a separate read.',
       match: {
         python: {all: [/count > LIMIT/, /status_code\s*=\s*429|HTTP_429/]},
+        typescript: {all: [/count > LIMIT/, /code\(\s*429\s*\)|status\(\s*429\s*\)/]},
         go: {all: [/count > limit/, /http\.StatusTooManyRequests|\b429\b/]},
         scala: {all: [/count > Limit/, /StatusCodes\.TooManyRequests|\b429\b/]},
         cpp: {all: [/count > kLimit/, /status\s*=\s*429/]},
@@ -94,6 +100,7 @@ the merchant id from the verified API key.
         '`Retry-After` carries the seconds until the window ends and `X-RateLimit-Remaining` the budget left; without them a well-behaved client can only guess.',
       match: {
         python: {all: [/Retry-After/, /WINDOW_S\s*-\s*now\s*%\s*WINDOW_S/, /X-RateLimit-Remaining/]},
+        typescript: {all: [/Retry-After/, /WINDOW_S\s*-\s*\(?\s*now\s*%\s*WINDOW_S\s*\)?/, /X-RateLimit-Remaining/]},
         go: {all: [/Retry-After/, /windowSeconds\s*-\s*now\s*%\s*windowSeconds/, /X-RateLimit-Remaining/]},
         scala: {all: [/Retry-After/, /WindowSeconds\s*-\s*now\s*%\s*WindowSeconds/, /X-RateLimit-Remaining/]},
         cpp: {all: [/Retry-After/, /kWindow\s*-\s*now\s*%\s*kWindow/, /X-RateLimit-Remaining/]},
@@ -176,6 +183,81 @@ def rate_limit(request: Request) -> int:
 async def checkout(response: Response, remaining: int = Depends(rate_limit)) -> dict:
     response.headers["X-RateLimit-Remaining"] = str(remaining)
     return {"status": "ok"}  # the real handler is step 1
+`,
+    },
+    typescript: {
+      starter: `import Fastify, {type FastifyReply, type FastifyRequest} from 'fastify';
+import Redis from 'ioredis';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const LIMIT = 100; // requests per merchant per minute
+export const WINDOW_S = 60;
+export const KEY_TTL_S = 120; // the key outlives its window by one more, then disappears on its own
+
+/** Merchant id from the verified API key (authentication is provided). */
+export const auth = {
+  merchantOf(request: FastifyRequest): string {
+    return (request as FastifyRequest & {merchantId: string}).merchantId;
+  },
+};
+
+/** preHandler: answers 429 when the merchant is over LIMIT this minute; otherwise sets X-RateLimit-Remaining. */
+export async function rateLimit(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+  const merchant = auth.merchantOf(request);
+  const now = Math.floor(Date.now() / 1000);
+  // TODO: key rl:{merchant}:{minute}; INCR it; EXPIRE KEY_TTL_S when the count is 1
+  // TODO: count > LIMIT → 429 with Retry-After (seconds left in the window) and X-RateLimit-Remaining: 0
+  // TODO: otherwise reply.header('X-RateLimit-Remaining', max(LIMIT - count, 0)) for the handler's response
+  void merchant;
+  void now;
+  throw new Error('not implemented');
+}
+
+app.post('/checkout', {preHandler: rateLimit}, async () => ({status: 'ok'})); // the real handler is step 1
+
+// app.listen({port: 8443, https: {cert, key}})
+`,
+      solution: `import Fastify, {type FastifyReply, type FastifyRequest} from 'fastify';
+import Redis from 'ioredis';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const LIMIT = 100; // requests per merchant per minute
+export const WINDOW_S = 60;
+export const KEY_TTL_S = 120; // the key outlives its window by one more, then disappears on its own
+
+/** Merchant id from the verified API key (authentication is provided). */
+export const auth = {
+  merchantOf(request: FastifyRequest): string {
+    return (request as FastifyRequest & {merchantId: string}).merchantId;
+  },
+};
+
+/** preHandler: answers 429 when the merchant is over LIMIT this minute; otherwise sets X-RateLimit-Remaining. */
+export async function rateLimit(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+  const merchant = auth.merchantOf(request);
+  const now = Math.floor(Date.now() / 1000);
+  const minute = Math.floor(now / WINDOW_S);
+  const key = \`rl:\${merchant}:\${minute}\`;
+  const count = await redis.incr(key);
+  if (count === 1) {
+    await redis.expire(key, KEY_TTL_S); // a brand-new window: make the key clean itself up
+  }
+  if (count > LIMIT) {
+    const retryAfter = WINDOW_S - (now % WINDOW_S);
+    reply.header('Retry-After', String(retryAfter)).header('X-RateLimit-Remaining', '0');
+    await reply.code(429).send({error: 'rate limit exceeded'});
+    return;
+  }
+  reply.header('X-RateLimit-Remaining', String(Math.max(LIMIT - count, 0)));
+}
+
+app.post('/checkout', {preHandler: rateLimit}, async () => ({status: 'ok'})); // the real handler is step 1
+
+// app.listen({port: 8443, https: {cert, key}})
 `,
     },
     go: {
@@ -553,6 +635,93 @@ async def check_headers(ctx):
     assert over.headers.get("x-ratelimit-remaining") == "0", f"the 429 must carry X-RateLimit-Remaining: 0, got {over.headers.get('x-ratelimit-remaining')!r}"
     assert last_ok.status_code == 200 and last_ok.headers.get("x-ratelimit-remaining") == "0", f"the 100th request is allowed with X-RateLimit-Remaining: 0, got {last_ok.status_code} / {last_ok.headers.get('x-ratelimit-remaining')!r}"
     assert fresh.status_code == 200 and fresh.headers.get("x-ratelimit-remaining") == "99", f"a merchant's first request leaves 99, got X-RateLimit-Remaining {fresh.headers.get('x-ratelimit-remaining')!r}"
+`,
+    typescript: `/** The learner's app with the provided authentication swapped for the X-Merchant header. */
+function api(ctx) {
+  const m = ctx.load('rate_limiter');
+  m.auth.merchantOf = request => request.headers['x-merchant'] ?? 'm42';
+  return m;
+}
+
+/** Moves the clock so the current minute is at :second (plus half a second); returns the integer seconds now. */
+function at(ctx, second: number): number {
+  const now = Date.now() / 1000;
+  let target = Math.floor(now) - (Math.floor(now) % 60) + second + 0.5;
+  if (target < now) target += 60;
+  ctx.clock.advance(target - now);
+  return Math.floor(Date.now() / 1000);
+}
+
+const post = (c, merchant = 'm42') => c.post('/checkout', {headers: {'X-Merchant': merchant}});
+
+export async function check_window_key(ctx) {
+  const m = api(ctx);
+  const now = at(ctx, 5);
+  const minute = Math.floor(now / 60);
+  const c = ctx.client(m.app);
+  const r = await post(c);
+  assert.equal(r.status, 200, \`the first request of the minute answered \${r.status}\`);
+  const key = \`rl:m42:\${minute}\`;
+  assert.equal(ctx.redis.get(key), '1', \`after one request \${key} is \${JSON.stringify(ctx.redis.get(key))}, expected '1' (keys: \${JSON.stringify(ctx.redis.keys('rl:*'))})\`);
+  await post(c, 'm7');
+  assert.equal(ctx.redis.get(\`rl:m7:\${minute}\`), '1', 'each merchant has its own counter');
+  assert.equal(ctx.redis.get(key), '1', "another merchant's request must not count against m42");
+  ctx.clock.advance(60);
+  await post(c);
+  assert.equal(ctx.redis.get(\`rl:m42:\${minute + 1}\`), '1', \`a minute later the counter must live under rl:m42:\${minute + 1} (keys: \${JSON.stringify(ctx.redis.keys('rl:*'))})\`);
+  assert.equal(ctx.redis.get(key), '1', "the previous window's counter is left alone: the key name is the window");
+}
+
+export async function check_incr_expire(ctx) {
+  const m = api(ctx);
+  const now = at(ctx, 5);
+  const key = \`rl:m42:\${Math.floor(now / 60)}\`;
+  const c = ctx.client(m.app);
+  for (let i = 0; i < 3; i++) await post(c);
+  assert.equal(ctx.redis.get(key), '3', \`after three requests \${key} is \${JSON.stringify(ctx.redis.get(key))}, expected '3'\`);
+  let ttl = ctx.redis.ttl(key);
+  assert(110 <= ttl && ttl <= 120, \`\${key} has TTL \${ttl}, expected 120 s set when the key was created\`);
+  ctx.clock.advance(30);
+  await post(c);
+  ttl = ctx.redis.ttl(key);
+  assert(80 <= ttl && ttl <= 90, \`30 s later \${key} has TTL \${ttl}: the expiry is set once, when INCR returns 1, not on every request\`);
+  ctx.clock.advance(100);
+  assert(!ctx.redis.exists(key), \`\${key} must have expired 120 s after it was created\`);
+}
+
+export async function check_too_many(ctx) {
+  const m = api(ctx);
+  const now = at(ctx, 5);
+  ctx.redis.set(\`rl:m42:\${Math.floor(now / 60)}\`, 98); // 98 checkouts already this minute
+  const c = ctx.client(m.app);
+  const r99 = await post(c);
+  const r100 = await post(c);
+  const r101 = await post(c);
+  const r102 = await post(c);
+  const other = await post(c, 'm7');
+  ctx.clock.advance(60);
+  const later = await post(c);
+  assert(r99.status === 200 && r100.status === 200, \`requests 99 and 100 are within the limit, got \${r99.status} and \${r100.status}\`);
+  assert.equal(r101.status, 429, \`the 101st request of the minute answered \${r101.status}, expected 429\`);
+  assert.equal(r102.status, 429, \`the 102nd request answered \${r102.status}, expected 429 for the rest of the window\`);
+  assert.equal(other.status, 200, 'one merchant over its limit must not block another');
+  assert.equal(later.status, 200, \`in the next minute the merchant is allowed again, got \${later.status}\`);
+}
+
+export async function check_headers(ctx) {
+  const m = api(ctx);
+  const now = at(ctx, 43);
+  ctx.redis.set(\`rl:m42:\${Math.floor(now / 60)}\`, 99);
+  const c = ctx.client(m.app);
+  const lastOk = await post(c);
+  const over = await post(c);
+  const fresh = await post(c, 'm7');
+  assert.equal(over.status, 429, \`the 101st request answered \${over.status}, expected 429\`);
+  assert.equal(over.headers['retry-after'], '17', \`at :43 the 429 must say Retry-After: 17 (seconds left in the window), got \${JSON.stringify(over.headers['retry-after'])}\`);
+  assert.equal(over.headers['x-ratelimit-remaining'], '0', \`the 429 must carry X-RateLimit-Remaining: 0, got \${JSON.stringify(over.headers['x-ratelimit-remaining'])}\`);
+  assert(lastOk.status === 200 && lastOk.headers['x-ratelimit-remaining'] === '0', \`the 100th request is allowed with X-RateLimit-Remaining: 0, got \${lastOk.status} / \${JSON.stringify(lastOk.headers['x-ratelimit-remaining'])}\`);
+  assert(fresh.status === 200 && fresh.headers['x-ratelimit-remaining'] === '99', \`a merchant's first request leaves 99, got X-RateLimit-Remaining \${JSON.stringify(fresh.headers['x-ratelimit-remaining'])}\`);
+}
 `,
   },
   debrief: `One atomic \`INCR\` per request is the whole limiter: no read-modify-write race, no Lua, and the window boundary is encoded in the key name so nothing ever has to be reset. The \`EXPIRE\` on the first hit is what keeps Redis from filling with dead windows. Real gateways run the limiter at the edge, size the limit per plan, use a sliding window or a token bucket when the double-burst at the boundary matters, and — as the Go solution does — fail open when Redis is unreachable, because a limiter that turns a cache outage into a checkout outage is worse than no limiter at all.`,

@@ -52,6 +52,7 @@ about. Implement \`record_placement(user, x, y, color)\` — \`POST /place\` cal
         'The record goes to the `placements` topic with the user, coordinates, colour and a millisecond timestamp as JSON.',
       match: {
         python: {all: [/"placements"/, /producer\.produce\(/, /"ts"/]},
+        typescript: {all: [/'placements'|"placements"/, /producer\s*\.send\(/, /\bts:/]},
         go: {all: [/"placements"/, /WriteMessages\(/, /json:"ts"/]},
         scala: {all: [/"placements"/, /producer\.send\(/, /"ts"/]},
         cpp: {all: [/"placements"/, /producer->produce\(/, /"ts"/]},
@@ -64,6 +65,7 @@ about. Implement \`record_placement(user, x, y, color)\` — \`POST /place\` cal
         'The key is `"{x}:{y}"`: all placements on one pixel land on one partition, in order, for the history consumer.',
       match: {
         python: {all: [/produce\([^\n]*key\s*=\s*f["']\{x\}:\{y\}["']/]},
+        typescript: {all: [/`\$\{x\}:\$\{y\}`/, /messages:\s*\[\s*\{\s*key\b/]},
         go: {all: [/Key:\s*\[\]byte\(\s*fmt\.Sprintf\(\s*"%d:%d"\s*,\s*x\s*,\s*y\s*\)\s*\)/]},
         scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*Topic\s*,\s*s"\$x:\$y"\s*,/]},
         cpp: {
@@ -84,6 +86,10 @@ about. Implement \`record_placement(user, x, y, color)\` — \`POST /place\` cal
           all: [/producer\.poll\(\s*0\s*\)/],
           none: [/def record_placement(?:(?!\ndef )[\s\S])*?producer\.flush\(/],
         },
+        typescript: {
+          all: [/\.catch\(|\.then\([^\n]*,/],
+          none: [/function recordPlacement(?:(?!\nexport )[\s\S])*?await producer\.send\(/],
+        },
         go: {all: [/Async:\s*true/], none: [/if err := writer\.WriteMessages/]},
         scala: {all: [/producer\.send\(\s*\w+\s*,/], none: [/\.send\([^\n]*\)\.get\(/]},
         cpp: {all: [/producer->poll\(\s*0\s*\)/], none: [/void record_placement(?:(?!\n\})[\s\S])*?producer->flush\(/]},
@@ -96,6 +102,7 @@ about. Implement \`record_placement(user, x, y, color)\` — \`POST /place\` cal
         'A delivery report callback logs failed records; the placement itself is not undone and the handler never sees an exception.',
       match: {
         python: {all: [/on_delivery\s*=\s*on_delivery|callback\s*=\s*on_delivery/, /log\.(warning|error)\(/]},
+        typescript: {all: [/onDelivery\(/, /console\.(warn|error)\(/]},
         go: {all: [/Completion:\s*func\(/, /log\.Printf\(/]},
         scala: {all: [/onCompletion\(/, /System\.err\.println|log(ger)?\.(warn|error)\(/]},
         cpp: {all: [/dr_cb\(|DeliveryReportCb/, /std::cerr/]},
@@ -107,6 +114,11 @@ about. Implement \`record_placement(user, x, y, color)\` — \`POST /place\` cal
       detail: 'Buffered records are only sent when the producer flushes; do it once at shutdown, with a timeout.',
       match: {
         python: {all: [/def shutdown(?:(?!\ndef )[\s\S])*?producer\.flush\(/]},
+        typescript: {
+          all: [
+            /function shutdown(?:(?!\nexport )[\s\S])*?Promise\.(all|allSettled)\((?:(?!\nexport )[\s\S])*?setTimeout\(/,
+          ],
+        },
         go: {all: [/func shutdown(?:(?!\n\})[\s\S])*?writer\.Close\(\)/]},
         scala: {all: [/def shutdown(?:(?!\n {2}def )[\s\S])*?producer\.(flush|close)\(/]},
         cpp: {all: [/void shutdown(?:(?!\n\})[\s\S])*?producer->flush\(/]},
@@ -171,6 +183,75 @@ def shutdown() -> None:
     remaining = producer.flush(timeout=5)
     if remaining:
         log.warning("%d placements were not delivered", remaining)
+`,
+    },
+    typescript: {
+      starter: `import {Kafka} from 'kafkajs';
+import {setTimeout} from 'node:timers/promises';
+
+export const TOPIC = 'placements';
+
+const kafka = new Kafka({clientId: 'place-api', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+void producer.connect(); // in the background; the first send queues behind the handshake
+
+/** Sends still in flight: shutdown() waits for them, the request path never does. */
+const inFlight = new Set<Promise<void>>();
+
+/** Delivery report for one record, keyed by its tile. */
+export function onDelivery(key: string, err: Error | null): void {
+  // TODO: log a warning when err is set; the tile stays painted either way
+}
+
+/** One event per painted tile; the board already holds the pixel, whatever happens here. */
+export function recordPlacement(user: string, x: number, y: number, color: number): void {
+  const value = JSON.stringify({user, x, y, color, ts: Date.now()});
+  // TODO: producer.send keyed by \`\${x}:\${y}\`; report through onDelivery; keep the promise in inFlight; never await here
+  throw new Error('not implemented');
+}
+
+/** A clean stop loses nothing: wait for what is in flight, with a timeout. */
+export async function shutdown(): Promise<void> {
+  // TODO: Promise.all(inFlight) raced against setTimeout(5000) so buffered placements reach the broker
+  throw new Error('not implemented');
+}
+`,
+      solution: `import {Kafka} from 'kafkajs';
+import {setTimeout} from 'node:timers/promises';
+
+export const TOPIC = 'placements';
+
+const kafka = new Kafka({clientId: 'place-api', brokers: ['kafka:9092']});
+const producer = kafka.producer();
+void producer.connect(); // in the background; the first send queues behind the handshake
+
+/** Sends still in flight: shutdown() waits for them, the request path never does. */
+const inFlight = new Set<Promise<void>>();
+
+/** Delivery report for one record, keyed by its tile. */
+export function onDelivery(key: string, err: Error | null): void {
+  if (err !== null) console.warn(\`placement on \${key} not delivered: \${err.message}\`);
+}
+
+/** One event per painted tile; the board already holds the pixel, whatever happens here. */
+export function recordPlacement(user: string, x: number, y: number, color: number): void {
+  const key = \`\${x}:\${y}\`;
+  const value = JSON.stringify({user, x, y, color, ts: Date.now()});
+  const delivery: Promise<void> = producer
+    .send({topic: TOPIC, messages: [{key, value}], acks: 1})
+    .then(
+      () => onDelivery(key, null),
+      (err: Error) => onDelivery(key, err),
+    )
+    .finally(() => inFlight.delete(delivery));
+  inFlight.add(delivery); // the handler returns now; the broker answers later
+}
+
+/** A clean stop loses nothing: wait for what is in flight, with a timeout. */
+export async function shutdown(): Promise<void> {
+  const flushed = await Promise.race([Promise.all(inFlight).then(() => true), setTimeout(5000, false)]);
+  if (!flushed) console.warn(\`\${inFlight.size} placements were not delivered\`);
+}
 `,
     },
     go: {
@@ -534,6 +615,130 @@ def check_flush(ctx):
     m.shutdown()
     took = ctx.clock.time() - start
     assert took <= 60, f"with the broker down, shutdown() took {took:.0f} s: flush with a timeout so a stop is not held for the producer's whole message timeout"
+`,
+    typescript: `const TILE = {x: 3, y: 7, color: 12, user: 'ana'};
+
+/** What the module logs at warning level or above while the check runs. */
+function logged(): string[] {
+  const records: string[] = [];
+  const warn = console.warn;
+  const error = console.error;
+  console.warn = (...args) => {
+    records.push(args.map(String).join(' '));
+    warn(...args);
+  };
+  console.error = (...args) => {
+    records.push(args.map(String).join(' '));
+    error(...args);
+  };
+  return records;
+}
+
+function pixel(ctx, api, x: number, y: number): number {
+  const board: Uint8Array = ctx.redis.getBuffer('board') ?? new Uint8Array();
+  const off = y * api.SIZE + x;
+  return off < board.length ? board[off] : 0;
+}
+
+function placements(ctx): Record<string, unknown>[] {
+  return ctx.kafka.values('placements').map((v: string) => JSON.parse(v));
+}
+
+/** Let the producer's delivery promises settle: pending timers (a broker answering late, a flush deadline) get their turn. */
+async function settle(): Promise<void> {
+  for (let i = 0; i < 5; i++) {
+    const {promise, resolve} = Promise.withResolvers<void>();
+    globalThis.setTimeout(resolve, 0);
+    await promise;
+  }
+}
+
+async function settleMicrotasks(): Promise<void> {
+  for (let i = 0; i < 5; i++) {
+    const {promise, resolve} = Promise.withResolvers<void>();
+    queueMicrotask(resolve);
+    await promise;
+  }
+}
+
+export async function check_topic(ctx) {
+  const m = ctx.load('placement_events');
+  m.recordPlacement('ana', 3, 7, 12);
+  await settle();
+  const produced = placements(ctx);
+  assert.equal(produced.length, 1, \`expected one record on placements, found \${produced.length}\`);
+  const event = produced[0];
+  assert.deepEqual({user: event.user, x: event.x, y: event.y, color: event.color}, {user: 'ana', x: 3, y: 7, color: 12}, \`the value must be JSON carrying user, x, y and color: \${JSON.stringify(event)}\`);
+  assert(Number.isInteger(event.ts) && Math.abs((event.ts as number) - Date.now()) < 60000, \`ts must be the current time in epoch milliseconds, got \${JSON.stringify(event.ts)}\`);
+}
+
+export async function check_keyed_by_tile(ctx) {
+  const m = ctx.load('placement_events');
+  m.recordPlacement('ana', 3, 7, 12);
+  m.recordPlacement('bo', 3, 7, 5);
+  m.recordPlacement('ana', 7, 3, 12);
+  await settle();
+  const keys = ctx.kafka.keys('placements');
+  assert.deepEqual(keys, ['3:7', '3:7', '7:3'], \`records must be keyed by the tile 'x:y', got \${JSON.stringify(keys)}\`);
+  const records = ctx.kafka.records('placements');
+  assert.equal(records[0].partition, records[1].partition, 'two placements on the same pixel must land on the same partition, in order');
+}
+
+export async function check_non_blocking(ctx) {
+  const api = ctx.load('board_api');
+  const events = ctx.load('placement_events');
+  ctx.kafka.stall(); // the brokers stop answering
+  let start = ctx.clock.now();
+  const r = await ctx.client(api.app).post('/place', {json: TILE});
+  let took = (ctx.clock.now() - start) / 1000;
+  assert(took < 0.5, \`with the broker not answering, POST /place took \${took.toFixed(1)} s: recordPlacement must hand the record to the producer and return, not wait for the acknowledgement\`);
+  assert.equal(r.status, 200, \`with the broker not answering, POST /place answered \${r.status}: the tile is painted, the event follows when the broker is back\`);
+  assert.equal(pixel(ctx, api, 3, 7), 12, 'the tile must be on the board while its event waits for the broker');
+  start = ctx.clock.now();
+  await events.recordPlacement('bo', 4, 7, 1); // returns at once; a promise here would be the wait itself
+  took = (ctx.clock.now() - start) / 1000;
+  assert(took < 0.5, \`recordPlacement waited \${took.toFixed(1)} s for a broker that does not answer: enqueue and return\`);
+  ctx.kafka.resume();
+  events.recordPlacement('cy', 5, 7, 2); // the producer's retries get served again
+  await settle();
+  const users = placements(ctx).map(e => e.user).sort();
+  assert.deepEqual(users, ['ana', 'bo', 'cy'], \`once the broker answered again every placement handed to the producer must be delivered: placements holds the tiles of \${JSON.stringify(users)}, expected ana's, bo's and cy's\`);
+}
+
+export async function check_callback(ctx) {
+  const m = ctx.load('placement_events');
+  const records = logged();
+  ctx.kafka.failNext('placements');
+  m.recordPlacement('ana', 3, 7, 12); // the failure arrives through the delivery report, not as an exception
+  m.recordPlacement('ana', 4, 7, 12);
+  await m.shutdown();
+  assert(records.length > 0, 'a failed delivery must be logged by the delivery callback');
+  assert.equal(ctx.kafka.records('placements').length, 1, 'the second placement must still be produced after the first one failed');
+  // Through the API: a broker failure must not undo a painted tile.
+  const api = ctx.load('board_api');
+  records.length = 0;
+  ctx.kafka.failNext('placements');
+  const r = await ctx.client(api.app).post('/place', {json: {x: 5, y: 7, color: 9, user: 'cy'}});
+  assert.equal(r.status, 200, \`with the broker failing, POST /place answered \${r.status}: the tile is painted, the event is best effort\`);
+  assert.equal(pixel(ctx, api, 5, 7), 9, 'the tile must stay on the board even though its event was not delivered');
+  await m.shutdown();
+  assert(records.length > 0, "the failed delivery of cy's placement must be logged");
+}
+
+export async function check_flush(ctx) {
+  const m = ctx.load('placement_events');
+  ctx.kafka.stall(null, 2); // the broker is slow to answer at the moment of the stop
+  m.recordPlacement('ana', 3, 7, 12);
+  await m.shutdown();
+  const users = placements(ctx).map(e => e.user);
+  assert.deepEqual(users, ['ana'], \`shutdown() returned with ana's placement still in the producer's buffer (placements holds the tiles of \${JSON.stringify(users)}; the broker answered after 2 s): flush so a clean stop loses nothing\`);
+  ctx.kafka.stall(); // now the broker is down for good
+  m.recordPlacement('bo', 4, 7, 1);
+  const start = ctx.clock.now();
+  await m.shutdown();
+  const took = (ctx.clock.now() - start) / 1000;
+  assert(took <= 10, \`with the broker down, shutdown() took \${took.toFixed(0)} s: flush with a timeout so a stop is not held for the producer's whole request timeout\`);
+}
 `,
   },
   debrief: `A Kafka producer is a buffer with a background thread: \`produce\` costs microseconds and the network happens later in batches, which is what makes "one event per tile" free on the request path — as long as nobody blocks on the acknowledgement. The key is the ordering contract: the only consumer that needs order is the per-pixel history, so the pixel is the key, and the leaderboard, which only sums, rides along. Decoupling the write from its consumers is also the operational lesson of the original: Reddit's write path called the websocket fan-out directly, and when the message bus behind it buckled under the burst, the fix was to lengthen the cooldown for everyone. With a log in between, a slow consumer falls behind on its own; the board keeps taking tiles.`,

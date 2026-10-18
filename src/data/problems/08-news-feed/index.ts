@@ -1,13 +1,13 @@
 import type {Problem} from '@/lib/types';
 
-import {protoModules} from './proto';
+import {protoFiles, protoModules} from './proto';
 import {postEndpointStep} from './steps/1-post-endpoint';
 import {fanoutWorkerStep} from './steps/2-fanout-worker';
 import {timelineReadStep} from './steps/3-timeline-read';
 import {hydratePostsStep} from './steps/4-hydrate-posts';
 import {likePostStep} from './steps/5-like-post';
 import {engagementRollupStep} from './steps/6-engagement-rollup';
-import {supportModules} from './support';
+import {supportModules, supportModulesTs} from './support';
 
 /**
  * News feed: a post API that publishes to Kafka → a fan-out-on-write worker pushing post ids into
@@ -77,5 +77,8 @@ batching, idempotent counters — which is what every feed-shaped system is made
     ],
   },
   steps: [postEndpointStep, fanoutWorkerStep, timelineReadStep, hydratePostsStep, likePostStep, engagementRollupStep],
-  support: {python: {...protoModules, ...supportModules}},
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+  },
 };

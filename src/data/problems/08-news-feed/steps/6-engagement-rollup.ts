@@ -48,6 +48,12 @@ table maps a type to a field and a delta (\`unlike\` is \`likes -1\`).
       detail: 'The consumer must use `group.id` `engagement-rollup` and subscribe to `engagement`.',
       match: {
         python: {all: [/"group\.id"\s*:\s*"engagement-rollup"/, /subscribe\(\s*\[\s*"engagement"\s*\]\s*\)/]},
+        typescript: {
+          all: [
+            /groupId:\s*['"]engagement-rollup['"]/,
+            /subscribe\(\s*\{[^\n]*(topic:\s*['"]engagement['"]|topics:\s*\[[^\n]*['"]engagement['"])/,
+          ],
+        },
         go: {all: [/GroupID:\s*"engagement-rollup"/, /Topic:\s*"engagement"/]},
         scala: {
           all: [
@@ -64,6 +70,7 @@ table maps a type to a field and a delta (\`unlike\` is \`likes -1\`).
       detail: 'Offsets are committed explicitly after the event was counted — at-least-once, never at-most-once.',
       match: {
         python: {all: [/"enable\.auto\.commit"\s*:\s*False/]},
+        typescript: {all: [/autoCommit:\s*false/]},
         go: {all: [/reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
         scala: {all: [/"enable\.auto\.commit"\s*,\s*"false"|ENABLE_AUTO_COMMIT_CONFIG\s*,\s*"false"/]},
         cpp: {all: [/"enable\.auto\.commit"\s*,\s*"false"/]},
@@ -76,6 +83,7 @@ table maps a type to a field and a delta (\`unlike\` is \`likes -1\`).
         '`SET seen:{event_id} 1 NX EX 604800` claims the event exactly once; a replayed record finds the key and is skipped.',
       match: {
         python: {all: [/\.set\(\s*f"seen:\{/, /\bnx\s*=\s*True/, /\bex\s*=\s*(SEEN_TTL_S|604_?800)/]},
+        typescript: {all: [/\.set\(\s*`seen:\$\{/, /['"]NX['"]/, /['"]EX['"]\s*,\s*(SEEN_TTL_S|604_?800)/]},
         go: {
           all: [
             /\.SetNX\(\s*ctx\s*,\s*"seen:"\s*\+|\.SetNX\(\s*ctx\s*,\s*fmt\.Sprintf\(\s*"seen:%s"/,
@@ -93,6 +101,7 @@ table maps a type to a field and a delta (\`unlike\` is \`likes -1\`).
         "`HINCRBY stats:{post_id} <field> <delta>` keeps all of a post's counters in one hash — one key to read for the post page.",
       match: {
         python: {all: [/\.hincrby\(\s*f"stats:\{/]},
+        typescript: {all: [/\.hincrby\(\s*`stats:\$\{/]},
         go: {all: [/\.HIncrBy\(\s*ctx\s*,\s*"stats:"\s*\+|\.HIncrBy\(\s*ctx\s*,\s*fmt\.Sprintf\(\s*"stats:%s"/]},
         scala: {all: [/\.hincrBy\(\s*s"stats:\$/]},
         cpp: {all: [/\.hincrby\(\s*"stats:"\s*\+/]},
@@ -105,6 +114,7 @@ table maps a type to a field and a delta (\`unlike\` is \`likes -1\`).
         'The dedupe SET happens before the HINCRBY, and the commit after both — a crash in between replays the record into the dedupe, not into the counter.',
       match: {
         python: {order: [/\.set\(\s*f"seen:/, /\.hincrby\(/, /consumer\.commit\(/]},
+        typescript: {order: [/\.set\(\s*`seen:/, /\.hincrby\(/, /\bcommit\(|commitOffsets\(/]},
         go: {order: [/\.SetNX\(/, /\.HIncrBy\(/, /reader\.CommitMessages\(/]},
         scala: {order: [/\.set\(\s*s"seen:/, /\.hincrBy\(/, /consumer\.commitSync\(/]},
         cpp: {order: [/\.set\(\s*"seen:/, /\.hincrby\(/, /consumer->commitSync\(/]},
@@ -193,6 +203,122 @@ def run() -> None:
             continue
         r.hincrby(f"stats:{post_id}", field, delta)
         consumer.commit(message=msg, asynchronous=False)
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const SEEN_TTL_S = 7 * 24 * 3600;
+export const FIELDS: Record<string, [field: string, delta: number]> = {
+  like: ['likes', 1],
+  unlike: ['likes', -1],
+  comment: ['comments', 1],
+  share: ['shares', 1],
+};
+
+const kafka = new Kafka({clientId: 'engagement-rollup', brokers: ['kafka:9092']});
+const consumer = kafka.consumer({groupId: 'engagement-rollup'});
+
+interface Counted {
+  eventId: string;
+  postId: string;
+  field: string;
+  delta: number;
+}
+
+/** The event's id, post and counter, or null for a malformed record or an unknown type. */
+function parse(value: Buffer | null): Counted | null {
+  try {
+    const event = JSON.parse(value?.toString() ?? '') as {event_id?: unknown; type?: unknown; post_id?: unknown} | null;
+    if (!event || typeof event.event_id !== 'string' || typeof event.post_id !== 'string' || typeof event.type !== 'string') return null;
+    const counter = FIELDS[event.type];
+    return counter === undefined ? null : {eventId: event.event_id, postId: event.post_id, field: counter[0], delta: counter[1]};
+  } catch {
+    return null;
+  }
+}
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: 'engagement', fromBeginning: true});
+  await consumer.run({
+    // TODO: disable auto-commit
+    eachMessage: async ({topic, partition, message}) => {
+      // TODO: parse the event; unknown type or malformed → log, commit, return
+      // TODO: SET seen:{eventId} 1 NX EX SEEN_TTL_S; already seen → commit, return
+      // TODO: HINCRBY stats:{postId} field delta, then commit this message's offset
+      throw new Error('not implemented');
+    },
+  });
+}
+
+async function commit(topic: string, partition: number, offset: string): Promise<void> {
+  await consumer.commitOffsets([{topic, partition, offset: String(Number(offset) + 1)}]);
+}
+`,
+      solution: `import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const SEEN_TTL_S = 7 * 24 * 3600;
+export const FIELDS: Record<string, [field: string, delta: number]> = {
+  like: ['likes', 1],
+  unlike: ['likes', -1],
+  comment: ['comments', 1],
+  share: ['shares', 1],
+};
+
+const kafka = new Kafka({clientId: 'engagement-rollup', brokers: ['kafka:9092']});
+const consumer = kafka.consumer({groupId: 'engagement-rollup'});
+
+interface Counted {
+  eventId: string;
+  postId: string;
+  field: string;
+  delta: number;
+}
+
+/** The event's id, post and counter, or null for a malformed record or an unknown type. */
+function parse(value: Buffer | null): Counted | null {
+  try {
+    const event = JSON.parse(value?.toString() ?? '') as {event_id?: unknown; type?: unknown; post_id?: unknown} | null;
+    if (!event || typeof event.event_id !== 'string' || typeof event.post_id !== 'string' || typeof event.type !== 'string') return null;
+    const counter = FIELDS[event.type];
+    return counter === undefined ? null : {eventId: event.event_id, postId: event.post_id, field: counter[0], delta: counter[1]};
+  } catch {
+    return null;
+  }
+}
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: 'engagement', fromBeginning: true});
+  await consumer.run({
+    autoCommit: false,
+    eachMessage: async ({topic, partition, message}) => {
+      const event = parse(message.value);
+      if (event === null) {
+        console.warn(\`skipping malformed record at offset \${message.offset}\`);
+        await commit(topic, partition, message.offset);
+        return;
+      }
+      if ((await redis.set(\`seen:\${event.eventId}\`, 1, 'EX', SEEN_TTL_S, 'NX')) === null) {
+        await commit(topic, partition, message.offset); // replay: already counted
+        return;
+      }
+      await redis.hincrby(\`stats:\${event.postId}\`, event.field, event.delta);
+      await commit(topic, partition, message.offset);
+    },
+  });
+}
+
+async function commit(topic: string, partition: number, offset: string): Promise<void> {
+  await consumer.commitOffsets([{topic, partition, offset: String(Number(offset) + 1)}]);
+}
 `,
     },
     go: {
@@ -568,6 +694,82 @@ def check_order(ctx):
     assert at_hincrby[0] is True, "seen:e1 must be claimed (SET NX) before the HINCRBY, not after"
     assert at_commit, "the offset was never committed"
     assert at_commit[0] == ("1", True), f"the commit must come after the claim and the HINCRBY: at commit time stats:p1 likes was {at_commit[0][0]!r} and seen:e1 existed: {at_commit[0][1]}"
+`,
+    typescript: `function event(ctx, kind: string, postId: string, eventId: string, user = 'alice') {
+  const value = {event_id: eventId, type: kind, post_id: postId, user_id: user, ts: 1700000000000};
+  ctx.kafka.seed('engagement', {key: postId, value: JSON.stringify(value)});
+}
+
+export async function check_group(ctx) {
+  event(ctx, 'like', 'p1', 'e1');
+  const m = ctx.load('engagement_worker');
+  await ctx.drain(m.run());
+  const subscriptions = ctx.kafka.events.filter(e => e[0] === 'subscribe');
+  assert(subscriptions.length > 0, 'the consumer must subscribe to a topic');
+  const [, group, topics] = subscriptions[subscriptions.length - 1];
+  assert.equal(group, 'engagement-rollup', \`groupId must be engagement-rollup, got \${JSON.stringify(group)}\`);
+  assert(topics.includes('engagement'), \`the consumer must subscribe to engagement, got \${JSON.stringify(topics)}\`);
+  assert.equal(ctx.redis.hget('stats:p1', 'likes'), '1', \`after one like event stats:p1 likes is \${JSON.stringify(ctx.redis.hget('stats:p1', 'likes'))}, expected 1\`);
+}
+
+export async function check_manual_commit(ctx) {
+  event(ctx, 'like', 'p1', 'e1');
+  event(ctx, 'like', 'p1', 'e2', 'bob');
+  const m = ctx.load('engagement_worker');
+  await ctx.drain(m.run());
+  const consumer = ctx.kafka.consumers[ctx.kafka.consumers.length - 1];
+  assert(consumer !== undefined && consumer.autoCommit === false, 'autoCommit must be false: offsets would be committed on a timer, before the event was counted');
+  assert(!ctx.kafka.events.some(e => e[0] === 'auto-commit'), 'auto-commit is on: offsets were committed on a timer, before processing');
+  assert(ctx.kafka.events.some(e => e[0] === 'manual-commit'), 'no explicit commit happened');
+  assert.equal(ctx.kafka.lag('engagement-rollup', 'engagement'), 0, 'every processed record must be committed');
+}
+
+export async function check_dedupe(ctx) {
+  event(ctx, 'like', 'p1', 'e1');
+  event(ctx, 'like', 'p1', 'e2', 'bob');
+  event(ctx, 'like', 'p1', 'e1'); // the replay, last on its partition: skipping it without a commit leaves lag
+  const m = ctx.load('engagement_worker');
+  await ctx.drain(m.run());
+  assert.equal(ctx.redis.hget('stats:p1', 'likes'), '2', \`e1 arrived twice: stats:p1 likes must be 2, got \${JSON.stringify(ctx.redis.hget('stats:p1', 'likes'))}\`);
+  assert.equal(ctx.redis.exists('seen:e1'), 1, 'seen:{event_id} must be claimed with SET NX so a replay finds it');
+  const ttl = ctx.redis.ttl('seen:e1');
+  assert(604000 < ttl && ttl <= 604800, \`seen:e1 must expire after a week (EX 604800), its TTL is \${ttl}\`);
+  assert.equal(ctx.kafka.lag('engagement-rollup', 'engagement'), 0, 'a duplicate must be skipped but still committed, or it is re-read forever');
+}
+
+export async function check_rollup(ctx) {
+  event(ctx, 'like', 'p1', 'e1');
+  event(ctx, 'like', 'p1', 'e2', 'bob');
+  event(ctx, 'unlike', 'p1', 'e3');
+  event(ctx, 'comment', 'p1', 'e4');
+  event(ctx, 'share', 'p1', 'e5');
+  event(ctx, 'like', 'p2', 'e6');
+  event(ctx, 'view', 'p1', 'e7'); // unknown type
+  ctx.kafka.seed('engagement', {key: 'p1', value: 'not json'});
+  ctx.kafka.seed('engagement', {key: 'p1', value: JSON.stringify({type: 'like'})}); // no event_id, no post_id
+  const m = ctx.load('engagement_worker');
+  await ctx.drain(m.run());
+  const stats = ctx.redis.hgetall('stats:p1');
+  assert.deepStrictEqual(stats, {likes: '1', comments: '1', shares: '1'}, \`stats:p1 must be likes 1 (2 likes, 1 unlike), comments 1, shares 1, got \${JSON.stringify(stats)}\`);
+  assert.equal(ctx.redis.hget('stats:p2', 'likes'), '1', \`stats:p2 likes must be 1, got \${JSON.stringify(ctx.redis.hget('stats:p2', 'likes'))}\`);
+  assert.equal(ctx.kafka.lag('engagement-rollup', 'engagement'), 0, 'unknown types and malformed records must be skipped and committed, not crash-looped on');
+}
+
+export async function check_order(ctx) {
+  event(ctx, 'like', 'p1', 'e1');
+  const m = ctx.load('engagement_worker');
+  let seenAtCount: boolean | null = null;
+  ctx.redisAfter('stats:p1', () => {
+    seenAtCount = ctx.redis.exists('seen:e1') === 1;
+  });
+  const atCommit: [string | null, boolean][] = [];
+  ctx.kafka.onCommit(() => atCommit.push([ctx.redis.hget('stats:p1', 'likes'), ctx.redis.exists('seen:e1') === 1]));
+  await ctx.drain(m.run());
+  assert(seenAtCount !== null, 'HINCRBY stats:p1 never happened');
+  assert(seenAtCount === true, 'seen:e1 must be claimed (SET NX) before the HINCRBY, not after');
+  assert(atCommit.length > 0, 'the offset was never committed');
+  assert.deepStrictEqual(atCommit[0], ['1', true], \`the commit must come after the claim and the HINCRBY: at commit time stats:p1 likes was \${JSON.stringify(atCommit[0][0])} and seen:e1 existed: \${atCommit[0][1]}\`);
+}
 `,
   },
   debrief: `At-least-once delivery plus an idempotent consumer is how streams get effectively-once results without transactions: the \`SET NX\` claim is the idempotency key of the stream, and the counter only moves for events that won the claim. The window between the claim and the \`HINCRBY\` is the one real gap — a crash there loses the event's count, because the replay finds the key already set. Real rollups close it by doing both in one Lua script, batch commits per poll for throughput, and compute the counters per minute into a time series so "likes in the last hour" is a range read instead of a scan.`,

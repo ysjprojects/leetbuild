@@ -61,6 +61,7 @@ Implement \`eta_seconds(origin, dest)\`. \`cell(lat, lng)\` (a ~1 km grid id) an
       detail: 'Every `Eta` call carries a deadline so a slow routing service cannot hold the match open.',
       match: {
         python: {all: [/stub\.Eta\([^\n]*timeout\s*=/]},
+        typescript: {all: [/stub\.Eta\([^\n]*deadline/]},
         go: {all: [/context\.WithTimeout\(/]},
         scala: {all: [/withDeadlineAfter\(/]},
         cpp: {all: [/set_deadline\(/]},
@@ -73,6 +74,7 @@ Implement \`eta_seconds(origin, dest)\`. \`cell(lat, lng)\` (a ~1 km grid id) an
         'Exactly those two statuses degrade to `haversine_km / 30 km/h`; a slow or absent routing service must not break the match.',
       match: {
         python: {all: [/StatusCode\.DEADLINE_EXCEEDED/, /StatusCode\.UNAVAILABLE/, /(?<!def )\bhaversine_km\(/]},
+        typescript: {all: [/status\.DEADLINE_EXCEEDED/, /status\.UNAVAILABLE/, /\bhaversineKm\(/]},
         go: {all: [/codes\.DeadlineExceeded/, /codes\.Unavailable/, /(?<!func )\bhaversineKm\(/]},
         scala: {all: [/Code\.DEADLINE_EXCEEDED/, /Code\.UNAVAILABLE/, /(?<!def )\bhaversineKm\(/]},
         cpp: {all: [/StatusCode::DEADLINE_EXCEEDED/, /StatusCode::UNAVAILABLE/, /\bhaversine_km\(\s*(?!const\b)\w/]},
@@ -84,6 +86,7 @@ Implement \`eta_seconds(origin, dest)\`. \`cell(lat, lng)\` (a ~1 km grid id) an
       detail: 'The estimate is returned with `estimated` set, so the screen can say "~4 min" instead of pretending.',
       match: {
         python: {all: [/estimated\s*=\s*True/]},
+        typescript: {all: [/estimated:\s*true/]},
         go: {all: [/Estimated:\s*true/]},
         scala: {all: [/estimated\s*=\s*true|Eta\(\s*[^,\n]+,\s*true\s*\)/]},
         cpp: {all: [/Eta\{[^}\n]*,\s*true\s*\}|\.estimated\s*=\s*true/]},
@@ -96,6 +99,7 @@ Implement \`eta_seconds(origin, dest)\`. \`cell(lat, lng)\` (a ~1 km grid id) an
         'A single attempt: the fallback is the plan B, not another 500 ms spent on a service that is already slow.',
       match: {
         python: {all: [/stub\.Eta\(/], none: [/for \w+ in range\(/, /while True/]},
+        typescript: {all: [/stub\.Eta\(/], none: [/\bfor\s*\(/, /\bwhile\s*\(/]},
         go: {all: [/stub\.Eta\(/], none: [/for \w+ := 0;/, /for \{/]},
         scala: {all: [/\.eta\(/], none: [/while\s*\(/, /for\s*\(/]},
         cpp: {all: [/stub->Eta\(/], none: [/for \(/, /while \(/]},
@@ -110,6 +114,10 @@ Implement \`eta_seconds(origin, dest)\`. \`cell(lat, lng)\` (a ~1 km grid id) an
         python: {
           all: [/["']eta:/, /(?<!def )\bcell\(/, /\.set\([^\n]*\bex\s*=\s*(?:ETA_TTL_S|60)\b|\.setex\(/],
           order: [/\br\.get\(/, /stub\.Eta\(/],
+        },
+        typescript: {
+          all: [/`eta:|['"]eta:/, /\bcell\(/, /\.set\([^\n]*['"]EX['"]\s*,\s*(?:ETA_TTL_S|60)\b|\.setex\(/],
+          order: [/\bredis\.get\(/, /stub\.Eta\(/],
         },
         go: {
           all: [
@@ -204,6 +212,88 @@ def eta_seconds(origin: routing_pb2.LatLng, dest: routing_pb2.LatLng) -> Eta:
         raise
     r.set(key, reply.seconds, ex=ETA_TTL_S)
     return Eta(seconds=reply.seconds, estimated=False)
+`,
+    },
+    typescript: {
+      starter: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
+
+import {cell, haversineKm} from 'geo'; // provided: cell(lat, lng) -> ~1 km grid id; haversineKm(a, b) -> great-circle distance
+
+export const DEADLINE_MS = 500;
+export const ETA_TTL_S = 60;
+export const FALLBACK_KMH = 30;
+
+const redis = new Redis({host: 'redis', port: 6379});
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('routing.proto')) as {
+  dispatch: {Routing: grpc.ServiceClientConstructor};
+};
+const stub = new pkg.dispatch.Routing('routing:9000', grpc.credentials.createInsecure());
+
+export interface LatLng {
+  lat: number;
+  lng: number;
+}
+
+export interface Eta {
+  seconds: number;
+  /** The routing service did not answer in time; this is a straight-line guess. */
+  estimated: boolean;
+}
+
+export async function etaSeconds(origin: LatLng, dest: LatLng): Promise<Eta> {
+  // TODO: key eta:{cell(origin)}:{cell(dest)}; GET → hit returns {seconds, estimated: false}
+  // TODO: stub.Eta({origin, dest}, {deadline: Date.now() + DEADLINE_MS}); SET key EX ETA_TTL_S on success
+  // TODO: DEADLINE_EXCEEDED / UNAVAILABLE → haversineKm / FALLBACK_KMH as seconds, estimated, not cached; other statuses propagate
+  throw new Error('not implemented');
+}
+`,
+      solution: `import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import Redis from 'ioredis';
+
+import {cell, haversineKm} from 'geo'; // provided: cell(lat, lng) -> ~1 km grid id; haversineKm(a, b) -> great-circle distance
+
+export const DEADLINE_MS = 500;
+export const ETA_TTL_S = 60;
+export const FALLBACK_KMH = 30;
+
+const redis = new Redis({host: 'redis', port: 6379});
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('routing.proto')) as {
+  dispatch: {Routing: grpc.ServiceClientConstructor};
+};
+const stub = new pkg.dispatch.Routing('routing:9000', grpc.credentials.createInsecure());
+
+export interface LatLng {
+  lat: number;
+  lng: number;
+}
+
+export interface Eta {
+  seconds: number;
+  /** The routing service did not answer in time; this is a straight-line guess. */
+  estimated: boolean;
+}
+
+export async function etaSeconds(origin: LatLng, dest: LatLng): Promise<Eta> {
+  const key = \`eta:\${cell(origin.lat, origin.lng)}:\${cell(dest.lat, dest.lng)}\`;
+  const cached = await redis.get(key);
+  if (cached !== null) return {seconds: Number(cached), estimated: false};
+  let reply: {seconds: number};
+  try {
+    reply = (await stub.Eta({origin, dest}, {deadline: Date.now() + DEADLINE_MS})) as {seconds: number};
+  } catch (e) {
+    const code = (e as grpc.ServiceError).code;
+    if (code === grpc.status.DEADLINE_EXCEEDED || code === grpc.status.UNAVAILABLE) {
+      const seconds = Math.floor((haversineKm(origin, dest) / FALLBACK_KMH) * 3600);
+      return {seconds, estimated: true}; // not cached: a guess must not outlive the outage
+    }
+    throw e;
+  }
+  await redis.set(key, reply.seconds, 'EX', ETA_TTL_S);
+  return {seconds: reply.seconds, estimated: false};
+}
 `,
     },
     go: {
@@ -594,6 +684,129 @@ def check_cache_60s(ctx):
     eta = m.eta_seconds(far_origin, far_dest)
     assert eta.estimated
     assert ctx.redis.get(_key(far_origin, far_dest)) is None, "an estimate must never be cached: a 500 ms outage would become a 60 s one"
+`,
+    typescript: `import {cell, haversineKm} from 'geo';
+
+interface LatLng {
+  lat: number;
+  lng: number;
+}
+
+/** A fake Routing peer answering 412 s and counting its calls, then the learner's module. */
+function client(ctx) {
+  const pkg = ctx.proto('routing.proto');
+  const peer = {calls: 0};
+  ctx.grpc.serve(pkg.dispatch.Routing.service, {
+    Eta: (call, callback) => {
+      peer.calls += 1;
+      callback(null, {seconds: 412});
+    },
+  });
+  return {m: ctx.load('eta_client'), peer};
+}
+
+/** Distinct origin/destination pairs (distinct cache cells) per i. */
+function pair(i = 0): [LatLng, LatLng] {
+  return [
+    {lat: 48.85 + i / 10, lng: 2.35},
+    {lat: 48.86 + i / 10, lng: 2.36},
+  ];
+}
+
+const fallbackSeconds = (origin: LatLng, dest: LatLng): number => (haversineKm(origin, dest) / 30) * 3600;
+
+const key = (origin: LatLng, dest: LatLng): string => \`eta:\${cell(origin.lat, origin.lng)}:\${cell(dest.lat, dest.lng)}\`;
+
+export async function check_deadline(ctx) {
+  const {m} = client(ctx);
+  const [origin, dest] = pair();
+  const eta = await m.etaSeconds(origin, dest);
+  assert(eta.seconds === 412 && !eta.estimated, \`a routing answer of 412 s must be returned as-is, got \${JSON.stringify(eta)}\`);
+  const calls = ctx.grpc.callsTo('Eta');
+  assert(calls.length > 0, 'no Eta RPC was made');
+  const last = calls[calls.length - 1];
+  assert(last.timeout !== null, 'the Eta call carries no deadline');
+  assert(0.4 <= last.timeout && last.timeout <= 0.6, \`the deadline must be about 500 ms, got \${last.timeout} s\`);
+  assert(last.request.origin.lat === origin.lat && last.request.dest.lng === dest.lng, 'the request must carry origin and dest');
+}
+
+export async function check_fallback(ctx) {
+  const {m} = client(ctx);
+  let [origin, dest] = pair();
+  ctx.grpc.setLatency('Eta', 3.0);
+  let eta = await m.etaSeconds(origin, dest);
+  const expected = fallbackSeconds(origin, dest);
+  assert(eta.estimated, \`a routing service slower than the deadline must degrade to an estimate, got \${JSON.stringify(eta)}\`);
+  assert(Math.abs(eta.seconds - expected) <= 2, \`the estimate must be haversineKm / 30 km/h in seconds (about \${expected.toFixed(0)}), got \${eta.seconds}\`);
+  ctx.grpc.setLatency('Eta', 0.0);
+  [origin, dest] = pair(1);
+  ctx.grpc.fail('Eta', ctx.grpc.status.UNAVAILABLE, 'routing down');
+  eta = await m.etaSeconds(origin, dest);
+  assert(eta.estimated && Math.abs(eta.seconds - fallbackSeconds(origin, dest)) <= 2, \`UNAVAILABLE must degrade to the straight-line estimate, got \${JSON.stringify(eta)}\`);
+  [origin, dest] = pair(2);
+  ctx.grpc.fail('Eta', ctx.grpc.status.INVALID_ARGUMENT, 'bad coordinates');
+  let outcome: {eta: unknown} | {code: number};
+  try {
+    outcome = {eta: await m.etaSeconds(origin, dest)};
+  } catch (e) {
+    outcome = {code: (e as {code: number}).code};
+  }
+  assert('code' in outcome, \`INVALID_ARGUMENT must propagate, not be turned into an estimate: got \${JSON.stringify(outcome)}\`);
+  assert.equal(outcome.code, ctx.grpc.status.INVALID_ARGUMENT, \`expected INVALID_ARGUMENT to propagate, got status \${outcome.code}\`);
+}
+
+export async function check_estimated_flag(ctx) {
+  const {m} = client(ctx);
+  let [origin, dest] = pair();
+  let eta = await m.etaSeconds(origin, dest);
+  assert.equal(eta.estimated, false, \`a real routing answer must not be flagged as estimated: \${JSON.stringify(eta)}\`);
+  [origin, dest] = pair(1);
+  ctx.grpc.setLatency('Eta', 3.0);
+  eta = await m.etaSeconds(origin, dest);
+  assert.equal(eta.estimated, true, \`the straight-line fallback must be flagged estimated: true so the screen can say '~4 min': \${JSON.stringify(eta)}\`);
+}
+
+export async function check_no_retry(ctx) {
+  const {m} = client(ctx);
+  let [origin, dest] = pair();
+  ctx.grpc.setLatency('Eta', 3.0);
+  await m.etaSeconds(origin, dest);
+  assert.equal(ctx.grpc.callsTo('Eta').length, 1, \`a slow routing service was called \${ctx.grpc.callsTo('Eta').length} times; one attempt, then the fallback\`);
+  ctx.grpc.setLatency('Eta', 0.0);
+  [origin, dest] = pair(1);
+  ctx.grpc.fail('Eta', ctx.grpc.status.UNAVAILABLE, 'routing down', 3);
+  const eta = await m.etaSeconds(origin, dest);
+  assert(eta.estimated, 'UNAVAILABLE must degrade, not throw');
+  assert.equal(ctx.grpc.callsTo('Eta').length, 2, \`UNAVAILABLE was retried: \${ctx.grpc.callsTo('Eta').length - 1} calls for the second request, expected exactly 1\`);
+}
+
+export async function check_cache_60s(ctx) {
+  const {m, peer} = client(ctx);
+  const [origin, dest] = pair();
+  const k = key(origin, dest);
+  let eta = await m.etaSeconds(origin, dest);
+  assert.equal(eta.seconds, 412);
+  assert.equal(ctx.redis.get(k), '412', \`\${k} is \${JSON.stringify(ctx.redis.get(k))} after a real answer, expected 412 cached (keys: \${JSON.stringify(ctx.redis.keys('eta:*'))})\`);
+  const ttl = ctx.redis.ttl(k);
+  assert(0 < ttl && ttl <= 60, \`\${k} has TTL \${ttl}, expected EX 60\`);
+  const nearOrigin = {lat: origin.lat + 0.001, lng: origin.lng + 0.001}; // same ~1 km cell
+  eta = await m.etaSeconds(nearOrigin, dest);
+  assert(eta.seconds === 412 && !eta.estimated, \`a nearby origin in the same cell must be served from the cache, got \${JSON.stringify(eta)}\`);
+  assert.equal(peer.calls, 1, \`a cached cell pair must not call Routing again (Routing saw \${peer.calls} calls)\`);
+  ctx.clock.advance(61);
+  await m.etaSeconds(origin, dest);
+  assert.equal(peer.calls, 2, 'after 60 s the cached answer has expired and Routing must be asked again');
+  const [seededOrigin, seededDest] = pair(1);
+  ctx.redis.set(key(seededOrigin, seededDest), '99', 'EX', 60);
+  eta = await m.etaSeconds(seededOrigin, seededDest);
+  assert(eta.seconds === 99 && !eta.estimated, \`a cached value must be returned without an RPC, got \${JSON.stringify(eta)}\`);
+  assert.equal(peer.calls, 2, 'the cache must be read before calling Routing');
+  const [farOrigin, farDest] = pair(2);
+  ctx.grpc.setLatency('Eta', 3.0);
+  eta = await m.etaSeconds(farOrigin, farDest);
+  assert(eta.estimated, \`a routing service slower than the deadline must degrade to an estimate, got \${JSON.stringify(eta)}\`);
+  assert.equal(ctx.redis.get(key(farOrigin, farDest)), null, 'an estimate must never be cached: a 500 ms outage would become a 60 s one');
+}
 `,
   },
   debrief: `Graceful degradation is a design decision made in advance: decide what a *worse but acceptable* answer looks like, and switch to it on exactly the failures that mean "slow or gone". The deadline bounds the cost of finding out, the flag keeps the degradation honest to the caller, and not caching the estimate keeps a 500 ms outage from becoming a 60 s one. Real clients propagate the caller's deadline instead of choosing their own, use hedged requests to a second routing replica, and feed the estimate/actual ratio back to tune the fallback speed per city and hour.`,

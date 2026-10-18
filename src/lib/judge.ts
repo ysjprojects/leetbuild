@@ -11,7 +11,7 @@
  * browser runtime (src/lib/runtime): the harness's `check_<id>` functions decide each check and
  * acceptance, and the static result survives only as the advisory `shape` note of each check.
  */
-import type {RunResult} from './runtime/python';
+import type {RunResult} from './runtime/types';
 import type {Language, Matcher, Step, StepCheck} from './types';
 
 export interface CheckResult {
@@ -110,7 +110,8 @@ function stripCLike(code: string, language: Language): string {
       i = stop;
       continue;
     }
-    if (c === '"' || c === "'" || (c === '`' && language === 'go')) {
+    // Go's raw strings and TypeScript's template literals are backtick-quoted and span lines.
+    if (c === '"' || c === "'" || (c === '`' && (language === 'go' || language === 'typescript'))) {
       const triple = c === '"' && language === 'scala' && code.startsWith('"""', i);
       const quote = triple ? '"""' : c;
       const raw = c === '`';

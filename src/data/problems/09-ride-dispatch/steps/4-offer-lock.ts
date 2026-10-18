@@ -60,6 +60,12 @@ to the next driver on its list.
             /\.set\((?:[^\n]*\bnx\s*=\s*True[^\n]*\bex\s*=\s*(?:OFFER_TTL_S|15)\b|[^\n]*\bex\s*=\s*(?:OFFER_TTL_S|15)\b[^\n]*\bnx\s*=\s*True)/,
           ],
         },
+        typescript: {
+          all: [
+            /`offer:driver:|['"]offer:driver:/,
+            /\.set\((?:[^\n]*['"]EX['"]\s*,\s*(?:OFFER_TTL_S|15)\b[^\n]*['"]NX['"]|[^\n]*['"]NX['"][^\n]*['"]EX['"]\s*,\s*(?:OFFER_TTL_S|15)\b)/,
+          ],
+        },
         go: {all: [/"offer:driver:/, /rdb\.SetNX\([^\n]*\b(?:offerTTL|15\s*\*\s*time\.Second)\b/]},
         scala: {all: [/"offer:driver:/, /\.nx\(\)/, /\.ex\(\s*(?:OfferTtlSeconds|15L?)\s*\)/]},
         cpp: {all: [/"offer:driver:/, /redis\.set\([^;]*?\bkOfferTtl\b[^;]*?UpdateType::NOT_EXIST/]},
@@ -72,6 +78,7 @@ to the next driver on its list.
         'The script compares `GET KEYS[1]` with `ARGV[1]` and only then `DEL`s — one atomic step (or a `WATCH`/`MULTI` transaction).',
       match: {
         python: {all: [COMPARE_AND_DELETE]},
+        typescript: {all: [COMPARE_AND_DELETE]},
         go: {all: [COMPARE_AND_DELETE]},
         scala: {all: [COMPARE_AND_DELETE]},
         cpp: {all: [COMPARE_AND_DELETE]},
@@ -83,6 +90,9 @@ to the next driver on its list.
       detail: 'Inside `accept`: run the release script, and only when it returned 1 write `ride:{ride_id}:driver`.',
       match: {
         python: {order: [/def accept\(/, /\brelease_script\(/, /["']ride:[^\n]*:driver/]},
+        typescript: {
+          order: [/function accept\(/, /\breleaseScript\(/, /`ride:\$\{rideId\}:driver`|['"]ride:[^\n]*:driver/],
+        },
         go: {order: [/func accept\(/, /releaseScript\.(?:Run|Eval|EvalSha)\(/, /"ride:[^\n]*:driver/]},
         scala: {order: [/def accept\(/, /jedis\.evalsha\(\s*releaseSha\b/, /"ride:[^\n]*:driver/]},
         cpp: {order: [/bool accept\(/, /evalsha<[^>]*>\(\s*release_sha\b/, /"ride:[^\n]*:driver/]},
@@ -97,6 +107,10 @@ to the next driver on its list.
         python: {
           order: [/def decline\(/, /\brelease_script\(/, /(?<!def )\bnext_candidate\(/],
           none: [/\br\.delete\(/],
+        },
+        typescript: {
+          order: [/function decline\(/, /\breleaseScript\(/, /\bdispatcher\.nextCandidate\(/],
+          none: [/\bredis\.del\(/],
         },
         go: {
           order: [/func decline\(/, /releaseScript\.(?:Run|Eval|EvalSha)\(/, /(?<!func )\bnextCandidate\(/],
@@ -192,6 +206,95 @@ def decline(ride_id: str, driver_id: str) -> None:
     """The driver said no or the offer window closed: free the driver and move on."""
     release_script(keys=[f"offer:driver:{driver_id}"], args=[ride_id])
     next_candidate(ride_id)
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const OFFER_TTL_S = 15;
+
+// KEYS[1] = offer:driver:{driverId}   ARGV[1] = rideId
+// Deletes the offer only when it still belongs to this ride; returns 1 when it did, 0 otherwise.
+const RELEASE_LUA = \`
+return 0
+\`;
+
+/** The guarded delete, run on the server as one step. */
+const releaseScript = (key: string, rideId: string): Promise<number> =>
+  redis.eval(RELEASE_LUA, 1, key, rideId) as Promise<number>;
+
+/** Dispatcher (provided): offers the ride to the next driver on its candidate list. */
+export const dispatcher = {
+  nextCandidate(rideId: string): void {
+    throw new Error('not implemented');
+  },
+};
+
+/** True when the offer went out; false when the driver already has an open offer. */
+export async function offer(rideId: string, driverId: string): Promise<boolean> {
+  // TODO: SET offer:driver:{driverId} rideId NX EX OFFER_TTL_S
+  throw new Error('not implemented');
+}
+
+/** True when this driver got the ride; false when the offer expired or belongs to another ride. */
+export async function accept(rideId: string, driverId: string): Promise<boolean> {
+  // TODO: releaseScript(offer key, rideId); 0 → false
+  // TODO: SET ride:{rideId}:driver driverId, return true
+  throw new Error('not implemented');
+}
+
+/** The driver said no or the offer window closed: free the driver and move on. */
+export async function decline(rideId: string, driverId: string): Promise<void> {
+  // TODO: the same guarded delete (never a blind DEL: a newer offer may already sit under the key)
+  // TODO: dispatcher.nextCandidate(rideId)
+  throw new Error('not implemented');
+}
+`,
+      solution: `import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const OFFER_TTL_S = 15;
+
+// KEYS[1] = offer:driver:{driverId}   ARGV[1] = rideId
+// Deletes the offer only when it still belongs to this ride; returns 1 when it did, 0 otherwise.
+const RELEASE_LUA = \`
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+\`;
+
+/** The guarded delete, run on the server as one step. */
+const releaseScript = (key: string, rideId: string): Promise<number> =>
+  redis.eval(RELEASE_LUA, 1, key, rideId) as Promise<number>;
+
+/** Dispatcher (provided): offers the ride to the next driver on its candidate list. */
+export const dispatcher = {
+  nextCandidate(rideId: string): void {
+    throw new Error('not implemented');
+  },
+};
+
+/** True when the offer went out; false when the driver already has an open offer. */
+export async function offer(rideId: string, driverId: string): Promise<boolean> {
+  return (await redis.set(\`offer:driver:\${driverId}\`, rideId, 'EX', OFFER_TTL_S, 'NX')) === 'OK';
+}
+
+/** True when this driver got the ride; false when the offer expired or belongs to another ride. */
+export async function accept(rideId: string, driverId: string): Promise<boolean> {
+  if ((await releaseScript(\`offer:driver:\${driverId}\`, rideId)) !== 1) return false;
+  await redis.set(\`ride:\${rideId}:driver\`, driverId);
+  return true;
+}
+
+/** The driver said no or the offer window closed: free the driver and move on. */
+export async function decline(rideId: string, driverId: string): Promise<void> {
+  await releaseScript(\`offer:driver:\${driverId}\`, rideId);
+  dispatcher.nextCandidate(rideId);
+}
 `,
     },
     go: {
@@ -558,6 +661,90 @@ def check_decline_guarded(ctx):
     else:
         assert ctx.redis.get("offer:driver:d-9") is None, "declining the ride on offer must release the key"
     assert m.moved_on[-1] == "r-60", "decline must call next_candidate with the declined ride"
+`,
+    typescript: `/** The learner's module with the provided dispatcher recording every ride it is handed. */
+function offers(ctx) {
+  const m = ctx.load('offers');
+  const movedOn: string[] = [];
+  m.dispatcher.nextCandidate = (rideId: string) => void movedOn.push(rideId);
+  return {m, movedOn};
+}
+
+/**
+ * The race: right after the first command that reads the offer key, the offer is replaced by a newer
+ * ride. A GET-then-DEL from the client has the swap land between its two steps and deletes the newer
+ * offer; an atomic compare-and-delete finishes before the swap, so the newer offer survives it.
+ */
+function race(ctx, key: string, newer: string) {
+  ctx.redisAfter(key, () => ctx.redis.set(key, newer, 'EX', 15));
+}
+
+export async function check_offer_nx(ctx) {
+  const {m} = offers(ctx);
+  assert.equal(await m.offer('r-42', 'd-7'), true, 'the first offer to a free driver must return true');
+  assert.equal(ctx.redis.get('offer:driver:d-7'), 'r-42', \`offer:driver:d-7 holds \${JSON.stringify(ctx.redis.get('offer:driver:d-7'))}, expected the ride id r-42\`);
+  const ttl = ctx.redis.ttl('offer:driver:d-7');
+  assert(0 < ttl && ttl <= 15, \`offer:driver:d-7 has TTL \${ttl}, expected EX 15\`);
+  assert.equal(await m.offer('r-43', 'd-7'), false, 'a driver with an open offer must be skipped: the second offer must return false');
+  assert.equal(ctx.redis.get('offer:driver:d-7'), 'r-42', 'the second offer overwrote the first: the SET must be NX');
+  assert.equal(await m.offer('r-43', 'd-8'), true, 'another driver is free and must get the offer');
+  ctx.clock.advance(16);
+  assert.equal(await m.offer('r-44', 'd-7'), true, 'after the 15 s window the driver is free again');
+  assert.equal(ctx.redis.get('offer:driver:d-7'), 'r-44');
+}
+
+export async function check_compare_and_delete(ctx) {
+  const {m} = offers(ctx);
+  await m.offer('r-42', 'd-7');
+  assert.equal(await m.accept('r-99', 'd-7'), false, 'accepting a ride that is not the one on offer must return false');
+  assert.equal(ctx.redis.get('offer:driver:d-7'), 'r-42', 'a mismatched accept must leave the offer in place');
+  assert.equal(await m.accept('r-42', 'd-7'), true, 'accepting the ride on offer must return true');
+  assert.equal(ctx.redis.get('offer:driver:d-7'), null, 'a successful accept must release the offer key');
+  assert.equal(await m.accept('r-42', 'd-7'), false, 'the offer is gone: a second accept must return false');
+  await m.offer('r-50', 'd-8');
+  ctx.clock.advance(16); // the offer expired unanswered ...
+  await m.offer('r-51', 'd-8'); // ... and a newer ride landed under the key
+  assert.equal(await m.accept('r-50', 'd-8'), false, 'a stale accept after the offer expired must return false');
+  assert.equal(ctx.redis.get('offer:driver:d-8'), 'r-51', 'the stale accept deleted the newer offer r-51: compare and delete must be one atomic step');
+  // The race itself: a GET-then-DEL from the client lets the key change in between.
+  await m.offer('r-60', 'd-9');
+  race(ctx, 'offer:driver:d-9', 'r-61');
+  const got = await m.accept('r-60', 'd-9');
+  assert.equal(got, true, 'accept of the ride on offer must succeed');
+  assert.equal(ctx.redis.get('offer:driver:d-9'), 'r-61', 'the offer changed to r-61 between the GET and the DEL and the stale accept deleted it: the compare and the delete must run atomically (a Lua script or WATCH/MULTI)');
+}
+
+export async function check_assign_after_accept(ctx) {
+  const {m} = offers(ctx);
+  await m.offer('r-42', 'd-7');
+  assert.equal(await m.accept('r-42', 'd-7'), true);
+  assert.equal(ctx.redis.get('ride:r-42:driver'), 'd-7', \`after a successful accept ride:r-42:driver must be d-7, got \${JSON.stringify(ctx.redis.get('ride:r-42:driver'))}\`);
+  await m.offer('r-50', 'd-8');
+  assert.equal(await m.accept('r-51', 'd-8'), false);
+  assert.equal(ctx.redis.get('ride:r-51:driver'), null, 'the guarded delete returned 0 but ride:r-51:driver was written: assign only after the release succeeded');
+  assert.equal(ctx.redis.get('offer:driver:d-8'), 'r-50', 'a failed accept must not touch the offer');
+  assert.equal(await m.accept('r-42', 'd-9'), false, 'd-9 holds no offer: accept must return false');
+  assert.equal(ctx.redis.get('ride:r-42:driver'), 'd-7', 'a failed accept must not reassign the ride');
+}
+
+export async function check_decline_guarded(ctx) {
+  const {m, movedOn} = offers(ctx);
+  await m.offer('r-42', 'd-7');
+  await m.decline('r-42', 'd-7');
+  assert.equal(ctx.redis.get('offer:driver:d-7'), null, 'declining the ride on offer must release the key');
+  assert.deepEqual(movedOn, ['r-42'], \`decline must hand the ride to nextCandidate; nextCandidate saw \${JSON.stringify(movedOn)}\`);
+  await m.offer('r-50', 'd-8');
+  ctx.clock.advance(16);
+  await m.offer('r-51', 'd-8');
+  await m.decline('r-50', 'd-8');
+  assert.equal(ctx.redis.get('offer:driver:d-8'), 'r-51', 'a late decline of r-50 deleted the newer offer r-51: the release must be the guarded delete, never a blind DEL');
+  assert.deepEqual(movedOn, ['r-42', 'r-50'], \`a late decline still moves the ride on; nextCandidate saw \${JSON.stringify(movedOn)}\`);
+  await m.offer('r-60', 'd-9');
+  race(ctx, 'offer:driver:d-9', 'r-61');
+  await m.decline('r-60', 'd-9');
+  assert.equal(ctx.redis.get('offer:driver:d-9'), 'r-61', 'the offer changed to r-61 between the GET and the DEL and decline deleted it anyway: compare and delete atomically');
+  assert.equal(movedOn[movedOn.length - 1], 'r-60', 'decline must call nextCandidate with the declined ride');
+}
 `,
   },
   debrief: `This is the Redis lock pattern in its honest form: \`SET NX EX\` to acquire with a lease, a value that identifies the holder, and a compare-and-delete to release — the only way a release cannot remove someone else's lock after yours expired. The lease is also the product rule (an offer lasts 15 s), so expiry and business logic coincide. Real dispatchers offer one ride to several drivers at once and let the first accept win (the same compare-and-delete, keyed by ride), add a per-ride lock so two dispatcher instances do not offer the same ride, and record every offer and answer for the matching model.`,

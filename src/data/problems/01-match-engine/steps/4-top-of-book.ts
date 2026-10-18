@@ -49,6 +49,10 @@ book and every subscriber hears about the change.
           all: [/f"book:\{symbol\}"/, /\.hset\([^\n]*mapping\s*=/],
           none: [/\.expire\(|\bex\s*=|\.hexpire\(/],
         },
+        typescript: {
+          all: [/`book:\$\{symbol\}`|['"]book:['"]\s*\+\s*symbol/, /\.hset\(/],
+          none: [/\.expire\(|['"]EX['"]|\.hexpire\(/],
+        },
         go: {all: [/"book:"\s*\+\s*symbol/, /\.HSet\(\s*ctx\s*,/], none: [/\.Expire\(|\.HExpire\(/]},
         scala: {all: [/s"book:\$symbol"/, /\.hset\(/], none: [/\.expire\(|\.hexpire\(/]},
         cpp: {all: [/"book:"\s*\+\s*symbol/, /\.hset\(/], none: [/\.expire\(|\.hexpire\(/]},
@@ -61,6 +65,7 @@ book and every subscriber hears about the change.
         'The hash carries exactly the three fields subscribers and the snapshot endpoint read: `bid`, `ask`, `last`.',
       match: {
         python: {all: [/"bid":\s*bid\b/, /"ask":\s*ask\b/, /"last":\s*last\b/]},
+        typescript: {all: [/\{[^}]*\bbid\b[^}]*\bask\b[^}]*\blast\b[^}]*\}/]},
         go: {all: [/"bid":\s*bid\b/, /"ask":\s*ask\b/, /"last":\s*last\b/]},
         scala: {all: [/"bid"\s*->\s*bid\b/, /"ask"\s*->\s*ask\b/, /"last"\s*->\s*last\b/]},
         cpp: {all: [/\{"bid",\s*/, /\{"ask",\s*/, /\{"last",\s*/]},
@@ -73,6 +78,13 @@ book and every subscriber hears about the change.
         'PUBLISH on `ticks:{symbol}` a JSON document that names the symbol and repeats bid/ask/last, so a subscriber never has to read the hash.',
       match: {
         python: {all: [/f"ticks:\{symbol\}"/, /\.publish\(/, /"symbol":\s*symbol/]},
+        typescript: {
+          all: [
+            /`ticks:\$\{symbol\}`|['"]ticks:['"]\s*\+\s*symbol/,
+            /\.publish\(/,
+            /\{\s*symbol\s*[,}]|symbol:\s*symbol\b/,
+          ],
+        },
         go: {all: [/"ticks:"\s*\+\s*symbol/, /\.Publish\(\s*ctx\s*,/, /"symbol":\s*symbol/]},
         scala: {all: [/s"ticks:\$symbol"/, /\.publish\(/, /"symbol":"\$symbol"/]},
         cpp: {all: [/"ticks:"\s*\+\s*symbol/, /\.publish\(/, /\{"symbol",\s*symbol\}/]},
@@ -87,6 +99,10 @@ book and every subscriber hears about the change.
         python: {
           order: [/\.pipeline\(/, /\.hset\(/, /\.publish\(/, /\.execute\(\)/],
           none: [/transaction\s*=\s*False/, /\br\.hset\(/, /\br\.publish\(/],
+        },
+        typescript: {
+          order: [/\.multi\(\)/, /\.hset\(/, /\.publish\(/, /\.exec\(\)/],
+          none: [/\.pipeline\(/, /\bredis\.hset\(/, /\bredis\.publish\(/],
         },
         go: {order: [/rdb\.TxPipelined?\(/, /\.HSet\(/, /\.Publish\(/], none: [/rdb\.HSet\(/, /rdb\.Publish\(/]},
         scala: {
@@ -133,6 +149,33 @@ def publish_top_of_book(symbol: str, bid: float, ask: float, last: float) -> Non
     pipe.hset(key, mapping=fields)
     pipe.publish(channel, payload)
     pipe.execute()  # MULTI … EXEC: readers see the new hash and the tick together, or neither
+`,
+    },
+    typescript: {
+      starter: `import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+/** Called by the engine after every order that changed the book; 0 means an empty side / no trade yet. */
+export async function publishTopOfBook(symbol: string, bid: number, ask: number, last: number): Promise<void> {
+  // TODO: key book:{symbol}, channel ticks:{symbol}; fields {bid, ask, last}; payload = fields + symbol as JSON
+  // TODO: one MULTI/EXEC (redis.multi()…exec()): HSET the fields (no TTL) and PUBLISH the payload
+  throw new Error('not implemented');
+}
+`,
+      solution: `import Redis from 'ioredis';
+
+const redis = new Redis({host: 'redis', port: 6379});
+
+/** Called by the engine after every order that changed the book; 0 means an empty side / no trade yet. */
+export async function publishTopOfBook(symbol: string, bid: number, ask: number, last: number): Promise<void> {
+  const key = \`book:\${symbol}\`;
+  const channel = \`ticks:\${symbol}\`;
+  const fields = {bid, ask, last};
+  const payload = JSON.stringify({symbol, ...fields});
+  // MULTI … EXEC: readers see the new hash and the tick together, or neither.
+  await redis.multi().hset(key, fields).publish(channel, payload).exec();
+}
 `,
     },
     go: {
@@ -351,6 +394,69 @@ def check_atomic(ctx):
     transaction, commands = pipelines[-1]
     assert transaction, "the pipeline was opened with transaction=False: without MULTI/EXEC a reader can see one command without the other"
     assert any(c in ("HSET", "HMSET") for c in commands) and "PUBLISH" in commands, f"the transaction queued {commands}; it must hold both the HSET and the PUBLISH"
+`,
+    typescript: `/** Another connection subscribed to ticks:{symbol}: every message it received, in order. */
+function subscriber(ctx, symbol: string): string[] {
+  const received: string[] = [];
+  ctx.redisSubscribe('ticks:' + symbol, (_channel: string, message: string) => received.push(message));
+  return received;
+}
+
+/** Pub/Sub delivery lands a microtask after the PUBLISH. */
+async function delivered(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+export async function check_hash(ctx) {
+  const m = ctx.load('market_data');
+  await m.publishTopOfBook('ACME', 10.05, 10.06, 10.05);
+  assert.equal(ctx.redis.type('book:ACME'), 'hash', \`book:ACME is \${JSON.stringify(ctx.redis.type('book:ACME'))}, expected a hash\`);
+  assert.equal(ctx.redis.ttl('book:ACME'), -1, \`book:ACME has a TTL of \${ctx.redis.ttl('book:ACME')} s; the top of book is state, not a cache entry\`);
+  await m.publishTopOfBook('ACME', 10.07, 10.08, 10.07);
+  assert.equal(Number(ctx.redis.hget('book:ACME', 'bid')), 10.07, 'a second update must overwrite the hash with the current top of book');
+}
+
+export async function check_fields(ctx) {
+  const m = ctx.load('market_data');
+  await m.publishTopOfBook('ACME', 10.05, 10.06, 10.0);
+  const fields = ctx.redis.hgetall('book:ACME');
+  assert.deepEqual(Object.keys(fields).sort(), ['ask', 'bid', 'last'], \`book:ACME has fields \${JSON.stringify(Object.keys(fields).sort())}, expected exactly bid, ask, last\`);
+  const values = Object.fromEntries(Object.entries(fields).map(([k, v]) => [k, Number(v)]));
+  assert.deepEqual(values, {bid: 10.05, ask: 10.06, last: 10.0}, \`book:ACME holds \${JSON.stringify(values)}, expected bid 10.05, ask 10.06, last 10.0\`);
+  await m.publishTopOfBook('NEW', 0, 10.5, 0);
+  const empty = Object.fromEntries(Object.entries(ctx.redis.hgetall('book:NEW')).map(([k, v]) => [k, Number(v)]));
+  assert.deepEqual(empty, {bid: 0, ask: 10.5, last: 0}, 'an empty side (0) must still be stored as 0');
+}
+
+export async function check_publish(ctx) {
+  const m = ctx.load('market_data');
+  const received = subscriber(ctx, 'ACME');
+  const other = subscriber(ctx, 'BETA');
+  await m.publishTopOfBook('ACME', 10.05, 10.06, 10.05);
+  await delivered();
+  assert(received.length > 0, 'nothing was published on ticks:ACME');
+  const tick = JSON.parse(received[0]);
+  assert.equal(tick.symbol, 'ACME', \`the tick must name the symbol, got \${received[0]}\`);
+  assert.deepEqual([Number(tick.bid ?? -1), Number(tick.ask ?? -1), Number(tick.last ?? -1)], [10.05, 10.06, 10.05], \`the tick must repeat bid/ask/last, got \${received[0]}\`);
+  assert.deepEqual(other, [], 'the tick for ACME leaked onto ticks:BETA');
+}
+
+export async function check_atomic(ctx) {
+  const m = ctx.load('market_data');
+  ctx.redis.hset('book:ACME', 'bid', '1', 'ask', '2', 'last', '1');
+  const received = subscriber(ctx, 'ACME');
+  // Two readers that land between the commands, as another connection's request would:
+  // one reads the hash the moment a tick is out, the other announces itself the moment the hash changed.
+  let bidWhenTickOut: unknown = null;
+  ctx.redisAfter('ticks:ACME', () => (bidWhenTickOut = ctx.redis.hget('book:ACME', 'bid')));
+  ctx.redisAfter('book:ACME', () => ctx.redis.publish('ticks:ACME', 'reader saw the hash'));
+  await m.publishTopOfBook('ACME', 10.05, 10.06, 10.05);
+  await delivered();
+  assert(Object.keys(ctx.redis.hgetall('book:ACME')).length > 0 && received.length > 0, 'the hash and the tick must both be produced');
+  assert.equal(Number(bidWhenTickOut), 10.05, \`the tick was published while book:ACME still held bid \${JSON.stringify(bidWhenTickOut)}: a reader woken by the tick would read a stale hash. HSET and PUBLISH belong in one MULTI/EXEC\`);
+  assert.notEqual(received[0], 'reader saw the hash', 'a reader saw the new book:ACME before any tick announced it: without MULTI/EXEC a reader can see one command without the other');
+}
 `,
   },
   debrief: `Two commands, one unit: the transaction is what lets the next step trust a subscriber's tick without re-reading the hash, and lets the snapshot endpoint trust the hash without a tick. The hash has no TTL because expiring it would turn "stale" into "absent", which is a worse lie. A single writer per key (thanks to the partition key) keeps the transaction simple — no WATCH, no Lua. Real market-data feeds add a sequence number to every tick so subscribers can detect gaps, keep the full depth (\`ZADD\` per price level, or a proper feed handler), and multicast at the network layer instead of Pub/Sub, which drops messages for slow subscribers.`,

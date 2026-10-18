@@ -49,6 +49,7 @@ respect quiet hours.
       detail: 'One cache entry per user: the key is `prefs:{user_id}`.',
       match: {
         python: {all: [/f["']prefs:\{user_id\}["']/]},
+        typescript: {all: [/`prefs:\$\{userId\}`/]},
         go: {all: [/"prefs:"\s*\+\s*\w+|"prefs:%s"/]},
         scala: {all: [/s"prefs:\$/]},
         cpp: {all: [/"prefs:"\s*\+/]},
@@ -60,6 +61,7 @@ respect quiet hours.
       detail: 'Cache-aside: GET first and call `load_prefs` only on a miss.',
       match: {
         python: {order: [/\br\.get\(/, /db\.load_prefs\(/]},
+        typescript: {order: [/\bredis\.get\(/, /db\.loadPrefs\(/]},
         go: {order: [/rdb\.Get\(/, /db\.LoadPrefs\(/]},
         scala: {order: [/jedis\.get\(/, /Db\.loadPrefs\(/]},
         cpp: {order: [/redis\.get\(/, /db::load_prefs\(/]},
@@ -74,6 +76,11 @@ respect quiet hours.
         python: {
           all: [
             /\.set\(\s*\w+\s*,\s*[^,\n]+,\s*ex\s*=\s*(PREFS_TTL_S|600)\s*\)|\.setex\(\s*\w+\s*,\s*(PREFS_TTL_S|600)\s*,/,
+          ],
+        },
+        typescript: {
+          all: [
+            /\.set\(\s*\w+\s*,\s*[^,\n]+,\s*['"]EX['"]\s*,\s*(PREFS_TTL_S|600)\s*\)|\.setex\(\s*\w+\s*,\s*(PREFS_TTL_S|600)\s*,/,
           ],
         },
         go: {
@@ -94,6 +101,10 @@ respect quiet hours.
         python: {
           order: [/db\.save_prefs\(/, /\br\.delete\(/],
           none: [/def put_prefs(?:(?!\ndef )[\s\S])*?\br\.set(ex)?\(/],
+        },
+        typescript: {
+          order: [/db\.savePrefs\(/, /\bredis\.del\(/],
+          none: [/app\.put\((?:(?!\n\}\);)[\s\S])*?\bredis\.set(ex)?\(/],
         },
         go: {
           order: [/db\.SavePrefs\(/, /rdb\.Del\(/],
@@ -181,6 +192,73 @@ async def put_prefs(user_id: str, request: Request) -> Response:
     db.save_prefs(user_id, prefs)
     r.delete(f"prefs:{user_id}")  # the next read misses and reloads; never SET the new value here
     return Response(status_code=204)
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {type Prefs, db} from 'notify/db'; // db.loadPrefs(userId): Prefs · db.savePrefs(userId, prefs) — provided
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const PREFS_TTL_S = 600;
+export type {Prefs};
+
+/** True when \`hour\` falls in the user's quiet window (provided). */
+export function quiet(prefs: Prefs, hour: number): boolean {
+  const {quiet_start: start, quiet_end: end} = prefs;
+  return start <= end ? start <= hour && hour < end : hour >= start || hour < end;
+}
+
+export async function getPrefs(userId: string): Promise<Prefs> {
+  const key = ''; // TODO: prefs:{userId}
+  // TODO: GET first; a hit returns JSON.parse(cached)
+  // TODO: miss → db.loadPrefs(userId), SET key json EX PREFS_TTL_S, return it
+  throw new Error('not implemented');
+}
+
+app.put('/users/:userId/preferences', async (request, reply) => {
+  const {userId} = request.params as {userId: string};
+  const prefs = request.body as Prefs;
+  // TODO: db.savePrefs(userId, prefs), then DEL prefs:{userId} (invalidate; never SET the cache here)
+  return reply.code(501).send();
+});
+`,
+      solution: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+import {type Prefs, db} from 'notify/db'; // db.loadPrefs(userId): Prefs · db.savePrefs(userId, prefs) — provided
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+
+export const PREFS_TTL_S = 600;
+export type {Prefs};
+
+/** True when \`hour\` falls in the user's quiet window (provided). */
+export function quiet(prefs: Prefs, hour: number): boolean {
+  const {quiet_start: start, quiet_end: end} = prefs;
+  return start <= end ? start <= hour && hour < end : hour >= start || hour < end;
+}
+
+export async function getPrefs(userId: string): Promise<Prefs> {
+  const key = \`prefs:\${userId}\`;
+  const cached = await redis.get(key);
+  if (cached !== null) return JSON.parse(cached) as Prefs;
+  const prefs = db.loadPrefs(userId);
+  await redis.set(key, JSON.stringify(prefs), 'EX', PREFS_TTL_S);
+  return prefs;
+}
+
+app.put('/users/:userId/preferences', async (request, reply) => {
+  const {userId} = request.params as {userId: string};
+  const prefs = request.body as Prefs;
+  db.savePrefs(userId, prefs);
+  await redis.del(\`prefs:\${userId}\`); // the next read misses and reloads; never SET the new value here
+  return reply.code(204).send();
+});
 `,
     },
     go: {
@@ -580,6 +658,72 @@ async def check_invalidate(ctx):
     loads = len(_loads(m))
     assert m.get_prefs("u42") == new, "the next read must see the new preferences"
     assert len(_loads(m)) == loads + 1, "the read after the PUT must reload from the database"
+`,
+    typescript: `const ROW = {push: true, quiet_start: 22, quiet_end: 7};
+
+/** The learner's module and the provided database it imported, with u42's row seeded. */
+function prefs(ctx) {
+  const db = ctx.load('/support/notify/db.ts').db;
+  db.rows.u42 = {...ROW};
+  return {m: ctx.load('preferences'), db};
+}
+
+function loads(db): string[] {
+  return db.calls.filter((c: unknown[]) => c[0] === 'load').map((c: unknown[]) => c[1]);
+}
+
+export async function check_key(ctx) {
+  const {m} = prefs(ctx);
+  assert.deepEqual(await m.getPrefs('u42'), ROW, \`getPrefs must return the database row \${JSON.stringify(ROW)}, got \${JSON.stringify(await m.getPrefs('u42'))}\`);
+  const cached = ctx.redis.get('prefs:u42');
+  assert(cached !== null, \`the row must be cached under prefs:u42, keys are \${JSON.stringify(ctx.redis.keys('*'))}\`);
+  assert.deepEqual(JSON.parse(cached), ROW, \`prefs:u42 must hold the row as JSON, got \${JSON.stringify(cached)}\`);
+}
+
+export async function check_read_first(ctx) {
+  const {m, db} = prefs(ctx);
+  const stale = {...ROW, push: false};
+  ctx.redis.set('prefs:u42', JSON.stringify(stale));
+  assert.deepEqual(await m.getPrefs('u42'), stale, 'a cached entry must be returned as is, without consulting the database');
+  assert.deepEqual(loads(db), [], \`the cache held prefs:u42, yet loadPrefs was called: \${JSON.stringify(db.calls)}\`);
+  const DEFAULT_PREFS = ctx.load('/support/notify/db.ts').DEFAULT_PREFS;
+  assert.deepEqual(await m.getPrefs('u7'), DEFAULT_PREFS, 'a miss must load the row from the database');
+  assert.deepEqual(loads(db), ['u7'], \`expected one load for u7, calls were \${JSON.stringify(db.calls)}\`);
+  await m.getPrefs('u7');
+  assert.equal(loads(db).length, 1, 'the second read of u7 must hit the cache, not the database');
+}
+
+export async function check_ttl(ctx) {
+  const {m, db} = prefs(ctx);
+  await m.getPrefs('u42');
+  const ttl = ctx.redis.ttl('prefs:u42');
+  assert(540 <= ttl && ttl <= 600, \`prefs:u42 must expire after 600 s, TTL is \${ttl}\`);
+  ctx.clock.advance(601);
+  assert.equal(ctx.redis.get('prefs:u42'), null, 'the cached entry must be gone after 600 s');
+  await m.getPrefs('u42');
+  assert.equal(loads(db).length, 2, 'after the entry expired the next read must reload from the database');
+}
+
+export async function check_invalidate(ctx) {
+  const {m, db} = prefs(ctx);
+  await m.getPrefs('u42');
+  assert(ctx.redis.exists('prefs:u42'), 'warm the cache first');
+  const cacheAtSave: number[] = [];
+  const savePrefs = db.savePrefs;
+  db.savePrefs = (userId: string, newPrefs: unknown) => {
+    cacheAtSave.push(ctx.redis.exists('prefs:u42'));
+    savePrefs(userId, newPrefs);
+  };
+  const next = {push: false, quiet_start: 23, quiet_end: 8};
+  const r = await ctx.client(m.app).put('/users/u42/preferences', {json: next});
+  assert([200, 204].includes(r.status), \`PUT answered \${r.status}, expected 204 (or 200)\`);
+  assert.deepEqual(db.rows.u42, next, \`the database must hold the new preferences, it holds \${JSON.stringify(db.rows.u42)}\`);
+  assert.deepEqual(cacheAtSave, [1], 'savePrefs must run before the DEL: the cache entry was already gone when the database was written');
+  assert.equal(ctx.redis.exists('prefs:u42'), 0, \`PUT must delete prefs:u42, it holds \${JSON.stringify(ctx.redis.get('prefs:u42'))} (invalidate, never SET)\`);
+  const before = loads(db).length;
+  assert.deepEqual(await m.getPrefs('u42'), next, 'the next read must see the new preferences');
+  assert.equal(loads(db).length, before + 1, 'the read after the PUT must reload from the database');
+}
 `,
   },
   debrief: `Cache-aside on the read path and invalidate-on-write is the pairing that survives concurrency: readers refill from the source of truth, writers only ever remove, and the TTL bounds how long a missed invalidation can hurt. Updating the cache in place looks faster and is the classic source of "my setting reverted ten minutes later" bugs. Real systems add a short negative entry for users with no row, version the document so an old refill cannot overwrite a newer one, and fan the DEL out to every region's cache.`,

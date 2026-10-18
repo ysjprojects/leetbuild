@@ -48,6 +48,7 @@ count twice — so the **membership set is the source of truth** and the counter
         '`SADD liked:{post} user` returning 0 means the like already exists: respond `409 Conflict` and do not touch the counter.',
       match: {
         python: {all: [/\.sadd\(\s*f"liked:\{/, /status_code\s*=\s*409|HTTP_409/]},
+        typescript: {all: [/\.sadd\(\s*`liked:\$\{/, /code\(\s*409\s*\)|status\(\s*409\s*\)|statusCode:\s*409/]},
         go: {all: [/\.SAdd\(\s*[^\n]*"liked:"\s*\+|\.SAdd\(\s*[^\n]*"liked:%s"/, /http\.StatusConflict|\b409\b/]},
         scala: {all: [/\.sadd\(\s*s"liked:\$/, /StatusCodes\.Conflict|\b409\b/]},
         cpp: {all: [/\.sadd\(\s*"liked:"\s*\+/, /status\s*=\s*409/]},
@@ -59,6 +60,7 @@ count twice — so the **membership set is the source of truth** and the counter
       detail: 'The counter moves after the set confirmed a new member — never before, never on a duplicate.',
       match: {
         python: {all: [/\.incr\(\s*f"likes:\{/], order: [/\.sadd\(/, /\.incr\(/]},
+        typescript: {all: [/\.incr\(\s*`likes:\$\{/], order: [/\.sadd\(/, /\.incr\(/]},
         go: {all: [/\.Incr\(\s*[^\n]*"likes:"\s*\+|\.Incr\(\s*[^\n]*"likes:%s"/], order: [/\.SAdd\(/, /\.Incr\(/]},
         scala: {all: [/\.incr\(\s*s"likes:\$/], order: [/\.sadd\(/, /\.incr\(/]},
         cpp: {all: [/\.incr\(\s*"likes:"\s*\+/], order: [/\.sadd\(/, /\.incr\(/]},
@@ -71,6 +73,7 @@ count twice — so the **membership set is the source of truth** and the counter
         '`SREM liked:{post} user` returning 0 → `409`; otherwise `DECR likes:{post}` so the counter stays equal to the set size.',
       match: {
         python: {order: [/\.srem\(\s*f"liked:\{/, /\.decr\(\s*f"likes:\{/]},
+        typescript: {order: [/\.srem\(\s*`liked:\$\{/, /\.decr\(\s*`likes:\$\{/]},
         go: {order: [/\.SRem\(\s*[^\n]*"liked:/, /\.Decr\(\s*[^\n]*"likes:/]},
         scala: {order: [/\.srem\(\s*s"liked:\$/, /\.decr\(\s*s"likes:\$/]},
         cpp: {order: [/\.srem\(\s*"liked:"\s*\+/, /\.decr\(\s*"likes:"\s*\+/]},
@@ -85,6 +88,10 @@ count twice — so the **membership set is the source of truth** and the counter
         python: {
           all: [/produce\(\s*(TOPIC|"engagement")\s*,[^\n]*key\s*=\s*post_id/, /producer\.poll\(\s*0\s*\)/],
           none: [/producer\.flush\(/],
+        },
+        typescript: {
+          all: [/producer\.send\(/, /topic:\s*(TOPIC|['"]engagement['"])/, /key:\s*(postId|post_id)\b/],
+          none: [/await\s+producer\.send\(|await\s+connected\b|await\s+emit\(/],
         },
         go: {all: [/Key:\s*\[\]byte\(\s*postID\s*\)/, /Async:\s*true/]},
         scala: {
@@ -106,6 +113,7 @@ count twice — so the **membership set is the source of truth** and the counter
         'Read `likes:{post}` and turn an absent key into `0` — a missing counter is the normal state of a fresh post.',
       match: {
         python: {all: [/\.get\(\s*f"likes:\{[^\n]*\)\s*or\s*0/]},
+        typescript: {all: [/\.get\(\s*`likes:\$\{[^\n]*\)[^\n]*(\?\?|\|\|)\s*(0|['"]0['"])/]},
         go: {all: [/\.Get\(\s*[^\n]*"likes:"\s*\+/, /redis\.Nil/]},
         scala: {all: [/jedis\.get\(\s*s"likes:\$/, /getOrElse\(\s*0L?\s*\)|\.fold\(\s*0L?\s*\)/]},
         cpp: {all: [/redis\.get\(\s*"likes:"\s*\+/, /value_or\(\s*"0"\s*\)|\?\s*std::stoll\([^\n]*:\s*0/]},
@@ -196,6 +204,93 @@ def unlike(post_id: str, x_user_id: str = Header()) -> dict:
 @app.get("/posts/{post_id}/likes")
 def likes(post_id: str) -> dict:
     return {"likes": int(r.get(f"likes:{post_id}") or 0)}
+`,
+    },
+    typescript: {
+      starter: `import {randomUUID} from 'node:crypto';
+
+import Fastify from 'fastify';
+import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+const producer = new Kafka({clientId: 'feed-api', brokers: ['kafka:9092']}).producer();
+const connected = producer.connect();
+
+export const TOPIC = 'engagement';
+
+function emit(kind: 'like' | 'unlike', postId: string, userId: string): void {
+  const event = {event_id: randomUUID(), type: kind, post_id: postId, user_id: userId, ts: Date.now()};
+  // TODO: once connected, producer.send to TOPIC keyed by postId; never await the acknowledgement here (log a failure)
+  throw new Error('not implemented');
+}
+
+app.post('/posts/:postId/like', async (request, reply) => {
+  const {postId} = request.params as {postId: string};
+  const userId = request.headers['x-user-id'] as string;
+  // TODO: SADD liked:{postId} userId → 0 means already liked → 409
+  // TODO: INCR likes:{postId}, emit('like', ...), answer {likes: n}
+  return reply.code(501).send();
+});
+
+app.delete('/posts/:postId/like', async (request, reply) => {
+  const {postId} = request.params as {postId: string};
+  const userId = request.headers['x-user-id'] as string;
+  // TODO: SREM liked:{postId} userId → 0 means not liked → 409
+  // TODO: DECR likes:{postId}, emit('unlike', ...), answer {likes: n}
+  return reply.code(501).send();
+});
+
+app.get('/posts/:postId/likes', async (request, reply) => {
+  const {postId} = request.params as {postId: string};
+  // TODO: GET likes:{postId}; 0 when the key does not exist
+  return reply.code(501).send();
+});
+`,
+      solution: `import {randomUUID} from 'node:crypto';
+
+import Fastify from 'fastify';
+import Redis from 'ioredis';
+import {Kafka} from 'kafkajs';
+
+export const app = Fastify();
+const redis = new Redis({host: 'redis', port: 6379});
+const producer = new Kafka({clientId: 'feed-api', brokers: ['kafka:9092']}).producer();
+const connected = producer.connect();
+
+export const TOPIC = 'engagement';
+
+function emit(kind: 'like' | 'unlike', postId: string, userId: string): void {
+  const event = {event_id: randomUUID(), type: kind, post_id: postId, user_id: userId, ts: Date.now()};
+  // Fire and forget: the request never waits for the broker; a lost event is logged, not surfaced.
+  void connected
+    .then(() => producer.send({topic: TOPIC, messages: [{key: postId, value: JSON.stringify(event)}]}))
+    .catch((err: unknown) => console.error('engagement event not delivered', err));
+}
+
+app.post('/posts/:postId/like', async (request, reply) => {
+  const {postId} = request.params as {postId: string};
+  const userId = request.headers['x-user-id'] as string;
+  if ((await redis.sadd(\`liked:\${postId}\`, userId)) === 0) return reply.code(409).send({error: 'already liked'});
+  const count = await redis.incr(\`likes:\${postId}\`);
+  emit('like', postId, userId);
+  return {likes: count};
+});
+
+app.delete('/posts/:postId/like', async (request, reply) => {
+  const {postId} = request.params as {postId: string};
+  const userId = request.headers['x-user-id'] as string;
+  if ((await redis.srem(\`liked:\${postId}\`, userId)) === 0) return reply.code(409).send({error: 'not liked'});
+  const count = await redis.decr(\`likes:\${postId}\`);
+  emit('unlike', postId, userId);
+  return {likes: count};
+});
+
+app.get('/posts/:postId/likes', async request => {
+  const {postId} = request.params as {postId: string};
+  return {likes: Number((await redis.get(\`likes:\${postId}\`)) ?? 0)};
+});
 `,
     },
     go: {
@@ -717,6 +812,101 @@ async def check_count_read(ctx):
         await c.post("/posts/p1/like", headers=_user("bob"))
         r = await c.get("/posts/p1/likes")
         assert r.status_code == 200 and r.json() == {"likes": 2}, f"after two likes GET must answer likes 2, got {r.status_code} {r.text}"
+`,
+    typescript: `const user = (name: string) => ({'X-User-Id': name});
+
+/** A turn of the event loop, so fire-and-forget produces have landed on the broker. */
+const settle = () => new Promise<void>(resolve => setTimeout(resolve, 1));
+
+function events(ctx) {
+  return ctx.kafka.values('engagement').map(v => JSON.parse(v));
+}
+
+export async function check_idempotent_like(ctx) {
+  const m = ctx.load('likes');
+  const c = ctx.client(m.app);
+  let r = await c.post('/posts/p1/like', {headers: user('alice')});
+  assert.equal(r.status, 200, \`the first like must answer 200, got \${r.status}\`);
+  assert.deepStrictEqual(r.json(), {likes: 1}, \`the first like must answer likes 1, got \${r.text}\`);
+  r = await c.post('/posts/p1/like', {headers: user('alice')});
+  assert.equal(r.status, 409, \`a second like by the same user must answer 409, got \${r.status}\`);
+  assert.equal(ctx.redis.get('likes:p1'), '1', \`a duplicate like must not move the counter: likes:p1 is \${JSON.stringify(ctx.redis.get('likes:p1'))}\`);
+  r = await c.post('/posts/p1/like', {headers: user('bob')});
+  assert(r.status === 200 && JSON.stringify(r.json()) === JSON.stringify({likes: 2}), \`a like by another user counts: expected 200 likes 2, got \${r.status} \${r.text}\`);
+  assert.deepStrictEqual([...ctx.redis.smembers('liked:p1')].sort(), ['alice', 'bob'], \`liked:p1 must hold the users who liked, got \${JSON.stringify(ctx.redis.smembers('liked:p1'))}\`);
+}
+
+export async function check_count_after_membership(ctx) {
+  const m = ctx.load('likes');
+  ctx.redis.sadd('liked:p1', 'alice'); // the fact exists; the counter does not yet
+  const c = ctx.client(m.app);
+  let r = await c.post('/posts/p1/like', {headers: user('alice')});
+  assert.equal(r.status, 409, \`SADD returned 0 for alice: expected 409, got \${r.status}\`);
+  assert.equal(ctx.redis.get('likes:p1'), null, \`the counter must not move when SADD added nothing: likes:p1 is \${JSON.stringify(ctx.redis.get('likes:p1'))}\`);
+  await settle();
+  assert.equal(ctx.kafka.records('engagement').length, 0, 'a rejected like must not produce an event');
+  r = await c.post('/posts/p1/like', {headers: user('bob')});
+  assert(r.status === 200 && JSON.stringify(r.json()) === JSON.stringify({likes: 1}), \`bob is a new member: expected 200 likes 1, got \${r.status} \${r.text}\`);
+  assert.equal(ctx.redis.get('likes:p1'), '1', \`likes:p1 must be 1 after one successful INCR, got \${JSON.stringify(ctx.redis.get('likes:p1'))}\`);
+  assert.equal(ctx.redis.scard('liked:p1'), 2, \`liked:p1 must hold alice and bob, got \${JSON.stringify(ctx.redis.smembers('liked:p1'))}\`);
+}
+
+export async function check_unlike(ctx) {
+  const m = ctx.load('likes');
+  const c = ctx.client(m.app);
+  let r = await c.delete('/posts/p1/like', {headers: user('alice')});
+  assert.equal(r.status, 409, \`unliking a post alice never liked must answer 409, got \${r.status}\`);
+  assert.equal(ctx.redis.get('likes:p1'), null, \`a rejected unlike must not touch the counter: likes:p1 is \${JSON.stringify(ctx.redis.get('likes:p1'))}\`);
+  await c.post('/posts/p1/like', {headers: user('alice')});
+  await c.post('/posts/p1/like', {headers: user('bob')});
+  r = await c.delete('/posts/p1/like', {headers: user('alice')});
+  assert(r.status === 200 && JSON.stringify(r.json()) === JSON.stringify({likes: 1}), \`unlike after a like must answer 200 with the decremented count, got \${r.status} \${r.text}\`);
+  assert.deepStrictEqual(ctx.redis.smembers('liked:p1'), ['bob'], \`SREM must remove alice from liked:p1, got \${JSON.stringify(ctx.redis.smembers('liked:p1'))}\`);
+  r = await c.delete('/posts/p1/like', {headers: user('alice')});
+  assert.equal(r.status, 409, \`a repeated unlike must answer 409, got \${r.status}\`);
+  assert.equal(ctx.redis.get('likes:p1'), '1', \`the counter must equal the set size (1), got \${JSON.stringify(ctx.redis.get('likes:p1'))}\`);
+  await settle();
+  const kinds = events(ctx).map(e => e.type);
+  assert.deepStrictEqual(kinds, ['like', 'like', 'unlike'], \`expected like, like, unlike events, got \${JSON.stringify(kinds)}\`);
+}
+
+export async function check_event(ctx) {
+  const m = ctx.load('likes');
+  const c = ctx.client(m.app);
+  await c.post('/posts/p1/like', {headers: user('alice')});
+  await c.post('/posts/p1/like', {headers: user('alice')}); // 409: no event
+  await c.post('/posts/p2/like', {headers: user('alice')});
+  await c.delete('/posts/p1/like', {headers: user('alice')});
+  await settle();
+  const records = ctx.kafka.records('engagement');
+  assert.equal(records.length, 3, \`expected 3 engagement events (like, like, unlike), found \${records.length}\`);
+  assert.deepStrictEqual(ctx.kafka.keys('engagement'), ['p1', 'p2', 'p1'], \`events must be keyed by the post id, got keys \${JSON.stringify(ctx.kafka.keys('engagement'))}\`);
+  assert.equal(records[0].partition, records[2].partition, "one post's events must land on one partition");
+  const [like, , unlike] = events(ctx);
+  assert(like.type === 'like' && like.post_id === 'p1' && like.user_id === 'alice', \`the like event must carry type, post_id and user_id: \${JSON.stringify(like)}\`);
+  assert(unlike.type === 'unlike' && unlike.post_id === 'p1', \`the unlike event must carry type unlike: \${JSON.stringify(unlike)}\`);
+  const ids = events(ctx).map(e => e.event_id);
+  assert(ids.every(Boolean) && new Set(ids).size === 3, \`every event needs its own event_id, got \${JSON.stringify(ids)}\`);
+  // The broker stops acknowledging: a request that waits for the produce hangs (and then fails) with it.
+  ctx.kafka.stall('engagement');
+  const before = ctx.clock.now();
+  const r = await c.post('/posts/p3/like', {headers: user('alice')});
+  assert.equal(r.status, 200, \`while the broker does not acknowledge, the like must still answer 200 — the request must not wait for the broker — got \${r.status}\`);
+  assert(ctx.clock.now() - before < 1000, \`the request waited \${ctx.clock.now() - before} ms for the broker: produce fire-and-forget, never await the acknowledgement\`);
+  ctx.kafka.resume();
+}
+
+export async function check_count_read(ctx) {
+  const m = ctx.load('likes');
+  const c = ctx.client(m.app);
+  let r = await c.get('/posts/fresh/likes');
+  assert.equal(r.status, 200, \`a post nobody liked must answer 200, got \${r.status}\`);
+  assert.deepStrictEqual(r.json(), {likes: 0}, \`a post nobody liked has 0 likes, got \${r.text}\`);
+  await c.post('/posts/p1/like', {headers: user('alice')});
+  await c.post('/posts/p1/like', {headers: user('bob')});
+  r = await c.get('/posts/p1/likes');
+  assert(r.status === 200 && JSON.stringify(r.json()) === JSON.stringify({likes: 2}), \`after two likes GET must answer likes 2, got \${r.status} \${r.text}\`);
+}
 `,
   },
   debrief: `The set is the fact ("alice likes p1") and the counter is a derived number; letting \`SADD\`'s return value gate the \`INCR\` is what makes a retried request harmless. Keying the engagement event by post id keeps a post's likes and unlikes in order on one partition, and the fire-and-forget produce keeps the broker off the request path. Real systems make the two Redis commands atomic (a Lua script or \`MULTI\`), keep the sets in a sharded cluster because \`liked:{post}\` of a viral post has millions of members, and eventually move the counter to the rollup stream of step 6 so the request path only writes the fact.`,

@@ -21,6 +21,12 @@ import {LinkedInButton, POST_HINT} from './Social';
 /** Wrong submissions on the step before failing checks reveal their expected shape. */
 export const SHAPE_AFTER_WRONG = 2;
 
+/** What the first run fetches, per executing language (the idle copy under the checks). */
+const RUNTIME_DOWNLOAD: Partial<Record<Language, string>> = {
+  python: 'the Python runtime (~10 MB)',
+  typescript: 'the TypeScript compiler (~14 MB)',
+};
+
 const Fragment: FC<{text: string}> = memo(({text}) => (
   <code className="bg-ink-800 font-code text-iris-200 rounded px-1.5 py-0.5 text-[11px]">{text}</code>
 ));
@@ -180,7 +186,7 @@ const VerdictPane: FC<{
           {executes ? (
             <span
               className="border-iris-400/40 bg-iris-400/10 text-iris-200 rounded-full border px-2 py-0.5 text-[10px]"
-              title="your code runs in the browser: Python, Redis, Kafka, gRPC and Postgres in-page; these checks exercise it">
+              title={`your code runs in the browser: ${LANGUAGE_LABEL[language]}, Redis, Kafka, gRPC and Postgres in-page; these checks exercise it`}>
               runs in the browser
             </span>
           ) : null}
@@ -197,7 +203,7 @@ const VerdictPane: FC<{
           {verdict === null ? (
             <p className="text-ink-300 mb-2 text-[12px]">
               {executes
-                ? 'Submit (⌘/Ctrl + Enter) to run your code. Each check exercises your implementation and reports what it observed; the first run downloads the Python runtime (~10 MB).'
+                ? `Submit (⌘/Ctrl + Enter) to run your code. Each check exercises your implementation and reports what it observed; the first run downloads ${RUNTIME_DOWNLOAD[language]}.`
                 : 'Submit (⌘/Ctrl + Enter) to run the checks. Each one is a property a correct implementation has; failures show what was expected.'}
             </p>
           ) : runError !== undefined ? (

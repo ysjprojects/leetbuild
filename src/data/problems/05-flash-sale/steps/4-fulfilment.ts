@@ -70,6 +70,9 @@ allocation:
             /"enable\.auto\.commit"\s*:\s*(False|"false")/,
           ],
         },
+        typescript: {
+          all: [/groupId:\s*['"]fulfilment['"]/, /subscribe\(\s*\{[^}]*topic:\s*['"]orders['"]/, /autoCommit:\s*false/],
+        },
         go: {all: [/GroupID:\s*"fulfilment"/, /Topic:\s*"orders"/, /reader\.FetchMessage\(/], none: [/ReadMessage\(/]},
         scala: {
           all: [/"group\.id"\s*,\s*"fulfilment"/, /subscribe\([^\n]*"orders"/, /"enable\.auto\.commit"\s*,\s*"false"/],
@@ -85,6 +88,7 @@ allocation:
       detail: 'Every RPC must carry a deadline so a hung warehouse cannot stall the partition forever.',
       match: {
         python: {all: [/stub\.Allocate\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
+        typescript: {all: [/stub\.Allocate\([\s\S]{0,200}?deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
         go: {order: [/context\.WithTimeout\(\s*\w+\s*,\s*deadline\s*\)/, /stub\.Allocate\(/]},
         scala: {
           all: [
@@ -106,6 +110,14 @@ allocation:
             /range\([^)]*MAX_ATTEMPTS|attempt\s*<=?\s*MAX_ATTEMPTS/,
             /time\.sleep\(/,
             /BACKOFF_S\s*\*\s*\(?\s*2\s*\*\*|BACKOFF_S\s*\*\s*\(?\s*1\s*<<|\*=\s*2\b/,
+          ],
+        },
+        typescript: {
+          all: [
+            /status\.UNAVAILABLE/,
+            /attempt\s*<=?\s*MAX_ATTEMPTS/,
+            /await sleep\(|setTimeout\(/,
+            /BACKOFF_MS\s*\*\s*\(?\s*2\s*\*\*|BACKOFF_MS\s*\*\s*\(?\s*1\s*<<|BACKOFF_MS\s*<<|\*=\s*2\b/,
           ],
         },
         go: {
@@ -147,6 +159,9 @@ allocation:
             /publish_failed\(\s*order\s*\)/,
           ],
         },
+        typescript: {
+          all: [/status\.FAILED_PRECONDITION/, /release\(\s*order\.order_id\s*\)/, /publishFailed\(\s*order\s*\)/],
+        },
         go: {
           all: [
             /codes\.FailedPrecondition/,
@@ -167,6 +182,7 @@ allocation:
         'Allocate, then `confirm(order_id)`, then commit: an offset committed before the outcome is handled would lose the order on a crash.',
       match: {
         python: {order: [/stub\.Allocate\(/, /confirm\(\s*order\[["']order_id["']\]\s*\)/, /consumer\.commit\(/]},
+        typescript: {order: [/stub\.Allocate\(/, /confirm\(\s*order\.order_id\s*\)/, /consumer\.commitOffsets\(/]},
         go: {order: [/stub\.Allocate\(/, /confirm\(\s*ctx\s*,\s*order\.OrderID\s*\)/, /reader\.CommitMessages\(/]},
         scala: {order: [/\.allocate\(/, /confirm\(\s*order\.orderId\s*\)/, /consumer\.commitSync\(/]},
         cpp: {order: [/stub->Allocate\(/, /confirm\(\s*order\.order_id\s*\)/, /consumer->commitSync\(/]},
@@ -314,6 +330,146 @@ def run() -> None:
             release(order["order_id"])
             publish_failed(order)
         consumer.commit(message=msg, asynchronous=False)
+`,
+    },
+    typescript: {
+      starter: `import {setTimeout as sleep} from 'node:timers/promises';
+
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import {Kafka} from 'kafkajs';
+
+import type {Order} from './checkout_api';
+
+export const DEADLINE_MS = 5000;
+export const BACKOFF_MS = 250;
+export const MAX_ATTEMPTS = 4;
+
+interface WarehouseClient {
+  Allocate(request: {order_id: string; sku: string; qty: number}, options: {deadline: number}): Promise<{shipment_id: string}>;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('warehouse.proto')) as unknown as {
+  flashsale: {Warehouse: new (target: string, credentials: grpc.ChannelCredentials) => WarehouseClient};
+};
+const stub = new pkg.flashsale.Warehouse('warehouse:9000', grpc.credentials.createInsecure());
+
+const kafka = new Kafka({clientId: 'fulfilment', brokers: ['kafka:9092']});
+const consumer = kafka.consumer({groupId: 'fulfilment'});
+
+/** Step 5 and the dead-letter producer (provided). */
+export const services = {
+  /** The reservation became a sale: DEL hold:{order_id}, ZREM holds. */
+  async confirm(orderId: string): Promise<void> {
+    throw new Error('not implemented');
+  },
+  /** Gives the hold back to stock (step 5). */
+  async release(orderId: string): Promise<void> {
+    throw new Error('not implemented');
+  },
+  /** Dead-letters the order on orders-failed. */
+  async publishFailed(order: Order): Promise<void> {
+    throw new Error('not implemented');
+  },
+};
+
+/** true when the warehouse took the order, false when it has no physical stock. */
+export async function allocate(order: Order): Promise<boolean> {
+  const request = {order_id: order.order_id, sku: order.sku, qty: order.qty};
+  // TODO: up to MAX_ATTEMPTS calls to stub.Allocate with deadline: Date.now() + DEADLINE_MS
+  // TODO: FAILED_PRECONDITION → false; UNAVAILABLE → sleep BACKOFF_MS * 2 ** (attempt - 1) and retry; else rethrow
+  throw new Error('not implemented');
+}
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: 'orders', fromBeginning: true});
+  await consumer.run({
+    // TODO: disable auto-commit
+    eachMessage: async ({topic, partition, message}) => {
+      const order = JSON.parse(message.value!.toString()) as Order;
+      // TODO: allocate(order) → services.confirm; no stock → services.release + services.publishFailed
+      // TODO: commit this message's offset (offset + 1) only after the outcome is handled
+      throw new Error('not implemented');
+    },
+  });
+}
+`,
+      solution: `import {setTimeout as sleep} from 'node:timers/promises';
+
+import * as grpc from '@grpc/grpc-js';
+import * as protoLoader from '@grpc/proto-loader';
+import {Kafka} from 'kafkajs';
+
+import type {Order} from './checkout_api';
+
+export const DEADLINE_MS = 5000;
+export const BACKOFF_MS = 250;
+export const MAX_ATTEMPTS = 4;
+
+interface WarehouseClient {
+  Allocate(request: {order_id: string; sku: string; qty: number}, options: {deadline: number}): Promise<{shipment_id: string}>;
+}
+
+const pkg = grpc.loadPackageDefinition(protoLoader.loadSync('warehouse.proto')) as unknown as {
+  flashsale: {Warehouse: new (target: string, credentials: grpc.ChannelCredentials) => WarehouseClient};
+};
+const stub = new pkg.flashsale.Warehouse('warehouse:9000', grpc.credentials.createInsecure());
+
+const kafka = new Kafka({clientId: 'fulfilment', brokers: ['kafka:9092']});
+const consumer = kafka.consumer({groupId: 'fulfilment'});
+
+/** Step 5 and the dead-letter producer (provided). */
+export const services = {
+  /** The reservation became a sale: DEL hold:{order_id}, ZREM holds. */
+  async confirm(orderId: string): Promise<void> {
+    throw new Error('not implemented');
+  },
+  /** Gives the hold back to stock (step 5). */
+  async release(orderId: string): Promise<void> {
+    throw new Error('not implemented');
+  },
+  /** Dead-letters the order on orders-failed. */
+  async publishFailed(order: Order): Promise<void> {
+    throw new Error('not implemented');
+  },
+};
+
+/** true when the warehouse took the order, false when it has no physical stock. */
+export async function allocate(order: Order): Promise<boolean> {
+  const request = {order_id: order.order_id, sku: order.sku, qty: order.qty};
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    if (attempt > 0) await sleep(BACKOFF_MS * 2 ** (attempt - 1));
+    try {
+      await stub.Allocate(request, {deadline: Date.now() + DEADLINE_MS});
+      return true;
+    } catch (e) {
+      const {code} = e as grpc.ServiceError;
+      if (code === grpc.status.FAILED_PRECONDITION) return false;
+      if (code !== grpc.status.UNAVAILABLE) throw e;
+    }
+  }
+  throw new Error(\`warehouse unavailable after \${MAX_ATTEMPTS} attempts\`);
+}
+
+export async function run(): Promise<void> {
+  await consumer.connect();
+  await consumer.subscribe({topic: 'orders', fromBeginning: true});
+  await consumer.run({
+    autoCommit: false,
+    eachMessage: async ({topic, partition, message}) => {
+      const order = JSON.parse(message.value!.toString()) as Order;
+      if (await allocate(order)) {
+        await services.confirm(order.order_id);
+      } else {
+        console.warn(\`no physical stock for \${order.sku}: releasing \${order.order_id}\`);
+        await services.release(order.order_id);
+        await services.publishFailed(order);
+      }
+      await consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
+    },
+  });
+}
 `,
     },
     go: {
@@ -915,6 +1071,150 @@ def check_commit_after(ctx):
         pass
     assert ctx.kafka.lag("fulfilment", "orders") == 1, "a record whose outcome is unknown must stay uncommitted so it is redelivered after a restart"
     assert "o2" not in _calls(log, "confirm") and "o2" not in _calls(log, "release"), "an unexpected status must neither confirm nor release the hold"
+`,
+    typescript: `const NO_STOCK_SKU = 'phantom-9';
+
+type Entry = [string, unknown];
+
+interface Order {
+  order_id: string;
+  sku: string;
+  qty: number;
+  user: string;
+}
+
+const order = (orderId: string, sku = 'shoe-42', qty = 2): Order => ({order_id: orderId, sku, qty, user: 'ada'});
+
+function seed(ctx, ...orders: Order[]) {
+  for (const o of orders) ctx.kafka.seed('orders', {key: o.sku, value: JSON.stringify(o)});
+}
+
+/** The warehouse peer (no stock for phantom-9) and the consumer with steps 5 and the dead-letter producer recorded. */
+function consumer(ctx, ...orders: Order[]) {
+  seed(ctx, ...orders);
+  const allocated: [string, string, number][] = [];
+  const pkg = ctx.proto('warehouse.proto');
+  ctx.grpc.serve(pkg.flashsale.Warehouse.service, {
+    Allocate(call, callback) {
+      const {order_id, sku, qty} = call.request;
+      if (sku === NO_STOCK_SKU) {
+        callback({code: ctx.grpc.status.FAILED_PRECONDITION, details: 'no physical stock'});
+        return;
+      }
+      allocated.push([order_id, sku, qty]);
+      callback(null, {shipment_id: 'ship-' + order_id});
+    },
+  });
+  const m = ctx.load('fulfilment_consumer');
+  const log: Entry[] = [];
+  m.services.confirm = async (orderId: string) => {
+    log.push(['confirm', orderId]);
+  };
+  m.services.release = async (orderId: string) => {
+    log.push(['release', orderId]);
+  };
+  m.services.publishFailed = async (o: Record<string, unknown>) => {
+    log.push(['failed', {...o}]);
+  };
+  return {m, allocated, log};
+}
+
+const calls = (log: Entry[], kind: string) => log.filter(e => e[0] === kind).map(e => e[1]);
+
+/** Rejection of a promise as a value, or null when it resolved. */
+async function rejection(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise;
+    return null;
+  } catch (e) {
+    return e;
+  }
+}
+
+export async function check_group_manual_commit(ctx) {
+  const {m} = consumer(ctx, order('o1'));
+  await ctx.drain(m.run());
+  const subscriptions = ctx.kafka.events.filter(e => e[0] === 'subscribe');
+  assert(subscriptions.length > 0, 'the consumer must subscribe to a topic');
+  const [, group, topics] = subscriptions[subscriptions.length - 1];
+  assert.equal(group, 'fulfilment', \`groupId must be fulfilment, got \${JSON.stringify(group)}\`);
+  assert(topics.includes('orders'), \`the consumer must subscribe to orders, got \${JSON.stringify(topics)}\`);
+  assert(!ctx.kafka.events.some(e => e[0] === 'auto-commit'), 'autoCommit is on: offsets were committed on a timer, before the outcome is handled');
+  assert(ctx.kafka.events.some(e => e[0] === 'manual-commit'), 'the consumer never committed an offset itself');
+  assert.equal(ctx.kafka.lag('fulfilment', 'orders'), 0, 'the handled record must be committed');
+}
+
+export async function check_deadline(ctx) {
+  const {m} = consumer(ctx, order('o1'));
+  await ctx.drain(m.run());
+  const calls_ = ctx.grpc.callsTo('Allocate');
+  assert(calls_.length > 0, 'no Allocate RPC reached the warehouse');
+  const timeout = calls_[calls_.length - 1].timeout;
+  assert(timeout !== null, 'the Allocate RPC carries no deadline: a hung warehouse would stall the partition forever');
+  assert(4 < timeout && timeout <= 5, \`the deadline is \${timeout} s, expected 5 s\`);
+  ctx.grpc.setLatency('Allocate', 30);
+  const before = calls_.length;
+  const error = await rejection(m.allocate(order('o2')));
+  assert(error !== null, 'a warehouse slower than the deadline must reject with DEADLINE_EXCEEDED, not resolve');
+  assert.equal((error as {code?: number}).code, ctx.grpc.status.DEADLINE_EXCEEDED, \`a slow warehouse failed with code \${(error as {code?: number}).code}, expected DEADLINE_EXCEEDED (\${ctx.grpc.status.DEADLINE_EXCEEDED})\`);
+  assert.equal(ctx.grpc.callsTo('Allocate').length, before + 1, 'DEADLINE_EXCEEDED must not be retried');
+}
+
+export async function check_backoff_bounded(ctx) {
+  const {m, allocated} = consumer(ctx);
+  ctx.grpc.fail('Allocate', ctx.grpc.status.UNAVAILABLE, '', 2);
+  let started = ctx.clock.now();
+  assert.equal(await m.allocate(order('o1')), true, 'two UNAVAILABLE answers followed by success must end as allocated (true)');
+  assert.equal(ctx.grpc.callsTo('Allocate').length, 3, \`made \${ctx.grpc.callsTo('Allocate').length} calls, expected 3 (two UNAVAILABLE, then success)\`);
+  assert.equal(ctx.clock.sleeps, 2, \`slept \${ctx.clock.sleeps} times before the retries, expected 2 (never before the first call)\`);
+  let waited = ctx.clock.now() - started;
+  assert(740 <= waited && waited <= 900, \`waited \${waited} ms across two retries, expected 250 + 500 = 750 ms (base x 2^(attempt-1))\`);
+  assert.deepEqual(allocated, [['o1', 'shoe-42', 2]], \`the warehouse saw \${JSON.stringify(allocated)}, expected the order's id, sku and qty\`);
+
+  ctx.grpc.fail('Allocate', ctx.grpc.status.INVALID_ARGUMENT, 'qty', 1);
+  const error = await rejection(m.allocate(order('o2')));
+  assert(error !== null, 'INVALID_ARGUMENT must propagate, not be retried or swallowed');
+  assert.equal((error as {code?: number}).code, ctx.grpc.status.INVALID_ARGUMENT, \`got code \${(error as {code?: number}).code}, expected INVALID_ARGUMENT (\${ctx.grpc.status.INVALID_ARGUMENT}) to propagate unchanged\`);
+  assert.equal(ctx.grpc.callsTo('Allocate').length, 4, 'INVALID_ARGUMENT must not be retried');
+
+  ctx.grpc.fail('Allocate', ctx.grpc.status.UNAVAILABLE, '', 50);
+  started = ctx.clock.now();
+  const down = await rejection(m.allocate(order('o3')));
+  assert(down !== null, 'a warehouse that stays UNAVAILABLE must reject after MAX_ATTEMPTS, not resolve');
+  const attempts = ctx.grpc.callsTo('Allocate').length - 4;
+  assert.equal(attempts, 4, \`made \${attempts} attempts against a down warehouse, expected 4 in total\`);
+  waited = ctx.clock.now() - started;
+  assert(1740 <= waited && waited <= 1900, \`waited \${waited} ms across three retries, expected 250 + 500 + 1000 = 1750 ms\`);
+}
+
+export async function check_no_stock(ctx) {
+  const ghost = order('o2', NO_STOCK_SKU);
+  const {m, log} = consumer(ctx, order('o1'), ghost);
+  await ctx.drain(m.run());
+  assert.deepEqual(calls(log, 'release'), ['o2'], \`release calls were \${JSON.stringify(calls(log, 'release'))}, expected exactly ['o2'] (the order without physical stock)\`);
+  assert.deepEqual(calls(log, 'failed'), [ghost], \`publishFailed calls were \${JSON.stringify(calls(log, 'failed'))}, expected the whole order o2\`);
+  assert.deepEqual(calls(log, 'confirm'), ['o1'], \`confirm calls were \${JSON.stringify(calls(log, 'confirm'))}, expected ['o1'] only\`);
+  assert.equal(ctx.grpc.callsTo('Allocate').length, 2, 'FAILED_PRECONDITION is final: it must not be retried');
+  assert.equal(ctx.kafka.lag('fulfilment', 'orders'), 0, 'a no-stock order is handled (released and dead-lettered) and must be committed');
+}
+
+export async function check_commit_after(ctx) {
+  const {m, log} = consumer(ctx, order('o1'));
+  const atCommit: Entry[][] = [];
+  ctx.kafka.onCommit(() => atCommit.push([...log]));
+  await ctx.drain(m.run());
+  assert.deepEqual(calls(log, 'confirm'), ['o1'], \`a successful allocation must confirm the sale: confirm calls were \${JSON.stringify(calls(log, 'confirm'))}\`);
+  assert(atCommit.length > 0, 'the offset was never committed');
+  assert(atCommit[0].some(e => e[0] === 'confirm' && e[1] === 'o1'), 'the commit came before confirm(o1): a crash in between would lose the sale');
+  assert.equal(ctx.kafka.lag('fulfilment', 'orders'), 0, 'the handled record must be committed');
+
+  ctx.grpc.fail('Allocate', ctx.grpc.status.INTERNAL, 'warehouse bug', 1);
+  seed(ctx, order('o2'));
+  const error = await rejection(ctx.drain(m.run()));
+  assert(error !== null, 'an unexpected status must propagate out of the loop, not be swallowed');
+  assert.equal(ctx.kafka.lag('fulfilment', 'orders'), 1, 'a record whose outcome is unknown must stay uncommitted so it is redelivered after a restart');
+  assert(!calls(log, 'confirm').includes('o2') && !calls(log, 'release').includes('o2'), 'an unexpected status must neither confirm nor release the hold');
+}
 `,
   },
   debrief: `The consumer is a state machine per record: allocate → (sale | no stock) → commit, and the commit is last so a crash anywhere before it replays the record instead of losing it. The gRPC side does what every good client does — a deadline on each call, backoff only for the one status that means "try later", a hard cap on attempts — and the order id in the request is what makes that replay safe on the warehouse side. Real fulfilment services process partitions with a small worker pool per partition, pause the partition (not the whole consumer) while a warehouse is down, and put the Redis \`confirm\` behind the warehouse's own transactional record so the two never disagree.`,

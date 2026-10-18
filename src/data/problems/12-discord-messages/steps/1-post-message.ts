@@ -55,6 +55,7 @@ Implement \`POST /channels/{channel_id}/messages\` with body \`{"author_id": …
       detail: 'A handler must be registered for `POST` on `/channels/{channel_id}/messages`.',
       match: {
         python: {all: [/@app\.post\(\s*["']\/channels\/\{channel_id\}\/messages["']/]},
+        typescript: {all: [/app\.post\(\s*['"]\/channels\/:channel_id\/messages['"]/]},
         go: {all: [/HandleFunc\(\s*"POST \/channels\/\{channel_id\}\/messages"/]},
         scala: {all: [/path\(\s*"channels"\s*\/\s*LongNumber\s*\/\s*"messages"\s*\)/, /\bpost\s*\{/]},
         cpp: {all: [/svr\.Post\(\s*R"\(\/channels\/\(\\d\+\)\/messages\)"/]},
@@ -67,6 +68,9 @@ Implement \`POST /channels/{channel_id}/messages\` with body \`{"author_id": …
         'Trim the content and require 1–`MAX_CONTENT` (2000) characters; answer `400 Bad Request` before minting an id or touching the table.',
       match: {
         python: {all: [/MAX_CONTENT|\b2000\b/, /\.strip\(\)/, /status_code\s*=\s*400|HTTP_400/]},
+        typescript: {
+          all: [/MAX_CONTENT|\b2000\b/, /\.trim\(\)/, /code\(\s*400\s*\)|status\(\s*400\s*\)|statusCode:\s*400/],
+        },
         go: {all: [/maxContent|\b2000\b/, /strings\.TrimSpace\(/, /http\.StatusBadRequest|\b400\b/]},
         scala: {all: [/MaxContent|\b2000\b/, /\.trim\b/, /StatusCodes\.BadRequest|\b400\b/]},
         cpp: {all: [/kMaxContent|\b2000\b/, /find_first_not_of\(/, /status\s*=\s*400/]},
@@ -79,6 +83,7 @@ Implement \`POST /channels/{channel_id}/messages\` with body \`{"author_id": …
         'The id packs milliseconds since `DISCORD_EPOCH_MS` above bit 22, the worker id at bit 17 and a per-millisecond sequence masked to 12 bits; it never decreases.',
       match: {
         python: {all: [/DISCORD_EPOCH_MS\s*\)\s*<<\s*22/, /WORKER_ID\s*<<\s*17/, /&\s*0x[fF]{3}\b/]},
+        typescript: {all: [/DISCORD_EPOCH_MS\s*\)\s*<<\s*22n?/, /WORKER_ID\s*<<\s*17n?/, /&\s*0x[fF]{3}n?\b/]},
         go: {all: [/discordEpochMs\s*\)\s*<<\s*22/, /workerID\s*<<\s*17/, /&\s*0x[fF]{3}\b/]},
         scala: {all: [/DiscordEpochMs\s*\)\s*<<\s*22/, /WorkerId\s*<<\s*17/, /&\s*0x[fF]{3}\b/]},
         cpp: {all: [/kDiscordEpochMs\s*\)\s*<<\s*22/, /kWorkerId\s*<<\s*17/, /&\s*0x[fF]{3}\b/]},
@@ -91,6 +96,7 @@ Implement \`POST /channels/{channel_id}/messages\` with body \`{"author_id": …
         'The bucket is `(id >> 22) // BUCKET_MS`: the snowflake timestamp divided into 10-day windows from the Discord epoch, so every message of a channel in one window shares a partition.',
       match: {
         python: {all: [/\(\s*\w+\s*>>\s*22\s*\)\s*\/\/\s*BUCKET_MS/]},
+        typescript: {all: [/\(\s*\w+\s*>>\s*22n?\s*\)\s*\/\s*(BigInt\(\s*BUCKET_MS\s*\)|BUCKET_MS)/]},
         go: {all: [/\(\s*\w+\s*>>\s*22\s*\)\s*\/\s*bucketMs/]},
         scala: {all: [/\(\s*\w+\s*>>\s*22\s*\)\s*\/\s*BucketMs/]},
         cpp: {all: [/\(\s*\w+\s*>>\s*22\s*\)\s*\/\s*kBucketMs/]},
@@ -108,6 +114,13 @@ Implement \`POST /channels/{channel_id}/messages\` with body \`{"author_id": …
             /str\(\s*message_id\s*\)/,
           ],
           order: [/db\.execute\(/, /status_code\s*=\s*201/],
+        },
+        typescript: {
+          all: [
+            /INSERT INTO messages \(channel_id, bucket, message_id, author_id, content\)/,
+            /String\(\s*messageId\s*\)|messageId\.toString\(\)/,
+          ],
+          order: [/db\.execute\(/, /code\(\s*201\s*\)/],
         },
         go: {
           all: [
@@ -268,6 +281,149 @@ async def post_message(channel_id: int, body: NewMessage) -> JSONResponse:
 
 
 # uvicorn post_message:app --port 8443 --ssl-certfile cert.pem --ssl-keyfile key.pem
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+
+import {db} from 'messages/db'; // await db.execute(sql, params) -> rows; ids travel as text
+
+export const app = Fastify();
+
+export const DISCORD_EPOCH_MS = 1_420_070_400_000; // 2015-01-01T00:00:00Z: the first instant a Discord id can name
+export const WORKER_ID = 1;
+export const PROCESS_ID = 0;
+export const BUCKET_MS = 10 * 24 * 3600 * 1000; // one partition per channel per 10 days
+export const MAX_CONTENT = 2000;
+
+let lastMs = 0;
+let seq = 0;
+
+export interface NewMessage {
+  author_id: number;
+  content?: string;
+}
+
+export interface StoredMessage {
+  id: string;
+  channel_id: string;
+  author_id: string;
+  content: string;
+  bucket: number;
+}
+
+/** A snowflake: 42 bits of milliseconds since DISCORD_EPOCH_MS, 5 worker, 5 process, 12 sequence. */
+export function next_id(nowMs: number): bigint {
+  // TODO: nowMs <= lastMs → reuse lastMs and bump seq (& 0xFFF); seq wrapped to 0 → next millisecond
+  // TODO: a later nowMs → seq = 0; remember lastMs
+  // TODO: BigInt(nowMs - DISCORD_EPOCH_MS) << 22n | BigInt(WORKER_ID << 17 | PROCESS_ID << 12 | seq)
+  throw new Error('not implemented');
+}
+
+/** The 10-day window the id's timestamp falls in, counted from the Discord epoch. */
+export function bucket_of(snowflake: bigint): number {
+  // TODO: Number((snowflake >> 22n) / BigInt(BUCKET_MS))
+  throw new Error('not implemented');
+}
+
+export function valid_content(content: string): boolean {
+  // TODO: 1..MAX_CONTENT characters once trimmed
+  return true;
+}
+
+/** Mints the id, computes the bucket, inserts the row; returns the message as the API answers it. */
+export async function store_message(channelId: bigint, authorId: bigint, content: string): Promise<StoredMessage> {
+  // TODO: messageId = next_id(Date.now()); bucket = bucket_of(messageId)
+  // TODO: INSERT INTO messages (channel_id, bucket, message_id, author_id, content)
+  // TODO: {id: String(messageId), channel_id: String(channelId), author_id: String(authorId), content, bucket}
+  throw new Error('not implemented');
+}
+
+app.post('/channels/:channel_id/messages', async (request, reply) => {
+  const channelId = BigInt((request.params as {channel_id: string}).channel_id);
+  const body = request.body as NewMessage;
+  // TODO: 400 unless valid_content(body.content ?? '')
+  // TODO: store_message(...) → 201 with the message
+  return reply.code(501).send();
+});
+`,
+      solution: `import Fastify from 'fastify';
+
+import {db} from 'messages/db'; // await db.execute(sql, params) -> rows; ids travel as text
+
+export const app = Fastify();
+
+export const DISCORD_EPOCH_MS = 1_420_070_400_000; // 2015-01-01T00:00:00Z: the first instant a Discord id can name
+export const WORKER_ID = 1;
+export const PROCESS_ID = 0;
+export const BUCKET_MS = 10 * 24 * 3600 * 1000; // one partition per channel per 10 days
+export const MAX_CONTENT = 2000;
+
+let lastMs = 0;
+let seq = 0;
+
+export interface NewMessage {
+  author_id: number;
+  content?: string;
+}
+
+export interface StoredMessage {
+  id: string;
+  channel_id: string;
+  author_id: string;
+  content: string;
+  bucket: number;
+}
+
+/** A snowflake: 42 bits of milliseconds since DISCORD_EPOCH_MS, 5 worker, 5 process, 12 sequence. */
+export function next_id(nowMs: number): bigint {
+  if (nowMs <= lastMs) {
+    // same millisecond, or a clock that stepped back: never issue a lower id
+    nowMs = lastMs;
+    seq = (seq + 1) & 0xfff;
+    if (seq === 0) nowMs += 1; // 4096 ids in one millisecond: borrow the next one
+  } else {
+    seq = 0;
+  }
+  lastMs = nowMs;
+  return (BigInt(nowMs - DISCORD_EPOCH_MS) << 22n) | BigInt((WORKER_ID << 17) | (PROCESS_ID << 12) | seq);
+}
+
+/** The 10-day window the id's timestamp falls in, counted from the Discord epoch. */
+export function bucket_of(snowflake: bigint): number {
+  return Number((snowflake >> 22n) / BigInt(BUCKET_MS));
+}
+
+export function valid_content(content: string): boolean {
+  return content.trim().length >= 1 && content.length <= MAX_CONTENT;
+}
+
+/** Mints the id, computes the bucket, inserts the row; returns the message as the API answers it. */
+export async function store_message(channelId: bigint, authorId: bigint, content: string): Promise<StoredMessage> {
+  const messageId = next_id(Date.now());
+  const bucket = bucket_of(messageId);
+  await db.execute(
+    'INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES ($1, $2, $3, $4, $5)',
+    [channelId, bucket, messageId, authorId, content],
+  );
+  return {
+    id: String(messageId), // 64 bits: a JSON number would lose the low bits past 2**53
+    channel_id: String(channelId),
+    author_id: String(authorId),
+    content,
+    bucket,
+  };
+}
+
+app.post('/channels/:channel_id/messages', async (request, reply) => {
+  const channelId = BigInt((request.params as {channel_id: string}).channel_id);
+  const body = request.body as NewMessage;
+  if (!valid_content(body.content ?? '')) {
+    return reply.code(400).send({error: 'content must be 1 to 2000 characters'});
+  }
+  const message = await store_message(channelId, BigInt(body.author_id), body.content ?? '');
+  return reply.code(201).send(message);
+});
 `,
     },
     go: {
@@ -879,6 +1035,103 @@ async def check_insert_created(ctx):
         r2 = await c.post(f"/channels/{CHANNEL}/messages", json={"author_id": 7, "content": "second"})
         assert int(r2.json()["id"]) > message_id, "ids must increase from one message to the next"
         assert len(await _rows(ctx)) == 2, "every accepted message is one row"
+`,
+    typescript: `import {SCHEMA} from 'messages/db';
+
+const EPOCH = 1420070400000n;
+const BUCKET_MS = 10n * 24n * 3600n * 1000n;
+const CHANNEL = ((400n * BUCKET_MS + 123456n) << 22n) | (1n << 17n); // a channel created in bucket 400
+
+async function api(ctx) {
+  await ctx.db.reset(SCHEMA);
+  return ctx.load('post_message');
+}
+
+async function rows(ctx) {
+  return ctx.db.execute('SELECT channel_id, bucket, message_id, author_id, content FROM messages ORDER BY message_id');
+}
+
+export async function check_route(ctx) {
+  const m = await api(ctx);
+  const r = await ctx.client(m.app).post(\`/channels/\${CHANNEL}/messages\`, {json: {author_id: 42, content: 'hello'}});
+  assert(![404, 405].includes(r.status), \`POST /channels/{id}/messages answered \${r.status}: no handler is registered for it\`);
+  assert.equal(r.status, 201, \`a valid message answered \${r.status}, expected 201\`);
+}
+
+export async function check_validate_content(ctx) {
+  const m = await api(ctx);
+  const c = ctx.client(m.app);
+  for (const bad of ['', '   ', '\\n\\t', 'a'.repeat(2001)]) {
+    const r = await c.post(\`/channels/\${CHANNEL}/messages\`, {json: {author_id: 42, content: bad}});
+    assert.equal(r.status, 400, \`content \${JSON.stringify(bad.slice(0, 12))} (\${bad.length} chars) is not 1..2000 characters: expected 400, got \${r.status}\`);
+  }
+  assert.deepEqual(await rows(ctx), [], 'a rejected message must not reach the table');
+  let r = await c.post(\`/channels/\${CHANNEL}/messages\`, {json: {author_id: 42, content: 'a'.repeat(2000)}});
+  assert.equal(r.status, 201, \`exactly 2000 characters is allowed: expected 201, got \${r.status}\`);
+  r = await c.post(\`/channels/\${CHANNEL}/messages\`, {json: {author_id: 42, content: 'x'}});
+  assert.equal(r.status, 201, \`one character is allowed: expected 201, got \${r.status}\`);
+}
+
+export async function check_snowflake(ctx) {
+  const m = await api(ctx);
+  const ms = Number(EPOCH + 430n * BUCKET_MS) + 5000;
+  const first: bigint = m.next_id(ms);
+  assert.equal((first >> 22n) + EPOCH, BigInt(ms), \`the high bits must be now_ms - DISCORD_EPOCH_MS: \${first} decodes to \${(first >> 22n) + EPOCH}, expected \${ms}\`);
+  assert.equal(Number((first >> 17n) & 0x1fn), m.WORKER_ID, \`bits 17..21 must carry WORKER_ID (\${m.WORKER_ID}), got \${(first >> 17n) & 0x1fn}\`);
+  assert.equal(first & 0xfffn, 0n, \`the first id of a millisecond has sequence 0, got \${first & 0xfffn}\`);
+  const second: bigint = m.next_id(ms);
+  assert(second >> 22n === first >> 22n && (second & 0xfffn) === 1n, \`a second id in the same millisecond keeps the timestamp and takes sequence 1: \${first} then \${second}\`);
+  const later: bigint = m.next_id(ms + 7);
+  assert((later >> 22n) + EPOCH === BigInt(ms + 7) && (later & 0xfffn) === 0n, 'a later millisecond restarts the sequence at 0');
+  const steppedBack: bigint = m.next_id(ms + 3);
+  assert(steppedBack > later, \`the clock stepped back (ms + 3 after ms + 7) and next_id issued a lower id: \${steppedBack} <= \${later}\`);
+  const burstMs = ms + 1000;
+  const ids: bigint[] = Array.from({length: 4097}, () => m.next_id(burstMs));
+  assert(ids.every((id, i) => i === 0 || id > ids[i - 1]), 'ids minted within one millisecond must strictly increase');
+  assert((ids[4095] >> 22n) + EPOCH === BigInt(burstMs) && (ids[4095] & 0xfffn) === 4095n, 'the 4096th id of a millisecond has sequence 4095');
+  assert((ids[4096] >> 22n) + EPOCH === BigInt(burstMs + 1) && (ids[4096] & 0xfffn) === 0n, \`the 4097th id in one millisecond must move to the next millisecond with sequence 0, got ms \${(ids[4096] >> 22n) + EPOCH - BigInt(burstMs)} seq \${ids[4096] & 0xfffn}\`);
+}
+
+export async function check_bucket(ctx) {
+  const m = await api(ctx);
+  const cases: [bigint, number][] = [
+    [426n * BUCKET_MS, 426],
+    [426n * BUCKET_MS + 9n * 24n * 3600n * 1000n, 426],
+    [427n * BUCKET_MS, 427],
+    [0n, 0],
+  ];
+  for (const [offsetMs, expected] of cases) {
+    const snowflake = (offsetMs << 22n) | (1n << 17n) | 7n;
+    const got = m.bucket_of(snowflake);
+    assert.equal(got, expected, \`bucket_of(\${snowflake}) is \${got}, expected \${expected}: (id >> 22) / BUCKET_MS counts 10-day windows from the Discord epoch\`);
+  }
+  assert.equal(m.bucket_of(CHANNEL), 400, 'a channel id is a snowflake too: bucket_of(channel_id) is the window the channel was created in');
+  assert.equal(m.BUCKET_MS, 864000000, \`BUCKET_MS must be 10 days in milliseconds, got \${m.BUCKET_MS}\`);
+}
+
+export async function check_insert_created(ctx) {
+  const m = await api(ctx);
+  const c = ctx.client(m.app);
+  const r = await c.post(\`/channels/\${CHANNEL}/messages\`, {json: {author_id: 42, content: 'hello'}});
+  assert.equal(r.status, 201, \`expected 201 Created, got \${r.status}\`);
+  const body = r.json() as Record<string, unknown>;
+  assert(typeof body.id === 'string' && /^\\d+$/.test(body.id), \`the id must be a string of digits (64 bits do not fit a JSON number), got \${JSON.stringify(body.id)}\`);
+  const messageId = BigInt(body.id as string);
+  assert(messageId > 2n ** 53n, \`the id \${messageId} is too small for a snowflake minted now: the timestamp must sit above bit 22\`);
+  assert(Math.abs(Number((messageId >> 22n) + EPOCH) - Date.now()) < 60000, "the id's timestamp must be the current time in milliseconds");
+  assert.equal(body.bucket, m.bucket_of(messageId), \`the body must carry the bucket of the id (\${m.bucket_of(messageId)}), got \${JSON.stringify(body.bucket)}\`);
+  assert(body.content === 'hello' && String(body.author_id) === '42', \`the body must echo author_id and content: \${JSON.stringify(body)}\`);
+  const stored = await rows(ctx);
+  assert.equal(stored.length, 1, \`expected one row in messages, found \${stored.length}\`);
+  const row = stored[0];
+  assert.equal(BigInt(row.channel_id), CHANNEL, \`channel_id must be the path parameter, got \${JSON.stringify(row.channel_id)}\`);
+  assert.equal(BigInt(row.message_id), messageId, \`message_id must be the minted id \${messageId}, got \${JSON.stringify(row.message_id)}\`);
+  assert.equal(row.bucket, m.bucket_of(messageId), \`bucket must be bucket_of(message_id) = \${m.bucket_of(messageId)}, got \${JSON.stringify(row.bucket)}\`);
+  assert(String(row.author_id) === '42' && row.content === 'hello', \`author_id and content must be stored as sent, got \${JSON.stringify(row)}\`);
+  const r2 = await c.post(\`/channels/\${CHANNEL}/messages\`, {json: {author_id: 7, content: 'second'}});
+  assert(BigInt((r2.json() as {id: string}).id) > messageId, 'ids must increase from one message to the next');
+  assert.equal((await rows(ctx)).length, 2, 'every accepted message is one row');
+}
 `,
   },
   debrief: `A snowflake is an id and a clock in one 64-bit word: the timestamp in the high bits makes ids sort by time, the worker and sequence bits make them unique without a central counter, and the 12-bit sequence lets one process mint 4,096 ids per millisecond before it has to borrow the next one. Discord's 2017 schema leaned on exactly that: the primary key became (channel_id, bucket, message_id), with the bucket derived from the id, so every message of a channel from one 10-day window lands in one partition and a page of recent history is one contiguous range scan. The epoch is chosen so the timestamp fits in 42 bits for 139 years, and ids go out as strings because the languages reading the JSON cannot hold 64 bits in a number. Real services allocate worker ids from a registry so two instances can never agree on one, and refuse to mint when the clock steps back by more than a few milliseconds instead of silently reusing the last one.`,

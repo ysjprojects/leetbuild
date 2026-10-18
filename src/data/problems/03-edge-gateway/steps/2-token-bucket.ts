@@ -48,6 +48,7 @@ and the middleware that uses it, as a **token bucket** per key stored in Redis:
       detail: 'The Redis key must be `bucket:{api_key}` so each caller has its own budget.',
       match: {
         python: {all: [/f["']bucket:\{api_key\}["']/]},
+        typescript: {all: [/`bucket:\$\{apiKey\}`|['"]bucket:['"]\s*\+\s*apiKey/]},
         go: {all: [/"bucket:"\s*\+\s*apiKey|"bucket:%s"/]},
         scala: {all: [/s"bucket:\$\{?apiKey\}?"/]},
         cpp: {all: [/"bucket:"\s*\+\s*api_key/]},
@@ -64,6 +65,13 @@ and the middleware that uses it, as a **token bucket** per key stored in Redis:
             /redis\.call\(\s*['"]HM?GET['"]/,
             /redis\.call\(\s*['"]HSET['"]/,
             /register_script\(|\.eval\(|\.evalsha\(/,
+          ],
+        },
+        typescript: {
+          all: [
+            /redis\.call\(\s*['"]HM?GET['"]/,
+            /redis\.call\(\s*['"]HSET['"]/,
+            /defineCommand\(|\.eval\(|\.evalsha\(/,
           ],
         },
         go: {
@@ -84,6 +92,7 @@ and the middleware that uses it, as a **token bucket** per key stored in Redis:
         'Tokens grow by `(now - ts) * rate` and never exceed `burst`; without the cap an idle key could bank an unbounded burst.',
       match: {
         python: {all: [/math\.min\(\s*burst\s*,/, /\(\s*now\s*-\s*ts\s*\)\s*\*\s*rate/]},
+        typescript: {all: [/math\.min\(\s*burst\s*,/, /\(\s*now\s*-\s*ts\s*\)\s*\*\s*rate/]},
         go: {all: [/math\.min\(\s*burst\s*,/, /\(\s*now\s*-\s*ts\s*\)\s*\*\s*rate/]},
         scala: {all: [/math\.min\(\s*burst\s*,/, /\(\s*now\s*-\s*ts\s*\)\s*\*\s*rate/]},
         cpp: {all: [/math\.min\(\s*burst\s*,/, /\(\s*now\s*-\s*ts\s*\)\s*\*\s*rate/]},
@@ -95,6 +104,7 @@ and the middleware that uses it, as a **token bucket** per key stored in Redis:
       detail: 'A request consumes one token only if `tokens >= 1`; a denied request must not push the bucket negative.',
       match: {
         python: {all: [/tokens\s*>=\s*1/, /tokens\s*-\s*1/]},
+        typescript: {all: [/tokens\s*>=\s*1/, /tokens\s*-\s*1/]},
         go: {all: [/tokens\s*>=\s*1/, /tokens\s*-\s*1/]},
         scala: {all: [/tokens\s*>=\s*1/, /tokens\s*-\s*1/]},
         cpp: {all: [/tokens\s*>=\s*1/, /tokens\s*-\s*1/]},
@@ -107,6 +117,9 @@ and the middleware that uses it, as a **token bucket** per key stored in Redis:
         'A denied request answers `429 Too Many Requests` with `Retry-After` and `X-RateLimit-Remaining` so well-behaved clients back off instead of hammering.',
       match: {
         python: {all: [/status_code\s*=\s*429|HTTP_429/, /Retry-After/i, /X-RateLimit-Remaining/i]},
+        typescript: {
+          all: [/code\(\s*429\s*\)|status\(\s*429\s*\)|statusCode:\s*429/, /Retry-After/i, /X-RateLimit-Remaining/i],
+        },
         go: {all: [/http\.StatusTooManyRequests|\b429\b/, /Retry-After/i, /X-RateLimit-Remaining/i]},
         scala: {all: [/StatusCodes\.TooManyRequests|\b429\b/, /Retry-After/i, /X-RateLimit-Remaining/i]},
         cpp: {all: [/status\s*=\s*429/, /Retry-After/i, /X-RateLimit-Remaining/i]},
@@ -194,6 +207,91 @@ async def rate_limit(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-RateLimit-Remaining"] = str(remaining)
     return response
+`,
+    },
+    typescript: {
+      starter: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+export const app = Fastify();
+
+export const RATE = 5; // tokens per second
+export const BURST = 10; // bucket capacity
+
+// TODO: Lua — HMGET tokens/ts, refill min(burst, tokens + (now - ts) * rate), take one, HSET, return {allowed, remaining}
+const SCRIPT = \`\`;
+
+interface BucketRedis extends Redis {
+  takeToken(key: string, rate: number, burst: number, now: number): Promise<[number, number]>;
+}
+
+const redis = new Redis({host: 'redis', port: 6379}) as BucketRedis;
+redis.defineCommand('takeToken', {numberOfKeys: 1, lua: SCRIPT});
+
+/** One atomic round trip: refill, take one token, report what is left. */
+export async function allow(apiKey: string): Promise<[boolean, number]> {
+  const key = ''; // TODO: bucket:{apiKey}
+  // TODO: redis.takeToken(key, RATE, BURST, now in seconds)
+  throw new Error('not implemented');
+}
+
+app.addHook('onRequest', async (request, reply) => {
+  const apiKey = (request.headers['x-api-key'] as string | undefined) ?? 'anonymous';
+  const [allowed, remaining] = await allow(apiKey);
+  // TODO: denied → 429 with Retry-After (ceil(1 / RATE)) and X-RateLimit-Remaining: 0
+  // TODO: allowed → let the request through with X-RateLimit-Remaining on the response
+});
+`,
+      solution: `import Fastify from 'fastify';
+import Redis from 'ioredis';
+
+export const app = Fastify();
+
+export const RATE = 5; // tokens per second
+export const BURST = 10; // bucket capacity
+
+const SCRIPT = \`
+local bucket = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local rate, burst, now = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local tokens = tonumber(bucket[1]) or burst
+local ts = tonumber(bucket[2]) or now
+tokens = math.min(burst, tokens + (now - ts) * rate)
+local allowed = 0
+if tokens >= 1 then
+  tokens = tokens - 1
+  allowed = 1
+end
+redis.call('HSET', KEYS[1], 'tokens', tokens, 'ts', now)
+redis.call('EXPIRE', KEYS[1], math.ceil(burst / rate) * 2)
+return {allowed, math.floor(tokens)}
+\`;
+
+interface BucketRedis extends Redis {
+  takeToken(key: string, rate: number, burst: number, now: number): Promise<[number, number]>;
+}
+
+const redis = new Redis({host: 'redis', port: 6379}) as BucketRedis;
+// Loaded once: every call is an EVALSHA, with EVAL as the fallback on NOSCRIPT.
+redis.defineCommand('takeToken', {numberOfKeys: 1, lua: SCRIPT});
+
+/** One atomic round trip: refill, take one token, report what is left. */
+export async function allow(apiKey: string): Promise<[boolean, number]> {
+  const key = \`bucket:\${apiKey}\`;
+  const [allowed, remaining] = await redis.takeToken(key, RATE, BURST, Date.now() / 1000);
+  return [allowed === 1, remaining];
+}
+
+app.addHook('onRequest', async (request, reply) => {
+  const apiKey = (request.headers['x-api-key'] as string | undefined) ?? 'anonymous';
+  const [allowed, remaining] = await allow(apiKey);
+  if (!allowed) {
+    return reply
+      .code(429)
+      .headers({'Retry-After': String(Math.ceil(1 / RATE)), 'X-RateLimit-Remaining': '0'})
+      .send({error: 'rate limit exceeded'});
+  }
+  reply.header('X-RateLimit-Remaining', String(remaining));
+});
 `,
     },
     go: {
@@ -600,6 +698,100 @@ async def check_deny_429(ctx):
     assert len(m.served) == served + 1 and other.status_code == 200, "a denied request must not reach the route, and other keys must be unaffected"
     assert r.headers.get("retry-after") == "1", f"Retry-After is {r.headers.get('retry-after')!r}, expected 1 (ceil(1 / rate) seconds until one token refills)"
     assert r.headers.get("x-ratelimit-remaining") == "0", f"X-RateLimit-Remaining on a 429 is {r.headers.get('x-ratelimit-remaining')!r}, expected 0"
+`,
+    typescript: `const K1 = {'X-API-Key': 'k1'};
+
+/** The hook needs something to wrap: a route the harness registers, counting what got through. */
+function gateway(ctx) {
+  const m = ctx.load('rate_limit');
+  const served: string[] = [];
+  m.app.get('/items/:id', async request => {
+    const {id} = request.params as {id: string};
+    served.push(id);
+    return {id};
+  });
+  return {m, served, c: ctx.client(m.app)};
+}
+
+async function burst(c, n: number, headers: Record<string, string> = K1): Promise<number[]> {
+  const statuses: number[] = [];
+  for (let i = 0; i < n; i += 1) statuses.push((await c.get('/items/42', {headers})).status);
+  return statuses;
+}
+
+export async function check_key(ctx) {
+  const {c} = gateway(ctx);
+  await c.get('/items/42', {headers: K1});
+  await c.get('/items/42', {headers: {'X-API-Key': 'k2'}});
+  await c.get('/items/42');
+  for (const key of ['bucket:k1', 'bucket:k2', 'bucket:anonymous']) {
+    const kind = ctx.redis.type(key);
+    assert.equal(kind, 'hash', \`\${key} is \${JSON.stringify(kind)} after a request (keys: \${JSON.stringify(ctx.redis.keys('*').sort())}), expected a hash with tokens and ts\`);
+    const fields = Object.keys(ctx.redis.hgetall(key)).sort();
+    assert(fields.includes('tokens') && fields.includes('ts'), \`\${key} has fields \${JSON.stringify(fields)}, expected tokens and ts\`);
+  }
+  const tokens = ctx.redis.hget('bucket:k1', 'tokens');
+  assert.equal(Number(tokens), 9, \`bucket:k1 holds \${tokens} tokens after one request, expected burst - 1 = 9\`);
+}
+
+export async function check_atomic_lua(ctx) {
+  const {c} = gateway(ctx);
+  // Another gateway replica lands right after the first command that touches the bucket — between a
+  // client-side read and its write-back — and spends the whole bucket.
+  ctx.redisAfter('bucket:k1', () => {
+    const ts = ctx.redis.hget('bucket:k1', 'ts');
+    ctx.redis.hset('bucket:k1', 'tokens', 0, 'ts', ts ?? String(Date.now() / 1000));
+  });
+  const first = await c.get('/items/42', {headers: K1});
+  assert.equal(first.status, 200, \`the first request on a fresh key answered \${first.status}: \${first.text}\`);
+  assert.equal(ctx.redis.type('bucket:k1'), 'hash', 'the request wrote no bucket:k1 hash');
+  const tokens = Number(ctx.redis.hget('bucket:k1', 'tokens'));
+  assert.equal(tokens, 0, \`bucket:k1 holds \${tokens} tokens after another replica emptied it between your read and your write: the replica's update was lost. Refill and take must run inside one EVAL/EVALSHA script, not as HMGET … HSET from the client\`);
+  const second = await c.get('/items/42', {headers: K1});
+  assert.equal(second.status, 429, \`with the bucket emptied by another replica the next request answered \${second.status}, expected 429: two gateways saw the same last token\`);
+}
+
+export async function check_refill_capped(ctx) {
+  const {c} = gateway(ctx);
+  let statuses = await burst(c, 11);
+  assert.deepEqual(statuses, [...Array(10).fill(200), 429], \`a fresh key gets a full burst of 10, then 429: got \${JSON.stringify(statuses)}\`);
+  ctx.clock.advance(1.0);
+  statuses = await burst(c, 6);
+  assert.deepEqual(statuses, [...Array(5).fill(200), 429], \`one second at rate 5 refills 5 tokens, so 5 allowed then 429: got \${JSON.stringify(statuses)}\`);
+  ctx.clock.advance(100.0);
+  statuses = await burst(c, 11);
+  assert.deepEqual(statuses, [...Array(10).fill(200), 429], \`after 100 idle seconds the bucket is capped at burst (10), not 500: got \${JSON.stringify(statuses)}\`);
+}
+
+export async function check_take_one(ctx) {
+  const {c} = gateway(ctx);
+  const remaining: (string | undefined)[] = [];
+  for (let i = 0; i < 3; i += 1) remaining.push((await c.get('/items/42', {headers: K1})).headers['x-ratelimit-remaining']);
+  assert.deepEqual(remaining, ['9', '8', '7'], \`X-RateLimit-Remaining over three requests was \${JSON.stringify(remaining)}, expected 9, 8, 7 (one token each)\`);
+  await burst(c, 7);
+  const denied = await burst(c, 5);
+  assert.deepEqual(denied, Array(5).fill(429), \`with the bucket empty every request is denied: got \${JSON.stringify(denied)}\`);
+  const tokens = Number(ctx.redis.hget('bucket:k1', 'tokens'));
+  assert(tokens >= 0, \`bucket:k1 holds \${tokens} tokens after denied requests: a denial must not take a token\`);
+  ctx.clock.advance(0.4);
+  const statuses = await burst(c, 3);
+  assert.deepEqual(statuses, [200, 200, 429], \`0.4 s at rate 5 is exactly 2 tokens: got \${JSON.stringify(statuses)} (a bucket pushed negative by denials would refill less)\`);
+}
+
+export async function check_deny_429(ctx) {
+  const {c, served} = gateway(ctx);
+  for (let i = 0; i < 10; i += 1) {
+    const r = await c.get('/items/42', {headers: K1});
+    assert.equal(r.status, 200, \`request within the burst answered \${r.status}\`);
+  }
+  const before = served.length;
+  const r = await c.get('/items/42', {headers: K1});
+  const other = await c.get('/items/42', {headers: {'X-API-Key': 'k2'}});
+  assert.equal(r.status, 429, \`the 11th request on an empty bucket answered \${r.status}, expected 429\`);
+  assert(served.length === before + 1 && other.status === 200, 'a denied request must not reach the route, and other keys must be unaffected');
+  assert.equal(r.headers['retry-after'], '1', \`Retry-After is \${JSON.stringify(r.headers['retry-after'])}, expected 1 (ceil(1 / rate) seconds until one token refills)\`);
+  assert.equal(r.headers['x-ratelimit-remaining'], '0', \`X-RateLimit-Remaining on a 429 is \${JSON.stringify(r.headers['x-ratelimit-remaining'])}, expected 0\`);
+}
 `,
   },
   debrief: `A token bucket is two numbers and a clock, which is why it fits in a Redis hash and a dozen lines of Lua. Putting the refill and the take in the script is the whole point: Redis runs scripts one at a time, so every replica of the gateway shares one correct counter without a lock. The \`EXPIRE\` keeps idle keys from living forever, and \`Retry-After\` turns a rejection into advice. Real gateways add a per-route and a global bucket, fail open when Redis is unreachable, and pass \`now\` from the client (as here) rather than calling \`TIME\` inside the script so it stays deterministic under replication.`,

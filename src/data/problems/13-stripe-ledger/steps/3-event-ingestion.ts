@@ -79,6 +79,7 @@ Implement \`to_entries(event)\` and the consumer loop \`run()\` in group **\`led
         'The consumer uses `group.id` `ledger`, subscribes to `money-events` and commits offsets itself; auto-commit acknowledges on a timer, before the write.',
       match: {
         python: {all: [/"group\.id"\s*:\s*"ledger"/, /"enable\.auto\.commit"\s*:\s*False/, /consumer\.commit\(/]},
+        typescript: {all: [/groupId:\s*['"]ledger['"]/, /autoCommit:\s*false/, /\.commitOffsets\(/]},
         go: {
           all: [/GroupID:\s*"ledger"/, /reader\.FetchMessage\(/, /reader\.CommitMessages\(/],
           none: [/ReadMessage\(/],
@@ -99,6 +100,14 @@ Implement \`to_entries(event)\` and the consumer loop \`run()\` in group **\`led
             /-\s*amount\b/,
             /(?<!def )write_transaction\([^\n]*event_id\s*=/,
             /posted_at\s*=\s*event\[["']occurred_at["']\]/,
+          ],
+        },
+        typescript: {
+          all: [
+            /MAPPING\[/,
+            /-\s*amount\b/,
+            /(?<!\{)\bwriteTransaction\([^\n]*eventId/,
+            /postedAt:\s*event\.occurred_at/,
           ],
         },
         go: {all: [/mapping\[/, /-amount\b|-\s*event\.Amount\b/, /(?<!func )writeTransaction\(/, /event\.OccurredAt/]},
@@ -122,6 +131,7 @@ Implement \`to_entries(event)\` and the consumer loop \`run()\` in group **\`led
         'Produce the original key and value to `money-events.dead` with a `reason` header and flush; nothing is written to the journal for such an event.',
       match: {
         python: {all: [/producer\.produce\(\s*DEAD_TOPIC/, /producer\.flush\(/, /reason/]},
+        typescript: {all: [/\.send\(\s*\{\s*topic:\s*DEAD_TOPIC/, /reason/]},
         go: {all: [/deadWriter\.WriteMessages\(/, /reason/]},
         scala: {all: [/new ProducerRecord\[[^\]]*\]\(\s*DeadTopic/, /\.get\(\)/, /reason/]},
         cpp: {all: [/producer->produce\(\s*kDeadTopic/, /producer->flush\(/, /reason/]},
@@ -135,6 +145,14 @@ Implement \`to_entries(event)\` and the consumer loop \`run()\` in group **\`led
       match: {
         python: {
           order: [/producer\.produce\(\s*DEAD_TOPIC/, /consumer\.commit\(/, /continue/, /await write_transaction\(/],
+        },
+        typescript: {
+          order: [
+            /\.send\(\s*\{\s*topic:\s*DEAD_TOPIC/,
+            /await commit\(\)|\.commitOffsets\(/,
+            /return/,
+            /await writeTransaction\(/,
+          ],
         },
         go: {
           order: [
@@ -159,6 +177,7 @@ Implement \`to_entries(event)\` and the consumer loop \`run()\` in group **\`led
         'The commit follows `write_transaction`; a crash between the two replays the record, and step 4 makes the replay harmless.',
       match: {
         python: {order: [/await write_transaction\(/, /consumer\.commit\(/]},
+        typescript: {order: [/await writeTransaction\(/, /await commit\(\)|\.commitOffsets\(/]},
         go: {order: [/(?<!func )writeTransaction\(/, /reader\.CommitMessages\(/]},
         scala: {order: [/(?<!def )writeTransaction\(/, /commit\(\s*record\s*\)/]},
         cpp: {order: [/(?<!string )write_transaction\(/, /consumer->commitSync\(/]},
@@ -306,6 +325,156 @@ async def run() -> None:
             continue
         await write_transaction(entries, event["type"], event_id=event["event_id"], posted_at=event["occurred_at"])
         consumer.commit(message=msg, asynchronous=False)
+`,
+    },
+    typescript: {
+      starter: `import {type EachMessagePayload, Kafka, type KafkaMessage} from 'kafkajs';
+
+import {type Entry, writeTransaction} from './ledger_writer'; // built in step 4: insert-or-skip on event_id, returns the id or null
+
+export const TOPIC = 'money-events';
+export const DEAD_TOPIC = 'money-events.dead';
+const REQUIRED = ['event_id', 'type', 'amount', 'currency', 'occurred_at'];
+
+export interface MoneyEvent {
+  event_id: string;
+  type: string;
+  amount: number;
+  currency: string;
+  occurred_at: number;
+  [extra: string]: unknown;
+}
+
+// Event type → [debit account, credit account]: the amount is debited from the first, credited to the second.
+export const MAPPING: Record<string, [string, string]> = {
+  'payment.captured': ['cash:acquirer', 'clearing:payments'],
+  'payout.sent': ['clearing:payouts', 'cash:bank'],
+  'refund.issued': ['clearing:payments', 'cash:acquirer'],
+};
+
+const kafka = new Kafka({clientId: 'ledger-ingest', brokers: ['kafka:9092']});
+const consumer = kafka.consumer({groupId: 'ledger'});
+const producer = kafka.producer({idempotent: true});
+
+/** The event as an object, or null when the record is not JSON or lacks a required field. */
+export function parse(raw: Buffer | null): MoneyEvent | null {
+  if (raw === null) return null;
+  let event: unknown;
+  try {
+    event = JSON.parse(raw.toString());
+  } catch {
+    return null;
+  }
+  if (typeof event !== 'object' || event === null || Array.isArray(event)) return null;
+  if (REQUIRED.some(field => !(field in event))) return null;
+  return event as MoneyEvent;
+}
+
+/** The two balanced entries for an event, or null when its type has no mapping. */
+export function toEntries(event: MoneyEvent): Entry[] | null {
+  // TODO: MAPPING[type] → [{debit account, +amount}, {credit account, -amount}] in the event's currency
+  return null;
+}
+
+/** Park the original record where a human can look at it; \`send\` resolves once the broker acknowledged it. */
+async function deadLetter(message: KafkaMessage, reason: string): Promise<void> {
+  await producer.send({topic: DEAD_TOPIC, messages: [{key: message.key, value: message.value, headers: {reason}}]});
+}
+
+export async function run(): Promise<void> {
+  await producer.connect();
+  await consumer.connect();
+  await consumer.subscribe({topic: TOPIC, fromBeginning: true});
+  await consumer.run({
+    // TODO: disable auto-commit
+    eachMessage: async ({topic, partition, message}: EachMessagePayload) => {
+      // TODO: parse + toEntries; null → deadLetter(message, reason), commit this offset, return
+      // TODO: await writeTransaction(entries, event.type, {eventId: event.event_id, postedAt: event.occurred_at}), then commit
+      throw new Error('not implemented');
+    },
+  });
+}
+`,
+      solution: `import {type EachMessagePayload, Kafka, type KafkaMessage} from 'kafkajs';
+
+import {type Entry, writeTransaction} from './ledger_writer'; // built in step 4: insert-or-skip on event_id, returns the id or null
+
+export const TOPIC = 'money-events';
+export const DEAD_TOPIC = 'money-events.dead';
+const REQUIRED = ['event_id', 'type', 'amount', 'currency', 'occurred_at'];
+
+export interface MoneyEvent {
+  event_id: string;
+  type: string;
+  amount: number;
+  currency: string;
+  occurred_at: number;
+  [extra: string]: unknown;
+}
+
+// Event type → [debit account, credit account]: the amount is debited from the first, credited to the second.
+export const MAPPING: Record<string, [string, string]> = {
+  'payment.captured': ['cash:acquirer', 'clearing:payments'],
+  'payout.sent': ['clearing:payouts', 'cash:bank'],
+  'refund.issued': ['clearing:payments', 'cash:acquirer'],
+};
+
+const kafka = new Kafka({clientId: 'ledger-ingest', brokers: ['kafka:9092']});
+const consumer = kafka.consumer({groupId: 'ledger'});
+const producer = kafka.producer({idempotent: true});
+
+/** The event as an object, or null when the record is not JSON or lacks a required field. */
+export function parse(raw: Buffer | null): MoneyEvent | null {
+  if (raw === null) return null;
+  let event: unknown;
+  try {
+    event = JSON.parse(raw.toString());
+  } catch {
+    return null;
+  }
+  if (typeof event !== 'object' || event === null || Array.isArray(event)) return null;
+  if (REQUIRED.some(field => !(field in event))) return null;
+  return event as MoneyEvent;
+}
+
+/** The two balanced entries for an event, or null when its type has no mapping. */
+export function toEntries(event: MoneyEvent): Entry[] | null {
+  const accounts = MAPPING[event.type];
+  if (accounts === undefined) return null;
+  const [debit, credit] = accounts;
+  const {amount, currency} = event;
+  return [
+    {account: debit, currency, amount},
+    {account: credit, currency, amount: -amount},
+  ];
+}
+
+/** Park the original record where a human can look at it; \`send\` resolves once the broker acknowledged it. */
+async function deadLetter(message: KafkaMessage, reason: string): Promise<void> {
+  await producer.send({topic: DEAD_TOPIC, messages: [{key: message.key, value: message.value, headers: {reason}}]});
+}
+
+export async function run(): Promise<void> {
+  await producer.connect();
+  await consumer.connect();
+  await consumer.subscribe({topic: TOPIC, fromBeginning: true});
+  await consumer.run({
+    autoCommit: false,
+    eachMessage: async ({topic, partition, message}: EachMessagePayload) => {
+      const commit = (): Promise<void> =>
+        consumer.commitOffsets([{topic, partition, offset: String(Number(message.offset) + 1)}]);
+      const event = parse(message.value);
+      const entries = event === null ? null : toEntries(event);
+      if (event === null || entries === null) {
+        await deadLetter(message, event === null ? 'malformed event' : \`no mapping for event type \${event.type}\`);
+        await commit();
+        return;
+      }
+      await writeTransaction(entries, event.type, {eventId: event.event_id, postedAt: event.occurred_at});
+      await commit();
+    },
+  });
+}
 `,
     },
     go: {
@@ -1079,6 +1248,257 @@ async def check_commit_after_write(ctx):
     assert sorted(journal) == ["e1", "e2", "e3"], f"after a restart the consumer must redeliver e3 and write it, the journal holds {sorted(journal)}"
     assert len(journal["e3"][1]) == 2, f"e3 must be written exactly once, the journal holds {len(journal['e3'][1])} entries for it"
     _fully_committed(ctx)
+`,
+    typescript: `const SCHEMA = \`
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL REFERENCES transactions (id),
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL,
+    posted_at bigint NOT NULL
+);
+\`;
+
+const T0 = 1700000000000;
+const TOPIC = 'money-events';
+const DEAD = 'money-events.dead';
+
+interface EventOptions {
+  type?: string;
+  amount?: number;
+  currency?: string;
+  occurred_at?: number;
+}
+
+function event(eventId: string, {type = 'payment.captured', amount = 4999, currency = 'EUR', occurred_at = T0}: EventOptions = {}) {
+  return {event_id: eventId, type, amount, currency, occurred_at, charge: 'ch_' + eventId};
+}
+
+function seed(ctx, ...events: (Record<string, unknown> | string)[]) {
+  for (const e of events) {
+    if (typeof e === 'string') ctx.kafka.seed(TOPIC, {key: 'raw', value: e});
+    else ctx.kafka.seed(TOPIC, {key: e.event_id, value: JSON.stringify(e)});
+  }
+}
+
+/** The learner's consumer in front of the real journal writer (step 4) and an empty ledger database. */
+async function consumer(ctx) {
+  await ctx.db.reset(SCHEMA);
+  return ctx.load('event_consumer');
+}
+
+/** {event_id: {transaction, entries: [account, currency, amount, posted_at][]}} as the database holds it. */
+async function journal(ctx) {
+  const transactions = await ctx.db.execute('SELECT * FROM transactions ORDER BY event_id');
+  const entries = await ctx.db.execute('SELECT * FROM entries ORDER BY account');
+  const out: Record<string, {transaction; entries: [string, string, number, number][]}> = {};
+  for (const t of transactions) {
+    out[t.event_id] = {
+      transaction: t,
+      entries: entries.filter(e => e.transaction_id === t.id).map(e => [e.account, e.currency, Number(e.amount), Number(e.posted_at)]),
+    };
+  }
+  return out;
+}
+
+const dead = (ctx) => ctx.kafka.records(DEAD);
+
+interface CommitSeen {
+  group: string;
+  offsets: Map<string, number>;
+  queries: [string, unknown[]][];
+  dead: (Buffer | null)[];
+}
+
+/** Every commit as the broker saw it, with the database's query log and the dead-letter topic at that instant. */
+function watchCommits(ctx): CommitSeen[] {
+  const seen: CommitSeen[] = [];
+  ctx.kafka.onCommit((group, offsets) =>
+    seen.push({group, offsets: new Map(offsets), queries: [...ctx.db.queries], dead: dead(ctx).map(r => r.value)}),
+  );
+  return seen;
+}
+
+/** Whether the database had committed a write of eventId by the end of this query log. */
+function writeCommitted(queries: [string, unknown[]][], eventId: string): boolean {
+  const insert = queries.findIndex(([sql, params]) => sql.toLowerCase().includes('insert into transactions') && params.includes(eventId));
+  return insert !== -1 && queries.slice(insert + 1).some(([sql]) => sql.trim().toUpperCase() === 'COMMIT');
+}
+
+/** [record, query log, dead-letter values] for each record of money-events as its offset was first committed. */
+function newlyCommitted(ctx, commits: CommitSeen[]) {
+  const out: {record; queries: [string, unknown[]][]; dead: (Buffer | null)[]}[] = [];
+  const done: Record<number, number> = {};
+  for (const {group, offsets, queries, dead: parked} of commits) {
+    if (group !== 'ledger') continue;
+    for (const [tp, offset] of offsets) {
+      const [topic, partition] = tp.split('|');
+      if (topic !== TOPIC) continue;
+      const p = Number(partition);
+      for (const record of ctx.kafka.records(TOPIC)) {
+        if (record.partition === p && (done[p] ?? 0) <= record.offset && record.offset < offset) out.push({record, queries, dead: parked});
+      }
+      done[p] = Math.max(done[p] ?? 0, offset);
+    }
+  }
+  return out;
+}
+
+function fullyCommitted(ctx) {
+  const lag = ctx.kafka.lag('ledger', TOPIC);
+  assert.equal(lag, 0, \`\${lag} record(s) of money-events are not committed for group ledger after the consumer handled them\`);
+}
+
+const text = (b: Buffer | null): string => (b === null ? '' : b.toString());
+
+export async function check_group_manual_commit(ctx) {
+  seed(ctx, event('e1'), event('e2', {amount: 120}), event('e3', {amount: 7}));
+  const m = await consumer(ctx);
+  const commits = watchCommits(ctx);
+  await m.run();
+  let j = await journal(ctx);
+  assert.deepEqual(Object.keys(j).sort(), ['e1', 'e2', 'e3'], \`the consumer must read money-events and write every event: the journal holds \${JSON.stringify(Object.keys(j).sort())}\`);
+  assert(ctx.kafka.commits('ledger').length > 0, \`no offsets were committed for group ledger (groups that committed: \${JSON.stringify([...new Set(commits.map(c => c.group))].sort())})\`);
+  fullyCommitted(ctx);
+  const members = ctx.kafka.consumers.filter(c => c.groupId === 'ledger');
+  assert(members.length > 0, \`no consumer joined group ledger (groups seen: \${JSON.stringify(ctx.kafka.consumers.map(c => c.groupId))})\`);
+  assert(members.every(c => !c.autoCommit), 'the consumer runs with auto-commit on: the broker acknowledges on a timer, before the write — set autoCommit: false and commit after writeTransaction returned');
+  for (const {record, queries} of newlyCommitted(ctx, commits)) {
+    const eventId = text(record.key);
+    assert(writeCommitted(queries, eventId), \`the offset of \${eventId} was committed before its transaction was in the journal: offsets are committed by the consumer, after the write\`);
+  }
+  // e4's write is slow (the transactions insert takes 6 s) and then fails on a constraint: a consumer
+  // that acknowledges before the write has returned loses e4.
+  await ctx.db.execute('ALTER TABLE entries ADD CONSTRAINT journal_down CHECK (amount <> 7777) NOT VALID');
+  let slow = false;
+  ctx.dbAfter('INSERT INTO transactions', () => {
+    slow = true;
+    ctx.clock.advance(6);
+  });
+  seed(ctx, event('e4', {amount: 7777}));
+  try {
+    await m.run();
+  } catch {
+    // the failed write surfaces here; what matters is what was committed
+  }
+  assert(slow, 'e4 was never written: the consumer must keep reading money-events');
+  const lag = ctx.kafka.lag('ledger', TOPIC);
+  assert.equal(lag, 1, \`e4's write took 6 s and then failed, yet group ledger's lag is \${lag} instead of 1: e4 was acknowledged although its write never landed — disable autoCommit and commit the offset yourself, after the write\`);
+  await ctx.db.execute('ALTER TABLE entries DROP CONSTRAINT journal_down');
+  const restarted = ctx.load('event_consumer');
+  await restarted.run();
+  j = await journal(ctx);
+  assert('e4' in j && j.e4.entries.length === 2, \`after a restart e4 must be redelivered and written once, the journal holds \${JSON.stringify(Object.keys(j).sort())}\`);
+  fullyCommitted(ctx);
+}
+
+export async function check_mapping(ctx) {
+  seed(
+    ctx,
+    event('e1'),
+    event('e2', {type: 'payout.sent', amount: 120000, currency: 'USD', occurred_at: T0 + 5}),
+    event('e3', {type: 'refund.issued', amount: 999, occurred_at: T0 + 9}),
+  );
+  const m = await consumer(ctx);
+  await m.run();
+  const j = await journal(ctx);
+  assert.deepEqual(Object.keys(j).sort(), ['e1', 'e2', 'e3'], \`three mapped events must become three transactions keyed by their event id, the journal holds \${JSON.stringify(Object.keys(j).sort())}\`);
+  const expected: Record<string, [[string, string, number][], string, number]> = {
+    e1: [[['cash:acquirer', 'EUR', 4999], ['clearing:payments', 'EUR', -4999]], 'payment.captured', T0],
+    e2: [[['clearing:payouts', 'USD', 120000], ['cash:bank', 'USD', -120000]], 'payout.sent', T0 + 5],
+    e3: [[['clearing:payments', 'EUR', 999], ['cash:acquirer', 'EUR', -999]], 'refund.issued', T0 + 9],
+  };
+  for (const [eventId, {transaction, entries}] of Object.entries(j)) {
+    const [accounts, description, occurredAt] = expected[eventId];
+    const got = entries.map(([a, c, amount]) => [a, c, amount]).sort();
+    assert(entries.length === 2 && JSON.stringify(got) === JSON.stringify([...accounts].sort()), \`\${eventId}: the journal holds the entries \${JSON.stringify(got)} — expected \${JSON.stringify([...accounts].sort())} (the first account debited, the second credited the negated amount, in the event's currency)\`);
+    assert.equal(transaction.description, description, \`\${eventId}: the transaction's description is \${JSON.stringify(transaction.description)}, expected the event type\`);
+    assert(Number(transaction.posted_at) === occurredAt && entries.every(([, , , at]) => at === occurredAt), \`\${eventId}: posted at \${transaction.posted_at} / \${JSON.stringify(entries.map(([, , , at]) => at))}, expected the event's occurred_at \${occurredAt}\`);
+  }
+  const got = m.toEntries(event('x', {amount: 250}));
+  assert.deepEqual(got, [{account: 'cash:acquirer', currency: 'EUR', amount: 250}, {account: 'clearing:payments', currency: 'EUR', amount: -250}], \`toEntries of a 250 EUR payment.captured returned \${JSON.stringify(got)}\`);
+  assert.equal(m.toEntries(event('x', {type: 'dispute.opened'})), null, 'toEntries must return null for a type without a mapping');
+}
+
+export async function check_dead_letter(ctx) {
+  const unknown = event('e2', {type: 'dispute.opened'});
+  seed(ctx, event('e1'), unknown, '{not json', event('e4'));
+  const m = await consumer(ctx);
+  // The dead-letter topic's leader is slow to acknowledge for the first 30 s of the run.
+  ctx.kafka.stall(DEAD, 30);
+  const commits = watchCommits(ctx);
+  await m.run();
+  const j = await journal(ctx);
+  assert.deepEqual(Object.keys(j).sort(), ['e1', 'e4'], \`only the mapped events are written, the journal holds \${JSON.stringify(Object.keys(j).sort())}\`);
+  for (const {record, dead: parked} of newlyCommitted(ctx, commits)) {
+    if (['e2', 'raw'].includes(text(record.key))) {
+      assert(parked.some(v => text(v) === text(record.value)), \`the offset of \${JSON.stringify(text(record.value))} was committed while its dead-letter copy was not on money-events.dead yet: wait for the broker's acknowledgement before committing, or a crash in between loses the only copy\`);
+    }
+  }
+  const parked = dead(ctx);
+  assert.equal(parked.length, 2, \`the unmapped event and the malformed record must both be parked on money-events.dead, found \${parked.length} record(s) there\`);
+  const values = parked.map(r => text(r.value));
+  assert(values.includes(JSON.stringify(unknown)), 'the unmapped event must be parked with its original value, unchanged');
+  assert(values.includes('{not json'), 'the malformed record must be parked with its original value, unchanged');
+  const unmapped = parked.find(r => text(r.value) === JSON.stringify(unknown));
+  assert.equal(text(unmapped.key), 'e2', \`the parked record must keep the original key, got \${JSON.stringify(text(unmapped.key))}\`);
+  for (const r of parked) {
+    assert(text(r.headers['reason'] ?? null) !== '', \`every parked record must carry a 'reason' header, got headers \${JSON.stringify(Object.fromEntries(Object.entries(r.headers).map(([k, v]) => [k, text(v)])))}\`);
+  }
+}
+
+export async function check_continues_after_dead(ctx) {
+  seed(ctx, event('e1', {type: 'dispute.opened'}), event('e2'), '{not json', event('e4'), event('e5', {type: 'chargeback.won'}));
+  const m = await consumer(ctx);
+  try {
+    await m.run();
+  } catch (e) {
+    assert.fail(\`an event that cannot be mapped must not stop the consumer, but run() rejected with \${e instanceof Error ? e.name : typeof e}: \${e instanceof Error ? e.message : String(e)}\`);
+  }
+  const j = await journal(ctx);
+  assert.deepEqual(Object.keys(j).sort(), ['e2', 'e4'], \`the events after a parked one must still be written, the journal holds \${JSON.stringify(Object.keys(j).sort())}\`);
+  assert.equal(dead(ctx).length, 3, \`three records must be parked, money-events.dead holds \${dead(ctx).length}\`);
+  const lag = ctx.kafka.lag('ledger', TOPIC);
+  assert.equal(lag, 0, \`\${lag} record(s) not committed: a parked record's offset must be committed too, or it is redelivered forever\`);
+}
+
+export async function check_commit_after_write(ctx) {
+  seed(ctx, event('e1'), event('e2', {amount: 120}));
+  const m = await consumer(ctx);
+  const commits = watchCommits(ctx);
+  await m.run();
+  const committed = newlyCommitted(ctx, commits);
+  assert(committed.length > 0, 'the offsets of e1 and e2 were never committed');
+  for (const {record, queries} of committed) {
+    const eventId = text(record.key);
+    assert(writeCommitted(queries, eventId), \`the offset of \${eventId} was committed before its transaction was committed in the journal: commit the offset only after writeTransaction returned\`);
+  }
+  // The journal starts refusing: an entry of 7777 now violates a constraint, so e3's write rolls back.
+  await ctx.db.execute('ALTER TABLE entries ADD CONSTRAINT journal_down CHECK (amount <> 7777) NOT VALID');
+  seed(ctx, event('e3', {amount: 7777}));
+  try {
+    await m.run();
+  } catch {
+    // the failed write surfaces here; what matters is what was committed
+  }
+  assert(!('e3' in (await journal(ctx))), "e3's write failed in the database and must have left nothing in the journal");
+  assert.equal(ctx.kafka.lag('ledger', TOPIC), 1, 'a record whose write failed must not be committed: it has to come back');
+  assert.deepEqual(dead(ctx), [], 'a failed write is not a dead letter: the record is retried, not parked');
+  await ctx.db.execute('ALTER TABLE entries DROP CONSTRAINT journal_down');
+  const restarted = ctx.load('event_consumer');
+  await restarted.run();
+  const j = await journal(ctx);
+  assert.deepEqual(Object.keys(j).sort(), ['e1', 'e2', 'e3'], \`after a restart the consumer must redeliver e3 and write it, the journal holds \${JSON.stringify(Object.keys(j).sort())}\`);
+  assert.equal(j.e3.entries.length, 2, \`e3 must be written exactly once, the journal holds \${j.e3.entries.length} entries for it\`);
+  fullyCommitted(ctx);
+}
 `,
   },
   debrief: `The mapping table is the course's stand-in for Stripe's fund flows: a declaration of which accounts an event moves money between, kept out of the consumer's code so adding a producer is a data change. The consumer's job is then only ordering and failure handling — write, then commit, so a crash replays rather than loses — and the dead-letter topic separates "I do not understand this" from "this failed": the first is parked and committed so the partition keeps flowing, the second is retried. Real ingestion pipelines version the mappings, carry the mapping version on each transaction so a bad mapping can be found and reversed, and alert on the dead-letter topic's growth rate rather than on every record.`,
