@@ -1,13 +1,14 @@
 import Link from 'next/link';
 import {type FC, memo, useCallback, useMemo, useState} from 'react';
 
-import {type Streak, badgeProgress, BADGES} from '@/lib/gamify';
+import {type Streak, activityByDay, badgeProgress, BADGES, stepOfTheDay} from '@/lib/gamify';
 import {type Profile, type StepAttempt, OPEN_ATTEMPT, problemScore, rankProgress} from '@/lib/scoring';
 import {type TimedSession, bestSession, formatClock} from '@/lib/timer';
-import {type Difficulty, type Problem, CONCEPT_LABEL, stepKey} from '@/lib/types';
+import {type Difficulty, type Problem, CONCEPT_LABEL, stepKey, stepPath} from '@/lib/types';
 
 import {BadgeCatalog, BadgeGlyph} from './Badges';
 import {useDialog} from './Dialog';
+import {ActivityHeatmap} from './Heatmap';
 import {LandingIntro} from './LoadingScreen';
 import {CompanyChip, CONCEPT_COLOR, ConceptChip, DifficultyChip} from './paneShared';
 import {Clock, SessionList} from './Timer';
@@ -148,6 +149,8 @@ const ProfileStrip: FC<{
     });
   }, [openDialog, earned.length, badges, progress]);
   const counted = useMemo(() => sessions.filter(s => s.counted).length, [sessions]);
+  const pick = useMemo(() => stepOfTheDay(problems, attempts, today), [problems, attempts, today]);
+  const activity = useMemo(() => activityByDay(attempts, activeDays), [attempts, activeDays]);
   const onRuns = useCallback(() => {
     void openDialog({
       title: `Timed runs · ${sessions.length}`,
@@ -188,20 +191,29 @@ const ProfileStrip: FC<{
 
         <SolvedByDifficulty profile={profile} />
 
-        {/* Streak */}
-        <div className="flex items-center gap-2" title="accept a step on consecutive days">
+        {/* Streak, with what to do about it: the step whose turn it is today */}
+        <div
+          className="flex min-w-0 items-center gap-2"
+          title="accept a step on consecutive days; the step of the day is one you can open right now">
           <Flame lit={streak.current > 0} />
-          <div>
+          <div className="min-w-0">
             <p className={`text-[13px] font-bold leading-tight ${streak.current > 0 ? 'text-ink-50' : 'text-ink-200'}`}>
               {streak.current > 0 ? `${streak.current}-day streak` : 'No streak yet'}
             </p>
-            <p className="text-ink-400 text-[11px]">
-              {streak.today
-                ? `safe for today${streak.best > streak.current ? ` · best ${streak.best}` : ''}`
-                : streak.current > 0
-                ? 'accept a step today to keep it'
-                : 'accept a step today to start one'}
-            </p>
+            {streak.today ? (
+              <p className="text-ink-400 text-[11px]">
+                safe for today{streak.best > streak.current ? ` · best ${streak.best}` : ''}
+              </p>
+            ) : pick !== null ? (
+              <Link
+                className="text-iris-300 hover:text-iris-200 block max-w-[20rem] text-[11px] leading-tight"
+                href={stepPath(pick.problem, pick.step)}
+                title={`today's step: ${pick.step.title} (${pick.problem.title}, step ${pick.index + 1})`}>
+                {streak.current > 0 ? 'keep it' : 'start one'} today: {pick.problem.title} · step {pick.index + 1} ›
+              </Link>
+            ) : (
+              <p className="text-ink-400 text-[11px]">every step is done — start a course over to keep it</p>
+            )}
           </div>
         </div>
 
@@ -289,7 +301,8 @@ const ProfileStrip: FC<{
       </div>
 
       {statsOpen ? (
-        <div className="border-ink-700/70 mt-2.5 border-t pt-3">
+        <div className="border-ink-700/70 mt-2.5 space-y-3 border-t pt-3">
+          <ActivityHeatmap days={activity} streak={streak} today={today} />
           <dl className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-[12px]">
             <div className="flex items-baseline justify-between gap-2">
               <dt className="text-ink-300">steps accepted</dt>

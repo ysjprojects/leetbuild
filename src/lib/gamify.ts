@@ -13,6 +13,7 @@ import {
   type Concept,
   type Language,
   type Problem,
+  type Step,
   CONCEPT_LABEL,
   CONCEPTS,
   LANGUAGE_LABEL,
@@ -121,6 +122,13 @@ export const BADGES: readonly Badge[] = [
     track: 'habit',
   },
   {id: 'streak-7', title: 'One week', blurb: 'Accept a step on seven consecutive days.', glyph: '7d', track: 'habit'},
+  {
+    id: 'streak-30',
+    title: 'One month',
+    blurb: 'Accept a step on thirty consecutive days.',
+    glyph: '30d',
+    track: 'habit',
+  },
   {
     id: 'bilingual',
     title: 'Bilingual',
@@ -236,6 +244,67 @@ export function streakOf(activeDays: readonly string[], today: string): Streak {
     cursor = previousDay(cursor);
   }
   return {current, best, today: days.has(today)};
+}
+
+/**
+ * Accepted steps per local day — what the heatmap draws and the streak counts. A day in
+ * `activeDays` whose attempts were since cleared (a course started over) still counts as one, so
+ * the calendar never loses a day the streak kept.
+ */
+export function activityByDay(
+  attempts: Record<string, StepAttempt>,
+  activeDays: readonly string[],
+): Record<string, number> {
+  const days: Record<string, number> = {};
+  for (const attempt of Object.values(attempts)) {
+    if (attempt.status !== 'accepted' || attempt.solvedAt === null) continue;
+    const key = dayKey(new Date(attempt.solvedAt));
+    days[key] = (days[key] ?? 0) + 1;
+  }
+  for (const day of activeDays) days[day] = Math.max(days[day] ?? 0, 1);
+  return days;
+}
+
+/** FNV-1a over UTF-16 code units: a stable, well-spread 32-bit hash for the day's pick. */
+const hash = (text: string): number => {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h;
+};
+
+export interface DailyPick {
+  problem: Problem;
+  step: Step;
+  /** Position of the step in its problem. */
+  index: number;
+}
+
+/**
+ * Today's step: of the steps the learner can open right now — each unfinished problem's next one —
+ * the one whose hash with the date is highest. Rendezvous hashing keeps the pick in place while
+ * other problems move on; it changes when the picked step is done, and with the date.
+ */
+export function stepOfTheDay(
+  problems: readonly Problem[],
+  attempts: Record<string, StepAttempt>,
+  today: string,
+): DailyPick | null {
+  let best: DailyPick | null = null;
+  let bestHash = -1;
+  for (const problem of problems) {
+    const index = problem.steps.findIndex(s => (attempts[stepKey(problem.id, s.id)] ?? OPEN_ATTEMPT).status === 'open');
+    if (index === -1) continue;
+    const step = problem.steps[index];
+    const h = hash(`${today}|${problem.id}/${step.id}`);
+    if (h > bestHash) {
+      bestHash = h;
+      best = {problem, step, index};
+    }
+  }
+  return best;
 }
 
 /** How far along a badge is: earned when `value >= target`. Binary badges have a target of 1. */
@@ -359,6 +428,7 @@ export function badgeProgress(
     // A past run does not count toward a streak badge; only the current one can reach it.
     'streak-3': {value: streak.best >= 3 ? 3 : Math.min(streak.current, 3), target: 3, detail: 'days'},
     'streak-7': {value: streak.best >= 7 ? 7 : Math.min(streak.current, 7), target: 7, detail: 'days'},
+    'streak-30': {value: streak.best >= 30 ? 30 : Math.min(streak.current, 30), target: 30, detail: 'days'},
     bilingual: {value: Math.min(languages.size, 2), target: 2, detail: languageList || undefined},
     polyglot: {
       value: Math.min(languages.size, LANGUAGES.length),

@@ -6,7 +6,12 @@ import type {StepAttempt, Submission} from '@/lib/scoring';
 import {type Language, type Step, type StepCheck, LANGUAGE_LABEL} from '@/lib/types';
 
 import {InlineMarkdown} from './Markdown';
+import {mod} from './Shortcuts';
 import {LinkedInButton, POST_HINT} from './Social';
+import StepEditor from './StepEditor';
+
+const SUBMIT_KEYS = mod('⏎');
+const RUN_KEYS = mod("'");
 
 /**
  * LeetCode-style result panel: before a submission it lists the checks as the step's test cases;
@@ -79,39 +84,114 @@ const formatTime = (at: number): string => {
   return sameDay ? time : `${d.toLocaleDateString(undefined, {month: 'short', day: 'numeric'})} ${time}`;
 };
 
-const Submissions: FC<{history: readonly Submission[]}> = memo(({history}) => {
-  const [open, setOpen] = useState(false);
-  const toggle = useCallback(() => setOpen(o => !o), []);
-  if (history.length === 0) return null;
-  return (
-    <div className="border-ink-700 bg-ink-850 mt-3 rounded-lg border">
-      <button
-        className="text-ink-300 hover:text-ink-50 flex w-full items-center justify-between px-3 py-1.5 text-left text-[11px] font-bold uppercase tracking-wider"
-        onClick={toggle}
-        type="button">
-        <span>Submissions ({history.length})</span>
-        <span className="text-[10px]">{open ? '▼' : '▶'}</span>
-      </button>
-      {open ? (
-        <ul className="border-ink-700 font-code border-t px-3 py-1.5 text-[11px]">
-          {[...history].reverse().map((s, i) => (
-            <li className="flex items-center gap-3 py-0.5" key={`${s.at}-${i}`}>
-              <span className={s.accepted ? 'text-success-300' : 'text-danger-300'}>
-                {s.accepted ? 'Accepted' : 'Wrong Answer'}
-              </span>
-              <span className="text-ink-300">
-                {s.passed}/{s.total}
-              </span>
-              <span className="text-ink-400">{LANGUAGE_LABEL[s.language]}</span>
-              <span className="text-ink-400 ml-auto">{formatTime(s.at)}</span>
-            </li>
-          ))}
-        </ul>
-      ) : null}
-    </div>
-  );
-});
+const Submissions: FC<{history: readonly Submission[]; onView?: (submission: Submission) => void}> = memo(
+  ({history, onView}) => {
+    const [open, setOpen] = useState(false);
+    const toggle = useCallback(() => setOpen(o => !o), []);
+    if (history.length === 0) return null;
+    return (
+      <div className="border-ink-700 bg-ink-850 mt-3 rounded-lg border">
+        <button
+          className="text-ink-300 hover:text-ink-50 flex w-full items-center justify-between px-3 py-1.5 text-left text-[11px] font-bold uppercase tracking-wider"
+          onClick={toggle}
+          type="button">
+          <span>Submissions ({history.length})</span>
+          <span className="text-[10px]">{open ? '▼' : '▶'}</span>
+        </button>
+        {open ? (
+          <ul className="border-ink-700 font-code border-t px-3 py-1.5 text-[11px]">
+            {[...history].reverse().map((s, i) => (
+              <li className="flex items-center gap-3 py-0.5" key={`${s.at}-${i}`}>
+                <span className={s.accepted ? 'text-success-300' : 'text-danger-300'}>
+                  {s.accepted ? 'Accepted' : 'Wrong Answer'}
+                </span>
+                <span className="text-ink-300">
+                  {s.passed}/{s.total}
+                </span>
+                <span className="text-ink-400">{LANGUAGE_LABEL[s.language]}</span>
+                {s.code !== undefined && onView !== undefined ? (
+                  <SubmissionLink onView={onView} submission={s} />
+                ) : null}
+                <span className="text-ink-400 ml-auto">{formatTime(s.at)}</span>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </div>
+    );
+  },
+);
 Submissions.displayName = 'Submissions';
+
+const SubmissionLink: FC<{submission: Submission; onView: (submission: Submission) => void}> = memo(
+  ({submission, onView}) => {
+    const onClick = useCallback(() => onView(submission), [onView, submission]);
+    return (
+      <button
+        className="text-iris-300 hover:text-iris-200 transition"
+        onClick={onClick}
+        title="the code this submission judged — view it, see what changed since, put it back in the editor"
+        type="button">
+        code ›
+      </button>
+    );
+  },
+);
+SubmissionLink.displayName = 'SubmissionLink';
+
+/**
+ * A past submission's code in a read-only editor; `current` (the step's file now, when it is in the
+ * same language) adds a second view: the current file with its edits since the submission marked.
+ */
+export const SubmissionCode: FC<{code: string; current: string | null; language: Language}> = memo(
+  ({code, current, language}) => {
+    const [changes, setChanges] = useState(false);
+    const showCode = useCallback(() => setChanges(false), []);
+    const showChanges = useCallback(() => setChanges(true), []);
+    const unchanged = current === code;
+    return (
+      <div>
+        {current !== null ? (
+          <div className="mb-2 flex items-center gap-1 text-[11px]">
+            <button
+              aria-pressed={!changes}
+              className={`rounded-md px-2 py-0.5 transition ${
+                changes ? 'text-ink-300 hover:text-ink-50' : 'bg-ink-700 text-ink-50'
+              }`}
+              onClick={showCode}
+              type="button">
+              as submitted
+            </button>
+            <button
+              aria-pressed={changes}
+              className={`rounded-md px-2 py-0.5 transition disabled:cursor-default disabled:opacity-50 ${
+                changes ? 'bg-ink-700 text-ink-50' : 'text-ink-300 hover:text-ink-50'
+              }`}
+              disabled={unchanged}
+              onClick={showChanges}
+              title={
+                unchanged
+                  ? 'the file has not changed since this submission'
+                  : 'your file now, with the edits since this submission marked'
+              }
+              type="button">
+              changes since
+            </button>
+            {unchanged ? <span className="text-ink-400 ml-1">identical to the editor</span> : null}
+          </div>
+        ) : null}
+        <StepEditor
+          className="border-ink-700 h-[55vh] overflow-hidden rounded-lg border"
+          language={language}
+          original={changes && current !== null ? code : null}
+          readOnly
+          value={changes && current !== null ? current : code}
+        />
+      </div>
+    );
+  },
+);
+SubmissionCode.displayName = 'SubmissionCode';
 
 const EMPTY_HISTORY: Submission[] = [];
 
@@ -151,6 +231,8 @@ const VerdictPane: FC<{
   shareUrl?: string;
   /** Every step of the course is accepted: open the certificate. */
   onCertificate?: () => void;
+  /** Open a past submission's code (only submissions that kept their code offer it). */
+  onViewSubmission?: (submission: Submission) => void;
 }> = memo(
   ({
     step,
@@ -166,12 +248,13 @@ const VerdictPane: FC<{
     onNext,
     shareUrl,
     onCertificate,
+    onViewSubmission,
   }) => {
     const showShape = attempt.wrong >= SHAPE_AFTER_WRONG;
     const runError = verdict?.run?.error;
     /** Every failing check reported the same thing (typically one unimplemented function): say it once. */
     const common = useMemo(() => {
-      if (verdict === null || verdict.accepted) return null;
+      if (verdict === null || verdict.accepted || verdict.trial === true) return null;
       const failing = verdict.results.filter(r => !r.passed);
       const first = failing[0]?.message;
       return first !== undefined && failing.every(r => r.message === first) ? first : null;
@@ -196,21 +279,47 @@ const VerdictPane: FC<{
               {runtime.state === 'booting' ? STATUS_TEXT[runtime.phase] : 'running your code…'}
             </span>
           ) : stale && verdict !== null ? (
-            <span className="text-warning-300 ml-auto">edited since the last submit</span>
+            <span className="text-warning-300 ml-auto">
+              edited since the last {verdict.trial === true ? 'run' : 'submit'}
+            </span>
           ) : null}
         </div>
         <div aria-live="polite" className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
           {verdict === null ? (
             <p className="text-ink-300 mb-2 text-[12px]">
               {executes
-                ? `Submit (⌘/Ctrl + Enter) to run your code. Each check exercises your implementation and reports what it observed; the first run downloads ${RUNTIME_DOWNLOAD[language]}.`
-                : 'Submit (⌘/Ctrl + Enter) to run the checks. Each one is a property a correct implementation has; failures show what was expected.'}
+                ? `Run (${RUN_KEYS}) tries the example check — the first one — without recording anything. Submit (${SUBMIT_KEYS}) runs all ${step.checks.length} checks and counts; each one exercises your implementation and reports what it observed. The first run downloads ${RUNTIME_DOWNLOAD[language]}.`
+                : `Submit (${SUBMIT_KEYS}) to run the checks. Each one is a property a correct implementation has; failures show what was expected.`}
             </p>
           ) : runError !== undefined ? (
             <div className="border-warning-400/60 bg-warning-400/10 mb-3 rounded-xl border p-3">
               <p className="text-warning-300 text-[11px] font-bold uppercase tracking-wider">Runtime</p>
               <p className="text-ink-50 mt-0.5 text-lg font-extrabold">Could not run</p>
               <p className="text-warning-200 mt-0.5 text-[12px]">{runError}. This did not count as a submission.</p>
+            </div>
+          ) : verdict.trial === true ? (
+            <div
+              className={`mb-3 rounded-xl border p-3 ${
+                verdict.accepted ? 'border-iris-400/60 bg-iris-400/10' : 'border-warning-400/60 bg-warning-400/10'
+              }`}>
+              <p
+                className={`text-[11px] font-bold uppercase tracking-wider ${
+                  verdict.accepted ? 'text-iris-300' : 'text-warning-300'
+                }`}>
+                Run · example only
+              </p>
+              <p className="text-ink-50 mt-0.5 text-lg font-extrabold">
+                {verdict.accepted ? 'Example passed' : 'Example failed'}
+              </p>
+              <p className={`mt-0.5 text-[12px] ${verdict.accepted ? 'text-iris-200' : 'text-warning-200'}`}>
+                {verdict.accepted
+                  ? `Check 1 passed${
+                      verdict.run !== undefined ? ` in ${verdict.run.ms} ms` : ''
+                    }; nothing was recorded. Submit (${SUBMIT_KEYS}) runs all ${
+                      step.checks.length
+                    } checks and scores the step.`
+                  : `Check 1 failed; nothing was recorded. The message under it says what the harness observed.`}
+              </p>
             </div>
           ) : verdict.accepted ? (
             <div className="border-success-400/60 bg-success-400/10 mb-3 flex flex-wrap items-center gap-3 rounded-xl border p-3">
@@ -278,7 +387,7 @@ const VerdictPane: FC<{
           )}
           <ul className="space-y-1.5">
             {step.checks.map((check, i) => {
-              const result = verdict?.results[i] ?? null;
+              const result = verdict?.results.find(r => r.id === check.id) ?? null;
               const tone =
                 result === null
                   ? 'border-ink-700 bg-ink-850'
@@ -300,6 +409,13 @@ const VerdictPane: FC<{
                     </span>
                     <span className="font-code text-ink-400 text-[10px]">{i + 1}</span>
                     <span className="font-semibold">{check.title}</span>
+                    {executes && i === 0 ? (
+                      <span
+                        className="border-ink-600 text-ink-400 shrink-0 rounded-full border px-1.5 text-[10px]"
+                        title={`the check Run (${RUN_KEYS}) exercises without recording anything`}>
+                        example
+                      </span>
+                    ) : null}
                     {result !== null && result.shape !== undefined && result.shape !== result.passed ? (
                       <span
                         className={`ml-auto shrink-0 rounded-full border px-1.5 text-[10px] ${
@@ -332,7 +448,7 @@ const VerdictPane: FC<{
             })}
           </ul>
           {verdict?.run !== undefined ? <Output stderr={verdict.run.stderr} stdout={verdict.run.stdout} /> : null}
-          <Submissions history={attempt.history ?? EMPTY_HISTORY} />
+          <Submissions history={attempt.history ?? EMPTY_HISTORY} onView={onViewSubmission} />
         </div>
       </div>
     );

@@ -41,6 +41,18 @@ export interface Verdict {
   total: number;
   /** Present when the step ran in the runtime. */
   run?: RunInfo;
+  /** A Run rather than a submission: only the example check was executed and nothing was recorded. */
+  trial?: boolean;
+}
+
+/** The check a Run exercises: the step's first, the basic behaviour the others build on. */
+export const exampleCheck = (step: Step): StepCheck => step.checks[0];
+
+/** The verdict restricted to the checks in `ids`, as a Run reports only the example. */
+export function narrow(verdict: Verdict, ids: readonly string[]): Verdict {
+  const results = verdict.results.filter(r => ids.includes(r.id));
+  const passed = results.filter(r => r.passed).length;
+  return {accepted: passed === results.length, results, passed, total: results.length};
 }
 
 /** Replaces every comment character (but not newlines) with a space so positions and lines survive. */

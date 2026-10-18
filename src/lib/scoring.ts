@@ -12,6 +12,8 @@ export interface Submission {
   passed: number;
   total: number;
   accepted: boolean;
+  /** The step's file as it was judged; absent in records written before code was kept. */
+  code?: string;
 }
 
 export const HISTORY_LENGTH = 12;

@@ -22,6 +22,8 @@ interface Props {
   onChange?: (value: string) => void;
   /** Cmd/Ctrl+Enter. */
   onSubmit?: () => void;
+  /** Cmd/Ctrl+': run the example check without recording anything. */
+  onRun?: () => void;
   /** Baseline text for a unified diff against `value` (viewers only): the learner's code under the solution. */
   original?: string | null;
   /**
@@ -52,6 +54,7 @@ const StepEditor = memo(
     readOnly = false,
     onChange,
     onSubmit,
+    onRun,
     original = null,
     fileKey,
     resetKey,
@@ -62,6 +65,7 @@ const StepEditor = memo(
     const view = useRef<EditorView | null>(null);
     const onChangeRef = useRef(onChange);
     const onSubmitRef = useRef(onSubmit);
+    const onRunRef = useRef(onRun);
     const languageCompartment = useRef(new Compartment());
     const diffCompartment = useRef(new Compartment());
     /** Editor state of every file opened on this view, by `fileKey`; restored when the file is reopened. */
@@ -70,6 +74,7 @@ const StepEditor = memo(
     const lastResetKey = useRef(resetKey);
     onChangeRef.current = onChange;
     onSubmitRef.current = onSubmit;
+    onRunRef.current = onRun;
 
     const buildState = (doc: string, baseline: string | null): EditorState => {
       const extensions: Extension[] = [
@@ -95,6 +100,13 @@ const StepEditor = memo(
             key: 'Mod-Enter',
             run: () => {
               onSubmitRef.current?.();
+              return true;
+            },
+          },
+          {
+            key: "Mod-'",
+            run: () => {
+              onRunRef.current?.();
               return true;
             },
           },

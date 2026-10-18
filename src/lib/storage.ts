@@ -246,7 +246,15 @@ const normalizeHistory = (value: unknown): Submission[] => {
     if (typeof item !== 'object' || item === null) continue;
     const s = item as Partial<Submission>;
     if (typeof s.at !== 'number' || !isLanguage(s.language) || !isCount(s.passed) || !isCount(s.total)) continue;
-    history.push({at: s.at, language: s.language, passed: s.passed, total: s.total, accepted: s.accepted === true});
+    const submission: Submission = {
+      at: s.at,
+      language: s.language,
+      passed: s.passed,
+      total: s.total,
+      accepted: s.accepted === true,
+    };
+    if (typeof s.code === 'string') submission.code = s.code;
+    history.push(submission);
   }
   return history.slice(-HISTORY_LENGTH);
 };

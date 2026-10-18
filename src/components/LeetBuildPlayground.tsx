@@ -16,7 +16,7 @@ import {problems} from '@/data/problems';
 import {downloadCertificate} from '@/lib/certificate';
 import {downloadMarkdown, exportFileName, problemToMarkdown, problemUrl, siteUrl} from '@/lib/export';
 import {type Badge, badgeOf, dayKey, earnedBadges, streakOf} from '@/lib/gamify';
-import {type Verdict, judge, withRuntime} from '@/lib/judge';
+import {type Verdict, exampleCheck, judge, narrow, withRuntime} from '@/lib/judge';
 import {type RuntimeStatus, getRunner} from '@/lib/runtime/client';
 import type {RunJob} from '@/lib/runtime/types';
 import {
@@ -74,7 +74,7 @@ import SplitGutter from './SplitGutter';
 import StepEditor from './StepEditor';
 import ThemeToggle from './ThemeToggle';
 import {BudgetPicker, SessionList, TimerIdlePill, TimerPill} from './Timer';
-import VerdictPane from './VerdictPane';
+import VerdictPane, {SubmissionCode} from './VerdictPane';
 
 const problemById: Record<string, Problem> = {};
 for (const problem of problems) problemById[problem.id] = problem;
@@ -88,9 +88,11 @@ const resolveStep = (problem: Problem, attempts: Record<string, StepAttempt>, wa
   return problem.steps[index >= 0 && unlocked(problem, index, attempts) ? index : 0];
 };
 
-/** The submit shortcut as this platform writes it. */
+/** The submit and run shortcuts as this platform writes them. */
 const SUBMIT_KEYS = mod('⏎');
 const SUBMIT_SHORTCUT = MAC ? '⌘ Enter' : 'Ctrl + Enter';
+const RUN_KEYS = mod("'");
+const RUN_SHORTCUT = MAC ? "⌘ '" : "Ctrl + '";
 
 /** Below `lg` the checks sit under the editor instead of beside it. */
 const STACKED = '(max-width: 1023px)';
@@ -814,9 +816,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     if (loaded && step?.harness?.[language] !== undefined) runner?.prewarm();
   }, [loaded, step, language, runner]);
 
-  /** Record a decided verdict: the attempt, the submission history, the score, the celebration. */
+  /** Record a decided verdict: the attempt, the submission history (with the code judged), the score, the celebration. */
   const record = useCallback(
-    (result: Verdict) => {
+    (result: Verdict, code: string) => {
       if (problem === null || attemptKey === null) return;
       const now = Date.now();
       const previous = progressRef.current.attempts[attemptKey] ?? OPEN_ATTEMPT;
@@ -832,6 +834,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
         passed: result.passed,
         total: result.total,
         accepted: result.accepted,
+        code,
       };
       next = {...next, history: [...(previous.history ?? []), submission].slice(-HISTORY_LENGTH)};
       setEarned(result.accepted ? stepScore(problem.difficulty, next) : null);
@@ -855,6 +858,29 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     else editorRef.current?.focus();
   }, []);
 
+  /**
+   * The step runs inside the course's real system. The step's own file is the learner's, and so is every
+   * step they have passed in this language; every other step — not reached yet, revealed, or passed in
+   * another language — runs its reference implementation, so the code under test talks to real neighbours
+   * instead of TODO stubs. (`yarn verify` mounts the reference for every other step the same way.)
+   */
+  const assemble = useCallback(
+    (harness: string, checks: readonly string[]): RunJob | null => {
+      if (problem === null || step === null) return null;
+      const attempts = progressRef.current.attempts;
+      const files: Record<string, string> = {};
+      for (const s of problem.steps) {
+        const attempt = attempts[stepKey(problem.id, s.id)];
+        const own = s.id === step.id || (attempt?.status === 'accepted' && attempt.language === language);
+        files[fileName(s.file, language)] = own
+          ? filesRef.current[s.id] ?? s.code[language].starter
+          : s.code[language].solution;
+      }
+      return {files, support: problem.support?.[language] ?? {}, harness, checks: [...checks]};
+    },
+    [problem, step, language],
+  );
+
   const submit = useCallback(() => {
     if (problem === null || step === null || attemptKey === null || running) return;
     const src = filesRef.current[step.id] ?? step.code[language].starter;
@@ -864,30 +890,15 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     const harness = step.harness?.[language];
     if (harness === undefined) {
       setVerdict(result);
-      record(result);
+      record(result, src);
       showVerdict();
       return;
     }
-    // The step runs inside the course's real system. The step's own file is the learner's, and so is every
-    // step they have passed in this language; every other step — not reached yet, revealed, or passed in
-    // another language — runs its reference implementation, so the code under test talks to real neighbours
-    // instead of TODO stubs. (`yarn verify` mounts the reference for every other step the same way.)
-    const attempts = progressRef.current.attempts;
-    const files: Record<string, string> = {};
-    for (const s of problem.steps) {
-      const attempt = attempts[stepKey(problem.id, s.id)];
-      const own = s.id === step.id || (attempt?.status === 'accepted' && attempt.language === language);
-      files[fileName(s.file, language)] = own
-        ? filesRef.current[s.id] ?? s.code[language].starter
-        : s.code[language].solution;
-    }
-    const job: RunJob = {
-      files,
-      support: problem.support?.[language] ?? {},
+    const job = assemble(
       harness,
-      checks: step.checks.map(c => c.id),
-    };
-    if (runner === null) return;
+      step.checks.map(c => c.id),
+    );
+    if (job === null || runner === null) return;
     setVerdict(null);
     setRunning(true);
     void runner.run(job).then(run => {
@@ -895,12 +906,69 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       const decided = withRuntime(result, run);
       // A runtime that could not run the code is not a wrong submission; a decided run is recorded even if the
       // learner moved on, but its verdict is only shown for the step it belongs to.
-      if (run.error === undefined) record(decided);
+      if (run.error === undefined) record(decided, src);
       if (submitSeq.current !== token) return;
       setVerdict(decided);
       showVerdict();
     });
-  }, [problem, step, attemptKey, language, running, runner, record, showVerdict]);
+  }, [problem, step, attemptKey, language, running, runner, assemble, record, showVerdict]);
+
+  /** Run: execute the example check only and show what happened; no attempt, history or score is touched. */
+  const trial = useCallback(() => {
+    if (problem === null || step === null || running) return;
+    const harness = step.harness?.[language];
+    if (harness === undefined || runner === null) return;
+    const src = filesRef.current[step.id] ?? step.code[language].starter;
+    const example = exampleCheck(step);
+    const result = narrow(judge(step, language, src), [example.id]);
+    const job = assemble(harness, [example.id]);
+    if (job === null) return;
+    setVerdictCode(src);
+    const token = ++submitSeq.current;
+    setVerdict(null);
+    setEarned(null);
+    setRunning(true);
+    void runner.run(job).then(run => {
+      setRunning(false);
+      if (submitSeq.current !== token) return;
+      setVerdict({...withRuntime(result, run), trial: true});
+      showVerdict();
+    });
+  }, [problem, step, language, running, runner, assemble, showVerdict]);
+
+  /** A past submission's code, read-only, with the edits since it and a way to put it back in the editor. */
+  const onViewSubmission = useCallback(
+    (submission: Submission) => {
+      if (step === null || submission.code === undefined) return;
+      const code = submission.code;
+      const sameLanguage = submission.language === language;
+      void openDialog({
+        title: `${submission.accepted ? 'Accepted' : 'Wrong Answer'} · ${submission.passed}/${submission.total} · ${
+          LANGUAGE_LABEL[submission.language]
+        } · ${new Date(submission.at).toLocaleString(undefined, {
+          month: 'short',
+          day: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+        })}`,
+        body: (
+          <SubmissionCode
+            code={code}
+            current={sameLanguage ? filesRef.current[step.id] ?? step.code[language].starter : null}
+            language={submission.language}
+          />
+        ),
+        confirm: sameLanguage ? 'Restore to editor' : undefined,
+        wide: true,
+      }).then(ok => {
+        if (!ok || !sameLanguage) return;
+        writeFile(step.id, code);
+        openTab(step.id);
+        setResetKey(k => k + 1);
+      });
+    },
+    [step, language, openDialog, writeFile, openTab],
+  );
 
   const onRevealHint = useCallback(
     (count: number) => {
@@ -1021,6 +1089,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       if (modKey && e.key === 'Enter') {
         e.preventDefault();
         submit();
+      } else if (modKey && !e.shiftKey && !e.altKey && e.code === 'Quote') {
+        e.preventDefault();
+        trial();
       } else if (modKey && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'b' && problem !== null) {
         e.preventDefault();
         toggleExplorer();
@@ -1044,7 +1115,17 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [submit, problem, toggleExplorer, togglePaneSidebar, onNextStep, onPrevStep, onShortcuts, toggleScratchpad]);
+  }, [
+    submit,
+    trial,
+    problem,
+    toggleExplorer,
+    togglePaneSidebar,
+    onNextStep,
+    onPrevStep,
+    onShortcuts,
+    toggleScratchpad,
+  ]);
 
   useEffect(() => {
     try {
@@ -1262,6 +1343,19 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                       type="button">
                       reset
                     </button>
+                    {step.harness?.[language] !== undefined ? (
+                      <button
+                        className="border-ink-600 text-ink-200 hover:border-iris-400/60 hover:text-ink-50 rounded-lg border px-2.5 py-[3px] text-[12px] font-semibold transition disabled:cursor-wait disabled:opacity-60"
+                        disabled={running}
+                        onClick={trial}
+                        title={`${RUN_SHORTCUT} · runs ${fileName(
+                          step.file,
+                          language,
+                        )} against the example check; nothing is recorded`}
+                        type="button">
+                        Run {RUN_KEYS}
+                      </button>
+                    ) : null}
                     <button
                       className="bg-iris-400 text-ink-950 hover:bg-iris-300 rounded-lg px-3 py-1 text-[12px] font-bold transition disabled:cursor-wait disabled:opacity-60"
                       disabled={running}
@@ -1285,6 +1379,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                     fileKey={`${problem.id}/${openFile}/${language}`}
                     language={language}
                     onChange={onCodeChange}
+                    onRun={trial}
                     onSubmit={submit}
                     resetKey={resetKey}
                     value={openCode}
@@ -1304,6 +1399,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                   nextTitle={problem.steps[stepIndex + 1]?.title}
                   onCertificate={certified ? onCertificate : undefined}
                   onNext={stepIndex + 1 < problem.steps.length ? onNextStep : undefined}
+                  onViewSubmission={onViewSubmission}
                   running={running}
                   runtime={runtimeStatus}
                   shareUrl={stepShareUrl}
