@@ -7,7 +7,7 @@
  * (some private modes). Writes are debounced per record so typing does not hammer the database,
  * and `flush()` runs on page hide so the last edits survive navigation.
  */
-import type {StepAttempt} from './scoring';
+import {type StepAttempt, type Submission, HISTORY_LENGTH} from './scoring';
 import {type Scratchpad, normalizeShapes} from './scratchpad';
 import {type ActiveTimer, type TimedSession, SESSION_HISTORY} from './timer';
 import {type Language, LANGUAGES} from './types';
@@ -125,15 +125,15 @@ class IdbBackend implements Backend {
       request(pads.getAllKeys()),
       request(pads.getAll()),
     ]);
-    const workspaces: Record<string, Workspace> = {};
+    const raw: Record<string, unknown> = {};
     keys.forEach((key, i) => {
-      workspaces[String(key)] = values[i] as Workspace;
+      raw[String(key)] = values[i];
     });
     const scratchpads: Record<string, Scratchpad> = {};
     padKeys.forEach((key, i) => {
       scratchpads[String(key)] = normalizeScratchpad(padValues[i]);
     });
-    return {progress: normalizeProgress(progress), workspaces, scratchpads};
+    return {progress: normalizeProgress(progress), workspaces: normalizeWorkspaces(raw), scratchpads};
   }
 
   async writeWorkspace(id: string, state: Workspace): Promise<void> {
@@ -174,7 +174,7 @@ class LocalStorageBackend implements Backend {
         for (const [id, pad] of Object.entries(parsed.scratchpads ?? {})) scratchpads[id] = normalizeScratchpad(pad);
         this.snapshot = {
           progress: normalizeProgress(parsed.progress),
-          workspaces: parsed.workspaces ?? {},
+          workspaces: normalizeWorkspaces(parsed.workspaces),
           scratchpads,
         };
       }
@@ -224,6 +224,56 @@ const normalizeScratchpad = (value: unknown): Scratchpad => {
   return {shapes: normalizeShapes(pad.shapes), updatedAt: typeof pad.updatedAt === 'number' ? pad.updatedAt : 0};
 };
 
+const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+
+/** Stored workspaces are cast into the editor, so a malformed record is dropped (the step falls back to its starter). */
+const normalizeWorkspaces = (value: unknown): Record<string, Workspace> => {
+  if (typeof value !== 'object' || value === null) return {};
+  const workspaces: Record<string, Workspace> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof item !== 'object' || item === null) continue;
+    const w = item as Partial<Workspace>;
+    if (typeof w.code !== 'string' || typeof w.updatedAt !== 'number' || !Number.isFinite(w.updatedAt)) continue;
+    workspaces[key] = {code: w.code, updatedAt: w.updatedAt};
+  }
+  return workspaces;
+};
+
+const normalizeHistory = (value: unknown): Submission[] => {
+  if (!Array.isArray(value)) return [];
+  const history: Submission[] = [];
+  for (const item of value) {
+    if (typeof item !== 'object' || item === null) continue;
+    const s = item as Partial<Submission>;
+    if (typeof s.at !== 'number' || !isLanguage(s.language) || !isCount(s.passed) || !isCount(s.total)) continue;
+    history.push({at: s.at, language: s.language, passed: s.passed, total: s.total, accepted: s.accepted === true});
+  }
+  return history.slice(-HISTORY_LENGTH);
+};
+
+/**
+ * Attempts are read straight into scoring and the submissions list, so a record from an older
+ * schema or a partial write is repaired here: a missing `hints`/`wrong` would score NaN, and a
+ * non-array `history` would throw while rendering.
+ */
+const normalizeAttempts = (value: unknown): Record<string, StepAttempt> => {
+  if (typeof value !== 'object' || value === null) return {};
+  const attempts: Record<string, StepAttempt> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof item !== 'object' || item === null) continue;
+    const a = item as Partial<StepAttempt>;
+    attempts[key] = {
+      status: a.status === 'accepted' || a.status === 'revealed' ? a.status : 'open',
+      hints: isCount(a.hints) ? Math.floor(a.hints) : 0,
+      wrong: isCount(a.wrong) ? Math.floor(a.wrong) : 0,
+      language: isLanguage(a.language) ? a.language : null,
+      solvedAt: typeof a.solvedAt === 'number' && Number.isFinite(a.solvedAt) ? a.solvedAt : null,
+      history: normalizeHistory(a.history),
+    };
+  }
+  return attempts;
+};
+
 const normalizeTimer = (value: unknown): ActiveTimer | null => {
   if (typeof value !== 'object' || value === null) return null;
   const t = value as Partial<ActiveTimer>;
@@ -265,7 +315,7 @@ function normalizeProgress(value: unknown): Progress {
     return {...EMPTY_PROGRESS, attempts: {}, lastStep: {}, activeDays: [], badges: {}, sessions: []};
   const p = value as Partial<Progress>;
   return {
-    attempts: typeof p.attempts === 'object' && p.attempts !== null ? p.attempts : {},
+    attempts: normalizeAttempts(p.attempts),
     language: isLanguage(p.language) ? p.language : 'python',
     lastStep: typeof p.lastStep === 'object' && p.lastStep !== null ? p.lastStep : {},
     submissions: typeof p.submissions === 'number' ? p.submissions : 0,
