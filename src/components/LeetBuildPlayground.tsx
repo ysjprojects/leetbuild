@@ -178,7 +178,11 @@ const TaskDot: FC = memo(() => (
 ));
 TaskDot.displayName = 'TaskDot';
 
-/** An open file as an editor tab, VS Code style: click to show, × to close (shown on hover and while active). */
+/**
+ * An open file as an editor tab, VS Code style: full height of the strip, the active one on the editor's
+ * own surface under an accent line with the strip's rule broken beneath it, click to show, × to close
+ * (always on the active tab, on hover elsewhere).
+ */
 const FileTab: FC<{
   step: Step;
   index: number;
@@ -204,29 +208,40 @@ const FileTab: FC<{
   const name = fileName(step.file, language);
   return (
     <div
-      className={`group flex shrink-0 items-center rounded-t-md border pl-2 pr-1 text-[11px] transition ${
-        active
-          ? 'border-ink-600 bg-ink-800 text-ink-50 border-b-0'
-          : 'text-ink-300 hover:bg-ink-800/60 hover:text-ink-50 border-transparent'
+      aria-selected={active}
+      className={`border-ink-700 group relative flex shrink-0 items-stretch border-r text-[11px] transition-colors ${
+        active ? 'bg-ink-850 text-ink-50' : 'text-ink-300 hover:bg-ink-800/50 hover:text-ink-100 border-b'
       }`}
-      ref={ref}>
+      ref={ref}
+      role="tab">
+      {active ? <span aria-hidden className="bg-iris-400 absolute inset-x-0 top-0 h-0.5" /> : null}
       <button
-        className="font-code flex items-center gap-1.5 py-0.5"
+        className="font-code flex items-center gap-2 pl-3 pr-1"
         onClick={onClick}
         title={task ? 'the file this step builds — Submit judges it' : `built in step ${index + 1}: ${step.title}`}
         type="button">
         {task ? <TaskDot /> : null}
-        {name}
+        <span className="whitespace-nowrap">{name}</span>
       </button>
       <button
         aria-label={`close ${name}`}
-        className={`hover:bg-ink-700 touch:h-6 touch:w-6 touch:opacity-100 ml-1 flex h-4 w-4 items-center justify-center rounded text-[12px] leading-none transition ${
-          active ? '' : 'opacity-0 focus:opacity-100 group-hover:opacity-100'
+        className={`hover:bg-ink-700 hover:text-ink-50 touch:h-6 touch:w-6 touch:opacity-100 mr-1.5 flex h-5 w-5 items-center justify-center self-center rounded transition ${
+          active ? 'text-ink-300 opacity-80 hover:opacity-100' : 'opacity-0 focus:opacity-100 group-hover:opacity-100'
         }`}
         onClick={onCloseClick}
         title="close"
         type="button">
-        ×
+        <svg
+          aria-hidden
+          fill="none"
+          height={9}
+          stroke="currentColor"
+          strokeLinecap="round"
+          strokeWidth={1.5}
+          viewBox="0 0 10 10"
+          width={9}>
+          <path d="M1.5 1.5l7 7M8.5 1.5l-7 7" />
+        </svg>
       </button>
     </div>
   );
@@ -244,7 +259,7 @@ const FileTabs: FC<{
   onOpen: (id: string) => void;
   onClose: (id: string) => void;
 }> = memo(({problem, language, openTabs, openFile, stepId, onOpen, onClose}) => (
-  <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto" role="tablist">
+  <div className="flex min-w-0 flex-1 items-stretch overflow-x-auto overflow-y-hidden" role="tablist">
     {openTabs.map(id => {
       const index = problem.steps.findIndex(s => s.id === id);
       return index < 0 ? null : (
@@ -260,6 +275,7 @@ const FileTabs: FC<{
         />
       );
     })}
+    <div aria-hidden className="border-ink-700 min-w-2 flex-1 border-b" />
   </div>
 ));
 FileTabs.displayName = 'FileTabs';
@@ -325,7 +341,9 @@ const Explorer: FC<{
   onOpen: (id: string) => void;
 }> = memo(({problem, language, attempts, stepId, openFile, onOpen}) => (
   <nav aria-label="files" className="flex h-full min-h-0 flex-col">
-    <div className="text-ink-400 shrink-0 px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider">Explorer</div>
+    <div className="text-ink-400 flex h-9 shrink-0 items-center px-3 text-[10px] font-bold uppercase tracking-wider">
+      Explorer
+    </div>
     <div className="min-h-0 flex-1 overflow-y-auto pb-2">
       <div className="text-ink-100 flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold">
         <span aria-hidden className="text-ink-400 w-3 text-center text-[9px]">
@@ -1191,27 +1209,30 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
               ref={ideRef}
               style={ideStyle}>
               <div className="flex h-[56vh] min-h-0 min-w-0 flex-col lg:h-auto">
-                <div className="border-ink-700 flex items-center gap-2 border-b px-2 py-1.5">
-                  <button
-                    aria-pressed={layout.explorer}
-                    className={`hover:text-ink-50 flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition ${
-                      layout.explorer ? 'bg-ink-800 text-ink-100' : 'text-ink-400'
-                    }`}
-                    onClick={toggleExplorer}
-                    title={`${layout.explorer ? 'hide' : 'show'} the file explorer (${mod('B')})`}
-                    type="button">
-                    <svg
-                      aria-hidden
-                      fill="none"
-                      height={13}
-                      stroke="currentColor"
-                      strokeWidth={1.6}
-                      viewBox="0 0 16 16"
-                      width={13}>
-                      <rect height={11} rx={1.5} width={13} x={1.5} y={2.5} />
-                      <path d="M6 2.5v11" />
-                    </svg>
-                  </button>
+                {/* The tab bar: the rule along its bottom is drawn by the inactive tabs and the filler, never under the active tab, which shares the editor's surface. */}
+                <div className="bg-ink-900 flex h-9 shrink-0 items-stretch">
+                  <div className="border-ink-700 flex shrink-0 items-center border-b px-1.5">
+                    <button
+                      aria-pressed={layout.explorer}
+                      className={`hover:text-ink-50 flex h-6 w-6 shrink-0 items-center justify-center rounded-md transition ${
+                        layout.explorer ? 'bg-ink-800 text-ink-100' : 'text-ink-400'
+                      }`}
+                      onClick={toggleExplorer}
+                      title={`${layout.explorer ? 'hide' : 'show'} the file explorer (${mod('B')})`}
+                      type="button">
+                      <svg
+                        aria-hidden
+                        fill="none"
+                        height={13}
+                        stroke="currentColor"
+                        strokeWidth={1.6}
+                        viewBox="0 0 16 16"
+                        width={13}>
+                        <rect height={11} rx={1.5} width={13} x={1.5} y={2.5} />
+                        <path d="M6 2.5v11" />
+                      </svg>
+                    </button>
+                  </div>
                   <FileTabs
                     language={language}
                     onClose={closeTab}
@@ -1221,12 +1242,12 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                     problem={problem}
                     stepId={step.id}
                   />
-                  <span
-                    className="font-code text-ink-400 hidden shrink-0 text-[10px] md:inline"
-                    title="library the reference solution uses">
-                    {LANGUAGE_STACK[language][step.concept]}
-                  </span>
-                  <div className="flex shrink-0 items-center gap-2">
+                  <div className="border-ink-700 flex shrink-0 items-center gap-2 border-b pl-2 pr-2">
+                    <span
+                      className="font-code text-ink-400 hidden shrink-0 text-[10px] md:inline"
+                      title="library the reference solution uses">
+                      {LANGUAGE_STACK[language][step.concept]}
+                    </span>
                     <button
                       className="text-ink-300 hover:text-ink-50 rounded-md px-2 py-1 text-[11px] transition disabled:cursor-not-allowed disabled:opacity-30"
                       disabled={openFile === null}
