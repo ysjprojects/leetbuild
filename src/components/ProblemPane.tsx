@@ -236,8 +236,7 @@ const CompanyHeader: FC<{company: Company}> = memo(({company}) => (
         <a className={linkClass} href={company.url} rel="noopener noreferrer" target="_blank">
           {company.publication}
         </a>
-        : this course rebuilds the part of {company.name}&apos;s system described there, the way they described it. The
-        sources are listed at the end.
+        : this course rebuilds the part of {company.name}&apos;s system described there, the way they described it.
       </p>
     </div>
   </div>

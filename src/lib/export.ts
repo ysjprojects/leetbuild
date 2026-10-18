@@ -193,7 +193,7 @@ export function problemToMarkdown(problem: Problem, language: Language): string 
   parts.push('');
   if (problem.company !== undefined)
     parts.push(
-      `> **Company tagged** — derived from the [${problem.company.publication}](${problem.company.url}); the sources are listed at the end.`,
+      `> **Company tagged** — derived from the [${problem.company.publication}](${problem.company.url}).`,
       '',
     );
   // The statement already starts with its own `# Title`; drop it and demote the rest under ours.
