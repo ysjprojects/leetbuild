@@ -192,10 +192,7 @@ export function problemToMarkdown(problem: Problem, language: Language): string 
   parts.push(problem.tagline);
   parts.push('');
   if (problem.company !== undefined)
-    parts.push(
-      `> **Company tagged** — derived from the [${problem.company.publication}](${problem.company.url}).`,
-      '',
-    );
+    parts.push(`> **Company tagged** — derived from the [${problem.company.publication}](${problem.company.url}).`, '');
   // The statement already starts with its own `# Title`; drop it and demote the rest under ours.
   const statement = problem.statement.replace(/^#\s+[^\n]*\n/, '');
   parts.push(widgetsToNotes(shiftHeadings(statement, 1), problemUrl(problem)).trim());
