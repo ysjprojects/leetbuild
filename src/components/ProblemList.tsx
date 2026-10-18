@@ -217,26 +217,6 @@ const ProfileStrip: FC<{
           </div>
         </div>
 
-        {/* Timed runs */}
-        <button
-          className="hover:bg-ink-800 group flex items-center gap-2 rounded-lg px-1.5 py-1 text-left transition"
-          onClick={onRuns}
-          title="every timed run, newest first"
-          type="button">
-          <span className={sessions.length > 0 ? 'text-iris-300' : 'text-ink-500'}>
-            <Clock />
-          </span>
-          <span>
-            <span className="text-ink-50 block text-[13px] font-bold leading-tight">
-              {sessions.length === 0 ? 'No timed runs' : `${counted} counted`}
-              {sessions.length > 0 ? <span className="text-ink-400 font-normal"> / {sessions.length} runs</span> : null}
-            </span>
-            <span className="text-iris-300 group-hover:text-iris-200 block text-[11px]">
-              {sessions.length === 0 ? 'race a problem’s estimate ›' : 'history ›'}
-            </span>
-          </span>
-        </button>
-
         {/* Badges */}
         <button
           className="hover:bg-ink-800 group ml-auto flex items-center gap-2 rounded-lg px-1.5 py-1 text-left transition"
@@ -319,6 +299,27 @@ const ProfileStrip: FC<{
             <div className="flex items-baseline justify-between gap-2">
               <dt className="text-ink-300">acceptance</dt>
               <dd className="font-code text-ink-100">{Math.round(profile.acceptance * 100)}%</dd>
+            </div>
+            <div className="flex items-baseline justify-between gap-2">
+              <dt className="text-ink-300">timed runs</dt>
+              <dd className="text-ink-100 flex items-baseline gap-2">
+                <span className="font-code">
+                  {sessions.length === 0 ? (
+                    '0'
+                  ) : (
+                    <>
+                      {counted} counted <span className="text-ink-400">/ {sessions.length}</span>
+                    </>
+                  )}
+                </span>
+                <button
+                  className="text-iris-300 hover:text-iris-200 text-[11px] transition"
+                  onClick={onRuns}
+                  title={sessions.length === 0 ? 'how timed runs work' : 'every timed run, newest first'}
+                  type="button">
+                  {sessions.length === 0 ? 'race a problem’s estimate ›' : 'history ›'}
+                </button>
+              </dd>
             </div>
             <p className="text-ink-400 col-span-2 text-[11px]">
               Scored like a contest: each hint −20%, each wrong submission −5% (floor 25%), a revealed step 0.
