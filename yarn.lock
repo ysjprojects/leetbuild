@@ -145,10 +145,15 @@
     style-mod "^4.1.0"
     w3c-keyname "^2.2.4"
 
-"@electric-sql/pglite@0.5.9":
-  version "0.5.9"
-  resolved "https://registry.yarnpkg.com/@electric-sql/pglite/-/pglite-0.5.9.tgz#39da94c5379282976cf916d2f5540c8fc97fc979"
-  integrity sha512-GoQTRMZ/o4J3sMW4mLDtDFGNOm1xy5oH+iHDALWll3uERY6OF4BSnL1t7FZH2Mlw+RPceDBlFJgSaecO73c4EA==
+"@electric-sql/pglite-pgvector@0.0.11":
+  version "0.0.11"
+  resolved "https://registry.yarnpkg.com/@electric-sql/pglite-pgvector/-/pglite-pgvector-0.0.11.tgz#1a671277a6942f1ccfaead966f54e730f25eba1c"
+  integrity sha512-pUukU2iqI5TLBv/0D5Bk9R9zVyms+7Do6yscl4WRKW5pD2wNl8FlzGWDXphXj/Q42SsVIJHbP4+oqwjQC9fasg==
+
+"@electric-sql/pglite@0.5.10":
+  version "0.5.10"
+  resolved "https://registry.yarnpkg.com/@electric-sql/pglite/-/pglite-0.5.10.tgz#fa875b6199e6641d82b19cbf8e9fde51196afd4d"
+  integrity sha512-tXc/25U3ulOkiRQuTFdwIv+JhBqtMdAF7Gvo6CfZZWtSB4+hgC4Wr2vwK5ngvvN5PJfAAEGIsfyCVy1JhCOBYw==
 
 "@emnapi/core@1.10.0":
   version "1.10.0"

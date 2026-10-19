@@ -4,6 +4,7 @@
  * TypeScript: esbuild (native) as the transpiler. Both: fengari and PGlite from npm.
  */
 import {PGlite} from '@electric-sql/pglite';
+import {vector} from '@electric-sql/pglite-pgvector';
 import {transform} from 'esbuild';
 import {readFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
@@ -20,12 +21,15 @@ export interface NodeRuntime {
   run(job: RunJob): Promise<RunResult>;
 }
 
+/** The same Postgres the workers get from the CDN: PGlite with pgvector. */
+const openPglite = async (): Promise<PGlite> => new PGlite({extensions: {vector}});
+
 export async function createNodePythonRuntime(assetDir = resolve(process.cwd(), 'public/py')): Promise<NodeRuntime> {
   const pyodide = await loadPyodide({stdout: () => undefined, stderr: () => undefined});
   await bootPython(
     pyodide,
     {read: path => readFile(resolve(assetDir, path))},
-    {luaEval, db: createDbBridge(async () => new PGlite())},
+    {luaEval, db: createDbBridge(openPglite)},
   );
   return {run: job => runPython(pyodide, job)};
 }
@@ -45,6 +49,6 @@ export function createNodeTypeScriptRuntime(): NodeRuntime {
       return {code: out.code, map: out.map};
     },
     luaEval,
-    db: createDbBridge(async () => new PGlite()),
+    db: createDbBridge(openPglite),
   });
 }

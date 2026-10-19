@@ -6,14 +6,13 @@
  */
 import type {PyodideInterface} from 'pyodide';
 
-import {createDbBridge} from './db';
+import {createDbBridge, openPgliteFromCdn} from './db';
 import {luaEval} from './lua';
 import {bootPython, PYODIDE_INDEX_URL, runPython} from './python';
 import type {WorkerIn, WorkerOut} from './types';
 
-/** Both come from the CDN at run time: they locate their own .wasm/.data next to their module URL. */
+/** Pyodide comes from the CDN at run time: it locates its own .wasm/.data next to its module URL. */
 const PYODIDE_MODULE_URL = `${PYODIDE_INDEX_URL}pyodide.mjs`;
-const PGLITE_URL = 'https://cdn.jsdelivr.net/npm/@electric-sql/pglite@0.5.9/dist/index.js';
 
 interface WorkerScope {
   postMessage(message: WorkerOut): void;
@@ -42,11 +41,7 @@ const boot = async (): Promise<PyodideInterface> => {
     },
     {
       luaEval,
-      db: createDbBridge(async () => {
-        // Runtime import on purpose, as for Pyodide above.
-        const mod = (await import(/* webpackIgnore: true */ PGLITE_URL)) as typeof import('@electric-sql/pglite');
-        return new mod.PGlite();
-      }),
+      db: createDbBridge(openPgliteFromCdn),
     },
     phase => post({type: 'phase', phase}),
   );

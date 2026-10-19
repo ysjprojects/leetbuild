@@ -6,7 +6,7 @@
  */
 import type * as esbuild from 'esbuild-wasm';
 
-import {createDbBridge} from './db';
+import {createDbBridge, openPgliteFromCdn} from './db';
 import {luaEval} from './lua';
 import {reportUnhandledRejection} from './ts/harness';
 import type {WorkerIn, WorkerOut} from './types';
@@ -16,7 +16,6 @@ const ESBUILD_VERSION = '0.28.2';
 /** Both come from the CDN at run time: they locate their own .wasm next to their module URL. */
 const ESBUILD_MODULE_URL = `https://cdn.jsdelivr.net/npm/esbuild-wasm@${ESBUILD_VERSION}/esm/browser.min.js`;
 const ESBUILD_WASM_URL = `https://cdn.jsdelivr.net/npm/esbuild-wasm@${ESBUILD_VERSION}/esbuild.wasm`;
-const PGLITE_URL = 'https://cdn.jsdelivr.net/npm/@electric-sql/pglite@0.5.9/dist/index.js';
 
 interface WorkerScope {
   postMessage(message: WorkerOut): void;
@@ -54,11 +53,7 @@ const boot = async (): Promise<TypeScriptRuntime> => {
       return {code: out.code, map: out.map};
     },
     luaEval,
-    db: createDbBridge(async () => {
-      // Runtime import on purpose, as above.
-      const pglite = (await import(/* webpackIgnore: true */ PGLITE_URL)) as typeof import('@electric-sql/pglite');
-      return new pglite.PGlite();
-    }),
+    db: createDbBridge(openPgliteFromCdn),
   });
   post({type: 'ready'});
   return runtime;
