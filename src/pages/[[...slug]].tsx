@@ -86,7 +86,11 @@ export const getStaticProps: GetStaticProps<Props, {slug?: string[]}> = ({params
       problemId,
       stepId: step === null ? null : step.id,
       path: step === null ? `/${problem.id}` : stepPath(problem, step),
-      title: step === null ? `${problem.title} — LeetBuild` : `${step.title} · ${problem.title} — LeetBuild`,
+      // Course first: a tab shows ~25 characters, and the course is what tells tabs apart.
+      title:
+        step === null
+          ? `${problem.title} — LeetBuild`
+          : `${problem.title} · ${problem.steps.indexOf(step) + 1}. ${step.title} — LeetBuild`,
       description: problem.tagline,
     },
   };
