@@ -30,7 +30,9 @@ import {
   rectangularSelection,
 } from '@codemirror/view';
 import {highlightCode, tagHighlighter, tags} from '@lezer/highlight';
+import {vim} from '@replit/codemirror-vim';
 
+import type {EditorSettings} from './editorSettings';
 import type {Language} from './types';
 
 // ---- grammars ---------------------------------------------------------------------------------
@@ -157,5 +159,18 @@ export function editorExtensions(): Extension[] {
     highlightActiveLineGutter(),
     rectangularSelection(),
     keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, ...foldKeymap, indentWithTab]),
+  ];
+}
+
+/**
+ * What the learner's settings add: Vim bindings (editors only; first in the configuration so they
+ * see keys before the other keymaps), the font size, line wrapping. Lives in its own compartment
+ * so a change reconfigures the live view.
+ */
+export function settingsExtensions(settings: EditorSettings, readOnly: boolean): Extension[] {
+  return [
+    settings.keymap === 'vim' && !readOnly ? vim({status: true}) : [],
+    EditorView.theme({'&.cm-editor': {fontSize: `${settings.fontSize}px`}}),
+    settings.wrap ? EditorView.lineWrapping : [],
   ];
 }

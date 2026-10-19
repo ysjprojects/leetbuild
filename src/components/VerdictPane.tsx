@@ -354,6 +354,8 @@ const VerdictPane: FC<{
   reference?: Verdict | null;
   /** The reference is running. */
   comparing?: boolean;
+  /** A GitHub issue prefilled for this step and the last verdict. */
+  issueUrl?: string;
 }> = memo(
   ({
     step,
@@ -373,6 +375,7 @@ const VerdictPane: FC<{
     onCompare,
     reference = null,
     comparing = false,
+    issueUrl,
   }) => {
     const showShape = attempt.wrong >= SHAPE_AFTER_WRONG;
     const runError = verdict?.run?.error;
@@ -587,6 +590,19 @@ const VerdictPane: FC<{
           </ul>
           {verdict?.run !== undefined ? <Output stderr={verdict.run.stderr} stdout={verdict.run.stdout} /> : null}
           <Submissions history={attempt.history ?? EMPTY_HISTORY} onView={onViewSubmission} />
+          {issueUrl !== undefined ? (
+            <p className="text-ink-500 mt-3 text-[11px]">
+              Something wrong with this step — the task, a hint, a check, the verdict?{' '}
+              <a
+                className="text-iris-300 hover:text-iris-200 transition"
+                href={issueUrl}
+                rel="noreferrer"
+                target="_blank"
+                title="opens a GitHub issue prefilled with the step, the language, your browser and the last verdict">
+                report it ›
+              </a>
+            </p>
+          ) : null}
         </div>
       </div>
     );

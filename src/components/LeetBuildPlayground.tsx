@@ -17,6 +17,7 @@ import {downloadCertificate} from '@/lib/certificate';
 import {downloadMarkdown, exportFileName, problemToMarkdown, problemUrl, siteUrl} from '@/lib/export';
 import {type Badge, badgeOf, dayKey, earnedBadges, streakOf} from '@/lib/gamify';
 import {type Verdict, exampleCheck, judge, narrow, withRuntime} from '@/lib/judge';
+import {stepIssueUrl} from '@/lib/report';
 import {type RuntimeStatus, getRunner} from '@/lib/runtime/client';
 import type {RunJob} from '@/lib/runtime/types';
 import {
@@ -63,6 +64,7 @@ import {
 import {BadgeGlyph} from './Badges';
 import Confetti from './Confetti';
 import {useDialog} from './Dialog';
+import {EditorSettingsForm, GearIcon} from './EditorSettings';
 import {LoadingScreen, LogoMark, wordmarkClass} from './LoadingScreen';
 import {ghostButtonClass, selectClass} from './paneShared';
 import ProblemList from './ProblemList';
@@ -419,6 +421,8 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   const submitSeq = useRef(0);
   /** Below `lg` the problem pane is an accordion over the editor; this is its state (the `lg` sidebar is `layout.pane`). */
   const [paneOpen, setPaneOpen] = useState(true);
+  /** What focus mode folded away, to bring back when it ends. */
+  const focusRestore = useRef<{explorer: boolean; pane: boolean; paneOpen: boolean} | null>(null);
   /** Bumped on every fresh accept; each value mounts one confetti burst. */
   const [celebration, setCelebration] = useState(0);
   const [toasts, setToasts] = useState<{id: number; badge: Badge}[]>([]);
@@ -763,6 +767,22 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
         : linkedInPostUrl(stepShareText(problem, step, language, `${siteUrl()}${stepPath(problem, step)}`)),
     [problem, step, language],
   );
+  /** A GitHub issue prefilled with the step, the language, the browser and the last verdict. */
+  const issueUrl = useMemo(
+    () =>
+      problem === null || step === null
+        ? undefined
+        : stepIssueUrl({
+            problem,
+            step,
+            index: stepIndex,
+            language,
+            url: `${siteUrl()}${stepPath(problem, step)}`,
+            verdict,
+            userAgent: navigator.userAgent,
+          }),
+    [problem, step, stepIndex, language, verdict],
+  );
   /** The course is complete with every step accepted: a certificate can be issued. */
   const certified = useMemo(() => {
     if (problem === null) return false;
@@ -1098,8 +1118,29 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   const resetY = useCallback(() => setLayout(l => ({...l, y: DEFAULT_SPLIT.y})), []);
   const togglePaneSidebar = useCallback(() => setLayout(l => ({...l, pane: !l.pane})), []);
   const toggleExplorer = useCallback(() => setLayout(l => ({...l, explorer: !l.explorer})), []);
+  /**
+   * Focus: the explorer and the problem pane fold together and come back together, to how they
+   * were. In the stacked layout the pane is the accordion over the editor, so that is what folds.
+   */
+  const toggleFocus = useCallback(() => {
+    const stacked = window.matchMedia(STACKED).matches;
+    const focused = !layout.explorer && (stacked ? !paneOpen : !layout.pane);
+    if (focused) {
+      const saved = focusRestore.current ?? {explorer: true, pane: true, paneOpen: true};
+      focusRestore.current = null;
+      setLayout(l => ({...l, explorer: saved.explorer, pane: saved.pane}));
+      setPaneOpen(saved.paneOpen);
+      return;
+    }
+    focusRestore.current = {explorer: layout.explorer, pane: layout.pane, paneOpen};
+    setLayout(l => ({...l, explorer: false, pane: false}));
+    if (stacked) setPaneOpen(false);
+  }, [layout.explorer, layout.pane, paneOpen]);
   const onShortcuts = useCallback(() => {
     void openDialog({title: 'Keyboard shortcuts', body: <ShortcutList />});
+  }, [openDialog]);
+  const onEditorSettings = useCallback(() => {
+    void openDialog({title: 'Editor', body: <EditorSettingsForm />});
   }, [openDialog]);
 
   // Scratchpad: one sketch per course (and one for the landing page), persisted like the workspaces.
@@ -1126,6 +1167,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       } else if (modKey && !e.shiftKey && !e.altKey && e.code === 'Quote') {
         e.preventDefault();
         trial();
+      } else if (modKey && e.shiftKey && !e.altKey && e.code === 'KeyF' && problem !== null) {
+        e.preventDefault();
+        toggleFocus();
       } else if (modKey && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'b' && problem !== null) {
         e.preventDefault();
         toggleExplorer();
@@ -1155,6 +1199,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     problem,
     toggleExplorer,
     togglePaneSidebar,
+    toggleFocus,
     onNextStep,
     onPrevStep,
     onShortcuts,
@@ -1370,6 +1415,14 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                       {LANGUAGE_STACK[language][step.concept]}
                     </span>
                     <button
+                      aria-label="editor settings"
+                      className="text-ink-300 hover:text-ink-50 flex h-6 w-6 items-center justify-center rounded-md transition"
+                      onClick={onEditorSettings}
+                      title="editor settings: font size, long lines, Vim"
+                      type="button">
+                      <GearIcon />
+                    </button>
+                    <button
                       className="text-ink-300 hover:text-ink-50 rounded-md px-2 py-1 text-[11px] transition disabled:cursor-not-allowed disabled:opacity-30"
                       disabled={openFile === null}
                       onClick={onResetCode}
@@ -1430,6 +1483,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                   comparing={comparing}
                   earned={earned}
                   executes={step.harness?.[language] !== undefined}
+                  issueUrl={issueUrl}
                   language={language}
                   nextTitle={problem.steps[stepIndex + 1]?.title}
                   onCertificate={certified ? onCertificate : undefined}

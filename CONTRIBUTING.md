@@ -70,7 +70,7 @@ What the checks cannot enforce, reviewers will:
 
 ## Reporting bugs
 
-All state is local to your browser, so include what we cannot see: the URL (`/<course>/<n>-<step>`), the language, the browser and OS, the console output, and — for a wrong verdict — the submission and the verdict text. Search existing issues first; one bug per issue.
+All state is local to your browser, so include what we cannot see: the URL (`/<course>/<n>-<step>`), the language, the browser and OS, the console output, and — for a wrong verdict — the submission and the verdict text. The *report it ›* link under a step's checks opens an issue with everything but the console output and your code filled in. Search existing issues first; one bug per issue.
 
 ## Conduct
 

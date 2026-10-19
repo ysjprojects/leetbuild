@@ -11,7 +11,8 @@ import {type Extension, Compartment, EditorState} from '@codemirror/state';
 import {EditorView, keymap} from '@codemirror/view';
 import {type MutableRefObject, memo, useEffect, useRef} from 'react';
 
-import {editorExtensions, editorLanguage, INDENT, viewerExtensions} from '@/lib/editor';
+import {editorExtensions, editorLanguage, INDENT, settingsExtensions, viewerExtensions} from '@/lib/editor';
+import {useEditorSettings} from '@/lib/editorSettings';
 import type {Language} from '@/lib/types';
 
 interface Props {
@@ -68,6 +69,10 @@ const StepEditor = memo(
     const onRunRef = useRef(onRun);
     const languageCompartment = useRef(new Compartment());
     const diffCompartment = useRef(new Compartment());
+    const settingsCompartment = useRef(new Compartment());
+    const settings = useEditorSettings();
+    const settingsRef = useRef(settings);
+    settingsRef.current = settings;
     /** Editor state of every file opened on this view, by `fileKey`; restored when the file is reopened. */
     const states = useRef(new Map<string, EditorState>());
     const lastFileKey = useRef(fileKey);
@@ -78,6 +83,8 @@ const StepEditor = memo(
 
     const buildState = (doc: string, baseline: string | null): EditorState => {
       const extensions: Extension[] = [
+        // First, so Vim's bindings see keys before the editing keymaps.
+        settingsCompartment.current.of(settingsExtensions(settings, readOnly)),
         readOnly ? viewerExtensions() : editorExtensions(),
         // Typing comfort the read-only viewers do not need: paired brackets and completion of words
         // already in the file (the starter's identifiers are what the learner types most).
@@ -143,6 +150,13 @@ const StepEditor = memo(
       v.dispatch({effects: languageCompartment.current.reconfigure(languageExtensions(language))});
     }, [language]);
 
+    // Font size, wrapping and key bindings follow the shared settings.
+    useEffect(() => {
+      const v = view.current;
+      if (v === null) return;
+      v.dispatch({effects: settingsCompartment.current.reconfigure(settingsExtensions(settings, readOnly))});
+    }, [settings, readOnly]);
+
     // Viewers follow `value`/`original`; editors swap states on `fileKey` and replace in place on `resetKey`.
     useEffect(() => {
       const v = view.current;
@@ -174,7 +188,12 @@ const StepEditor = memo(
         v.setState(
           cached !== undefined && cached.doc.toString() === value ? cached : buildStateRef.current(value, null),
         );
-        v.dispatch({effects: languageCompartment.current.reconfigure(languageExtensions(language))});
+        v.dispatch({
+          effects: [
+            languageCompartment.current.reconfigure(languageExtensions(language)),
+            settingsCompartment.current.reconfigure(settingsExtensions(settingsRef.current, readOnly)),
+          ],
+        });
         return;
       }
       if (lastResetKey.current === resetKey) return;

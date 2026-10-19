@@ -124,7 +124,7 @@ dialog[open] {
     height: 100%;
     background: var(--lb-panel);
     color: var(--lb-text);
-    font-size: 13px;
+    /* font-size: set per editor from the learner's settings (src/lib/editor.ts, settingsExtensions) */
   }
 
   .cm-editor.cm-focused {
@@ -226,6 +226,19 @@ dialog[open] {
 
   .cm-panels {
     background: theme('colors.ink.800');
+    color: var(--lb-text);
+  }
+
+  /* Vim's status line (mode, pending keys, `:` commands) under the editor */
+  .cm-vim-panel {
+    border-top: 1px solid theme('colors.ink.700');
+    font-family: var(--font-code), monospace;
+    font-size: 11px;
+    line-height: 1.6;
+    color: theme('colors.ink.300');
+  }
+
+  .cm-vim-panel input {
     color: var(--lb-text);
   }
 

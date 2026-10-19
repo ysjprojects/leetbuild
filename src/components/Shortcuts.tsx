@@ -24,6 +24,7 @@ export const SHORTCUTS: readonly Shortcut[] = [
   {keys: mod("'"), label: 'Run the example check (nothing recorded)'},
   {keys: mod('B'), label: 'Show or hide the file explorer'},
   {keys: mod('\\'), label: 'Show or hide the problem pane'},
+  {keys: MAC ? '⌘⇧F' : 'Ctrl+Shift+F', label: 'Focus: fold the explorer and the problem pane together, and back'},
   {keys: mod(';'), label: 'Open or close the scratchpad'},
   {keys: alt(']'), label: 'Next step (once unlocked)'},
   {keys: alt('['), label: 'Previous step'},
