@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import {type FC, memo, useCallback, useMemo, useState} from 'react';
 
-import {applyListQuery, isDefaultQuery} from '@/lib/catalog';
+import {applyListQuery, problemStatus} from '@/lib/catalog';
 import {type Streak, activityByDay, badgeProgress, BADGES, stepOfTheDay} from '@/lib/gamify';
 import {useListQuery} from '@/lib/listQuery';
 import {type Profile, type StepAttempt, OPEN_ATTEMPT, problemScore, rankProgress} from '@/lib/scoring';
@@ -448,7 +448,10 @@ const ProblemList: FC<{
   const [query, update, reset] = useListQuery();
   const shown = useMemo(() => applyListQuery(problems, attempts, query), [problems, attempts, query]);
   const numbers = useMemo(() => new Map(problems.map((p, i) => [p.id, i])), [problems]);
-  const filtered = !isDefaultQuery(query);
+  const solvedCount = useMemo(
+    () => problems.filter(p => problemStatus(p, attempts) === 'solved').length,
+    [problems, attempts],
+  );
   return (
     <div className="mx-auto w-full max-w-4xl space-y-5 px-4 py-5">
       <LandingIntro />
@@ -463,19 +466,15 @@ const ProblemList: FC<{
         today={today}
       />
       <section>
-        <p className="mb-2 flex items-baseline gap-2">
-          <span className="text-iris-400 text-[11px] font-bold uppercase tracking-wider">Problems</span>
-          <span className="font-code text-ink-400 text-[11px]">
-            {filtered ? `${shown.length} of ${problems.length}` : problems.length}
-          </span>
-          {filtered ? (
-            <button className="text-iris-300 hover:text-iris-200 text-[11px] transition" onClick={reset} type="button">
-              clear filters
-            </button>
-          ) : null}
-        </p>
         <div className="mb-3">
-          <ListControls query={query} update={update} />
+          <ListControls
+            query={query}
+            reset={reset}
+            shown={shown.length}
+            solved={solvedCount}
+            total={problems.length}
+            update={update}
+          />
         </div>
         {shown.length === 0 ? (
           <p className="border-ink-700 text-ink-300 rounded-xl border border-dashed px-4 py-6 text-center text-[12px]">
