@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import inspect
+import sys
 from typing import Any, Callable
 
 from .clock import CLOCK
@@ -91,6 +92,23 @@ class RpcMethodHandler:
         return self.unary_unary or self.unary_stream or self.stream_unary or self.stream_stream
 
 
+def _caller_is_harness() -> bool:
+    """
+    Whether the nearest learner-or-harness frame on the current stack is the harness's: a call counts
+    toward the learner's metrics only when it is not. Only the synchronous stack is walked — a task
+    boundary cuts it exactly where responsibility changes hands.
+    """
+    frame = sys._getframe(1)
+    while frame is not None:
+        name = frame.f_code.co_filename
+        if name == "<harness>":
+            return True
+        if name.startswith("/work") or name.startswith("/support"):
+            return False
+        frame = frame.f_back
+    return False
+
+
 class Call:
     """One invocation as the registry saw it."""
 
@@ -103,6 +121,8 @@ class Call:
         self.target = target
         self.started = CLOCK.time()
         self.code: StatusCode | None = None
+        # Made by the harness (a check calling the learner's server) rather than by the learner's code.
+        self.from_harness = _caller_is_harness()
 
     @property
     def method(self) -> str:

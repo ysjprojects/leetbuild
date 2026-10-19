@@ -18,6 +18,7 @@
  *   ctx.client(app)          in-process HTTP: get/post/put/patch/delete/request → {status, headers, text, json()}
  *   ctx.drain(promise)       await the learner's loop until it ends or the sleep budget stops it
  */
+import type {RunMetrics} from '../types';
 import {Buffer} from './buffer';
 import {CLOCK} from './clock';
 import * as grpc from './grpc';
@@ -32,6 +33,7 @@ export interface CheckResult {
   id: string;
   passed: boolean;
   message?: string;
+  metrics?: RunMetrics;
 }
 
 /** Virtual sleeps one check may take before its loops are stopped. */
@@ -249,6 +251,23 @@ const resetWorld = (modules: ModuleSystem): void => {
   modules.purge();
 };
 
+/** What the learner's code did in the check so far, read off the resources (they are reset per check). */
+const snapshotMetrics = (): RunMetrics => {
+  const events = BROKER.events;
+  const count = (kind: string): number => events.reduce((n, e) => (e[0] === kind ? n + 1 : n), 0);
+  return {
+    redisTrips: SERVER.trips.length,
+    redisCommands: SERVER.trips.reduce((n, t) => n + t.filter(c => c !== 'MULTI' && c !== 'EXEC').length, 0),
+    kafkaProduced: count('produce'),
+    kafkaDelivered: count('deliver'),
+    kafkaCommits: count('commit'),
+    grpcCalls: grpc.REGISTRY.calls.reduce((n, c) => (c.fromHarness ? n : n + 1), 0),
+    sqlStatements: DB.learnerStatements,
+    sleeps: CLOCK.sleeps,
+    sleptMs: Math.round(CLOCK.slept),
+  };
+};
+
 type Check = (ctx: Ctx) => unknown;
 
 interface Console {
@@ -312,9 +331,9 @@ export async function runChecks(
         );
       });
       await Promise.race([(check as Check)(ctx), timeout]);
-      results.push({id, passed: true});
+      results.push({id, passed: true, metrics: snapshotMetrics()});
     } catch (e) {
-      results.push({id, passed: false, message: explain(e, modules)});
+      results.push({id, passed: false, message: explain(e, modules), metrics: snapshotMetrics()});
     } finally {
       if (budget !== null) CLOCK.realClearTimeout(budget);
       CLOCK.uninstall();

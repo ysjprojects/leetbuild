@@ -128,6 +128,16 @@ const wrapperLineOffset = ((): number => {
   return frame === undefined ? 0 : frame.line - 1;
 })();
 
+/**
+ * Whether the nearest module frame on the current stack is the harness's: a resource counts a call
+ * toward the learner's metrics only when it is not. Synchronous frames only, which is what matters —
+ * an `await` cuts the stack exactly where the responsibility changes hands.
+ */
+export function callerIsHarness(): boolean {
+  const frame = parseStack(new Error().stack ?? '').find(f => f.file.startsWith(RUNTIME_PREFIX));
+  return frame !== undefined && frame.file.slice(RUNTIME_PREFIX.length) === HARNESS;
+}
+
 interface ModuleRecord {
   exports: Record<string, unknown>;
   loaded: boolean;

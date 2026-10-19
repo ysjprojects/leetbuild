@@ -136,12 +136,14 @@ export class Broker {
     return record;
   }
 
-  /** Put records from other producers on a topic: redeliveries, duplicates, poison messages. */
+  /** Put records from other producers on a topic: redeliveries, duplicates, poison messages. Not the learner's produce. */
   seed(
     topic: string,
     options: {key?: unknown; value?: unknown; headers?: Record<string, unknown>; partition?: number},
   ): KafkaRecord {
-    return this.produce(topic, options.key, options.value, options.headers, options.partition);
+    const record = this.produce(topic, options.key, options.value, options.headers, options.partition);
+    this.events[this.events.length - 1] = ['seed', topic, record.partition, record.offset];
+    return record;
   }
 
   /** The next `times` produces to `topic` fail with a delivery error. */

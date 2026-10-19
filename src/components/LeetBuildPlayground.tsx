@@ -412,6 +412,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus>({state: 'idle'});
   /** A submission is executing in the runtime; its result is still to come. */
   const [running, setRunning] = useState(false);
+  /** The reference solution's verdict for the accepted step, once compared; the run is in progress while `comparing`. */
+  const [reference, setReference] = useState<Verdict | null>(null);
+  const [comparing, setComparing] = useState(false);
   /** Bumped per submit and on every mount: a run that finishes after the step changed must not show its verdict. */
   const submitSeq = useRef(0);
   /** Below `lg` the problem pane is an accordion over the editor; this is its state (the `lg` sidebar is `layout.pane`). */
@@ -528,6 +531,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       setResetKey(k => k + 1);
       submitSeq.current += 1;
       setVerdict(null);
+      setReference(null);
       setVerdictCode('');
       setEarned(null);
     },
@@ -865,16 +869,19 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
    * instead of TODO stubs. (`yarn verify` mounts the reference for every other step the same way.)
    */
   const assemble = useCallback(
-    (harness: string, checks: readonly string[]): RunJob | null => {
+    (harness: string, checks: readonly string[], own?: string): RunJob | null => {
       if (problem === null || step === null) return null;
       const attempts = progressRef.current.attempts;
       const files: Record<string, string> = {};
       for (const s of problem.steps) {
         const attempt = attempts[stepKey(problem.id, s.id)];
-        const own = s.id === step.id || (attempt?.status === 'accepted' && attempt.language === language);
-        files[fileName(s.file, language)] = own
-          ? filesRef.current[s.id] ?? s.code[language].starter
-          : s.code[language].solution;
+        const theirs = s.id === step.id || (attempt?.status === 'accepted' && attempt.language === language);
+        files[fileName(s.file, language)] =
+          s.id === step.id && own !== undefined
+            ? own
+            : theirs
+            ? filesRef.current[s.id] ?? s.code[language].starter
+            : s.code[language].solution;
       }
       return {files, support: problem.support?.[language] ?? {}, harness, checks: [...checks]};
     },
@@ -890,6 +897,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     const harness = step.harness?.[language];
     if (harness === undefined) {
       setVerdict(result);
+      setReference(null);
       record(result, src);
       showVerdict();
       return;
@@ -900,6 +908,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     );
     if (job === null || runner === null) return;
     setVerdict(null);
+    setReference(null);
     setRunning(true);
     void runner.run(job).then(run => {
       setRunning(false);
@@ -926,6 +935,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     setVerdictCode(src);
     const token = ++submitSeq.current;
     setVerdict(null);
+    setReference(null);
     setEarned(null);
     setRunning(true);
     void runner.run(job).then(run => {
@@ -935,6 +945,30 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       showVerdict();
     });
   }, [problem, step, language, running, runner, assemble, showVerdict]);
+
+  /**
+   * Against the reference: the reference solution in place of the step's file, the same checks, the
+   * same neighbours — for what it did, read off the resources, beside what the learner's code did.
+   */
+  const compare = useCallback(() => {
+    if (problem === null || step === null || running || comparing) return;
+    const harness = step.harness?.[language];
+    if (harness === undefined || runner === null) return;
+    const solution = step.code[language].solution;
+    const job = assemble(
+      harness,
+      step.checks.map(c => c.id),
+      solution,
+    );
+    if (job === null) return;
+    const token = submitSeq.current;
+    setComparing(true);
+    void runner.run(job).then(run => {
+      setComparing(false);
+      if (submitSeq.current !== token) return;
+      setReference(withRuntime(judge(step, language, solution), run));
+    });
+  }, [problem, step, language, running, comparing, runner, assemble]);
 
   /** A past submission's code, read-only, with the edits since it and a way to put it back in the editor. */
   const onViewSubmission = useCallback(
@@ -1346,7 +1380,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                     {step.harness?.[language] !== undefined ? (
                       <button
                         className="border-ink-600 text-ink-200 hover:border-iris-400/60 hover:text-ink-50 rounded-lg border px-2.5 py-[3px] text-[12px] font-semibold transition disabled:cursor-wait disabled:opacity-60"
-                        disabled={running}
+                        disabled={running || comparing}
                         onClick={trial}
                         title={`${RUN_SHORTCUT} · runs ${fileName(
                           step.file,
@@ -1358,7 +1392,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                     ) : null}
                     <button
                       className="bg-iris-400 text-ink-950 hover:bg-iris-300 rounded-lg px-3 py-1 text-[12px] font-bold transition disabled:cursor-wait disabled:opacity-60"
-                      disabled={running}
+                      disabled={running || comparing}
                       onClick={submit}
                       title={`${SUBMIT_SHORTCUT} · judges ${fileName(step.file, language)}`}
                       type="button">
@@ -1393,13 +1427,16 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                 ref={verdictRef}>
                 <VerdictPane
                   attempt={attempt}
+                  comparing={comparing}
                   earned={earned}
                   executes={step.harness?.[language] !== undefined}
                   language={language}
                   nextTitle={problem.steps[stepIndex + 1]?.title}
                   onCertificate={certified ? onCertificate : undefined}
+                  onCompare={compare}
                   onNext={stepIndex + 1 < problem.steps.length ? onNextStep : undefined}
                   onViewSubmission={onViewSubmission}
+                  reference={reference}
                   running={running}
                   runtime={runtimeStatus}
                   shareUrl={stepShareUrl}

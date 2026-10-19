@@ -106,7 +106,11 @@ class Broker:
         self.events.append(("produce", topic, partition, record.offset))
         return record
 
-    seed = produce
+    def seed(self, topic: str, key=None, value=None, headers=None, partition: int | None = None) -> Record:
+        """Put a record from another producer on a topic (the harness's); not the learner's produce."""
+        record = self.produce(topic, key, value, headers, partition)
+        self.events[-1] = ("seed", topic, record.partition, record.offset)
+        return record
 
     def fail_next(self, topic: str, times: int = 1) -> None:
         """The next `times` produces to `topic` fail with a delivery error (served through the callback)."""

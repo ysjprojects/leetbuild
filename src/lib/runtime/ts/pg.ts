@@ -52,6 +52,8 @@ export class Db {
   statements: string[] = [];
   /** What the server was asked, in order: `[sql, params]` — the query log a DBA would read. */
   queries: [string, unknown[]][] = [];
+  /** Statements the learner's clients ran (the harness's `execute` is not one). */
+  learnerStatements = 0;
   probes: DbProbe[] = [];
   private lock: Promise<void> = Promise.resolve();
 
@@ -60,11 +62,12 @@ export class Db {
     this.statements = [];
     this.queries = [];
     this.probes = [];
+    this.learnerStatements = 0;
   }
 
-  /** One statement with autocommit; rows as objects keyed by column name. */
+  /** One statement with autocommit, from the harness; rows as objects keyed by column name. */
   async execute<R = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<R[]> {
-    const {rows} = await this.run<R>(sql, params);
+    const {rows} = await this.run<R>(sql, params, false, false);
     return rows;
   }
 
@@ -103,9 +106,10 @@ export class Db {
     }
   }
 
-  /** @internal — the statement path every client goes through. */
-  async run<R>(sql: string, params: unknown[], held = false): Promise<QueryResult<R>> {
-    if (!held) return this.withConnection(() => this.run<R>(sql, params, true));
+  /** @internal — the statement path every client goes through; `counted: false` is the harness's own statement. */
+  async run<R>(sql: string, params: unknown[], held = false, counted = true): Promise<QueryResult<R>> {
+    if (!held) return this.withConnection(() => this.run<R>(sql, params, true, counted));
+    if (counted) this.learnerStatements += 1;
     this.statements.push(sql);
     this.queries.push([sql, params]);
     const upper = sql.trim().toUpperCase();

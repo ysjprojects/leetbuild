@@ -22,6 +22,7 @@ export const WHEELS = ['redis-8.1.0-py3-none-any.whl', 'fakeredis-2.39.0-py3-non
 export const RUNTIME_FILES = [
   'leetbuild/__init__.py',
   'leetbuild/clock.py',
+  'leetbuild/metrics.py',
   'leetbuild/kafka.py',
   'leetbuild/grpcsim.py',
   'leetbuild/db.py',

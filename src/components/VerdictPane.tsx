@@ -1,9 +1,10 @@
 import {type FC, memo, useCallback, useMemo, useState} from 'react';
 
-import {type Verdict, describeMatcher} from '@/lib/judge';
+import {type CheckResult, type Verdict, describeMatcher} from '@/lib/judge';
+import {type MetricRow, comparedRows, metricByCheck, total} from '@/lib/metrics';
 import {type RuntimeStatus, STATUS_TEXT} from '@/lib/runtime/client';
 import type {StepAttempt, Submission} from '@/lib/scoring';
-import {type Language, type Step, type StepCheck, LANGUAGE_LABEL} from '@/lib/types';
+import {type Language, type Step, type StepCheck, fileName, LANGUAGE_LABEL} from '@/lib/types';
 
 import {InlineMarkdown} from './Markdown';
 import {mod} from './Shortcuts';
@@ -209,6 +210,120 @@ const Output: FC<{stdout: string; stderr: string}> = memo(({stdout, stderr}) => 
 });
 Output.displayName = 'VerdictOutput';
 
+/** One metric row: your total, the reference's, the difference; per-check values in the tooltips. */
+const MetricLine: FC<{row: MetricRow; step: Step; yours: readonly CheckResult[]; reference: readonly CheckResult[]}> =
+  memo(({row, step, yours, reference}) => {
+    const mine = metricByCheck(yours, row.key);
+    const theirs = metricByCheck(reference, row.key);
+    const a = total(mine);
+    const b = total(theirs);
+    const perCheck = (values: number[]): string =>
+      step.checks.map((c, i) => `${i + 1}. ${c.title}: ${row.format(values[i] ?? 0)}`).join('\n');
+    return (
+      <tr className="border-ink-700/70 border-t">
+        <th className="text-ink-200 py-1 pr-3 text-left font-semibold" scope="row" title={row.blurb}>
+          {row.label}
+        </th>
+        <td className="font-code text-ink-50 py-1 pr-3 text-right" title={perCheck(mine)}>
+          {row.format(a)}
+        </td>
+        <td className="font-code text-ink-300 py-1 pr-3 text-right" title={perCheck(theirs)}>
+          {row.format(b)}
+        </td>
+        <td
+          className={`font-code py-1 text-right text-[11px] ${
+            a === b ? 'text-ink-500' : a > b ? 'text-warning-300' : 'text-iris-300'
+          }`}>
+          {a === b ? 'same' : a > b ? `+${row.format(a - b)}` : `−${row.format(b - a)}`}
+        </td>
+      </tr>
+    );
+  });
+MetricLine.displayName = 'MetricLine';
+
+/**
+ * Against the reference: a button until it has run, then the table — what your code and the
+ * reference solution each did under the same checks, totalled over the checks (per-check figures
+ * in the tooltips). More is amber, less is iris, neither is a verdict.
+ */
+const Comparison: FC<{
+  step: Step;
+  file: string;
+  yours: readonly CheckResult[];
+  reference: Verdict | null;
+  comparing: boolean;
+  onCompare: () => void;
+}> = memo(({step, file, yours, reference, comparing, onCompare}) => {
+  const rows = useMemo(() => (reference === null ? [] : comparedRows(yours, reference.results)), [yours, reference]);
+  return (
+    <section className="border-ink-700 bg-ink-850 mb-3 rounded-lg border px-3 py-2">
+      <p className="flex flex-wrap items-baseline justify-between gap-2">
+        <span className="text-ink-300 text-[11px] font-bold uppercase tracking-wider">Against the reference</span>
+        {reference === null && !comparing ? (
+          <button
+            className="border-ink-600 text-ink-200 hover:border-iris-400/60 hover:text-ink-50 rounded-lg border px-2.5 py-0.5 text-[11px] font-semibold transition"
+            onClick={onCompare}
+            title={`runs the reference solution in place of ${file}, through the same checks, and counts what it did`}
+            type="button">
+            compare
+          </button>
+        ) : null}
+      </p>
+      {comparing ? (
+        <p className="text-iris-200 mt-1 flex items-center gap-1.5 text-[12px]">
+          <span className="bg-iris-300 h-1.5 w-1.5 animate-pulse rounded-full" />
+          running the reference solution through the same checks…
+        </p>
+      ) : reference === null ? (
+        <p className="text-ink-400 mt-1 text-[12px]">
+          Run the reference solution through the same {step.checks.length} checks and set what each did side by side:
+          Redis round trips, records, RPCs, statements, waits — counted by the runtime, so the difference is in the
+          code.
+        </p>
+      ) : reference.run?.error !== undefined || !reference.accepted ? (
+        <p className="text-warning-200 mt-1 text-[12px]">
+          The reference did not pass every check in this world
+          {reference.run?.error !== undefined ? ` (${reference.run.error})` : ''}: nothing to compare.
+        </p>
+      ) : rows.length === 0 ? (
+        <p className="text-ink-400 mt-1 text-[12px]">Neither run touched a counted resource: nothing to compare.</p>
+      ) : (
+        <>
+          <table className="mt-1.5 w-full text-[12px]">
+            <thead>
+              <tr className="text-ink-400 text-[10px] uppercase tracking-wider">
+                <th className="pb-1 text-left font-semibold" scope="col">
+                  over {step.checks.length} checks
+                </th>
+                <th className="pb-1 pr-3 text-right font-semibold" scope="col">
+                  you
+                </th>
+                <th className="pb-1 pr-3 text-right font-semibold" scope="col">
+                  reference
+                </th>
+                <th className="pb-1 text-right font-semibold" scope="col">
+                  Δ
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(row => (
+                <MetricLine key={row.key} reference={reference.results} row={row} step={step} yours={yours} />
+              ))}
+            </tbody>
+          </table>
+          <p className="text-ink-400 mt-1.5 text-[11px]">
+            Counted by the runtime's Redis, broker, gRPC, Postgres and clock while each check ran; the harness's own
+            calls are not included, and hovering a figure lists it per check. Fewer is not always better — the debrief
+            says why the reference is shaped the way it is.
+          </p>
+        </>
+      )}
+    </section>
+  );
+});
+Comparison.displayName = 'ReferenceComparison';
+
 const VerdictPane: FC<{
   step: Step;
   language: Language;
@@ -233,6 +348,12 @@ const VerdictPane: FC<{
   onCertificate?: () => void;
   /** Open a past submission's code (only submissions that kept their code offer it). */
   onViewSubmission?: (submission: Submission) => void;
+  /** Run the reference solution through the same checks and compare what each did. */
+  onCompare?: () => void;
+  /** The reference's verdict for this step, once compared. */
+  reference?: Verdict | null;
+  /** The reference is running. */
+  comparing?: boolean;
 }> = memo(
   ({
     step,
@@ -249,6 +370,9 @@ const VerdictPane: FC<{
     shareUrl,
     onCertificate,
     onViewSubmission,
+    onCompare,
+    reference = null,
+    comparing = false,
   }) => {
     const showShape = attempt.wrong >= SHAPE_AFTER_WRONG;
     const runError = verdict?.run?.error;
@@ -385,6 +509,20 @@ const VerdictPane: FC<{
               {common !== null ? <p className="font-code text-ink-50 mt-1.5 text-[12px]">{common}</p> : null}
             </div>
           )}
+          {verdict !== null &&
+          verdict.accepted &&
+          verdict.trial !== true &&
+          verdict.run !== undefined &&
+          onCompare !== undefined ? (
+            <Comparison
+              comparing={comparing}
+              file={fileName(step.file, language)}
+              onCompare={onCompare}
+              reference={reference}
+              step={step}
+              yours={verdict.results}
+            />
+          ) : null}
           <ul className="space-y-1.5">
             {step.checks.map((check, i) => {
               const result = verdict?.results.find(r => r.id === check.id) ?? null;

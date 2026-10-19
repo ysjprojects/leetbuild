@@ -16,6 +16,8 @@ class Clock:
         self._real_async_sleep = asyncio.sleep
         self.offset = 0.0
         self.sleeps = 0
+        # Virtual seconds the sleeps covered.
+        self.slept = 0.0
         self.sleep_limit: int | None = None
         # Background timers (Kafka's auto-commit) — they outlive `reset`, which only rewinds time.
         self._listeners: list = []
@@ -31,6 +33,7 @@ class Clock:
     def reset(self, sleep_limit: int | None = None) -> None:
         self.offset = 0.0
         self.sleeps = 0
+        self.slept = 0.0
         self.sleep_limit = sleep_limit
 
     def time(self) -> float:
@@ -63,6 +66,7 @@ class Clock:
         self.sleeps += 1
         if self.sleep_limit is not None and self.sleeps > self.sleep_limit:
             raise KeyboardInterrupt(f"stopped after {self.sleep_limit} sleeps")
+        self.slept += seconds
         self.offset += seconds
         self._fire()
 

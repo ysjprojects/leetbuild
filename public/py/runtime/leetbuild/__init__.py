@@ -52,18 +52,55 @@ def _patch_redis() -> None:
     import fakeredis
     import redis
     import redis.asyncio
+    from redis.asyncio.client import Pipeline as _AsyncPipeline
+    from redis.client import Pipeline as _SyncPipeline
 
     from .harness import SERVER
+    from .metrics import METRICS
+
+    # The learner's clients count what they send (one trip per command, one per pipeline or
+    # transaction); the harness uses fakeredis's own classes, so its reads stay out of the count.
+    class Pipeline(_SyncPipeline):
+        def execute(self, raise_on_error=True):
+            METRICS.redis_trip(len(self.command_stack))
+            return super().execute(raise_on_error)
+
+        def immediate_execute_command(self, *args, **options):
+            METRICS.redis_trip(1)
+            return super().immediate_execute_command(*args, **options)
 
     class Redis(fakeredis.FakeRedis):
         def __init__(self, *args, **kwargs) -> None:
             kwargs.setdefault("server", SERVER)
             super().__init__(*args, **kwargs)
 
+        def execute_command(self, *args, **options):
+            METRICS.redis_trip(1)
+            return super().execute_command(*args, **options)
+
+        def pipeline(self, transaction=True, shard_hint=None):
+            return Pipeline(self.connection_pool, self.response_callbacks, transaction, shard_hint)
+
+    class AsyncPipeline(_AsyncPipeline):
+        async def execute(self, raise_on_error=True):
+            METRICS.redis_trip(len(self.command_stack))
+            return await super().execute(raise_on_error)
+
+        async def immediate_execute_command(self, *args, **options):
+            METRICS.redis_trip(1)
+            return await super().immediate_execute_command(*args, **options)
+
     class AsyncRedis(fakeredis.FakeAsyncRedis):
         def __init__(self, *args, **kwargs) -> None:
             kwargs.setdefault("server", SERVER)
             super().__init__(*args, **kwargs)
+
+        async def execute_command(self, *args, **options):
+            METRICS.redis_trip(1)
+            return await super().execute_command(*args, **options)
+
+        def pipeline(self, transaction=True, shard_hint=None):
+            return AsyncPipeline(self.connection_pool, self.response_callbacks, transaction, shard_hint)
 
     redis.Redis = Redis
     redis.StrictRedis = Redis

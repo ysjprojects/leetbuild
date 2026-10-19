@@ -21,7 +21,7 @@ import importlib
 import inspect
 import sys
 import traceback
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Sequence
 
 import fakeredis
 from fakeredis._socket._base import BaseFakeSocket
@@ -31,6 +31,7 @@ from .clock import CLOCK
 from .db import DB
 from .grpcsim import REGISTRY
 from .kafka import BROKER
+from .metrics import METRICS
 
 WORK = "/work"
 SUPPORT = "/support"
@@ -74,6 +75,24 @@ def _process_command_with_probes(self, fields: list[bytes]) -> None:
 BaseFakeSocket._process_command = _process_command_with_probes
 
 
+class HarnessDb:
+    """
+    The harness's handle on Postgres: the same database the learner's code uses, but statements run
+    through it are the harness's own and stay out of the learner's metrics. The logs (`events`,
+    `statements`, `queries`) are the shared ones.
+    """
+
+    def __init__(self, db) -> None:
+        self._db = db
+
+    async def execute(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
+        rows, _ = await self._db._run(sql, params, counted=False)
+        return rows
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._db, name)
+
+
 class Ctx:
     def __init__(self, files: dict[str, str]) -> None:
         self.files = files
@@ -82,7 +101,7 @@ class Ctx:
         self.kafka = BROKER
         self.grpc = REGISTRY
         self.clock = CLOCK
-        self.db = DB
+        self.db = HarnessDb(DB)
 
     def load(self, stem: str) -> Any:
         """Import a learner (or support) module fresh, by module name (`thumb_cache`, `payments.db`)."""
@@ -149,6 +168,7 @@ def reset_world() -> None:
     DB.statements.clear()
     DB.queries.clear()
     DB.probes.clear()
+    METRICS.reset()
     _PROBES.clear()
     _purge_modules()
 
@@ -179,6 +199,22 @@ async def _cancel_stray_tasks() -> None:
             pass
 
 
+def _metrics() -> dict:
+    """What the learner's code did in the check so far, read off the resources (they are reset per check)."""
+    events = BROKER.events
+    return {
+        "redisTrips": METRICS.redis_trips,
+        "redisCommands": METRICS.redis_commands,
+        "kafkaProduced": sum(1 for e in events if e[0] == "produce"),
+        "kafkaDelivered": sum(1 for e in events if e[0] == "deliver"),
+        "kafkaCommits": sum(1 for e in events if e[0] == "commit"),
+        "grpcCalls": sum(1 for c in REGISTRY.calls if not c.from_harness),
+        "sqlStatements": METRICS.sql_statements,
+        "sleeps": CLOCK.sleeps,
+        "sleptMs": round(CLOCK.slept * 1000),
+    }
+
+
 async def run_checks(harness_src: str, check_ids: list[str], files: dict[str, str]) -> list[dict]:
     namespace: dict[str, Any] = {"__name__": "harness"}
     try:
@@ -198,13 +234,13 @@ async def run_checks(harness_src: str, check_ids: list[str], files: dict[str, st
             outcome = check(ctx)
             if inspect.isawaitable(outcome):
                 await outcome
-            results.append({"id": cid, "passed": True})
+            results.append({"id": cid, "passed": True, "metrics": _metrics()})
         except AssertionError as exc:
-            results.append({"id": cid, "passed": False, "message": str(exc) or "assertion failed"})
+            results.append({"id": cid, "passed": False, "message": str(exc) or "assertion failed", "metrics": _metrics()})
         except KeyboardInterrupt as exc:
-            results.append({"id": cid, "passed": False, "message": f"the loop never ended ({exc})"})
+            results.append({"id": cid, "passed": False, "message": f"the loop never ended ({exc})", "metrics": _metrics()})
         except BaseException as exc:
-            results.append({"id": cid, "passed": False, "message": _explain(exc)})
+            results.append({"id": cid, "passed": False, "message": _explain(exc), "metrics": _metrics()})
         finally:
             await _cancel_stray_tasks()
     return results

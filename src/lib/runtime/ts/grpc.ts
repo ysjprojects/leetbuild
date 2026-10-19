@@ -14,6 +14,7 @@
  */
 import {Buffer} from './buffer';
 import {CLOCK} from './clock';
+import {callerIsHarness} from './loader';
 
 // ---- status --------------------------------------------------------------------------------------
 
@@ -411,6 +412,8 @@ export interface Call {
   target: string | null;
   started: number;
   code: StatusCode | null;
+  /** Made by the harness (a check calling the learner's server) rather than by the learner's code. */
+  fromHarness: boolean;
 }
 
 type Handler = (call: ServerCall) => void;
@@ -729,7 +732,16 @@ function begin(
   timeout: number | null,
   target: string | null,
 ): {call: Call; installed: Installed; latency: number} {
-  const call: Call = {path, request, metadata, timeout, target, started: CLOCK.now(), code: null};
+  const call: Call = {
+    path,
+    request,
+    metadata,
+    timeout,
+    target,
+    started: CLOCK.now(),
+    code: null,
+    fromHarness: callerIsHarness(),
+  };
   REGISTRY.calls.push(call);
   const failure = REGISTRY.popFailure(path, target);
   if (failure !== null) {

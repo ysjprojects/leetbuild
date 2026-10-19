@@ -52,6 +52,8 @@ export class Clock {
   /** Milliseconds added to real time. */
   offset = 0;
   sleeps = 0;
+  /** Virtual milliseconds the sleeps covered. */
+  slept = 0;
   sleepLimit: number | null = null;
   interrupted = false;
   /** Real wall time, for the host's own bookkeeping. */
@@ -73,6 +75,7 @@ export class Clock {
   reset(sleepLimit: number | null = null): void {
     this.offset = 0;
     this.sleeps = 0;
+    this.slept = 0;
     this.sleepLimit = sleepLimit;
     this.interrupted = false;
     this.timers = [];
@@ -172,7 +175,10 @@ export class Clock {
       }
       this.sleeps += 1;
       const target = sleeps[0].at;
-      if (target > this.now()) this.offset += target - this.now();
+      if (target > this.now()) {
+        this.slept += target - this.now();
+        this.offset += target - this.now();
+      }
       this.fire();
       if (this.timers.some(t => t.interval === null)) this.schedulePump();
     });

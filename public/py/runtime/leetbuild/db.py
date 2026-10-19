@@ -14,6 +14,8 @@ import json
 import re
 from typing import Any, Callable, Sequence
 
+from .metrics import METRICS
+
 _PLACEHOLDER = re.compile(r"%(%|s)")
 
 
@@ -139,9 +141,11 @@ class Db:
         except Exception as exc:
             raise DbError(_message(exc)) from None
 
-    async def _run(self, sql: str, params: Sequence[Any]) -> tuple[list[dict], int]:
+    async def _run(self, sql: str, params: Sequence[Any], counted: bool = True) -> tuple[list[dict], int]:
         import leetbuild_host
 
+        if counted:
+            METRICS.sql_statements += 1
         self.statements.append(sql)
         self.queries.append((sql, list(params)))
         try:
