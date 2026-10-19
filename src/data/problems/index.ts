@@ -15,6 +15,7 @@ import {netflixCountersProblem} from './11-netflix-counters/index';
 import {discordMessagesProblem} from './12-discord-messages/index';
 import {stripeLedgerProblem} from './13-stripe-ledger/index';
 import {dropboxGatesProblem} from './14-dropbox-gates/index';
+import {doordashSupportProblem} from './15-doordash-support/index';
 
 /**
  * Problem order on the list page: easy first, then medium, then hard. Company-tagged courses
@@ -29,6 +30,7 @@ export const problems: Problem[] = [
   notificationsProblem,
   redditPlaceProblem,
   netflixCountersProblem,
+  doordashSupportProblem,
   matchEngineProblem,
   merchantPaymentsProblem,
   flashSaleProblem,

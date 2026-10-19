@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package support;
+
+// The model-serving service the assistant calls (step 3 unary, step 5 streaming). In this course it
+// is a stand-in served by the harness — deterministic, so what the system around it does can be
+// graded — at two addresses: llm-large:50051 and llm-small:50051.
+service Llm {
+  rpc Generate(GenerateRequest) returns (GenerateReply);
+  rpc Stream(GenerateRequest) returns (stream Token);
+}
+
+message GenerateRequest {
+  // "large" or "small": which model the caller believes it is talking to; echoed in the reply.
+  string model = 1;
+  string prompt = 2;
+  // Hard cap on the reply, in tokens (words, in this course).
+  int32 max_tokens = 3;
+}
+
+message GenerateReply {
+  string text = 1;
+  int32 tokens = 2;
+  string model = 3;
+}
+
+message Token {
+  string text = 1;
+  int32 index = 2;
+}
+
+// The LLM evaluator (step 4's second tier, step 6's offline judge), served by the harness at judge:50051.
+service Judge {
+  rpc Evaluate(EvaluateRequest) returns (Scores);
+}
+
+message EvaluateRequest {
+  string question = 1;
+  string answer = 2;
+  // Chunk ids the answer was allowed to draw on.
+  repeated string context_ids = 3;
+}
+
+message Scores {
+  float groundedness = 1;
+  float coherence = 2;
+  float compliance = 3;
+  bool pass = 4;
+}
+
+// The streaming chat the Dasher app uses (step 5): tokens as they come, then one done event.
+service Chat {
+  rpc Stream(ChatRequest) returns (stream ChatEvent);
+}
+
+message ChatRequest {
+  string session_id = 1;
+  string dasher_id = 2;
+  string message = 3;
+}
+
+message ChatEvent {
+  // One token of the answer; empty on the done event.
+  string token = 1;
+  bool done = 2;
+  // Set on the done event.
+  repeated string sources = 3;
+  bool escalated = 4;
+  string model = 5;
+}

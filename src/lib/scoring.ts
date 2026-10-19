@@ -35,11 +35,11 @@ export const OPEN_ATTEMPT: StepAttempt = {status: 'open', hints: 0, wrong: 0, la
 
 /**
  * Points per step by difficulty, chosen so every course together adds up to exactly
- * `COURSE_POINTS` (14 easy + 27 medium + 41 hard steps: 70 + 324 + 943 = 1337). The verify script
+ * `COURSE_POINTS` (14 easy + 33 medium + 41 hard steps: 56 + 297 + 984 = 1337). The verify script
  * enforces the total, so adding or removing a step — or a course — means re-balancing these; an
  * issued certificate keeps the maximum it was earned under (it travels in its URL).
  */
-export const STEP_POINTS: Record<Difficulty, number> = {easy: 5, medium: 12, hard: 23};
+export const STEP_POINTS: Record<Difficulty, number> = {easy: 4, medium: 9, hard: 24};
 
 /** Every course together is worth exactly this many points — the number is the point. */
 export const COURSE_POINTS = 1337;
