@@ -1,7 +1,9 @@
 import Link from 'next/link';
 import {type FC, memo, useCallback, useMemo, useState} from 'react';
 
+import {applyListQuery, isDefaultQuery} from '@/lib/catalog';
 import {type Streak, activityByDay, badgeProgress, BADGES, stepOfTheDay} from '@/lib/gamify';
+import {useListQuery} from '@/lib/listQuery';
 import {type Profile, type StepAttempt, OPEN_ATTEMPT, problemScore, rankProgress} from '@/lib/scoring';
 import {type TimedSession, bestSession, formatClock} from '@/lib/timer';
 import {type Difficulty, type Problem, CONCEPT_LABEL, stepKey, stepPath} from '@/lib/types';
@@ -9,6 +11,7 @@ import {type Difficulty, type Problem, CONCEPT_LABEL, stepKey, stepPath} from '@
 import {BadgeCatalog, BadgeGlyph} from './Badges';
 import {useDialog} from './Dialog';
 import {ActivityHeatmap} from './Heatmap';
+import {ListControls} from './ListControls';
 import {LandingIntro} from './LoadingScreen';
 import {CompanyChip, CONCEPT_COLOR, ConceptChip, DifficultyChip} from './paneShared';
 import {Clock, SessionList} from './Timer';
@@ -441,35 +444,63 @@ const ProblemList: FC<{
   activeDays: readonly string[];
   today: string;
   sessions: readonly TimedSession[];
-}> = memo(({problems, attempts, profile, streak, badges, activeDays, today, sessions}) => (
-  <div className="mx-auto w-full max-w-4xl space-y-5 px-4 py-5">
-    <LandingIntro />
-    <ProfileStrip
-      activeDays={activeDays}
-      attempts={attempts}
-      badges={badges}
-      problems={problems}
-      profile={profile}
-      sessions={sessions}
-      streak={streak}
-      today={today}
-    />
-    <section>
-      <p className="text-iris-400 mb-2 text-[11px] font-bold uppercase tracking-wider">Problems</p>
-      <ul className="space-y-2">
-        {problems.map((problem, i) => (
-          <ProblemRow
-            attempts={attempts}
-            best={bestSession(sessions, problem.id)}
-            index={i}
-            key={problem.id}
-            problem={problem}
-          />
-        ))}
-      </ul>
-    </section>
-  </div>
-));
+}> = memo(({problems, attempts, profile, streak, badges, activeDays, today, sessions}) => {
+  const [query, update, reset] = useListQuery();
+  const shown = useMemo(() => applyListQuery(problems, attempts, query), [problems, attempts, query]);
+  const numbers = useMemo(() => new Map(problems.map((p, i) => [p.id, i])), [problems]);
+  const filtered = !isDefaultQuery(query);
+  return (
+    <div className="mx-auto w-full max-w-4xl space-y-5 px-4 py-5">
+      <LandingIntro />
+      <ProfileStrip
+        activeDays={activeDays}
+        attempts={attempts}
+        badges={badges}
+        problems={problems}
+        profile={profile}
+        sessions={sessions}
+        streak={streak}
+        today={today}
+      />
+      <section>
+        <p className="mb-2 flex items-baseline gap-2">
+          <span className="text-iris-400 text-[11px] font-bold uppercase tracking-wider">Problems</span>
+          <span className="font-code text-ink-400 text-[11px]">
+            {filtered ? `${shown.length} of ${problems.length}` : problems.length}
+          </span>
+          {filtered ? (
+            <button className="text-iris-300 hover:text-iris-200 text-[11px] transition" onClick={reset} type="button">
+              clear filters
+            </button>
+          ) : null}
+        </p>
+        <div className="mb-3">
+          <ListControls query={query} update={update} />
+        </div>
+        {shown.length === 0 ? (
+          <p className="border-ink-700 text-ink-300 rounded-xl border border-dashed px-4 py-6 text-center text-[12px]">
+            No course matches{query.q.trim() !== '' ? ` “${query.q.trim()}”` : ''} with these filters.{' '}
+            <button className="text-iris-300 hover:text-iris-200 transition" onClick={reset} type="button">
+              Clear them ›
+            </button>
+          </p>
+        ) : (
+          <ul className="space-y-2">
+            {shown.map(problem => (
+              <ProblemRow
+                attempts={attempts}
+                best={bestSession(sessions, problem.id)}
+                index={numbers.get(problem.id) ?? 0}
+                key={problem.id}
+                problem={problem}
+              />
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+});
 ProblemList.displayName = 'ProblemList';
 
 export default ProblemList;

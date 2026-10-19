@@ -51,6 +51,7 @@ export const CONCEPTS: readonly Concept[] = ['http', 'grpc', 'kafka', 'redis'];
 export const CONCEPT_LABEL: Record<Concept, string> = {http: 'HTTPS', grpc: 'gRPC', kafka: 'Kafka', redis: 'Redis'};
 
 export type Difficulty = 'easy' | 'medium' | 'hard';
+export const DIFFICULTIES: readonly Difficulty[] = ['easy', 'medium', 'hard'];
 
 /**
  * What a check looks for in the learner's code once comments are stripped. Every `all` pattern
