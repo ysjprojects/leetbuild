@@ -295,7 +295,6 @@ const SystemDiagram: FC<{
           </span>
         ))}
         {wide ? <span className="text-ink-400">wide diagram · scroll sideways</span> : null}
-        {dimming ? <span className="text-iris-300 ml-auto">highlighted: what this step builds</span> : null}
       </div>
     </div>
   );
