@@ -1,3 +1,4 @@
+import Link from 'next/link';
 import {type CSSProperties, type FC, createContext, memo, useContext} from 'react';
 
 /**
@@ -44,17 +45,51 @@ export const BrandLockup: FC<{className?: string; size?: 'md' | 'lg'}> = memo(({
 BrandLockup.displayName = 'BrandLockup';
 
 /** Copy the landing page opens with — real text, so it is already in place while the rest loads. */
-export const LandingIntro: FC = memo(() => (
-  <div>
-    <h1 className="text-ink-50 text-2xl font-extrabold leading-tight">Build systems, step by step</h1>
-    <p className="text-ink-200 mt-1 max-w-2xl text-[13px] leading-relaxed">
-      Every problem is a real system cut down to the parts that matter: an HTTPS API, a gRPC call, a Kafka topic, a
-      Redis key. You implement it one file at a time in Python, TypeScript, Go, Scala or C++; the judge checks each
-      step, hints cost points, and revealing the answer costs all of them. Each problem&apos;s tutorial can be
-      downloaded as Markdown from its page.
-    </p>
-  </div>
-));
+export const LandingIntro: FC<{stats?: readonly string[]}> = memo(
+  ({stats = ['real systems', '5 languages', 'AI-era track', '1337 points']}) => (
+    <section className="border-ink-700 from-iris-400/[0.10] relative overflow-hidden rounded-2xl border bg-gradient-to-br via-transparent to-transparent p-5 sm:p-6">
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0 bg-[radial-gradient(80%_120%_at_0%_0%,rgba(108,76,241,0.18),transparent_60%),radial-gradient(60%_90%_at_100%_0%,rgba(45,212,160,0.10),transparent_55%)]"
+      />
+      <div className="relative">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <BrandLockup size="lg" />
+          <span className="border-iris-400/40 bg-iris-400/10 text-iris-200 rounded-full border px-3 py-1 text-[11px] font-bold uppercase tracking-wider">
+            Practice
+          </span>
+        </div>
+        <h1 className="text-ink-50 mt-7 max-w-3xl text-3xl font-extrabold leading-[1.1] tracking-tight sm:text-4xl">
+          Build systems. <span className="text-iris-300">Prove you can use AI.</span>
+        </h1>
+        <p className="text-ink-200 mt-4 max-w-2xl text-[14px] leading-7">
+          Real services, one file at a time. Classic systems and AI-era review problems, judged in five languages.
+        </p>
+        <div className="mt-5 flex flex-wrap gap-2">
+          {stats.map(stat => (
+            <span
+              className="border-ink-600 bg-ink-850/80 text-ink-200 rounded-full border px-3 py-1 text-[11px] font-semibold"
+              key={stat}>
+              {stat}
+            </span>
+          ))}
+        </div>
+        <div className="mt-5 flex flex-wrap items-center gap-3">
+          <Link
+            className="bg-iris-400 text-ink-950 hover:bg-iris-300 rounded-lg px-4 py-2 text-[13px] font-bold shadow-[0_8px_24px_rgba(108,76,241,0.18)] transition"
+            href="/mock-interview">
+            AI mock interview →
+          </Link>
+          <a
+            className="text-iris-300 hover:text-iris-200 decoration-iris-400/40 text-[12px] font-semibold underline"
+            href="#problems">
+            Browse courses ↓
+          </a>
+        </div>
+      </div>
+    </section>
+  ),
+);
 LandingIntro.displayName = 'LandingIntro';
 
 const PHASES: Record<LoadingPhase, {index: number; label: string; width: string}> = {
@@ -74,7 +109,7 @@ const ROW_TAGLINES = ['w-3/4', 'w-2/3', 'w-4/5', 'w-1/2', 'w-3/4', 'w-2/3', 'w-3
 
 const ProblemListSkeleton: FC = memo(() => (
   <main className="min-h-0 flex-1 overflow-y-auto">
-    <div className="mx-auto w-full max-w-4xl space-y-5 px-4 py-5">
+    <div className="mx-auto w-full max-w-5xl space-y-6 px-5 py-6">
       <LandingIntro />
       <section className="border-ink-700 bg-ink-850 rounded-xl border px-4 py-3">
         <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
@@ -326,7 +361,6 @@ export const LoadingScreen: FC<{phase: LoadingPhase; problemId: string | null}> 
       <header className="border-ink-700 bg-ink-950/60 flex shrink-0 items-center gap-x-4 border-b px-3 py-2">
         <div className="flex items-center gap-2">
           <BrandLockup />
-          <span className="text-ink-300 hidden text-[12px] sm:inline">build systems. use AI. prove it.</span>
         </div>
         <div className="ml-auto flex items-center gap-2">
           <Bone className="h-6 w-24 rounded-md" />
