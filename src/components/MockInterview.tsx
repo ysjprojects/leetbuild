@@ -6,6 +6,7 @@ import {type Verdict, judge} from '@/lib/judge';
 import {formatClock} from '@/lib/timer';
 import {type Language, fileName, LANGUAGE_LABEL, LANGUAGES} from '@/lib/types';
 
+import {BrandLockup} from './LoadingScreen';
 import Markdown from './Markdown';
 import ModeSwitch from './ModeSwitch';
 import {ghostButtonClass, primaryButtonClass, selectClass} from './paneShared';
@@ -46,20 +47,22 @@ const copyText = async (text: string): Promise<boolean> => {
 
 /** A compact pass/fail list, used both while the clock runs and in the report. */
 const CheckResults: FC<{verdict: Verdict; title: string}> = memo(({verdict, title}) => (
-  <div className="border-ink-700 bg-ink-850 rounded-xl border p-3">
-    <p className="text-ink-100 flex items-baseline justify-between gap-2 text-[12px] font-bold">
+  <div className="border-ink-700 bg-ink-850 rounded-xl border p-4">
+    <p className="text-ink-100 flex items-baseline justify-between gap-3 text-[13px] font-bold">
       <span>{title}</span>
-      <span className="font-code text-ink-300">
+      <span className="font-code text-ink-300 shrink-0">
         {verdict.passed}/{verdict.total} checks
       </span>
     </p>
-    <ul className="mt-2 space-y-1.5">
+    <ul className="mt-3 space-y-2">
       {verdict.results.map(result => (
-        <li className="flex gap-2 text-[11px] leading-snug" key={result.id}>
+        <li className="flex gap-2.5 text-[12px] leading-6" key={result.id}>
           <span className={result.passed ? 'text-success-300' : 'text-danger-300'}>{result.passed ? '✓' : '✗'}</span>
           <span className="min-w-0">
             <span className={result.passed ? 'text-ink-200' : 'text-ink-50 font-semibold'}>{result.title}</span>
-            {!result.passed ? <span className="text-ink-400 mt-0.5 block">{result.detail}</span> : null}
+            {!result.passed ? (
+              <span className="text-ink-400 mt-1 block text-[11px] leading-5">{result.detail}</span>
+            ) : null}
           </span>
         </li>
       ))}
@@ -69,7 +72,7 @@ const CheckResults: FC<{verdict: Verdict; title: string}> = memo(({verdict, titl
 CheckResults.displayName = 'CheckResults';
 
 const SignalChip: FC<{signal: string}> = memo(({signal}) => (
-  <span className="border-iris-400/30 bg-iris-400/[0.08] text-iris-200 rounded-full border px-2 py-0.5 text-[10px] font-semibold">
+  <span className="border-iris-400/30 bg-iris-400/[0.08] text-iris-200 rounded-full border px-2.5 py-1 text-[11px] font-semibold">
     {signal}
   </span>
 ));
@@ -97,6 +100,7 @@ const MockInterview: FC = memo(() => {
   const [promptCopied, setPromptCopied] = useState(false);
   const [promptText, setPromptText] = useState<string | null>(null);
   const logRef = useRef<HTMLDivElement>(null);
+  const mainRef = useRef<HTMLElement>(null);
   const nextMessage = useRef(1);
 
   const scenario = useMemo(
@@ -112,6 +116,11 @@ const MockInterview: FC = memo(() => {
   useEffect(() => {
     if (logRef.current !== null) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [messages]);
+
+  // A new phase starts at its top: the setup page may have been scrolled when the scenario started.
+  useEffect(() => {
+    mainRef.current?.scrollTo({top: 0});
+  }, [phase]);
 
   // One countdown; when it reaches zero the mock ends and the report grades whatever is on screen.
   useEffect(() => {
@@ -290,31 +299,29 @@ const MockInterview: FC = memo(() => {
     return (
       <div className="leetbuild-playground bg-ink-900 text-ink-100 flex h-dvh flex-col overflow-hidden">
         <header className="border-ink-700 bg-ink-950/60 flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b px-3 py-2">
-          <Link
-            className="from-iris-300 to-ink-50 bg-gradient-to-r bg-clip-text text-lg font-extrabold tracking-tight text-transparent"
-            href="/">
-            LeetBuild
+          <Link className="shrink-0" href="/">
+            <BrandLockup />
           </Link>
-          <span className="text-ink-300 hidden text-[11px] sm:inline">
+          <span className="text-ink-300 hidden text-[12px] sm:inline">
             practice the interview loop you will actually face
           </span>
-          <ModeSwitch mode="mock" />
+          <ModeSwitch className="ml-auto" mode="mock" />
         </header>
-        <main className="min-h-0 flex-1 overflow-y-auto">
-          <div className="mx-auto w-full max-w-5xl space-y-5 px-4 py-6">
+        <main className="min-h-0 flex-1 overflow-y-auto" ref={mainRef}>
+          <div className="mx-auto w-full max-w-5xl space-y-7 px-5 py-8">
             <div>
               <p className="text-iris-300 text-[11px] font-bold uppercase tracking-wider">AI-assisted mock interview</p>
-              <h1 className="text-ink-50 mt-1 text-2xl font-extrabold leading-tight">
+              <h1 className="text-ink-50 mt-2 text-2xl font-extrabold leading-tight">
                 You get a flawed AI draft. Fix it under a clock.
               </h1>
-              <p className="text-ink-200 mt-2 max-w-3xl text-[13px] leading-relaxed">
+              <p className="text-ink-200 mt-3 max-w-3xl text-[14px] leading-7">
                 This is practice for the interview loop where the question is not “write it from memory” but “use the
                 model, then prove the result.” Every scenario starts from a plausible model-generated patch, gives you
                 an offline AI pair, and asks for a fix the checks can verify. No hints are free, no solution is
                 revealed, and the timer is the interview.
               </p>
             </div>
-            <div className="grid gap-2 sm:grid-cols-3">
+            <div className="grid gap-3 sm:grid-cols-3">
               {[
                 [
                   '1 · Read the brief',
@@ -329,33 +336,33 @@ const MockInterview: FC = memo(() => {
                   'Accepted or not, you get the checks, the flaw, follow-up questions and a copyable debrief.',
                 ],
               ].map(([title, body]) => (
-                <div className="border-ink-700 bg-ink-850 rounded-xl border p-3" key={title}>
+                <div className="border-ink-700 bg-ink-850 rounded-xl border p-4" key={title}>
                   <p className="text-iris-200 text-[11px] font-bold uppercase tracking-wide">{title}</p>
-                  <p className="text-ink-300 mt-1 text-[11px] leading-relaxed">{body}</p>
+                  <p className="text-ink-300 mt-2 text-[12px] leading-6">{body}</p>
                 </div>
               ))}
             </div>
-            <div className="grid gap-3 md:grid-cols-2">
+            <div className="grid gap-4 md:grid-cols-2">
               {resolvedMockScenarios.map(next => (
-                <article className="border-ink-700 bg-ink-850 flex flex-col rounded-xl border p-4" key={next.id}>
-                  <div className="flex items-start justify-between gap-2">
-                    <h2 className="text-ink-50 text-[14px] font-bold leading-snug">{next.title}</h2>
+                <article className="border-ink-700 bg-ink-850 flex flex-col rounded-xl border p-5" key={next.id}>
+                  <div className="flex items-start justify-between gap-3">
+                    <h2 className="text-ink-50 text-[15px] font-bold leading-snug">{next.title}</h2>
                     <span className="font-code text-ink-300 shrink-0 text-[11px]">{next.minutes}:00</span>
                   </div>
-                  <p className="text-ink-400 mt-0.5 text-[11px]">{next.role}</p>
-                  <p className="text-ink-300 mt-2 flex-1 text-[12px] leading-relaxed">{next.prompt}</p>
-                  <div className="mt-3 flex flex-wrap gap-1.5">
+                  <p className="text-ink-400 mt-1 text-[12px]">{next.role}</p>
+                  <p className="text-ink-300 mt-3 flex-1 text-[13px] leading-6">{next.prompt}</p>
+                  <div className="mt-4 flex flex-wrap gap-1.5">
                     {next.signals.map(signal => (
                       <SignalChip key={signal} signal={signal} />
                     ))}
                   </div>
-                  <button className={`${primaryButtonClass} mt-3 w-full`} onClick={() => start(next)} type="button">
+                  <button className={`${primaryButtonClass} mt-4 w-full`} onClick={() => start(next)} type="button">
                     Start mock interview →
                   </button>
                 </article>
               ))}
             </div>
-            <p className="text-ink-400 border-ink-700 border-t pt-3 text-[11px] leading-relaxed">
+            <p className="text-ink-400 border-ink-700 border-t pt-4 text-[12px] leading-6">
               The AI pair is simulated, not a hosted model: it drafts from the exercise’s starter, reviews with the same
               checks the judge uses, and reveals the scenario’s flaw on request. The point is to practise reviewing AI
               output without an API key or an account. Regular courses live under{' '}
@@ -381,61 +388,59 @@ const MockInterview: FC = memo(() => {
     return (
       <div className="leetbuild-playground bg-ink-900 text-ink-100 flex h-dvh flex-col overflow-hidden">
         <header className="border-ink-700 bg-ink-950/60 flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b px-3 py-2">
-          <Link
-            className="from-iris-300 to-ink-50 bg-gradient-to-r bg-clip-text text-lg font-extrabold tracking-tight text-transparent"
-            href="/">
-            LeetBuild
+          <Link className="shrink-0" href="/">
+            <BrandLockup />
           </Link>
-          <span className="text-ink-300 hidden text-[11px] sm:inline">mock interview report</span>
+          <span className="text-ink-300 hidden text-[12px] sm:inline">mock interview report</span>
           <ModeSwitch mode="mock" />
           <button className={`${ghostButtonClass} ml-auto`} onClick={backToSetup} type="button">
             ← all scenarios
           </button>
         </header>
-        <main className="min-h-0 flex-1 overflow-y-auto">
-          <div className="mx-auto w-full max-w-4xl space-y-4 px-4 py-6">
+        <main className="min-h-0 flex-1 overflow-y-auto" ref={mainRef}>
+          <div className="mx-auto w-full max-w-4xl space-y-5 px-5 py-8">
             <div>
               <p className="text-iris-300 text-[11px] font-bold uppercase tracking-wider">Mock interview report</p>
               <h1 className="text-ink-50 mt-1 text-2xl font-extrabold leading-tight">{scenario.title}</h1>
-              <p className="text-ink-400 mt-1 text-[12px]">{scenario.role}</p>
+              <p className="text-ink-400 mt-2 text-[13px]">{scenario.role}</p>
             </div>
-            <div className="grid gap-2 sm:grid-cols-4">
+            <div className="grid gap-3 sm:grid-cols-4">
               {[
                 ['Outcome', outcome],
                 ['Checks', `${shownVerdict.passed}/${shownVerdict.total}`],
                 ['Submissions', String(attempts)],
                 ['AI hints', String(hints)],
               ].map(([label, value]) => (
-                <div className="border-ink-700 bg-ink-850 rounded-xl border px-3 py-2" key={label}>
-                  <p className="text-ink-400 text-[10px] font-bold uppercase tracking-wider">{label}</p>
-                  <p className="text-ink-50 font-code mt-0.5 text-[14px] font-semibold">{value}</p>
+                <div className="border-ink-700 bg-ink-850 rounded-xl border px-4 py-3" key={label}>
+                  <p className="text-ink-400 text-[11px] font-bold uppercase tracking-wider">{label}</p>
+                  <p className="text-ink-50 font-code mt-1 text-[15px] font-semibold">{value}</p>
                 </div>
               ))}
             </div>
             <CheckResults title="What the checks found" verdict={shownVerdict} />
-            <div className="border-ink-700 bg-ink-850 rounded-xl border p-4">
-              <p className="text-iris-200 text-[11px] font-bold uppercase tracking-wide">What the AI got wrong</p>
-              <p className="text-ink-200 mt-1 text-[12px] leading-relaxed">{scenario.aiNote}</p>
+            <div className="border-ink-700 bg-ink-850 rounded-xl border p-5">
+              <p className="text-iris-200 text-[12px] font-bold uppercase tracking-wide">What the AI got wrong</p>
+              <p className="text-ink-200 mt-2 text-[13px] leading-6">{scenario.aiNote}</p>
               {!shownVerdict.accepted ? (
-                <p className="text-ink-400 mt-2 text-[11px] leading-relaxed">
+                <p className="text-ink-400 mt-3 text-[12px] leading-6">
                   You used {formatClock(used)} of the {scenario.minutes}:00 budget. Retry the scenario and aim to name
                   the failure mode before you run the review.
                 </p>
               ) : null}
             </div>
-            <div className="border-ink-700 bg-ink-850 rounded-xl border p-4">
-              <p className="text-iris-200 text-[11px] font-bold uppercase tracking-wide">Follow-up questions</p>
-              <p className="text-ink-400 mt-1 text-[11px]">
+            <div className="border-ink-700 bg-ink-850 rounded-xl border p-5">
+              <p className="text-iris-200 text-[12px] font-bold uppercase tracking-wide">Follow-up questions</p>
+              <p className="text-ink-400 mt-2 text-[12px] leading-6">
                 In a real interview you would answer these out loud. Write the shape of your answer, not an essay.
               </p>
               <div className="mt-3 space-y-3">
                 {scenario.followUps.map((question, index) => (
                   <label className="block" key={question}>
-                    <span className="text-ink-200 text-[12px]">
+                    <span className="text-ink-200 text-[13px] leading-6">
                       {index + 1}. {question}
                     </span>
                     <textarea
-                      className="border-ink-600 bg-ink-900 text-ink-100 focus:border-iris-400 mt-1 min-h-16 w-full resize-y rounded-lg border p-2 text-[12px] outline-none"
+                      className="border-ink-600 bg-ink-900 text-ink-100 focus:border-iris-400 mt-2 min-h-20 w-full resize-y rounded-lg border p-2.5 text-[13px] leading-6 outline-none"
                       onChange={event => setFollowUps(current => ({...current, [index]: event.target.value}))}
                       placeholder="Your answer…"
                       value={followUps[index] ?? ''}
@@ -444,8 +449,8 @@ const MockInterview: FC = memo(() => {
                 ))}
               </div>
             </div>
-            <div className="border-ink-700 bg-ink-850 rounded-xl border p-4">
-              <p className="text-iris-200 text-[11px] font-bold uppercase tracking-wide">
+            <div className="border-ink-700 bg-ink-850 rounded-xl border p-5">
+              <p className="text-iris-200 text-[12px] font-bold uppercase tracking-wide">
                 Signals this scenario practises
               </p>
               <div className="mt-2 flex flex-wrap gap-1.5">
@@ -454,15 +459,15 @@ const MockInterview: FC = memo(() => {
                 ))}
               </div>
             </div>
-            <details className="border-ink-700 bg-ink-850 rounded-xl border p-4">
-              <summary className="text-iris-200 cursor-pointer text-[11px] font-bold uppercase tracking-wide">
+            <details className="border-ink-700 bg-ink-850 rounded-xl border p-5">
+              <summary className="text-iris-200 cursor-pointer text-[12px] font-bold uppercase tracking-wide">
                 Debrief · what a strong answer sounds like
               </summary>
               <div className="mt-2">
                 <Markdown source={step.debrief} />
               </div>
             </details>
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-3">
               <button className={primaryButtonClass} onClick={() => start(scenario)} type="button">
                 Retry this scenario
               </button>
@@ -484,20 +489,13 @@ const MockInterview: FC = memo(() => {
 
   return (
     <div className="leetbuild-playground bg-ink-900 text-ink-100 flex h-dvh flex-col overflow-hidden">
-      <header className="border-ink-700 bg-ink-950/60 flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b px-3 py-2">
-        <button className={ghostButtonClass} onClick={backToSetup} type="button">
-          ← scenarios
-        </button>
-        <span className="text-ink-50 min-w-0 truncate text-[13px] font-bold">{scenario.title}</span>
-        <span
-          className={`font-code rounded-full border px-2.5 py-1 text-[12px] font-semibold ${
-            secondsLeft <= 120 ? 'border-danger-400/60 bg-danger-400/10 text-danger-300' : 'border-ink-600 text-ink-100'
-          }`}>
-          {formatClock(secondsLeft)}
-        </span>
-        <ModeSwitch className="hidden lg:flex" mode="mock" />
-        <div className="ml-auto flex flex-wrap items-center gap-2">
-          <label className="text-ink-300 flex items-center gap-1.5 text-[11px]">
+      <header className="border-ink-700 bg-ink-950/60 flex shrink-0 flex-col border-b">
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-3 py-2">
+          <Link className="shrink-0" href="/">
+            <BrandLockup />
+          </Link>
+          <ModeSwitch mode="mock" />
+          <label className="text-ink-300 ml-auto flex items-center gap-1.5 text-[11px]">
             <span className="hidden sm:inline">language</span>
             <select className={selectClass} onChange={changeLanguage} value={language}>
               {LANGUAGES.map(item => (
@@ -507,8 +505,25 @@ const MockInterview: FC = memo(() => {
               ))}
             </select>
           </label>
+        </div>
+        <div className="border-ink-700 flex flex-wrap items-center gap-x-3 gap-y-2 border-t px-3 py-2">
+          <div className="flex w-full min-w-0 items-center gap-2 sm:w-auto sm:flex-1">
+            <button className={ghostButtonClass} onClick={backToSetup} type="button">
+              ← scenarios
+            </button>
+            <h1 className="text-ink-50 min-w-0 flex-1 truncate text-[13px] font-bold">{scenario.title}</h1>
+          </div>
+          <span
+            className={`font-code rounded-full border px-2.5 py-1 text-[12px] font-semibold ${
+              secondsLeft <= 120
+                ? 'border-danger-400/60 bg-danger-400/10 text-danger-300'
+                : 'border-ink-600 text-ink-100'
+            }`}>
+            {formatClock(secondsLeft)}
+          </span>
           <button className={ghostButtonClass} onClick={onFinish} type="button">
-            Finish &amp; report
+            <span className="sm:hidden">Finish</span>
+            <span className="hidden sm:inline">Finish &amp; report</span>
           </button>
           <button className={primaryButtonClass} onClick={onSubmit} type="button">
             Submit ⌘⏎
@@ -516,28 +531,30 @@ const MockInterview: FC = memo(() => {
         </div>
       </header>
 
-      <main className="min-h-0 flex-1 overflow-y-auto lg:grid lg:grid-cols-[minmax(17rem,0.9fr)_minmax(24rem,1.15fr)_minmax(17rem,0.8fr)] lg:overflow-hidden">
-        <section className="border-ink-700 min-h-0 border-b p-4 lg:h-full lg:overflow-y-auto lg:border-b-0 lg:border-r">
+      <main
+        className="min-h-0 flex-1 overflow-y-auto lg:grid lg:grid-cols-[minmax(19rem,0.9fr)_minmax(25rem,1.15fr)_minmax(19rem,0.85fr)] lg:overflow-hidden"
+        ref={mainRef}>
+        <section className="border-ink-700 min-h-0 border-b p-5 lg:h-full lg:overflow-y-auto lg:border-b-0 lg:border-r">
           <p className="text-iris-300 text-[11px] font-bold uppercase tracking-wider">{scenario.role}</p>
-          <p className="text-ink-200 mt-2 text-[12px] leading-relaxed">{scenario.prompt}</p>
+          <p className="text-ink-200 mt-3 text-[13px] leading-6">{scenario.prompt}</p>
           <div className="mt-3 flex flex-wrap gap-1.5">
             {scenario.signals.map(signal => (
               <SignalChip key={signal} signal={signal} />
             ))}
           </div>
-          <div className="border-ink-700 mt-4 border-t pt-3">
-            <p className="text-ink-400 mb-1 text-[10px] font-bold uppercase tracking-wider">The brief</p>
+          <div className="border-ink-700 mt-5 border-t pt-4">
+            <p className="text-ink-400 mb-2 text-[11px] font-bold uppercase tracking-wider">The brief</p>
             <Markdown source={step.task} />
           </div>
         </section>
 
         <section className="border-ink-700 flex min-h-0 flex-col border-b lg:h-full lg:border-b-0 lg:border-r">
           <div className="border-ink-700 flex shrink-0 items-center gap-2 border-b px-2 py-1.5">
-            <span className="font-code text-ink-200 text-[11px]">{fileName(step.file, language)}</span>
+            <span className="font-code text-ink-200 text-[12px]">{fileName(step.file, language)}</span>
             <span className="border-warning-400/40 bg-warning-400/10 text-warning-300 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold">
               AI draft
             </span>
-            <span className="text-ink-400 ml-auto text-[10px]">edit, then submit</span>
+            <span className="text-ink-400 ml-auto text-[11px]">edit, then submit</span>
           </div>
           <StepEditor
             className="min-h-0 flex-1"
@@ -556,14 +573,14 @@ const MockInterview: FC = memo(() => {
         </section>
 
         <aside className="flex min-h-[28rem] flex-col lg:h-full lg:min-h-0">
-          <div className="border-ink-700 flex shrink-0 items-center justify-between gap-2 border-b px-3 py-2">
+          <div className="border-ink-700 flex shrink-0 items-center justify-between gap-2 border-b px-4 py-3">
             <div>
-              <p className="text-ink-50 text-[12px] font-bold">AI pair</p>
-              <p className="text-ink-400 text-[10px]">offline · deterministic</p>
+              <p className="text-ink-50 text-[13px] font-bold">AI pair</p>
+              <p className="text-ink-400 text-[11px]">offline · deterministic</p>
             </div>
-            <span className="font-code text-ink-400 text-[10px]">{hints} hints</span>
+            <span className="font-code text-ink-400 text-[11px]">{hints} hints used</span>
           </div>
-          <div className="grid shrink-0 grid-cols-2 gap-1.5 p-2 pb-1">
+          <div className="grid shrink-0 grid-cols-2 gap-2 p-3 pb-2">
             <button className={ghostButtonClass} onClick={onDraft} type="button">
               Draft with AI
             </button>
@@ -577,24 +594,24 @@ const MockInterview: FC = memo(() => {
               Test idea
             </button>
           </div>
-          <div className="shrink-0 px-2 pb-2">
+          <div className="shrink-0 px-3 pb-3">
             <button className={`${ghostButtonClass} w-full`} onClick={() => void onCopyPrompt()} type="button">
               {promptCopied ? 'Prompt copied ✓' : 'Copy prompt for your own AI'}
             </button>
           </div>
           {promptText !== null ? (
-            <div className="border-ink-700 shrink-0 border-t p-2">
+            <div className="border-ink-700 shrink-0 border-t p-3">
               <div className="flex items-center justify-between gap-2">
-                <span className="text-ink-400 text-[10px] font-bold uppercase tracking-wider">Prompt for your AI</span>
+                <span className="text-ink-400 text-[11px] font-bold uppercase tracking-wider">Prompt for your AI</span>
                 <button
-                  className="text-ink-400 hover:text-ink-50 text-[10px]"
+                  className="text-ink-400 hover:text-ink-50 text-[11px]"
                   onClick={() => setPromptText(null)}
                   type="button">
                   hide
                 </button>
               </div>
               <textarea
-                className="border-ink-600 bg-ink-900 text-ink-200 focus:border-iris-400 mt-1 h-28 w-full resize-y rounded-lg border p-2 font-mono text-[10px] outline-none"
+                className="border-ink-600 bg-ink-900 text-ink-200 focus:border-iris-400 mt-2 h-36 w-full resize-y rounded-lg border p-2.5 font-mono text-[11px] leading-5 outline-none"
                 onFocus={event => event.currentTarget.select()}
                 readOnly
                 value={promptText}
@@ -603,11 +620,11 @@ const MockInterview: FC = memo(() => {
           ) : null}
           <div
             aria-live="polite"
-            className="border-ink-700 min-h-0 flex-1 space-y-2 overflow-y-auto border-t p-2"
+            className="border-ink-700 min-h-0 flex-1 space-y-2.5 overflow-y-auto border-t p-3"
             ref={logRef}>
             {messages.map(message => (
               <div
-                className={`whitespace-pre-wrap rounded-lg px-2.5 py-1.5 text-[11px] leading-relaxed ${
+                className={`whitespace-pre-wrap rounded-lg px-3 py-2 text-[12px] leading-6 ${
                   message.from === 'ai'
                     ? message.tone === 'warn'
                       ? 'border-warning-400/30 bg-warning-400/[0.06] text-ink-200 border'
@@ -617,14 +634,14 @@ const MockInterview: FC = memo(() => {
                     : 'bg-iris-400/10 text-ink-200 ml-6'
                 }`}
                 key={message.id}>
-                <span className="text-ink-400 mb-0.5 block text-[9px] font-bold uppercase tracking-wider">
+                <span className="text-ink-400 mb-1 block text-[10px] font-bold uppercase tracking-wider">
                   {message.from === 'ai' ? 'AI pair' : 'you'}
                 </span>
                 {message.text}
               </div>
             ))}
           </div>
-          <p className="text-ink-400 border-ink-700 shrink-0 border-t px-3 py-2 text-[10px] leading-relaxed">
+          <p className="text-ink-400 border-ink-700 shrink-0 border-t px-4 py-3 text-[11px] leading-relaxed">
             The pair is simulated: it uses the exercise’s draft, checks and notes. It never sees a hosted model, and it
             does not grade you — the checks do.
           </p>
