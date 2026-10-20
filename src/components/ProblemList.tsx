@@ -389,7 +389,7 @@ const ProblemRow: FC<{
   return (
     <li>
       <Link
-        className="border-ink-700 bg-ink-850 hover:border-iris-400/60 hover:bg-ink-800 group flex w-full items-center gap-3 rounded-xl border px-4 py-3 text-left transition"
+        className="border-ink-700 bg-ink-850 hover:border-iris-400/60 hover:bg-ink-800 group flex w-full items-center gap-3 rounded-xl border px-4 py-3.5 text-left transition"
         href={`/${problem.id}`}>
         <span
           className={`font-code flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold ${
@@ -415,8 +415,8 @@ const ProblemRow: FC<{
               <ConceptChip concept={c} key={c} />
             ))}
           </span>
-          <span className="text-ink-300 mt-0.5 block text-[12px]">{problem.tagline}</span>
-          <span className="text-ink-300 mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
+          <span className="text-ink-300 mt-1 block text-[13px] leading-5">{problem.tagline}</span>
+          <span className="text-ink-300 mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px]">
             <StepSquares attempts={attempts} problem={problem} />
             <span className="font-code">
               {score.done}/{score.total} steps
@@ -510,45 +510,45 @@ const ProblemList: FC<{
         ) : (
           <>
             {ai.length > 0 ? (
-              <section className="border-iris-400/30 from-iris-400/[0.08] mb-5 rounded-2xl border bg-gradient-to-b to-transparent p-4">
-                <div className="flex flex-wrap items-start justify-between gap-2">
+              <section className="border-iris-400/30 from-iris-400/[0.08] mb-6 rounded-2xl border bg-gradient-to-b to-transparent p-5">
+                <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
                     <p className="text-iris-300 text-[11px] font-bold uppercase tracking-wider">
                       AI-era interview track
                     </p>
-                    <h2 className="text-ink-50 mt-1 text-[17px] font-extrabold leading-tight">
+                    <h2 className="text-ink-50 mt-2 text-[18px] font-extrabold leading-tight">
                       Use AI. Then prove it.
                     </h2>
                   </div>
-                  <span className="border-iris-400/40 bg-iris-400/10 text-iris-300 rounded-full border px-2 py-0.5 text-[10px] font-semibold">
+                  <span className="border-iris-400/40 bg-iris-400/10 text-iris-300 rounded-full border px-2.5 py-1 text-[11px] font-semibold">
                     {ai.length} courses · {ai.reduce((n, p) => n + p.steps.length, 0)} steps
                   </span>
                 </div>
-                <p className="text-ink-200 mt-2 max-w-3xl text-[12px] leading-relaxed">
+                <p className="text-ink-200 mt-3 max-w-3xl text-[13px] leading-6">
                   AI-era interviews are not only about typing an algorithm from memory. They ask whether you can specify
                   a problem, delegate to a model, verify the result, measure quality, and keep it safe and affordable.
                   Every starter below is a model-generated draft with a real flaw; the checks look for the review,
                   boundary, measurement or operational control that makes it safe to ship.
                 </p>
-                <div className="mt-3 flex flex-wrap items-center gap-3">
+                <div className="mt-4 flex flex-wrap items-center gap-3">
                   <Link
-                    className="bg-iris-400 text-ink-950 hover:bg-iris-300 rounded-lg px-3 py-1.5 text-[12px] font-bold transition"
+                    className="bg-iris-400 text-ink-950 hover:bg-iris-300 rounded-lg px-4 py-2 text-[13px] font-bold transition"
                     href="/mock-interview">
                     Start an AI mock interview →
                   </Link>
-                  <span className="text-ink-400 text-[11px]">
+                  <span className="text-ink-400 text-[12px]">
                     timed · flawed AI draft · an offline AI pair · no solution reveal
                   </span>
                 </div>
-                <ul className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                <ul className="mt-4 grid gap-2.5 sm:grid-cols-2 lg:grid-cols-3">
                   {AI_SKILLS.map(skill => (
-                    <li className="border-ink-700 bg-ink-900/60 rounded-lg border px-3 py-2" key={skill.title}>
+                    <li className="border-ink-700 bg-ink-900/60 rounded-lg border px-3.5 py-3" key={skill.title}>
                       <span className="text-iris-200 text-[11px] font-bold uppercase tracking-wide">{skill.title}</span>
-                      <span className="text-ink-300 mt-0.5 block text-[11px] leading-snug">{skill.body}</span>
+                      <span className="text-ink-300 mt-1 block text-[12px] leading-5">{skill.body}</span>
                     </li>
                   ))}
                 </ul>
-                <ul className="mt-3 space-y-2">
+                <ul className="mt-4 space-y-2">
                   {ai.map(problem => (
                     <ProblemRow
                       attempts={attempts}

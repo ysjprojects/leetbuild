@@ -34,6 +34,15 @@ export const LogoMark: FC<{className?: string}> = memo(({className = 'h-6 w-6'})
 ));
 LogoMark.displayName = 'LogoMark';
 
+/** The mark and the wordmark as one unit: every surface uses this so the lockup cannot drift. */
+export const BrandLockup: FC<{className?: string}> = memo(({className = ''}) => (
+  <span className={`flex items-center gap-2 ${className}`}>
+    <LogoMark />
+    <span className={wordmarkClass}>LeetBuild</span>
+  </span>
+));
+BrandLockup.displayName = 'BrandLockup';
+
 /** Copy the landing page opens with — real text, so it is already in place while the rest loads. */
 export const LandingIntro: FC = memo(() => (
   <div>
@@ -316,9 +325,8 @@ export const LoadingScreen: FC<{phase: LoadingPhase; problemId: string | null}> 
     <div aria-busy className="leetbuild-playground bg-ink-900 text-ink-100 flex h-dvh flex-col overflow-hidden">
       <header className="border-ink-700 bg-ink-950/60 flex shrink-0 items-center gap-x-4 border-b px-3 py-2">
         <div className="flex items-center gap-2">
-          <LogoMark />
-          <span className={wordmarkClass}>LeetBuild</span>
-          <span className="text-ink-300 hidden text-[11px] sm:inline">build systems step by step</span>
+          <BrandLockup />
+          <span className="text-ink-300 hidden text-[12px] sm:inline">build systems. use AI. prove it.</span>
         </div>
         <div className="ml-auto flex items-center gap-2">
           <Bone className="h-6 w-24 rounded-md" />
