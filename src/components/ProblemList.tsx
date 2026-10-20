@@ -491,109 +491,113 @@ const ProblemList: FC<{
     [problems, profile.max],
   );
   return (
-    <div className="mx-auto w-full max-w-5xl space-y-6 px-5 py-6">
+    <div className="w-full">
       <LandingIntro stats={stats} />
-      <ProfileStrip
-        activeDays={activeDays}
-        attempts={attempts}
-        badges={badges}
-        problems={problems}
-        profile={profile}
-        sessions={sessions}
-        streak={streak}
-        today={today}
-      />
-      <section id="problems">
-        <div className="mb-3">
-          <ListControls
-            query={query}
-            reset={reset}
-            shown={shown.length}
-            solved={solvedCount}
-            total={problems.length}
-            update={update}
-          />
-        </div>
-        {shown.length === 0 ? (
-          <p className="border-ink-700 text-ink-300 rounded-xl border border-dashed px-4 py-6 text-center text-[12px]">
-            No course matches{query.q.trim() !== '' ? ` “${query.q.trim()}”` : ''} with these filters.{' '}
-            <button className="text-iris-300 hover:text-iris-200 transition" onClick={reset} type="button">
-              Clear them ›
-            </button>
-          </p>
-        ) : (
-          <>
-            {ai.length > 0 ? (
-              <section className="border-iris-400/30 from-iris-400/[0.10] mb-5 rounded-2xl border bg-gradient-to-br via-transparent to-transparent p-5">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <p className="text-iris-300 text-[11px] font-bold uppercase tracking-wider">
-                      AI-era interview track
-                    </p>
-                    <h2 className="text-ink-50 mt-2 text-[20px] font-extrabold leading-tight">
-                      Use AI. Then prove it.
-                    </h2>
-                  </div>
-                  <span className="border-iris-400/40 bg-iris-400/10 text-iris-300 rounded-full border px-2.5 py-1 text-[11px] font-semibold">
-                    {ai.length} courses · {ai.reduce((n, p) => n + p.steps.length, 0)} steps
-                  </span>
-                </div>
-                <p className="text-ink-200 mt-3 max-w-3xl text-[13px] leading-6">
-                  Two courses, ten review-first steps, and the six signals AI-era interviews probe.
-                </p>
-                <div className="mt-3 flex flex-wrap gap-1.5">
-                  {AI_SKILLS.map(skill => (
-                    <span
-                      className="border-iris-400/30 bg-iris-400/[0.08] text-iris-200 rounded-full border px-2.5 py-1 text-[11px] font-semibold"
-                      key={skill.title}
-                      title={skill.body}>
-                      {skill.title}
+      <div className="mx-auto w-full max-w-5xl space-y-6 px-5 py-6">
+        <ProfileStrip
+          activeDays={activeDays}
+          attempts={attempts}
+          badges={badges}
+          problems={problems}
+          profile={profile}
+          sessions={sessions}
+          streak={streak}
+          today={today}
+        />
+        <section id="problems">
+          <div className="mb-3">
+            <ListControls
+              query={query}
+              reset={reset}
+              shown={shown.length}
+              solved={solvedCount}
+              total={problems.length}
+              update={update}
+            />
+          </div>
+          {shown.length === 0 ? (
+            <p className="border-ink-700 text-ink-300 rounded-xl border border-dashed px-4 py-6 text-center text-[12px]">
+              No course matches{query.q.trim() !== '' ? ` “${query.q.trim()}”` : ''} with these filters.{' '}
+              <button className="text-iris-300 hover:text-iris-200 transition" onClick={reset} type="button">
+                Clear them ›
+              </button>
+            </p>
+          ) : (
+            <>
+              {ai.length > 0 ? (
+                <section className="border-iris-400/30 from-iris-400/[0.10] mb-5 rounded-2xl border bg-gradient-to-br via-transparent to-transparent p-5">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <p className="text-iris-300 text-[11px] font-bold uppercase tracking-wider">
+                        AI-era interview track
+                      </p>
+                      <h2 className="text-ink-50 mt-2 text-[20px] font-extrabold leading-tight">
+                        Use AI. Then prove it.
+                      </h2>
+                    </div>
+                    <span className="border-iris-400/40 bg-iris-400/10 text-iris-300 rounded-full border px-2.5 py-1 text-[11px] font-semibold">
+                      {ai.length} courses · {ai.reduce((n, p) => n + p.steps.length, 0)} steps
                     </span>
-                  ))}
-                </div>
-                <p className="text-ink-400 mt-3 text-[12px]">
-                  <Link
-                    className="text-iris-300 hover:text-iris-200 decoration-iris-400/40 font-semibold underline"
-                    href="/mock-interview">
-                    Start the timed mock
-                  </Link>{' '}
-                  or take a course below.
-                </p>
-                <ul className="mt-4 space-y-2.5">
-                  {ai.map(problem => (
-                    <ProblemRow
-                      attempts={attempts}
-                      best={bestSession(sessions, problem.id)}
-                      index={numbers.get(problem.id) ?? 0}
-                      key={problem.id}
-                      problem={problem}
-                    />
-                  ))}
-                </ul>
-              </section>
-            ) : null}
-            {systems.length > 0 ? (
-              <section>
-                <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
-                  <h2 className="text-ink-50 text-lg font-extrabold">{ai.length > 0 ? 'Systems track' : 'Problems'}</h2>
-                  <span className="text-ink-400 text-[12px]">{systems.length} courses</span>
-                </div>
-                <ul className="space-y-2.5">
-                  {systems.map(problem => (
-                    <ProblemRow
-                      attempts={attempts}
-                      best={bestSession(sessions, problem.id)}
-                      index={numbers.get(problem.id) ?? 0}
-                      key={problem.id}
-                      problem={problem}
-                    />
-                  ))}
-                </ul>
-              </section>
-            ) : null}
-          </>
-        )}
-      </section>
+                  </div>
+                  <p className="text-ink-200 mt-3 max-w-3xl text-[13px] leading-6">
+                    Two courses, ten review-first steps, and the six signals AI-era interviews probe.
+                  </p>
+                  <div className="mt-3 flex flex-wrap gap-1.5">
+                    {AI_SKILLS.map(skill => (
+                      <span
+                        className="border-iris-400/30 bg-iris-400/[0.08] text-iris-200 rounded-full border px-2.5 py-1 text-[11px] font-semibold"
+                        key={skill.title}
+                        title={skill.body}>
+                        {skill.title}
+                      </span>
+                    ))}
+                  </div>
+                  <p className="text-ink-400 mt-3 text-[12px]">
+                    <Link
+                      className="text-iris-300 hover:text-iris-200 decoration-iris-400/40 font-semibold underline"
+                      href="/mock-interview">
+                      Start the timed mock
+                    </Link>{' '}
+                    or take a course below.
+                  </p>
+                  <ul className="mt-4 space-y-2.5">
+                    {ai.map(problem => (
+                      <ProblemRow
+                        attempts={attempts}
+                        best={bestSession(sessions, problem.id)}
+                        index={numbers.get(problem.id) ?? 0}
+                        key={problem.id}
+                        problem={problem}
+                      />
+                    ))}
+                  </ul>
+                </section>
+              ) : null}
+              {systems.length > 0 ? (
+                <section>
+                  <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+                    <h2 className="text-ink-50 text-lg font-extrabold">
+                      {ai.length > 0 ? 'Systems track' : 'Problems'}
+                    </h2>
+                    <span className="text-ink-400 text-[12px]">{systems.length} courses</span>
+                  </div>
+                  <ul className="space-y-2.5">
+                    {systems.map(problem => (
+                      <ProblemRow
+                        attempts={attempts}
+                        best={bestSession(sessions, problem.id)}
+                        index={numbers.get(problem.id) ?? 0}
+                        key={problem.id}
+                        problem={problem}
+                      />
+                    ))}
+                  </ul>
+                </section>
+              ) : null}
+            </>
+          )}
+        </section>
+      </div>
     </div>
   );
 });
