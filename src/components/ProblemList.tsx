@@ -6,7 +6,7 @@ import {type Streak, activityByDay, badgeProgress, BADGES, stepOfTheDay} from '@
 import {useListQuery} from '@/lib/listQuery';
 import {type Profile, type StepAttempt, OPEN_ATTEMPT, problemScore, rankProgress} from '@/lib/scoring';
 import {type TimedSession, bestSession, formatClock} from '@/lib/timer';
-import {type Difficulty, type Problem, CONCEPT_LABEL, stepKey, stepPath} from '@/lib/types';
+import {type Difficulty, type Problem, CONCEPT_LABEL, LANGUAGES, stepKey, stepPath} from '@/lib/types';
 
 import {BadgeCatalog, BadgeGlyph} from './Badges';
 import {useDialog} from './Dialog';
@@ -27,6 +27,13 @@ const DIFFICULTY_BAR: Record<Difficulty, string> = {
   easy: 'bg-success-400',
   medium: 'bg-warning-400',
   hard: 'bg-danger-400',
+};
+
+/** The row number carries the difficulty colour, the way the mock scenario cards carry their accent. */
+const DIFFICULTY_RING: Record<Difficulty, string> = {
+  easy: 'border-success-400/50 text-success-300',
+  medium: 'border-warning-400/50 text-warning-300',
+  hard: 'border-danger-400/50 text-danger-300',
 };
 
 const RING = {size: 60, stroke: 5};
@@ -93,7 +100,7 @@ const SolvedByDifficulty: FC<{profile: Profile}> = memo(({profile}) => {
   const total = profile.problems.easy + profile.problems.medium + profile.problems.hard;
   return (
     <div className="min-w-[13rem]" title="a problem counts as solved when every step is accepted">
-      <p className="flex items-baseline justify-between text-[11px]">
+      <p className="flex items-baseline justify-between text-[12px]">
         <span className="text-ink-300 font-bold uppercase tracking-wider">Solved</span>
         <span className="font-code text-ink-100">
           {solved}
@@ -102,9 +109,9 @@ const SolvedByDifficulty: FC<{profile: Profile}> = memo(({profile}) => {
       </p>
       <ul className="mt-1 space-y-1">
         {(['easy', 'medium', 'hard'] as const).map(d => (
-          <li className="flex items-center gap-2 text-[11px]" key={d}>
+          <li className="flex items-center gap-2 text-[12px]" key={d}>
             <span className={`w-9 font-semibold ${DIFFICULTY_TEXT[d]}`}>{DIFFICULTY_SHORT[d]}</span>
-            <span className="bg-ink-700 h-1.5 flex-1 overflow-hidden rounded-full">
+            <span className="bg-ink-700 h-2 flex-1 overflow-hidden rounded-full">
               <span
                 className={`block h-full rounded-full ${DIFFICULTY_BAR[d]}`}
                 style={{
@@ -168,8 +175,8 @@ const ProfileStrip: FC<{
   }, [openDialog, sessions, problems]);
   const shown = earned.slice(-5);
   return (
-    <section className="border-ink-700 bg-ink-850 rounded-xl border px-4 py-3">
-      <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+    <section className="border-iris-400/20 from-iris-400/[0.06] bg-ink-850 rounded-2xl border bg-gradient-to-br to-transparent px-5 py-4">
+      <div className="flex flex-wrap items-center gap-x-8 gap-y-4">
         {/* Where you stand */}
         <div className="flex min-w-0 items-center gap-3">
           <RankRing score={profile.score} share={share} top={rank.next === null} />
@@ -200,22 +207,22 @@ const ProfileStrip: FC<{
           title="accept a step on consecutive days; the step of the day is one you can open right now">
           <Flame lit={streak.current > 0} />
           <div className="min-w-0">
-            <p className={`text-[13px] font-bold leading-tight ${streak.current > 0 ? 'text-ink-50' : 'text-ink-200'}`}>
+            <p className={`text-[14px] font-bold leading-tight ${streak.current > 0 ? 'text-ink-50' : 'text-ink-200'}`}>
               {streak.current > 0 ? `${streak.current}-day streak` : 'No streak yet'}
             </p>
             {streak.today ? (
-              <p className="text-ink-400 text-[11px]">
+              <p className="text-ink-400 text-[12px]">
                 safe for today{streak.best > streak.current ? ` · best ${streak.best}` : ''}
               </p>
             ) : pick !== null ? (
               <Link
-                className="text-iris-300 hover:text-iris-200 block max-w-[20rem] text-[11px] leading-tight"
+                className="text-iris-300 hover:text-iris-200 block max-w-[20rem] text-[12px] leading-tight"
                 href={stepPath(pick.problem, pick.step)}
                 title={`today's step: ${pick.step.title} (${pick.problem.title}, step ${pick.index + 1})`}>
                 {streak.current > 0 ? 'keep it' : 'start one'} today: {pick.problem.title} · step {pick.index + 1} ›
               </Link>
             ) : (
-              <p className="text-ink-400 text-[11px]">every step is done — start a course over to keep it</p>
+              <p className="text-ink-400 text-[12px]">every step is done — start a course over to keep it</p>
             )}
           </div>
         </div>
@@ -241,11 +248,11 @@ const ProfileStrip: FC<{
             ) : null}
           </span>
           <span>
-            <span className="text-ink-50 block text-[13px] font-bold leading-tight">
+            <span className="text-ink-50 block text-[14px] font-bold leading-tight">
               {earned.length}
               <span className="text-ink-400 font-normal"> / {BADGES.length} badges</span>
             </span>
-            <span className="text-iris-300 group-hover:text-iris-200 block text-[11px]">
+            <span className="text-iris-300 group-hover:text-iris-200 block text-[12px]">
               {earned.length === 0 ? 'see what to aim for ›' : 'all badges ›'}
             </span>
           </span>
@@ -256,11 +263,11 @@ const ProfileStrip: FC<{
       <div className="border-ink-700/70 mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 border-t pt-2.5">
         {profile.concepts.map(c => (
           <div
-            className="flex min-w-[9rem] flex-1 items-center gap-2 text-[11px]"
+            className="flex min-w-[10rem] flex-1 items-center gap-2 text-[12px]"
             key={c.concept}
             title={`${CONCEPT_LABEL[c.concept]} steps accepted`}>
             <span className="text-ink-200 w-10 font-semibold">{CONCEPT_LABEL[c.concept]}</span>
-            <span className="bg-ink-700 h-1.5 flex-1 overflow-hidden rounded-full">
+            <span className="bg-ink-700 h-2 flex-1 overflow-hidden rounded-full">
               <span
                 className="block h-full rounded-full"
                 style={{
@@ -276,7 +283,7 @@ const ProfileStrip: FC<{
         ))}
         <button
           aria-expanded={statsOpen}
-          className="text-ink-400 hover:text-ink-50 ml-auto rounded-md px-1.5 py-0.5 text-[11px] transition"
+          className="text-ink-400 hover:text-ink-50 ml-auto rounded-md px-1.5 py-0.5 text-[12px] transition"
           onClick={toggleStats}
           type="button">
           stats {statsOpen ? '▴' : '▾'}
@@ -316,7 +323,7 @@ const ProfileStrip: FC<{
                   )}
                 </span>
                 <button
-                  className="text-iris-300 hover:text-iris-200 text-[11px] transition"
+                  className="text-iris-300 hover:text-iris-200 text-[12px] transition"
                   onClick={onRuns}
                   title={sessions.length === 0 ? 'how timed runs work' : 'every timed run, newest first'}
                   type="button">
@@ -395,9 +402,7 @@ const ProblemRow: FC<{
           className={`font-code flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold ${
             solved
               ? 'border-iris-400 bg-iris-400 text-ink-950'
-              : started
-              ? 'border-iris-400/70 text-iris-300'
-              : 'border-ink-600 text-ink-300'
+              : `${DIFFICULTY_RING[problem.difficulty]} ${started ? 'bg-ink-800' : ''}`
           }`}>
           {solved ? '✓' : index + 1}
         </span>
@@ -476,9 +481,18 @@ const ProblemList: FC<{
   );
   const ai = useMemo(() => shown.filter(p => p.track === 'ai'), [shown]);
   const systems = useMemo(() => shown.filter(p => p.track !== 'ai'), [shown]);
+  const stats = useMemo(
+    () => [
+      `${problems.length} courses`,
+      `${problems.reduce((n, p) => n + p.steps.length, 0)} steps`,
+      `${LANGUAGES.length} languages`,
+      `${profile.max} points`,
+    ],
+    [problems, profile.max],
+  );
   return (
-    <div className="mx-auto w-full max-w-4xl space-y-5 px-4 py-5">
-      <LandingIntro />
+    <div className="mx-auto w-full max-w-5xl space-y-6 px-5 py-6">
+      <LandingIntro stats={stats} />
       <ProfileStrip
         activeDays={activeDays}
         attempts={attempts}
@@ -489,7 +503,7 @@ const ProblemList: FC<{
         streak={streak}
         today={today}
       />
-      <section>
+      <section id="problems">
         <div className="mb-3">
           <ListControls
             query={query}
@@ -510,13 +524,13 @@ const ProblemList: FC<{
         ) : (
           <>
             {ai.length > 0 ? (
-              <section className="border-iris-400/30 from-iris-400/[0.08] mb-6 rounded-2xl border bg-gradient-to-b to-transparent p-5">
+              <section className="border-iris-400/30 from-iris-400/[0.10] mb-5 rounded-2xl border bg-gradient-to-br via-transparent to-transparent p-5">
                 <div className="flex flex-wrap items-start justify-between gap-3">
                   <div>
                     <p className="text-iris-300 text-[11px] font-bold uppercase tracking-wider">
                       AI-era interview track
                     </p>
-                    <h2 className="text-ink-50 mt-2 text-[18px] font-extrabold leading-tight">
+                    <h2 className="text-ink-50 mt-2 text-[20px] font-extrabold leading-tight">
                       Use AI. Then prove it.
                     </h2>
                   </div>
@@ -525,30 +539,27 @@ const ProblemList: FC<{
                   </span>
                 </div>
                 <p className="text-ink-200 mt-3 max-w-3xl text-[13px] leading-6">
-                  AI-era interviews are not only about typing an algorithm from memory. They ask whether you can specify
-                  a problem, delegate to a model, verify the result, measure quality, and keep it safe and affordable.
-                  Every starter below is a model-generated draft with a real flaw; the checks look for the review,
-                  boundary, measurement or operational control that makes it safe to ship.
+                  Two courses, ten review-first steps, and the six signals AI-era interviews probe.
                 </p>
-                <div className="mt-4 flex flex-wrap items-center gap-3">
-                  <Link
-                    className="bg-iris-400 text-ink-950 hover:bg-iris-300 rounded-lg px-4 py-2 text-[13px] font-bold transition"
-                    href="/mock-interview">
-                    Start an AI mock interview →
-                  </Link>
-                  <span className="text-ink-400 text-[12px]">
-                    timed · flawed AI draft · an offline AI pair · no solution reveal
-                  </span>
-                </div>
-                <ul className="mt-4 grid gap-2.5 sm:grid-cols-2 lg:grid-cols-3">
+                <div className="mt-3 flex flex-wrap gap-1.5">
                   {AI_SKILLS.map(skill => (
-                    <li className="border-ink-700 bg-ink-900/60 rounded-lg border px-3.5 py-3" key={skill.title}>
-                      <span className="text-iris-200 text-[11px] font-bold uppercase tracking-wide">{skill.title}</span>
-                      <span className="text-ink-300 mt-1 block text-[12px] leading-5">{skill.body}</span>
-                    </li>
+                    <span
+                      className="border-iris-400/30 bg-iris-400/[0.08] text-iris-200 rounded-full border px-2.5 py-1 text-[11px] font-semibold"
+                      key={skill.title}
+                      title={skill.body}>
+                      {skill.title}
+                    </span>
                   ))}
-                </ul>
-                <ul className="mt-4 space-y-2">
+                </div>
+                <p className="text-ink-400 mt-3 text-[12px]">
+                  <Link
+                    className="text-iris-300 hover:text-iris-200 decoration-iris-400/40 font-semibold underline"
+                    href="/mock-interview">
+                    Start the timed mock
+                  </Link>{' '}
+                  or take a course below.
+                </p>
+                <ul className="mt-4 space-y-2.5">
                   {ai.map(problem => (
                     <ProblemRow
                       attempts={attempts}
@@ -563,10 +574,11 @@ const ProblemList: FC<{
             ) : null}
             {systems.length > 0 ? (
               <section>
-                <p className="text-iris-400 mb-2 text-[11px] font-bold uppercase tracking-wider">
-                  {ai.length > 0 ? 'Systems track' : 'Problems'}
-                </p>
-                <ul className="space-y-2">
+                <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+                  <h2 className="text-ink-50 text-lg font-extrabold">{ai.length > 0 ? 'Systems track' : 'Problems'}</h2>
+                  <span className="text-ink-400 text-[12px]">{systems.length} courses</span>
+                </div>
+                <ul className="space-y-2.5">
                   {systems.map(problem => (
                     <ProblemRow
                       attempts={attempts}

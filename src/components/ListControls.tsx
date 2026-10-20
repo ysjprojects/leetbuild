@@ -32,12 +32,12 @@ import {type Difficulty, DIFFICULTIES} from '@/lib/types';
 const DIFFICULTY_LABEL: Record<Difficulty, string> = {easy: 'Easy', medium: 'Medium', hard: 'Hard'};
 
 const iconButton = (open: boolean): string =>
-  `relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition ${
+  `relative flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition ${
     open ? 'bg-ink-700 text-ink-50' : 'bg-ink-800 text-ink-200 hover:bg-ink-700 hover:text-ink-50'
   }`;
 
 const chip = (on: boolean): string =>
-  `rounded-full px-2.5 py-0.5 text-[11px] font-semibold transition ${
+  `rounded-full px-3 py-1 text-[12px] font-semibold transition ${
     on ? 'bg-iris-400 text-ink-950' : 'bg-ink-700/70 text-ink-200 hover:bg-ink-600 hover:text-ink-50'
   }`;
 
@@ -177,7 +177,7 @@ StatusChipButton.displayName = 'StatusChipButton';
 
 const FilterRow: FC<{label: string; children: ReactNode}> = memo(({label, children}) => (
   <div className="px-1 py-1.5">
-    <p className="text-ink-400 mb-1 text-[10px] font-bold uppercase tracking-wider">{label}</p>
+    <p className="text-ink-400 mb-1.5 text-[11px] font-bold uppercase tracking-wider">{label}</p>
     <div className="flex flex-wrap gap-1">{children}</div>
   </div>
 ));
@@ -247,7 +247,7 @@ export const ListControls: FC<{
   const sortSet = query.sort !== DEFAULT_LIST_QUERY.sort || query.desc;
   return (
     <div className="flex flex-wrap items-center gap-2">
-      <label className="bg-ink-800 text-ink-400 focus-within:bg-ink-700 flex h-9 w-full items-center gap-2 rounded-full px-3.5 transition sm:w-72">
+      <label className="bg-ink-800 text-ink-400 focus-within:bg-ink-700 flex h-10 w-full items-center gap-2 rounded-full px-4 transition sm:w-80">
         <SearchIcon />
         <input
           aria-label="search courses"
@@ -307,13 +307,13 @@ export const ListControls: FC<{
           </div>
         ) : null}
       </Menu>
-      <span className="ml-auto flex items-center gap-2 text-[12px]">
+      <span className="ml-auto flex items-center gap-2 text-[13px]">
         {filtering ? (
           <>
             <span className="text-ink-300">
               <span className="font-code text-ink-100">{shown}</span> of {total}
             </span>
-            <button className="text-iris-300 hover:text-iris-200 text-[11px] transition" onClick={reset} type="button">
+            <button className="text-iris-300 hover:text-iris-200 text-[12px] transition" onClick={reset} type="button">
               clear
             </button>
           </>

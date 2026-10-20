@@ -1234,7 +1234,6 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
           <button onClick={onBack} title="all problems" type="button">
             <BrandLockup />
           </button>
-          <span className="text-ink-300 hidden text-[11px] sm:inline">build systems. use AI. prove it.</span>
         </div>
         <ModeSwitch mode="practice" />
         <div className="ml-auto flex items-center gap-2">
