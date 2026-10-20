@@ -65,7 +65,7 @@ import {BadgeGlyph} from './Badges';
 import Confetti from './Confetti';
 import {useDialog} from './Dialog';
 import {EditorSettingsForm, GearIcon} from './EditorSettings';
-import {LoadingScreen, LogoMark, wordmarkClass} from './LoadingScreen';
+import {BrandLockup, LoadingScreen} from './LoadingScreen';
 import ModeSwitch from './ModeSwitch';
 import {ghostButtonClass, selectClass} from './paneShared';
 import ProblemList from './ProblemList';
@@ -1231,9 +1231,8 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     <div className="leetbuild-playground bg-ink-900 text-ink-100 flex h-dvh flex-col overflow-hidden">
       <header className="border-ink-700 bg-ink-950/60 flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b px-3 py-2">
         <div className="flex items-center gap-2">
-          <button className="flex items-center gap-2" onClick={onBack} title="all problems" type="button">
-            <LogoMark />
-            <span className={wordmarkClass}>LeetBuild</span>
+          <button onClick={onBack} title="all problems" type="button">
+            <BrandLockup />
           </button>
           <span className="text-ink-300 hidden text-[11px] sm:inline">build systems. use AI. prove it.</span>
         </div>

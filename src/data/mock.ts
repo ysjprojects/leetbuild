@@ -12,6 +12,8 @@ export interface MockScenario {
   problemId: string;
   stepId: string;
   title: string;
+  /** One line for the scenario picker; the full brief lives in `prompt` and the step. */
+  blurb: string;
   /** Who is running the interview and how long it lasts. */
   role: string;
   minutes: number;
@@ -38,6 +40,7 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'ai-gateway',
     stepId: 'tenant-budget',
     title: 'The budget that overspends under load',
+    blurb: 'Two requests raced past the daily budget. Fix the reservation.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
@@ -59,6 +62,7 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'ai-gateway',
     stepId: 'streaming-cancel',
     title: 'The stream that keeps billing after the tab closes',
+    blurb: 'The user left; the stream kept charging. Make cancellation real.',
     role: 'AI platform engineer · 20 min',
     minutes: 20,
     prompt:
@@ -80,6 +84,7 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'rag-service',
     stepId: 'hybrid-retrieve',
     title: 'The retrieval that crossed tenants',
+    blurb: 'A citation leaked across tenants. Close the boundary.',
     role: 'RAG backend engineer · 25 min',
     minutes: 25,
     prompt:
@@ -101,6 +106,7 @@ export const mockScenarios: readonly MockScenario[] = [
     problemId: 'rag-service',
     stepId: 'grounded-answer',
     title: 'The citation the model invented',
+    blurb: 'The model cited a source that does not say it. Verify the quote.',
     role: 'Applied AI engineer · 25 min',
     minutes: 25,
     prompt:

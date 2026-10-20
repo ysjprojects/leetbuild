@@ -4,6 +4,7 @@ import Link from 'next/link';
 import {useRouter} from 'next/router';
 import {type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 
+import {BrandLockup} from '@/components/LoadingScreen';
 import {LinkedInButton, POST_HINT, PROFILE_HINT} from '@/components/Social';
 import {problems} from '@/data/problems';
 import {downloadCertificate, drawCertificate} from '@/lib/certificate';
@@ -78,6 +79,9 @@ const Certificate: FC<{course: CourseSummary}> = memo(({course}) => {
 
   return (
     <main className="mx-auto w-full max-w-5xl px-4 py-8">
+      <Link className="mb-6 inline-flex" href="/">
+        <BrandLockup />
+      </Link>
       <p className="text-iris-400 text-[11px] font-bold uppercase tracking-wider">Certificate of completion</p>
       <h1 className="text-ink-50 mt-1 text-2xl font-extrabold leading-tight">{course.title}</h1>
       <p className="text-ink-300 mt-1 text-[13px]">{course.tagline}</p>
