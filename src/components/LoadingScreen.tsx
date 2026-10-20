@@ -47,12 +47,12 @@ BrandLockup.displayName = 'BrandLockup';
 /** Copy the landing page opens with — real text, so it is already in place while the rest loads. */
 export const LandingIntro: FC<{stats?: readonly string[]}> = memo(
   ({stats = ['real systems', '5 languages', 'AI-era track', '1337 points']}) => (
-    <section className="border-ink-700 from-iris-400/[0.10] relative overflow-hidden rounded-2xl border bg-gradient-to-br via-transparent to-transparent p-5 sm:p-6">
+    <section className="border-ink-700 relative overflow-hidden border-b">
       <div
         aria-hidden
         className="pointer-events-none absolute inset-0 bg-[radial-gradient(80%_120%_at_0%_0%,rgba(108,76,241,0.18),transparent_60%),radial-gradient(60%_90%_at_100%_0%,rgba(45,212,160,0.10),transparent_55%)]"
       />
-      <div className="relative">
+      <div className="relative mx-auto w-full max-w-5xl px-5 pb-8 pt-8">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <BrandLockup size="lg" />
           <span className="border-iris-400/40 bg-iris-400/10 text-iris-200 rounded-full border px-3 py-1 text-[11px] font-bold uppercase tracking-wider">
@@ -109,8 +109,8 @@ const ROW_TAGLINES = ['w-3/4', 'w-2/3', 'w-4/5', 'w-1/2', 'w-3/4', 'w-2/3', 'w-3
 
 const ProblemListSkeleton: FC = memo(() => (
   <main className="min-h-0 flex-1 overflow-y-auto">
+    <LandingIntro />
     <div className="mx-auto w-full max-w-5xl space-y-6 px-5 py-6">
-      <LandingIntro />
       <section className="border-ink-700 bg-ink-850 rounded-xl border px-4 py-3">
         <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
           <div className="flex items-center gap-3">

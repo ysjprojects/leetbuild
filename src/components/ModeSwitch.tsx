@@ -21,7 +21,11 @@ const ModeSwitch: FC<{mode: Mode; className?: string}> = memo(({mode, className 
       <Link
         aria-current={mode === item.mode ? 'page' : undefined}
         className={`rounded-full px-3 py-1.5 transition ${
-          mode === item.mode ? 'bg-iris-400 text-ink-950' : 'text-ink-300 hover:text-ink-50'
+          mode === item.mode
+            ? item.mode === 'mock'
+              ? 'bg-danger-400 text-ink-950'
+              : 'bg-iris-400 text-ink-950'
+            : 'text-ink-300 hover:text-ink-50'
         }`}
         href={item.href}
         key={item.mode}

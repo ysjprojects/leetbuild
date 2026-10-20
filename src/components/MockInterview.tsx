@@ -9,7 +9,7 @@ import {type Language, fileName, LANGUAGE_LABEL, LANGUAGES} from '@/lib/types';
 import {BrandLockup} from './LoadingScreen';
 import Markdown from './Markdown';
 import ModeSwitch from './ModeSwitch';
-import {ghostButtonClass, primaryButtonClass, selectClass} from './paneShared';
+import {ghostButtonClass, selectClass} from './paneShared';
 import StepEditor from './StepEditor';
 
 type Phase = 'setup' | 'running' | 'report';
@@ -72,17 +72,20 @@ const CheckResults: FC<{verdict: Verdict; title: string}> = memo(({verdict, titl
 CheckResults.displayName = 'CheckResults';
 
 const SignalChip: FC<{signal: string}> = memo(({signal}) => (
-  <span className="border-iris-400/30 bg-iris-400/[0.08] text-iris-200 rounded-full border px-2.5 py-1 text-[11px] font-semibold">
+  <span className="border-danger-400/30 bg-danger-400/[0.08] text-danger-200 rounded-full border px-2.5 py-1 text-[11px] font-semibold">
     {signal}
   </span>
 ));
 SignalChip.displayName = 'SignalChip';
 
+const MOCK_PRIMARY =
+  'rounded-lg bg-danger-400 px-3 py-1.5 text-[12px] font-semibold text-ink-950 transition hover:bg-danger-300 disabled:cursor-not-allowed disabled:opacity-30';
+
 const ACTION_BUTTON = 'rounded-lg border px-3 py-2 text-[12px] font-semibold transition';
 
 /** Each AI-pair action has its own colour, so the review loop is readable at a glance. */
 const AI_ACTIONS = {
-  draft: `${ACTION_BUTTON} border-iris-400/30 bg-iris-400/10 text-iris-200 hover:bg-iris-400/20`,
+  draft: `${ACTION_BUTTON} border-danger-400/30 bg-danger-400/10 text-danger-200 hover:bg-danger-400/20`,
   review: `${ACTION_BUTTON} border-success-400/30 bg-success-400/10 text-success-300 hover:bg-success-400/20`,
   missing: `${ACTION_BUTTON} border-warning-400/30 bg-warning-400/10 text-warning-300 hover:bg-warning-400/20`,
   test: `${ACTION_BUTTON} border-ink-600 bg-ink-850 text-ink-200 hover:bg-ink-800`,
@@ -91,14 +94,9 @@ const AI_ACTIONS = {
 /** One accent per scenario, so the picker reads as four distinct exercises rather than a wall of cards. */
 const SCENARIO_ACCENTS = [
   {
-    rail: 'from-iris-400 to-iris-300',
-    number: 'border-iris-400/40 bg-iris-400/10 text-iris-200',
-    hover: 'hover:border-iris-400/60 hover:bg-ink-800/80',
-  },
-  {
-    rail: 'from-success-400 to-success-300',
-    number: 'border-success-400/40 bg-success-400/10 text-success-300',
-    hover: 'hover:border-success-400/50 hover:bg-ink-800/80',
+    rail: 'from-danger-400 to-danger-300',
+    number: 'border-danger-400/40 bg-danger-400/10 text-danger-200',
+    hover: 'hover:border-danger-400/60 hover:bg-ink-800/80',
   },
   {
     rail: 'from-warning-400 to-warning-300',
@@ -106,9 +104,14 @@ const SCENARIO_ACCENTS = [
     hover: 'hover:border-warning-400/50 hover:bg-ink-800/80',
   },
   {
-    rail: 'from-danger-400 to-danger-300',
-    number: 'border-danger-400/40 bg-danger-400/10 text-danger-300',
-    hover: 'hover:border-danger-400/50 hover:bg-ink-800/80',
+    rail: 'from-danger-300 to-danger-200',
+    number: 'border-danger-300/40 bg-danger-300/10 text-danger-300',
+    hover: 'hover:border-danger-300/50 hover:bg-ink-800/80',
+  },
+  {
+    rail: 'from-warning-300 to-warning-200',
+    number: 'border-warning-300/40 bg-warning-300/10 text-warning-300',
+    hover: 'hover:border-warning-300/50 hover:bg-ink-800/80',
   },
 ] as const;
 
@@ -336,23 +339,23 @@ const MockInterview: FC = memo(() => {
           <Link className="shrink-0" href="/">
             <BrandLockup />
           </Link>
-          <ModeSwitch className="ml-auto" mode="mock" />
+          <ModeSwitch mode="mock" />
         </header>
         <main className="min-h-0 flex-1 overflow-y-auto" ref={mainRef}>
           <div className="border-ink-700 relative overflow-hidden border-b">
             <div
               aria-hidden
-              className="pointer-events-none absolute inset-0 bg-[radial-gradient(90%_120%_at_0%_0%,rgba(108,76,241,0.24),transparent_58%),radial-gradient(70%_90%_at_100%_0%,rgba(45,212,160,0.12),transparent_55%)]"
+              className="pointer-events-none absolute inset-0 bg-[radial-gradient(90%_120%_at_0%_0%,rgba(244,114,129,0.24),transparent_58%),radial-gradient(70%_90%_at_100%_0%,rgba(227,174,40,0.10),transparent_55%)]"
             />
             <div className="relative mx-auto w-full max-w-5xl px-5 pb-8 pt-8">
               <div className="flex flex-wrap items-center justify-between gap-4">
                 <BrandLockup size="lg" />
-                <span className="border-iris-400/40 bg-iris-400/10 text-iris-200 rounded-full border px-3 py-1 text-[11px] font-bold uppercase tracking-wider">
+                <span className="border-danger-400/40 bg-danger-400/10 text-danger-200 rounded-full border px-3 py-1 text-[11px] font-bold uppercase tracking-wider">
                   Timed practice
                 </span>
               </div>
               <h1 className="text-ink-50 mt-8 max-w-3xl text-3xl font-extrabold leading-[1.1] tracking-tight sm:text-4xl">
-                Fix the AI draft. <span className="text-iris-300">Beat the clock.</span>
+                Fix the AI draft. <span className="text-danger-300">Beat the clock.</span>
               </h1>
               <p className="text-ink-200 mt-4 max-w-2xl text-[14px] leading-7">
                 Four scenarios for the AI-era interview loop: review a model-generated patch, use an AI pair, fix the
@@ -405,7 +408,7 @@ const MockInterview: FC = memo(() => {
                       ))}
                     </div>
                     <button
-                      className={`${primaryButtonClass} mt-4 w-full shadow-[0_8px_24px_rgba(108,76,241,0.18)]`}
+                      className={`${MOCK_PRIMARY} mt-4 w-full shadow-[0_8px_24px_rgba(244,114,129,0.22)]`}
                       onClick={() => start(next)}
                       type="button">
                       Start →
@@ -446,7 +449,7 @@ const MockInterview: FC = memo(() => {
         <main className="min-h-0 flex-1 overflow-y-auto" ref={mainRef}>
           <div className="mx-auto w-full max-w-4xl space-y-5 px-5 py-8">
             <div>
-              <p className="text-iris-300 text-[11px] font-bold uppercase tracking-wider">Mock interview report</p>
+              <p className="text-danger-300 text-[11px] font-bold uppercase tracking-wider">Mock interview report</p>
               <h1 className="text-ink-50 mt-1 text-2xl font-extrabold leading-tight">{scenario.title}</h1>
               <p className="text-ink-400 mt-2 text-[13px]">{scenario.role}</p>
             </div>
@@ -465,7 +468,7 @@ const MockInterview: FC = memo(() => {
             </div>
             <CheckResults title="What the checks found" verdict={shownVerdict} />
             <div className="border-ink-700 bg-ink-850 rounded-xl border p-5">
-              <p className="text-iris-200 text-[12px] font-bold uppercase tracking-wide">What the AI got wrong</p>
+              <p className="text-danger-200 text-[12px] font-bold uppercase tracking-wide">What the AI got wrong</p>
               <p className="text-ink-200 mt-2 text-[13px] leading-6">{scenario.aiNote}</p>
               {!shownVerdict.accepted ? (
                 <p className="text-ink-400 mt-3 text-[12px] leading-6">
@@ -475,7 +478,7 @@ const MockInterview: FC = memo(() => {
               ) : null}
             </div>
             <div className="border-ink-700 bg-ink-850 rounded-xl border p-5">
-              <p className="text-iris-200 text-[12px] font-bold uppercase tracking-wide">Follow-up questions</p>
+              <p className="text-danger-200 text-[12px] font-bold uppercase tracking-wide">Follow-up questions</p>
               <p className="text-ink-400 mt-2 text-[12px] leading-6">Write the shape of your answer, not an essay.</p>
               <div className="mt-3 space-y-3">
                 {scenario.followUps.map((question, index) => (
@@ -484,7 +487,7 @@ const MockInterview: FC = memo(() => {
                       {index + 1}. {question}
                     </span>
                     <textarea
-                      className="border-ink-600 bg-ink-900 text-ink-100 focus:border-iris-400 mt-2 min-h-20 w-full resize-y rounded-lg border p-2.5 text-[13px] leading-6 outline-none"
+                      className="border-ink-600 bg-ink-900 text-ink-100 focus:border-danger-400 mt-2 min-h-20 w-full resize-y rounded-lg border p-2.5 text-[13px] leading-6 outline-none"
                       onChange={event => setFollowUps(current => ({...current, [index]: event.target.value}))}
                       placeholder="Your answer…"
                       value={followUps[index] ?? ''}
@@ -494,7 +497,7 @@ const MockInterview: FC = memo(() => {
               </div>
             </div>
             <div className="border-ink-700 bg-ink-850 rounded-xl border p-5">
-              <p className="text-iris-200 text-[12px] font-bold uppercase tracking-wide">
+              <p className="text-danger-200 text-[12px] font-bold uppercase tracking-wide">
                 Signals this scenario practises
               </p>
               <div className="mt-2 flex flex-wrap gap-1.5">
@@ -504,7 +507,7 @@ const MockInterview: FC = memo(() => {
               </div>
             </div>
             <details className="border-ink-700 bg-ink-850 rounded-xl border p-5">
-              <summary className="text-iris-200 cursor-pointer text-[12px] font-bold uppercase tracking-wide">
+              <summary className="text-danger-200 cursor-pointer text-[12px] font-bold uppercase tracking-wide">
                 Debrief · what a strong answer sounds like
               </summary>
               <div className="mt-2">
@@ -512,7 +515,7 @@ const MockInterview: FC = memo(() => {
               </div>
             </details>
             <div className="flex flex-wrap items-center gap-3">
-              <button className={primaryButtonClass} onClick={() => start(scenario)} type="button">
+              <button className={MOCK_PRIMARY} onClick={() => start(scenario)} type="button">
                 Retry this scenario
               </button>
               <button className={ghostButtonClass} onClick={backToSetup} type="button">
@@ -571,14 +574,14 @@ const MockInterview: FC = memo(() => {
             <span className="sm:hidden">Finish</span>
             <span className="hidden sm:inline">Finish &amp; report</span>
           </button>
-          <button className={primaryButtonClass} onClick={onSubmit} type="button">
+          <button className={MOCK_PRIMARY} onClick={onSubmit} type="button">
             Submit ⌘⏎
           </button>
         </div>
         <div aria-hidden className="bg-ink-800 h-0.5 w-full">
           <div
             className={`h-full transition-[width] duration-1000 ${
-              secondsLeft <= 120 ? 'bg-danger-400' : secondsLeft <= 300 ? 'bg-warning-400' : 'bg-iris-400'
+              secondsLeft <= 120 ? 'bg-danger-400' : secondsLeft <= 300 ? 'bg-warning-400' : 'bg-danger-300'
             }`}
             style={{width: `${(secondsLeft / (scenario.minutes * 60)) * 100}%`}}
           />
@@ -589,7 +592,7 @@ const MockInterview: FC = memo(() => {
         className="min-h-0 flex-1 overflow-y-auto lg:grid lg:grid-cols-[minmax(19rem,0.9fr)_minmax(25rem,1.15fr)_minmax(19rem,0.85fr)] lg:overflow-hidden"
         ref={mainRef}>
         <section className="border-ink-700 bg-ink-950/40 min-h-0 border-b p-5 lg:h-full lg:overflow-y-auto lg:border-b-0 lg:border-r">
-          <p className="text-iris-300 text-[11px] font-bold uppercase tracking-wider">{scenario.role}</p>
+          <p className="text-danger-300 text-[11px] font-bold uppercase tracking-wider">{scenario.role}</p>
           <p className="text-ink-200 mt-3 text-[13px] leading-6">{scenario.prompt}</p>
           <div className="mt-3 flex flex-wrap gap-1.5">
             {scenario.signals.map(signal => (
@@ -597,7 +600,7 @@ const MockInterview: FC = memo(() => {
             ))}
           </div>
           <details className="border-ink-700 bg-ink-850/60 group mt-5 rounded-xl border">
-            <summary className="text-iris-200 flex cursor-pointer items-center justify-between gap-3 px-4 py-3 text-[12px] font-bold">
+            <summary className="text-danger-200 flex cursor-pointer items-center justify-between gap-3 px-4 py-3 text-[12px] font-bold">
               <span>Requirements &amp; failure mode</span>
               <span className="text-ink-400 text-[10px] font-normal uppercase tracking-wider group-open:hidden">
                 open
@@ -637,7 +640,7 @@ const MockInterview: FC = memo(() => {
         </section>
 
         <aside className="bg-ink-950/40 flex min-h-[28rem] flex-col lg:h-full lg:min-h-0">
-          <div className="border-ink-700 from-iris-400/[0.08] flex shrink-0 items-center justify-between gap-2 border-b bg-gradient-to-r to-transparent px-4 py-3">
+          <div className="border-ink-700 from-danger-400/[0.08] flex shrink-0 items-center justify-between gap-2 border-b bg-gradient-to-r to-transparent px-4 py-3">
             <div>
               <p className="text-ink-50 text-[13px] font-bold">AI pair</p>
               <p className="text-success-300 flex items-center gap-1.5 text-[11px]">
@@ -678,7 +681,7 @@ const MockInterview: FC = memo(() => {
                 </button>
               </div>
               <textarea
-                className="border-ink-600 bg-ink-900 text-ink-200 focus:border-iris-400 mt-2 h-36 w-full resize-y rounded-lg border p-2.5 font-mono text-[11px] leading-5 outline-none"
+                className="border-ink-600 bg-ink-900 text-ink-200 focus:border-danger-400 mt-2 h-36 w-full resize-y rounded-lg border p-2.5 font-mono text-[11px] leading-5 outline-none"
                 onFocus={event => event.currentTarget.select()}
                 readOnly
                 value={promptText}
@@ -698,7 +701,7 @@ const MockInterview: FC = memo(() => {
                       : message.tone === 'ok'
                       ? 'border-success-400/30 bg-success-400/[0.06] text-ink-200 border'
                       : 'border-ink-700 bg-ink-850 text-ink-200 border'
-                    : 'bg-iris-400/10 text-ink-200 ml-6'
+                    : 'bg-danger-400/10 text-ink-200 ml-6'
                 }`}
                 key={message.id}>
                 <span className="text-ink-400 mb-1 block text-[10px] font-bold uppercase tracking-wider">
