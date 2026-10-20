@@ -15,7 +15,7 @@ export type LoadingPhase = 'app' | 'progress';
 export const LoadingRoute = createContext<string | null>(null);
 
 export const wordmarkClass =
-  'from-iris-300 to-ink-50 bg-gradient-to-r bg-clip-text text-lg font-extrabold tracking-tight text-transparent';
+  'from-iris-300 to-ink-50 bg-gradient-to-r bg-clip-text font-extrabold tracking-tight text-transparent';
 
 /** The brand colours of the mark (public/leetbuild-logo.svg): fixed, not themed — a logo is the same on every background. */
 const MARK_VIOLET = '#6c4cf1';
@@ -35,10 +35,10 @@ export const LogoMark: FC<{className?: string}> = memo(({className = 'h-6 w-6'})
 LogoMark.displayName = 'LogoMark';
 
 /** The mark and the wordmark as one unit: every surface uses this so the lockup cannot drift. */
-export const BrandLockup: FC<{className?: string}> = memo(({className = ''}) => (
+export const BrandLockup: FC<{className?: string; size?: 'md' | 'lg'}> = memo(({className = '', size = 'md'}) => (
   <span className={`flex items-center gap-2 ${className}`}>
-    <LogoMark />
-    <span className={wordmarkClass}>LeetBuild</span>
+    <LogoMark className={size === 'lg' ? 'h-10 w-10' : 'h-6 w-6'} />
+    <span className={`${wordmarkClass} ${size === 'lg' ? 'text-2xl' : 'text-lg'}`}>LeetBuild</span>
   </span>
 ));
 BrandLockup.displayName = 'BrandLockup';
