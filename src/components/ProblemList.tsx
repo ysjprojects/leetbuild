@@ -355,6 +355,23 @@ const StepSquares: FC<{problem: Problem; attempts: Record<string, StepAttempt>}>
 ));
 StepSquares.displayName = 'StepSquares';
 
+/**
+ * What the AI-era track asks an interviewer to see. These are the behaviours the new courses are
+ * built to expose: not "can you prompt", but can you specify, delegate, verify, evaluate, secure
+ * and operate a system whose core is a model.
+ */
+const AI_SKILLS: readonly {title: string; body: string}[] = [
+  {title: 'Specify', body: 'Turn an ambiguous ask into interfaces, budgets and acceptance criteria.'},
+  {title: 'Delegate', body: 'Use models where they help; make prompts, versions and fallbacks explicit.'},
+  {title: 'Verify', body: 'Review the generated draft, test the edge cases, and reject what you cannot prove.'},
+  {title: 'Evaluate', body: 'Golden sets, calibrated judges, regression gates and online metrics.'},
+  {
+    title: 'Secure',
+    body: 'Treat retrieved text and tool output as untrusted; scope tenants, allowlists and approvals.',
+  },
+  {title: 'Operate', body: 'Token and cost budgets, latency SLOs, retries, idempotency and traces.'},
+];
+
 const ProblemRow: FC<{
   problem: Problem;
   index: number;
@@ -388,6 +405,11 @@ const ProblemRow: FC<{
           <span className="flex flex-wrap items-center gap-2">
             <span className="text-ink-50 group-hover:text-iris-200 text-[14px] font-bold">{problem.title}</span>
             <DifficultyChip difficulty={problem.difficulty} />
+            {problem.track === 'ai' ? (
+              <span className="border-iris-400/40 bg-iris-400/10 text-iris-300 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide">
+                AI-era
+              </span>
+            ) : null}
             {problem.company !== undefined ? <CompanyChip company={problem.company} /> : null}
             {problem.concepts.map(c => (
               <ConceptChip concept={c} key={c} />
@@ -452,6 +474,8 @@ const ProblemList: FC<{
     () => problems.filter(p => problemStatus(p, attempts) === 'solved').length,
     [problems, attempts],
   );
+  const ai = useMemo(() => shown.filter(p => p.track === 'ai'), [shown]);
+  const systems = useMemo(() => shown.filter(p => p.track !== 'ai'), [shown]);
   return (
     <div className="mx-auto w-full max-w-4xl space-y-5 px-4 py-5">
       <LandingIntro />
@@ -484,17 +508,78 @@ const ProblemList: FC<{
             </button>
           </p>
         ) : (
-          <ul className="space-y-2">
-            {shown.map(problem => (
-              <ProblemRow
-                attempts={attempts}
-                best={bestSession(sessions, problem.id)}
-                index={numbers.get(problem.id) ?? 0}
-                key={problem.id}
-                problem={problem}
-              />
-            ))}
-          </ul>
+          <>
+            {ai.length > 0 ? (
+              <section className="border-iris-400/30 from-iris-400/[0.08] mb-5 rounded-2xl border bg-gradient-to-b to-transparent p-4">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div>
+                    <p className="text-iris-300 text-[11px] font-bold uppercase tracking-wider">
+                      AI-era interview track
+                    </p>
+                    <h2 className="text-ink-50 mt-1 text-[17px] font-extrabold leading-tight">
+                      Use AI. Then prove it.
+                    </h2>
+                  </div>
+                  <span className="border-iris-400/40 bg-iris-400/10 text-iris-300 rounded-full border px-2 py-0.5 text-[10px] font-semibold">
+                    {ai.length} courses · {ai.reduce((n, p) => n + p.steps.length, 0)} steps
+                  </span>
+                </div>
+                <p className="text-ink-200 mt-2 max-w-3xl text-[12px] leading-relaxed">
+                  AI-era interviews are not only about typing an algorithm from memory. They ask whether you can specify
+                  a problem, delegate to a model, verify the result, measure quality, and keep it safe and affordable.
+                  Every starter below is a model-generated draft with a real flaw; the checks look for the review,
+                  boundary, measurement or operational control that makes it safe to ship.
+                </p>
+                <div className="mt-3 flex flex-wrap items-center gap-3">
+                  <Link
+                    className="bg-iris-400 text-ink-950 hover:bg-iris-300 rounded-lg px-3 py-1.5 text-[12px] font-bold transition"
+                    href="/mock-interview">
+                    Start an AI mock interview →
+                  </Link>
+                  <span className="text-ink-400 text-[11px]">
+                    timed · flawed AI draft · an offline AI pair · no solution reveal
+                  </span>
+                </div>
+                <ul className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                  {AI_SKILLS.map(skill => (
+                    <li className="border-ink-700 bg-ink-900/60 rounded-lg border px-3 py-2" key={skill.title}>
+                      <span className="text-iris-200 text-[11px] font-bold uppercase tracking-wide">{skill.title}</span>
+                      <span className="text-ink-300 mt-0.5 block text-[11px] leading-snug">{skill.body}</span>
+                    </li>
+                  ))}
+                </ul>
+                <ul className="mt-3 space-y-2">
+                  {ai.map(problem => (
+                    <ProblemRow
+                      attempts={attempts}
+                      best={bestSession(sessions, problem.id)}
+                      index={numbers.get(problem.id) ?? 0}
+                      key={problem.id}
+                      problem={problem}
+                    />
+                  ))}
+                </ul>
+              </section>
+            ) : null}
+            {systems.length > 0 ? (
+              <section>
+                <p className="text-iris-400 mb-2 text-[11px] font-bold uppercase tracking-wider">
+                  {ai.length > 0 ? 'Systems track' : 'Problems'}
+                </p>
+                <ul className="space-y-2">
+                  {systems.map(problem => (
+                    <ProblemRow
+                      attempts={attempts}
+                      best={bestSession(sessions, problem.id)}
+                      index={numbers.get(problem.id) ?? 0}
+                      key={problem.id}
+                      problem={problem}
+                    />
+                  ))}
+                </ul>
+              </section>
+            ) : null}
+          </>
         )}
       </section>
     </div>

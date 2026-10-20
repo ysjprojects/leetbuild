@@ -12,8 +12,8 @@
     "verify": "tsx scripts/verify.ts",
     "protogen": "tsx scripts/protogen.ts",
     "build:runtime": "tsx scripts/build-runtime.ts",
-    "predev": "yarn build:runtime",
-    "prebuild": "yarn build:runtime"
+    "predev": "tsx scripts/build-runtime.ts",
+    "prebuild": "tsx scripts/build-runtime.ts"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.3",

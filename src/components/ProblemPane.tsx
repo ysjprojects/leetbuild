@@ -411,6 +411,11 @@ const ProblemPane: FC<{
           <span className="order-last flex min-w-0 basis-full items-center gap-2 sm:order-none sm:flex-1 sm:basis-0">
             <span className="text-ink-50 min-w-0 truncate text-[13px] font-bold">{problem.title}</span>
             <DifficultyChip difficulty={problem.difficulty} />
+            {problem.track === 'ai' ? (
+              <span className="border-iris-400/40 bg-iris-400/10 text-iris-300 shrink-0 rounded-full border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide">
+                AI-era
+              </span>
+            ) : null}
             <span className="font-code text-ink-300 shrink-0 text-[11px]">
               {score.score}/{score.max} pts
             </span>

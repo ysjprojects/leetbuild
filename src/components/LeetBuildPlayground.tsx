@@ -66,6 +66,7 @@ import Confetti from './Confetti';
 import {useDialog} from './Dialog';
 import {EditorSettingsForm, GearIcon} from './EditorSettings';
 import {LoadingScreen, LogoMark, wordmarkClass} from './LoadingScreen';
+import ModeSwitch from './ModeSwitch';
 import {ghostButtonClass, selectClass} from './paneShared';
 import ProblemList from './ProblemList';
 import ProblemPane, {type PaneTab, unlocked} from './ProblemPane';
@@ -1234,8 +1235,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
             <LogoMark />
             <span className={wordmarkClass}>LeetBuild</span>
           </button>
-          <span className="text-ink-300 hidden text-[11px] sm:inline">build systems step by step</span>
+          <span className="text-ink-300 hidden text-[11px] sm:inline">build systems. use AI. prove it.</span>
         </div>
+        <ModeSwitch mode="practice" />
         <div className="ml-auto flex items-center gap-2">
           <label className="text-ink-300 flex items-center gap-1.5 text-[11px]">
             <span className="hidden sm:inline">language</span>
