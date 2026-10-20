@@ -54,6 +54,13 @@ export type Difficulty = 'easy' | 'medium' | 'hard';
 export const DIFFICULTIES: readonly Difficulty[] = ['easy', 'medium', 'hard'];
 
 /**
+ * Which interview track a course belongs to. `systems` is the classic build-a-system track
+ * (the default when omitted); `ai` is the AI-era track, where every starter is a plausible
+ * model-generated draft that the learner has to review, fix and verify.
+ */
+export type Track = 'systems' | 'ai';
+
+/**
  * What a check looks for in the learner's code once comments are stripped. Every `all` pattern
  * must match, no `none` pattern may match, and the `order` patterns must each match with their
  * first matches in increasing position (used for "validate before you enqueue", "commit after you
@@ -204,6 +211,8 @@ export interface Problem {
   concepts: Concept[];
   /** Estimated time for all steps, in minutes. */
   minutes: number;
+  /** Interview track; omitted means the classic systems track. */
+  track?: Track;
   /** Problem statement: the real system, the simplified abstraction built here, what is out of scope. */
   statement: string;
   diagram: Diagram;
