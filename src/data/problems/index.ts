@@ -64,6 +64,7 @@ import {rerankerServiceProblem} from './60-reranker-service/index';
 import {summarizerServiceProblem} from './61-summarizer-service/index';
 import {semanticCacheProblem} from './62-semantic-cache/index';
 import {humanReviewQueueProblem} from './63-human-review-queue/index';
+import {fineTuneOrchestratorProblem} from './64-fine-tune-orchestrator/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -119,6 +120,7 @@ export const problems: Problem[] = [
   summarizerServiceProblem,
   semanticCacheProblem,
   humanReviewQueueProblem,
+  fineTuneOrchestratorProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
