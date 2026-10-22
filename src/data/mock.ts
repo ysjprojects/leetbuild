@@ -1531,6 +1531,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'fraud-scoring-the-fraud-model-that-approved-everything',
+    problemId: 'fraud-scoring',
+    stepId: 'endpoint',
+    title: 'The fraud model that approved everything',
+    blurb: 'Timeouts scored zero and caller features were trusted.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'During a model outage, approvals spiked because the draft mapped timeouts to risk zero, and a probe account nudged its own features upward by sending them in the request body. The same case detail exposed full card numbers. Review it, fix it, and prove degradation is rules-based and features are server-side.',
+    signals: ['Secure', 'Operate', 'Verify'],
+    aiNote:
+      'The draft treats a scoring timeout as risk zero, turning an outage into an approval wave, and it accepts caller-supplied risk features, so the entity being scored can declare itself safe; case detail also leaks full card numbers.',
+    testIdea:
+      'Time out the model and assert a rules-based score with the fallback marker; send body features and assert the stored score ignores them; inspect a case response for any unmasked card number.',
+    followUps: [
+      'Which fallback band is safest when the model is down?',
+      'How would you replay a score for a disputed decision?',
+      'What separates a rule change from a model change in audit?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
