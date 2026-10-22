@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'transcription-service-the-transcript-that-restarted-twice',
+    problemId: 'transcription-service',
+    stepId: 'endpoint',
+    title: 'The transcript that restarted twice',
+    blurb: 'One bad chunk re-ran the whole file and re-billed it.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A two-hour recording was billed three times after a single chunk failed, because the draft restarted the entire transcription on any error. It also published raw text before redaction ran. Review it, fix it, and prove retries are per-chunk and redaction gates publishing.',
+    signals: ['Operate', 'Verify', 'Secure'],
+    aiNote:
+      'The draft restarts the whole transcription when any chunk fails, multiplying provider cost by the failure count, and it emits transcript segments before the redaction pass, so raw speech reaches the topic when redaction later fails.',
+    testIdea:
+      'Fail one middle chunk and assert only that chunk re-runs; count provider calls across the runs; fail redaction and assert no segment was published with raw text.',
+    followUps: [
+      'How would you make chunk boundaries speaker-safe?',
+      'What should happen when the language hint is wrong?',
+      'How do you prove a transcript is complete?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
