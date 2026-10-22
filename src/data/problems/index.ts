@@ -29,6 +29,7 @@ import {promptRegistryProblem} from './25-prompt-registry/index';
 import {costMeterProblem} from './26-cost-meter/index';
 import {feedbackCollectorProblem} from './27-feedback-collector/index';
 import {distillationPipelineProblem} from './28-distillation-pipeline/index';
+import {batchInferenceProblem} from './29-batch-inference/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -49,6 +50,7 @@ export const problems: Problem[] = [
   costMeterProblem,
   feedbackCollectorProblem,
   distillationPipelineProblem,
+  batchInferenceProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
