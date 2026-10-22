@@ -63,6 +63,7 @@ import {citationStoreProblem} from './59-citation-store/index';
 import {rerankerServiceProblem} from './60-reranker-service/index';
 import {summarizerServiceProblem} from './61-summarizer-service/index';
 import {semanticCacheProblem} from './62-semantic-cache/index';
+import {humanReviewQueueProblem} from './63-human-review-queue/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -117,6 +118,7 @@ export const problems: Problem[] = [
   rerankerServiceProblem,
   summarizerServiceProblem,
   semanticCacheProblem,
+  humanReviewQueueProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,

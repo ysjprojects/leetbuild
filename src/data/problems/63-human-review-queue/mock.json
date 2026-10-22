@@ -1,0 +1,18 @@
+[
+  {
+    "stepId": "endpoint",
+    "title": "The queue that resolved on a timeout",
+    "blurb": "Auto-resolve fired on a timeout for anything above 0.5 confidence.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 20,
+    "prompt": "A spam wave was silently resolved by the queue itself when the enforcement service timed out, because the draft auto-resolved high-confidence items and treated a timeout as approval. The same draft stranded items when reviewers abandoned leases. Review it, fix it, and prove auto-resolution is a narrow granted class and leases return.",
+    "signals": ["Operate", "Secure", "Verify"],
+    "aiNote": "The draft auto-resolves on enforcement timeouts for any item above a 0.5 confidence, so an enforcement outage becomes a silent self-approval loop, and it assigns items without leases so a crashed reviewer strands work forever.",
+    "testIdea": "Time out enforcement and assert the item escalates to a human; abandon a lease and assert the item re-enters the queue; enqueue the same source twice and assert one item.",
+    "followUps": [
+      "Which categories are ever safe to auto-resolve?",
+      "How do you keep SLA clocks honest across regions?",
+      "What would you record to audit an auto-resolve months later?"
+    ]
+  }
+]
