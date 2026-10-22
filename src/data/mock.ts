@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'content-classifier-the-classifier-that-invented-its-own-labels',
+    problemId: 'content-classifier',
+    stepId: 'endpoint',
+    title: 'The classifier that invented its own labels',
+    blurb: 'Unknown labels passed through and outages returned safe.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'Downstream routing silently dropped content labeled with categories the taxonomy never contained, and during a model outage everything was classified safe with no record of why. The model-generated draft returns invented labels and conflates fallback with classification. Review it, fix it, and prove taxonomy binding and provenance.',
+    signals: ['Specify', 'Evaluate', 'Verify'],
+    aiNote:
+      'The draft returns whatever label string the model produces without checking it against the taxonomy version, so invented labels flow downstream as real, and it maps every failure to the label safe with no provenance marker.',
+    testIdea:
+      'Feed the model an invented label and assert the response routes it to review rather than returning it; kill the model and assert fallback provenance appears; edit a taxonomy and assert past classifications still name their original version.',
+    followUps: [
+      'How would you measure label drift without ground truth?',
+      'What review flow handles invented labels best?',
+      'When should a taxonomy version be retired?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
