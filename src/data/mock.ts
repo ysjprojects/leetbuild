@@ -1333,6 +1333,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'session-store-the-session-that-survived-logout',
+    problemId: 'session-store',
+    stepId: 'endpoint',
+    title: 'The session that survived logout',
+    blurb: 'Rotation was not atomic and revocation never reached the cache.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A user logged out but their token kept working for an hour, because the draft validated sessions against an hourly cache and extended it on auth-service failure. A crash during rotation also left two live sessions. Review it, fix it, and prove rotation is atomic and revocation is immediate.',
+    signals: ['Secure', 'Specify', 'Verify'],
+    aiNote:
+      'The draft caches validation for an hour and fails open when the auth service is unavailable, so a revoked session keeps working, and its rotation writes the replacement before deleting the original in separate commands, so a crash leaves both live.',
+    testIdea:
+      'Revoke a token and assert requests fail within the cache window; fail the auth service and assert requests are denied; crash between rotation writes and assert exactly one session id remains valid.',
+    followUps: [
+      'How short can a validation cache be before it costs too much?',
+      'What is the right behavior for a session mid-request when it is revoked?',
+      'Which session metadata is safe to show a user?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
