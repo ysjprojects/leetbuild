@@ -24,6 +24,7 @@ import {evalHarnessProblem} from './20-eval-harness/index';
 import {guardrailServiceProblem} from './21-guardrail-service/index';
 import {agentOrchestratorProblem} from './22-agent-orchestrator/index';
 import {embeddingServiceProblem} from './23-embedding-service/index';
+import {vectorSearchProblem} from './24-vector-search/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -39,6 +40,7 @@ export const problems: Problem[] = [
   guardrailServiceProblem,
   agentOrchestratorProblem,
   embeddingServiceProblem,
+  vectorSearchProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,

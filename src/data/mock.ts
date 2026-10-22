@@ -255,6 +255,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'vector-search-the-search-that-leaked-across-tenants',
+    problemId: 'vector-search',
+    stepId: 'endpoint',
+    title: 'The search that leaked across tenants',
+    blurb: "A cache key missing the tenant let one tenant see another's hits.",
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      "A tenant spotted results in search that belonged to another tenant's private corpus. The model-generated draft keys the result cache by query hash alone and trusts a tenant field from the request body. Review it, fix it, and prove tenant isolation holds on every path including the cache.",
+    signals: ['Secure', 'Specify', 'Verify'],
+    aiNote:
+      'The draft builds the result cache key from the query hash and k only, so the first tenant to run a query populates an entry that the next tenant receives, and it reads the tenant filter from the request body instead of from auth.',
+    testIdea:
+      "Run the same vector for two tenants and assert the returned ids are disjoint; send a body tenant that contradicts the authenticated tenant and assert 403; poison one tenant's cache entry and assert the other tenant is unaffected.",
+    followUps: [
+      'Should the cache key include the index version, and what breaks if it does not?',
+      'How would you merge shard results when one shard is slow but healthy?',
+      'What would you store to reproduce a bad ranking without keeping the raw query?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
