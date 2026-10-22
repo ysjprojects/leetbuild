@@ -19,6 +19,7 @@ import {doordashSupportProblem} from './15-doordash-support/index';
 import {aiGatewayProblem} from './16-ai-gateway/index';
 import {ragServiceProblem} from './17-rag-service/index';
 import {modelRouterProblem} from './18-model-router/index';
+import {chatMemoryProblem} from './19-chat-memory/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -29,6 +30,7 @@ export const problems: Problem[] = [
   aiGatewayProblem,
   ragServiceProblem,
   modelRouterProblem,
+  chatMemoryProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
