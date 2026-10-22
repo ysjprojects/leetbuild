@@ -1,0 +1,16 @@
+{
+  "title": "The approval that approved itself",
+  "blurb": "The requester named their own approvers and states advanced twice.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "A spend request was approved by the requester's own account because the draft accepted caller-named approvers, and one approver's double-click advanced two steps of the chain. Review it, fix it, and prove approvers come from policy and one decision moves one step.",
+  "signals": ["Specify", "Secure", "Verify"],
+  "aiNote": "The draft resolves approvers from the request body instead of the pinned policy, so a requester can name a friendly or themselves, and its advance logic accepts any approval item from a list, so a duplicated decision skips a step entirely.",
+  "testIdea": "Submit with caller-named approvers and assert policy resolution overrides them; double-decide as one approver and assert the chain advances one step; time out eligibility and assert the decision is denied.",
+  "followUps": [
+    "When is delegation legitimate versus a bypass?",
+    "How do you version a chain for in-flight requests?",
+    "What makes a why field auditable without leaking it into events?"
+  ],
+  "stepId": "endpoint"
+}
