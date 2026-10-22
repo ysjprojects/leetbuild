@@ -348,7 +348,7 @@ const ProvidedRow: FC<{file: ProvidedFile; active: boolean; onOpen: (id: string)
       <li>
         <button
           className={`flex w-full items-center gap-1.5 py-0.5 pl-5 pr-2 text-left text-[11px] transition ${
-            active ? 'bg-ink-800 text-ink-200' : 'text-ink-400 hover:bg-ink-800/60 hover:text-ink-200'
+            active ? 'bg-ink-800 text-ink-300' : 'text-ink-500 hover:bg-ink-800/60 hover:text-ink-300'
           }`}
           onClick={onClick}
           title={`${file.path} — provided by the course, read-only`}
