@@ -1,0 +1,16 @@
+{
+  "stepId": "endpoint",
+  "title": "The job that fired 200 times",
+  "blurb": "A scheduler pause was followed by a catch-up burst.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "After a ten-minute scheduler pause, a minutely job fired 200 catch-up executions in seconds and took down its downstream database. The model-generated draft retried each missed window and had no misfire policy. Review it, fix it, and prove misfires are policied, not stormed.",
+  "signals": ["Specify", "Operate", "Verify"],
+  "aiNote": "The draft treats every missed window as owed and fires them all as fast as retries allow, so any scheduler pause converts into a burst against the target, and its last-run check-then-write lets two instances fire one window during a rolling deploy.",
+  "testIdea": "Pause the scheduler for ten windows and assert at most one catch-up fire under fire-once; deploy two instances simultaneously and assert one fire per window; assert skipped windows appear in history with their policy.",
+  "followUps": [
+    "Which jobs deserve catch-up versus skip?",
+    "How do you cap a catch-up burst?",
+    "What clock guarantees does the scheduler need across nodes?"
+  ]
+}

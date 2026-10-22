@@ -79,6 +79,7 @@ import {logIndexerProblem} from './75-log-indexer/index';
 import {traceCollectorProblem} from './76-trace-collector/index';
 import {jobQueueProblem} from './77-job-queue/index';
 import {workflowEngineProblem} from './78-workflow-engine/index';
+import {cronSchedulerProblem} from './79-cron-scheduler/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -149,6 +150,7 @@ export const problems: Problem[] = [
   traceCollectorProblem,
   jobQueueProblem,
   workflowEngineProblem,
+  cronSchedulerProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
