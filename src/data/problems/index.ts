@@ -42,6 +42,7 @@ import {connectorHubProblem} from './38-connector-hub/index';
 import {crawlIndexProblem} from './39-crawl-index/index';
 import {knowledgeGraphProblem} from './40-knowledge-graph/index';
 import {quotaBrokerProblem} from './41-quota-broker/index';
+import {modelAuditProblem} from './42-model-audit/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -75,6 +76,7 @@ export const problems: Problem[] = [
   crawlIndexProblem,
   knowledgeGraphProblem,
   quotaBrokerProblem,
+  modelAuditProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
