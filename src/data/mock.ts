@@ -2103,6 +2103,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'identity-service-the-email-that-became-two-accounts',
+    problemId: 'identity-service',
+    stepId: 'endpoint',
+    title: 'The email that became two accounts',
+    blurb: 'No normalization and an auto-verify path.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'One person ended up with two accounts because the draft compared raw email strings, and a third signup was auto-verified after the provider timed out, letting an unowned address login. Signup retries also kept creating accounts. Review it, fix it, and prove uniqueness and deliberate verification.',
+    signals: ['Secure', 'Specify', 'Verify'],
+    aiNote:
+      'The draft compares raw address strings so case and alias variants become separate identities, and it marks accounts verified when the verification provider times out, converting a provider outage into a way to claim addresses that were never proven owned.',
+    testIdea:
+      'Sign up as Alice@x.com then alice@x.com and assert one account; time out the verification provider and assert the account stays unverified and cannot log in; replay a signup and assert the original user id.',
+    followUps: [
+      'Which normalization rules should a domain control?',
+      'How do you handle a phone number recycled by the carrier?',
+      'What does the public projection of a user ever need?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
