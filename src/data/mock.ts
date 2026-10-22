@@ -827,6 +827,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'dataset-registry-the-dataset-that-changed-under-training',
+    problemId: 'dataset-registry',
+    stepId: 'endpoint',
+    title: 'The dataset that changed under training',
+    blurb: 'The draft let a version be overwritten and promoted on timeout.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'Two training runs on the same dataset name produced incomparable models, because the draft let the version hash be overwritten in place and promoted a candidate whose validation had timed out. The same endpoint handed out permanent object URLs. Review it, fix it, and prove versions are immutable and validation gates promotion.',
+    signals: ['Specify', 'Evaluate', 'Verify'],
+    aiNote:
+      "The draft overwrites an existing version's pointer in place, so a hash no longer identifies its bytes, and it promotes candidates whose validation timed out, so unvalidated data reaches training under a clean version name.",
+    testIdea:
+      'Re-register an existing version and assert 409; time out validation and assert the previous version stays latest while the candidate is pending; assert a signed URL expires and cannot be replayed.',
+    followUps: [
+      'What does a license allowlist actually need to encode?',
+      'How would you reproduce a training run two years later?',
+      'Who may purge a version, and what replaces it?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
