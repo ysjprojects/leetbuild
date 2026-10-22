@@ -101,6 +101,7 @@ import {formServiceProblem} from './97-form-service/index';
 import {approvalWorkflowProblem} from './98-approval-workflow/index';
 import {mapsRoutingProblem} from './99-maps-routing/index';
 import {fleetTrackingProblem} from './100-fleet-tracking/index';
+import {telemetryIngestProblem} from './101-telemetry-ingest/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -193,6 +194,7 @@ export const problems: Problem[] = [
   approvalWorkflowProblem,
   mapsRoutingProblem,
   fleetTrackingProblem,
+  telemetryIngestProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
