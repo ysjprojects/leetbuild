@@ -25,11 +25,11 @@ Pyodide (~10 MB) and esbuild-wasm (~14 MB) are fetched from jsDelivr on first us
 
 ## The gate
 
-Every PR passes all four locally before review.
+Every PR passes all four locally before review; CI (`.github/workflows/ci.yml`) runs the same four on every push to a PR, in parallel, and the `CI` check must be green to merge. `yarn format` rewrites what Prettier and `eslint --fix` can repair; `yarn lint` only checks, which is what CI runs. CI installs with `yarn install --frozen-lockfile`, so a `yarn.lock` that disagrees with `package.json` fails before anything else does.
 
 | Command | Enforces |
 |---|---|
-| `yarn lint` | Prettier (120 columns, single quotes, no bracket spacing) and ESLint with `--max-warnings=0`: sorted imports and JSX props, `react-hooks/exhaustive-deps`, `react-memo/require-memo` |
+| `yarn lint` | Prettier (120 columns, single quotes, no bracket spacing) and ESLint with `--max-warnings=0`: sorted imports and JSX props, `react-hooks/exhaustive-deps`, `react-memo/require-memo`, and the type-aware `no-floating-promises`, `await-thenable` and `switch-exhaustiveness-check` |
 | `yarn compile` | `tsc --noEmit`, strict |
 | `yarn verify` | the judge's self-tests, every course's shape, every starter failing and every solution passing in all five languages, every Python and TypeScript harness executed in Node against both, the catalogue totalling 1337 points (details below). `--problem <id>` scopes it; `--runtime typescript` skips the Pyodide boot |
 | `yarn build` | the production build; it also rebuilds the worker bundles |

@@ -15,7 +15,8 @@ yarn build && yarn start        # production
 yarn verify                     # checks every course (see below); run after editing content
 yarn verify --no-runtime        # the same without executing the Python and TypeScript harnesses
 yarn verify --runtime typescript   # execute only one language's harnesses
-yarn lint                       # prettier + eslint
+yarn lint                       # prettier --check + eslint, as CI runs them
+yarn format                     # prettier --write + eslint --fix
 yarn compile                    # tsc --noEmit
 yarn build:runtime              # rebuild public/py/worker.js and public/ts/worker.js after editing src/lib/runtime/
 yarn protogen <course dir>      # regenerate a course's Python protobuf modules and .proto sources from proto/*.proto

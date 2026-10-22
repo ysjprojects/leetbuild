@@ -124,6 +124,28 @@ export const mockScenarios: readonly MockScenario[] = [
     defaultLanguage: 'python',
   },
   {
+    id: 'router-policy',
+    problemId: 'model-router',
+    stepId: 'route-endpoint',
+    title: 'The route endpoint that trusts its caller',
+    blurb: "The draft returns the caller's policy as the model name — fix the trust boundary.",
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'You are the AI platform engineer on call. A tenant\'s integration sent `policy: "gpt-4o"` and the draft echoed it back as the model name, so any client can select any model the provider serves. The same handler also skips the prompt caps and the Idempotency-Key. Review it, fix it, and prove the fix.',
+    signals: ['Specify', 'Secure', 'Verify'],
+    aiNote:
+      "The draft treats the caller's `policy` string as the model name, validates neither the 256 KiB prompt cap nor `max_tokens`, ignores `Idempotency-Key` so a client retry routes twice, and logs the prompt on every request.",
+    testIdea:
+      'Post an unknown policy and expect 400; post a prompt over 256 KiB and expect 413; replay one request with the same Idempotency-Key and assert the second response is the stored decision rather than a new route.',
+    followUps: [
+      'Where should the policy-to-model mapping live so a config change does not need a code deploy?',
+      'Is char-count over 4 a good token estimate, and what would you use when the provider disagrees?',
+      'What would you log for a replayed request so on-call can tell a duplicate from a new route?',
+    ],
+    defaultLanguage: 'python',
+  },
+  {
     id: 'chat-memory-the-memory-that-grows-forever',
     problemId: 'chat-memory',
     stepId: 'endpoint',
