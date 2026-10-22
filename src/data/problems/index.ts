@@ -122,6 +122,7 @@ import {researchOrchestratorProblem} from './123-research-orchestrator/index';
 import {merchantAgentProblem} from './124-merchant-agent/index';
 import {fairHousingGuardrailProblem} from './125-fair-housing-guardrail/index';
 import {catalogEnrichmentProblem} from './126-catalog-enrichment/index';
+import {promptDefenceProblem} from './127-prompt-defence/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -235,6 +236,7 @@ export const problems: Problem[] = [
   merchantAgentProblem,
   fairHousingGuardrailProblem,
   catalogEnrichmentProblem,
+  promptDefenceProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
