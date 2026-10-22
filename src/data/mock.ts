@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'voice-agent-the-agent-that-interrupted-itself',
+    problemId: 'voice-agent',
+    stepId: 'endpoint',
+    title: 'The agent that interrupted itself',
+    blurb: 'Barge-in raced the TTS offset and the draft replayed audio on retry.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A user interrupted the agent and it kept talking to the end of the sentence; a reconnect later replayed the first two sentences of audio, and the client was billed for both. The model-generated draft updates barge-in state in two commands and restarts TTS from offset zero. Review it, fix it, and prove interruption is atomic and audio never replays.',
+    signals: ['Operate', 'Specify', 'Verify'],
+    aiNote:
+      'The draft writes the speaker change and the TTS offset as separate commands, so a barge-in can land between them and the agent speaks over the user, and its TTS retry restarts the stream at the beginning, re-billing and re-playing delivered audio.',
+    testIdea:
+      "Race a barge-in with an audio frame and assert the agent's stream is truncated at the current token; fail TTS mid-response and assert the retry resumes at the delivered offset or errors without replaying audio.",
+    followUps: [
+      'What is the right behavior when ASR confidence is low for the whole turn?',
+      "How would you cap a session's cost without cutting off a long legitimate answer?",
+      'What redaction happens before a transcript is stored?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
