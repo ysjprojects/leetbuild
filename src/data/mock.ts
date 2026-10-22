@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'translation-service-the-translation-that-was-never-translated',
+    problemId: 'translation-service',
+    stepId: 'endpoint',
+    title: 'The translation that was never translated',
+    blurb: 'Failures returned source text labeled as the target language.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      "A UI shipped untranslated English stamped as French because the draft returned the source text as a success when the MT service timed out, and the CDN cached it as localized. The same cache key ignored the tenant, so one customer's glossary translated another's content. Review it, fix it, and prove fallbacks are marked and caches are scoped.",
+    signals: ['Specify', 'Verify', 'Secure'],
+    aiNote:
+      'The draft returns source text with a success status and the requested target locale when MT fails, so failures are indistinguishable from translations and get cached, and its glossary cache key ignores the tenant.',
+    testIdea:
+      "Fail the MT call and assert the response carries an untranslated marker and a retriable status; assert the marked response is never cached; change tenant B's glossary and assert tenant A's translations are unaffected.",
+    followUps: [
+      'When is identity translation (for example a product name) ever correct?',
+      'How would you detect glossary terms being ignored by the model?',
+      'What makes a quality score per locale comparable across locales?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
