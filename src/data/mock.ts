@@ -1971,6 +1971,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'iot-hub-the-door-that-unlocked-twice',
+    problemId: 'iot-hub',
+    stepId: 'endpoint',
+    title: 'The door that unlocked twice',
+    blurb: 'Replayed commands and shadow overwrites.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      "One unlock command executed twice after a gateway retry repeated it, and a device reporting its old configuration erased an operator's settings change. An offline device was also hammered with retries for days. Review it, fix it, and prove command identity and shadow versions hold.",
+    signals: ['Secure', 'Operate', 'Verify'],
+    aiNote:
+      "The draft discards the command's idempotency id, so a retried delivery re-executes side effects like unlocking a door, and it overwrites the desired document with whatever the device reports, so intent is silently reverted instead of flagging divergence.",
+    testIdea:
+      'Replay one command id and assert one execution; report a stale device version and assert desired survives with divergence listed; leave a device offline past its window and assert the queue drops the command rather than retrying forever.',
+    followUps: [
+      'Which commands may ever be idempotent by device acks?',
+      'How should desired state handle irreversible actions?',
+      'What freshness does shadow divergence need?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
