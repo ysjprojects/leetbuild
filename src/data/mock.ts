@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'feature-store-the-feature-that-looked-into-the-future',
+    problemId: 'feature-store',
+    stepId: 'endpoint',
+    title: 'The feature that looked into the future',
+    blurb: 'As-of reads served newer values and leaked into training.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A model scored suspiciously well offline and poorly in production, because the feature store served values computed after the training cutoff. The same backfill zero-filled partitions that timed out. Review it, fix it, and prove point-in-time correctness and honest backfills.',
+    signals: ['Evaluate', 'Specify', 'Verify'],
+    aiNote:
+      'The draft reads the latest value with no as-of guard, so a backfill against a past cutoff receives features computed later, inflating offline scores, and its offline path zero-fills timed-out partitions, turning infrastructure failures into plausible-looking data.',
+    testIdea:
+      'Write a value with a timestamp after the cutoff and assert an as-of read returns the older value or nothing; time out a partition and assert it is reported missing, not zero-filled; bump a version and assert old cached keys are not read for the new version.',
+    followUps: [
+      'What is the right unit of versioning for a feature?',
+      'How would you prove training and serving read identical definitions?',
+      'What drift signal would page an engineer versus open a ticket?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
