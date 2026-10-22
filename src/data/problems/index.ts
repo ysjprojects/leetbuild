@@ -104,6 +104,7 @@ import {fleetTrackingProblem} from './100-fleet-tracking/index';
 import {telemetryIngestProblem} from './101-telemetry-ingest/index';
 import {iotHubProblem} from './102-iot-hub/index';
 import {gameMatchmakingProblem} from './103-game-matchmaking/index';
+import {mediaTranscoderProblem} from './104-media-transcoder/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -199,6 +200,7 @@ export const problems: Problem[] = [
   telemetryIngestProblem,
   iotHubProblem,
   gameMatchmakingProblem,
+  mediaTranscoderProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,

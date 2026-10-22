@@ -2015,6 +2015,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'media-transcoder-the-video-with-a-hole-at-minute-nine',
+    problemId: 'media-transcoder',
+    stepId: 'endpoint',
+    title: 'The video with a hole at minute nine',
+    blurb: 'Segments were marked done before encoding and corrupt input retried forever.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A finished video glitched at minute nine, because the draft marked a segment done before its encode returned and the crashed worker was never retried, while a corrupt segment elsewhere looped the job for hours. Review it, fix it, and prove completion follows encoding and failures classify.',
+    signals: ['Verify', 'Operate', 'Specify'],
+    aiNote:
+      'The draft marks segments complete when they are claimed rather than when the encode returns, so a worker crash leaves a hole that the manifest still reports as full, and it retries corrupt input indefinitely instead of classifying it as terminal.',
+    testIdea:
+      'Kill a worker mid-segment and assert the segment is re-encoded and the manifest is gapless; corrupt one input segment and assert the job fails with that index after bounded attempts; replay a submit and assert one job.',
+    followUps: [
+      'How do you bound retries when input corruption is intermittent?',
+      'What makes a manifest trustworthy?',
+      'When should transcoding prefer quality over speed?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
