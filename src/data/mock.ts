@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'checkpoint-store-the-checkpoint-that-resumed-from-garbage',
+    problemId: 'checkpoint-store',
+    stepId: 'endpoint',
+    title: 'The checkpoint that resumed from garbage',
+    blurb: 'Chunks were acknowledged before verification and resumed as weights.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A training run resumed from a checkpoint whose middle chunk was corrupted, because the draft acknowledged chunks before the store verified checksums and its commit flag trusted a caller-supplied byte count. Review it, fix it, and prove acknowledgments mean durability and commits mean completeness.',
+    signals: ['Operate', 'Verify', 'Specify'],
+    aiNote:
+      "The draft acknowledges each chunk as soon as it hands it to the store, so corruption is found only in a background pass long after a resume has consumed it, and its commit marker is derived from the caller's declared size rather than the verified chunk set.",
+    testIdea:
+      'Corrupt one chunk and assert the upload fails at verification rather than committing; lie about the byte count and assert the commit marker never sets; read the latest checkpoint while an upload is uncommitted and assert it is invisible.',
+    followUps: [
+      'How would you verify a checkpoint without reading it back fully?',
+      'What TTL keeps abandoned uploads from pinning storage forever?',
+      'How should a resumed run treat the last verified chunk boundary?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
