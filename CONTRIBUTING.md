@@ -27,12 +27,12 @@ Pyodide (~10 MB) and esbuild-wasm (~14 MB) are fetched from jsDelivr on first us
 
 Every PR passes all four locally before review; CI (`.github/workflows/ci.yml`) runs the same four on every push to a PR, in parallel, and the `CI` check must be green to merge. `yarn format` rewrites what Prettier and `eslint --fix` can repair; `yarn lint` only checks, which is what CI runs. CI installs with `yarn install --frozen-lockfile`, so a `yarn.lock` that disagrees with `package.json` fails before anything else does.
 
-| Command | Enforces |
-|---|---|
-| `yarn lint` | Prettier (120 columns, single quotes, no bracket spacing) and ESLint with `--max-warnings=0`: sorted imports and JSX props, `react-hooks/exhaustive-deps`, `react-memo/require-memo`, and the type-aware `no-floating-promises`, `await-thenable` and `switch-exhaustiveness-check` |
-| `yarn compile` | `tsc --noEmit`, strict |
-| `yarn verify` | the judge's self-tests, every course's shape, every starter failing and every solution passing in all five languages, every Python and TypeScript harness executed in Node against both, the catalogue totalling 1337 points (details below). `--problem <id>` scopes it; `--runtime typescript` skips the Pyodide boot |
-| `yarn build` | the production build; it also rebuilds the worker bundles |
+| Command        | Enforces                                                                                                                                                                                                                                                                                                            |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `yarn lint`    | Prettier (120 columns, single quotes, no bracket spacing) and ESLint with `--max-warnings=0`: sorted imports and JSX props, `react-hooks/exhaustive-deps`, `react-memo/require-memo`, and the type-aware `no-floating-promises`, `await-thenable` and `switch-exhaustiveness-check`                                 |
+| `yarn compile` | `tsc --noEmit`, strict                                                                                                                                                                                                                                                                                              |
+| `yarn verify`  | the judge's self-tests, every course's shape, every starter failing and every solution passing in all five languages, every Python and TypeScript harness executed in Node against both, and the catalogue's point total (details below). `--problem <id>` scopes it; `--runtime typescript` skips the Pyodide boot |
+| `yarn build`   | the production build; it also rebuilds the worker bundles                                                                                                                                                                                                                                                           |
 
 ## Writing a course
 
@@ -40,12 +40,12 @@ A course is a directory `src/data/problems/<NN>-<id>/`: `index.ts` (metadata, st
 
 What `yarn verify` holds every course to:
 
-- `id`s kebab-case, file stems snake_case; at least 4 steps; every one of the four concepts (HTTPS, gRPC, Kafka, Redis) exercised by some step; `concepts[0]` is the first step's concept; no two steps own the same file in any language.
+- `id`s kebab-case, file stems snake_case; at least 4 steps and every one of the four concepts (HTTPS, gRPC, Kafka, Redis) exercised by some step — unless the problem is a **single-topic drill** (`concepts` lists exactly one concept): then one step is enough and every step exercises that concept; `concepts[0]` is the first step's concept; no two steps own the same file in any language.
 - Per step: a task and a debrief, 2–3 progressive hints, at least 3 checks, each check with a non-empty matcher for all five languages, `focus` naming real diagram nodes, every `:::widget` registered in `src/lib/widgets.ts`.
 - Per language: the starter carries a `TODO`, differs from the solution, fails at least one static check and pre-passes at most one; the solution passes them all.
 - Every step ships a Python **and** a TypeScript harness: one `check_<id>(ctx)` per check (`-` → `_`), the solution passes every runtime check, the starter does not. `ctx` is documented in `public/py/runtime/leetbuild/harness.py` and `src/lib/runtime/ts/harness.ts`.
 - Company-tagged courses: `company` ⇔ `sources`, every source with an https URL, a `YYYY-MM-DD` (or `YYYY-MM`) date, a title and what the course takes from it; the statement has a `## From the source` section.
-- The catalogue is worth exactly 1337 points. Adding or removing a step changes the total, so re-balance `STEP_POINTS` in `src/lib/scoring.ts` in the same PR and say so in its description; issued certificates keep the maximum they were earned under.
+- The catalogue's maximum is the sum over every problem (7 / 10 / 19 points per step by difficulty) and simply grows as content is added; issued certificates keep the maximum they were earned under.
 
 What the checks cannot enforce, reviewers will:
 
@@ -70,7 +70,7 @@ What the checks cannot enforce, reviewers will:
 
 ## Reporting bugs
 
-All state is local to your browser, so include what we cannot see: the URL (`/<course>/<n>-<step>`), the language, the browser and OS, the console output, and — for a wrong verdict — the submission and the verdict text. The *report it ›* link under a step's checks opens an issue with everything but the console output and your code filled in. Search existing issues first; one bug per issue.
+All state is local to your browser, so include what we cannot see: the URL (`/<course>/<n>-<step>`), the language, the browser and OS, the console output, and — for a wrong verdict — the submission and the verdict text. The _report it ›_ link under a step's checks opens an issue with everything but the console output and your code filled in. Search existing issues first; one bug per issue.
 
 ## Conduct
 

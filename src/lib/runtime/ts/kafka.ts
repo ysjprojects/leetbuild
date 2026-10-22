@@ -315,6 +315,13 @@ export class Admin {
   async listTopics(): Promise<string[]> {
     return [...BROKER.topics.keys()];
   }
+  /** kafkajs: every partition's end offset (`offset` and `high`, as strings) and its first (`low`). */
+  async fetchTopicOffsets(topic: string): Promise<{partition: number; offset: string; high: string; low: string}[]> {
+    return BROKER.partitions(topic).map((_, partition) => {
+      const end = String(BROKER.endOffset(topic, partition));
+      return {partition, offset: end, high: end, low: '0'};
+    });
+  }
 }
 
 /**

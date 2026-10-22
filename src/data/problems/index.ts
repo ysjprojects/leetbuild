@@ -123,23 +123,63 @@ import {merchantAgentProblem} from './124-merchant-agent/index';
 import {fairHousingGuardrailProblem} from './125-fair-housing-guardrail/index';
 import {catalogEnrichmentProblem} from './126-catalog-enrichment/index';
 import {promptDefenceProblem} from './127-prompt-defence/index';
+import {redisFixedWindowLimitProblem} from './128-redis-fixed-window-limit/index';
+import {redisSessionStoreProblem} from './129-redis-session-store/index';
+import {redisLeaderboardProblem} from './130-redis-leaderboard/index';
+import {redisLeaseLockProblem} from './131-redis-lease-lock/index';
+import {redisCacheAsideProblem} from './132-redis-cache-aside/index';
+import {redisSlidingWindowLuaProblem} from './133-redis-sliding-window-lua/index';
+import {redisTokenBucketLuaProblem} from './134-redis-token-bucket-lua/index';
+import {redisReliableQueueProblem} from './135-redis-reliable-queue/index';
+import {redisDelayedJobsProblem} from './136-redis-delayed-jobs/index';
+import {redisGeoPresenceProblem} from './137-redis-geo-presence/index';
+import {kafkaKeyedProducerProblem} from './138-kafka-keyed-producer/index';
+import {kafkaCommitAfterProcessingProblem} from './139-kafka-commit-after-processing/index';
+import {kafkaBatchConsumerProblem} from './140-kafka-batch-consumer/index';
+import {kafkaIdempotentProducerProblem} from './141-kafka-idempotent-producer/index';
+import {kafkaRetryDlqProblem} from './142-kafka-retry-dlq/index';
+import {kafkaBackpressurePauseProblem} from './143-kafka-backpressure-pause/index';
+import {kafkaReplayFromOffsetProblem} from './144-kafka-replay-from-offset/index';
+import {kafkaTumblingWindowProblem} from './145-kafka-tumbling-window/index';
+import {kafkaOffsetWatermarkProblem} from './146-kafka-offset-watermark/index';
+import {kafkaConsumeTransformProduceProblem} from './147-kafka-consume-transform-produce/index';
+import {kafkaAsyncAckTrackingProblem} from './148-kafka-async-ack-tracking/index';
+import {kafkaTieredRetryDelaysProblem} from './149-kafka-tiered-retry-delays/index';
+import {kafkaChangelogRestoreProblem} from './150-kafka-changelog-restore/index';
+import {kafkaOrderedMergeWatermarkProblem} from './151-kafka-ordered-merge-watermark/index';
+import {kafkaGracefulShutdownProblem} from './152-kafka-graceful-shutdown/index';
 
 /**
  * Problem order on the list page: the classic systems track first, in its catalogue order, then the
  * AI-era track in the order its courses were added (the directory numbers). The list's track tabs
  * show either on its own; "All topics" shows this order. Company-tagged courses (derived from
- * engineering blogs, see `Problem.company`) sit with the others of their difficulty.
+ * engineering blogs, see `Problem.company`) and the single-topic drills (one concept, one step)
+ * sit with the courses of their difficulty, after them.
  */
 export const problems: Problem[] = [
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
+  redisFixedWindowLimitProblem,
+  redisSessionStoreProblem,
+  kafkaKeyedProducerProblem,
+  kafkaCommitAfterProcessingProblem,
+  kafkaBatchConsumerProblem,
   imageCacheProblem,
   liveChatProblem,
   notificationsProblem,
   redditPlaceProblem,
   netflixCountersProblem,
   doordashSupportProblem,
+  redisLeaderboardProblem,
+  redisLeaseLockProblem,
+  redisCacheAsideProblem,
+  kafkaIdempotentProducerProblem,
+  kafkaRetryDlqProblem,
+  kafkaBackpressurePauseProblem,
+  kafkaReplayFromOffsetProblem,
+  kafkaTumblingWindowProblem,
+  kafkaOffsetWatermarkProblem,
   matchEngineProblem,
   merchantPaymentsProblem,
   flashSaleProblem,
@@ -147,6 +187,17 @@ export const problems: Problem[] = [
   rideDispatchProblem,
   discordMessagesProblem,
   stripeLedgerProblem,
+  redisSlidingWindowLuaProblem,
+  redisTokenBucketLuaProblem,
+  redisReliableQueueProblem,
+  redisDelayedJobsProblem,
+  redisGeoPresenceProblem,
+  kafkaConsumeTransformProduceProblem,
+  kafkaAsyncAckTrackingProblem,
+  kafkaTieredRetryDelaysProblem,
+  kafkaChangelogRestoreProblem,
+  kafkaOrderedMergeWatermarkProblem,
+  kafkaGracefulShutdownProblem,
   aiGatewayProblem,
   ragServiceProblem,
   modelRouterProblem,

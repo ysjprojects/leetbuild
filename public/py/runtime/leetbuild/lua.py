@@ -100,6 +100,9 @@ def _eval_script(socket: FakeSocket, script: bytes, numkeys: int, keys_and_args:
     socket._server.script_cache[sha1] = script
     keys = json.dumps([_latin(k) for k in keys_and_args[:numkeys]])
     argv = json.dumps([_latin(a) for a in keys_and_args[numkeys:]])
+    # Inside a script Redis answers redis.call in RESP2 (flat WITHSCORES pairs, scores as strings),
+    # whatever protocol the client speaks; fakeredis keys that on `_script_resp` for the script's duration.
+    socket._script_resp = 2
     try:
         out = leetbuild_host.lua_eval(_latin(script), keys, argv, lambda args_json: _redis_call(socket, args_json))
     except Exception as exc:  # a Lua error, or an error reply raised through redis.call
@@ -109,6 +112,8 @@ def _eval_script(socket: FakeSocket, script: bytes, numkeys: int, keys_and_args:
         if message.startswith("ERR ") or message.startswith("WRONGTYPE") or message.startswith("NOSCRIPT"):
             raise SimpleError(message) from None
         raise SimpleError(msgs.SCRIPT_ERROR_MSG.format(sha1.decode(), message)) from None
+    finally:
+        socket._script_resp = None
     return _decode_result(json.loads(out))
 
 

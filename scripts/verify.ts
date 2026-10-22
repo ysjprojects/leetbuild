@@ -152,7 +152,11 @@ function verifyStep(problem: Problem, step: Step, index: number): string[] {
 function verifyProblem(problem: Problem): string[] {
   const errors: string[] = [];
   if (!/^[a-z0-9-]+$/.test(problem.id)) errors.push(`${problem.id}: problem id must be kebab-case`);
-  if (problem.steps.length < MIN_STEPS) errors.push(`${problem.id}: needs at least ${MIN_STEPS} steps`);
+  // A single-topic problem (one concept listed) drills that concept alone and may be one step long;
+  // a course covers all four concepts over at least MIN_STEPS steps.
+  const single = problem.concepts.length === 1;
+  if (problem.steps.length < (single ? 1 : MIN_STEPS))
+    errors.push(`${problem.id}: needs at least ${single ? 1 : MIN_STEPS} steps`);
   if (problem.statement.trim() === '') errors.push(`${problem.id}: empty statement`);
   for (const w of widgetsOf(problem.statement))
     if (WIDGETS[w] === undefined) errors.push(`${problem.id}: unknown widget '${w}'`);
@@ -174,7 +178,14 @@ function verifyProblem(problem: Problem): string[] {
     if (!nodeIds.has(edge.to)) errors.push(`${problem.id}: edge to unknown node '${edge.to}'`);
   }
   const covered = new Set(problem.steps.map(s => s.concept));
-  for (const concept of CONCEPTS) if (!covered.has(concept)) errors.push(`${problem.id}: no step exercises ${concept}`);
+  if (single) {
+    for (const step of problem.steps)
+      if (step.concept !== problem.concepts[0])
+        errors.push(`${problem.id}/${step.id}: a single-topic problem's steps all exercise ${problem.concepts[0]}`);
+  } else {
+    for (const concept of CONCEPTS)
+      if (!covered.has(concept)) errors.push(`${problem.id}: no step exercises ${concept}`);
+  }
   for (const concept of problem.concepts)
     if (!covered.has(concept)) errors.push(`${problem.id}: lists concept ${concept} but no step exercises it`);
   // The playground shows a course as one filesystem per language: two steps may not own one file.

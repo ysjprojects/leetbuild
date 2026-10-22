@@ -494,6 +494,7 @@ class Consumer:
         self._positions: dict[tuple[str, int], int] = {}
         self._delivered: dict[tuple[str, int], int] = {}
         self._stored: dict[tuple[str, int], int] = {}
+        self._paused: set[tuple[str, int]] = set()
         self._closed = False
         self._rr = 0
         BROKER.consumers.append(self)
@@ -552,6 +553,8 @@ class Consumer:
         for i in range(n):
             tp = self._assignment[(self._rr + i) % n]
             key = (tp.topic, tp.partition)
+            if key in self._paused:
+                continue
             pos = self._positions.get(key, 0)
             log = BROKER.topics[tp.topic][tp.partition]
             if pos < len(log):
@@ -561,7 +564,12 @@ class Consumer:
                 self._delivered[key] = pos + 1
                 BROKER.events.append(("deliver", self.group, tp.topic, tp.partition, pos))
                 return Message(record)
-        if BROKER.stop_when_drained:
+        # Nothing deliverable. A paused partition may still hold records: the loop is not drained then.
+        remaining = any(
+            self._positions.get((tp.topic, tp.partition), 0) < len(BROKER.topics[tp.topic][tp.partition])
+            for tp in self._assignment
+        )
+        if BROKER.stop_when_drained and not remaining:
             raise KeyboardInterrupt("every seeded message was delivered")
         if timeout:
             from .clock import CLOCK
@@ -626,10 +634,18 @@ class Consumer:
         self._positions[(partition.topic, partition.partition)] = partition.offset
 
     def pause(self, partitions) -> None:
-        pass
+        """Stop delivering from these partitions until `resume`; the fetch position is kept, as librdkafka keeps it."""
+        for tp in partitions:
+            self._paused.add((tp.topic, tp.partition))
 
     def resume(self, partitions) -> None:
-        pass
+        for tp in partitions:
+            self._paused.discard((tp.topic, tp.partition))
+
+    def get_watermark_offsets(self, partition: TopicPartition, timeout=None, cached=False) -> tuple[int, int]:
+        """confluent_kafka's `(low, high)`: the log's first offset and its end (the next offset to be written)."""
+        BROKER.create_topic(partition.topic)
+        return (0, BROKER.end_offset(partition.topic, partition.partition))
 
     def close(self) -> None:
         if self._closed:

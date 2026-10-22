@@ -6,14 +6,14 @@ import {type Streak, activityByDay, badgeProgress, BADGES, stepOfTheDay} from '@
 import {useListQuery} from '@/lib/listQuery';
 import {type Profile, type StepAttempt, OPEN_ATTEMPT, problemScore, rankProgress} from '@/lib/scoring';
 import {type TimedSession, bestSession, formatClock} from '@/lib/timer';
-import {type Difficulty, type Problem, CONCEPT_LABEL, LANGUAGES, stepKey, stepPath} from '@/lib/types';
+import {type Difficulty, type Problem, CONCEPT_LABEL, CONCEPTS, LANGUAGES, stepKey, stepPath} from '@/lib/types';
 
 import {BadgeCatalog, BadgeGlyph} from './Badges';
 import {useDialog} from './Dialog';
 import {ActivityHeatmap} from './Heatmap';
 import {ListControls} from './ListControls';
 import {LandingIntro} from './LoadingScreen';
-import {CompanyChip, CONCEPT_COLOR, DifficultyChip} from './paneShared';
+import {CompanyChip, CONCEPT_COLOR, ConceptChip, DifficultyChip} from './paneShared';
 import {Clock, SessionList} from './Timer';
 
 /**
@@ -416,6 +416,10 @@ const ProblemRow: FC<{
               </span>
             ) : null}
             {problem.company !== undefined ? <CompanyChip company={problem.company} /> : null}
+            {/* A course covers every concept, so its chips would say nothing; a single-topic drill names its one. */}
+            {problem.concepts.length < CONCEPTS.length
+              ? problem.concepts.map(c => <ConceptChip concept={c} key={c} />)
+              : null}
           </span>
           <span className="text-ink-300 mt-1 block text-[13px] leading-5">{problem.tagline}</span>
           <span className="text-ink-300 mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px]">
