@@ -432,28 +432,6 @@ export const mockScenarios: readonly MockScenario[] = [
     defaultLanguage: 'python',
   },
   {
-    id: 'code-assistant-the-assistant-that-read-a-private-repo',
-    problemId: 'code-assistant',
-    stepId: 'endpoint',
-    title: 'The assistant that read a private repo',
-    blurb: 'The draft keyed context by path without checking repository access.',
-    role: 'AI platform engineer · 20 min',
-    minutes: 20,
-    prompt:
-      "An external audit found completions that quoted code from a repository the requesting user could not read, because the draft trusted file paths in the request. The same cache served a force-pushed repo's dead symbols. Review it, fix it, and prove repository access and index freshness are enforced.",
-    signals: ['Secure', 'Specify', 'Verify'],
-    aiNote:
-      'The draft treats a caller-supplied file path as sufficient authority to read repository content, so context from any repo can be completed on, and it caches the index by repo name alone, so a force-push keeps serving deleted symbols.',
-    testIdea:
-      'Request a completion whose path points into a repo the caller cannot read and assert 403; push a new commit and assert the next completion is a cache miss and the status reports the new sha; assert a completion on a repo more than ten commits behind is refused.',
-    followUps: [
-      'Should rejected completions be training signal, and with what privacy boundary?',
-      'How would you budget context when a file is larger than the token cap?',
-      'What makes a symbol index trustworthy after a rebase?',
-    ],
-    defaultLanguage: 'python',
-  },
-  {
     id: 'sql-copilot-the-copilot-that-offered-a-delete',
     problemId: 'sql-copilot',
     stepId: 'endpoint',
@@ -1000,28 +978,6 @@ export const mockScenarios: readonly MockScenario[] = [
       'What metrics can a shadow observably improve before deployment?',
       'How would you compare cost between candidate and production paths?',
       'When is a 5 percent share too much?',
-    ],
-    defaultLanguage: 'python',
-  },
-  {
-    id: 'prompt-firewall-the-firewall-that-allowed-on-error',
-    problemId: 'prompt-firewall',
-    stepId: 'endpoint',
-    title: 'The firewall that allowed on error',
-    blurb: 'An internal error returned allow, and the detector failure skipped the backstop.',
-    role: 'AI platform engineer · 20 min',
-    minutes: 20,
-    prompt:
-      'During a detector outage, injection attempts passed because the draft mapped every exception to allow and skipped the lexical backstop once the model call had failed. The same draft logged matched span text. Review it, fix it, and prove failures block and logs carry no prompt content.',
-    signals: ['Secure', 'Evaluate', 'Verify'],
-    aiNote:
-      'The draft catches every internal error and returns allow, so an outage opens the firewall completely, and when the detector fails it skips the lexical backstop instead of falling through to it.',
-    testIdea:
-      'Stub the detector to fail and assert a known injection pattern is still blocked or stripped by the backstop; trigger an internal error and assert block with no prompt in the body; inspect an event payload for span text.',
-    followUps: [
-      'Which patterns deserve block versus strip?',
-      'How do you tune rules without storing the prompts that matched?',
-      'What makes an injection rule durable against paraphrase?',
     ],
     defaultLanguage: 'python',
   },
@@ -2320,6 +2276,51 @@ export const mockScenarios: readonly MockScenario[] = [
       'Who owns the guardrail recipe?',
       'How do you roll back a bad price across storefronts?',
       'What does a reason code need to be auditable?',
+    ],
+    defaultLanguage: 'python',
+  },
+  {
+    id: 'copilot-context-tabs',
+    problemId: 'copilot-context',
+    stepId: 'neighboring-tabs',
+    title: 'The context cache that leaks between developers',
+    blurb: 'A developer saw a stranger’s code in a suggestion. Fix the neighboring-tabs cache.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'You own the completion service behind the editor’s ghost text. A developer reported a suggestion that contained a function from a file they have never seen; another reported that completions ignore the helper open in the next tab; the Redis instance is at 90 % memory. The neighboring-tabs cache below was generated from a one-line description and merged because the demo showed context from other files. Review it, fix it, and prove the fix.',
+    signals: ['Secure', 'Evaluate', 'Operate', 'Verify'],
+    aiNote:
+      'The draft keys tabs by file path only, so any developer with a `db/conn.py` open shares one entry — a cross-tenant leak. The entries have no TTL, so every closed tab stays in Redis forever. The match is an exact substring test on the cursor line, a bar so high that the feature includes nothing on most keystrokes, where GitHub’s A/B tests found a very low bar — even a weak best match — was what lifted acceptance. And it issues one GET per open tab on every keystroke instead of a single MGET.',
+    testIdea:
+      'Two sessions each remember a tab at the same path with different contents; pick snippets for session A and assert only A’s text can appear. Remember a tab, advance the clock 601 s, assert the key is gone. Score a tab that shares two identifiers out of forty with the cursor window and assert it is still included as the best match. Count Redis commands for a request with eight open tabs and assert one MGET.',
+    followUps: [
+      'The editor sends the full text of every open tab on every keystroke. What would you change in the protocol so the cache is updated only when a tab changes?',
+      'Jaccard over identifiers ignores order and structure. Where would you put a smarter similarity — an embedding, a language-aware tokenizer — and what would it cost on a 300 ms keystroke budget?',
+      'How would you evict a tab the instant the editor closes it, and what happens to your TTL design if the editor crashes without reporting?',
+    ],
+    defaultLanguage: 'python',
+  },
+  {
+    id: 'ai-firewall-detect',
+    problemId: 'ai-firewall',
+    stepId: 'prompt-detect',
+    title: 'The firewall that blocks the wrong end of the scale',
+    blurb:
+      'The detector scores 1–99 with 1 the most likely injection. The draft blocks high scores and allows every outage.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'You own the firewall in front of a customer-facing assistant. The prompt validation service scores every prompt from 1 to 99 — 1 being the most likely injection — and tags it by topic. Last night the detector was down for twelve minutes and every prompt went through; this morning a prompt scored 4 and was forwarded. The model-generated client below looks right in a demo. Review it, fix it, and prove the fix.',
+    signals: ['Specify', 'Secure', 'Verify'],
+    aiNote:
+      'The draft compares the wrong way round: it blocks when the score is above 80, the benign end of the scale, so the prompts the detector is most sure about pass. It never reads the tags, so the topic rules are a no-op. The call carries no deadline, so a slow detector stalls every request. And the bare catch returns allow on any error, so a detector outage is a published off switch.',
+    testIdea:
+      'Stub Detect to return score 4 with no tags and assert the decision is block with reason score; return score 90 with tag politics and assert block with reason tag:politics. Make the stub sleep past 150 ms and assert block with reason detector-unavailable, then pass fail_open and assert allow; make it return INVALID_ARGUMENT and assert the error propagates.',
+    followUps: [
+      'How would you run a new threshold in shadow mode — scoring and emitting events without blocking — before changing BLOCK_SCORE in production?',
+      'Which applications should be allowed to set fail_open, and who owns that decision: the application team or the security team?',
+      'The source says the prompt score is combined with bot and attack scores. Where in this call would that combination live, and what would the decision carry?',
     ],
     defaultLanguage: 'python',
   },
