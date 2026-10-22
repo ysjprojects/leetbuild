@@ -1,0 +1,16 @@
+{
+  "title": "The car that teleported backward",
+  "blurb": "Last-write-wins updates and dropped geofence checks.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "The dispatch map showed a truck six blocks behind its actual position, because a delayed cellular update wrote last, and a warehouse geofence alert never fired when the check call timed out. Review it, fix it, and prove positions compare by timestamp and alerts cannot be lost or doubled.",
+  "signals": ["Operate", "Verify", "Specify"],
+  "aiNote": "The draft writes the latest-arriving position regardless of its timestamp, so delayed packets roll a vehicle's state backward, and it drops geofence checks on timeout, then retries them under fresh keys so a generated alert can duplicate.",
+  "testIdea": "Deliver a new position then a delayed older one and assert the newer state stands; time out a geofence check and assert it retries under the same sequence key; check the snapshot freshness bound across lazily refreshed vehicles.",
+  "followUps": [
+    "What clock assumptions does a device sequence survive?",
+    "How fresh must a dispatch snapshot be to be usable?",
+    "Which alerts may never be dropped even under load?"
+  ],
+  "stepId": "endpoint"
+}
