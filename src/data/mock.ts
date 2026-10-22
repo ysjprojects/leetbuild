@@ -2346,6 +2346,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'merchant-agent-jit',
+    problemId: 'merchant-agent',
+    stepId: 'agent-loop',
+    title: 'The system prompt that grew a thousand instructions',
+    blurb: 'Forty tools, one bloated prompt, a loop with no exit. Make the context just-in-time.',
+    role: 'Applied ML engineer · 25 min',
+    minutes: 25,
+    prompt:
+      'You own the loop behind a merchant assistant inside a store admin. Since the tool count passed thirty, the model picks the wrong tool more often, every prompt edit invalidates the provider cache, and last week one conversation looped for eleven minutes. The AI draft below works on the demo. Review the loop, fix it, and prove the fix.',
+    signals: ['Specify', 'Secure', 'Operate', 'Verify'],
+    aiNote:
+      'The draft concatenates every tool’s instructions into the system prompt and again into each tool description, so the prompt grows with the registry, conflicts with itself, and changes whenever any tool does. It loops with `while True`, sets no deadline on the model or tool calls, and invokes whatever tool name the model emits — including a product-writing tool for a staff account that only has read scopes. The fix is structural: a constant system prompt, a compact name-plus-description tool list, the invoked tool’s instructions passed in the next model call only, `MAX_TURNS`, per-call deadlines, a loop budget, and a `required_scope` check before every `Invoke`.',
+    testIdea:
+      'Stub the model to always return a tool call. Assert the loop ends after exactly six Complete calls and returns the tools used. Then stub a `fill_product_form` call for scopes `[read_customers]` and assert `Invoke` is never called and the next model request carries a `PERMISSION_DENIED` tool message. Finally assert the system field is byte-identical across all six requests and that `instructions` is non-empty only on the request that follows a successful invoke.',
+    followUps: [
+      'The source says instructions can vary by beta flag, model version or page context. Where in this loop would that variation live without touching the system prompt?',
+      'What should happen to the reserved budget and the write-tool claim when the loop hits the 30-second budget halfway through a form fill?',
+      'How would you detect, from traces alone, that the model is still choosing the wrong tool after the JIT change — and what would you add to the ground-truth set to catch it?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
