@@ -18,7 +18,7 @@ import {widgetsOf} from '../src/components/Markdown';
 import {describePattern, judge, matches, stripComments} from '../src/lib/judge';
 import {type NodeRuntime, createNodePythonRuntime, createNodeTypeScriptRuntime} from '../src/lib/runtime/node';
 import {type RunJob, type RunResult} from '../src/lib/runtime/types';
-import {COURSE_POINTS, STEP_POINTS} from '../src/lib/scoring';
+import {STEP_POINTS} from '../src/lib/scoring';
 import {type Language, type Problem, type Step, CONCEPTS, fileName, LANGUAGES} from '../src/lib/types';
 import {WIDGETS} from '../src/lib/widgets';
 
@@ -328,20 +328,15 @@ async function main(): Promise<void> {
     );
     errors.push(...e);
   }
-  // The course total is a fixed number; only meaningful when every problem was loaded.
+  // The live maximum is the sum over every course; it only grows as content is added.
   if (onlyFile === null && onlyProblem === null) {
     const total = problems.reduce((sum, p) => sum + STEP_POINTS[p.difficulty] * p.steps.length, 0);
-    if (total !== COURSE_POINTS) {
-      const counts = problems.reduce<Record<string, number>>((acc, p) => {
-        acc[p.difficulty] = (acc[p.difficulty] ?? 0) + p.steps.length;
-        return acc;
-      }, {});
-      errors.push(
-        `course totals ${total} points, not ${COURSE_POINTS}: re-balance STEP_POINTS in src/lib/scoring.ts for ${JSON.stringify(
-          counts,
-        )} steps`,
-      );
-    } else console.log(`✓ course totals ${COURSE_POINTS} points`);
+    const counts = problems.reduce<Record<string, number>>((acc, p) => {
+      acc[p.difficulty] = (acc[p.difficulty] ?? 0) + p.steps.length;
+      return acc;
+    }, {});
+    if (total <= 0) errors.push('course totals are not positive');
+    else console.log(`✓ course totals ${total} points (${JSON.stringify(counts)})`);
   }
   const languages: Language[] = [...LANGUAGES];
   const ran = EXECUTING.filter(({language}) => !withRuntime || runtimes[language] !== undefined)
