@@ -1,0 +1,16 @@
+{
+  "title": "The gateway that double-billed every retry",
+  "blurb": "Retries counted twice and close ids re-minted.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "A customer's invoice showed twice their traffic, because the draft counted every gateway retry and then re-closed the billing period under a fresh close id. A crash also silently dropped the last minute of usage. Review it, fix it, and prove counts and closes are idempotent.",
+  "signals": ["Verify", "Operate", "Specify"],
+  "aiNote": "The draft has no request-id dedupe, so gateway retries inflate usage, and its period close mints a new id per attempt, so a retry after a timeout can bill a period that already closed under a different id.",
+  "testIdea": "Replay a usage report three times and assert one count; time out the billing flush and assert the period stays open and the retry reuses the close id; crash between response and count and assert the record and counter agree after recovery.",
+  "followUps": [
+    "Should metering ever block traffic?",
+    "What sanity cap belongs on per-request units?",
+    "How do you reconcile metering with gateway logs?"
+  ],
+  "stepId": "endpoint"
+}
