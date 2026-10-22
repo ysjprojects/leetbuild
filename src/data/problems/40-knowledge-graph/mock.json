@@ -1,0 +1,18 @@
+[
+  {
+    "stepId": "endpoint",
+    "title": "The graph that split itself",
+    "blurb": "Resolution timeouts were treated as mismatches and entities split.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 20,
+    "prompt": "Every hour the resolver was slow, the graph gained duplicate entities because the draft read a timeout as not a match, and a hub entity later made one query traverse millions of paths. The same draft deleted cache entries after edge writes so stale reads survived. Review it, fix it, and prove merges are deliberate, traversal bounded and caches safe.",
+    "signals": ["Specify", "Operate", "Verify"],
+    "aiNote": "The draft maps resolution timeouts to not a match, silently spawning duplicates, and it invalidates the adjacency cache by deleting after the write, so a concurrent read can repopulate stale data that no later deletion cleans.",
+    "testIdea": "Stub resolution to time out and assert the pair is parked in review, not split; race a neighbor read against an edge write and assert the read reflects the new version once; request depth 5 and assert 400.",
+    "followUps": [
+      "What evidence should a merge require before it is automatic?",
+      "How would you represent a merge so it can be undone?",
+      "Why is delete-after-write the wrong invalidation pattern?"
+    ]
+  }
+]
