@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {protoFiles, protoModules} from './proto';
 import {notifyEndpointStep} from './steps/1-notify-endpoint';
 import {userTopicStep} from './steps/2-user-topic';
@@ -78,4 +79,5 @@ guarded RPC, and a consumer that never loses a record it has not finished with.`
   },
   steps: [notifyEndpointStep, userTopicStep, userRateLimitStep, prefsCacheStep, pushGatewayStep, retryConsumerStep],
   support: {python: {...protoModules, ...supportModules}, typescript: {...protoFiles, ...supportModulesTs}},
+  learn,
 };

@@ -1,6 +1,7 @@
 import {DISCORD} from '@/data/companies';
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {protoFiles, protoModules} from './proto';
 import {postMessageStep} from './steps/1-post-message';
 import {readMessagesStep} from './steps/2-read-messages';
@@ -123,4 +124,5 @@ channel.`,
   },
   steps: [postMessageStep, readMessagesStep, dataServiceStep, channelRoutingStep, messageEventsStep, hotChannelsStep],
   support: {python: {...protoModules, ...supportModules}, typescript: {...protoFiles, ...supportModulesTs}},
+  learn,
 };

@@ -1,6 +1,7 @@
 import {NETFLIX} from '@/data/companies';
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {protoFiles, protoModules} from './proto';
 import {counterApiStep} from './steps/1-counter-api';
 import {bestEffortStep} from './steps/2-best-effort';
@@ -103,4 +104,5 @@ and the one API over them the same.`,
   },
   steps: [counterApiStep, bestEffortStep, countEventsStep, rollupStep, countServiceStep],
   support: {python: protoModules, typescript: protoFiles},
+  learn,
 };

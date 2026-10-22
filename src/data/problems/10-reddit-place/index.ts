@@ -1,6 +1,7 @@
 import {REDDIT} from '@/data/companies';
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {protoFiles, protoModules} from './proto';
 import {boardEndpointStep} from './steps/1-board-endpoint';
 import {cooldownStep} from './steps/2-cooldown';
@@ -108,4 +109,5 @@ whiteboard or map.`,
   },
   steps: [boardEndpointStep, cooldownStep, placementEventsStep, tileStreamStep, leaderboardStep],
   support: {python: {...protoModules, ...supportModules}, typescript: {...protoFiles, ...supportModulesTs}},
+  learn,
 };

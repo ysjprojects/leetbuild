@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {protoFiles, protoModules} from './proto';
 import {presenceStep} from './steps/1-presence';
 import {chatStreamStep} from './steps/2-chat-stream';
@@ -74,4 +75,5 @@ are what every live fan-out system — chat, collaborative editing, live dashboa
   },
   steps: [presenceStep, chatStreamStep, fanOutTopicStep, historyEndpointStep, recentCacheStep],
   support: {python: {...protoModules, ...supportModules}, typescript: {...protoFiles, ...supportModulesTs}},
+  learn,
 };

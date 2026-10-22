@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {protoFiles, protoModules} from './proto';
 import {checkoutIdempotencyStep} from './steps/1-checkout-idempotency';
 import {authorizePaymentStep} from './steps/2-authorize-payment';
@@ -83,4 +84,5 @@ system that moves money ends up with.`,
     merchantRateLimitStep,
   ],
   support: {python: {...protoModules, ...supportModules}, typescript: {...protoFiles, ...supportModulesTs}},
+  learn,
 };

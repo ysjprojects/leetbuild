@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {protoFiles, protoModules} from './proto';
 import {tlsListenerStep} from './steps/1-tls-listener';
 import {tokenBucketStep} from './steps/2-token-bucket';
@@ -68,4 +69,5 @@ changing its shape — which is the shape of every gateway you will meet.`,
   },
   steps: [tlsListenerStep, tokenBucketStep, grpcProxyStep, auditStreamStep, responseCacheStep],
   support: {python: protoModules, typescript: {...protoFiles, ...supportModulesTs}},
+  learn,
 };

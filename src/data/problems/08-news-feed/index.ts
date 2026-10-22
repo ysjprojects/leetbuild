@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {protoFiles, protoModules} from './proto';
 import {postEndpointStep} from './steps/1-post-endpoint';
 import {fanoutWorkerStep} from './steps/2-fanout-worker';
@@ -81,4 +82,5 @@ batching, idempotent counters — which is what every feed-shaped system is made
     python: {...protoModules, ...supportModules},
     typescript: {...protoFiles, ...supportModulesTs},
   },
+  learn,
 };

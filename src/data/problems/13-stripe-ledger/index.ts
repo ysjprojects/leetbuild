@@ -1,6 +1,7 @@
 import {STRIPE} from '@/data/companies';
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {protoFiles, protoModules} from './proto';
 import {postTransactionStep} from './steps/1-post-transaction';
 import {idempotentPostStep} from './steps/2-idempotent-post';
@@ -134,4 +135,5 @@ corrections. The six pieces above are the ledger itself: the part everything els
     python: {...protoModules, ...supportModules},
     typescript: {...protoFiles, ...supportModulesTs},
   },
+  learn,
 };

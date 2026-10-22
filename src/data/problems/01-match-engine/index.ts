@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {protoFiles, protoModules} from './proto';
 import {orderGatewayStep} from './steps/1-order-gateway';
 import {publishOrdersStep} from './steps/2-publish-orders';
@@ -75,4 +76,5 @@ order matters.`,
   },
   steps: [orderGatewayStep, publishOrdersStep, matchConsumerStep, topOfBookStep, streamTicksStep, bookSnapshotStep],
   support: {python: {...protoModules, ...supportModules}, typescript: {...protoFiles, ...supportModulesTs}},
+  learn,
 };

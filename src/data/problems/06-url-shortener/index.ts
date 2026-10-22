@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {protoFiles, protoModules} from './proto';
 import {shortenEndpointStep} from './steps/1-shorten-endpoint';
 import {keyServiceStep} from './steps/2-key-service';
@@ -73,4 +74,5 @@ services — are made of.`,
   },
   steps: [shortenEndpointStep, keyServiceStep, redirectCacheStep, clickEventsStep, topLinksStep],
   support: {python: protoModules, typescript: protoFiles},
+  learn,
 };

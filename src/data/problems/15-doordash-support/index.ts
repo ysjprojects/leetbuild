@@ -1,6 +1,7 @@
 import {DOORDASH} from '@/data/companies';
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {protoFiles, protoModules} from './proto';
 import {chatEndpointStep} from './steps/1-chat-endpoint';
 import {kbRetrievalStep} from './steps/2-kb-retrieval';
@@ -140,4 +141,5 @@ channel a company can put its name on.`,
   },
   steps: [chatEndpointStep, kbRetrievalStep, modelCallStep, guardrailsStep, tokenStreamStep, qualityJudgeStep],
   support: {python: {...protoModules, ...supportModules}, typescript: {...protoFiles, ...supportModulesTs}},
+  learn,
 };

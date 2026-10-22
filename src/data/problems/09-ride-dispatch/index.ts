@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {protoFiles, protoModules} from './proto';
 import {requestRideStep} from './steps/1-request-ride';
 import {locationStreamStep} from './steps/2-location-stream';
@@ -76,4 +77,5 @@ you must not let take you down.`,
   },
   steps: [requestRideStep, locationStreamStep, nearestDriversStep, offerLockStep, tripEventsStep, etaStep],
   support: {python: {...protoModules, ...supportModules}, typescript: {...protoFiles, ...supportModulesTs}},
+  learn,
 };
