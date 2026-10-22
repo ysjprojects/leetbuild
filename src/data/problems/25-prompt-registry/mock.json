@@ -1,0 +1,18 @@
+[
+  {
+    "stepId": "endpoint",
+    "title": "The rollback that half applied",
+    "blurb": "A promotion and a rollback raced and tenants split across versions.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 20,
+    "prompt": "A prompt promotion was rolled back within seconds, but the pointer write and the tenant pins went through separately, so half the fleet kept serving the bad template. The same endpoint had promoted a version whose eval timed out. Review it, fix it, and prove rollback is atomic and eval-gated.",
+    "signals": ["Specify", "Evaluate", "Secure"],
+    "aiNote": "The draft writes the new global pointer and the tenant pins as separate commands, so a racing rollback leaves some readers pinned forward and some back, and it treats an eval timeout as an informal pass instead of a block.",
+    "testIdea": "Promote and roll back concurrently and assert every reader resolves to exactly one version per tenant; stub the eval service to time out and assert the promotion is refused with the eval id in the error.",
+    "followUps": [
+      "Why should prompt versions be immutable instead of editable in place?",
+      "How would you pin a tenant for a canary without letting its sessions flip mid-conversation?",
+      "What belongs in the eval record so a promotion can be audited a year later?"
+    ]
+  }
+]
