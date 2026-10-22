@@ -1,0 +1,22 @@
+[
+  {
+    "stepId": "endpoint",
+    "title": "The queue that routed itself",
+    "blurb": "Callers set their own priority and the fallback outage was invisible.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 20,
+    "prompt": "A single customer marked their own ticket critical every hour, and during a classifier outage the catch-all queue silently absorbed everything with no fallback metric. The model-generated draft honors body priority and hides the fallback path. Review it, fix it, and prove routing is server-side and fallback stays visible.",
+    "signals": [
+      "Specify",
+      "Operate",
+      "Verify"
+    ],
+    "aiNote": "The draft uses the request body's priority and queue when present, so callers route themselves, and its fallback path funnels everything into one queue while the summary omits any fallback share, so an outage looks like extra demand.",
+    "testIdea": "Send a critical priority in the body and assert the assigned priority comes from classification; kill the classifier and assert keyword routing records a fallback reason; assert the summary reports the fallback share above zero during the outage.",
+    "followUps": [
+      "Which tickets should ever skip classification entirely?",
+      "How would you retrain routing rules from corrections without a feedback loop of bias?",
+      "What SLA metric best detects a silently misrouting triage?"
+    ]
+  }
+]
