@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'pii-redactor-the-redactor-that-leaked-on-failure',
+    problemId: 'pii-redactor',
+    stepId: 'endpoint',
+    title: 'The redactor that leaked on failure',
+    blurb: 'A detector error returned the original text unchanged.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'During a detector outage, the redactor returned unredacted customer text with a warning header, and the audit topic contained sample values of the entities it removed. The model-generated draft fails open and logs removed values. Review it, fix it, and prove redaction fails closed and audits stay content-free.',
+    signals: ['Secure', 'Specify', 'Verify'],
+    aiNote:
+      'The draft catches detector errors and returns the original input with a degraded header, so an outage becomes a leak, and it publishes a sample of each removed value to the audit topic, putting the very data redaction exists to protect into a retained log.',
+    testIdea:
+      "Stub the detector to fail and assert the response is a 503 with no text; run a redaction over an email address and assert the audit payload contains spans and counts but no address; request another tenant's document and assert 404.",
+    followUps: [
+      'When is regex fallback good enough, and when must redaction hard fail?',
+      'How would you verify redaction completeness without keeping the original?',
+      'What retention policy should span offsets have?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
