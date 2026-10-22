@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'form-service-the-form-that-delivered-one-lead-twice',
+    problemId: 'form-service',
+    stepId: 'endpoint',
+    title: 'The form that delivered one lead twice',
+    blurb: 'Fresh idempotency keys and raw HTML in fields.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A marketing CRM received duplicate leads after webhook retries produced new keys, and a stored HTML field rendered as script on the admin dashboard. The captcha token was also replayable. Review it, fix it, and prove delivery is keyed and inputs are inert.',
+    signals: ['Secure', 'Verify', 'Operate'],
+    aiNote:
+      'The draft retries each handler under a fresh idempotency key, so downstream systems create duplicate records, and it stores raw markup that the admin UI renders, turning a public form into a stored-XSS vector; captcha consumption is non-atomic.',
+    testIdea:
+      'Replay a submission and assert the handler is invoked once per key; submit script markup and assert it renders inert in the admin view; race two captcha replays and assert one is rejected.',
+    followUps: [
+      'Which fields must be redacted by default in exports?',
+      'How do you version a form without breaking in-flight sessions?',
+      'What detection stops a slow botnet sweep?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
