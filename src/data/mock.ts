@@ -190,50 +190,6 @@ export const mockScenarios: readonly MockScenario[] = [
     defaultLanguage: 'python',
   },
   {
-    id: 'guardrail-service-the-guardrail-that-fails-open',
-    problemId: 'guardrail-service',
-    stepId: 'endpoint',
-    title: 'The guardrail that fails open',
-    blurb: 'The classifier timed out and the draft allowed the prompt through.',
-    role: 'AI platform engineer · 20 min',
-    minutes: 20,
-    prompt:
-      'During a classifier outage the guardrail allowed everything, and the review queue missed blocks because the violation events were fire-and-forget. The model-generated draft returns allow on any exception and publishes violations with no outbox. Review it, fix it, and prove the gate fails safe and loses no violation.',
-    signals: ['Secure', 'Operate', 'Verify'],
-    aiNote:
-      'The draft maps every classifier exception and timeout to allow, so an outage silently disables the gate instead of failing safe, and it publishes violation events without an outbox so a broker rejection loses the block record.',
-    testIdea:
-      'Kill the classifier stub and assert high-risk tenants get the conservative deny while low-risk tenants use their configured fallback; reject the produce and assert an outbox row exists; replay the queue and assert no duplicate review entries.',
-    followUps: [
-      'Which tenants should fail closed and which should fail open, and who decides?',
-      'How would you version a rule set so a rollback cannot resurrect a retracted rule?',
-      'What goes in the span offsets so reviewers can find the exact offending phrase?',
-    ],
-    defaultLanguage: 'python',
-  },
-  {
-    id: 'agent-orchestrator-the-agent-that-never-stops-paying',
-    problemId: 'agent-orchestrator',
-    stepId: 'endpoint',
-    title: 'The agent that never stops paying',
-    blurb: 'A timeout on a payment tool was retried, so the customer was charged twice.',
-    role: 'AI platform engineer · 20 min',
-    minutes: 20,
-    prompt:
-      'An agent run timed out during a payment tool call and the draft retried it, charging the customer twice; the same run also kept consuming budget while stalled behind a dead worker. The model-generated draft retries every tool and has no lease. Review it, fix it, and prove side-effecting tools are never replayed and stalled runs get recovered.',
-    signals: ['Specify', 'Operate', 'Secure'],
-    aiNote:
-      'The draft retries every tool call, including non-idempotent side effects, counts budget before acceptance so retries burn steps, and lets a second worker advance the same run because state transitions are plain SETs with no lease.',
-    testIdea:
-      'Force a timeout on a payment tool and assert exactly one call; claim a leased run from a second worker and assert rejection; kill the lease holder and assert recovery reopens the run without replaying completed side effects.',
-    followUps: [
-      'How would you make a payment tool idempotent so a retry is safe?',
-      'What should happen to a run when its budget hits zero mid-tool?',
-      'How do you distinguish a crashed worker from a slow one without a lease?',
-    ],
-    defaultLanguage: 'python',
-  },
-  {
     id: 'embedding-service-the-cache-that-forgot-the-model',
     problemId: 'embedding-service',
     stepId: 'endpoint',
@@ -428,28 +384,6 @@ export const mockScenarios: readonly MockScenario[] = [
       'What is the right behavior when ASR confidence is low for the whole turn?',
       "How would you cap a session's cost without cutting off a long legitimate answer?",
       'What redaction happens before a transcript is stored?',
-    ],
-    defaultLanguage: 'python',
-  },
-  {
-    id: 'sql-copilot-the-copilot-that-offered-a-delete',
-    problemId: 'sql-copilot',
-    stepId: 'endpoint',
-    title: 'The copilot that offered a DELETE',
-    blurb: 'The draft skipped validation and a generated statement ran writes.',
-    role: 'AI platform engineer · 20 min',
-    minutes: 20,
-    prompt:
-      'A user asked the copilot to clean up stale rows and the generated DELETE was returned without a dry-run because the draft only validated short statements. The same endpoint executed caller-supplied SQL on the primary. Review it, fix it, and prove generated statements are read-only and every one is validated.',
-    signals: ['Specify', 'Secure', 'Verify'],
-    aiNote:
-      'The draft skips warehouse validation for statements over 100 characters and returns the SQL even when the dry-run errors, and the results endpoint executes whatever statement it receives on the primary connection.',
-    testIdea:
-      'Ask for a DELETE and assert it is either refused or clearly marked non-executable; throw a validation timeout and assert no SQL is returned; send a two-statement payload to the results endpoint and assert 400.',
-    followUps: [
-      'How would you tell a read-only statement from a write without a parser?',
-      'What cost estimate would you show before running a query and why?',
-      'Where should row-level permissions for the copilot live?',
     ],
     defaultLanguage: 'python',
   },
@@ -2321,6 +2255,182 @@ export const mockScenarios: readonly MockScenario[] = [
       'How would you run a new threshold in shadow mode — scoring and emitting events without blocking — before changing BLOCK_SCORE in production?',
       'Which applications should be allowed to set fail_open, and who owns that decision: the application team or the security team?',
       'The source says the prompt score is combined with bot and attack scores. Where in this call would that combination live, and what would the decision carry?',
+    ],
+    defaultLanguage: 'python',
+  },
+  {
+    id: 'text-to-sql-run-guard',
+    problemId: 'text-to-sql',
+    stepId: 'run-guard',
+    title: 'The SQL the model wrote is about to run',
+    blurb: 'Generated SQL goes straight to the warehouse. Put the guard in front of it.',
+    role: 'Data platform engineer · 25 min',
+    minutes: 25,
+    prompt:
+      'You own the warehouse behind a text-to-SQL product. Yesterday a generated query joined a table nobody ACKed, another scanned every partition of a Tier-1 table for forty minutes, and a third returned zero rows because the model filtered on status = "Finished". The run endpoint below was generated by a model and ships the SQL as-is. Review it, add the guard, and prove it with the checks.',
+    signals: ['Secure', 'Specify', 'Verify', 'Operate'],
+    aiNote:
+      'The draft looks the record up and executes record["sql"]. It never checks that the statement is a single SELECT, that every FROM/JOIN target is in the ACKed list, that the WHERE clause filters on the partition column, or that the query has a LIMIT and a statement timeout. It also cannot report has_output, so a hallucinated filter that returns nothing looks identical to a success.',
+    testIdea:
+      'Store four records: a clean SELECT over an ACKed table with a datestr filter; a SELECT that JOINs a table outside the ACKed list; a SELECT with no partition filter; and "SELECT 1; DROP TABLE trips". Only the first may reach the warehouse, with LIMIT 1000 appended and a 60 s timeout; the other three must answer 422 before any warehouse call, and the clean one must report has_output false when the warehouse returns no rows.',
+    followUps: [
+      'The regex guard accepts a subquery that references a table outside the ACKed list inside a CTE. What would you replace it with, and what does a real parser cost you at request time?',
+      'A user ACKs five tables and the model uses two. Is that a guard failure, an evaluation signal, or both — and which number on the eval dashboard moves?',
+      'Where would a dry-run EXPLAIN with a cost ceiling sit relative to these guards, and which of the four guards could it replace?',
+    ],
+    defaultLanguage: 'python',
+  },
+  {
+    id: 'support-automation-guardrails',
+    problemId: 'support-automation',
+    stepId: 'guardrails',
+    title: 'The guardrail that waves everything through',
+    blurb: 'A hallucinated refund policy reached a guest while the guardrail service was slow. Make the gate a gate.',
+    role: 'AI platform engineer · 25 min',
+    minutes: 25,
+    prompt:
+      'You own the Guardrails Framework behind the support assistant. Last night the guardrail service had a slow hour; every answer the model produced in that hour went out, including one that promised a full refund the policy does not allow. The model-generated gate below checks relevance and returns the answer. Review it, fix it, and prove the fix: every configured guardrail, in parallel, under one deadline, failing closed, escalating to a human on any verdict that is not PASS.',
+    signals: ['Secure', 'Specify', 'Verify', 'Operate'],
+    aiNote:
+      'The draft runs one guardrail (relevance) with no deadline, catches the exception and continues as if it had passed, and on an explicit FAIL logs a warning and returns the draft anyway. Groundedness and pii never run. A guardrail outage is indistinguishable from no guardrail.',
+    testIdea:
+      'Stub the guardrail service so groundedness sleeps past 2 s and pii returns FAIL. Assert the gate returns within the deadline, that the verdict map has three entries with groundedness = ERROR, that handoff.escalate was called with those verdicts, and that the result field is absent from the response.',
+    followUps: [
+      'Which guardrails should block and which should only annotate the answer, and where does that severity live?',
+      'The post describes tool guardrails that use rules to stop a bad execution. Where in the Chain of Thought loop would you run them, and what do they see that the answer guardrails do not?',
+      'If the guardrail service is down for an hour, every turn escalates to a human. What do you build so the queue does not drown the agents, without reopening the gate?',
+    ],
+    defaultLanguage: 'python',
+  },
+  {
+    id: 'data-classification-verify',
+    problemId: 'data-classification',
+    stepId: 'verify-endpoint',
+    title: 'The tier that came from the request body',
+    blurb: 'A producer marked a passport table Tier 4 and the catalogue believed them. Fix the verification endpoint.',
+    role: 'Data platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'You are the engineer on the metadata service that classifies every table in the lake. Yesterday a table with a passport_no column went from Tier 1 to Tier 4 and opened to the whole company; the audit trail shows a verification call and nothing else. The model-generated handler below is what served it. Review it, fix it, and prove the fix.',
+    signals: ['Secure', 'Specify', 'Verify'],
+    aiNote:
+      'The draft reads X-User-Id but never checks it against the entity owner, so anyone can verify any table. It copies `tier` from the request body instead of deriving it from the tags and the privacy rules, so the caller sets the access level. It accepts any string as a tag, so an unknown tag has no rule and no tier. And it records nothing about who verified, so the incident has no name on it.',
+    testIdea:
+      'POST a verification for an entity whose owner is team-a with X-User-Id: team-b and assert 403. Then, as team-a, send `{"action": "edit", "tags": {"passport_no": "Personal.ID"}, "tier": 4}` and assert the response tier is 1 and the stored audit row names team-a. Send a tag outside the taxonomy and assert 400.',
+    followUps: [
+      'An edit that lowers the tier is the dangerous direction. Would you require a second approver for downgrades, and where in the handler would that gate live?',
+      'The source feeds verification edits back into prompt evaluation. What would you record per edit so the next prompt version can be measured against it?',
+      'The owner is one person and tables outlive people. How does the handler behave when owner_of returns a team instead of a user, and when the owner has left?',
+    ],
+    defaultLanguage: 'python',
+  },
+  {
+    id: 'research-orchestrator-fanout',
+    problemId: 'research-orchestrator',
+    stepId: 'subagent-fanout',
+    title: 'The lead agent that spawns fifty subagents, one at a time',
+    blurb: 'A deep research job took forty minutes and overflowed the lead’s context. Fix the fan-out.',
+    role: 'AI platform engineer · 25 min',
+    minutes: 25,
+    prompt:
+      'You are the platform engineer who owns the research orchestrator. A customer’s deep query took forty minutes, the lead agent lost its plan halfway through, and the bill showed sixty subagents for a job budgeted at ten. The model-generated lead agent below passes the demo. Review it against what the source says about delegation, parallelism and compression, fix it, and prove the fix.',
+    signals: ['Delegate', 'Specify', 'Operate', 'Verify'],
+    aiNote:
+      'The draft awaits each subagent before starting the next, runs every task the planner returns instead of cutting the plan to budget.max_subagents, calls Subagent.Run with no deadline, sends only an objective (no output format, tools or boundaries), and appends each reply’s full transcript — not its condensed findings — to the lead’s notes.',
+    testIdea:
+      'Fake the subagent stub so each Run sleeps one second and returns a 50 000-character transcript with a 200-character findings field. With a plan of twelve tasks and a budget of ten, the fixed lead must finish in about two seconds (two batches of five), call Run exactly ten times with all four task fields set, and hand synthesis notes no longer than 4 000 characters each. Then make one stub hang: the batch must still return within 120 seconds with a “no result” note for that task.',
+    followUps: [
+      'The source runs subagents synchronously and names it as a bottleneck. What would asynchronous subagents change about error propagation and state consistency here?',
+      'Where does the 4 000-character cap belong — in the lead, or in the subagent’s output format? What breaks if a subagent returns a reference to an artefact instead of text?',
+      'Two subagents came back with overlapping findings. Which field of the task spec was too loose, and how would you detect that from the trace without reading the findings?',
+    ],
+    defaultLanguage: 'python',
+  },
+  {
+    id: 'merchant-agent-jit',
+    problemId: 'merchant-agent',
+    stepId: 'agent-loop',
+    title: 'The system prompt that grew a thousand instructions',
+    blurb: 'Forty tools, one bloated prompt, a loop with no exit. Make the context just-in-time.',
+    role: 'Applied ML engineer · 25 min',
+    minutes: 25,
+    prompt:
+      'You own the loop behind a merchant assistant inside a store admin. Since the tool count passed thirty, the model picks the wrong tool more often, every prompt edit invalidates the provider cache, and last week one conversation looped for eleven minutes. The AI draft below works on the demo. Review the loop, fix it, and prove the fix.',
+    signals: ['Specify', 'Secure', 'Operate', 'Verify'],
+    aiNote:
+      'The draft concatenates every tool’s instructions into the system prompt and again into each tool description, so the prompt grows with the registry, conflicts with itself, and changes whenever any tool does. It loops with `while True`, sets no deadline on the model or tool calls, and invokes whatever tool name the model emits — including a product-writing tool for a staff account that only has read scopes. The fix is structural: a constant system prompt, a compact name-plus-description tool list, the invoked tool’s instructions passed in the next model call only, `MAX_TURNS`, per-call deadlines, a loop budget, and a `required_scope` check before every `Invoke`.',
+    testIdea:
+      'Stub the model to always return a tool call. Assert the loop ends after exactly six Complete calls and returns the tools used. Then stub a `fill_product_form` call for scopes `[read_customers]` and assert `Invoke` is never called and the next model request carries a `PERMISSION_DENIED` tool message. Finally assert the system field is byte-identical across all six requests and that `instructions` is non-empty only on the request that follows a successful invoke.',
+    followUps: [
+      'The source says instructions can vary by beta flag, model version or page context. Where in this loop would that variation live without touching the system prompt?',
+      'What should happen to the reserved budget and the write-tool claim when the loop hits the 30-second budget halfway through a form fill?',
+      'How would you detect, from traces alone, that the model is still choosing the wrong tool after the JIT change — and what would you add to the ground-truth set to catch it?',
+    ],
+    defaultLanguage: 'python',
+  },
+  {
+    id: 'fair-housing-guardrail-tiers',
+    problemId: 'fair-housing-guardrail',
+    stepId: 'classifier-tiers',
+    title: 'The guard that approves when it is down',
+    blurb: 'The classifier had a bad afternoon and every steering query passed. Fix the tiers.',
+    role: 'AI platform engineer · 25 min',
+    minutes: 25,
+    prompt:
+      "You own the Fair Housing guardrail in front of the real-estate assistant. Yesterday the classifier pods were overloaded for forty minutes; the dashboard shows zero blocks in that window and legal has asked why. The model-generated decision function below looks reasonable and the demo refuses the obvious queries. Review it against Zillow's design — stop list, fast classifier tuned for recall, a slower reader for the uncertain cases — fix it, and prove the fix.",
+    signals: ['Specify', 'Secure', 'Operate', 'Verify'],
+    aiNote:
+      'The draft catches every exception and returns allowed, so an outage is indistinguishable from approval. It has no stop list, so the phrases that must be caught every time depend on a probabilistic model. Its single 0.5 threshold optimises precision when the domain needs recall, and it calls the LLM judge on every request with no deadline, so the fast tier buys nothing and a slow judge pins the conversation.',
+    testIdea:
+      'Point the classifier stub at a server that sleeps 2 s and assert the decision is blocked with reason guard_unavailable within ~250 ms. Feed a stop-list phrase and assert tier stoplist with zero RPCs. Return scores 0.40, 0.20 and 0.10 and assert blocked / judge called / allowed without a judge call.',
+    followUps: [
+      'The judge is down for an hour: do you want every band request to wait 2 s and fail closed, or should a breaker short-circuit the band to blocked? What changes in the audit?',
+      'Legal moves the block threshold to 0.30 for a new policy version. How does a running instance pick it up, and what happens to decisions cached under the old version?',
+      'How would you measure recall in production when you cannot see the true label? What does the sampled human-review loop from the post give you that metrics do not?',
+    ],
+    defaultLanguage: 'python',
+  },
+  {
+    id: 'catalog-enrichment-extract',
+    problemId: 'catalog-enrichment',
+    stepId: 'extract-attributes',
+    title: 'The brand the model made up',
+    blurb: 'A grocery feed came back tagged with brands that do not exist. Constrain the extraction call.',
+    role: 'Catalog ML platform engineer · 25 min',
+    minutes: 25,
+    prompt:
+      'You own the catalog enrichment service. Overnight a new grocery merchant was onboarded and this morning search is showing "Doove" and "Dove Glow Co." as brands, a 500 ml body wash tagged as 500 lb, and every one of the 40 000 SKUs marked accepted — nothing reached the review queue. The model-generated extraction client below is what ran. Review it against the taxonomy we already have, fix it, and prove the fix.',
+    signals: ['Specify', 'Verify', 'Evaluate', 'Operate'],
+    aiNote:
+      'The draft sends the title alone and lets the model name any brand instead of retrieving the 20 nearest brands from the taxonomy and making it choose among them. It asks for free text and splits lines on ":", so a rephrased answer silently drops attributes. It has no deadline and no retry on UNAVAILABLE. It copies whatever brand, unit and category the model returns without checking them against the taxonomy, and it marks every result accepted, so the confidence gate that should route unresolved SKUs to human review never fires.',
+    testIdea:
+      'Feed a title whose true brand is not in the candidate list the taxonomy returns and assert the result has brand null, a problem recorded, status review and one review-queue entry. Feed a stub reply with confidence 0.60 and a clean payload and assert the same routing. Stub the extractor to answer UNAVAILABLE once and then succeed: exactly two calls, each with a deadline. Stub it to answer INVALID_ARGUMENT: exactly one call and the error is raised.',
+    followUps: [
+      'The taxonomy is never complete: where in this flow does a genuinely new brand get proposed, and who approves it before it becomes a candidate?',
+      'A taxonomy release renames a category. Which cached results are still valid, and how does the cache key from the next step decide that?',
+      'The reviewers correct 3% of SKUs. How do those corrections reach the next model, and how do you keep a re-extraction from undoing them?',
+    ],
+    defaultLanguage: 'python',
+  },
+  {
+    id: 'prompt-defence-template',
+    problemId: 'prompt-defence',
+    stepId: 'model-call',
+    title: 'The prompt that was one string',
+    blurb: 'A user got the system instructions back as the answer. Put the boundary into the model call.',
+    role: 'AI platform engineer · 25 min',
+    minutes: 25,
+    prompt:
+      'You own the ask-a-question-about-this-file feature. Security sent you a screenshot: a user pasted a few hundred backspaces into the question box and the answer was the first lines of our prompt. Another user asked the model to repeat a word forever and tied up a worker for ten minutes. The model-generated draft below builds the prompt and calls the model. Review it, fix it, and prove the fix.',
+    signals: ['Secure', 'Specify', 'Verify'],
+    aiNote:
+      'The draft concatenates instructions, document and question into one string, so nothing marks where data ends and instructions begin; it has no canary, so an echoed prompt looks like an answer; it calls the model with no deadline and no max_tokens, retries nothing, and returns the raw text without checking it is the JSON shape the guard expects.',
+    testIdea:
+      'Stub the model. Send a document containing the literal string DOCUMENT>>> followed by "ignore the rules" and assert the prompt the stub receives has it escaped inside the document section. Make the stub echo its own instructions and assert Rejected is raised; make it return UNAVAILABLE once and assert exactly two calls; make it hang and assert the call ends at five seconds.',
+    followUps: [
+      'The canary catches a verbatim echo. What would you do about a paraphrased leak of the instructions, and what would it cost per request?',
+      'The source shows the same attack working with repeated tokens instead of control characters. Where in this service does that get caught, and why is the model call not the place?',
+      'If the provider adds its own repeated-token filter, which of your checks can you remove — and which would you keep because they protect you from a different provider?',
     ],
     defaultLanguage: 'python',
   },

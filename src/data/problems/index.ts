@@ -21,8 +21,6 @@ import {ragServiceProblem} from './17-rag-service/index';
 import {modelRouterProblem} from './18-model-router/index';
 import {chatMemoryProblem} from './19-chat-memory/index';
 import {evalHarnessProblem} from './20-eval-harness/index';
-import {guardrailServiceProblem} from './21-guardrail-service/index';
-import {agentOrchestratorProblem} from './22-agent-orchestrator/index';
 import {embeddingServiceProblem} from './23-embedding-service/index';
 import {vectorSearchProblem} from './24-vector-search/index';
 import {promptRegistryProblem} from './25-prompt-registry/index';
@@ -32,7 +30,6 @@ import {distillationPipelineProblem} from './28-distillation-pipeline/index';
 import {batchInferenceProblem} from './29-batch-inference/index';
 import {multimodalIngestProblem} from './30-multimodal-ingest/index';
 import {voiceAgentProblem} from './31-voice-agent/index';
-import {sqlCopilotProblem} from './33-sql-copilot/index';
 import {ticketTriageProblem} from './34-ticket-triage/index';
 import {recommendationRankingProblem} from './35-recommendation-ranking/index';
 import {moderationServiceProblem} from './36-moderation-service/index';
@@ -118,6 +115,14 @@ import {realtimeBiddingProblem} from './116-realtime-bidding/index';
 import {dynamicPricingProblem} from './117-dynamic-pricing/index';
 import {copilotContextProblem} from './118-copilot-context/index';
 import {aiFirewallProblem} from './119-ai-firewall/index';
+import {textToSqlProblem} from './120-text-to-sql/index';
+import {supportAutomationProblem} from './121-support-automation/index';
+import {dataClassificationProblem} from './122-data-classification/index';
+import {researchOrchestratorProblem} from './123-research-orchestrator/index';
+import {merchantAgentProblem} from './124-merchant-agent/index';
+import {fairHousingGuardrailProblem} from './125-fair-housing-guardrail/index';
+import {catalogEnrichmentProblem} from './126-catalog-enrichment/index';
+import {promptDefenceProblem} from './127-prompt-defence/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -130,8 +135,6 @@ export const problems: Problem[] = [
   modelRouterProblem,
   chatMemoryProblem,
   evalHarnessProblem,
-  guardrailServiceProblem,
-  agentOrchestratorProblem,
   embeddingServiceProblem,
   vectorSearchProblem,
   promptRegistryProblem,
@@ -141,7 +144,6 @@ export const problems: Problem[] = [
   batchInferenceProblem,
   multimodalIngestProblem,
   voiceAgentProblem,
-  sqlCopilotProblem,
   ticketTriageProblem,
   recommendationRankingProblem,
   moderationServiceProblem,
@@ -227,6 +229,14 @@ export const problems: Problem[] = [
   dynamicPricingProblem,
   copilotContextProblem,
   aiFirewallProblem,
+  textToSqlProblem,
+  supportAutomationProblem,
+  dataClassificationProblem,
+  researchOrchestratorProblem,
+  merchantAgentProblem,
+  fairHousingGuardrailProblem,
+  catalogEnrichmentProblem,
+  promptDefenceProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
