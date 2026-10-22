@@ -81,6 +81,22 @@ const SignalChip: FC<{signal: string}> = memo(({signal}) => (
 ));
 SignalChip.displayName = 'SignalChip';
 
+/** What a sealed pane shows before the clock starts: a note and the silhouette of what will be there. */
+const Sealed: FC<{note: string; lines: number}> = memo(({note, lines}) => (
+  <div aria-hidden className="mt-3">
+    <p className="text-ink-400 text-[12px]">{note}</p>
+    <div className="mt-4 space-y-2.5">
+      {Array.from({length: lines}, (_, i) => (
+        <div
+          className={`bg-ink-800 h-2.5 rounded ${i % 3 === 2 ? 'w-1/2' : i % 2 === 0 ? 'w-11/12' : 'w-4/5'}`}
+          key={i}
+        />
+      ))}
+    </div>
+  </div>
+));
+Sealed.displayName = 'Sealed';
+
 const MOCK_PRIMARY =
   'rounded-lg bg-danger-400 px-3 py-1.5 text-[12px] font-semibold text-ink-950 transition hover:bg-danger-300 disabled:cursor-not-allowed disabled:opacity-30';
 
@@ -207,7 +223,10 @@ const ScenarioBrief: FC<{scenario: ResolvedMockScenario; initial: Language; onLa
           {scenario.problem.company !== undefined ? <CompanyChip company={scenario.problem.company} /> : null}
           <span className="text-ink-400">· {scenario.role}</span>
         </div>
-        <p className="text-ink-200 text-[13px] leading-6">{scenario.prompt}</p>
+        <p className="text-ink-300 text-[12px] leading-5">
+          The interviewer's brief, the requirements and the AI draft open when the clock starts. Only the signals it
+          probes are known in advance:
+        </p>
         <div className="flex flex-wrap gap-1.5">
           {scenario.signals.map(signal => (
             <SignalChip key={signal} signal={signal} />
@@ -388,13 +407,7 @@ const MockInterview: FC = memo(() => {
     setPromptCopied(false);
     setPromptText(null);
     nextMessage.current = 1;
-    setMessages([
-      {
-        id: nextMessage.current++,
-        from: 'ai',
-        text: 'I drafted a first version. It passes the happy path. Review it before you trust it.',
-      },
-    ]);
+    setMessages([]);
     setPhase('ready');
   }, []);
 
@@ -416,8 +429,16 @@ const MockInterview: FC = memo(() => {
       confirm: `Start the clock · ${scenario.minutes}:00`,
       cancel: 'Back to scenarios',
       conceal: true,
-    }).then(ok => (ok ? setPhase('running') : backToSetup()));
-  }, [phase, scenario, openDialog, backToSetup]);
+    }).then(ok => {
+      if (!ok) {
+        backToSetup();
+        return;
+      }
+      setPhase('running');
+      say('I drafted a first version. It passes the happy path. Review it before you trust it.');
+    });
+  }, [phase, scenario, openDialog, backToSetup, say]);
+  const sealed = phase === 'ready';
 
   const openScenario = useCallback((next: ResolvedMockScenario) => prepare(next, next.defaultLanguage), [prepare]);
   const retry = useCallback(() => {
@@ -771,26 +792,32 @@ const MockInterview: FC = memo(() => {
         ref={mainRef}>
         <section className="border-ink-700 bg-ink-950/40 min-h-0 border-b p-5 lg:h-full lg:overflow-y-auto lg:border-b-0 lg:border-r">
           <p className="text-danger-300 text-[11px] font-bold uppercase tracking-wider">{scenario.role}</p>
-          <p className="text-ink-200 mt-3 text-[13px] leading-6">{scenario.prompt}</p>
-          <div className="mt-3 flex flex-wrap gap-1.5">
-            {scenario.signals.map(signal => (
-              <SignalChip key={signal} signal={signal} />
-            ))}
-          </div>
-          <details className="border-ink-700 bg-ink-850/60 group mt-5 rounded-xl border">
-            <summary className="text-danger-200 flex cursor-pointer items-center justify-between gap-3 px-4 py-3 text-[12px] font-bold">
-              <span>Requirements &amp; failure mode</span>
-              <span className="text-ink-400 text-[10px] font-normal uppercase tracking-wider group-open:hidden">
-                open
-              </span>
-              <span className="text-ink-400 hidden text-[10px] font-normal uppercase tracking-wider group-open:inline">
-                close
-              </span>
-            </summary>
-            <div className="border-ink-700 border-t px-4 py-3">
-              <Markdown source={step.task} />
-            </div>
-          </details>
+          {sealed ? (
+            <Sealed lines={5} note="The interviewer's brief and the requirements open when the clock starts." />
+          ) : (
+            <>
+              <p className="text-ink-200 mt-3 text-[13px] leading-6">{scenario.prompt}</p>
+              <div className="mt-3 flex flex-wrap gap-1.5">
+                {scenario.signals.map(signal => (
+                  <SignalChip key={signal} signal={signal} />
+                ))}
+              </div>
+              <details className="border-ink-700 bg-ink-850/60 group mt-5 rounded-xl border">
+                <summary className="text-danger-200 flex cursor-pointer items-center justify-between gap-3 px-4 py-3 text-[12px] font-bold">
+                  <span>Requirements &amp; failure mode</span>
+                  <span className="text-ink-400 text-[10px] font-normal uppercase tracking-wider group-open:hidden">
+                    open
+                  </span>
+                  <span className="text-ink-400 hidden text-[10px] font-normal uppercase tracking-wider group-open:inline">
+                    close
+                  </span>
+                </summary>
+                <div className="border-ink-700 border-t px-4 py-3">
+                  <Markdown source={step.task} />
+                </div>
+              </details>
+            </>
+          )}
         </section>
 
         <section className="border-ink-700 flex min-h-0 flex-col border-b lg:h-full lg:border-b-0 lg:border-r">
@@ -801,15 +828,21 @@ const MockInterview: FC = memo(() => {
             </span>
             <span className="text-ink-400 ml-auto text-[11px]">edit, then submit</span>
           </div>
-          <StepEditor
-            className="min-h-0 flex-1"
-            fileKey={`${scenario.id}:${language}`}
-            language={language}
-            onChange={changeCode}
-            onSubmit={onSubmit}
-            resetKey={editorReset}
-            value={code}
-          />
+          {sealed ? (
+            <div className="min-h-0 flex-1 p-4">
+              <Sealed lines={12} note="The AI draft loads when the clock starts." />
+            </div>
+          ) : (
+            <StepEditor
+              className="min-h-0 flex-1"
+              fileKey={`${scenario.id}:${language}`}
+              language={language}
+              onChange={changeCode}
+              onSubmit={onSubmit}
+              resetKey={editorReset}
+              value={code}
+            />
+          )}
           {verdict !== null && !verdict.accepted ? (
             <div className="border-ink-700 max-h-[16rem] shrink-0 overflow-y-auto border-t p-2">
               <CheckResults title="Latest submission" verdict={verdict} />
