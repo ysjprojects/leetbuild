@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'product-search-the-search-that-leaked-filters',
+    problemId: 'product-search',
+    stepId: 'endpoint',
+    title: 'The search that leaked filters',
+    blurb: 'Raw filters hit fields outside the allowlist and caches ignored filters.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A crafted filter string surfaced unpublished products, and a cached unfiltered result set was served to a filtered query. The model-generated draft interpolates filter text into the engine query and caches by raw query string. Review it, fix it, and prove filters are allowlisted and cache keys are complete.',
+    signals: ['Secure', 'Specify', 'Verify'],
+    aiNote:
+      'The draft passes caller filter syntax through to the query engine, so fields outside the per-tenant allowlist are addressable, and its cache key omits filters, tenant and index version, so one result set answers queries it never matched.',
+    testIdea:
+      'Send a filter naming a forbidden field and assert 400; cache an unfiltered query then run the filtered version and assert a miss; force a shard timeout and assert partial is marked and duplicates are deduped.',
+    followUps: [
+      'What belongs in a query cache key versus a cache eviction signal?',
+      'How would you rank results so a partial merge stays stable?',
+      'When is serving a stale price acceptable?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
