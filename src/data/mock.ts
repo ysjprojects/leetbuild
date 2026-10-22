@@ -453,6 +453,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'sql-copilot-the-copilot-that-offered-a-delete',
+    problemId: 'sql-copilot',
+    stepId: 'endpoint',
+    title: 'The copilot that offered a DELETE',
+    blurb: 'The draft skipped validation and a generated statement ran writes.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A user asked the copilot to clean up stale rows and the generated DELETE was returned without a dry-run because the draft only validated short statements. The same endpoint executed caller-supplied SQL on the primary. Review it, fix it, and prove generated statements are read-only and every one is validated.',
+    signals: ['Specify', 'Secure', 'Verify'],
+    aiNote:
+      'The draft skips warehouse validation for statements over 100 characters and returns the SQL even when the dry-run errors, and the results endpoint executes whatever statement it receives on the primary connection.',
+    testIdea:
+      'Ask for a DELETE and assert it is either refused or clearly marked non-executable; throw a validation timeout and assert no SQL is returned; send a two-statement payload to the results endpoint and assert 400.',
+    followUps: [
+      'How would you tell a read-only statement from a write without a parser?',
+      'What cost estimate would you show before running a query and why?',
+      'Where should row-level permissions for the copilot live?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
