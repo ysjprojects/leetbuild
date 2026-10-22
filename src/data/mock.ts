@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'email-delivery-the-email-that-ignored-an-unsubscribe',
+    problemId: 'email-delivery',
+    stepId: 'endpoint',
+    title: 'The email that ignored an unsubscribe',
+    blurb: 'Suppression expired and hard bounces were retried.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A customer who unsubscribed received three more campaigns, because the draft kept suppression in an expiring cache, and a hard bounce was retried for a week. A timeout resend delivered duplicates with a fresh message id. Review it, fix it, and prove suppression is durable and retries are idempotent.',
+    signals: ['Specify', 'Secure', 'Verify'],
+    aiNote:
+      'The draft keeps suppression in a TTL cache, so an unsubscribe is forgotten after an hour, and it retries hard bounces and resends after timeouts under a new message id, delivering duplicates and ignoring terminal signals.',
+    testIdea:
+      'Suppress a recipient and assert sends are refused after the cache TTL; return a hard bounce and assert exactly one relay attempt; time out a relay and assert the reconciliation uses the original message id.',
+    followUps: [
+      'Which bounces are terminal versus retryable?',
+      'How do you reconcile an unknown relay outcome?',
+      'What belongs in a merge variable allowlist?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
