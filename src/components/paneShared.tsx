@@ -1,6 +1,14 @@
 import {type FC, memo} from 'react';
 
-import {type Company, type Concept, type Difficulty, CONCEPT_LABEL} from '@/lib/types';
+import {
+  type Company,
+  type Concept,
+  type Difficulty,
+  type Language,
+  CONCEPT_LABEL,
+  LANGUAGE_LABEL,
+  LANGUAGES,
+} from '@/lib/types';
 import {concept} from '@/styles/palette';
 
 /** Difficulty is a level, not a tag: a solid badge with 1–3 bars, unlike the outlined concept pills. */
@@ -76,7 +84,12 @@ export const ghostButtonClass =
 export const primaryButtonClass =
   'rounded-lg bg-iris-400 px-3 py-1.5 text-[12px] font-semibold text-ink-950 transition hover:bg-iris-300 disabled:cursor-not-allowed disabled:opacity-30';
 
-export const selectClass =
-  'rounded-md border border-ink-600 bg-ink-800 px-2 py-1 font-code text-[11px] text-ink-100 focus:border-iris-400 focus:outline-none focus:ring-0';
+const languageOption = (language: Language): {value: Language; label: string} => ({
+  value: language,
+  label: LANGUAGE_LABEL[language],
+});
+
+/** The five languages as `Select` options, shared by every language picker. */
+export const LANGUAGE_OPTIONS = LANGUAGES.map(languageOption);
 
 export const linkClass = 'text-iris-300 underline decoration-iris-400/50 hover:text-iris-200';

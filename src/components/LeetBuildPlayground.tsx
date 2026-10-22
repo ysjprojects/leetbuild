@@ -1,16 +1,6 @@
 import type {EditorView} from '@codemirror/view';
 import Router from 'next/router';
-import {
-  type ChangeEvent,
-  type CSSProperties,
-  type FC,
-  memo,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react';
+import {type CSSProperties, type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 
 import {problems} from '@/data/problems';
 import {downloadCertificate} from '@/lib/certificate';
@@ -67,10 +57,11 @@ import {useDialog} from './Dialog';
 import {EditorSettingsForm, GearIcon} from './EditorSettings';
 import {BrandLockup, LoadingScreen} from './LoadingScreen';
 import ModeSwitch from './ModeSwitch';
-import {ghostButtonClass, selectClass} from './paneShared';
+import {ghostButtonClass, LANGUAGE_OPTIONS} from './paneShared';
 import ProblemList from './ProblemList';
 import ProblemPane, {type PaneTab, unlocked} from './ProblemPane';
 import Scratchpad, {ScratchpadIcon} from './Scratchpad';
+import {Select} from './Select';
 import {isEditable, KeyboardIcon, MAC, mod, ShortcutList} from './Shortcuts';
 import {CertificateForm, LinkedInButton, POST_HINT} from './Social';
 import SplitGutter from './SplitGutter';
@@ -817,8 +808,8 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   }, [problem, certified, language, openDialog, onNameChange, verifyUrl]);
 
   const onLanguage = useCallback(
-    (e: ChangeEvent<HTMLSelectElement>) => {
-      const lang = e.target.value as Language;
+    (value: string) => {
+      const lang = value as Language;
       if (!LANGUAGES.includes(lang) || lang === language) return;
       setProgress(p => ({...p, language: lang}));
       if (problem !== null && step !== null) mount(problem, step, lang);
@@ -1237,16 +1228,10 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
         </div>
         <ModeSwitch mode="practice" />
         <div className="ml-auto flex items-center gap-2">
-          <label className="text-ink-300 flex items-center gap-1.5 text-[11px]">
+          <span className="text-ink-300 flex items-center gap-1.5 text-[11px]">
             <span className="hidden sm:inline">language</span>
-            <select className={selectClass} onChange={onLanguage} value={language}>
-              {LANGUAGES.map(lang => (
-                <option key={lang} value={lang}>
-                  {LANGUAGE_LABEL[lang]}
-                </option>
-              ))}
-            </select>
-          </label>
+            <Select align="right" label="language" onChange={onLanguage} options={LANGUAGE_OPTIONS} value={language} />
+          </span>
           <span
             className="border-ink-600 font-code text-ink-200 rounded-full border px-2.5 py-1 text-[11px]"
             title={profile.rank}>

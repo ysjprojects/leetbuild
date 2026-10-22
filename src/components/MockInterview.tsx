@@ -11,7 +11,8 @@ import {SearchIcon} from './ListControls';
 import {BrandLockup} from './LoadingScreen';
 import Markdown from './Markdown';
 import ModeSwitch from './ModeSwitch';
-import {CompanyChip, DifficultyChip, ghostButtonClass, selectClass} from './paneShared';
+import {DifficultyChip, ghostButtonClass, LANGUAGE_OPTIONS} from './paneShared';
+import {Select} from './Select';
 import StepEditor from './StepEditor';
 
 /** `ready` is the scenario page with the clock not yet running, behind the start dialog. */
@@ -179,7 +180,6 @@ const ScenarioCard: FC<{scenario: ResolvedMockScenario; number: number; onStart:
             {scenario.problem.title}
           </span>
           <DifficultyChip difficulty={scenario.problem.difficulty} />
-          {scenario.problem.company !== undefined ? <CompanyChip company={scenario.problem.company} /> : null}
         </span>
         <span className="text-ink-50 mt-3 block text-[14px] font-bold leading-snug">{scenario.title}</span>
         <span className="text-ink-200 mt-1.5 block flex-1 text-[12px] leading-5">{scenario.blurb}</span>
@@ -207,8 +207,8 @@ const ScenarioBrief: FC<{scenario: ResolvedMockScenario; initial: Language; onLa
   ({scenario, initial, onLanguage}) => {
     const [chosen, setChosen] = useState<Language>(initial);
     const onChange = useCallback(
-      (e: ChangeEvent<HTMLSelectElement>) => {
-        const next = e.target.value as Language;
+      (value: string) => {
+        const next = value as Language;
         setChosen(next);
         onLanguage(next);
       },
@@ -220,7 +220,6 @@ const ScenarioBrief: FC<{scenario: ResolvedMockScenario; initial: Language; onLa
         <div className="flex flex-wrap items-center gap-2 text-[12px]">
           <span className="text-ink-100 font-semibold">{scenario.problem.title}</span>
           <DifficultyChip difficulty={scenario.problem.difficulty} />
-          {scenario.problem.company !== undefined ? <CompanyChip company={scenario.problem.company} /> : null}
           <span className="text-ink-400">· {scenario.role}</span>
         </div>
         <p className="text-ink-300 text-[12px] leading-5">
@@ -233,16 +232,10 @@ const ScenarioBrief: FC<{scenario: ResolvedMockScenario; initial: Language; onLa
           ))}
         </div>
         <div className="border-ink-700 flex flex-wrap items-center justify-between gap-3 border-t pt-3 text-[12px]">
-          <label className="text-ink-300 flex items-center gap-2">
+          <span className="text-ink-300 flex items-center gap-2">
             language
-            <select className={selectClass} onChange={onChange} value={chosen}>
-              {LANGUAGES.map(l => (
-                <option key={l} value={l}>
-                  {LANGUAGE_LABEL[l]}
-                </option>
-              ))}
-            </select>
-          </label>
+            <Select label="language" onChange={onChange} options={LANGUAGE_OPTIONS} value={chosen} />
+          </span>
           <span className="text-ink-400">
             <span className="font-code text-ink-100">{scenario.minutes}:00</span> from the moment you start · the draft
             loads in the editor · nothing is recorded
@@ -445,8 +438,8 @@ const MockInterview: FC = memo(() => {
     if (scenario !== null) prepare(scenario, language);
   }, [prepare, scenario, language]);
 
-  const changeLanguage = useCallback((event: ChangeEvent<HTMLSelectElement>) => {
-    setLanguage(event.target.value as Language);
+  const changeLanguage = useCallback((value: string) => {
+    setLanguage(value as Language);
   }, []);
 
   const changeCode = useCallback(
@@ -741,16 +734,16 @@ const MockInterview: FC = memo(() => {
             <BrandLockup />
           </Link>
           <ModeSwitch mode="mock" />
-          <label className="text-ink-300 ml-auto flex items-center gap-1.5 text-[11px]">
+          <span className="text-ink-300 ml-auto flex items-center gap-1.5 text-[11px]">
             <span className="hidden sm:inline">language</span>
-            <select className={selectClass} onChange={changeLanguage} value={language}>
-              {LANGUAGES.map(item => (
-                <option key={item} value={item}>
-                  {LANGUAGE_LABEL[item]}
-                </option>
-              ))}
-            </select>
-          </label>
+            <Select
+              align="right"
+              label="language"
+              onChange={changeLanguage}
+              options={LANGUAGE_OPTIONS}
+              value={language}
+            />
+          </span>
         </div>
         <div className="border-ink-700 flex flex-wrap items-center gap-x-3 gap-y-2 border-t px-3 py-2">
           <div className="flex w-full min-w-0 items-center gap-2 sm:w-auto sm:flex-1">

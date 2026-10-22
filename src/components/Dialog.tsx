@@ -44,7 +44,7 @@ const Dialog: FC<{spec: DialogSpec; onClose: (ok: boolean) => void}> = memo(({sp
   return (
     <dialog
       aria-labelledby="lb-dialog-title"
-      className={`border-ink-600 bg-ink-800 text-ink-200 rounded-xl border p-0 shadow-2xl ${
+      className={`border-ink-600 bg-ink-800 text-ink-200 overflow-visible rounded-xl border p-0 shadow-2xl ${
         spec.conceal === true ? 'backdrop:bg-ink-950/65 backdrop:backdrop-blur-md' : 'backdrop:bg-ink-950/70'
       } ${spec.wide === true ? 'w-[min(94vw,40rem)]' : 'w-[min(92vw,26rem)]'}`}
       onClick={onClick}

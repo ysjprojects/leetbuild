@@ -19,9 +19,6 @@ WidgetFrame.displayName = 'WidgetFrame';
 
 export default WidgetFrame;
 
-export const SELECT_CLASS =
-  'rounded-md border border-ink-600 bg-ink-800 py-0.5 pl-2 pr-6 font-code text-[11px] text-ink-100 focus:border-iris-400 focus:ring-0';
-
 export const RANGE_CLASS = 'h-1 w-24 cursor-pointer accent-iris-400';
 
 export const tabClass = (active: boolean): string =>

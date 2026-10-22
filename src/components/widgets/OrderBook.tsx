@@ -2,11 +2,17 @@ import {type ChangeEvent, type FC, type ReactElement, memo, useCallback, useMemo
 
 import {danger, ink, success} from '@/styles/palette';
 
-import WidgetFrame, {RANGE_CLASS, SELECT_CLASS} from './frame';
+import {Select} from '../Select';
+import WidgetFrame, {RANGE_CLASS} from './frame';
 import type {WidgetProps} from './index';
 import {BUTTON_CLASS} from './playback';
 
 type Side = 'buy' | 'sell';
+
+const SIDES = [
+  {value: 'buy', label: 'buy'},
+  {value: 'sell', label: 'sell'},
+] as const;
 
 interface Order {
   id: number;
@@ -132,7 +138,7 @@ const OrderBook: FC<WidgetProps> = memo(() => {
   const [price, setPrice] = useState(100.5);
   const [qty, setQty] = useState(5);
 
-  const onSide = useCallback((e: ChangeEvent<HTMLSelectElement>) => setSide(e.target.value as Side), []);
+  const onSide = useCallback((value: string) => setSide(value as Side), []);
   const onPrice = useCallback((e: ChangeEvent<HTMLInputElement>) => setPrice(Number(e.target.value)), []);
   const onQty = useCallback((e: ChangeEvent<HTMLInputElement>) => setQty(Number(e.target.value)), []);
   const onAdd = useCallback(() => setBook(b => submit(b, side, price, qty)), [price, qty, side]);
@@ -144,10 +150,7 @@ const OrderBook: FC<WidgetProps> = memo(() => {
   const controls = useMemo(
     () => (
       <>
-        <select aria-label="side" className={SELECT_CLASS} onChange={onSide} value={side}>
-          <option value="buy">buy</option>
-          <option value="sell">sell</option>
-        </select>
+        <Select label="side" onChange={onSide} options={SIDES} value={side} />
         <label className="flex items-center gap-1.5">
           <span className="text-ink-300">price</span>
           <input
