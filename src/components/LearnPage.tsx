@@ -7,7 +7,7 @@ import {WIDGETS} from '@/lib/widgets';
 
 import {BrandLockup} from './LoadingScreen';
 import Markdown, {type WidgetRenderer} from './Markdown';
-import {ConceptChip, DifficultyChip, ghostButtonClass, linkClass, primaryButtonClass} from './paneShared';
+import {ConceptChip, DifficultyChip, ghostButtonClass, linkClass} from './paneShared';
 import ThemeToggle from './ThemeToggle';
 import {renderWidget} from './widgets';
 
@@ -18,7 +18,6 @@ import {renderWidget} from './widgets';
  * through the browser's print dialog, with every folded section open and demos replaced by a note.
  */
 
-const WORDS_PER_MINUTE = 220;
 const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL;
 
 /** The guide's sections: every `#` heading outside fenced code, with the anchor the heading renders. */
@@ -35,21 +34,8 @@ const sectionsOf = (markdown: string): {title: string; id: string}[] => {
   return out;
 };
 
-const DocumentGlyph: FC = memo(() => (
-  <svg aria-hidden className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.6" viewBox="0 0 16 16">
-    <path d="M4 1.5h5.5L13 5v9.5H4z" strokeLinejoin="round" />
-    <path d="M9.5 1.5V5H13" strokeLinejoin="round" />
-    <path d="M6 8h5M6 10.5h5" strokeLinecap="round" />
-  </svg>
-));
-DocumentGlyph.displayName = 'DocumentGlyph';
-
 const LearnPage: FC<{guide: Guide}> = memo(({guide}) => {
   const sections = useMemo(() => sectionsOf(guide.learn), [guide.learn]);
-  const minutes = useMemo(
-    () => Math.max(1, Math.round(guide.learn.split(/\s+/).length / WORDS_PER_MINUTE)),
-    [guide.learn],
-  );
   const [printing, setPrinting] = useState(false);
   const [active, setActive] = useState<string | null>(null);
   // Where this page lives, for the printed notes; the server does not know the origin unless configured.
@@ -119,18 +105,15 @@ const LearnPage: FC<{guide: Guide}> = memo(({guide}) => {
           <BrandLockup />
         </Link>
         <span className="ml-auto flex items-center gap-2">
-          <Link className={ghostButtonClass} href={`/${guide.problemId}`}>
-            ← back to the course
-          </Link>
           <ThemeToggle />
         </span>
       </header>
 
       <section className="mt-8">
-        <p className="text-iris-400 flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider">
-          <DocumentGlyph />
-          Learning guide · ~{minutes} min read
-        </p>
+        {/* The one way back: the description is where the guide is opened from. */}
+        <Link className={`${ghostButtonClass} -ml-3 print:hidden`} href={`/${guide.problemId}`}>
+          ← back to the course
+        </Link>
         <h1 className="text-ink-50 mt-1 text-3xl font-extrabold leading-tight tracking-tight">{guide.title}</h1>
         <p className="text-ink-300 mt-2 max-w-3xl text-[14px] leading-6">{guide.tagline}</p>
         <div className="text-ink-300 mt-3 flex flex-wrap items-center gap-2 text-[11px]">
@@ -141,9 +124,6 @@ const LearnPage: FC<{guide: Guide}> = memo(({guide}) => {
           <span>{guide.steps} steps in the course</span>
         </div>
         <div className="mt-4 flex flex-wrap items-center gap-2 print:hidden">
-          <Link className={primaryButtonClass} href={`/${guide.problemId}`}>
-            Start the course →
-          </Link>
           <button className={ghostButtonClass} onClick={onDownload} title="The guide as Markdown" type="button">
             ⤓ Download .md
           </button>
@@ -197,11 +177,6 @@ const LearnPage: FC<{guide: Guide}> = memo(({guide}) => {
               </ul>
             </section>
           ) : null}
-          <p className="mt-8 text-[12px] print:hidden">
-            <Link className={linkClass} href={`/${guide.problemId}`}>
-              Open the {guide.title} course on LeetBuild →
-            </Link>
-          </p>
         </article>
       </div>
     </main>
