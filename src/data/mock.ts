@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'ad-serving-the-ad-that-followed-one-user-everywhere',
+    problemId: 'ad-serving',
+    stepId: 'endpoint',
+    title: 'The ad that followed one user everywhere',
+    blurb: 'Frequency caps were not enforced and impressions counted at serve.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'One user saw the same campaign on every page for an hour, and the advertiser was billed for impressions on pages the ad never rendered. The draft also served exhausted budgets during a burst. Review it, fix it, and prove caps, budget and counting are truthful.',
+    signals: ['Specify', 'Operate', 'Verify'],
+    aiNote:
+      'The draft ignores frequency caps when ranking, so the highest bidder can saturate one user, and it counts an impression when the ad is served rather than when a render beacon confirms display, billing for ads that were never seen.',
+    testIdea:
+      'Serve one user fifty times and assert the capped campaign stops appearing after the cap; exhaust a budget and assert no serve under a burst; drop a render beacon and assert no impression is counted.',
+    followUps: [
+      'What belongs in a user context hash so no PII enters serving?',
+      'How should fallback impressions be reported to advertisers?',
+      'When is a campaign paused versus throttled?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
