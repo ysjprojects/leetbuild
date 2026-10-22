@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'sync-engine-the-sync-that-ate-a-day-of-work',
+    problemId: 'sync-engine',
+    stepId: 'endpoint',
+    title: 'The sync that ate a day of work',
+    blurb: 'Stale bases overwrote edits and merges picked winners.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A laptop returned from a long weekend and its push overwrote a week of edits from another device, because the draft ignored the base revision and resolved merge failures last-write-wins. The same cursor advanced before apply, losing its own batch on a crash. Review it, fix it, and prove conflicts are surfaced and cursors follow apply.',
+    signals: ['Verify', 'Specify', 'Operate'],
+    aiNote:
+      "The draft applies pushes without checking the base revision against the server's history, so an arbitrarily stale client overwrites newer state, and it resolves merge timeouts with last-write-wins, converting infrastructure failure into silent data loss.",
+    testIdea:
+      'Push with a month-old base and assert per-document conflicts, not overwrites; crash between apply and cursor advance and assert the batch is re-sent; hit the pull cap and assert the watermark covers exactly the returned entries.',
+    followUps: [
+      'What does a conflict look like to a user?',
+      'How do you compact a long document history?',
+      'Should cursors be per device or per user?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
