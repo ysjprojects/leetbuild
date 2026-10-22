@@ -118,6 +118,7 @@ import {aiFirewallProblem} from './119-ai-firewall/index';
 import {textToSqlProblem} from './120-text-to-sql/index';
 import {supportAutomationProblem} from './121-support-automation/index';
 import {dataClassificationProblem} from './122-data-classification/index';
+import {researchOrchestratorProblem} from './123-research-orchestrator/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -227,6 +228,7 @@ export const problems: Problem[] = [
   textToSqlProblem,
   supportAutomationProblem,
   dataClassificationProblem,
+  researchOrchestratorProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,

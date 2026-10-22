@@ -2324,6 +2324,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'research-orchestrator-fanout',
+    problemId: 'research-orchestrator',
+    stepId: 'subagent-fanout',
+    title: 'The lead agent that spawns fifty subagents, one at a time',
+    blurb: 'A deep research job took forty minutes and overflowed the lead’s context. Fix the fan-out.',
+    role: 'AI platform engineer · 25 min',
+    minutes: 25,
+    prompt:
+      'You are the platform engineer who owns the research orchestrator. A customer’s deep query took forty minutes, the lead agent lost its plan halfway through, and the bill showed sixty subagents for a job budgeted at ten. The model-generated lead agent below passes the demo. Review it against what the source says about delegation, parallelism and compression, fix it, and prove the fix.',
+    signals: ['Delegate', 'Specify', 'Operate', 'Verify'],
+    aiNote:
+      'The draft awaits each subagent before starting the next, runs every task the planner returns instead of cutting the plan to budget.max_subagents, calls Subagent.Run with no deadline, sends only an objective (no output format, tools or boundaries), and appends each reply’s full transcript — not its condensed findings — to the lead’s notes.',
+    testIdea:
+      'Fake the subagent stub so each Run sleeps one second and returns a 50 000-character transcript with a 200-character findings field. With a plan of twelve tasks and a budget of ten, the fixed lead must finish in about two seconds (two batches of five), call Run exactly ten times with all four task fields set, and hand synthesis notes no longer than 4 000 characters each. Then make one stub hang: the batch must still return within 120 seconds with a “no result” note for that task.',
+    followUps: [
+      'The source runs subagents synchronously and names it as a bottleneck. What would asynchronous subagents change about error propagation and state consistency here?',
+      'Where does the 4 000-character cap belong — in the lead, or in the subagent’s output format? What breaks if a subagent returns a reference to an artefact instead of text?',
+      'Two subagents came back with overlapping findings. Which field of the task spec was too loose, and how would you detect that from the trace without reading the findings?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
