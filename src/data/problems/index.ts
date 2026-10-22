@@ -84,6 +84,7 @@ import {featureFlagsProblem} from './80-feature-flags/index';
 import {experimentsPlatformProblem} from './81-experiments-platform/index';
 import {fraudScoringProblem} from './82-fraud-scoring/index';
 import {kycVerificationProblem} from './83-kyc-verification/index';
+import {productCatalogProblem} from './84-product-catalog/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -159,6 +160,7 @@ export const problems: Problem[] = [
   experimentsPlatformProblem,
   fraudScoringProblem,
   kycVerificationProblem,
+  productCatalogProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
