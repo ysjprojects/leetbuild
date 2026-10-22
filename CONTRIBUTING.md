@@ -42,6 +42,7 @@ What `yarn verify` holds every course to:
 
 - `id`s kebab-case, file stems snake_case; at least 4 steps and every one of the four concepts (HTTPS, gRPC, Kafka, Redis) exercised by some step — unless the problem is a **single-topic drill** (`concepts` lists exactly one concept): then one step is enough and every step exercises that concept; `concepts[0]` is the first step's concept; no two steps own the same file in any language.
 - Per step: a task and a debrief, 2–3 progressive hints, at least 3 checks, each check with a non-empty matcher for all five languages, `focus` naming real diagram nodes, every `:::widget` registered in `src/lib/widgets.ts`.
+- A deep-learning problem (`track: 'dl'`) fixes its language (`language: 'python' | 'cuda'`), lists its one concept (`pytorch` or `cuda`), carries code and matchers for that language only and no harness; its reference solution is a complete, self-testing program.
 - Per language: the starter carries a `TODO`, differs from the solution, fails at least one static check and pre-passes at most one; the solution passes them all.
 - Every step ships a Python **and** a TypeScript harness: one `check_<id>(ctx)` per check (`-` → `_`), the solution passes every runtime check, the starter does not. `ctx` is documented in `public/py/runtime/leetbuild/harness.py` and `src/lib/runtime/ts/harness.ts`.
 - Company-tagged courses: `company` ⇔ `sources`, every source with an https URL, a `YYYY-MM-DD` (or `YYYY-MM`) date, a title and what the course takes from it; the statement has a `## From the source` section.

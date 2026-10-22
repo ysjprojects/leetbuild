@@ -19,7 +19,15 @@ import {malformedBlocksOf, widgetsOf} from '../src/lib/markdown';
 import {type NodeRuntime, createNodePythonRuntime, createNodeTypeScriptRuntime} from '../src/lib/runtime/node';
 import {type RunJob, type RunResult} from '../src/lib/runtime/types';
 import {STEP_POINTS} from '../src/lib/scoring';
-import {type Language, type Problem, type Step, CONCEPTS, fileName, LANGUAGES} from '../src/lib/types';
+import {
+  type Language,
+  type Problem,
+  type Step,
+  codeFor,
+  fileName,
+  problemLanguages,
+  SYSTEMS_CONCEPTS,
+} from '../src/lib/types';
 import {WIDGETS} from '../src/lib/widgets';
 
 const args = process.argv.slice(2);
@@ -97,7 +105,7 @@ function verifyStep(problem: Problem, step: Step, index: number): string[] {
     if (checkIds.has(check.id)) errors.push(`${tag}: duplicate check id '${check.id}'`);
     checkIds.add(check.id);
     if (check.detail.trim() === '') errors.push(`${tag}/${check.id}: missing detail`);
-    for (const language of LANGUAGES) {
+    for (const language of problemLanguages(problem)) {
       const m = check.match[language];
       if (m === undefined) {
         errors.push(`${tag}/${check.id}: no matcher for ${language}`);
@@ -116,7 +124,7 @@ function verifyStep(problem: Problem, step: Step, index: number): string[] {
       if (!participants.has(m.to)) errors.push(`${tag}: sequence message ${i + 1} to unknown participant '${m.to}'`);
     }
   }
-  for (const language of LANGUAGES) {
+  for (const language of problemLanguages(problem)) {
     const code = step.code[language];
     if (code === undefined) {
       errors.push(`${tag}: no code for ${language}`);
@@ -183,13 +191,20 @@ function verifyProblem(problem: Problem): string[] {
       if (step.concept !== problem.concepts[0])
         errors.push(`${problem.id}/${step.id}: a single-topic problem's steps all exercise ${problem.concepts[0]}`);
   } else {
-    for (const concept of CONCEPTS)
+    for (const concept of SYSTEMS_CONCEPTS)
       if (!covered.has(concept)) errors.push(`${problem.id}: no step exercises ${concept}`);
   }
+  // A fixed language is one of the deep-learning track's; a course has none.
+  if (problem.language !== undefined && problem.track !== 'dl')
+    errors.push(`${problem.id}: only the deep-learning track fixes a language`);
+  if (problem.track === 'dl' && problem.language === undefined)
+    errors.push(`${problem.id}: a deep-learning problem fixes its language`);
+  if (problem.track === 'dl' && !single)
+    errors.push(`${problem.id}: a deep-learning problem lists its one concept (pytorch or cuda)`);
   for (const concept of problem.concepts)
     if (!covered.has(concept)) errors.push(`${problem.id}: lists concept ${concept} but no step exercises it`);
   // The playground shows a course as one filesystem per language: two steps may not own one file.
-  for (const language of LANGUAGES) {
+  for (const language of problemLanguages(problem)) {
     const names = new Set<string>();
     for (const step of problem.steps) {
       const name = fileName(step.file, language);
@@ -240,7 +255,7 @@ async function loadProblems(): Promise<Problem[]> {
 /** The job that runs `step` of `problem` with `code` as its file: every other file is the reference solution. */
 function runJob(problem: Problem, step: Step, language: Language, code: string): RunJob {
   const files: Record<string, string> = {};
-  for (const s of problem.steps) files[fileName(s.file, language)] = s === step ? code : s.code[language].solution;
+  for (const s of problem.steps) files[fileName(s.file, language)] = s === step ? code : codeFor(s, language).solution;
   return {
     files,
     support: problem.support?.[language] ?? {},
@@ -292,10 +307,10 @@ async function verifyRuntime(
       const name = `check_${check.id.replace(/-/g, '_')}`;
       if (!declares(harness, name)) errors.push(`${tag}: harness defines no ${name}`);
     }
-    const solution = await runtime.run(runJob(problem, step, language, step.code[language].solution));
+    const solution = await runtime.run(runJob(problem, step, language, codeFor(step, language).solution));
     if (solution.error !== undefined || !solution.checks.every(c => c.passed))
       errors.push(`${tag}: solution fails — ${describeRun(solution)}`);
-    const starter = await runtime.run(runJob(problem, step, language, step.code[language].starter));
+    const starter = await runtime.run(runJob(problem, step, language, codeFor(step, language).starter));
     if (starter.error === undefined && starter.checks.every(c => c.passed))
       errors.push(`${tag}: the starter already passes every runtime check`);
     if (verbose) {
@@ -316,6 +331,7 @@ async function main(): Promise<void> {
   const problems = await loadProblems();
   const ids = new Set<string>();
   let steps = 0;
+  let checked = 0;
   const harnesses: Partial<Record<Language, number>> = {};
   const selected = problems.filter(p => onlyProblem === null || p.id === onlyProblem || onlyProblem.endsWith(p.id));
   const runtimes: Partial<Record<Language, NodeRuntime>> = {};
@@ -340,6 +356,7 @@ async function main(): Promise<void> {
         (harnesses[language] ?? 0) + problem.steps.filter(s => s.harness?.[language] !== undefined).length;
     }
     steps += problem.steps.length;
+    checked += problem.steps.length * problemLanguages(problem).length;
     console.log(
       `${e.length === 0 ? '✓' : '✗'} ${problem.title} — ${problem.steps.length} steps (${Date.now() - started} ms)`,
     );
@@ -355,12 +372,11 @@ async function main(): Promise<void> {
     if (total <= 0) errors.push('course totals are not positive');
     else console.log(`✓ course totals ${total} points (${JSON.stringify(counts)})`);
   }
-  const languages: Language[] = [...LANGUAGES];
   const ran = EXECUTING.filter(({language}) => !withRuntime || runtimes[language] !== undefined)
     .map(({language}) => `${harnesses[language] ?? 0} ${language}`)
     .join(' + ');
   console.log(
-    `\n${steps} step(s) × ${languages.length} languages checked, ${ran} harness(es)${
+    `\n${steps} step(s), ${checked} step-language pairs checked, ${ran} harness(es)${
       withRuntime ? ' run' : ' skipped'
     }, ${errors.length} problem(s)`,
   );

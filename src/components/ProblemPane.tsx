@@ -10,6 +10,7 @@ import {
   type Problem,
   type Source,
   type Step,
+  codeFor,
   CONCEPT_LABEL,
   fileName,
   LANGUAGE_LABEL,
@@ -163,7 +164,7 @@ const Solution: FC<{
 }> = memo(({step, language, attempt, userCode, onReveal, onLoad}) => {
   const [shown, setShown] = useState(false);
   const [diff, setDiff] = useState(false);
-  const solution = step.code[language].solution;
+  const solution = codeFor(step, language).solution;
   const onShow = useCallback(() => setShown(true), []);
   const onHide = useCallback(() => setShown(false), []);
   const toggleDiff = useCallback(() => setDiff(d => !d), []);
@@ -595,6 +596,8 @@ const ProblemPane: FC<{
                 then submit.{' '}
                 {step.harness?.[language] !== undefined
                   ? 'Your code runs in the browser: each check exercises it and reports what it observed.'
+                  : problem.track === 'dl'
+                  ? 'The checks read the shape of your code. Run the file on your own machine: the reference ends in a self-test that prints PASS.'
                   : 'The checks read the shape of your code; nothing is executed in this language.'}
               </p>
               {step.sequence !== undefined ? (

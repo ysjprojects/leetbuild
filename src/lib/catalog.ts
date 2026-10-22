@@ -9,7 +9,7 @@ import {type Difficulty, type Problem, CONCEPT_LABEL, DIFFICULTIES} from './type
 export type StatusFilter = 'all' | 'open' | 'started' | 'solved';
 export type SortKey = 'order' | 'difficulty' | 'points' | 'minutes' | 'progress' | 'title';
 /** The tabs above the list, LeetCode-style: every course, the classic systems track, or the AI-era track. */
-export type TrackFilter = 'all' | 'systems' | 'ai';
+export type TrackFilter = 'all' | 'systems' | 'dl' | 'ai';
 
 export interface ListQuery {
   /** Which track the list shows; a view rather than a filter, so `reset` and "clear" leave it alone. */
@@ -38,11 +38,12 @@ export const DEFAULT_LIST_QUERY: ListQuery = {
 export const TRACKS: readonly {key: TrackFilter; label: string}[] = [
   {key: 'all', label: 'All topics'},
   {key: 'systems', label: 'Systems'},
+  {key: 'dl', label: 'Deep learning'},
   {key: 'ai', label: 'AI era'},
 ];
 
 export const inTrack = (problem: Problem, track: TrackFilter): boolean =>
-  track === 'all' || (track === 'ai') === (problem.track === 'ai');
+  track === 'all' || (problem.track ?? 'systems') === track;
 
 export const STATUS_LABEL: Record<StatusFilter, string> = {
   all: 'All',
@@ -153,7 +154,7 @@ export function parseListQuery(params: Record<string, string | string[] | undefi
   const status = one(params.status);
   const sort = one(params.sort);
   return {
-    track: track === 'systems' || track === 'ai' ? track : 'all',
+    track: track === 'systems' || track === 'ai' || track === 'dl' ? track : 'all',
     q: one(params.q) ?? '',
     difficulty: (DIFFICULTIES as readonly string[]).includes(difficulty ?? '') ? (difficulty as Difficulty) : 'all',
     status: status !== undefined && status in STATUS_LABEL && status !== 'all' ? (status as StatusFilter) : 'all',

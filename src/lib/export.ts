@@ -14,6 +14,7 @@ import {
   type Sequence,
   type Source,
   type Step,
+  codeFor,
   CONCEPT_LABEL,
   fileName,
   LANGUAGE_LABEL,
@@ -32,6 +33,7 @@ const FENCE_LANGUAGE: Record<Language, string> = {
   go: 'go',
   scala: 'scala',
   cpp: 'cpp',
+  cuda: 'cuda',
 };
 
 /** Mermaid node shape per component kind: `open` and `close` wrap the quoted label. */
@@ -165,7 +167,7 @@ export const problemUrl = (problem: Problem): string => `${siteUrl()}/${problem.
 const stepUrl = (problem: Problem, step: Step): string => `${siteUrl()}${stepPath(problem, step)}`;
 
 function stepToMarkdown(problem: Problem, step: Step, index: number, language: Language): string {
-  const code = step.code[language];
+  const code = codeFor(step, language);
   const fence = FENCE_LANGUAGE[language];
   const url = stepUrl(problem, step);
   const parts: string[] = [];

@@ -161,6 +161,8 @@ export function profile(
     grpc: {concept: 'grpc', accepted: 0, total: 0},
     kafka: {concept: 'kafka', accepted: 0, total: 0},
     redis: {concept: 'redis', accepted: 0, total: 0},
+    pytorch: {concept: 'pytorch', accepted: 0, total: 0},
+    cuda: {concept: 'cuda', accepted: 0, total: 0},
   };
   for (const problem of problems) {
     const p = problemScore(problem, attempts);

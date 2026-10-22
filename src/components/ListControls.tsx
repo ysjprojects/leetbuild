@@ -24,8 +24,8 @@ import {
 import {type Difficulty, DIFFICULTIES} from '@/lib/types';
 
 /**
- * The rows above the problem list, LeetCode-style: a row of track tabs (All topics · Systems · AI
- * era, each with its icon; the active one is inverted), then a search pill, a sort menu and a
+ * The rows above the problem list, LeetCode-style: a row of track tabs (All topics · Systems · Deep
+ * learning · AI era, each with its icon; the active one is inverted), then a search pill, a sort menu and a
  * filter menu behind two round buttons (a dot marks one that is in effect), and at the right how
  * many courses of the track are solved — or, while filtering, how many rows match and the way out.
  * Every control writes to the URL through `update`; the search box keeps its own text so the caret
@@ -97,10 +97,21 @@ const AiEraIcon: FC = memo(() => (
 ));
 AiEraIcon.displayName = 'AiEraIcon';
 
+/** Deep learning: a chip with pins. */
+const DeepLearningIcon: FC = memo(() => (
+  <svg aria-hidden fill="none" height={15} stroke="currentColor" strokeWidth={1.5} viewBox="0 0 16 16" width={15}>
+    <rect height={8} rx={1.2} width={8} x={4} y={4} />
+    <rect height={3} rx={0.6} width={3} x={6.5} y={6.5} />
+    <path d="M6 1.5v2.5M10 1.5v2.5M6 12v2.5M10 12v2.5M1.5 6h2.5M1.5 10h2.5M12 6h2.5M12 10h2.5" strokeLinecap="round" />
+  </svg>
+));
+DeepLearningIcon.displayName = 'DeepLearningIcon';
+
 /** The icon and the colour it keeps while its tab is not selected (an inverted tab takes the text colour). */
 const TRACK_ICON: Record<TrackFilter, {icon: FC; tint: string}> = {
   all: {icon: AllTopicsIcon, tint: 'text-ink-100'},
   systems: {icon: SystemsIcon, tint: 'text-warning-300'},
+  dl: {icon: DeepLearningIcon, tint: 'text-concept-cuda'},
   ai: {icon: AiEraIcon, tint: 'text-iris-300'},
 };
 

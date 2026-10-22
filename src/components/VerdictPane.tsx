@@ -39,7 +39,7 @@ const Fragment: FC<{text: string}> = memo(({text}) => (
 Fragment.displayName = 'ShapeFragment';
 
 const ExpectedShape: FC<{check: StepCheck; language: Language}> = memo(({check, language}) => {
-  const shape = useMemo(() => describeMatcher(check.match[language]), [check, language]);
+  const shape = useMemo(() => describeMatcher(check.match[language] ?? {}), [check, language]);
   return (
     <div className="text-ink-300 mt-1.5 space-y-1 pl-6 text-[12px]">
       <p className="text-ink-400 font-bold uppercase tracking-wider">

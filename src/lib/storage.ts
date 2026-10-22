@@ -10,7 +10,7 @@
 import {type StepAttempt, type Submission, HISTORY_LENGTH} from './scoring';
 import {type Scratchpad, normalizeShapes} from './scratchpad';
 import {type ActiveTimer, type TimedSession, SESSION_HISTORY} from './timer';
-import {type Language, LANGUAGES} from './types';
+import {type Language, ALL_LANGUAGES, LANGUAGES} from './types';
 
 export interface Workspace {
   code: string;
@@ -217,7 +217,10 @@ class LocalStorageBackend implements Backend {
   }
 }
 
-const isLanguage = (v: unknown): v is Language => typeof v === 'string' && LANGUAGES.includes(v as Language);
+/** A language a record may carry (a CUDA step's attempt included). */
+const isLanguage = (v: unknown): v is Language => typeof v === 'string' && ALL_LANGUAGES.includes(v as Language);
+/** A language the learner can pick in the header — the stored preference is always one of these. */
+const isSelectable = (v: unknown): v is Language => typeof v === 'string' && LANGUAGES.includes(v as Language);
 
 const normalizeScratchpad = (value: unknown): Scratchpad => {
   const pad = typeof value === 'object' && value !== null ? (value as Partial<Scratchpad>) : {};
@@ -324,7 +327,7 @@ function normalizeProgress(value: unknown): Progress {
   const p = value as Partial<Progress>;
   return {
     attempts: normalizeAttempts(p.attempts),
-    language: isLanguage(p.language) ? p.language : 'python',
+    language: isSelectable(p.language) ? p.language : 'python',
     lastStep: typeof p.lastStep === 'object' && p.lastStep !== null ? p.lastStep : {},
     submissions: typeof p.submissions === 'number' ? p.submissions : 0,
     acceptedSubmissions: typeof p.acceptedSubmissions === 'number' ? p.acceptedSubmissions : 0,

@@ -148,13 +148,39 @@ import {kafkaTieredRetryDelaysProblem} from './149-kafka-tiered-retry-delays/ind
 import {kafkaChangelogRestoreProblem} from './150-kafka-changelog-restore/index';
 import {kafkaOrderedMergeWatermarkProblem} from './151-kafka-ordered-merge-watermark/index';
 import {kafkaGracefulShutdownProblem} from './152-kafka-graceful-shutdown/index';
+import {ptStableSoftmaxProblem} from './153-pt-stable-softmax/index';
+import {ptSgdMomentumProblem} from './154-pt-sgd-momentum/index';
+import {ptLayernormRmsnormProblem} from './155-pt-layernorm-rmsnorm/index';
+import {ptAdamwProblem} from './156-pt-adamw/index';
+import {ptRopeProblem} from './157-pt-rope/index';
+import {ptCausalAttentionProblem} from './158-pt-causal-attention/index';
+import {ptGpt2BlockProblem} from './159-pt-gpt2-block/index';
+import {ptLrScheduleClipProblem} from './160-pt-lr-schedule-clip/index';
+import {ptBpeTokenizerProblem} from './161-pt-bpe-tokenizer/index';
+import {ptGpt2Problem} from './162-pt-gpt2/index';
+import {ptFlashAttentionTiledProblem} from './163-pt-flash-attention-tiled/index';
+import {ptDdpmProblem} from './164-pt-ddpm/index';
+import {ptLoraProblem} from './165-pt-lora/index';
+import {ptMixedPrecisionProblem} from './166-pt-mixed-precision/index';
+import {ptMoeRouterProblem} from './167-pt-moe-router/index';
+import {cudaVectorAddProblem} from './168-cuda-vector-add/index';
+import {cudaFusedGeluProblem} from './169-cuda-fused-gelu/index';
+import {cudaReductionProblem} from './170-cuda-reduction/index';
+import {cudaTiledMatmulProblem} from './171-cuda-tiled-matmul/index';
+import {cudaRowSoftmaxProblem} from './172-cuda-row-softmax/index';
+import {cudaLayernormWelfordProblem} from './173-cuda-layernorm-welford/index';
+import {cudaFlashAttentionProblem} from './174-cuda-flash-attention/index';
+import {cudaWmmaMatmulProblem} from './175-cuda-wmma-matmul/index';
+import {cudaPrefixScanProblem} from './176-cuda-prefix-scan/index';
+import {cudaStreamsOverlapProblem} from './177-cuda-streams-overlap/index';
 
 /**
  * Problem order on the list page: the classic systems track first, in its catalogue order, then the
- * AI-era track in the order its courses were added (the directory numbers). The list's track tabs
- * show either on its own; "All topics" shows this order. Company-tagged courses (derived from
- * engineering blogs, see `Problem.company`) and the single-topic drills (one concept, one step)
- * sit with the courses of their difficulty, after them.
+ * deep-learning track (PyTorch, then CUDA, each by difficulty), then the AI-era track in the order
+ * its courses were added (the directory numbers). The list's track tabs show each on its own; "All
+ * topics" shows this order. Company-tagged courses (derived from engineering blogs, see
+ * `Problem.company`) and the single-topic drills (one concept, one step) sit with the courses of
+ * their difficulty, after them.
  */
 export const problems: Problem[] = [
   dropboxGatesProblem,
@@ -198,6 +224,31 @@ export const problems: Problem[] = [
   kafkaChangelogRestoreProblem,
   kafkaOrderedMergeWatermarkProblem,
   kafkaGracefulShutdownProblem,
+  ptStableSoftmaxProblem,
+  ptSgdMomentumProblem,
+  ptLayernormRmsnormProblem,
+  ptAdamwProblem,
+  ptRopeProblem,
+  ptCausalAttentionProblem,
+  ptGpt2BlockProblem,
+  ptLrScheduleClipProblem,
+  ptBpeTokenizerProblem,
+  ptGpt2Problem,
+  ptFlashAttentionTiledProblem,
+  ptDdpmProblem,
+  ptLoraProblem,
+  ptMixedPrecisionProblem,
+  ptMoeRouterProblem,
+  cudaVectorAddProblem,
+  cudaFusedGeluProblem,
+  cudaReductionProblem,
+  cudaTiledMatmulProblem,
+  cudaRowSoftmaxProblem,
+  cudaLayernormWelfordProblem,
+  cudaFlashAttentionProblem,
+  cudaWmmaMatmulProblem,
+  cudaPrefixScanProblem,
+  cudaStreamsOverlapProblem,
   aiGatewayProblem,
   ragServiceProblem,
   modelRouterProblem,

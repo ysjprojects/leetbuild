@@ -6,7 +6,7 @@ import {type Streak, activityByDay, badgeProgress, BADGES, stepOfTheDay} from '@
 import {useListQuery} from '@/lib/listQuery';
 import {type Profile, type StepAttempt, OPEN_ATTEMPT, problemScore, rankProgress} from '@/lib/scoring';
 import {type TimedSession, bestSession, formatClock} from '@/lib/timer';
-import {type Difficulty, type Problem, CONCEPT_LABEL, CONCEPTS, LANGUAGES, stepKey, stepPath} from '@/lib/types';
+import {type Difficulty, type Problem, ALL_LANGUAGES, CONCEPT_LABEL, stepKey, stepPath} from '@/lib/types';
 
 import {BadgeCatalog, BadgeGlyph} from './Badges';
 import {useDialog} from './Dialog';
@@ -416,10 +416,8 @@ const ProblemRow: FC<{
               </span>
             ) : null}
             {problem.company !== undefined ? <CompanyChip company={problem.company} /> : null}
-            {/* A course covers every concept, so its chips would say nothing; a single-topic drill names its one. */}
-            {problem.concepts.length < CONCEPTS.length
-              ? problem.concepts.map(c => <ConceptChip concept={c} key={c} />)
-              : null}
+            {/* A course covers every concept, so its chips would say nothing; a single-topic problem names its one. */}
+            {problem.concepts.length === 1 ? <ConceptChip concept={problem.concepts[0]} /> : null}
           </span>
           <span className="text-ink-300 mt-1 block text-[13px] leading-5">{problem.tagline}</span>
           <span className="text-ink-300 mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px]">
@@ -486,7 +484,7 @@ const ProblemList: FC<{
     () => [
       `${problems.length} courses`,
       `${problems.reduce((n, p) => n + p.steps.length, 0)} steps`,
-      `${LANGUAGES.length} languages`,
+      `${ALL_LANGUAGES.length} languages`,
       `${profile.max} points`,
     ],
     [problems, profile.max],
@@ -519,8 +517,8 @@ const ProblemList: FC<{
           {query.track === 'ai' ? (
             <div className="border-iris-400/30 from-iris-400/[0.10] mb-4 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-2xl border bg-gradient-to-r via-transparent to-transparent px-4 py-3">
               <p className="text-ink-200 text-[12px]">
-                In these courses every starter is a model-generated draft with a real flaw. Review it, fix it, prove it
-                — the six signals AI-era interviews probe:
+                In these courses every starter is a model-generated draft with a real flaw. Review it, fix it, prove it.
+                The six signals AI-era interviews probe:
               </p>
               <div className="flex flex-wrap gap-1.5">
                 {AI_SKILLS.map(skill => (

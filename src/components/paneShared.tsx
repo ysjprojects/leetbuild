@@ -25,6 +25,8 @@ export const CONCEPT_CLASS: Record<Concept, string> = {
   grpc: 'border-concept-grpc/50 bg-concept-grpc/10 text-concept-grpc',
   kafka: 'border-concept-kafka/50 bg-concept-kafka/10 text-concept-kafka',
   redis: 'border-concept-redis/50 bg-concept-redis/10 text-concept-redis',
+  pytorch: 'border-concept-pytorch/50 bg-concept-pytorch/10 text-concept-pytorch',
+  cuda: 'border-concept-cuda/50 bg-concept-cuda/10 text-concept-cuda',
 };
 
 /** Solid colour per concept for bars and dots (the diagram palette). */

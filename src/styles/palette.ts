@@ -51,7 +51,14 @@ const nightInk = {
 };
 
 /** One hue per course concept; also the edge and node colours of the architecture diagrams. */
-const nightConcept = {http: '#85b1ff', grpc: '#c9a3f5', kafka: '#f99f5d', redis: '#f77d84'};
+const nightConcept = {
+  http: '#85b1ff',
+  grpc: '#c9a3f5',
+  kafka: '#f99f5d',
+  redis: '#f77d84',
+  pytorch: '#ff9a7a',
+  cuda: '#a7d95a',
+};
 
 export const night = {
   ink: nightInk,
@@ -97,7 +104,14 @@ const dayInk = {
   950: '#ffffff',
 };
 
-const dayConcept = {http: '#3364bf', grpc: '#8151b1', kafka: '#a25200', redis: '#bf3045'};
+const dayConcept = {
+  http: '#3364bf',
+  grpc: '#8151b1',
+  kafka: '#a25200',
+  redis: '#bf3045',
+  pytorch: '#c2410c',
+  cuda: '#4d7a00',
+};
 
 export const day: Palette = {
   ink: dayInk,

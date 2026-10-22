@@ -60,7 +60,7 @@ const describe = (shape: ProtoShape, comment: string): string[] => [
 /** The import path the Go starters use for the generated package (`pb "chat/gen/chat"`), if they spell one out. */
 const goImportPath = (problem: Problem, name: string): string | null => {
   for (const step of problem.steps) {
-    const found = new RegExp(`"([\\w./-]+/gen/${name})"`).exec(step.code.go.starter);
+    const found = new RegExp(`"([\\w./-]+/gen/${name})"`).exec(step.code.go?.starter ?? '');
     if (found !== null) return found[1];
   }
   return null;
@@ -237,7 +237,7 @@ function generated(problem: Problem, language: 'go' | 'scala' | 'cpp', file: str
 
 /** Everything the step code in `language` says, starters and solutions, for scanning imports and uses. */
 const allCode = (problem: Problem, language: Language): string =>
-  problem.steps.map(s => `${s.code[language].starter}\n${s.code[language].solution}`).join('\n');
+  problem.steps.map(s => `${s.code[language]?.starter ?? ''}\n${s.code[language]?.solution ?? ''}`).join('\n');
 
 /** `Name.member` uses of an imported package or object across the step code, deduplicated, in order of appearance. */
 const usesOf = (code: string, alias: string): string[] => {
@@ -401,6 +401,8 @@ export function providedFiles(problem: Problem, language: Language): ProvidedFil
       note: note(path),
     }));
   }
+  // A kernel imports nothing the course provides.
+  if (language === 'cuda') return [];
   // The .proto sources travel with the TypeScript support (proto-loader reads them at run time).
   const protos = Object.entries(problem.support?.typescript ?? {}).filter(([path]) => path.endsWith('.proto'));
   const fromProtos = protos.flatMap(([file, text]) => generated(problem, language, file, text));

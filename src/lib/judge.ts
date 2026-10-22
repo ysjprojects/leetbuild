@@ -177,7 +177,13 @@ export function matches(matcher: Matcher, text: string): boolean {
 }
 
 export function runCheck(check: StepCheck, language: Language, stripped: string): CheckResult {
-  return {id: check.id, title: check.title, detail: check.detail, passed: matches(check.match[language], stripped)};
+  // A language the step is not written in has no matcher; verify guarantees one for every language it is.
+  return {
+    id: check.id,
+    title: check.title,
+    detail: check.detail,
+    passed: matches(check.match[language] ?? {}, stripped),
+  };
 }
 
 export function judge(step: Step, language: Language, code: string): Verdict {

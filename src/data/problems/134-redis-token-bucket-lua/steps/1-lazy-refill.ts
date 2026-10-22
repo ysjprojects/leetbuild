@@ -1,6 +1,9 @@
 import type {Language, Matcher, Step} from '@/lib/types';
 
-const EVAL: Record<Language, RegExp> = {
+/** The five languages a course is written in (the drill is not in CUDA). */
+type CourseLanguage = Exclude<Language, 'cuda'>;
+
+const EVAL: Record<CourseLanguage, RegExp> = {
   python: /\br\.eval\(|register_script\(|\.evalsha\(/,
   typescript: /redis\.eval\(|defineCommand\(|\.evalsha\(/,
   go: /redis\.NewScript\(|\.Eval\(|\.EvalSha\(/,
@@ -9,7 +12,7 @@ const EVAL: Record<Language, RegExp> = {
 };
 
 /** The bucket read, computed or written from the client instead of inside the script. */
-const CLIENT_SIDE: Record<Language, RegExp[]> = {
+const CLIENT_SIDE: Record<CourseLanguage, RegExp[]> = {
   python: [/\br\.(hm?get|hgetall|hset|hincrbyfloat|pttl|pexpire)\(/, /(?<![\w.])(min|ceil)\(/],
   typescript: [/redis\.(hm?get|hgetall|hset|hincrbyfloat|pttl|pexpire)\(/, /Math\.(min|ceil)\(/],
   go: [/rdb\.(HM?Get|HGetAll|HSet|HIncrByFloat|PTTL|PExpire)\(/, /math\.(Min|Ceil)\(/],
@@ -18,7 +21,7 @@ const CLIENT_SIDE: Record<Language, RegExp[]> = {
 };
 
 /** The script is the same Lua in every language, so matchers on it are built once and applied everywhere. */
-const perLanguage = (build: (language: Language) => Matcher): Record<Language, Matcher> => ({
+const perLanguage = (build: (language: CourseLanguage) => Matcher): Record<CourseLanguage, Matcher> => ({
   python: build('python'),
   typescript: build('typescript'),
   go: build('go'),

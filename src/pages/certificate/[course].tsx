@@ -20,7 +20,7 @@ import {
   linkedInPostUrl,
   summarize,
 } from '@/lib/social';
-import {type Language, LANGUAGES} from '@/lib/types';
+import {type Language, ALL_LANGUAGES} from '@/lib/types';
 
 /**
  * A certificate's own page: pre-rendered per course (so a LinkedIn link unfurls with the course's
@@ -50,7 +50,7 @@ const Certificate: FC<{course: CourseSummary}> = memo(({course}) => {
     const name = one(q.n)?.trim();
     const completedAt = Number(one(q.d));
     const language = one(q.l);
-    if (!name || !Number.isFinite(completedAt) || !LANGUAGES.includes(language as Language)) return null;
+    if (!name || !Number.isFinite(completedAt) || !ALL_LANGUAGES.includes(language as Language)) return null;
     // The scale the certificate was earned on; links issued before `m` existed fall back to today's.
     const issuedMax = Number(one(q.m));
     const max =

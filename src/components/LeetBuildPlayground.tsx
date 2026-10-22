@@ -45,6 +45,7 @@ import {
   type Language,
   type Problem,
   type Step,
+  codeFor,
   fileName,
   LANGUAGE_LABEL,
   LANGUAGE_STACK,
@@ -700,12 +701,13 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   const step: Step | null =
     problem === null ? null : resolveStep(problem, progress.attempts, stepId ?? progress.lastStep[problem.id]);
   const stepIndex = problem === null || step === null ? -1 : problem.steps.indexOf(step);
-  const language = progress.language;
+  // A deep-learning problem is written in one language; everything else follows the learner's choice.
+  const language = problem?.language ?? progress.language;
   const runner = useMemo(() => getRunner(language), [language]);
   const attemptKey = problem !== null && step !== null ? stepKey(problem.id, step.id) : null;
   const attempt: StepAttempt = attemptKey === null ? OPEN_ATTEMPT : progress.attempts[attemptKey] ?? OPEN_ATTEMPT;
   /** The step's own file — what Submit judges and the solution diffs against, whichever tab is open. */
-  const stepCode = step === null ? '' : files[step.id] ?? step.code[language].starter;
+  const stepCode = step === null ? '' : files[step.id] ?? codeFor(step, language).starter;
   const openCode = openFile === null ? '' : files[openFile] ?? '';
   /** What the course provides beside the learner's files in this language; read-only in the explorer. */
   const provided = useMemo(() => (problem === null ? [] : providedFiles(problem, language)), [problem, language]);
@@ -777,7 +779,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     (target: Problem, targetStep: Step, lang: Language) => {
       const next: Record<string, string> = {};
       for (const s of target.steps) {
-        next[s.id] = workspaces.current[workspaceKey(target.id, s.id, lang)]?.code ?? s.code[lang].starter;
+        next[s.id] = workspaces.current[workspaceKey(target.id, s.id, lang)]?.code ?? codeFor(s, lang).starter;
       }
       setFiles(next);
       // Tabs of the same problem stay open, except provided files this language does not have.
@@ -841,7 +843,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       problem.steps.every(s => current.attempts[stepKey(problem.id, s.id)] === undefined);
     setTab(fresh ? 'problem' : 'step');
     setPaneOpen(true);
-    mount(problem, step, current.language);
+    mount(problem, step, problem.language ?? current.language);
     setProgress(p =>
       p.lastStep[problem.id] === step.id ? p : {...p, lastStep: {...p.lastStep, [problem.id]: step.id}},
     );
@@ -1153,8 +1155,8 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
           s.id === step.id && own !== undefined
             ? own
             : theirs
-            ? filesRef.current[s.id] ?? s.code[language].starter
-            : s.code[language].solution;
+            ? filesRef.current[s.id] ?? codeFor(s, language).starter
+            : codeFor(s, language).solution;
       }
       return {files, support: problem.support?.[language] ?? {}, harness, checks: [...checks]};
     },
@@ -1163,7 +1165,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
 
   const submit = useCallback(() => {
     if (problem === null || step === null || attemptKey === null || running) return;
-    const src = filesRef.current[step.id] ?? step.code[language].starter;
+    const src = filesRef.current[step.id] ?? codeFor(step, language).starter;
     const result = judge(step, language, src);
     setVerdictCode(src);
     const token = ++submitSeq.current;
@@ -1200,7 +1202,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     if (problem === null || step === null || running) return;
     const harness = step.harness?.[language];
     if (harness === undefined || runner === null) return;
-    const src = filesRef.current[step.id] ?? step.code[language].starter;
+    const src = filesRef.current[step.id] ?? codeFor(step, language).starter;
     const example = exampleCheck(step);
     const result = narrow(judge(step, language, src), [example.id]);
     const job = assemble(harness, [example.id]);
@@ -1227,7 +1229,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     if (problem === null || step === null || running || comparing) return;
     const harness = step.harness?.[language];
     if (harness === undefined || runner === null) return;
-    const solution = step.code[language].solution;
+    const solution = codeFor(step, language).solution;
     const job = assemble(
       harness,
       step.checks.map(c => c.id),
@@ -1261,7 +1263,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
         body: (
           <SubmissionCode
             code={code}
-            current={sameLanguage ? filesRef.current[step.id] ?? step.code[language].starter : null}
+            current={sameLanguage ? filesRef.current[step.id] ?? codeFor(step, language).starter : null}
             language={submission.language}
           />
         ),
@@ -1328,7 +1330,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     if (problem === null || openFile === null) return;
     const owner = problem.steps.find(s => s.id === openFile);
     if (owner === undefined) return;
-    const starter = owner.code[language].starter;
+    const starter = codeFor(owner, language).starter;
     if (filesRef.current[openFile] === starter) return;
     void openDialog({
       title: `Restore the starting code of ${fileName(owner.file, language)}?`,
@@ -1491,7 +1493,21 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
         <div className="ml-auto flex items-center gap-2">
           <span className="text-ink-300 flex items-center gap-1.5 text-[11px]">
             <span className="hidden sm:inline">language</span>
-            <Select align="right" label="language" onChange={onLanguage} options={LANGUAGE_OPTIONS} value={language} />
+            {problem?.language === undefined ? (
+              <Select
+                align="right"
+                label="language"
+                onChange={onLanguage}
+                options={LANGUAGE_OPTIONS}
+                value={language}
+              />
+            ) : (
+              <span
+                className="border-ink-600 bg-ink-850 font-code text-ink-100 rounded-full border px-2.5 py-1 text-[11px]"
+                title="This problem is written in one language">
+                {LANGUAGE_LABEL[language]}
+              </span>
+            )}
           </span>
           <span
             className="border-ink-600 font-code text-ink-200 rounded-full border px-2.5 py-1 text-[11px]"
@@ -1663,7 +1679,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                     <span
                       className="font-code text-ink-400 hidden shrink-0 text-[10px] md:inline"
                       title="library the reference solution uses">
-                      {LANGUAGE_STACK[language][step.concept]}
+                      {LANGUAGE_STACK[language][step.concept] ?? ''}
                     </span>
                     <button
                       aria-label="editor settings"

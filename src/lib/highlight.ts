@@ -18,6 +18,10 @@ const FENCE_LANGUAGE: Record<string, Language> = {
   c: 'cpp',
   proto: 'cpp',
   protobuf: 'cpp',
+  cuda: 'cuda',
+  cu: 'cuda',
+  typescript: 'typescript',
+  ts: 'typescript',
 };
 
 export const leetbuildHighlighter: Highlighter = (code, info) => {

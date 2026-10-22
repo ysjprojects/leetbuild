@@ -11,7 +11,7 @@ Two modes share one app:
 
 | Address           | Mode              | What it is                                                                                       |
 | ----------------- | ----------------- | ------------------------------------------------------------------------------------------------ |
-| `/`               | Practice          | The course catalogue: classic systems courses plus the AI-era courses.                           |
+| `/`               | Practice          | The catalogue: the systems courses and drills, the deep-learning problems, the AI-era courses.   |
 | `/mock-interview` | AI mock interview | Timed scenarios that start from a flawed AI draft, with an offline AI pair, checks and a report. |
 
 The switch between them is `src/components/ModeSwitch.tsx`. The mock scenarios are
@@ -62,11 +62,14 @@ course content, `AGENTS.md`, or the mock-interview feature unless the user names
 
 ## Content rules
 
-- Every course has `Problem.track?: 'systems' | 'ai'`; omitted means the systems track.
+- Every problem has `Problem.track?: 'systems' | 'dl' | 'ai'`; omitted means the systems track.
 - The AI-era courses are `src/data/problems/16-ai-gateway/` and `17-rag-service/`. Their starters
   are plausible model-generated drafts with a real flaw; their solutions are the review fix.
-- All five languages are mandatory in every step. The catalogue maximum is the live sum over every
-  course (`STEP_POINTS` in `src/lib/scoring.ts`); adding a course never re-balances it.
+- All five languages are mandatory in every step of a course. A deep-learning problem (`track: 'dl'`)
+  fixes one language instead — `language: 'python'` (PyTorch) or `'cuda'` — and its steps carry code
+  and matchers for that language only; it has no harness, and its reference solution is a complete
+  program ending in a self-test the learner runs on their own machine. The catalogue maximum is the
+  live sum over every problem (`STEP_POINTS` in `src/lib/scoring.ts`); adding content never re-balances it.
 - The AI-era courses currently use static review checks only. The classic courses have Python and
   TypeScript harnesses that execute in the browser runtime. If you add AI-era harnesses, keep the
   checks outcome-based and update the README.

@@ -4,7 +4,7 @@ import {type ChangeEvent, type FC, memo, useCallback, useEffect, useMemo, useRef
 import {type ResolvedMockScenario, resolvedMockScenarios} from '@/data/mock';
 import {type Verdict, judge} from '@/lib/judge';
 import {formatClock} from '@/lib/timer';
-import {type Difficulty, type Language, fileName, LANGUAGE_LABEL, LANGUAGES} from '@/lib/types';
+import {type Difficulty, type Language, codeFor, fileName, LANGUAGE_LABEL, LANGUAGES} from '@/lib/types';
 
 import {useDialog} from './Dialog';
 import {SearchIcon} from './ListControls';
@@ -26,7 +26,7 @@ interface AssistantMessage {
 }
 
 const startersFor = (scenario: ResolvedMockScenario): Record<Language, string> =>
-  Object.fromEntries(LANGUAGES.map(language => [language, scenario.step.code[language].starter])) as Record<
+  Object.fromEntries(LANGUAGES.map(language => [language, codeFor(scenario.step, language).starter])) as Record<
     Language,
     string
   >;
@@ -475,7 +475,7 @@ const MockInterview: FC = memo(() => {
   const onDraft = useCallback(() => {
     if (scenario === null) return;
     setCodeByLanguage(current =>
-      current === null ? current : {...current, [language]: scenario.step.code[language].starter},
+      current === null ? current : {...current, [language]: codeFor(scenario.step, language).starter},
     );
     setEditorReset(value => value + 1);
     say('Regenerated the draft. It still passes the happy path — that is the problem. What does it miss?', 'ai');

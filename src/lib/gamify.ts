@@ -115,6 +115,22 @@ export const BADGES: readonly Badge[] = [
     concept: 'redis',
   },
   {
+    id: 'pytorch-master',
+    title: 'PyTorch master',
+    blurb: 'Accept every PyTorch step in the catalogue.',
+    glyph: 'NN',
+    track: 'mastery',
+    concept: 'pytorch',
+  },
+  {
+    id: 'cuda-master',
+    title: 'CUDA master',
+    blurb: 'Accept every CUDA step in the catalogue.',
+    glyph: 'GPU',
+    track: 'mastery',
+    concept: 'cuda',
+  },
+  {
     id: 'streak-3',
     title: 'Three in a row',
     blurb: 'Accept a step on three consecutive days.',
@@ -394,7 +410,8 @@ export function badgeProgress(
       const attempt = attempts[stepKey(problem.id, step.id)] ?? OPEN_ATTEMPT;
       if (attempt.status !== 'accepted') continue;
       accepted += 1;
-      if (attempt.language !== null) languages.add(attempt.language);
+      // The language badges are about the five a course is offered in; a fixed-language problem does not count.
+      if (attempt.language !== null && LANGUAGES.includes(attempt.language)) languages.add(attempt.language);
       if (attempt.hints === 0) unassisted = true;
       if (attempt.hints === 0 && attempt.wrong === 0) firstTry = true;
       if (attempt.wrong >= 3) comeback = true;

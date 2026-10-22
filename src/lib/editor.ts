@@ -47,6 +47,7 @@ const grammars: Record<Syntax, LanguageSupport | StreamLanguage<unknown>> = {
   go: go(),
   scala: StreamLanguage.define(scala),
   cpp: cpp(),
+  cuda: cpp(),
   proto: StreamLanguage.define(protobuf),
 };
 
@@ -58,6 +59,7 @@ export function editorLanguage(syntax: Syntax): Extension {
 /** Indentation the language community expects; Go is tabs (gofmt). */
 export const INDENT: Record<Syntax, {unit: string; tabSize: number}> = {
   cpp: {unit: '  ', tabSize: 2},
+  cuda: {unit: '  ', tabSize: 2},
   go: {unit: '\t', tabSize: 4},
   python: {unit: '    ', tabSize: 4},
   typescript: {unit: '  ', tabSize: 2},

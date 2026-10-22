@@ -9,9 +9,18 @@
  * over (idempotency, deadlines, partition keys, TTLs…) instead of framework trivia.
  */
 
-export type Language = 'python' | 'typescript' | 'go' | 'scala' | 'cpp';
+/**
+ * The languages a step's file can be in. The five a learner picks from in the header are
+ * `LANGUAGES`; `cuda` only appears in the deep-learning track, whose problems fix their language
+ * (`Problem.language`) — nobody switches a kernel to Scala.
+ */
+export type Language = 'python' | 'typescript' | 'go' | 'scala' | 'cpp' | 'cuda';
 
+/** The languages every course is written in, and the header lets the learner choose between. */
 export const LANGUAGES: readonly Language[] = ['python', 'typescript', 'go', 'scala', 'cpp'];
+
+/** Every language a step can be in — what an attempt, a timed session or a certificate may record. */
+export const ALL_LANGUAGES: readonly Language[] = [...LANGUAGES, 'cuda'];
 
 export const LANGUAGE_LABEL: Record<Language, string> = {
   python: 'Python',
@@ -19,18 +28,33 @@ export const LANGUAGE_LABEL: Record<Language, string> = {
   go: 'Go',
   scala: 'Scala',
   cpp: 'C++',
+  cuda: 'CUDA',
 };
 
 /** Libraries the reference solutions use; shown next to the editor so the learner knows the target API. */
-export const LANGUAGE_STACK: Record<Language, Record<Concept, string>> = {
-  python: {http: 'FastAPI + uvicorn', grpc: 'grpcio (grpc.aio)', kafka: 'confluent-kafka', redis: 'redis-py'},
+export const LANGUAGE_STACK: Record<Language, Partial<Record<Concept, string>>> = {
+  python: {
+    http: 'FastAPI + uvicorn',
+    grpc: 'grpcio (grpc.aio)',
+    kafka: 'confluent-kafka',
+    redis: 'redis-py',
+    pytorch: 'PyTorch 2',
+  },
   typescript: {http: 'Fastify', grpc: '@grpc/grpc-js + proto-loader', kafka: 'kafkajs', redis: 'ioredis'},
   go: {http: 'net/http', grpc: 'google.golang.org/grpc', kafka: 'segmentio/kafka-go', redis: 'go-redis v9'},
   scala: {http: 'Pekko HTTP', grpc: 'ScalaPB + grpc-java', kafka: 'kafka-clients (Java)', redis: 'Jedis'},
   cpp: {http: 'cpp-httplib', grpc: 'grpc++', kafka: 'librdkafka (C++ API)', redis: 'redis-plus-plus'},
+  cuda: {cuda: 'CUDA C++ · nvcc'},
 };
 
-const FILE_EXTENSION: Record<Language, string> = {python: 'py', typescript: 'ts', go: 'go', scala: 'scala', cpp: 'cpp'};
+const FILE_EXTENSION: Record<Language, string> = {
+  python: 'py',
+  typescript: 'ts',
+  go: 'go',
+  scala: 'scala',
+  cpp: 'cpp',
+  cuda: 'cu',
+};
 
 /** File name shown on the editor tab: `order_gateway` → `order_gateway.py` / `OrderGateway.scala`. */
 export function fileName(stem: string, language: Language): string {
@@ -44,21 +68,33 @@ export function fileName(stem: string, language: Language): string {
   return `${stem}.${FILE_EXTENSION[language]}`;
 }
 
-export type Concept = 'http' | 'grpc' | 'kafka' | 'redis';
+export type Concept = 'http' | 'grpc' | 'kafka' | 'redis' | 'pytorch' | 'cuda';
 
-export const CONCEPTS: readonly Concept[] = ['http', 'grpc', 'kafka', 'redis'];
+/** The four every systems course covers over its steps. */
+export const SYSTEMS_CONCEPTS: readonly Concept[] = ['http', 'grpc', 'kafka', 'redis'];
 
-export const CONCEPT_LABEL: Record<Concept, string> = {http: 'HTTPS', grpc: 'gRPC', kafka: 'Kafka', redis: 'Redis'};
+/** Every concept the catalogue grades, mastery bars and badges included. */
+export const CONCEPTS: readonly Concept[] = ['http', 'grpc', 'kafka', 'redis', 'pytorch', 'cuda'];
+
+export const CONCEPT_LABEL: Record<Concept, string> = {
+  http: 'HTTPS',
+  grpc: 'gRPC',
+  kafka: 'Kafka',
+  redis: 'Redis',
+  pytorch: 'PyTorch',
+  cuda: 'CUDA',
+};
 
 export type Difficulty = 'easy' | 'medium' | 'hard';
 export const DIFFICULTIES: readonly Difficulty[] = ['easy', 'medium', 'hard'];
 
 /**
- * Which interview track a course belongs to. `systems` is the classic build-a-system track
- * (the default when omitted); `ai` is the AI-era track, where every starter is a plausible
- * model-generated draft that the learner has to review, fix and verify.
+ * Which track a problem belongs to. `systems` is the classic build-a-system track (the default
+ * when omitted); `ai` is the AI-era track, where every starter is a plausible model-generated
+ * draft that the learner has to review, fix and verify; `dl` is the deep-learning track — PyTorch
+ * and CUDA problems in a fixed language, judged by static checks and run on the learner's own machine.
  */
-export type Track = 'systems' | 'ai';
+export type Track = 'systems' | 'ai' | 'dl';
 
 /**
  * What a check looks for in the learner's code once comments are stripped. Every `all` pattern
@@ -80,7 +116,8 @@ export interface StepCheck {
   title: string;
   /** Shown when the check fails: what it looks for and why it matters. Markdown inline. */
   detail: string;
-  match: Record<Language, Matcher>;
+  /** One matcher per language the step is written in (every language of `LANGUAGES` for a course; the fixed one for a deep-learning problem). */
+  match: Partial<Record<Language, Matcher>>;
 }
 
 export interface StepCode {
@@ -150,7 +187,8 @@ export interface Step {
   /** Progressive hints, cheapest first (2–3). Each one revealed costs part of the step's points. */
   hints: string[];
   checks: StepCheck[];
-  code: Record<Language, StepCode>;
+  /** Starter and solution per language the step is written in (see `StepCheck.match`). */
+  code: Partial<Record<Language, StepCode>>;
   /** Shown once the step is accepted or revealed: why the solution is shaped this way, what real systems add. */
   debrief: string;
   /**
@@ -213,6 +251,11 @@ export interface Problem {
   minutes: number;
   /** Interview track; omitted means the classic systems track. */
   track?: Track;
+  /**
+   * A fixed language: the learner cannot switch, and every step carries code and matchers for
+   * this language only (the deep-learning track: `python` for PyTorch, `cuda` for kernels).
+   */
+  language?: Language;
   /** Problem statement: the real system, the simplified abstraction built here, what is out of scope. */
   statement: string;
   /**
@@ -251,4 +294,15 @@ export function stepBySlug(problem: Problem, slug: string): Step | undefined {
 /** Site-relative address of a step: `/image-cache/2-cache-aside`. */
 export function stepPath(problem: Problem, step: Step): string {
   return `/${problem.id}/${stepSlug(problem, step)}`;
+}
+
+/** The languages a problem's steps are written in: the fixed one, or every language a course has. */
+export const problemLanguages = (problem: Pick<Problem, 'language'>): readonly Language[] =>
+  problem.language === undefined ? LANGUAGES : [problem.language];
+
+/** A step's code in a language it is written in; a step is never shown in another. */
+export function codeFor(step: Step, language: Language): StepCode {
+  const code = step.code[language];
+  if (code === undefined) throw new Error(`step ${step.id} has no ${language} code`);
+  return code;
 }
