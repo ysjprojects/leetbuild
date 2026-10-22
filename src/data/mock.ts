@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'citation-store-the-citation-that-pointed-at-nothing',
+    problemId: 'citation-store',
+    stepId: 'endpoint',
+    title: 'The citation that pointed at nothing',
+    blurb: 'Offsets were never verified and an update silently re-pointed old citations.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A generated answer cited a quote that no longer existed, because the draft stored offsets without checking them and resolved by document id, so an update re-pointed every old citation at new text. The same store marked fetch failures valid. Review it, fix it, and prove spans resolve against immutable versions.',
+    signals: ['Specify', 'Verify', 'Evaluate'],
+    aiNote:
+      'The draft stores caller-provided offsets without validating them against the document bytes, and its cache and resolution key by document id instead of (document, version), so a document update silently rewrites what old citations point at.',
+    testIdea:
+      'Submit an offset whose bytes do not match the quote and assert 422; update the document and assert an old citation still resolves against its version; time out the fetch and assert broken status, not valid.',
+    followUps: [
+      'How would you re-anchor a citation after a small edit?',
+      'What TTL makes sense for span caches of immutable versions?',
+      'Should an answer with one broken citation fail the whole response?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
