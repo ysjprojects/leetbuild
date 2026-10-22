@@ -56,6 +56,7 @@ import {gpuSchedulerProblem} from './52-gpu-scheduler/index';
 import {modelRegistryProblem} from './53-model-registry/index';
 import {checkpointStoreProblem} from './54-checkpoint-store/index';
 import {featureStoreProblem} from './55-feature-store/index';
+import {driftMonitorProblem} from './56-drift-monitor/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -103,6 +104,7 @@ export const problems: Problem[] = [
   modelRegistryProblem,
   checkpointStoreProblem,
   featureStoreProblem,
+  driftMonitorProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
