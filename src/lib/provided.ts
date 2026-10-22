@@ -233,6 +233,163 @@ function generated(problem: Problem, language: 'go' | 'scala' | 'cpp', file: str
   ];
 }
 
+// ---- helpers the steps import that only exist in Python and TypeScript -------------------------
+
+/** Everything the step code in `language` says, starters and solutions, for scanning imports and uses. */
+const allCode = (problem: Problem, language: Language): string =>
+  problem.steps.map(s => `${s.code[language].starter}\n${s.code[language].solution}`).join('\n');
+
+/** `Name.member` uses of an imported package or object across the step code, deduplicated, in order of appearance. */
+const usesOf = (code: string, alias: string): string[] => {
+  const seen = new Set<string>();
+  for (const m of code.matchAll(new RegExp(`\\b${alias}\\.(\\w+)`, 'g'))) seen.add(m[1]);
+  return [...seen];
+};
+
+/** The Python support module with this stem (`db` → `payments/db.py`), with what it defines. */
+const pythonReference = (
+  problem: Problem,
+  name: string,
+): {path: string; ts: string | null; defines: string[]} | null => {
+  const want = name.toLowerCase().replace(/_/g, '');
+  const entry = Object.entries(problem.support?.python ?? {}).find(
+    ([path]) => !/_pb2(_grpc)?\.py$/.test(path) && stem(path.split('/').pop() ?? '').replace(/_/g, '') === want,
+  );
+  if (entry === undefined) return null;
+  const [path, text] = entry;
+  const defines = [...text.matchAll(/^(?:async\s+)?(?:def|class)\s+(\w+)/gm)]
+    .map(m => m[1])
+    .filter(n => !n.startsWith('_'));
+  const tsPath = Object.keys(problem.support?.typescript ?? {}).find(
+    p =>
+      p.endsWith('.ts') &&
+      stem(p.split('/').pop() ?? '')
+        .replace(/_/g, '')
+        .toLowerCase() === want,
+  );
+  return {path, ts: tsPath ?? null, defines};
+};
+
+const HELPER_NOTE = 'A stub for a helper the course ships only in Python and TypeScript; it says how the steps use it.';
+
+/** The comment lines every helper stub opens with: what it is, where the reference is, what the steps use. */
+const helperLines = (
+  comment: string,
+  what: string,
+  reference: ReturnType<typeof pythonReference>,
+  uses: string[],
+): string[] => [
+  `${comment} Provided by the course — not shipped in this language. ${what}`,
+  ...(reference === null
+    ? [`${comment} No Python or TypeScript counterpart is shipped either; the steps show what it has to offer.`]
+    : [
+        `${comment} The reference implementation is the Python helper ${reference.path}${
+          reference.ts === null ? '' : ` (and ${reference.ts})`
+        }, which the browser runtime mounts; open it in the Python or TypeScript tree.`,
+        ...(reference.defines.length === 0 ? [] : [`${comment} It defines: ${reference.defines.join(', ')}`]),
+      ]),
+  ...(uses.length === 0 ? [] : [`${comment} The steps use: ${uses.join(', ')}`]),
+];
+
+/** Go: every `<module>/<pkg>` import that is not the generated package, as `<pkg>/<pkg>.go`. */
+function goHelpers(problem: Problem): ProvidedFile[] {
+  const code = allCode(problem, 'go');
+  const modules = new Set([...code.matchAll(/"([\w.-]+)\/gen\/\w+"/g)].map(m => m[1]));
+  const out = new Map<string, ProvidedFile>();
+  for (const m of code.matchAll(/^\s*(?:(\w+)\s+)?"([\w./-]+)"/gm)) {
+    const [, alias, path] = m;
+    const mod = path.split('/')[0];
+    if (!modules.has(mod) || path.includes('/gen/')) continue;
+    const rel = path.slice(mod.length + 1);
+    const pkg = rel.split('/').pop() ?? rel;
+    const file = `${rel}/${pkg}.go`;
+    if (out.has(file)) continue;
+    const uses = usesOf(code, alias ?? pkg).map(u => `${alias ?? pkg}.${u}`);
+    out.set(file, {
+      path: file,
+      syntax: 'go',
+      note: HELPER_NOTE,
+      text: [
+        ...helperLines('//', `The step files import it as "${path}".`, pythonReference(problem, pkg), uses),
+        ``,
+        `package ${pkg}`,
+        ``,
+      ].join('\n'),
+    });
+  }
+  return [...out.values()];
+}
+
+/** Scala: imports under the proto package's root (`payments.Db`, `feed.store._`) that are not the ScalaPB package. */
+function scalaHelpers(problem: Problem, protoPackages: {pkg: string; name: string}[]): ProvidedFile[] {
+  const code = allCode(problem, 'scala');
+  const roots = new Set(protoPackages.map(p => p.pkg.split('.')[0]));
+  const generatedPrefixes = protoPackages.map(p => `${p.pkg}.${p.name}`);
+  const out = new Map<string, ProvidedFile>();
+  for (const m of code.matchAll(/^\s*import\s+([\w.]+)/gm)) {
+    const segments = m[1].split('.').filter(Boolean);
+    if (!roots.has(segments[0]) || generatedPrefixes.some(g => m[1].startsWith(`${g}.`) || m[1] === g)) continue;
+    // `a.b.C` names an object (file C.scala); `a.b._`-style wildcards (the trailing dot) name a package.
+    const last = segments[segments.length - 1];
+    const isObject = /^[A-Z]/.test(last);
+    const dir = (isObject ? segments.slice(0, -1) : segments).join('/');
+    const file = isObject ? `src/main/scala/${dir}/${last}.scala` : `src/main/scala/${dir}/package.scala`;
+    if (out.has(file)) continue;
+    const uses = isObject ? usesOf(code, last).map(u => `${last}.${u}`) : [];
+    out.set(file, {
+      path: file,
+      syntax: 'scala',
+      note: HELPER_NOTE,
+      text: [
+        ...helperLines(
+          '//',
+          `The step files import it as ${m[1].replace(/\.+$/, '')}${isObject ? '' : '._'}.`,
+          pythonReference(problem, last),
+          uses,
+        ),
+        ``,
+        `package ${(isObject ? segments.slice(0, -1) : segments).join('.')}`,
+        ``,
+      ].join('\n'),
+    });
+  }
+  return [...out.values()];
+}
+
+/** C++: every quoted include that is not a generated header — a step's own header, or a helper's. */
+function cppHelpers(problem: Problem, generatedHeaders: Set<string>): ProvidedFile[] {
+  const code = allCode(problem, 'cpp');
+  const out = new Map<string, ProvidedFile>();
+  for (const m of code.matchAll(/^\s*#include\s+"([^"]+)"/gm)) {
+    const include = m[1];
+    if (generatedHeaders.has(include) || out.has(include)) continue;
+    const name = stem(include.split('/').pop() ?? include);
+    const owner = problem.steps.findIndex(s => s.file === name);
+    out.set(include, {
+      path: include,
+      syntax: 'cpp',
+      note:
+        owner < 0
+          ? HELPER_NOTE
+          : `The header of a step's own file: what the other steps include from ${name}.cpp. The course ships the .cpp.`,
+      text: [
+        ...(owner < 0
+          ? helperLines('//', `The step files include it as "${include}".`, pythonReference(problem, name), [])
+          : [
+              `// Header for ${name}.cpp (step ${owner + 1}: ${
+                problem.steps[owner].title
+              }): what the later steps include`,
+              `// from it. The course ships the .cpp as that step's file; the declarations follow its solution.`,
+            ]),
+        ``,
+        `#pragma once`,
+        ``,
+      ].join('\n'),
+    });
+  }
+  return [...out.values()];
+}
+
 /** Every file `language`'s starters may import that no step builds, in the order the course lists them. */
 export function providedFiles(problem: Problem, language: Language): ProvidedFile[] {
   if (language === 'python' || language === 'typescript') {
@@ -245,7 +402,16 @@ export function providedFiles(problem: Problem, language: Language): ProvidedFil
     }));
   }
   // The .proto sources travel with the TypeScript support (proto-loader reads them at run time).
-  return Object.entries(problem.support?.typescript ?? {})
-    .filter(([path]) => path.endsWith('.proto'))
-    .flatMap(([file, text]) => generated(problem, language, file, text));
+  const protos = Object.entries(problem.support?.typescript ?? {}).filter(([path]) => path.endsWith('.proto'));
+  const fromProtos = protos.flatMap(([file, text]) => generated(problem, language, file, text));
+  if (language === 'go') return [...fromProtos, ...goHelpers(problem)];
+  if (language === 'scala')
+    return [
+      ...fromProtos,
+      ...scalaHelpers(
+        problem,
+        protos.map(([file, text]) => ({pkg: parseProto(text).pkg ?? stem(file), name: stem(file)})),
+      ),
+    ];
+  return [...fromProtos, ...cppHelpers(problem, new Set(fromProtos.map(f => f.path.replace(/^gen\//, ''))))];
 }

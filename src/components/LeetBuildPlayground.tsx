@@ -538,11 +538,12 @@ const Explorer: FC<{
   /** Fold the explorer into a strip beside the editor (`lg` and up), as the problem pane folds. */
   onCollapse: () => void;
 }> = memo(({problem, language, provided, attempts, stepId, openFile, onOpen, onCollapse}) => {
+  // Where the language's build looks for sources: sbt under src/main/scala; the others at the root.
   const tree = useMemo(
     () =>
       buildTree<Leaf>([
         ...problem.steps.map((step, index) => ({
-          path: fileName(step.file, language),
+          path: `${language === 'scala' ? 'src/main/scala/' : ''}${fileName(step.file, language)}`,
           leaf: {kind: 'step' as const, step, index},
         })),
         ...provided.map(file => ({path: file.path, leaf: {kind: 'provided' as const, file}})),
