@@ -36,6 +36,7 @@ import {codeAssistantProblem} from './32-code-assistant/index';
 import {sqlCopilotProblem} from './33-sql-copilot/index';
 import {ticketTriageProblem} from './34-ticket-triage/index';
 import {recommendationRankingProblem} from './35-recommendation-ranking/index';
+import {moderationServiceProblem} from './36-moderation-service/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -63,6 +64,7 @@ export const problems: Problem[] = [
   sqlCopilotProblem,
   ticketTriageProblem,
   recommendationRankingProblem,
+  moderationServiceProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
