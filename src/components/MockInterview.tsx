@@ -6,6 +6,7 @@ import {type Verdict, judge} from '@/lib/judge';
 import {formatClock} from '@/lib/timer';
 import {type Difficulty, type Language, fileName, LANGUAGE_LABEL, LANGUAGES} from '@/lib/types';
 
+import {useDialog} from './Dialog';
 import {SearchIcon} from './ListControls';
 import {BrandLockup} from './LoadingScreen';
 import Markdown from './Markdown';
@@ -181,6 +182,57 @@ const ScenarioCard: FC<{scenario: ResolvedMockScenario; number: number; onStart:
   });
 ScenarioCard.displayName = 'ScenarioCard';
 
+/**
+ * The start dialog's body: what the interviewer will say, where the step comes from, how long the
+ * clock runs, and the language to start in — chosen here so no seconds go to a dropdown later.
+ */
+const ScenarioBrief: FC<{scenario: ResolvedMockScenario; initial: Language; onLanguage: (l: Language) => void}> = memo(
+  ({scenario, initial, onLanguage}) => {
+    const [chosen, setChosen] = useState<Language>(initial);
+    const onChange = useCallback(
+      (e: ChangeEvent<HTMLSelectElement>) => {
+        const next = e.target.value as Language;
+        setChosen(next);
+        onLanguage(next);
+      },
+      [onLanguage],
+    );
+    return (
+      <div className="space-y-3">
+        <div className="flex flex-wrap items-center gap-2 text-[12px]">
+          <span className="text-ink-100 font-semibold">{scenario.problem.title}</span>
+          <DifficultyChip difficulty={scenario.problem.difficulty} />
+          {scenario.problem.company !== undefined ? <CompanyChip company={scenario.problem.company} /> : null}
+          <span className="text-ink-400">· {scenario.role}</span>
+        </div>
+        <p className="text-ink-200 text-[13px] leading-6">{scenario.prompt}</p>
+        <div className="flex flex-wrap gap-1.5">
+          {scenario.signals.map(signal => (
+            <SignalChip key={signal} signal={signal} />
+          ))}
+        </div>
+        <div className="border-ink-700 flex flex-wrap items-center justify-between gap-3 border-t pt-3 text-[12px]">
+          <label className="text-ink-300 flex items-center gap-2">
+            language
+            <select className={selectClass} onChange={onChange} value={chosen}>
+              {LANGUAGES.map(l => (
+                <option key={l} value={l}>
+                  {LANGUAGE_LABEL[l]}
+                </option>
+              ))}
+            </select>
+          </label>
+          <span className="text-ink-400">
+            <span className="font-code text-ink-100">{scenario.minutes}:00</span> from the moment you start · the draft
+            loads in the editor · nothing is recorded
+          </span>
+        </div>
+      </div>
+    );
+  },
+);
+ScenarioBrief.displayName = 'ScenarioBrief';
+
 /** The setup page's list: a search pill and the six signals to narrow by, then the cards in threes. */
 const ScenarioPicker: FC<{scenarios: readonly ResolvedMockScenario[]; onStart: (s: ResolvedMockScenario) => void}> =
   memo(({scenarios, onStart}) => {
@@ -318,10 +370,10 @@ const MockInterview: FC = memo(() => {
     return () => window.clearTimeout(timer);
   }, [phase, secondsLeft]);
 
-  const start = useCallback((next: ResolvedMockScenario) => {
+  const start = useCallback((next: ResolvedMockScenario, chosen: Language) => {
     const starters = startersFor(next);
     setScenarioId(next.id);
-    setLanguage(next.defaultLanguage);
+    setLanguage(chosen);
     setCodeByLanguage(starters);
     setEditorReset(value => value + 1);
     setSecondsLeft(next.minutes * 60);
@@ -342,6 +394,27 @@ const MockInterview: FC = memo(() => {
     ]);
     setPhase('running');
   }, []);
+
+  // The card opens a brief, not the clock: the scenario, its course, the language, and one Start.
+  const [dialog, openDialog] = useDialog();
+  const languageChoice = useRef<Language>('python');
+  const onLanguageChoice = useCallback((chosen: Language) => {
+    languageChoice.current = chosen;
+  }, []);
+  const confirmStart = useCallback(
+    (next: ResolvedMockScenario) => {
+      languageChoice.current = next.defaultLanguage;
+      void openDialog({
+        title: next.title,
+        body: <ScenarioBrief initial={next.defaultLanguage} onLanguage={onLanguageChoice} scenario={next} />,
+        confirm: `Start the clock · ${next.minutes}:00`,
+        cancel: 'Not yet',
+      }).then(ok => {
+        if (ok) start(next, languageChoice.current);
+      });
+    },
+    [openDialog, onLanguageChoice, start],
+  );
 
   const backToSetup = useCallback(() => {
     setPhase('setup');
@@ -525,8 +598,9 @@ const MockInterview: FC = memo(() => {
               </div>
             </div>
           </div>
-          <ScenarioPicker onStart={start} scenarios={resolvedMockScenarios} />
+          <ScenarioPicker onStart={confirmStart} scenarios={resolvedMockScenarios} />
         </main>
+        {dialog}
       </div>
     );
   }
@@ -620,7 +694,7 @@ const MockInterview: FC = memo(() => {
               </div>
             </details>
             <div className="flex flex-wrap items-center gap-3">
-              <button className={MOCK_PRIMARY} onClick={() => start(scenario)} type="button">
+              <button className={MOCK_PRIMARY} onClick={() => start(scenario, language)} type="button">
                 Retry this scenario
               </button>
               <button className={ghostButtonClass} onClick={backToSetup} type="button">
