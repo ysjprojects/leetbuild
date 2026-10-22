@@ -19,13 +19,14 @@ import {
   isDefaultQuery,
   SORTS,
   STATUS_LABEL,
+  TRACK_TINT,
   TRACKS,
 } from '@/lib/catalog';
 import {type Difficulty, DIFFICULTIES} from '@/lib/types';
 
 /**
- * The rows above the problem list, LeetCode-style: a row of track tabs (All topics · Systems · AI era ·
- * Deep learning, each with its icon; the active one is inverted), then a search pill, a sort menu and a
+ * The rows above the problem list, LeetCode-style: a row of track tabs (All topics · Systems · AI Era ·
+ * DLLM, each with its icon; the active one is inverted), then a search pill, a sort menu and a
  * filter menu behind two round buttons (a dot marks one that is in effect), and at the right how
  * many courses of the track are solved — or, while filtering, how many rows match and the way out.
  * Every control writes to the URL through `update`; the search box keeps its own text so the caret
@@ -85,7 +86,7 @@ const SystemsIcon: FC = memo(() => (
 ));
 SystemsIcon.displayName = 'SystemsIcon';
 
-/** AI era: sparkles. */
+/** AI Era: sparkles. */
 const AiEraIcon: FC = memo(() => (
   <svg aria-hidden fill="none" height={15} stroke="currentColor" strokeWidth={1.5} viewBox="0 0 16 16" width={15}>
     <path
@@ -97,7 +98,7 @@ const AiEraIcon: FC = memo(() => (
 ));
 AiEraIcon.displayName = 'AiEraIcon';
 
-/** Deep learning: a chip with pins. */
+/** DLLM: a chip with pins. */
 const DeepLearningIcon: FC = memo(() => (
   <svg aria-hidden fill="none" height={15} stroke="currentColor" strokeWidth={1.5} viewBox="0 0 16 16" width={15}>
     <rect height={8} rx={1.2} width={8} x={4} y={4} />
@@ -110,20 +111,29 @@ DeepLearningIcon.displayName = 'DeepLearningIcon';
 /** The icon and the colour it keeps while its tab is not selected (an inverted tab takes the text colour). */
 const TRACK_ICON: Record<TrackFilter, {icon: FC; tint: string}> = {
   all: {icon: AllTopicsIcon, tint: 'text-ink-100'},
-  systems: {icon: SystemsIcon, tint: 'text-warning-300'},
-  dl: {icon: DeepLearningIcon, tint: 'text-concept-cuda'},
-  ai: {icon: AiEraIcon, tint: 'text-iris-300'},
+  systems: {icon: SystemsIcon, tint: TRACK_TINT.systems.text},
+  dl: {icon: DeepLearningIcon, tint: TRACK_TINT.dl.text},
+  ai: {icon: AiEraIcon, tint: TRACK_TINT.ai.text},
 };
 
-const TrackTab: FC<{value: TrackFilter; label: string; current: TrackFilter; update: (p: Partial<ListQuery>) => void}> =
-  memo(({value, label, current, update}) => {
-    const on = value === current;
-    const {icon: Icon, tint} = TRACK_ICON[value];
-    const onClick = useCallback(() => update({track: value}), [update, value]);
-    return (
+const TrackTab: FC<{
+  value: TrackFilter;
+  label: string;
+  /** What a short label stands for: a tooltip under the tab on hover and keyboard focus. */
+  hint?: string;
+  current: TrackFilter;
+  update: (p: Partial<ListQuery>) => void;
+}> = memo(({value, label, hint, current, update}) => {
+  const on = value === current;
+  const {icon: Icon, tint} = TRACK_ICON[value];
+  const onClick = useCallback(() => update({track: value}), [update, value]);
+  const hintId = `track-hint-${value}`;
+  return (
+    <span className="group relative">
       <button
+        aria-describedby={hint === undefined ? undefined : hintId}
         aria-pressed={on}
-        className={`flex h-9 items-center gap-2 rounded-full px-4 text-[13px] font-semibold transition ${
+        className={`peer flex h-9 items-center gap-2 rounded-full px-4 text-[13px] font-semibold transition ${
           on ? 'bg-ink-50 text-ink-950' : 'bg-ink-800 text-ink-100 hover:bg-ink-700 hover:text-ink-50'
         }`}
         onClick={onClick}
@@ -133,8 +143,17 @@ const TrackTab: FC<{value: TrackFilter; label: string; current: TrackFilter; upd
         </span>
         {label}
       </button>
-    );
-  });
+      {hint === undefined ? null : (
+        <span
+          className="border-ink-600 bg-ink-800 text-ink-200 pointer-events-none absolute left-1/2 top-full z-20 mt-2 -translate-x-1/2 whitespace-nowrap rounded-lg border px-2.5 py-1.5 text-[11.5px] opacity-0 shadow-xl transition group-hover:opacity-100 peer-focus-visible:opacity-100"
+          id={hintId}
+          role="tooltip">
+          {hint}
+        </span>
+      )}
+    </span>
+  );
+});
 TrackTab.displayName = 'TrackTab';
 
 /** A small dot on a button whose setting is in effect. */
@@ -322,7 +341,7 @@ export const ListControls: FC<{
     <div className="space-y-3">
       <div aria-label="track" className="flex flex-wrap items-center gap-2" role="group">
         {TRACKS.map(t => (
-          <TrackTab current={query.track} key={t.key} label={t.label} update={update} value={t.key} />
+          <TrackTab current={query.track} hint={t.hint} key={t.key} label={t.label} update={update} value={t.key} />
         ))}
       </div>
       <div className="flex flex-wrap items-center gap-2">

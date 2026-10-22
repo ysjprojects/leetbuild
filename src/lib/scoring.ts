@@ -3,7 +3,7 @@
  * each wrong submission takes a slice off (never below a floor), and revealing the solution marks
  * the step done for zero points. Totals roll up into a rank title and per-concept mastery.
  */
-import {type Concept, type Difficulty, type Language, type Problem, CONCEPTS, stepKey} from './types';
+import {type Concept, type Difficulty, type Language, type Problem, type Track, CONCEPTS, stepKey} from './types';
 
 /** One judged submission, kept per step (newest last, capped) for the Submissions list. */
 export interface Submission {
@@ -93,6 +93,13 @@ export interface ConceptMastery {
   total: number;
 }
 
+/** Steps accepted out of all steps in one track: the profile's progress row. */
+export interface TrackProgress {
+  track: Track;
+  accepted: number;
+  total: number;
+}
+
 export interface Profile {
   score: number;
   max: number;
@@ -104,7 +111,10 @@ export interface Profile {
   submissions: number;
   /** Accepted submissions over all submissions, 0–1. */
   acceptance: number;
+  /** Per concept, for the mastery badges. */
   concepts: ConceptMastery[];
+  /** Per track, in tab order: Systems, AI Era, DLLM. */
+  tracks: TrackProgress[];
   rank: string;
 }
 
@@ -164,18 +174,26 @@ export function profile(
     pytorch: {concept: 'pytorch', accepted: 0, total: 0},
     cuda: {concept: 'cuda', accepted: 0, total: 0},
   };
+  const byTrack: Record<Track, TrackProgress> = {
+    systems: {track: 'systems', accepted: 0, total: 0},
+    ai: {track: 'ai', accepted: 0, total: 0},
+    dl: {track: 'dl', accepted: 0, total: 0},
+  };
   for (const problem of problems) {
     const p = problemScore(problem, attempts);
     score += p.score;
     max += p.max;
     counts[problem.difficulty] += 1;
     if (p.accepted === p.total) solved[problem.difficulty] += 1;
+    const track = byTrack[problem.track ?? 'systems'];
     for (const step of problem.steps) {
       const attempt = attempts[stepKey(problem.id, step.id)] ?? OPEN_ATTEMPT;
       byConcept[step.concept].total += 1;
+      track.total += 1;
       if (attempt.status === 'accepted') {
         stepsAccepted += 1;
         byConcept[step.concept].accepted += 1;
+        track.accepted += 1;
       } else if (attempt.status === 'revealed') stepsRevealed += 1;
     }
   }
@@ -191,6 +209,7 @@ export function profile(
     submissions,
     acceptance: submissions === 0 ? 0 : acceptedSubmissions / submissions,
     concepts: CONCEPTS.map(c => byConcept[c]),
+    tracks: [byTrack.systems, byTrack.ai, byTrack.dl],
     rank,
   };
 }

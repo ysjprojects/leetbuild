@@ -1,24 +1,24 @@
 import Link from 'next/link';
 import {type FC, memo, useCallback, useMemo, useState} from 'react';
 
-import {applyListQuery, inTrack, problemStatus} from '@/lib/catalog';
+import {applyListQuery, inTrack, problemStatus, TRACK_HINT, TRACK_LABEL, TRACK_TINT} from '@/lib/catalog';
 import {type Streak, activityByDay, badgeProgress, BADGES, stepOfTheDay} from '@/lib/gamify';
 import {useListQuery} from '@/lib/listQuery';
 import {type Profile, type StepAttempt, OPEN_ATTEMPT, problemScore, rankProgress} from '@/lib/scoring';
 import {type TimedSession, bestSession, formatClock} from '@/lib/timer';
-import {type Difficulty, type Problem, ALL_LANGUAGES, CONCEPT_LABEL, stepKey, stepPath} from '@/lib/types';
+import {type Difficulty, type Problem, ALL_LANGUAGES, stepKey, stepPath} from '@/lib/types';
 
 import {BadgeCatalog, BadgeGlyph} from './Badges';
 import {useDialog} from './Dialog';
 import {ActivityHeatmap} from './Heatmap';
 import {ListControls} from './ListControls';
 import {LandingIntro} from './LoadingScreen';
-import {CompanyChip, CONCEPT_COLOR, ConceptChip, DifficultyChip} from './paneShared';
+import {CompanyChip, ConceptChip, DifficultyChip} from './paneShared';
 import {Clock, SessionList} from './Timer';
 
 /**
  * The landing page: a short profile strip — where you stand (points inside a rank ring, the next
- * rank), the streak, the badges you have — one row of concept mastery, and then the problems,
+ * rank), the streak, the badges you have — one row of progress per track, and then the problems,
  * which are the point of the page. Everything secondary (difficulty breakdown, acceptance rate,
  * the full badge catalog with progress) is one click away, not on the page.
  */
@@ -259,25 +259,22 @@ const ProfileStrip: FC<{
         </button>
       </div>
 
-      {/* Mastery: one row, four concepts */}
-      <div className="border-ink-700/70 mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 border-t pt-2.5">
-        {profile.concepts.map(c => (
+      {/* Progress: one row, one bar per track */}
+      <div className="border-ink-700/70 mt-3 flex flex-wrap items-center gap-x-6 gap-y-2 border-t pt-2.5">
+        {profile.tracks.map(t => (
           <div
-            className="flex min-w-[10rem] flex-1 items-center gap-2 text-[12px]"
-            key={c.concept}
-            title={`${CONCEPT_LABEL[c.concept]} steps accepted`}>
-            <span className="text-ink-200 w-10 font-semibold">{CONCEPT_LABEL[c.concept]}</span>
-            <span className="bg-ink-700 h-2 flex-1 overflow-hidden rounded-full">
+            className="flex min-w-[11rem] flex-1 items-center gap-2.5 text-[12px]"
+            key={t.track}
+            title={`${TRACK_HINT[t.track] ?? TRACK_LABEL[t.track]}: ${t.accepted} of ${t.total} steps accepted`}>
+            <span className="text-ink-200 shrink-0 whitespace-nowrap font-semibold">{TRACK_LABEL[t.track]}</span>
+            <span className="bg-ink-700 h-2 min-w-[2.5rem] flex-1 overflow-hidden rounded-full">
               <span
-                className="block h-full rounded-full"
-                style={{
-                  background: CONCEPT_COLOR[c.concept],
-                  width: c.total === 0 ? '0%' : `${(100 * c.accepted) / c.total}%`,
-                }}
+                className={`block h-full rounded-full ${TRACK_TINT[t.track].bg}`}
+                style={{width: t.total === 0 ? '0%' : `${(100 * t.accepted) / t.total}%`}}
               />
             </span>
-            <span className="font-code text-ink-300 w-9 text-right text-[11px]">
-              {c.accepted}/{c.total}
+            <span className="font-code text-ink-300 shrink-0 text-right text-[11px] tabular-nums">
+              {t.accepted}/{t.total}
             </span>
           </div>
         ))}

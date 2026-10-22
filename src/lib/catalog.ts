@@ -4,7 +4,7 @@
  * so a filtered view is a link. Rows keep their catalogue number whatever the order on screen.
  */
 import {type StepAttempt, problemScore, STEP_POINTS} from './scoring';
-import {type Difficulty, type Problem, CONCEPT_LABEL, DIFFICULTIES} from './types';
+import {type Difficulty, type Problem, type Track, CONCEPT_LABEL, DIFFICULTIES} from './types';
 
 export type StatusFilter = 'all' | 'open' | 'started' | 'solved';
 export type SortKey = 'order' | 'difficulty' | 'points' | 'minutes' | 'progress' | 'title';
@@ -35,11 +35,23 @@ export const DEFAULT_LIST_QUERY: ListQuery = {
   desc: false,
 };
 
-export const TRACKS: readonly {key: TrackFilter; label: string}[] = [
+export const TRACK_LABEL: Record<Track, string> = {systems: 'Systems', ai: 'AI Era', dl: 'DLLM'};
+
+/** What a short label stands for, shown when the pointer rests on it. */
+export const TRACK_HINT: Partial<Record<Track, string>> = {dl: 'Deep Learning / Language Models'};
+
+/** Each track's colour: its tab icon wears `text`, its progress bar on the profile `bg`. */
+export const TRACK_TINT: Record<Track, {text: string; bg: string}> = {
+  systems: {text: 'text-warning-300', bg: 'bg-warning-300'},
+  ai: {text: 'text-iris-300', bg: 'bg-iris-300'},
+  dl: {text: 'text-concept-cuda', bg: 'bg-concept-cuda'},
+};
+
+export const TRACKS: readonly {key: TrackFilter; label: string; hint?: string}[] = [
   {key: 'all', label: 'All topics'},
-  {key: 'systems', label: 'Systems'},
-  {key: 'ai', label: 'AI era'},
-  {key: 'dl', label: 'Deep learning'},
+  {key: 'systems', label: TRACK_LABEL.systems},
+  {key: 'ai', label: TRACK_LABEL.ai},
+  {key: 'dl', label: TRACK_LABEL.dl, hint: TRACK_HINT.dl},
 ];
 
 export const inTrack = (problem: Problem, track: TrackFilter): boolean =>
