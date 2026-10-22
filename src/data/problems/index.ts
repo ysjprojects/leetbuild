@@ -49,6 +49,7 @@ import {visionInferenceProblem} from './45-vision-inference/index';
 import {transcriptionServiceProblem} from './46-transcription-service/index';
 import {translationServiceProblem} from './47-translation-service/index';
 import {contentClassifierProblem} from './48-content-classifier/index';
+import {labelingServiceProblem} from './49-labeling-service/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -89,6 +90,7 @@ export const problems: Problem[] = [
   transcriptionServiceProblem,
   translationServiceProblem,
   contentClassifierProblem,
+  labelingServiceProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,

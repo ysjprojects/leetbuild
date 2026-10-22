@@ -805,6 +805,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'labeling-service-the-queue-that-ate-its-own-work',
+    problemId: 'labeling-service',
+    stepId: 'endpoint',
+    title: 'The queue that ate its own work',
+    blurb: 'Stale assignments never returned and pre-label outages froze the queue.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'Half a batch sat assigned to annotators who went home, because the draft assigned items with no lease expiry, and when the pre-label model went down the whole queue stopped. The same draft showed every annotator the labels of their peers. Review it, fix it, and prove leases return and degradation keeps the queue moving.',
+    signals: ['Operate', 'Specify', 'Verify'],
+    aiNote:
+      'The draft marks items assigned permanently with no expiry, so abandoned work never returns to the pool, and it blocks assignment on pre-labeling, turning a model outage into a full labeling stop; it also exposes peer labels before submission.',
+    testIdea:
+      'Assign an item and let the lease lapse and assert it returns to the pool; kill the pre-label model and assert items still assign with an unlabeled marker; submit as one annotator and assert peers still cannot see the label.',
+    followUps: [
+      'How many reviewers make agreement math meaningful?',
+      'What would you do with labels from annotators that fail review?',
+      'Should pre-labels ever be hidden from reviewers, and why?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
