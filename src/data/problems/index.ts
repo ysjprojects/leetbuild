@@ -114,6 +114,7 @@ import {usageMeteringProblem} from './110-usage-metering/index';
 import {resumableUploadProblem} from './111-resumable-upload/index';
 import {invoiceServiceProblem} from './112-invoice-service/index';
 import {shipmentTrackingProblem} from './113-shipment-tracking/index';
+import {returnsProcessingProblem} from './114-returns-processing/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -219,6 +220,7 @@ export const problems: Problem[] = [
   resumableUploadProblem,
   invoiceServiceProblem,
   shipmentTrackingProblem,
+  returnsProcessingProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
