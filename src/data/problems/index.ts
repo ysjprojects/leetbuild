@@ -23,6 +23,7 @@ import {chatMemoryProblem} from './19-chat-memory/index';
 import {evalHarnessProblem} from './20-eval-harness/index';
 import {guardrailServiceProblem} from './21-guardrail-service/index';
 import {agentOrchestratorProblem} from './22-agent-orchestrator/index';
+import {embeddingServiceProblem} from './23-embedding-service/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -37,6 +38,7 @@ export const problems: Problem[] = [
   evalHarnessProblem,
   guardrailServiceProblem,
   agentOrchestratorProblem,
+  embeddingServiceProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,

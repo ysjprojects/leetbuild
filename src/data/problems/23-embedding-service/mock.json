@@ -1,0 +1,18 @@
+[
+  {
+    "stepId": "endpoint",
+    "title": "The cache that forgot the model",
+    "blurb": "A model upgrade shipped, but the cache kept serving old-version vectors.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 20,
+    "prompt": "After an embedding model upgrade, retrieval quality dropped because cached vectors from the old model were still served under the new model name. The model-generated draft hashes content only and returns cache hits regardless of version. Review it, fix it, and prove a version change cannot serve a stale vector.",
+    "signals": ["Specify", "Evaluate", "Verify"],
+    "aiNote": "The draft keys the cache by content hash alone with no model version in the key or the value, so vectors from the previous model version are served forever after an upgrade, and the read path can return a wrong-dimension fallback as a 200.",
+    "testIdea": "Embed one input under model v1, switch to v2, and assert the second call is a miss and produces a v2 vector; assert the v1 cache entry still exists for explicit v1 requests; force a fallback model and assert its dimension is refused under the v2 namespace.",
+    "followUps": [
+      "Should the cache be shared across tenants or scoped per tenant, and what leaks either way?",
+      "How would you backfill embeddings after a model upgrade without a thundering herd?",
+      "What TTL makes sense for embedding cache entries, and what drives that number?"
+    ]
+  }
+]
