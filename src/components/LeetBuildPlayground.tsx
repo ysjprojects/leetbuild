@@ -341,8 +341,8 @@ const EyeGlyph: FC = memo(() => (
 ));
 EyeGlyph.displayName = 'EyeGlyph';
 
-/** Indent per nesting level; depth 0 is a file directly under the course root. */
-const indent = (depth: number): CSSProperties => ({paddingLeft: 20 + depth * 12});
+/** Indent per nesting level, the same for files and folders so siblings align: a glyph or chevron, then the name. */
+const indent = (depth: number): CSSProperties => ({paddingLeft: 8 + depth * 12});
 
 /** A provided file in the tree: muted like a locked step, in italics, an eye for the glyph — readable, not editable. */
 const ProvidedRow: FC<{
@@ -428,12 +428,12 @@ ExplorerRow.displayName = 'ExplorerRow';
 const FolderRow: FC<{name: string; path: string; depth: number; open: boolean; onToggle: (path: string) => void}> =
   memo(({name, path, depth, open, onToggle}) => {
     const onClick = useCallback(() => onToggle(path), [onToggle, path]);
-    const style = useMemo(() => ({paddingLeft: 8 + depth * 12}), [depth]);
+    const style = useMemo(() => indent(depth), [depth]);
     return (
       <li>
         <button
           aria-expanded={open}
-          className={`hover:bg-ink-800/60 flex w-full items-center gap-1 py-0.5 pr-2 text-left text-[11px] transition ${
+          className={`hover:bg-ink-800/60 flex w-full items-center gap-1.5 py-0.5 pr-2 text-left text-[11px] transition ${
             depth === 0 ? 'text-ink-100 font-semibold' : 'text-ink-200'
           }`}
           onClick={onClick}
