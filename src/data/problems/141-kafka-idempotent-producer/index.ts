@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {idempotentProducerStep} from './steps/1-idempotent-producer';
 
 /**
@@ -59,4 +60,5 @@ retry turns one event into two or into zero.`,
     ],
   },
   steps: [idempotentProducerStep],
+  learn,
 };

@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {fillLockStep} from './steps/1-fill-lock';
 
 /**
@@ -53,4 +54,5 @@ a thousand.`,
     ],
   },
   steps: [fillLockStep],
+  learn,
 };

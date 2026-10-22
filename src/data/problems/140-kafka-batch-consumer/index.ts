@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {batchConsumerStep} from './steps/1-batch-consumer';
 
 /**
@@ -62,4 +63,5 @@ drill is the two-condition close and the one commit that is the batch's receipt.
     ],
   },
   steps: [batchConsumerStep],
+  learn,
 };

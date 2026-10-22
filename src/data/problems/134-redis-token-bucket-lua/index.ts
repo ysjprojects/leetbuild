@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {lazyRefillStep} from './steps/1-lazy-refill';
 
 /**
@@ -51,4 +52,5 @@ derives from the three numbers this function returns.`,
     edges: [{from: 'service', to: 'redis', kind: 'redis', label: 'EVAL (refill · take · HSET · PEXPIRE)'}],
   },
   steps: [lazyRefillStep],
+  learn,
 };

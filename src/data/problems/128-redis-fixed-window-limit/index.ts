@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {fixedWindowStep} from './steps/1-fixed-window';
 
 /**
@@ -51,4 +52,5 @@ other limiter is compared against.`,
     edges: [{from: 'gateway', to: 'redis', kind: 'redis', label: 'INCR · EXPIRE on 1 · TTL when full'}],
   },
   steps: [fixedWindowStep],
+  learn,
 };

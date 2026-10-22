@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {pauseAtHighWaterStep} from './steps/1-pause-at-high-water';
 
 /**
@@ -59,4 +60,5 @@ multi-threaded worker pool. The drill is the hysteresis loop itself and what it 
     ],
   },
   steps: [pauseAtHighWaterStep],
+  learn,
 };

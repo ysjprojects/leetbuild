@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {offsetWatermarkStep} from './steps/1-offset-watermark';
 
 /**
@@ -60,4 +61,5 @@ watermark), rebalances, transactions, and exactly-once producers: the drill is t
     ],
   },
   steps: [offsetWatermarkStep],
+  learn,
 };

@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {tumblingWindowStep} from './steps/1-tumbling-window';
 
 /**
@@ -63,4 +64,5 @@ and a transactional emit-and-commit. The one thing drilled is the watermark and 
     ],
   },
   steps: [tumblingWindowStep],
+  learn,
 };

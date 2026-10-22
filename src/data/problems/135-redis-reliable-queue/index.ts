@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {visibilityTimeoutStep} from './steps/1-visibility-timeout';
 
 /**
@@ -54,4 +55,5 @@ everything else is a caller.`,
     ],
   },
   steps: [visibilityTimeoutStep],
+  learn,
 };

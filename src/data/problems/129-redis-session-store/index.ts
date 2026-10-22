@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {slidingSessionStep} from './steps/1-sliding-session';
 
 /**
@@ -50,4 +51,5 @@ all — each is one more key or one more check on the same hash.`,
     ],
   },
   steps: [slidingSessionStep],
+  learn,
 };

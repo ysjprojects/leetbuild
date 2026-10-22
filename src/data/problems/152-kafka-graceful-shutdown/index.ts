@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {gracefulShutdownStep} from './steps/1-graceful-shutdown';
 
 /**
@@ -59,4 +60,5 @@ redelivery harmless, and the signal handling that calls \`shutdown\` — the dri
     ],
   },
   steps: [gracefulShutdownStep],
+  learn,
 };

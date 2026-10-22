@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {commitAfterProcessingStep} from './steps/1-commit-after-processing';
 
 /**
@@ -52,4 +53,5 @@ bolted onto.`,
     ],
   },
   steps: [commitAfterProcessingStep],
+  learn,
 };

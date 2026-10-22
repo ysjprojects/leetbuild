@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {keyedProducerStep} from './steps/1-keyed-producer';
 
 /** Kafka drill: a keyed, acks=all producer whose request path never waits and whose shutdown waits at most 5 s. */
@@ -42,4 +43,5 @@ Those come after the producer's three decisions are right.`,
     edges: [{from: 'orders', to: 'kafka', kind: 'kafka', label: 'produce · poll(0) · flush(5 s)'}],
   },
   steps: [keyedProducerStep],
+  learn,
 };

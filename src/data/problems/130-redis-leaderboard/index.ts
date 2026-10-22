@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {leaderboardStep} from './steps/1-leaderboard';
 
 /**
@@ -46,4 +47,5 @@ functions, ranks that agree with each other.`,
     edges: [{from: 'game', to: 'redis', kind: 'redis', label: 'ZINCRBY · ZREVRANGE · ZREVRANK · ZREM'}],
   },
   steps: [leaderboardStep],
+  learn,
 };

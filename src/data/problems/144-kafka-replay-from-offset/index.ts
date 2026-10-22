@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {replayToSnapshotStep} from './steps/1-replay-to-snapshot';
 
 /**
@@ -46,4 +47,5 @@ tests: rewind, bounded end, no side effect on the group.`,
     edges: [{from: 'tool', to: 'kafka', kind: 'kafka', label: 'watermarks · assign · seek · poll'}],
   },
   steps: [replayToSnapshotStep],
+  learn,
 };

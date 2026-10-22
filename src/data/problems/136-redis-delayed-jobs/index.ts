@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {delayedJobsStep} from './steps/1-delayed-jobs';
 
 /**
@@ -58,4 +59,5 @@ retry jitter, priorities, and \`EVALSHA\`. The drill is the atomic claim and the
     ],
   },
   steps: [delayedJobsStep],
+  learn,
 };

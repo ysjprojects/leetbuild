@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {geoPresenceStep} from './steps/1-geo-presence';
 
 /**
@@ -57,4 +58,5 @@ between a spatial index and a liveness signal.`,
     ],
   },
   steps: [geoPresenceStep],
+  learn,
 };

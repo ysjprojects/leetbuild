@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {orderedMergeStep} from './steps/1-ordered-merge';
 
 /**
@@ -56,4 +57,5 @@ side output for dropped readings, and producer-side timestamps (\`ts\` comes fro
     ],
   },
   steps: [orderedMergeStep],
+  learn,
 };

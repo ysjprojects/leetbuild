@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {changelogRestoreStep} from './steps/1-changelog-restore';
 
 /**
@@ -64,4 +65,5 @@ confident wrong ones.`,
     edges: [{from: 'view', to: 'kafka', kind: 'kafka', label: 'end offsets · assign · replay · live'}],
   },
   steps: [changelogRestoreStep],
+  learn,
 };

@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {leaseLockStep} from './steps/1-lease-lock';
 
 /**
@@ -46,4 +47,5 @@ and a race the harness actually runs.`,
     edges: [{from: 'worker', to: 'redis', kind: 'redis', label: 'SET NX PX · EVAL compare-and-DEL / PEXPIRE'}],
   },
   steps: [leaseLockStep],
+  learn,
 };

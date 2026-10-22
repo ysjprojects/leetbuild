@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {consumeTransformProduceStep} from './steps/1-consume-transform-produce';
 
 /**
@@ -62,4 +63,5 @@ that decides whether the stage loses, duplicates, or neither.`,
     ],
   },
   steps: [consumeTransformProduceStep],
+  learn,
 };

@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {tieredRetryStep} from './steps/1-tiered-retry';
 
 /**
@@ -59,4 +60,5 @@ that costs the partition nothing.`,
     ],
   },
   steps: [tieredRetryStep],
+  learn,
 };

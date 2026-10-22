@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {asyncAckTrackingStep} from './steps/1-async-ack-tracking';
 
 /** Kafka drill: handlers run concurrently per partition, the commit still means "everything below is done". */
@@ -62,4 +63,5 @@ the loop waits at the limit. Those are what production adds once the frontier is
     ],
   },
   steps: [asyncAckTrackingStep],
+  learn,
 };

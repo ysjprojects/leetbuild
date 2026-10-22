@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {retryDlqStep} from './steps/1-retry-dlq';
 
 /**
@@ -56,4 +57,5 @@ mechanism here is the hand-off and where its commit sits.`,
     ],
   },
   steps: [retryDlqStep],
+  learn,
 };

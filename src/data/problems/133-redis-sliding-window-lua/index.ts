@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {slidingWindowStep} from './steps/1-sliding-window';
 
 /**
@@ -55,4 +56,5 @@ counters) that trades exactness for memory.`,
     ],
   },
   steps: [slidingWindowStep],
+  learn,
 };
