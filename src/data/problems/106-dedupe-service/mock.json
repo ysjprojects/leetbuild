@@ -1,0 +1,16 @@
+{
+  "stepId": "endpoint",
+  "title": "The duplicate that crossed a tenant boundary",
+  "blurb": "A global similarity index leaked and weak pairs bridged clusters.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "A tenant's dedupe check confirmed that another tenant held the same customer record, and two unrelated records merged because one weak pair bridged them. The draft checks membership and insert non-atomically. Review it, fix it, and prove comparison stays in-tenant and merges carry evidence.",
+  "signals": ["Secure", "Verify", "Specify"],
+  "aiNote": "The draft runs fuzzy comparisons against a global index, so a check can confirm whether another tenant holds the same record and even name it, and it unions clusters transitively through any weak pair, letting low-confidence links collapse unrelated groups.",
+  "testIdea": "Check a record that exists for another tenant and assert a miss; build A-B strong and B-C weak and assert A and C never share a cluster without review; race two identical submissions and assert one winner.",
+  "followUps": [
+    "What confidence should a merge require?",
+    "How do you undo a bad merge?",
+    "When is exact-only matching actually enough?"
+  ]
+}
