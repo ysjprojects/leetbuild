@@ -32,7 +32,6 @@ import {distillationPipelineProblem} from './28-distillation-pipeline/index';
 import {batchInferenceProblem} from './29-batch-inference/index';
 import {multimodalIngestProblem} from './30-multimodal-ingest/index';
 import {voiceAgentProblem} from './31-voice-agent/index';
-import {sqlCopilotProblem} from './33-sql-copilot/index';
 import {ticketTriageProblem} from './34-ticket-triage/index';
 import {recommendationRankingProblem} from './35-recommendation-ranking/index';
 import {moderationServiceProblem} from './36-moderation-service/index';
@@ -141,7 +140,6 @@ export const problems: Problem[] = [
   batchInferenceProblem,
   multimodalIngestProblem,
   voiceAgentProblem,
-  sqlCopilotProblem,
   ticketTriageProblem,
   recommendationRankingProblem,
   moderationServiceProblem,
