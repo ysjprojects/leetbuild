@@ -2301,6 +2301,29 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'ai-firewall-detect',
+    problemId: 'ai-firewall',
+    stepId: 'prompt-detect',
+    title: 'The firewall that blocks the wrong end of the scale',
+    blurb:
+      'The detector scores 1–99 with 1 the most likely injection. The draft blocks high scores and allows every outage.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'You own the firewall in front of a customer-facing assistant. The prompt validation service scores every prompt from 1 to 99 — 1 being the most likely injection — and tags it by topic. Last night the detector was down for twelve minutes and every prompt went through; this morning a prompt scored 4 and was forwarded. The model-generated client below looks right in a demo. Review it, fix it, and prove the fix.',
+    signals: ['Specify', 'Secure', 'Verify'],
+    aiNote:
+      'The draft compares the wrong way round: it blocks when the score is above 80, the benign end of the scale, so the prompts the detector is most sure about pass. It never reads the tags, so the topic rules are a no-op. The call carries no deadline, so a slow detector stalls every request. And the bare catch returns allow on any error, so a detector outage is a published off switch.',
+    testIdea:
+      'Stub Detect to return score 4 with no tags and assert the decision is block with reason score; return score 90 with tag politics and assert block with reason tag:politics. Make the stub sleep past 150 ms and assert block with reason detector-unavailable, then pass fail_open and assert allow; make it return INVALID_ARGUMENT and assert the error propagates.',
+    followUps: [
+      'How would you run a new threshold in shadow mode — scoring and emitting events without blocking — before changing BLOCK_SCORE in production?',
+      'Which applications should be allowed to set fail_open, and who owns that decision: the application team or the security team?',
+      'The source says the prompt score is combined with bot and attack scores. Where in this call would that combination live, and what would the decision carry?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
