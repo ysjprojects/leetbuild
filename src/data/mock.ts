@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'replicator-the-replica-that-replayed-history',
+    problemId: 'replicator',
+    stepId: 'endpoint',
+    title: 'The replica that replayed history',
+    blurb: 'Offsets expired and retries applied twice.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A target region re-applied three months of changes after a quiet period, and a duplicated apply created orphan rows, because the draft stored offsets with a TTL and dropped the change id on some retry paths. Review it, fix it, and prove offsets are durable and applies are idempotent.',
+    signals: ['Operate', 'Specify', 'Verify'],
+    aiNote:
+      'The draft keeps per-shard offsets in an expiring cache key, so idleness silently rewinds a shard to zero, and its apply retry path omits the change id, so an apply that succeeded before the timeout is applied a second time.',
+    testIdea:
+      'Expire the offset key and assert replication halts or resumes from the confirmed offset, not zero; time out an apply and assert the retry carries the same change id and the target shows one row; sample digests across regions after a divergence test.',
+    followUps: [
+      'What clock assumptions does last-write-wins make?',
+      'When is manual conflict resolution the right policy?',
+      'How do you prove two regions converged?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
