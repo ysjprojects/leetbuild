@@ -60,6 +60,7 @@ import {driftMonitorProblem} from './56-drift-monitor/index';
 import {shadowEvalProblem} from './57-shadow-eval/index';
 import {promptFirewallProblem} from './58-prompt-firewall/index';
 import {citationStoreProblem} from './59-citation-store/index';
+import {rerankerServiceProblem} from './60-reranker-service/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -111,6 +112,7 @@ export const problems: Problem[] = [
   shadowEvalProblem,
   promptFirewallProblem,
   citationStoreProblem,
+  rerankerServiceProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
