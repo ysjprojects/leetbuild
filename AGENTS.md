@@ -9,10 +9,10 @@ server-side progress; do not add those unless the user explicitly asks.
 
 Two modes share one app:
 
-| Address           | Mode           | What it is                                                                                       |
-| ----------------- | -------------- | ------------------------------------------------------------------------------------------------ |
-| `/`               | Practice       | The course catalogue: classic systems courses plus the AI-era courses.                           |
-| `/mock-interview` | Mock interview | Timed scenarios that start from a flawed AI draft, with an offline AI pair, checks and a report. |
+| Address           | Mode              | What it is                                                                                       |
+| ----------------- | ----------------- | ------------------------------------------------------------------------------------------------ |
+| `/`               | Practice          | The course catalogue: classic systems courses plus the AI-era courses.                           |
+| `/mock-interview` | AI mock interview | Timed scenarios that start from a flawed AI draft, with an offline AI pair, checks and a report. |
 
 The switch between them is `src/components/ModeSwitch.tsx`. The mock scenarios are
 `src/data/mock.ts`; the experience is `src/components/MockInterview.tsx`.

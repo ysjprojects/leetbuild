@@ -44,11 +44,7 @@ export const BrandLockup: FC<{className?: string; size?: 'md' | 'lg'}> = memo(({
 ));
 BrandLockup.displayName = 'BrandLockup';
 
-/**
- * Copy the landing page opens with — real text, so it is already in place while the rest loads.
- * The hero is about the courses below it; the mock interview is a different mode, so it sits in a
- * card of its own that says so, not in the hero's call to action.
- */
+/** Copy the landing page opens with — real text, so it is already in place while the rest loads. */
 export const LandingIntro: FC<{stats?: readonly string[]}> = memo(
   ({stats = ['real systems', '5 languages', 'AI-era track', '1337 points']}) => (
     <section className="border-ink-700 relative overflow-hidden border-b">
@@ -63,43 +59,32 @@ export const LandingIntro: FC<{stats?: readonly string[]}> = memo(
             Practice
           </span>
         </div>
-        <div className="mt-7 flex flex-col gap-6 md:flex-row md:items-end md:justify-between">
-          <div className="min-w-0">
-            <h1 className="text-ink-50 max-w-3xl text-3xl font-extrabold leading-[1.1] tracking-tight sm:text-4xl">
-              Build systems. <span className="text-iris-300">Prove you can use AI.</span>
-            </h1>
-            <p className="text-ink-200 mt-4 max-w-2xl text-[14px] leading-7">
-              Real services, one file at a time. Classic systems and AI-era review problems, judged in five languages.
-            </p>
-            <div className="mt-5 flex flex-wrap gap-2">
-              {stats.map(stat => (
-                <span
-                  className="border-ink-600 bg-ink-850/80 text-ink-200 rounded-full border px-3 py-1 text-[11px] font-semibold"
-                  key={stat}>
-                  {stat}
-                </span>
-              ))}
-            </div>
-            <a
-              className="bg-iris-400 text-ink-950 hover:bg-iris-300 mt-5 inline-block rounded-lg px-4 py-2 text-[13px] font-bold shadow-[0_8px_24px_rgba(108,76,241,0.18)] transition"
-              href="#problems">
-              Browse the courses ↓
-            </a>
-          </div>
-          <aside className="border-danger-400/40 bg-ink-850/70 w-full shrink-0 rounded-2xl border p-4 md:w-72">
-            <p className="text-danger-300 text-[10px] font-bold uppercase tracking-wider">
-              Another mode · mock interview
-            </p>
-            <p className="text-ink-200 mt-2 text-[12px] leading-5">
-              A timed session on one scenario: a flawed AI draft to review and fix, with an offline AI pair. Separate
-              from the courses below — nothing here counts towards their points.
-            </p>
-            <Link
-              className="text-danger-300 hover:text-danger-200 decoration-danger-400/40 mt-3 inline-block text-[12px] font-semibold underline"
-              href="/mock-interview">
-              Open the mock interview →
-            </Link>
-          </aside>
+        <h1 className="text-ink-50 mt-7 max-w-3xl text-3xl font-extrabold leading-[1.1] tracking-tight sm:text-4xl">
+          Build systems. <span className="text-iris-300">Prove you can use AI.</span>
+        </h1>
+        <p className="text-ink-200 mt-4 max-w-2xl text-[14px] leading-7">
+          Real services, one file at a time. Classic systems and AI-era review problems, judged in five languages.
+        </p>
+        <div className="mt-5 flex flex-wrap gap-2">
+          {stats.map(stat => (
+            <span
+              className="border-ink-600 bg-ink-850/80 text-ink-200 rounded-full border px-3 py-1 text-[11px] font-semibold"
+              key={stat}>
+              {stat}
+            </span>
+          ))}
+        </div>
+        <div className="mt-5 flex flex-wrap items-center gap-3">
+          <Link
+            className="bg-iris-400 text-ink-950 hover:bg-iris-300 rounded-lg px-4 py-2 text-[13px] font-bold shadow-[0_8px_24px_rgba(108,76,241,0.18)] transition"
+            href="/mock-interview">
+            AI mock interview →
+          </Link>
+          <a
+            className="text-iris-300 hover:text-iris-200 decoration-iris-400/40 text-[12px] font-semibold underline"
+            href="#problems">
+            Browse courses ↓
+          </a>
         </div>
       </div>
     </section>
