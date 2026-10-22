@@ -1,0 +1,20 @@
+{
+  "stepId": "endpoint",
+  "title": "The summary that invented a quarter",
+  "blurb": "Chunk counters could commit without their summaries.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "A board summary invented a revenue decline because the draft appended a partial rolling summary that claimed chunks it never processed, and a source edit silently reused an old summary. Review it, fix it, and prove progress is atomic and content-bound.",
+  "signals": [
+    "Evaluate",
+    "Operate",
+    "Verify"
+  ],
+  "aiNote": "The draft commits the rolling summary and its chunk counter as separate writes, so a crash can produce a summary that claims coverage it never had, and its cache key omits the source content hash, so an edited source resumes and extends the previous summary.",
+  "testIdea": "Crash between counter and summary writes and assert the reopened summary lists only completed chunks; edit the source and assert a new summary line starts; request a summary for a foreign tenant and assert 404.",
+  "followUps": [
+    "How would you structure summaries so citations survive edits?",
+    "What compression ratio warns you a summary is probably extractive?",
+    "When is a trimmed extract better than an abstractive summary?"
+  ]
+}

@@ -61,6 +61,7 @@ import {shadowEvalProblem} from './57-shadow-eval/index';
 import {promptFirewallProblem} from './58-prompt-firewall/index';
 import {citationStoreProblem} from './59-citation-store/index';
 import {rerankerServiceProblem} from './60-reranker-service/index';
+import {summarizerServiceProblem} from './61-summarizer-service/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -113,6 +114,7 @@ export const problems: Problem[] = [
   promptFirewallProblem,
   citationStoreProblem,
   rerankerServiceProblem,
+  summarizerServiceProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
