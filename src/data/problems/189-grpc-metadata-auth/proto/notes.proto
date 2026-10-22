@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package notes.v1;
+
+option go_package = "notes/gen/notes;notesv1";
+
+// The notes service the drill serves: two unary RPCs, each authenticated and authorized from the
+// `authorization` metadata before the request is looked at.
+service Notes {
+  rpc GetNote(GetNoteRequest) returns (Note);          // needs scope notes.read
+  rpc DeleteNote(DeleteNoteRequest) returns (DeleteNoteResponse);  // needs scope notes.write
+}
+
+message GetNoteRequest { string id = 1; }
+message Note { string id = 1; string text = 2; }
+message DeleteNoteRequest { string id = 1; }
+message DeleteNoteResponse { bool deleted = 1; }

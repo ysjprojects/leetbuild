@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package library.v1;
+
+// One list method with AIP-158 pagination: the server owns the page size and an opaque page token
+// that continues strictly after the last book id it returned.
+service Library {
+  rpc ListBooks(ListBooksRequest) returns (ListBooksResponse);
+}
+
+message ListBooksRequest {
+  string shelf = 1;
+  int32 page_size = 2;   // 0 = 50, above 100 = 100, negative = INVALID_ARGUMENT
+  string page_token = 3; // "" = the first page
+}
+
+message Book {
+  string id = 1;
+  string title = 2;
+}
+
+message ListBooksResponse {
+  repeated Book books = 1;
+  string next_page_token = 2; // "" on the last page
+}

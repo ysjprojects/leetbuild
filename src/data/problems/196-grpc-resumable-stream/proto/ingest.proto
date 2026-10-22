@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package ingest.v1;
+
+// Resumable uploads. Upload streams chunks and answers with acks; GetStatus says where the
+// server's committed point is, so a client that lost its stream resumes from there.
+service Ingest {
+  rpc Upload(stream Chunk) returns (stream Ack);
+  rpc GetStatus(StatusRequest) returns (StatusResponse);
+}
+
+message Chunk {
+  string upload_id = 1;
+  int32 seq = 2;
+  bytes data = 3;
+}
+
+// The highest contiguous committed seq of the upload.
+message Ack {
+  int32 seq = 1;
+}
+
+message StatusRequest {
+  string upload_id = 1;
+}
+
+// The next seq the server needs: 0 for an upload it has never seen.
+message StatusResponse {
+  int32 next_seq = 1;
+}

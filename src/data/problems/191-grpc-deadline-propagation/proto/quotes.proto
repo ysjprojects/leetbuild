@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package quotes.v1;
+
+// The service the learner writes: one quote, priced by a downstream call inside the caller's deadline.
+service Quotes {
+  rpc GetQuote(QuoteRequest) returns (Quote);
+}
+
+// The downstream price service, served by the harness at pricing:50051.
+service Pricing {
+  rpc GetPrice(PriceRequest) returns (Price);
+}
+
+message QuoteRequest {
+  string sku = 1;
+  int32 qty = 2;
+}
+
+message Quote {
+  string sku = 1;
+  int32 qty = 2;
+  int32 total_cents = 3;
+}
+
+message PriceRequest {
+  string sku = 1;
+}
+
+message Price {
+  int32 unit_cents = 1;
+}

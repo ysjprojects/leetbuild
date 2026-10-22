@@ -183,6 +183,15 @@ import {ptGptqProblem} from './184-pt-gptq/index';
 import {ptZeroProblem} from './185-pt-zero/index';
 import {ptTensorParallelProblem} from './186-pt-tensor-parallel/index';
 import {cudaPagedAttentionProblem} from './187-cuda-paged-attention/index';
+import {httpCorsPreflightProblem} from './188-http-cors-preflight/index';
+import {grpcMetadataAuthProblem} from './189-grpc-metadata-auth/index';
+import {httpBehindTlsProxyProblem} from './190-http-behind-tls-proxy/index';
+import {grpcDeadlinePropagationProblem} from './191-grpc-deadline-propagation/index';
+import {grpcPageTokensProblem} from './192-grpc-page-tokens/index';
+import {httpConditionalRequestsProblem} from './193-http-conditional-requests/index';
+import {httpRangeRequestsProblem} from './194-http-range-requests/index';
+import {grpcOutlierEjectionProblem} from './195-grpc-outlier-ejection/index';
+import {grpcResumableStreamProblem} from './196-grpc-resumable-stream/index';
 
 /**
  * Problem order on the list page: the classic systems track first, in its catalogue order, then the
@@ -201,6 +210,8 @@ export const problems: Problem[] = [
   kafkaKeyedProducerProblem,
   kafkaCommitAfterProcessingProblem,
   kafkaBatchConsumerProblem,
+  httpCorsPreflightProblem,
+  grpcMetadataAuthProblem,
   imageCacheProblem,
   liveChatProblem,
   notificationsProblem,
@@ -216,6 +227,9 @@ export const problems: Problem[] = [
   kafkaReplayFromOffsetProblem,
   kafkaTumblingWindowProblem,
   kafkaOffsetWatermarkProblem,
+  httpBehindTlsProxyProblem,
+  grpcDeadlinePropagationProblem,
+  grpcPageTokensProblem,
   matchEngineProblem,
   merchantPaymentsProblem,
   flashSaleProblem,
@@ -234,6 +248,10 @@ export const problems: Problem[] = [
   kafkaChangelogRestoreProblem,
   kafkaOrderedMergeWatermarkProblem,
   kafkaGracefulShutdownProblem,
+  httpConditionalRequestsProblem,
+  httpRangeRequestsProblem,
+  grpcOutlierEjectionProblem,
+  grpcResumableStreamProblem,
   aiGatewayProblem,
   ragServiceProblem,
   modelRouterProblem,

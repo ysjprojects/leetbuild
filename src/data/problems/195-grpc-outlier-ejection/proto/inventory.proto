@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package inventory.v1;
+
+// Three instances serve it: inv-a:50051, inv-b:50051, inv-c:50051. The client balances over them.
+service Inventory {
+  rpc GetStock(StockRequest) returns (Stock);
+}
+
+message StockRequest {
+  string sku = 1;
+}
+
+message Stock {
+  string sku = 1;
+  int32 count = 2;
+}
