@@ -518,8 +518,8 @@ const ProblemList: FC<{
           {query.track === 'ai' ? (
             <div className="border-iris-400/30 from-iris-400/[0.10] mb-4 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-2xl border bg-gradient-to-r via-transparent to-transparent px-4 py-3">
               <p className="text-ink-200 text-[12px]">
-                Every starter is a model-generated draft with a real flaw. Review it, fix it, prove it — the six signals
-                AI-era interviews probe:
+                In these courses every starter is a model-generated draft with a real flaw. Review it, fix it, prove it
+                — the six signals AI-era interviews probe:
               </p>
               <div className="flex flex-wrap gap-1.5">
                 {AI_SKILLS.map(skill => (
@@ -531,11 +531,6 @@ const ProblemList: FC<{
                   </span>
                 ))}
               </div>
-              <Link
-                className="text-iris-300 hover:text-iris-200 decoration-iris-400/40 text-[12px] font-semibold underline"
-                href="/mock-interview">
-                Start the timed mock ›
-              </Link>
             </div>
           ) : null}
           {shown.length === 0 ? (

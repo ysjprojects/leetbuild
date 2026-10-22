@@ -76,8 +76,8 @@ classic courses keep the Python and TypeScript harnesses described above.
 
 ## Mock interview mode
 
-`/mock-interview` is the timed practice loop, linked from the header switch and from the strip under
-the AI era tab. A scenario opens with an interviewer brief and a plausible, flawed AI draft; the learner
+`/mock-interview` is the timed practice loop, linked from the header switch and from the landing
+page's mode card. A scenario opens with an interviewer brief and a plausible, flawed AI draft; the learner
 has 20–25 minutes and an **offline AI pair** (draft, review, reveal the flaw, test idea), plus a
 button that copies a review prompt for the learner's own AI assistant. Submit grades the step with
 the same static checks the course uses. Accepted or not, the report shows the checks, what the AI got
