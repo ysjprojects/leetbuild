@@ -14,7 +14,7 @@ export const cudaReductionProblem: Problem = {
   tagline:
     'Sum 16 M floats at memory bandwidth: a grid-stride partial per thread, __shfl_down_sync across the warp, one shared slot per warp, one atomicAdd per block — checked against a Kahan sum.',
   difficulty: 'medium',
-  track: 'dl',
+  track: 'dllm',
   language: 'cuda',
   concepts: ['cuda'],
   minutes: 45,

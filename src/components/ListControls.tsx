@@ -26,7 +26,7 @@ import {type Difficulty, DIFFICULTIES} from '@/lib/types';
 
 /**
  * The rows above the problem list, LeetCode-style: a row of track tabs (All topics · Systems · AI Era ·
- * DLLM, each with its icon; the active one is inverted), then a search pill, a sort menu and a
+ * DL/LM, each with its icon; the active one is inverted), then a search pill, a sort menu and a
  * filter menu behind two round buttons (a dot marks one that is in effect), and at the right how
  * many courses of the track are solved — or, while filtering, how many rows match and the way out.
  * Every control writes to the URL through `update`; the search box keeps its own text so the caret
@@ -98,7 +98,7 @@ const AiEraIcon: FC = memo(() => (
 ));
 AiEraIcon.displayName = 'AiEraIcon';
 
-/** DLLM: a chip with pins. */
+/** DL/LM: a chip with pins. */
 const DeepLearningIcon: FC = memo(() => (
   <svg aria-hidden fill="none" height={15} stroke="currentColor" strokeWidth={1.5} viewBox="0 0 16 16" width={15}>
     <rect height={8} rx={1.2} width={8} x={4} y={4} />
@@ -112,7 +112,7 @@ DeepLearningIcon.displayName = 'DeepLearningIcon';
 const TRACK_ICON: Record<TrackFilter, {icon: FC; tint: string}> = {
   all: {icon: AllTopicsIcon, tint: 'text-ink-100'},
   systems: {icon: SystemsIcon, tint: TRACK_TINT.systems.text},
-  dl: {icon: DeepLearningIcon, tint: TRACK_TINT.dl.text},
+  dllm: {icon: DeepLearningIcon, tint: TRACK_TINT.dllm.text},
   ai: {icon: AiEraIcon, tint: TRACK_TINT.ai.text},
 };
 

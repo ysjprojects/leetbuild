@@ -676,7 +676,7 @@ const ProblemPane: FC<{
                 then submit.{' '}
                 {step.harness?.[language] !== undefined
                   ? 'Your code runs in the browser: each check exercises it and reports what it observed.'
-                  : problem.track === 'dl'
+                  : problem.track === 'dllm'
                   ? 'The checks read the shape of your code. Run the file on your own machine: the reference ends in a self-test that prints PASS.'
                   : 'The checks read the shape of your code; nothing is executed in this language.'}
               </p>

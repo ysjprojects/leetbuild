@@ -15,7 +15,7 @@ export const ptRopeProblem: Problem = {
   tagline:
     'Precompute cos/sin over positions × frequency pairs, rotate q and k in halves, gather by position for the KV cache — and watch q·k come out a function of the distance alone.',
   difficulty: 'medium',
-  track: 'dl',
+  track: 'dllm',
   language: 'python',
   concepts: ['pytorch'],
   minutes: 40,

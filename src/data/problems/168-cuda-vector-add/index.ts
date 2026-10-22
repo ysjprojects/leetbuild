@@ -30,7 +30,7 @@ export const cudaVectorAddProblem: Problem = {
   tagline:
     'c[i] = a[i] + b[i] over 4 M floats: a capped grid, a loop that covers n, every API call checked, cudaGetLastError after the launch, a synchronise before the read, events around the timing, a CPU reference and PASS.',
   difficulty: 'easy',
-  track: 'dl',
+  track: 'dllm',
   language: 'cuda',
   concepts: ['cuda'],
   minutes: 25,

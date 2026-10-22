@@ -100,9 +100,9 @@ function verifyStep(problem: Problem, step: Step, index: number): string[] {
   const tag = `${problem.id}/${step.id}`;
   const nodeIds = focusIds(problem);
   if (!/^[a-z0-9-]+$/.test(step.id)) errors.push(`${tag}: step id must be kebab-case`);
-  if (problem.track === 'dl' && step.sequence !== undefined)
+  if (problem.track === 'dllm' && step.sequence !== undefined)
     errors.push(`${tag}: a deep-learning step has no request/reply sequence (use a figure or a widget)`);
-  if (problem.track === 'dl')
+  if (problem.track === 'dllm')
     for (const [where, text] of [
       ['task', step.task],
       ['debrief', step.debrief],
@@ -197,7 +197,7 @@ function verifyProblem(problem: Problem): string[] {
   for (const what of malformedBlocksOf(problem.statement)) errors.push(`${problem.id}: statement: ${what}`);
   // The systems track draws one system diagram; the deep-learning track draws titled figures, layer
   // stacks for PyTorch models and GPU figures for CUDA kernels, as many as the problem needs.
-  if (problem.track === 'dl') {
+  if (problem.track === 'dllm') {
     const figures = problem.figures ?? [];
     const kernel = problem.language === 'cuda';
     if (figures.length === 0) errors.push(`${problem.id}: a deep-learning problem draws at least one figure`);
@@ -261,11 +261,11 @@ function verifyProblem(problem: Problem): string[] {
       if (!covered.has(concept)) errors.push(`${problem.id}: no step exercises ${concept}`);
   }
   // A fixed language is one of the deep-learning track's; a course has none.
-  if (problem.language !== undefined && problem.track !== 'dl')
+  if (problem.language !== undefined && problem.track !== 'dllm')
     errors.push(`${problem.id}: only the deep-learning track fixes a language`);
-  if (problem.track === 'dl' && problem.language === undefined)
+  if (problem.track === 'dllm' && problem.language === undefined)
     errors.push(`${problem.id}: a deep-learning problem fixes its language`);
-  if (problem.track === 'dl' && !single)
+  if (problem.track === 'dllm' && !single)
     errors.push(`${problem.id}: a deep-learning problem lists its one concept (pytorch or cuda)`);
   for (const concept of problem.concepts)
     if (!covered.has(concept)) errors.push(`${problem.id}: lists concept ${concept} but no step exercises it`);

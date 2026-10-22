@@ -15,7 +15,7 @@ export const ptCausalAttentionProblem: Problem = {
   tagline:
     'One fused qkv GEMM, heads as a view, q·kᵀ/√hd, a tril buffer as -inf before a float32 softmax, dropout, proj — equal to SDPA(is_causal=True) to 1e-5, gradchecked in float64.',
   difficulty: 'medium',
-  track: 'dl',
+  track: 'dllm',
   language: 'python',
   concepts: ['pytorch'],
   minutes: 45,

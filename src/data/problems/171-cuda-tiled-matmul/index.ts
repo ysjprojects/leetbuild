@@ -15,7 +15,7 @@ export const cudaTiledMatmulProblem: Problem = {
   tagline:
     'C = A · B with 32 × 32 tiles staged in shared memory: coalesced loads, zero padding at the edges, two __syncthreads() per tile, 32× less global traffic than the naive kernel.',
   difficulty: 'medium',
-  track: 'dl',
+  track: 'dllm',
   language: 'cuda',
   concepts: ['cuda'],
   minutes: 45,

@@ -15,7 +15,7 @@ export const cudaStreamsOverlapProblem: Problem = {
   tagline:
     '16 MiB in four chunks on four streams: pinned host buffers, cudaMemcpyAsync and launches bound to a stream, an event instead of a host sync for the carry between chunks, event timing per chunk, a synchronous baseline to beat by 1.2× and PASS.',
   difficulty: 'hard',
-  track: 'dl',
+  track: 'dllm',
   language: 'cuda',
   concepts: ['cuda'],
   minutes: 75,

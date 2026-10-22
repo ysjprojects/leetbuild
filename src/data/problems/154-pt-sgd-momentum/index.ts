@@ -14,7 +14,7 @@ export const ptSgdMomentumProblem: Problem = {
   tagline:
     'A torch.optim.Optimizer from scratch: param groups, a lazy momentum buffer in state[p], in-place updates under no_grad, a closure — matching torch.optim.SGD step for step.',
   difficulty: 'easy',
-  track: 'dl',
+  track: 'dllm',
   language: 'python',
   concepts: ['pytorch'],
   minutes: 25,

@@ -15,7 +15,7 @@ export const ptStableSoftmaxProblem: Problem = {
   tagline:
     'log_softmax by log-sum-exp with the max shifted out, softmax as its exp, cross_entropy as a gather with label smoothing and ignore_index — matching torch.nn.functional on logits near 1e4, gradients checked.',
   difficulty: 'easy',
-  track: 'dl',
+  track: 'dllm',
   language: 'python',
   concepts: ['pytorch'],
   minutes: 25,

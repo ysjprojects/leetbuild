@@ -115,10 +115,10 @@ export const DIFFICULTIES: readonly Difficulty[] = ['easy', 'medium', 'hard'];
 /**
  * Which track a problem belongs to. `systems` is the classic build-a-system track (the default
  * when omitted); `ai` is the AI-era track, where every starter is a plausible model-generated
- * draft that the learner has to review, fix and verify; `dl` is the deep-learning track — PyTorch
+ * draft that the learner has to review, fix and verify; `dllm` is the deep-learning track — PyTorch
  * and CUDA problems in a fixed language, judged by static checks and run on the learner's own machine.
  */
-export type Track = 'systems' | 'ai' | 'dl';
+export type Track = 'systems' | 'ai' | 'dllm';
 
 /**
  * What a check looks for in the learner's code once comments are stripped. Every `all` pattern

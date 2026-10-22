@@ -9,7 +9,7 @@ import {type Difficulty, type Problem, type Track, CONCEPT_LABEL, DIFFICULTIES} 
 export type StatusFilter = 'all' | 'open' | 'started' | 'solved';
 export type SortKey = 'order' | 'difficulty' | 'points' | 'minutes' | 'progress' | 'title';
 /** The tabs above the list, LeetCode-style: every course, the classic systems track, or the AI-era track. */
-export type TrackFilter = 'all' | 'systems' | 'ai' | 'dl';
+export type TrackFilter = 'all' | 'systems' | 'ai' | 'dllm';
 
 export interface ListQuery {
   /** Which track the list shows; a view rather than a filter, so `reset` and "clear" leave it alone. */
@@ -35,23 +35,23 @@ export const DEFAULT_LIST_QUERY: ListQuery = {
   desc: false,
 };
 
-export const TRACK_LABEL: Record<Track, string> = {systems: 'Systems', ai: 'AI Era', dl: 'DLLM'};
+export const TRACK_LABEL: Record<Track, string> = {systems: 'Systems', ai: 'AI Era', dllm: 'DL/LM'};
 
 /** What a short label stands for, shown when the pointer rests on it. */
-export const TRACK_HINT: Partial<Record<Track, string>> = {dl: 'Deep Learning / Language Models'};
+export const TRACK_HINT: Partial<Record<Track, string>> = {dllm: 'Deep Learning / Language Models'};
 
 /** Each track's colour: its tab icon wears `text`, its progress bar on the profile `bg`. */
 export const TRACK_TINT: Record<Track, {text: string; bg: string}> = {
   systems: {text: 'text-warning-300', bg: 'bg-warning-300'},
   ai: {text: 'text-iris-300', bg: 'bg-iris-300'},
-  dl: {text: 'text-concept-cuda', bg: 'bg-concept-cuda'},
+  dllm: {text: 'text-concept-cuda', bg: 'bg-concept-cuda'},
 };
 
 export const TRACKS: readonly {key: TrackFilter; label: string; hint?: string}[] = [
   {key: 'all', label: 'All topics'},
   {key: 'systems', label: TRACK_LABEL.systems},
   {key: 'ai', label: TRACK_LABEL.ai},
-  {key: 'dl', label: TRACK_LABEL.dl, hint: TRACK_HINT.dl},
+  {key: 'dllm', label: TRACK_LABEL.dllm, hint: TRACK_HINT.dllm},
 ];
 
 export const inTrack = (problem: Problem, track: TrackFilter): boolean =>
@@ -166,7 +166,7 @@ export function parseListQuery(params: Record<string, string | string[] | undefi
   const status = one(params.status);
   const sort = one(params.sort);
   return {
-    track: track === 'systems' || track === 'ai' || track === 'dl' ? track : 'all',
+    track: track === 'systems' || track === 'ai' || track === 'dllm' ? track : 'all',
     q: one(params.q) ?? '',
     difficulty: (DIFFICULTIES as readonly string[]).includes(difficulty ?? '') ? (difficulty as Difficulty) : 'all',
     status: status !== undefined && status in STATUS_LABEL && status !== 'all' ? (status as StatusFilter) : 'all',

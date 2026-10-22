@@ -15,7 +15,7 @@ export const ptMoeRouterProblem: Problem = {
   tagline:
     'A router that picks k of E experts per token and the Switch loss that keeps it honest, a per-expert dispatch under a capacity, and a combine that still sends gradients to the gate.',
   difficulty: 'hard',
-  track: 'dl',
+  track: 'dllm',
   language: 'python',
   concepts: ['pytorch'],
   minutes: 75,

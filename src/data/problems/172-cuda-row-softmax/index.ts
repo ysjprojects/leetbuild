@@ -15,7 +15,7 @@ export const cudaRowSoftmaxProblem: Problem = {
   tagline:
     'softmax over each row of a 4096 × 1000 fp32 matrix: one block per row, a block max and a block sum through __shfl_xor_sync and shared memory, exp(x − max) so 1e4 logits survive, a masked row of zeros, a CPU reference and PASS.',
   difficulty: 'medium',
-  track: 'dl',
+  track: 'dllm',
   language: 'cuda',
   concepts: ['cuda'],
   minutes: 45,

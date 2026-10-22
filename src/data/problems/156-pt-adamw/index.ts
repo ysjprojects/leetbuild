@@ -14,7 +14,7 @@ export const ptAdamwProblem: Problem = {
   tagline:
     'Subclass torch.optim.Optimizer: lazy state, EMAs of g and g², bias correction from the step count, weight decay on the parameter — and match torch.optim.AdamW to 1e-7.',
   difficulty: 'medium',
-  track: 'dl',
+  track: 'dllm',
   language: 'python',
   concepts: ['pytorch'],
   minutes: 45,

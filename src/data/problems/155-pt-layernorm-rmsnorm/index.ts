@@ -14,7 +14,7 @@ export const ptLayernormRmsnormProblem: Problem = {
   tagline:
     'Centre and scale a row with the biased variance, or scale it by its root mean square — eps under the root, rsqrt, and the statistic taken in float32 even when the model runs in bfloat16.',
   difficulty: 'easy',
-  track: 'dl',
+  track: 'dllm',
   language: 'python',
   concepts: ['pytorch'],
   minutes: 25,

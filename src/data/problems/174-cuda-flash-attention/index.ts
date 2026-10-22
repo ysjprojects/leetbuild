@@ -15,7 +15,7 @@ export const cudaFlashAttentionProblem: Problem = {
   tagline:
     'softmax(QKᵀ)V for one head in one kernel: K/V tiles in shared memory, scores in registers, online softmax with a running max and sum, causal tiles skipped — no T × T matrix ever hits global memory.',
   difficulty: 'hard',
-  track: 'dl',
+  track: 'dllm',
   language: 'cuda',
   concepts: ['cuda'],
   minutes: 75,

@@ -15,7 +15,7 @@ export const cudaWmmaMatmulProblem: Problem = {
   tagline:
     'C = A · B with fp16 inputs and fp32 accumulation on tensor cores: wmma fragments of 16 × 16 × 16, one warp per output tile, the right leading dimensions, a shared-memory-staged 64 × 64 block tile, padding to multiples of 16, a CPU reference and a TFLOP/s line against tiled fp32.',
   difficulty: 'hard',
-  track: 'dl',
+  track: 'dllm',
   language: 'cuda',
   concepts: ['cuda'],
   minutes: 75,

@@ -1,7 +1,15 @@
 import Link from 'next/link';
 import {type FC, memo, useCallback, useMemo, useState} from 'react';
 
-import {applyListQuery, inTrack, problemStatus, TRACK_HINT, TRACK_LABEL, TRACK_TINT} from '@/lib/catalog';
+import {
+  type TrackFilter,
+  applyListQuery,
+  inTrack,
+  problemStatus,
+  TRACK_HINT,
+  TRACK_LABEL,
+  TRACK_TINT,
+} from '@/lib/catalog';
 import {type Streak, activityByDay, badgeProgress, BADGES, stepOfTheDay} from '@/lib/gamify';
 import {useListQuery} from '@/lib/listQuery';
 import {type Profile, type StepAttempt, OPEN_ATTEMPT, problemScore, rankProgress} from '@/lib/scoring';
@@ -360,21 +368,84 @@ const StepSquares: FC<{problem: Problem; attempts: Record<string, StepAttempt>}>
 StepSquares.displayName = 'StepSquares';
 
 /**
- * What the AI-era track asks an interviewer to see, shown as a strip under the toolbar while that
- * tab is selected: not "can you prompt", but can you specify, delegate, verify, evaluate, secure and
- * operate a system whose core is a model.
+ * What a track asks of the learner, as a strip under the toolbar while its tab is selected: how its
+ * courses work in a line, then the skills they test as chips that explain themselves on hover. The
+ * AI-era track is not "can you prompt" but can you specify, delegate, verify, evaluate, secure and
+ * operate a system whose core is a model; the DL/LM track writes the internals of frontier models.
  */
-const AI_SKILLS: readonly {title: string; body: string}[] = [
-  {title: 'Specify', body: 'Turn an ambiguous ask into interfaces, budgets and acceptance criteria.'},
-  {title: 'Delegate', body: 'Use models where they help; make prompts, versions and fallbacks explicit.'},
-  {title: 'Verify', body: 'Review the generated draft, test the edge cases, and reject what you cannot prove.'},
-  {title: 'Evaluate', body: 'Golden sets, calibrated judges, regression gates and online metrics.'},
-  {
-    title: 'Secure',
-    body: 'Treat retrieved text and tool output as untrusted; scope tenants, allowlists and approvals.',
+const TRACK_BRIEF: Partial<
+  Record<TrackFilter, {lead: string; skills: readonly {title: string; body: string}[]; frame: string; chip: string}>
+> = {
+  ai: {
+    lead: 'In these courses every starter is a model-generated draft with a real flaw. Review it, fix it, prove it. The six signals AI-era interviews probe:',
+    skills: [
+      {title: 'Specify', body: 'Turn an ambiguous ask into interfaces, budgets and acceptance criteria.'},
+      {title: 'Delegate', body: 'Use models where they help; make prompts, versions and fallbacks explicit.'},
+      {title: 'Verify', body: 'Review the generated draft, test the edge cases, and reject what you cannot prove.'},
+      {title: 'Evaluate', body: 'Golden sets, calibrated judges, regression gates and online metrics.'},
+      {
+        title: 'Secure',
+        body: 'Treat retrieved text and tool output as untrusted; scope tenants, allowlists and approvals.',
+      },
+      {title: 'Operate', body: 'Token and cost budgets, latency SLOs, retries, idempotency and traces.'},
+    ],
+    frame: 'border-iris-400/30 from-iris-400/[0.10]',
+    chip: 'border-iris-400/30 bg-iris-400/[0.08] text-iris-200',
   },
-  {title: 'Operate', body: 'Token and cost budgets, latency SLOs, retries, idempotency and traces.'},
-];
+  dllm: {
+    lead: 'In these courses you write the internals of frontier models from scratch, in PyTorch or CUDA. The six skills they test:',
+    skills: [
+      {
+        title: 'Architecture',
+        body: 'Attention, RoPE, norms, a GPT-2 block, MoE routing, LoRA and diffusion from their equations, every tensor shape accounted for.',
+      },
+      {
+        title: 'Numerics',
+        body: 'Finite and exact at the edges: max-shifted softmax, float32 statistics under bf16, loss scaling, Welford merges.',
+      },
+      {
+        title: 'Training',
+        body: 'Optimizer state, warmup and cosine, gradient clipping and accumulation, mixed precision.',
+      },
+      {
+        title: 'Parallelism',
+        body: 'Work mapped onto the GPU: grids, blocks, warps, shuffles, shared-memory tiles and barriers.',
+      },
+      {
+        title: 'Bandwidth',
+        body: 'Fewer bytes moved: coalesced and vector loads, fusion, tiling, tensor cores, copies overlapped with compute.',
+      },
+      {
+        title: 'Verification',
+        body: 'Proof against a reference: PyTorch to 1e-5, gradcheck in float64, a CPU reference, then PASS.',
+      },
+    ],
+    frame: 'border-concept-cuda/30 from-concept-cuda/[0.10]',
+    chip: 'border-concept-cuda/30 bg-concept-cuda/[0.08] text-concept-cuda',
+  },
+};
+
+const TrackBrief: FC<{track: TrackFilter}> = memo(({track}) => {
+  const brief = TRACK_BRIEF[track];
+  if (brief === undefined) return null;
+  return (
+    <div
+      className={`${brief.frame} mb-4 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-2xl border bg-gradient-to-r via-transparent to-transparent px-4 py-3`}>
+      <p className="text-ink-200 text-[12px]">{brief.lead}</p>
+      <div className="flex flex-wrap gap-1.5">
+        {brief.skills.map(skill => (
+          <span
+            className={`${brief.chip} rounded-full border px-2.5 py-0.5 text-[11px] font-semibold`}
+            key={skill.title}
+            title={skill.body}>
+            {skill.title}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+});
+TrackBrief.displayName = 'TrackBrief';
 
 const ProblemRow: FC<{
   problem: Problem;
@@ -511,24 +582,7 @@ const ProblemList: FC<{
               update={update}
             />
           </div>
-          {query.track === 'ai' ? (
-            <div className="border-iris-400/30 from-iris-400/[0.10] mb-4 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-2xl border bg-gradient-to-r via-transparent to-transparent px-4 py-3">
-              <p className="text-ink-200 text-[12px]">
-                In these courses every starter is a model-generated draft with a real flaw. Review it, fix it, prove it.
-                The six signals AI-era interviews probe:
-              </p>
-              <div className="flex flex-wrap gap-1.5">
-                {AI_SKILLS.map(skill => (
-                  <span
-                    className="border-iris-400/30 bg-iris-400/[0.08] text-iris-200 rounded-full border px-2.5 py-0.5 text-[11px] font-semibold"
-                    key={skill.title}
-                    title={skill.body}>
-                    {skill.title}
-                  </span>
-                ))}
-              </div>
-            </div>
-          ) : null}
+          <TrackBrief track={query.track} />
           {shown.length === 0 ? (
             <p className="border-ink-700 text-ink-300 rounded-xl border border-dashed px-4 py-6 text-center text-[12px]">
               No course matches{query.q.trim() !== '' ? ` “${query.q.trim()}”` : ''} with these filters.{' '}

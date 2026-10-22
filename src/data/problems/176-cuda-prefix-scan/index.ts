@@ -18,7 +18,7 @@ export const cudaPrefixScanProblem: Problem = {
   tagline:
     'Exclusive scan of a million ints: an up-sweep and a down-sweep over a padded shared tile per block, block totals scanned by the same function and added back, 2n adds instead of n log n, max abs error 0 and PASS.',
   difficulty: 'hard',
-  track: 'dl',
+  track: 'dllm',
   language: 'cuda',
   concepts: ['cuda'],
   minutes: 75,

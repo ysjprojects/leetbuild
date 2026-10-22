@@ -14,7 +14,7 @@ export const ptLrScheduleClipProblem: Problem = {
   tagline:
     'lr_at(step) by hand, clip_grad_norm_ by hand, and a train_step that accumulates four micro-batches into exactly one big-batch gradient before it clips, sets the LR and steps.',
   difficulty: 'medium',
-  track: 'dl',
+  track: 'dllm',
   language: 'python',
   concepts: ['pytorch'],
   minutes: 45,

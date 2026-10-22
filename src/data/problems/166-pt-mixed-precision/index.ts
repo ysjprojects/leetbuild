@@ -14,7 +14,7 @@ export const ptMixedPrecisionProblem: Problem = {
   tagline:
     'Run the forward in bf16 under torch.autocast, keep the weights in fp32, and write the loss scaler: scale, unscale in place, detect inf/nan, skip and back off, grow after N clean steps.',
   difficulty: 'hard',
-  track: 'dl',
+  track: 'dllm',
   language: 'python',
   concepts: ['pytorch'],
   minutes: 75,

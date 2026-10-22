@@ -62,10 +62,10 @@ course content, `AGENTS.md`, or the mock-interview feature unless the user names
 
 ## Content rules
 
-- Every problem has `Problem.track?: 'systems' | 'dl' | 'ai'`; omitted means the systems track.
+- Every problem has `Problem.track?: 'systems' | 'dllm' | 'ai'`; omitted means the systems track.
 - The AI-era courses are `src/data/problems/16-ai-gateway/` and `17-rag-service/`. Their starters
   are plausible model-generated drafts with a real flaw; their solutions are the review fix.
-- All five languages are mandatory in every step of a course. A deep-learning problem (`track: 'dl'`)
+- All five languages are mandatory in every step of a course. A deep-learning problem (`track: 'dllm'`)
   fixes one language instead — `language: 'python'` (PyTorch) or `'cuda'` — and its steps carry code
   and matchers for that language only; it has no harness, and its reference solution is a complete
   program ending in a self-test the learner runs on their own machine. The catalogue maximum is the

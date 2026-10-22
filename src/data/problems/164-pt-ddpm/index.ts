@@ -15,7 +15,7 @@ export const ptDdpmProblem: Problem = {
   tagline:
     'Precompute ᾱ_t as buffers, noise x_0 to any t in one step, train an ε-predictor with plain MSE — then sample T → 0 and with 50-step DDIM onto two moons.',
   difficulty: 'hard',
-  track: 'dl',
+  track: 'dllm',
   language: 'python',
   concepts: ['pytorch'],
   minutes: 80,

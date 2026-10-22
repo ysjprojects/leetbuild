@@ -14,7 +14,7 @@ export const ptFlashAttentionTiledProblem: Problem = {
   tagline:
     'Exact causal attention one [block_q, block_k] tile at a time: a running max and sum per row, rescaled by exp(m_old − m_new), the causal mask inside the tile, never a [T, T] matrix.',
   difficulty: 'hard',
-  track: 'dl',
+  track: 'dllm',
   language: 'python',
   concepts: ['pytorch'],
   minutes: 75,

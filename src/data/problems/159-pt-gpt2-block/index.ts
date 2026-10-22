@@ -14,7 +14,7 @@ export const ptGpt2BlockProblem: Problem = {
   tagline:
     'Pre-LN, two residuals, a 4× MLP with the tanh GELU, and the init GPT-2 ships with — one Block that a model repeats n_layer times.',
   difficulty: 'medium',
-  track: 'dl',
+  track: 'dllm',
   language: 'python',
   concepts: ['pytorch'],
   minutes: 40,

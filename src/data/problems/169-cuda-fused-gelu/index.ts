@@ -15,7 +15,7 @@ export const cudaFusedGeluProblem: Problem = {
   tagline:
     "y = gelu(x + bias) over GPT-2 small's 4096 × 3072 MLP activation in one pass: float4 loads and stores, the tanh approximation in single precision, __restrict__ pointers, a scalar tail for n % 4, and a bandwidth line in GB/s.",
   difficulty: 'easy',
-  track: 'dl',
+  track: 'dllm',
   language: 'cuda',
   concepts: ['cuda'],
   minutes: 25,

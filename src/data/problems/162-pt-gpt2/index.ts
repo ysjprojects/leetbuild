@@ -16,7 +16,7 @@ export const ptGpt2Problem: Problem = {
   tagline:
     'Write GPT-2 small as nanoGPT does — tied head, residual-scaled init, cross-entropy over every position — then train it with AdamW, warmup + cosine and bf16, and sample from it with top-k, nucleus and a KV cache.',
   difficulty: 'hard',
-  track: 'dl',
+  track: 'dllm',
   language: 'python',
   concepts: ['pytorch'],
   minutes: 90,

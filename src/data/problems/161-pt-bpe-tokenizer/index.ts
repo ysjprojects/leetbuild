@@ -14,7 +14,7 @@ export const ptBpeTokenizerProblem: Problem = {
   tagline:
     'Count adjacent byte pairs, merge the most frequent, repeat; encode by replaying the merges in rank order; decode bytes that may not be a whole character.',
   difficulty: 'medium',
-  track: 'dl',
+  track: 'dllm',
   language: 'python',
   concepts: ['pytorch'],
   minutes: 45,

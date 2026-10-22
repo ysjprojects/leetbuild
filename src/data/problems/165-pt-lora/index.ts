@@ -14,7 +14,7 @@ export const ptLoraProblem: Problem = {
   tagline:
     'Wrap a frozen nn.Linear with B @ A scaled by alpha / r, B = 0 at start: the identity at step 0, under 1 % of the parameters trained, merged into W for zero-cost inference.',
   difficulty: 'hard',
-  track: 'dl',
+  track: 'dllm',
   language: 'python',
   concepts: ['pytorch'],
   minutes: 75,

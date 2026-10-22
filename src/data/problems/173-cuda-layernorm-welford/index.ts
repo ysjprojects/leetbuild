@@ -16,7 +16,7 @@ export const cudaLayernormWelfordProblem: Problem = {
   tagline:
     'One block per row: Welford per thread, Chan’s merge through warp shuffles and shared memory, rsqrtf, mean and rstd saved for a backward that reduces Σ dy·γ and Σ dy·γ·x̂ per row and sums dγ, dβ from per-block partials — exact on rows at 1000 where E[x²] − E[x]² is not.',
   difficulty: 'hard',
-  track: 'dl',
+  track: 'dllm',
   language: 'cuda',
   concepts: ['cuda'],
   minutes: 80,
