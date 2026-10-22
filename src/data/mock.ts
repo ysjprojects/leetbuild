@@ -1091,6 +1091,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'semantic-cache-the-cache-that-answered-a-different-question',
+    problemId: 'semantic-cache',
+    stepId: 'endpoint',
+    title: 'The cache that answered a different question',
+    blurb: 'A zero threshold let unrelated questions hit.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A cached answer about refunds was served for a question about delivery, because the draft accepted a similarity threshold of zero from the caller and the tenant indexes were shared. Review it, fix it, and prove similarity floors and tenant scoping.',
+    signals: ['Evaluate', 'Secure', 'Verify'],
+    aiNote:
+      'The draft lets the caller set the similarity threshold with no floor, so a zero turns the nearest entry into a hit regardless of meaning, and it indexes all tenants in one vector index, so a similar question from one tenant can be answered with another tenant’s cached response.',
+    testIdea:
+      'Request with threshold zero and assert the service enforces its floor; insert two similar queries from different tenants and assert no cross-tenant hit; write an entry whose answer failed and assert no lookup hits it.',
+    followUps: [
+      'What similarity floor is defensible, and how would you calibrate it?',
+      'When should an answer be uncacheable?',
+      'How would you age out stale answers without losing the audit of what was served?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
