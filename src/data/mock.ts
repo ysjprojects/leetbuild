@@ -585,6 +585,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'crawl-index-the-crawler-that-hammered-one-host',
+    problemId: 'crawl-index',
+    stepId: 'endpoint',
+    title: 'The crawler that hammered one host',
+    blurb: 'A global queue let one host absorb the whole rate budget.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A blog host saw a thousand requests in a minute while the rest of the crawl idled, because the draft used one global queue with one shared rate bucket. The same draft retried 403s forever. Review it, fix it, and prove per-host politeness and terminal failure handling.',
+    signals: ['Operate', 'Specify', 'Verify'],
+    aiNote:
+      'The draft keeps a single global frontier and one rate bucket, so all crawl capacity can land on one host, and its retry policy treats a 403 as transient, replaying it forever while the shard head never advances.',
+    testIdea:
+      'Seed three hosts with different rates and assert requests per host match each bucket; answer 403 for one URL and assert it is recorded refused and popped; assert the frontier heads keep moving while a host is backed off.',
+    followUps: [
+      "How would you adapt crawl rate to a host's observed capacity?",
+      'What makes a coverage number honest when a site is partly refused?',
+      'When should a crawl stop entirely for a target?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */

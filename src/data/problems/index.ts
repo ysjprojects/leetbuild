@@ -39,6 +39,7 @@ import {recommendationRankingProblem} from './35-recommendation-ranking/index';
 import {moderationServiceProblem} from './36-moderation-service/index';
 import {piiRedactorProblem} from './37-pii-redactor/index';
 import {connectorHubProblem} from './38-connector-hub/index';
+import {crawlIndexProblem} from './39-crawl-index/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -69,6 +70,7 @@ export const problems: Problem[] = [
   moderationServiceProblem,
   piiRedactorProblem,
   connectorHubProblem,
+  crawlIndexProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
