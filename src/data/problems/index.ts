@@ -44,6 +44,7 @@ import {knowledgeGraphProblem} from './40-knowledge-graph/index';
 import {quotaBrokerProblem} from './41-quota-broker/index';
 import {modelAuditProblem} from './42-model-audit/index';
 import {promptCacheProblem} from './43-prompt-cache/index';
+import {toolRegistryProblem} from './44-tool-registry/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -79,6 +80,7 @@ export const problems: Problem[] = [
   quotaBrokerProblem,
   modelAuditProblem,
   promptCacheProblem,
+  toolRegistryProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
