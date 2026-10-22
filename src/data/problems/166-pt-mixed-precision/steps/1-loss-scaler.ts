@@ -14,7 +14,7 @@ export const lossScalerStep: Step = {
   title: 'autocast forward, scaled backward, unscale, clip, step — or skip',
   concept: 'pytorch',
   file: 'mixed_precision',
-  focus: ['autocast', 'scaler', 'optimizer'],
+  focus: ['zero', 'forward', 'loss', 'scale', 'backward', 'unscale', 'check', 'clip', 'skip', 'step', 'update'],
   task: `## Task
 
 Implement \`class DynamicLossScaler\` and \`train_step(model, batch, optimizer, scaler, dtype=torch.bfloat16, max_norm=1.0)\`
@@ -31,6 +31,28 @@ in \`mixed_precision.py\`. The parameters are float32 throughout; only the forwa
   non-finite gradient it **skips** \`optimizer.step()\`, multiplies the scale by \`backoff_factor\` and resets
   the good-step counter; otherwise it steps, counts, and after \`growth_interval\` consecutive good steps
   multiplies the scale by \`growth_factor\` and resets the counter. Either way the next step starts fresh.
+
+:::architecture
+{
+  "input": "step(optimizer)",
+  "output": "returns stepped",
+  "items": [
+    {"id": "s-flag", "label": "found_inf", "sub": "runs unscale_ first if needed", "kind": "io"},
+    {"columns": [
+      [
+        {"id": "s-skip", "label": "Non-finite: skip", "sub": "weights untouched"},
+        {"id": "s-back", "label": "Back off", "sub": "scale × 0.5 · counter = 0"}
+      ],
+      [
+        {"id": "s-step", "label": "Finite: optimizer.step()", "sub": "counter += 1"},
+        {"id": "s-grow", "label": "Grow at the interval", "sub": "N in a row: scale × 2, reset"}
+      ]
+    ]},
+    {"id": "s-reset", "label": "Clear found_inf", "sub": "next step starts fresh", "kind": "io"}
+  ]
+}
+:::
+
 - \`state_dict()\` → \`{"scale", "growth_factor", "backoff_factor", "growth_interval", "growth_tracker"}\`;
   \`load_state_dict(state)\` restores them.
 - \`train_step\`: \`optimizer.zero_grad(set_to_none=True)\`; the forward under
@@ -50,58 +72,12 @@ in \`mixed_precision.py\`. The parameters are float32 throughout; only the forwa
 
 > Multiply the loss by a large power of two so no gradient underflows in half precision, divide the
 > gradients by it before the optimizer sees them, and let an overflow — a gradient that is \`inf\` or \`nan\`
-> — skip the step and shrink the scale: that is all mixed precision adds to a training loop.`,
-  sequence: {
-    participants: ['train_step', 'autocast', 'model (fp32 weights)', 'DynamicLossScaler', 'optimizer'],
-    messages: [
-      {from: 'train_step', to: 'optimizer', label: 'zero_grad(set_to_none=True)', kind: 'sync'},
-      {from: 'train_step', to: 'autocast', label: 'with torch.autocast("cpu", dtype=bfloat16): model(x)', kind: 'sync'},
-      {
-        from: 'autocast',
-        to: 'model (fp32 weights)',
-        label: 'Linear: fp32 weight → bf16 copy, bf16 matmul',
-        kind: 'sync',
-      },
-      {
-        from: 'model (fp32 weights)',
-        to: 'train_step',
-        label: 'logits bf16 → cross_entropy(logits.float(), y) fp32',
-        kind: 'reply',
-      },
-      {from: 'train_step', to: 'DynamicLossScaler', label: 'scale(loss) → loss × 65536', kind: 'sync'},
-      {
-        from: 'train_step',
-        to: 'model (fp32 weights)',
-        label: '.backward(): every .grad is fp32, × 65536',
-        kind: 'sync',
-      },
-      {
-        from: 'train_step',
-        to: 'DynamicLossScaler',
-        label: 'unscale_(optimizer): grads ÷ 65536 in place · isfinite per group',
-        kind: 'sync',
-      },
-      {
-        from: 'train_step',
-        to: 'model (fp32 weights)',
-        label: 'clip_grad_norm_(parameters, 1.0) on true gradients',
-        kind: 'sync',
-      },
-      {from: 'train_step', to: 'DynamicLossScaler', label: 'step(optimizer)', kind: 'sync'},
-      {
-        from: 'DynamicLossScaler',
-        to: 'optimizer',
-        label: 'finite → step(); good steps += 1; 2000 in a row → scale × 2',
-        kind: 'sync',
-      },
-      {
-        from: 'DynamicLossScaler',
-        to: 'train_step',
-        label: 'inf/nan → no step, scale × 0.5, counter = 0 → stepped = False',
-        kind: 'reply',
-      },
-    ],
-  },
+> — skip the step and shrink the scale: that is all mixed precision adds to a training loop.
+
+Slide a value down through fp16's range to see where it flushes to zero, then move the loss scale and
+watch the gradient histogram lift clear of the underflow cliff:
+
+:::widget float-formats`,
   hints: [
     'Keep three numbers: the scale, the count of consecutive good steps, and whether the current step overflowed (`None` until `unscale_` ran). `scale(loss)` is `loss * self._scale`; `step` consults the flag, acts, and sets it back to `None`.',
     'In `unscale_`, per group: `grads = [p.grad for p in group["params"] if p.grad is not None]`, then `torch._foreach_div_(grads, self._scale)` (or `g.div_` in a loop) and one reduction: `torch.stack([torch.isfinite(g).all() for g in grads]).all()` — `bool(...)` of that is the group\'s single host sync.',

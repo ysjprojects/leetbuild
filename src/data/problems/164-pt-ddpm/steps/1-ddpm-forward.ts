@@ -5,7 +5,7 @@ export const ddpmForwardStep: Step = {
   title: 'The schedule, q(x_t | x_0) in one step, and the simple loss',
   concept: 'pytorch',
   file: 'ddpm_schedule',
-  focus: ['schedule', 'forward', 'model'],
+  focus: ['x0', 'draw', 'q-sample', 'eps-train', 'loss'],
   task: `## Task
 
 Implement the training half of a DDPM (Ho et al. 2020) over 2-D points: a \`NoiseSchedule(nn.Module)\`
@@ -32,6 +32,10 @@ provided and must stay as they are.
   unweighted MSE of the paper's Algorithm 1.
 - No \`diffusers\` and no scheduler classes; the constants are yours.
 
+The schedule decides how fast the signal fades. Drag the timestep and compare the two schedules' \`ᾱ_t\`:
+
+:::widget diffusion-noise {"schedule": "cosine"}
+
 The file ends with a self-test: \`alphas_cumprod\` strictly decreasing in \`(0, 1]\` for both kinds,
 \`posterior_variance[0] == 0\` and \`≤ betas\`, \`q_sample\` marginal statistics over 200 000 draws (mean
 \`√ᾱ_t · x0\`, variance \`1 − ᾱ_t\`, both to \`1e-2\`), and the loss falling to under 70 % of its first
@@ -40,23 +44,6 @@ twenty steps after \`train_toy\` — then \`PASS\`.
 > One formula replaces the chain: because every step adds independent Gaussian noise, \`x_t\` given \`x_0\`
 > is itself Gaussian with mean \`√ᾱ_t x_0\` and variance \`1 − ᾱ_t\`, so training picks any \`t\` at random
 > and never simulates the \`t − 1\` steps before it.`,
-  sequence: {
-    participants: ['train_toy', 'NoiseSchedule', 'TinyDenoiser'],
-    messages: [
-      {from: 'train_toy', to: 'NoiseSchedule', label: 'ddpm_loss(model, x0)  x0: (512, 2)', kind: 'sync'},
-      {
-        from: 'NoiseSchedule',
-        to: 'NoiseSchedule',
-        label: 't ~ randint(0, T, (512,)) · noise ~ randn_like(x0)',
-        kind: 'sync',
-      },
-      {from: 'NoiseSchedule', to: 'NoiseSchedule', label: 'x_t = √ᾱ_t · x0 + √(1 − ᾱ_t) · noise', kind: 'sync'},
-      {from: 'NoiseSchedule', to: 'TinyDenoiser', label: 'model(x_t, t)', kind: 'sync'},
-      {from: 'TinyDenoiser', to: 'NoiseSchedule', label: 'ε̂: (512, 2)', kind: 'reply'},
-      {from: 'NoiseSchedule', to: 'train_toy', label: 'F.mse_loss(ε̂, noise)', kind: 'reply'},
-      {from: 'train_toy', to: 'train_toy', label: 'zero_grad · backward · Adam step', kind: 'sync'},
-    ],
-  },
   hints: [
     'Build everything in float64 from `betas`: `alphas = 1 - betas`, `alphas_cumprod = torch.cumprod(alphas, dim=0)`, `alphas_cumprod_prev = torch.cat([torch.ones(1, dtype=torch.float64), alphas_cumprod[:-1]])`. Put the seven tensors in a dict and loop `self.register_buffer(name, value.float())`.',
     'The cosine schedule is defined through ᾱ, not β: compute `f` on `T + 1` grid points, normalise by `f[0]`, and take `betas = 1 - alphas_bar[1:] / alphas_bar[:-1]`; the clamp at 0.999 keeps the last steps from being pure noise.',

@@ -12,7 +12,7 @@ export const bpeStep: Step = {
   title: 'BPETokenizer: train the merges, encode in rank order, decode bytes',
   concept: 'pytorch',
   file: 'bpe',
-  focus: ['train', 'merges', 'codec'],
+  focus: ['utf8', 'count', 'pick', 'record', 'replace', 'lowest', 'apply', 'ids', 'lookup', 'utf8-decode'],
   task: `## Task
 
 Implement \`BPETokenizer\` in \`bpe.py\`: a byte-level BPE tokenizer with the training loop, the
@@ -28,6 +28,9 @@ rank-ordered encoder, the lossless-or-replaced decoder and a JSON merge file. Pu
   corpus, which is what \`max(counts, key=counts.get)\` gives — stop early if it occurs fewer than
   twice, otherwise append it to \`merges\`, add its bytes to \`vocab\` and replace every occurrence in
   \`ids\` by the new id. Return \`ids\` as the last merge left them.
+
+:::widget bpe-merges
+
 - **\`encode(text) -> list[int]\`.** \`ids = list(text.encode("utf-8"))\`; while two or more ids remain,
   find the adjacent pair with the **lowest rank** (\`min\` over \`zip(ids, ids[1:])\` keyed by
   \`ranks.get(pair, float("inf"))\`), stop if it has no rank, otherwise merge every occurrence into
@@ -44,27 +47,6 @@ rank-ordered encoder, the lossless-or-replaced decoder and a JSON merge file. Pu
 
 > The merge list is the model. Training decides its order by frequency; encoding must replay that
 > order — lowest rank first — or it produces token sequences the network never saw.`,
-  sequence: {
-    participants: ['train', 'ids', 'merges · vocab', 'encode', 'decode'],
-    messages: [
-      {from: 'train', to: 'ids', label: 'text.encode("utf-8") → 98 byte ids', kind: 'sync'},
-      {from: 'train', to: 'ids', label: 'Counter(zip(ids, ids[1:])) → (101, 115) × 9 first among ties', kind: 'sync'},
-      {from: 'train', to: 'merges · vocab', label: 'merges[0] = (101, 115) · vocab[256] = b"es"', kind: 'sync'},
-      {from: 'train', to: 'ids', label: 'replace every (101, 115) by 256', kind: 'sync'},
-      {
-        from: 'train',
-        to: 'merges · vocab',
-        label: 'merges[1] = (256, 116) · vocab[257] = b"est" … until vocab_size',
-        kind: 'sync',
-      },
-      {from: 'ids', to: 'train', label: 'final ids (the training segmentation)', kind: 'reply'},
-      {from: 'encode', to: 'ids', label: 'bytes of new text', kind: 'sync'},
-      {from: 'encode', to: 'merges · vocab', label: 'min rank among adjacent pairs → merge all; repeat', kind: 'sync'},
-      {from: 'merges · vocab', to: 'encode', label: 'no pair has a rank → ids', kind: 'reply'},
-      {from: 'decode', to: 'merges · vocab', label: 'vocab[id] for each id', kind: 'sync'},
-      {from: 'merges · vocab', to: 'decode', label: 'b"".join(...).decode("utf-8", errors="replace")', kind: 'reply'},
-    ],
-  },
   hints: [
     'Write `_merge(ids, pair, new_id)` first: walk `ids` left to right, emit `new_id` and skip two when `ids[i], ids[i+1] == pair`, else emit `ids[i]`. Both `train` and `encode` are loops around it.',
     'In `train`, `Counter(zip(ids, ids[1:]))` counts pairs in corpus order, so `max(counts, key=counts.get)` returns the first-seen pair among equals — that is the tie-break. The new id is `256 + len(self.merges)` before you append.',

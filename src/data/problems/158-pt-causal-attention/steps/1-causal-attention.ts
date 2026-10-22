@@ -5,7 +5,7 @@ export const causalAttentionStep: Step = {
   title: 'CausalSelfAttention: fused qkv, heads, tril mask, float32 softmax, proj',
   concept: 'pytorch',
   file: 'causal_attention',
-  focus: ['qkv', 'attn', 'mask', 'proj'],
+  focus: ['qkv', 'q', 'k', 'v', 'scores', 'mask', 'softmax', 'dropout', 'wsum', 'merge', 'proj'],
   task: `## Task
 
 Implement \`CausalSelfAttention(nn.Module)\` with \`__init__(self, d_model, n_heads, dropout=0.0, max_len=1024)\`
@@ -25,6 +25,9 @@ and \`forward(self, x, attn_mask=None)\` → \`[B, T, d_model]\`, where position
 - **Mask before the softmax** with \`masked_fill(~mask, float("-inf"))\`; the softmax runs over the last dim
   in **float32 or wider** (\`dtype=torch.float32\` for half inputs, never downcasting a float64 input), then
   casts back to \`v.dtype\`.
+
+:::widget attention-heatmap {"causal": true}
+
 - \`self.attn_dropout = nn.Dropout(dropout)\` on the probabilities, then \`probs @ v\`, merge heads,
   \`self.proj = nn.Linear(d_model, d_model)\`.
 - The file ends with the self-test: \`torch.manual_seed(0)\`, \`B, T, D, H = 2, 8, 32, 4\`, equality with
@@ -36,21 +39,6 @@ and \`forward(self, x, attn_mask=None)\` → \`[B, T, d_model]\`, where position
 > The mask must zero the *probability*, not the score: \`-inf\` before the softmax makes \`exp\` return exactly
 > 0 and leaves the row normalised over the past alone. Masking after the softmax leaks the future
 > through the denominator.`,
-  sequence: {
-    participants: ['forward', 'qkv', 'causal_mask', 'softmax', 'proj'],
-    messages: [
-      {from: 'forward', to: 'qkv', label: 'x [B, T, D] → Linear(D, 3D) → split → q, k, v', kind: 'sync'},
-      {from: 'qkv', to: 'forward', label: 'view(B, T, H, hd).transpose(1, 2) → [B, H, T, hd]', kind: 'reply'},
-      {from: 'forward', to: 'forward', label: 'scores = q @ kᵀ / sqrt(hd)  [B, H, T, T]', kind: 'sync'},
-      {from: 'forward', to: 'causal_mask', label: 'tril[:T, :T] & attn_mask[:, None, None, :]', kind: 'sync'},
-      {from: 'causal_mask', to: 'forward', label: 'masked_fill(~mask, -inf)', kind: 'reply'},
-      {from: 'forward', to: 'softmax', label: 'softmax over keys in float32 → dropout', kind: 'sync'},
-      {from: 'softmax', to: 'forward', label: 'probs [B, H, T, T], rows sum to 1 over 0..t', kind: 'reply'},
-      {from: 'forward', to: 'forward', label: 'probs @ v → transpose(1, 2).contiguous().view(B, T, D)', kind: 'sync'},
-      {from: 'forward', to: 'proj', label: 'Linear(D, D)', kind: 'sync'},
-      {from: 'proj', to: 'forward', label: '[B, T, D]', kind: 'reply'},
-    ],
-  },
   hints: [
     'Shapes first: `self.qkv(x)` is `[B, T, 3D]`; `.split(self.d_model, dim=-1)` gives three `[B, T, D]`; `.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)` makes each `[B, H, T, hd]`, and `q @ k.transpose(-2, -1)` is then `[B, H, T, T]` with no loop over heads.',
     'Build the mask once in `__init__` as a bool buffer and slice `self.causal_mask[:T, :T]` in `forward`; a `[T, T]` bool broadcasts over `[B, H, T, T]`. `scores.masked_fill(~mask, float("-inf"))` then `torch.softmax(..., dim=-1, dtype=torch.promote_types(scores.dtype, torch.float32)).to(v.dtype)` — `promote_types` is float32 for half inputs and leaves float64 alone, which is what `gradcheck` needs.',

@@ -63,20 +63,122 @@ The backward pass with recomputation (autograd here saves every tile, so trainin
 padding and attention masks beyond causal, multi-query / grouped-query heads, dropout, the SRAM/HBM
 accounting that picks \`block_q\` and \`block_k\` on a real GPU, and the FlashAttention-2 loop order and warp
 partitioning — the kernel engineering on top of the algorithm written here.`,
-  diagram: {
-    nodes: [
-      {id: 'inputs', kind: 'client', label: 'q · k · v', sub: '[B, H, T, hd] float32', x: 6, y: 50},
-      {id: 'qloop', kind: 'service', label: 'query tiles', sub: 'rows q0:q1 · block_q', x: 30, y: 50},
-      {id: 'kloop', kind: 'service', label: 'key/value tiles', sub: 's = q kᵀ/√hd · mask · exp', x: 54, y: 50},
-      {id: 'stats', kind: 'db', label: 'm · l · o', sub: 'per row: max · sum · accumulator', x: 78, y: 26},
-      {id: 'ref', kind: 'external', label: 'F.scaled_dot_product_attention', sub: 'self-test reference', x: 78, y: 74},
+  architecture: {
+    input: 'from the QKV projection',
+    output: 'exact softmax(q kᵀ / √hd) v',
+    items: [
+      {
+        id: 'inputs',
+        label: 'Queries, keys, values',
+        kind: 'io',
+        sub: 'q, k, v · [2, 3, 37, 16]',
+        shape: '[B, H, T, hd]',
+        detail:
+          'The self-test runs `B, H, T, hd = 2, 3, 37, 16`, with `T` a multiple of no tile size. Computed in float32 (float64 kept for `gradcheck`).',
+      },
+      {
+        tone: 'block',
+        repeat: '⌈T / block_q⌉ ×',
+        label: 'Query tile q0:q1',
+        items: [
+          {
+            id: 'qtile',
+            label: 'Q tile in SRAM',
+            kind: 'memory',
+            sub: 'q[:, :, q0:q1] · [B, H, 8, 16]',
+            shape: '[B, H, block_q, hd]',
+            detail:
+              'Loaded once per query tile and reused against every key tile. The last tile is shorter when `T` is not a multiple of `block_q`.',
+          },
+          {
+            id: 'init',
+            label: 'Running statistics',
+            sub: 'm = −inf, l = 0, o = 0',
+            detail:
+              'Per query row: `m` the largest score so far `[B, H, bq, 1]`, `l` the sum of exponentials under `m` `[B, H, bq, 1]`, `o` the unnormalised output `[B, H, bq, hd]`.',
+          },
+          {
+            tone: 'block',
+            repeat: 'while k0 < q1',
+            label: 'Key/value tile k0:k1',
+            items: [
+              {
+                id: 'kvtile',
+                label: 'K, V tiles in SRAM',
+                kind: 'memory',
+                sub: 'k, v[:, :, k0:k1] · [B, H, 8, 16]',
+                detail:
+                  'Key tiles are walked in order; the first one with `k0 >= q1` lies entirely after the query tile, so the loop breaks.',
+              },
+              {
+                id: 'scores',
+                label: 'Tile scores',
+                kind: 'attention',
+                sub: 's = q kᵀ / √16 · [8, 8]',
+                shape: '[B, H, block_q, block_k]',
+                side: {
+                  label: 'Causal mask',
+                  sub: 'cols > rows → −inf',
+                  detail:
+                    'Only a tile crossing the diagonal needs it, built from `arange(q0, q1)` and `arange(k0, k1)`: a `[block_q, block_k]` mask, never a `[T, T]` `tril`.',
+                },
+                detail: 'One small matmul; this tile is the only score matrix that ever exists.',
+              },
+              {
+                id: 'rowmax',
+                label: 'New running max',
+                sub: 'm_new = max(m, s.amax(-1))',
+                detail: 'The largest score seen so far in each row, this tile included.',
+              },
+              {
+                id: 'rescale',
+                label: 'Rescale factor',
+                kind: 'attention',
+                sub: 'alpha = exp(m − m_new)',
+                detail:
+                  '1 when the max did not move, below 1 when it did, 0 on the first tile (`m = -inf`). It converts sums taken under the old max to the new one.',
+              },
+              {
+                id: 'exp',
+                label: 'Exponentials',
+                sub: 'p = exp(s − m_new)',
+                shape: '[B, H, block_q, block_k]',
+                detail: 'Every argument is `≤ 0`, so nothing overflows; masked entries become exactly 0.',
+              },
+              {
+                id: 'accumulate',
+                label: 'Rescale and accumulate',
+                kind: 'attention',
+                sub: 'l = αl + Σp · o = αo + p v',
+                shape: '[B, H, block_q, hd]',
+                detail:
+                  '`l = alpha * l + p.sum(-1)`, `o = alpha * o + p @ v_tile`, `m = m_new`: what was accumulated under the old max is shrunk before the new tile is added.',
+              },
+            ],
+          },
+          {
+            id: 'normalise',
+            label: 'Normalise once',
+            sub: 'out[:, :, q0:q1] = o / l',
+            shape: '[B, H, block_q, hd]',
+            detail: 'One division per query tile, after the last key tile: `l` is only complete then.',
+          },
+        ],
+      },
+      {
+        id: 'out',
+        label: 'Output',
+        kind: 'io',
+        sub: 'out · [2, 3, 37, 16] · input dtype',
+        shape: '[B, H, T, hd]',
+        detail: 'Equal to `F.scaled_dot_product_attention(is_causal=True)` within `atol=1e-5` for every tile shape.',
+      },
     ],
-    edges: [
-      {from: 'inputs', to: 'qloop', kind: 'plain', label: 'q[:, :, q0:q1]'},
-      {from: 'qloop', to: 'kloop', kind: 'plain', label: 'k, v [k0:k1] · skip if k0 ≥ q1'},
-      {from: 'kloop', to: 'stats', kind: 'plain', label: 'alpha = exp(m − m_new) · l, o rescaled'},
-      {from: 'stats', to: 'qloop', kind: 'plain', label: 'o / l'},
-      {from: 'inputs', to: 'ref', kind: 'plain', label: 'allclose · gradcheck'},
+    notes: [
+      {at: 'scores', text: '**[8, 8]** tiles, never **[T, T]**'},
+      {at: 'rescale', text: 'alpha ≤ **1**: only ever shrinks what came before'},
+      {at: 'kvtile', text: 'Tiles past the diagonal skipped: about **half** the work', side: 'left'},
+      {at: 'normalise', text: '**One** division per query tile'},
     ],
   },
   steps: [flashAttentionStep],

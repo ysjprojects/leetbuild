@@ -10,6 +10,7 @@
  */
 import {type Palette, type Theme, PALETTE} from '@/styles/palette';
 
+import {type Architecture, type ArchKind, layoutArchitecture} from './architecture';
 import {layoutDiagram} from './layout';
 import type {EdgeKind, NodeKind, Problem} from './types';
 
@@ -747,6 +748,8 @@ const EDGE_HUE: Record<EdgeKind, Hue> = {http: 'http', grpc: 'grpc', kafka: 'kaf
  * anything else.
  */
 export function fromDiagram(problem: Problem): Shape[] {
+  if (problem.diagram === undefined)
+    return problem.architecture === undefined ? [] : fromArchitecture(problem.architecture);
   const layout = layoutDiagram(problem.diagram);
   const K = 1.5;
   const px = (x: number): number => x * K;
@@ -783,6 +786,102 @@ export function fromDiagram(problem: Problem): Shape[] {
       h: n.h * K,
       fill: n.kind !== 'service' && n.kind !== 'external',
       label: n.sub === undefined ? n.label : `${n.label}\n${n.sub}`,
+    });
+  return shapes;
+}
+
+const ARCH_HUE: Record<ArchKind, Hue> = {
+  layer: 'ink',
+  norm: 'ink',
+  embed: 'ink',
+  head: 'ink',
+  io: 'ink',
+  ffn: 'ink',
+  attention: 'iris',
+  loss: 'danger',
+  host: 'http',
+  memory: 'success',
+  kernel: 'iris',
+};
+
+/** A deep-learning problem's layer stack as editable boxes and arrows: frames, layers, ⊕, and every wire's segments. */
+function fromArchitecture(arch: Architecture): Shape[] {
+  const layout = layoutArchitecture(arch, true);
+  const K = 1.4;
+  const px = (x: number): number => (x - layout.minX) * K;
+  const py = (y: number): number => (y - layout.minY) * K;
+  const shapes: Shape[] = [];
+  for (const fr of layout.frames) {
+    shapes.push({
+      id: uid(),
+      kind: 'rect',
+      hue: fr.tone === 'block' ? 'iris' : 'ink',
+      width: 2,
+      x: px(fr.box.x),
+      y: py(fr.box.y),
+      w: fr.box.w * K,
+      h: fr.box.h * K,
+      fill: false,
+      label: '',
+    });
+    // In the frame's top-left corner, as the figure has it: a centred label would sit on the layers.
+    const text = [fr.repeat, fr.label].filter(Boolean).join(' ');
+    if (text !== '') {
+      const size = textSize(2);
+      shapes.push({
+        id: uid(),
+        kind: 'text',
+        hue: fr.tone === 'block' ? 'iris' : 'ink',
+        width: 2,
+        x: px(fr.box.x) + 10,
+        y: py(fr.box.y) + 6,
+        text,
+        size,
+        ...measureText(text, size),
+      });
+    }
+  }
+  for (const w of layout.wires)
+    w.points.slice(1).forEach((p, i) => {
+      const a = w.points[i];
+      const last = i === w.points.length - 2;
+      shapes.push({
+        id: uid(),
+        kind: last && w.open !== true ? 'arrow' : 'line',
+        hue: 'ink',
+        width: 2,
+        x1: px(a.x),
+        y1: py(a.y),
+        x2: px(p.x),
+        y2: py(p.y),
+        label: '',
+      });
+    });
+  for (const o of layout.ops)
+    shapes.push({
+      id: uid(),
+      kind: 'ellipse',
+      hue: 'ink',
+      width: 2,
+      x: px(o.c.x - o.r),
+      y: py(o.c.y - o.r),
+      w: o.r * 2 * K,
+      h: o.r * 2 * K,
+      fill: false,
+      label: o.op,
+    });
+  for (const b of layout.blocks)
+    shapes.push({
+      id: uid(),
+      kind: 'rect',
+      hue: ARCH_HUE[b.kind],
+      width: 2,
+      x: px(b.box.x),
+      y: py(b.box.y),
+      w: b.box.w * K,
+      h: b.box.h * K,
+      fill: b.kind !== 'layer' && b.kind !== 'norm' && b.kind !== 'embed' && b.kind !== 'head',
+      label: b.sub === undefined ? b.label : `${b.label}\n${b.sub}`,
     });
   return shapes;
 }

@@ -17,6 +17,7 @@ import {
   stepKey,
 } from '@/lib/types';
 
+import ArchitectureDiagram from './ArchitectureDiagram';
 import {useDialog} from './Dialog';
 import Markdown from './Markdown';
 import {CompanyMark, ConceptChip, DifficultyChip, ghostButtonClass, linkClass, primaryButtonClass} from './paneShared';
@@ -227,6 +228,26 @@ const Solution: FC<{
   );
 });
 Solution.displayName = 'Solution';
+
+const NO_FOCUS: readonly string[] = [];
+
+/** A deep-learning problem's layer stack in the pane's column, with the full figure a click away. */
+const PaneArchitecture: FC<{problem: Problem; focus: readonly string[]}> = memo(({problem, focus}) => {
+  const [dialog, openDialog] = useDialog();
+  const spec = problem.architecture;
+  const onExpand = useCallback(() => {
+    if (spec === undefined) return;
+    void openDialog({title: problem.title, body: <ArchitectureDiagram spec={spec} />, figure: true});
+  }, [openDialog, problem.title, spec]);
+  if (spec === undefined) return null;
+  return (
+    <>
+      <ArchitectureDiagram compact focus={focus} onExpand={onExpand} spec={spec} />
+      {dialog}
+    </>
+  );
+});
+PaneArchitecture.displayName = 'PaneArchitecture';
 
 /** Company-tagged courses open with the company: whose writing this is, and where it appears. */
 /** A page with lines on it: the learning guide's mark. */
@@ -515,13 +536,17 @@ const ProblemPane: FC<{
           </button>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3" ref={scroller}>
-          <SystemDiagram
-            compact
-            diagram={problem.diagram}
-            focus={tab === 'step' ? step.focus : []}
-            onSelectNode={onSelectNode}
-            stepsByNode={stepsByNode}
-          />
+          {problem.architecture !== undefined ? (
+            <PaneArchitecture focus={tab === 'step' ? step.focus : NO_FOCUS} problem={problem} />
+          ) : problem.diagram !== undefined ? (
+            <SystemDiagram
+              compact
+              diagram={problem.diagram}
+              focus={tab === 'step' ? step.focus : NO_FOCUS}
+              onSelectNode={onSelectNode}
+              stepsByNode={stepsByNode}
+            />
+          ) : null}
           <StepRail
             activeId={tab === 'step' ? step.id : null}
             attempts={attempts}

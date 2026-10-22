@@ -155,7 +155,7 @@ export const loraStep: Step = {
   title: 'LoRALinear, apply_lora, mark_only_lora_trainable, merge/unmerge',
   concept: 'pytorch',
   file: 'lora',
-  focus: ['lora', 'base', 'adapter', 'ckpt'],
+  focus: ['base', 'lora-a', 'lora-b', 'scale', 'add-lora'],
   task: `## Task
 
 Implement \`LoRALinear\`, \`apply_lora\`, \`mark_only_lora_trainable\` and \`lora_state_dict\` so that a frozen
@@ -185,6 +185,11 @@ can be folded into the weight for inference and unfolded again.
   base model.
 - No \`peft\`, no \`loralib\`; \`torch\` only.
 
+Size the adapter against the layer it wraps: drag the rank and the layer width and compare the trainable
+\`r · (in + out)\` with the frozen \`in · out\`.
+
+:::widget lora-rank
+
 The file ends with a self-test: a zero-init adapter is the identity (\`torch.equal\`); only \`lora_A\` / \`lora_B\`
 get gradients; merge/unmerge round-trips; adapting \`q_proj\` and \`v_proj\` of a two-block \`d = 128\`
 transformer with \`r = 4\` trains \`4096\` of \`462336\` parameters (0.89 %, must be below 2 %); five
@@ -194,26 +199,6 @@ reproduces the adapted model; merged whole-model inference matches within \`1e-5
 > Fine-tuning a layer is adding a matrix to its weight. LoRA bets that matrix is low-rank, writes it as
 > \`B @ A\` with \`B = 0\` at the start, trains only \`A\` and \`B\`, and folds them into \`W\` when training ends —
 > so training touches 1 % of the parameters and inference pays nothing.`,
-  sequence: {
-    participants: ['Trainer', 'LoRALinear', 'base nn.Linear', 'lora_A · lora_B'],
-    messages: [
-      {from: 'Trainer', to: 'LoRALinear', label: 'apply_lora(model, ["q_proj", "v_proj"], r=4, alpha=8)', kind: 'sync'},
-      {from: 'LoRALinear', to: 'base nn.Linear', label: 'requires_grad_(False)', kind: 'sync'},
-      {from: 'LoRALinear', to: 'lora_A · lora_B', label: 'A ~ kaiming_uniform (4, 128) · B = 0 (128, 4)', kind: 'sync'},
-      {from: 'Trainer', to: 'LoRALinear', label: 'forward(x)  x: (4, 16, 128)', kind: 'sync'},
-      {from: 'LoRALinear', to: 'base nn.Linear', label: 'W x + b', kind: 'sync'},
-      {
-        from: 'LoRALinear',
-        to: 'lora_A · lora_B',
-        label: '(dropout(x) @ Aᵀ @ Bᵀ) · alpha / r   — 0 while B = 0',
-        kind: 'sync',
-      },
-      {from: 'LoRALinear', to: 'Trainer', label: 'y: (4, 16, 128)', kind: 'reply'},
-      {from: 'Trainer', to: 'lora_A · lora_B', label: 'loss.backward() · AdamW.step() — grads only here', kind: 'sync'},
-      {from: 'Trainer', to: 'LoRALinear', label: 'merge()  →  W += (B @ A) · alpha / r', kind: 'sync'},
-      {from: 'Trainer', to: 'LoRALinear', label: 'unmerge()  →  W -= (B @ A) · alpha / r', kind: 'sync'},
-    ],
-  },
   hints: [
     'The adapter is two small parameters next to the frozen layer: `lora_A` of shape `(r, in)` with a Kaiming init and `lora_B` of shape `(out, r)` all zeros, so `x @ A.T @ B.T` is zero at step 0 and the wrapped layer answers exactly what the original did. `base.requires_grad_(False)` freezes both weight and bias in one call.',
     'Forward is `base(x) + (dropout(x) @ lora_A.T @ lora_B.T) * scaling` — two thin matmuls `(…, in) → (…, r) → (…, out)`. `merge()` is the dense version of the same product: `base.weight += (lora_B @ lora_A) * scaling` under `torch.no_grad()`, guarded by a `merged` flag so it cannot be applied twice; `unmerge()` subtracts it.',

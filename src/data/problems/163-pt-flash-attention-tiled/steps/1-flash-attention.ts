@@ -9,7 +9,7 @@ export const flashAttentionStep: Step = {
   title: 'flash_attention(): tiles, running max and sum, one normalisation at the end',
   concept: 'pytorch',
   file: 'flash_attention',
-  focus: ['qloop', 'kloop', 'stats'],
+  focus: ['qtile', 'init', 'kvtile', 'scores', 'rowmax', 'rescale', 'exp', 'accumulate', 'normalise'],
   task: `## Task
 
 Implement \`flash_attention(q, k, v, block_q, block_k, causal=True) -> out\` for \`q\`, \`k\`, \`v\` of shape
@@ -25,6 +25,9 @@ holding a \`[T, T]\` score matrix** — one \`[block_q, block_k]\` tile of score
   \`l = alpha · l + p.sum(-1)\`, \`o = alpha · o + p @ v[:, :, k0:k1]\`, \`m = m_new\`. The query tile's
   output is \`o / l\` — divide **once**, after the last key tile. Keep \`m\`, \`l\` and \`o\` as the names
   (\`m_new\` / \`m_i\` style suffixes are fine).
+
+:::widget online-softmax {"tile": 4}
+
 - **Causal.** A key tile that starts at or after the query tile's end (\`k0 >= q1\`) is skipped; a tile that
   crosses the diagonal is masked **inside the tile** with \`torch.arange\` row/column indices and
   \`masked_fill(cols > rows, -inf)\`; a tile entirely below the diagonal needs no mask.
@@ -42,50 +45,6 @@ holding a \`[T, T]\` score matrix** — one \`[block_q, block_k]\` tile of score
 > The softmax over a row needs the row's max before any exponential is taken — unless every partial
 > result is tagged with the max it was computed under and rescaled by \`exp(m_old - m_new)\` when a
 > later tile raises it. That rescaling is what lets attention stream over keys without the \`[T, T]\`.`,
-  sequence: {
-    participants: ['caller', 'flash_attention', 'k/v tile', 'm · l · o'],
-    messages: [
-      {
-        from: 'caller',
-        to: 'flash_attention',
-        label: 'q, k, v [2, 3, 37, 16] · block_q = 8 · block_k = 8',
-        kind: 'sync',
-      },
-      {from: 'flash_attention', to: 'm · l · o', label: 'query rows 8..15: m = -inf, l = 0, o = 0', kind: 'sync'},
-      {
-        from: 'flash_attention',
-        to: 'k/v tile',
-        label: 'keys 0..7: s = q₈₋₁₅ k₀₋₇ᵀ / √16  [8, 8], below the diagonal — no mask',
-        kind: 'sync',
-      },
-      {
-        from: 'k/v tile',
-        to: 'm · l · o',
-        label: 'm_new = max(m, rowmax s) · α = exp(m − m_new) = 0 · l = Σp · o = p v₀₋₇',
-        kind: 'sync',
-      },
-      {
-        from: 'flash_attention',
-        to: 'k/v tile',
-        label: 'keys 8..15: crosses the diagonal → masked_fill(col > row, −inf)',
-        kind: 'sync',
-      },
-      {
-        from: 'k/v tile',
-        to: 'm · l · o',
-        label: 'm_new ≥ m · α = exp(m − m_new) ≤ 1 · l = α l + Σp · o = α o + p v₈₋₁₅',
-        kind: 'sync',
-      },
-      {from: 'flash_attention', to: 'k/v tile', label: 'keys 16..23: k0 = 16 ≥ q1 = 16 → skipped', kind: 'async'},
-      {from: 'm · l · o', to: 'flash_attention', label: 'out[8:16] = o / l', kind: 'reply'},
-      {
-        from: 'flash_attention',
-        to: 'caller',
-        label: 'torch.cat(tiles, dim=2) → [2, 3, 37, 16], float32',
-        kind: 'reply',
-      },
-    ],
-  },
   hints: [
     'Shape the stats as `[B, H, bq, 1]` so they broadcast against `s` (`[B, H, bq, bk]`) and `o` (`[B, H, bq, hd]`): `m = torch.full((B, H, bq, 1), float("-inf"))`, `l = torch.zeros((B, H, bq, 1))`. With `m = -inf`, the first tile gives `alpha = exp(-inf) = 0`, so no special case for the first iteration.',
     'Within a tile the diagonal sits at absolute positions: `rows = torch.arange(q0, q1)[:, None]`, `cols = torch.arange(k0, k1)[None, :]`, `s = s.masked_fill(cols > rows, float("-inf"))`. Only tiles with `k1 > q0 + 1` can contain a masked entry; `k0 >= q1` means the whole tile is in the future — `break`, since later tiles are too.',

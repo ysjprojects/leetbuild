@@ -5,7 +5,7 @@ export const normsStep: Step = {
   title: 'LayerNorm and RMSNorm: centre, scale, upcast',
   concept: 'pytorch',
   file: 'norms',
-  focus: ['ln', 'rms', 'params'],
+  focus: ['ln-mean', 'ln-var', 'ln-scale', 'ln-affine', 'rms-up', 'rms-ms', 'rms-scale', 'rms-cast', 'rms-weight'],
   task: `## Task
 
 Implement the two normalisations a transformer block applies to its residual stream, as \`nn.Module\`s
@@ -20,6 +20,11 @@ written from scratch, in \`norms.py\`.
 - \`RMSNorm(dim, eps=1e-6)\`: the Llama form. No mean is subtracted and there is no bias: \`forward(x)\`
   returns \`x · rsqrt(mean(x²) + eps) · weight\` over the last dimension, with one parameter \`weight\` of
   shape \`(dim,)\` initialised to ones.
+
+Push the offset slider: LayerNorm's output stays centred, RMSNorm's carries the offset through, scaled.
+
+:::widget norm-compare
+
 - **The upcast rule**: a \`float16\` or \`bfloat16\` \`x\` is normalised in **float32** — \`x.float()\`,
   statistic and division in float32 — and the result is cast back to \`x\`'s dtype (\`.type_as(x)\`)
   *before* the multiplication by \`weight\`. A \`float32\` or \`float64\` \`x\` stays in its dtype, so
@@ -36,22 +41,6 @@ written from scratch, in \`norms.py\`.
 > A normalisation layer is three reductions and one broadcast: a statistic over the feature axis, a
 > scale, an affine map. Everything that matters — biased variance, eps under the root, the float32
 > statistic — is about where rounding and overflow are allowed to happen.`,
-  sequence: {
-    participants: ['block', 'LayerNorm', 'RMSNorm', 'weight · bias'],
-    messages: [
-      {from: 'block', to: 'LayerNorm', label: 'forward(x)  x: (2, 5, 64) float32', kind: 'sync'},
-      {from: 'LayerNorm', to: 'LayerNorm', label: 'mean, var(unbiased=False) over dim −1, keepdim', kind: 'sync'},
-      {from: 'LayerNorm', to: 'weight · bias', label: '(x − mean) · rsqrt(var + 1e-5)', kind: 'sync'},
-      {from: 'weight · bias', to: 'LayerNorm', label: '· weight + bias  (64,) broadcast', kind: 'reply'},
-      {from: 'LayerNorm', to: 'block', label: 'y: (2, 5, 64) float32', kind: 'reply'},
-      {from: 'block', to: 'RMSNorm', label: 'forward(x)  x: (2, 5, 64) bfloat16', kind: 'sync'},
-      {from: 'RMSNorm', to: 'RMSNorm', label: 'xf = x.float() · rsqrt(mean(xf²) + 1e-6)', kind: 'sync'},
-      {from: 'RMSNorm', to: 'RMSNorm', label: '.type_as(x) → bfloat16', kind: 'sync'},
-      {from: 'RMSNorm', to: 'weight · bias', label: '· weight  (64,)', kind: 'sync'},
-      {from: 'weight · bias', to: 'RMSNorm', label: 'bfloat16 · bfloat16', kind: 'reply'},
-      {from: 'RMSNorm', to: 'block', label: 'y: (2, 5, 64) bfloat16', kind: 'reply'},
-    ],
-  },
   hints: [
     'LayerNorm: `dims = tuple(range(-len(self.normalized_shape), 0))`, then `mean = x.mean(dim=dims, keepdim=True)` and `var = x.var(dim=dims, unbiased=False, keepdim=True)`; `keepdim` is what lets `(x - mean)` broadcast. Return `(x - mean) * torch.rsqrt(var + self.eps) * self.weight + self.bias`.',
     'RMSNorm has no centring step and no bias: `x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.weight`, one `nn.Parameter(torch.ones(dim))`, default `eps=1e-6`.',

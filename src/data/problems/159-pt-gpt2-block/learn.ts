@@ -13,24 +13,42 @@ position on its own with a two-layer MLP, and adds each result to a running vect
 LayerNorm *before* each sublayer, a hidden layer four times the model width, GELU, and an initialisation
 that shrinks the two matrices that write into the stream.
 
-:::diagram
+:::architecture
 {
-  "nodes": [
-    {"id": "x", "kind": "client", "label": "residual stream", "sub": "x · (B, T, C) · one vector per position", "x": 10, "y": 50},
-    {"id": "attn", "kind": "service", "label": "ln_1 → attn → + x", "sub": "read the context: causal self-attention", "x": 35, "y": 30},
-    {"id": "mlp", "kind": "service", "label": "ln_2 → mlp → + x", "sub": "per position: c_fc 4C · gelu_tanh · c_proj", "x": 60, "y": 30},
-    {"id": "params", "kind": "db", "label": "parameters", "sub": "N(0, 0.02) · c_proj ÷ √(2·n_layer) · LayerNorm 1, 0", "x": 48, "y": 75},
-    {"id": "ref", "kind": "external", "label": "PyTorch reference", "sub": "F.scaled_dot_product_attention · F.gelu(tanh)", "x": 85, "y": 50}
+  "input": "x · (B, T, 768) from the block below",
+  "output": "x · (B, T, 768) to the next block",
+  "items": [
+    {"id": "x", "label": "Residual stream", "kind": "io", "sub": "one vector per position", "shape": "[B, T, 768]", "detail": "Only ever added to, from the embedding to the final ln_f."},
+    {"tone": "block", "repeat": "12 ×", "label": "GPT-2 small block", "items": [
+      {"id": "ln1", "label": "LayerNorm ln_1", "kind": "norm", "sub": "768 · weight 1, bias 0", "detail": "A normalised copy for the attention to read; the stream is not touched."},
+      {"id": "attn", "label": "Causal self-attention", "kind": "attention", "sub": "12 heads × 64", "shape": "[B, T, 768]", "side": {"label": "tril mask", "sub": "1,024 × 1,024"}, "detail": "Reads the context: position t mixes the values of positions 0..t. Given in the drill; its own problem."},
+      {"id": "add1", "op": "+", "from": "ln1", "detail": "x = x + attn(ln_1(x))"},
+      {"id": "ln2", "label": "LayerNorm ln_2", "kind": "norm", "sub": "768 · weight 1, bias 0"},
+      {"id": "mlp", "label": "MLP", "kind": "ffn", "sub": "768 → 3,072 → 768", "shape": "[B, T, 768]", "detail": "Transforms every position on its own, with the same weights everywhere."},
+      {"id": "add2", "op": "+", "from": "ln2", "detail": "x = x + mlp(ln_2(x))"}
+    ]}
   ],
-  "edges": [
-    {"from": "x", "to": "attn", "kind": "plain", "label": "x"},
-    {"from": "attn", "to": "mlp", "kind": "plain", "label": "x + a"},
-    {"from": "params", "to": "attn", "kind": "plain", "label": "c_attn · c_proj · ln_1"},
-    {"from": "params", "to": "mlp", "kind": "plain", "label": "c_fc · c_proj · ln_2"},
-    {"from": "mlp", "to": "ref", "kind": "plain", "label": "allclose"}
+  "notes": [
+    {"at": "attn", "text": "c_attn **768 → 2,304**, c_proj **768 → 768**"},
+    {"at": "mlp", "text": "**4.72 M** of the block's **7.09 M** parameters", "side": "left"},
+    {"at": "add2", "text": "Both c_proj write at std **0.02/√24**", "side": "left"}
+  ],
+  "insets": [
+    {"for": "mlp", "title": "MLP", "items": [
+      {"id": "c-fc", "label": "Linear c_fc", "sub": "768 → 3,072", "shape": "[B, T, 3,072]"},
+      {"id": "gelu", "label": "gelu_tanh", "sub": "tanh(√(2/π)(x + 0.044715x³))"},
+      {"id": "c-proj", "label": "Linear c_proj", "sub": "3,072 → 768"},
+      {"id": "drop", "label": "Dropout", "sub": "0.1 in training, 0 here"}
+    ], "note": "Hidden width **4 × 768 = 3,072**"}
   ]
 }
 :::
+
+The figure is GPT-2 small (\`n_embd = 768\`); the drill builds the same block at \`n_embd = 64\`. Attention
+is the only sublayer in which positions exchange information, and its causal mask limits every query row
+to the past:
+
+:::widget attention-heatmap {"causal": true}
 
 The contract the drill implements, over a \`GPTConfig(n_embd, n_head, n_layer, block_size, dropout)\`:
 
@@ -46,19 +64,35 @@ The original Transformer wrote a sublayer as \`x = LayerNorm(x + f(x))\` — **p
 \`x = x + f(LayerNorm(x))\` — **pre-LN**. The difference is where the stream is standardised, and it
 decides whether a deep stack trains without a learning-rate warm-up.
 
-:::sequence
+Drawn the same way, bottom to top, the two forms differ only in where the LayerNorm sits on the path.
+**Post-LN**, the original Transformer: the norm is on the stream itself, after the add.
+
+:::architecture
 {
-  "participants": ["caller", "Block", "attn", "mlp"],
-  "messages": [
-    {"from": "caller", "to": "Block", "label": "x  (B, T, C)", "kind": "sync"},
-    {"from": "Block", "to": "attn", "label": "ln_1(x) — a normalised copy; x itself is untouched", "kind": "sync"},
-    {"from": "attn", "to": "Block", "label": "a = c_proj(softmax(qkᵀ/√d, causal) v)", "kind": "reply"},
-    {"from": "Block", "to": "Block", "label": "x = x + a", "kind": "sync"},
-    {"from": "Block", "to": "mlp", "label": "ln_2(x)", "kind": "sync"},
-    {"from": "mlp", "to": "Block", "label": "m = c_proj(gelu_tanh(c_fc(·)))", "kind": "reply"},
-    {"from": "Block", "to": "Block", "label": "x = x + m", "kind": "sync"},
-    {"from": "Block", "to": "caller", "label": "x  (B, T, C) — the same stream, two corrections richer", "kind": "reply"}
-  ]
+  "input": "x",
+  "output": "LN(x + f(x))",
+  "items": [
+    {"id": "f", "label": "Sublayer f", "kind": "attention", "sub": "attention or MLP"},
+    {"id": "add", "op": "+", "from": "f", "detail": "The residual: x is added back to f(x)."},
+    {"id": "ln", "label": "LayerNorm", "kind": "norm", "sub": "on the sum: the stream itself", "detail": "Every block re-standardises the stream, so the identity path runs through a LayerNorm Jacobian."}
+  ],
+  "notes": [{"at": "ln", "text": "Rescales the stream **every** block"}]
+}
+:::
+
+**Pre-LN**, GPT-2 and its descendants: the norm feeds only the sublayer, and the stream passes through
+the ⊕ untouched.
+
+:::architecture
+{
+  "input": "x",
+  "output": "x + f(LN(x))",
+  "items": [
+    {"id": "ln", "label": "LayerNorm", "kind": "norm", "sub": "on a copy, for f only", "detail": "ln_1 or ln_2: a temporary the sublayer reads."},
+    {"id": "f", "label": "Sublayer f", "kind": "attention", "sub": "attention or MLP"},
+    {"id": "add", "op": "+", "from": "ln", "detail": "The residual wire leaves below the LayerNorm: the raw x is what gets added to."}
+  ],
+  "notes": [{"at": "add", "text": "Exactly **x** when f writes zero"}]
 }
 :::
 
@@ -154,22 +188,15 @@ for name, p in self.named_parameters():        # then, and only then, the residu
 The order matters: \`apply\` sets every linear to \`0.02\`, so the \`c_proj\` loop must come after it or it is
 overwritten. The rule itself is about variance. Each \`c_proj\` output is a sum over its fan-in of
 weight × activation; with the sublayer's input standardised by its LayerNorm, each write into the stream
-adds roughly the same variance \`v\`. A model of \`n_layer\` blocks makes \`2·n_layer\` such writes:
+adds roughly the same variance \`v\`. A model of \`n_layer\` blocks makes \`2·n_layer\` such writes; for GPT-2
+XL's 48 blocks:
 
-:::sequence
-{
-  "participants": ["stream", "block 1", "block 24", "block 48"],
-  "messages": [
-    {"from": "stream", "to": "block 1", "label": "var(x) = 1 at the embedding", "kind": "sync"},
-    {"from": "block 1", "to": "stream", "label": "unscaled: + v (attn) + v (mlp) → 1 + 2v", "kind": "reply"},
-    {"from": "stream", "to": "block 24", "label": "… 46 more writes …", "kind": "sync"},
-    {"from": "block 24", "to": "stream", "label": "unscaled: 1 + 48v", "kind": "reply"},
-    {"from": "stream", "to": "block 48", "label": "…", "kind": "sync"},
-    {"from": "block 48", "to": "stream", "label": "unscaled: 1 + 96v — a √96 wider stream than block 1 saw", "kind": "reply"},
-    {"from": "block 48", "to": "stream", "label": "scaled by 1/√96: each write adds v/96 → 1 + v in total", "kind": "reply"}
-  ]
-}
-:::
+| Stream after | Writes so far | \`var(x)\`, unscaled | \`var(x)\`, \`c_proj\` std ÷ √96 |
+| --- | --- | --- | --- |
+| the embedding | 0 | 1 | 1 |
+| block 1 | 2 | 1 + 2v | 1 + v/48 |
+| block 24 | 48 | 1 + 48v | 1 + v/2 |
+| block 48 | 96 | 1 + 96v: a √96 wider stream than block 1 saw | 1 + v |
 
 - Scaling a weight's standard deviation by \`1/√(2·n_layer)\` divides each write's variance by \`2·n_layer\`,
   so the sum of all writes stays at about \`v\` whatever the depth. GPT-2 XL has 48 blocks; without the
@@ -211,6 +238,10 @@ per block in the linears, plus \`4 · T · C\` per token for the attention score
 \`v\` — \`3.1 MFLOPs\` at the full \`T = 1024\`, less at short contexts. The \`(B, T, 4C)\` hidden activation is
 the largest tensor the block creates: at \`B = 8\`, \`T = 1024\` it is 100 MB in float32, kept for the backward
 pass.
+
+The same arithmetic for any width, depth and vocabulary, with the weight and KV-cache memory it implies:
+
+:::widget model-size {"preset": "gpt2"}
 
 :::details The same block in the OpenAI and Hugging Face checkpoints
 Both keep this file's names — \`ln_1\`, \`attn.c_attn\`, \`attn.c_proj\`, \`ln_2\`, \`mlp.c_fc\`, \`mlp.c_proj\` — but

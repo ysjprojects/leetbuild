@@ -17,21 +17,44 @@ Megatron all do it in this order. The drill writes the three pieces by hand in \
 - \`train_step(model, batch_iter, optimizer, accum_steps, step, *, warmup_steps, total_steps, max_lr,
   min_lr, max_norm=1.0)\` — returns \`{"loss", "grad_norm", "lr"}\`.
 
-:::diagram
+One call of \`train_step\`, read bottom to top:
+
+:::architecture
 {
-  "nodes": [
-    {"id": "batches", "kind": "client", "label": "Micro-batches", "sub": "accum_steps × (x, y) from batch_iter", "x": 8, "y": 50},
-    {"id": "step", "kind": "service", "label": "train_step", "sub": "forward · loss / accum_steps · backward", "x": 30, "y": 50},
-    {"id": "grads", "kind": "db", "label": ".grad buffers", "sub": "cleared once per step · summed accum_steps times", "x": 54, "y": 24},
-    {"id": "clip", "kind": "service", "label": "clip_grad_norm_ · lr_at", "sub": "one global norm → one scale · step → LR", "x": 54, "y": 76},
-    {"id": "optimizer", "kind": "service", "label": "optimizer", "sub": "every param_groups[\\"lr\\"] = lr · step()", "x": 84, "y": 50}
+  "input": "batch_iter · accum_steps = 4",
+  "items": [
+    {"tone": "block", "repeat": "for each step", "label": "train_step(step)", "items": [
+      {"id": "zero", "label": "Clear the gradients", "sub": "zero_grad(set_to_none=True)",
+       "detail": "Once per optimizer step, before the micro-batch loop."},
+      {"tone": "dotted", "repeat": "accum_steps ×", "label": "Micro-batch", "items": [
+        {"id": "batch", "label": "Micro-batch (x, y)", "sub": "x, y = next(batch_iter)", "kind": "io"},
+        {"id": "forward", "label": "Model forward", "sub": "logits = model(x)"},
+        {"id": "loss", "label": "Scaled loss", "sub": "cross_entropy(logits, y) / accum", "kind": "loss",
+         "detail": "A mean over the micro-batch, divided by \`accum_steps\`: the four sum to the big-batch mean."},
+        {"id": "backward", "label": "Backward", "sub": "loss.backward() · .grad += ∂/∂θ"}
+      ]},
+      {"id": "grads", "label": ".grad buffers", "sub": "the big-batch gradient", "kind": "memory"},
+      {"id": "norm", "label": "Global grad norm", "sub": "‖ [‖g₁‖, …, ‖gₙ‖] ‖₂",
+       "detail": "The norm of the per-tensor norms: one number for the whole model, returned before clipping."},
+      {"id": "clip", "label": "Clip by the global norm", "sub": "g.mul_(max_norm / (‖g‖ + 1e-6))",
+       "detail": "Only when the factor is below 1; one factor for every tensor, so the direction is kept."},
+      {"id": "lr", "label": "Set the LR", "sub": "group[\\"lr\\"] = lr_at(step)",
+       "detail": "A pure function of the step, written into every param group before the step."},
+      {"id": "optimizer", "label": "optimizer.step()", "sub": "θ moves along the clipped .grad"}
+    ]},
+    {"id": "log", "label": "Training log", "sub": "{loss, grad_norm, lr}", "kind": "io"}
   ],
-  "edges": [
-    {"from": "batches", "to": "step", "kind": "plain", "label": "next(batch_iter)"},
-    {"from": "step", "to": "grads", "kind": "plain", "label": "backward() adds"},
-    {"from": "grads", "to": "clip", "kind": "plain", "label": "norm of norms · mul_"},
-    {"from": "clip", "to": "optimizer", "kind": "plain", "label": "lr · clipped grads"},
-    {"from": "optimizer", "to": "step", "kind": "plain", "label": "{loss, grad_norm, lr}"}
+  "notes": [
+    {"at": "zero", "text": "**Once** per step, never per micro-batch"},
+    {"at": "loss", "text": "Divide by **accum_steps** before backward"},
+    {"at": "clip", "text": "max_norm **1.0** in almost every LLM config", "side": "left"}
+  ],
+  "insets": [
+    {"for": "lr", "title": "lr_at(step)", "items": [
+      {"id": "warmup", "label": "Linear warmup", "sub": "max_lr · (step + 1) / warmup"},
+      {"id": "cosine", "label": "Cosine decay", "sub": "min + ½(1 + cos πp)(max − min)"},
+      {"id": "floor", "label": "Floor", "sub": "min_lr once step ≥ total"}
+    ], "note": "Halfway: **5.05e-04** at step 55"}
   ]
 }
 :::
@@ -116,6 +139,10 @@ step >= total_steps:  lr = min_lr
 - The floor is typically a tenth of \`max_lr\` (Chinchilla, Llama) — here a hundredth. Training past
   \`total_steps\` stays there instead of the cosine swinging back up.
 
+Drag the warmup, the run length, the peak and the floor, and read the rate at any step:
+
+:::widget lr-schedule {"warmup": 10, "total": 100}
+
 The schedule is a **pure function of the step**, not a stateful scheduler object. A run restored from
 a checkpoint needs nothing but its step counter to land on exactly the LR it had; nanoGPT's \`get_lr\`
 is this function, and HuggingFace's \`get_cosine_schedule_with_warmup\` wraps the same formula in a
@@ -165,6 +192,10 @@ return total_norm                                         # before clipping
 | a spike in one layer | scales every layer down together | shrinks only that layer | flattens the spike's elements |
 | PyTorch | \`clip_grad_norm_\` | loop of \`clip_grad_norm_\` per tensor | \`clip_grad_value_\` |
 
+The three side by side, on a gradient of a few tensors, as \`max_norm\` comes down:
+
+:::widget grad-clip
+
 - Global clipping is a step-length limit: the optimizer still goes downhill in the gradient's
   direction, just not as far. Per-tensor or per-element clipping changes which way it goes.
 - The \`1e-6\` keeps a zero gradient from dividing by zero; the \`clip_coef < 1\` guard keeps a small
@@ -202,19 +233,13 @@ micro-batch losses — exactly the big-batch loss.
 
 The failure the division prevents, with \`accum_steps = 4\` and the division forgotten:
 
-:::sequence
-{
-  "participants": ["train_step", "model", ".grad buffers", "clip_grad_norm_", "optimizer"],
-  "messages": [
-    {"from": "train_step", "to": ".grad buffers", "label": "zero_grad(set_to_none=True)", "kind": "sync"},
-    {"from": "train_step", "to": "model", "label": "4 × forward · loss (not / 4) · backward()", "kind": "sync"},
-    {"from": "model", "to": ".grad buffers", "label": ".grad = g₁ + g₂ + g₃ + g₄ = 4 × big-batch gradient", "kind": "async"},
-    {"from": "train_step", "to": "clip_grad_norm_", "label": "norm is 4× too large", "kind": "sync"},
-    {"from": "clip_grad_norm_", "to": ".grad buffers", "label": "clips far more often — hides the bug, distorts the step", "kind": "async"},
-    {"from": "train_step", "to": "optimizer", "label": "step(): SGD moves 4× too far; logged loss 4× too high", "kind": "sync"}
-  ]
-}
-:::
+| After four micro-batches | Loss divided by 4 (the drill) | Division forgotten |
+|---|---|---|
+| \`.grad\` | \`(g₁ + g₂ + g₃ + g₄) / 4\`, the big-batch gradient | \`g₁ + g₂ + g₃ + g₄\`, 4 × the big-batch gradient |
+| pre-clip norm | the true norm | 4 × too large |
+| \`clip_grad_norm_\` | clips only on real spikes | clips far more often: hides the bug, distorts the step |
+| SGD step | the big-batch step | 4 × too far |
+| logged loss | the big-batch loss | 4 × too high |
 
 - With plain SGD the effective LR is multiplied by \`accum_steps\`; changing \`accum_steps\` to fit a new
   GPU silently changes the training dynamics.

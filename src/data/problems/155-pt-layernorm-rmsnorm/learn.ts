@@ -13,23 +13,38 @@ that every block reads from and adds into. Before each sublayer — attention, t
 Two normalisations cover every modern LLM: **LayerNorm** (GPT-2, BERT, ViT) centres the row and divides
 by its standard deviation; **RMSNorm** (Llama, Mistral, Gemma, Qwen) skips the centring and divides by
 the root mean square. Each is a reduction over the feature axis, a per-row scale, and a learned
-per-feature affine map:
+per-feature affine map. Here are both inside one pre-norm sublayer, read bottom to top:
 
-:::diagram
+:::architecture
 {
-  "nodes": [
-    {"id": "x", "kind": "client", "label": "residual stream", "sub": "x (B, T, D) · float32 or bfloat16", "x": 8, "y": 50},
-    {"id": "ln", "kind": "service", "label": "LayerNorm", "sub": "(x − mean) · rsqrt(var + eps)", "x": 36, "y": 26},
-    {"id": "rms", "kind": "service", "label": "RMSNorm", "sub": "x.float() · rsqrt(mean(x²) + eps) → type_as(x)", "x": 36, "y": 74},
-    {"id": "params", "kind": "db", "label": "parameters", "sub": "weight (ones) · bias (zeros)", "x": 64, "y": 50},
-    {"id": "ref", "kind": "external", "label": "torch.nn.functional", "sub": "layer_norm · rms_norm · gradcheck", "x": 90, "y": 50}
+  "input": "x · (B, T, D) · float32 or bfloat16",
+  "output": "x + sublayer(norm(x))",
+  "items": [
+    {"id": "stream", "label": "Residual stream", "sub": "x · one D-vector per token", "kind": "io", "shape": "[B, T, D]", "detail": "Every block reads from it and adds into it; the norm acts on each row on its own, reducing over D only."},
+    {"columns": [
+      [{"tone": "dotted", "label": "LayerNorm · GPT-2, BERT", "items": [
+        {"id": "ln-mean", "label": "Row mean", "sub": "μ = x.mean(-1, keepdim)", "shape": "[B, T, 1]"},
+        {"id": "ln-var", "label": "Biased variance", "sub": "σ² = x.var(unbiased=False)", "shape": "[B, T, 1]", "detail": "Divide by D, not D − 1."},
+        {"id": "ln-scale", "label": "Centre and scale", "sub": "(x − μ) · rsqrt(σ² + 1e-5)", "detail": "eps inside the root; one rsqrt per row, then a multiply per element."},
+        {"id": "ln-affine", "label": "Affine map", "sub": "· weight + bias · (D,) each", "shape": "[B, T, D]"}
+      ]}],
+      [{"tone": "dotted", "label": "RMSNorm · Llama, Mistral", "items": [
+        {"id": "rms-up", "label": "Upcast", "sub": "xf = x.float() if 16-bit", "detail": "Only float16 and bfloat16; float64 stays float64."},
+        {"id": "rms-ms", "label": "Mean of squares", "sub": "mean(xf²) · no centring", "shape": "[B, T, 1]", "detail": "mean(x²) = σ² + μ²: one reduction, and the row is not moved to zero mean."},
+        {"id": "rms-scale", "label": "Scale", "sub": "xf · rsqrt(ms + 1e-6)"},
+        {"id": "rms-cast", "label": "Cast back", "sub": ".type_as(x)", "detail": "Before the weight multiply, so the output keeps the input dtype."},
+        {"id": "rms-weight", "label": "Scale by weight", "sub": "· weight (D,) · no bias", "shape": "[B, T, D]"}
+      ]}]
+    ]},
+    {"id": "sublayer", "label": "Attention or MLP", "kind": "attention", "sub": "reads the normalised row", "shape": "[B, T, D]", "detail": "GPT-2 feeds it the left path, Llama the right."},
+    {"id": "add", "op": "+", "from": "stream", "detail": "Pre-norm: x = x + sublayer(norm(x)); the residual carries the un-normalised x around the norm."}
   ],
-  "edges": [
-    {"from": "x", "to": "ln", "kind": "plain", "label": "forward(x)"},
-    {"from": "x", "to": "rms", "kind": "plain", "label": "forward(x)"},
-    {"from": "ln", "to": "params", "kind": "plain", "label": "· weight + bias"},
-    {"from": "rms", "to": "params", "kind": "plain", "label": "· weight"},
-    {"from": "params", "to": "ref", "kind": "plain", "label": "allclose · gradcheck"}
+  "notes": [
+    {"at": "ln-var", "text": "Divide by **D**, not D − 1", "side": "left"},
+    {"at": "ln-scale", "text": "eps **inside** the root: a flat row gives bias, not NaN", "side": "left"},
+    {"at": "rms-up", "text": "fp16 x² overflows at **|x| > 256**"},
+    {"at": "rms-ms", "text": "**1** reduction instead of 2"},
+    {"at": "add", "text": "Pre-norm: the stream itself is never normalised"}
   ]
 }
 :::
@@ -87,15 +102,24 @@ r  = rsqrt(σ² + eps)                eps inside the root
 y  = (x − μ) · r · weight + bias    weight, bias: shape (D,), broadcast over rows
 \`\`\`
 
-:::sequence
+With the self-test's \`(2, 5, 64)\` input, the two statistics are reductions that keep a size-1 axis, and
+everything after them is a broadcast:
+
+:::architecture
 {
-  "participants": ["block", "LayerNorm", "weight · bias"],
-  "messages": [
-    {"from": "block", "to": "LayerNorm", "label": "forward(x)  x: (2, 5, 64) float32", "kind": "sync"},
-    {"from": "LayerNorm", "to": "LayerNorm", "label": "mean, var(unbiased=False) over dim −1, keepdim → (2, 5, 1)", "kind": "sync"},
-    {"from": "LayerNorm", "to": "weight · bias", "label": "(x − mean) · rsqrt(var + 1e-5)", "kind": "sync"},
-    {"from": "weight · bias", "to": "LayerNorm", "label": "· weight + bias  (64,) broadcast", "kind": "reply"},
-    {"from": "LayerNorm", "to": "block", "label": "y: (2, 5, 64) float32", "kind": "reply"}
+  "input": "x · (2, 5, 64) · float32",
+  "output": "y · (2, 5, 64) · float32",
+  "items": [
+    {"columns": [
+      [{"id": "g-mean", "label": "Mean", "sub": "μ · (2, 5, 1)", "detail": "x.mean(dim=-1, keepdim=True)"}],
+      [{"id": "g-var", "label": "Biased variance", "sub": "σ² · (2, 5, 1)", "detail": "x.var(dim=-1, unbiased=False, keepdim=True)"}]
+    ]},
+    {"id": "g-norm", "label": "Normalise", "sub": "(x − μ) · rsqrt(σ² + 1e-5)", "detail": "x, μ and σ² broadcast against each other: (2, 5, 64) with (2, 5, 1)."},
+    {"id": "g-aff", "label": "Affine map", "sub": "· weight + bias · (64,) broadcast", "detail": "weight and bias broadcast over the 2 × 5 rows."}
+  ],
+  "notes": [
+    {"at": "g-mean", "text": "keepdim: **(2, 5, 1)** broadcasts back over the row", "side": "left"},
+    {"at": "g-aff", "text": "Identity at init: weight **1**, bias **0**"}
   ]
 }
 :::
@@ -177,6 +201,11 @@ def forward(self, x):
   runs 65 norms per token, and every reduction is a pass over a 4096-wide row held in memory
   bandwidth, not FLOPs.
 
+Give the row a common offset and the two part ways: LayerNorm subtracts it, RMSNorm scales it down with
+the rest of the row.
+
+:::widget norm-compare
+
 :::quiz
 Q: A row of all 3.0 (D = 64) goes through RMSNorm with weight = ones. What comes out?
 - [ ] All zeros: the row has no variance
@@ -199,33 +228,31 @@ them:
 
 The naive module squares in the input dtype:
 
-:::sequence
-{
-  "participants": ["block", "RMSNorm (naive)"],
-  "messages": [
-    {"from": "block", "to": "RMSNorm (naive)", "label": "forward(x)  x: float16, |x| up to 600", "kind": "sync"},
-    {"from": "RMSNorm (naive)", "to": "RMSNorm (naive)", "label": "x.pow(2) → inf where |x| > 256", "kind": "sync"},
-    {"from": "RMSNorm (naive)", "to": "RMSNorm (naive)", "label": "mean → inf · rsqrt(inf + eps) → 0", "kind": "sync"},
-    {"from": "block", "to": "RMSNorm (naive)", "label": "", "kind": "async"},
-    {"from": "RMSNorm (naive)", "to": "block", "label": "y = x · 0 · weight = zeros — finite, silent, wrong", "kind": "reply"}
-  ]
-}
-:::
+| Stage, all in float16 | Value |
+| --- | --- |
+| \`x\` | magnitudes up to 600 |
+| \`x.pow(2)\` | \`inf\` wherever a magnitude exceeds 256 |
+| \`mean(x²)\` | \`inf\`: one overflow poisons the row |
+| \`rsqrt(inf + eps)\` | \`0\` |
+| \`x · 0 · weight\` | zeros: finite, silent, wrong |
 
 Nothing raises. The row is replaced by zeros, the block's attention sees a blank token, and the loss
 moves a little. Llama's module takes the statistic in float32 and casts the *normalised* row back:
 
-:::sequence
+:::architecture
 {
-  "participants": ["block", "RMSNorm (upcast)", "weight"],
-  "messages": [
-    {"from": "block", "to": "RMSNorm (upcast)", "label": "forward(x)  x: float16, |x| up to 600", "kind": "sync"},
-    {"from": "RMSNorm (upcast)", "to": "RMSNorm (upcast)", "label": "xf = x.float() → squares up to 3.6 × 10⁵, fine", "kind": "sync"},
-    {"from": "RMSNorm (upcast)", "to": "RMSNorm (upcast)", "label": "xf · rsqrt(mean(xf²) + eps)  — row of unit RMS", "kind": "sync"},
-    {"from": "RMSNorm (upcast)", "to": "RMSNorm (upcast)", "label": ".type_as(x) → float16, every value O(1)", "kind": "sync"},
-    {"from": "RMSNorm (upcast)", "to": "weight", "label": "· weight (float16)", "kind": "sync"},
-    {"from": "weight", "to": "RMSNorm (upcast)", "label": "float16 · float16", "kind": "reply"},
-    {"from": "RMSNorm (upcast)", "to": "block", "label": "y: float16, matches the float32 statistic to ~1e-3", "kind": "reply"}
+  "input": "x · float16 · magnitudes up to 600",
+  "output": "y · float16 · within 1e-3 of the float32 statistic",
+  "items": [
+    {"id": "u-up", "label": "Upcast", "sub": "xf = x.float() · float32", "detail": "One temporary float32 row; the statistic, the rsqrt and the division all happen here."},
+    {"id": "u-ms", "label": "Mean of squares", "sub": "squares up to 3.6 × 10⁵", "detail": "Far inside float32's range of 3.4 × 10³⁸."},
+    {"id": "u-scale", "label": "Scale", "sub": "xf · rsqrt(ms + eps) · unit RMS"},
+    {"id": "u-cast", "label": "Cast back", "sub": ".type_as(x) · float16, values O(1)", "detail": "A row of unit RMS loses only mantissa bits in float16, never range."},
+    {"id": "u-w", "label": "Scale by weight", "sub": "float16 · float16", "detail": "weight lives in the model's dtype; multiplying after the cast keeps y in float16."}
+  ],
+  "notes": [
+    {"at": "u-ms", "text": "**No inf**: float32 holds the squares"},
+    {"at": "u-cast", "text": "Loses mantissa bits, **never** range"}
   ]
 }
 :::
@@ -286,6 +313,12 @@ batch is 32 MB per pass:
 - **Where the time goes.** A norm is memory-bound: a few FLOPs per element against one row read and one
   write. In a decode step it is a negligible fraction of the time; in prefill and training it is the
   difference between six passes and two, which is why no production model runs the eager version.
+
+The one-pass statistic has a trap of its own: \`E[x²] − E[x]²\` subtracts two nearly equal numbers when
+the row sits on a large offset, and float32 runs out of digits. Welford's update keeps them; slide the
+offset up and watch the shortcut fall apart:
+
+:::widget variance-cancellation
 
 # What to take away
 

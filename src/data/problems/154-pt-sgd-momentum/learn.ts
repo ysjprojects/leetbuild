@@ -12,22 +12,41 @@ every parameter; the second turns those gradients into new parameter values and 
 weights ever change. **SGD with momentum** keeps one extra tensor per parameter — a decaying sum of past
 gradients — and steps along it; **Nesterov** steps along the gradient plus that sum; **decoupled weight
 decay** shrinks the weight itself before the step. All three are a few lines inside one subclass of
-\`torch.optim.Optimizer\`, the base class that AdamW, Lion, Muon and every other optimizer share:
+\`torch.optim.Optimizer\`, the base class that AdamW, Lion, Muon and every other optimizer share. One
+training step through it, read bottom to top:
 
-:::diagram
+:::architecture
 {
-  "nodes": [
-    {"id": "autograd", "kind": "client", "label": "training loop", "sub": "loss.backward() → p.grad, then step()", "x": 8, "y": 50},
-    {"id": "step", "kind": "service", "label": "SGD.step()", "sub": "decay · buffer · look-ahead · update, under no_grad", "x": 36, "y": 50},
-    {"id": "state", "kind": "db", "label": "state[p]", "sub": "momentum_buffer — the running sum of gradients", "x": 64, "y": 22},
-    {"id": "params", "kind": "db", "label": "parameters", "sub": "p.mul_(1 − lr·wd) · p.add_(d, alpha=−lr)", "x": 64, "y": 78},
-    {"id": "ref", "kind": "external", "label": "torch.optim.SGD", "sub": "the same trajectory when weight_decay = 0", "x": 92, "y": 78}
+  "input": "params, lr = 0.02, μ = 0.9",
+  "items": [
+    {"tone": "block", "repeat": "for each step", "label": "Training loop", "items": [
+      {"id": "backward", "label": "loss.backward()", "sub": "fills p.grad", "kind": "loss",
+       "detail": "Autograd writes \`p.grad\` for every parameter the loss touched; one it never touched keeps \`grad = None\`."},
+      {"tone": "dotted", "label": "SGD.step() · each p with a grad", "items": [
+        {"id": "grad", "label": "Gradient g", "sub": "g = p.grad · skip if None", "kind": "io",
+         "detail": "Read inside \`for group in self.param_groups: for p in group['params']\`; hyper-parameters come from \`group\`."},
+        {"id": "buffer", "label": "Momentum buffer", "sub": "buf.mul_(μ).add_(g)", "kind": "memory",
+         "side": {"label": "state[p]", "sub": "clone(g) on step 1"},
+         "detail": "\`buf ← μ · buf + g\`, in place; the running sum of gradients and the only state SGD keeps."},
+        {"columns": [
+          [{"id": "classical", "label": "Classical momentum", "sub": "d = buf"}],
+          [{"id": "nesterov", "label": "Nesterov look-ahead", "sub": "d = g.add(buf, alpha=μ)",
+            "detail": "\`d = g + μ · buf\`: same buffer, a different direction."}]
+        ]},
+        {"id": "decay", "label": "Decoupled weight decay", "sub": "p.mul_(1 − lr·wd)",
+         "detail": "On the weight, before the update; the gradient and the buffer never see it."},
+        {"id": "update", "label": "In-place update", "sub": "p.add_(d, alpha=−lr)",
+         "detail": "\`p ← p − lr · d\` under \`@torch.no_grad()\`."}
+      ]}
+    ]},
+    {"id": "trained", "label": "Trained parameters", "sub": "p after 25 steps", "kind": "io",
+     "detail": "Compared with \`torch.optim.SGD\` at \`weight_decay=0\` after every step."}
   ],
-  "edges": [
-    {"from": "autograd", "to": "step", "kind": "plain", "label": "step(closure?)"},
-    {"from": "step", "to": "state", "kind": "plain", "label": "buf.mul_(μ).add_(g)"},
-    {"from": "step", "to": "params", "kind": "plain", "label": "in place"},
-    {"from": "params", "to": "ref", "kind": "plain", "label": "allclose after every step"}
+  "notes": [
+    {"at": "buffer", "text": "μ = **0.9**: steady state **10 × g**"},
+    {"at": "nesterov", "text": "Newest gradient weighs **1 + μ**"},
+    {"at": "decay", "text": "**wd · p** never enters the buffer"},
+    {"at": "trained", "text": "Same as torch.optim.SGD for **25** steps"}
   ]
 }
 :::
@@ -61,6 +80,10 @@ the gradient points mostly across; the step zig-zags and the walk along the floo
 buf_t = μ · buf_(t−1) + g_t
 p_t   = p_(t−1) − lr · buf_t
 \`\`\`
+
+Run plain SGD, momentum and Nesterov down such a ravine and compare the paths:
+
+:::widget optimizer-paths
 
 Across the ravine the gradient flips sign every step and the sum cancels; along it the gradient keeps its
 sign and the sum grows. For a constant gradient the buffer converges to \`g / (1 − μ)\`, so the effective
@@ -137,33 +160,12 @@ regularisation: add \`wd/2 · ‖p‖²\` to the loss, so the gradient gains a t
 never knows. For plain SGD that is the same as shrinking the weight by \`1 − lr · wd\`. With a momentum
 buffer it is not, because \`wd · p\` goes *into the buffer* and is replayed:
 
-:::sequence
-{
-  "participants": ["loop", "SGD.step (coupled)", "state[p]", "parameter p"],
-  "messages": [
-    {"from": "loop", "to": "SGD.step (coupled)", "label": "step 1: g₁", "kind": "sync"},
-    {"from": "SGD.step (coupled)", "to": "state[p]", "label": "buf = g₁ + wd·p₀", "kind": "sync"},
-    {"from": "SGD.step (coupled)", "to": "parameter p", "label": "p₁ = p₀ − lr·(g₁ + wd·p₀)   — equals the decoupled p₁", "kind": "sync"},
-    {"from": "loop", "to": "SGD.step (coupled)", "label": "step 2: g₂", "kind": "sync"},
-    {"from": "SGD.step (coupled)", "to": "state[p]", "label": "buf = μ·(g₁ + wd·p₀) + g₂ + wd·p₁", "kind": "sync"},
-    {"from": "SGD.step (coupled)", "to": "parameter p", "label": "p₂ = p₁ − lr·buf   — carries μ·wd·p₀: the decay replays through the buffer", "kind": "sync"}
-  ]
-}
-:::
-
-:::sequence
-{
-  "participants": ["loop", "SGD.step (decoupled)", "state[p]", "parameter p"],
-  "messages": [
-    {"from": "loop", "to": "SGD.step (decoupled)", "label": "step 1: g₁", "kind": "sync"},
-    {"from": "SGD.step (decoupled)", "to": "parameter p", "label": "p.mul_(1 − lr·wd)", "kind": "sync"},
-    {"from": "SGD.step (decoupled)", "to": "state[p]", "label": "buf = g₁   — the bare gradient", "kind": "sync"},
-    {"from": "SGD.step (decoupled)", "to": "parameter p", "label": "p₁ = p₀·(1 − lr·wd) − lr·g₁", "kind": "sync"},
-    {"from": "loop", "to": "SGD.step (decoupled)", "label": "step 2: g₂", "kind": "sync"},
-    {"from": "SGD.step (decoupled)", "to": "parameter p", "label": "p.mul_(1 − lr·wd), then p.add_(μ·g₁ + g₂, alpha=−lr)   — decay applied once, now", "kind": "sync"}
-  ]
-}
-:::
+| Two steps with momentum μ | Coupled: \`torch.optim.SGD(weight_decay=wd)\` | Decoupled: the drill |
+| --- | --- | --- |
+| Buffer after step 1 | \`g₁ + wd·p₀\` | \`g₁\`, the bare gradient |
+| Parameter after step 1 | \`p₀ − lr·(g₁ + wd·p₀)\` | \`p₀·(1 − lr·wd) − lr·g₁\`, the same value |
+| Buffer after step 2 | \`μ·(g₁ + wd·p₀) + g₂ + wd·p₁\` | \`μ·g₁ + g₂\` |
+| Parameter after step 2 | \`p₁ − lr·buf\`: carries \`μ·wd·p₀\`, the decay replayed | \`p₁·(1 − lr·wd) − lr·(μ·g₁ + g₂)\`: each decay applied once |
 
 The two agree on step 1 — \`p₀ − lr · wd · p₀ − lr · g₁\` either way, which is why the drill's hand check
 looks at the *buffer* after step 1 and at the parameters after step 2. From then on the coupled version
@@ -230,20 +232,11 @@ group with \`weight_decay=0\` lives. Four details decide whether the loop is cor
   one of them with grad mode on is a \`RuntimeError\`, and the buffer arithmetic would otherwise build a
   graph that is never freed:
 
-:::sequence
-{
-  "participants": ["loop", "SGD.step (no decorator)", "autograd"],
-  "messages": [
-    {"from": "loop", "to": "SGD.step (no decorator)", "label": "step()", "kind": "sync"},
-    {"from": "SGD.step (no decorator)", "to": "autograd", "label": "p.mul_(1 − lr·wd)   — leaf, requires_grad, grad mode on", "kind": "sync"},
-    {"from": "autograd", "to": "SGD.step (no decorator)", "label": "RuntimeError: a leaf Variable that requires grad is being used in an in-place operation", "kind": "reply"},
-    {"from": "loop", "to": "SGD.step (no decorator)", "label": "step()  — @torch.no_grad()", "kind": "sync"},
-    {"from": "SGD.step (no decorator)", "to": "autograd", "label": "closure() under torch.enable_grad(): forward, backward", "kind": "sync"},
-    {"from": "autograd", "to": "SGD.step (no decorator)", "label": "loss, p.grad", "kind": "reply"},
-    {"from": "SGD.step (no decorator)", "to": "SGD.step (no decorator)", "label": "mul_ / add_ record nothing; return loss", "kind": "sync"}
-  ]
-}
-:::
+| Inside \`step()\` | Grad mode | What happens |
+| --- | --- | --- |
+| \`p.mul_(1 - lr * wd)\`, no decorator | on | \`RuntimeError\`: a leaf Variable that requires grad is being used in an in-place operation |
+| \`closure()\` under \`with torch.enable_grad():\`, decorated | on again | zero the grads, forward, backward: the loss and a fresh \`p.grad\` |
+| \`mul_\` / \`add_\` on \`p\` and \`buf\`, decorated with \`@torch.no_grad()\` | off | the update, recorded nowhere; \`step\` returns the closure's loss |
 
 The closure is the one exception to "no graph here": an optimizer that re-evaluates the loss (LBFGS does,
 several times per step) receives a function that zeroes the gradients, runs forward and backward and

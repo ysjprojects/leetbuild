@@ -17,6 +17,8 @@ export interface DialogSpec {
   danger?: boolean;
   /** A catalog or table rather than a sentence: wider panel, body scrolls. */
   wide?: boolean;
+  /** A figure: the widest panel, body scrolls. */
+  figure?: boolean;
   /** The page behind is what is being confirmed (a timed assessment about to start): the backdrop blurs and darkens it. */
   conceal?: boolean;
 }
@@ -46,7 +48,13 @@ const Dialog: FC<{spec: DialogSpec; onClose: (ok: boolean) => void}> = memo(({sp
       aria-labelledby="lb-dialog-title"
       className={`border-ink-600 bg-ink-800 text-ink-200 overflow-visible rounded-xl border p-0 shadow-2xl ${
         spec.conceal === true ? 'backdrop:bg-ink-950/65 backdrop:backdrop-blur-md' : 'backdrop:bg-ink-950/70'
-      } ${spec.wide === true ? 'w-[min(94vw,40rem)]' : 'w-[min(92vw,26rem)]'}`}
+      } ${
+        spec.figure === true
+          ? 'w-[min(96vw,64rem)]'
+          : spec.wide === true
+          ? 'w-[min(94vw,40rem)]'
+          : 'w-[min(92vw,26rem)]'
+      }`}
       onClick={onClick}
       onClose={cancel}
       ref={ref}>
@@ -56,7 +64,7 @@ const Dialog: FC<{spec: DialogSpec; onClose: (ok: boolean) => void}> = memo(({sp
         </h2>
         <div
           className={`text-ink-300 mt-2 text-[13px] leading-relaxed ${
-            spec.wide === true ? 'max-h-[70vh] overflow-y-auto pr-1' : ''
+            spec.wide === true || spec.figure === true ? 'max-h-[75vh] overflow-y-auto pr-1' : ''
           }`}>
           {spec.body}
         </div>

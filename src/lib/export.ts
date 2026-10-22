@@ -7,6 +7,7 @@
  */
 import {night} from '@/styles/palette';
 
+import {type Architecture, architectureToMermaid} from './architecture';
 import {
   type Diagram,
   type Language,
@@ -114,16 +115,18 @@ export function widgetsToNotes(markdown: string, stepUrl?: string): string {
 /**
  * `:::quiz` blocks become the question, its options as a task list, and the answer with its
  * explanation behind a `<details>` spoiler; `:::details Title` blocks become `<details>` elements;
- * `:::sequence` and `:::diagram` blocks become Mermaid fences.
+ * `:::sequence`, `:::diagram` and `:::architecture` blocks become Mermaid fences.
  */
 export function blocksToMarkdown(markdown: string): string {
   return markdown.replace(
-    /^:::(quiz|details|sequence|diagram)([^\n]*)\n([\s\S]*?)^:::\s*$/gm,
+    /^:::(quiz|details|sequence|diagram|architecture)([^\n]*)\n([\s\S]*?)^:::\s*$/gm,
     (_, kind: string, rest: string, body: string) => {
       if (kind === 'details')
         return `<details>\n<summary>${rest.trim() || 'Details'}</summary>\n\n${body.trim()}\n\n</details>`;
       if (kind === 'sequence') return `\`\`\`mermaid\n${sequenceToMermaid(JSON.parse(body) as Sequence)}\n\`\`\``;
       if (kind === 'diagram') return `\`\`\`mermaid\n${diagramToMermaid(JSON.parse(body) as Diagram)}\n\`\`\``;
+      if (kind === 'architecture')
+        return `\`\`\`mermaid\n${architectureToMermaid(JSON.parse(body) as Architecture)}\n\`\`\``;
       const prompt: string[] = [];
       const options: string[] = [];
       const explanation: string[] = [];
@@ -253,12 +256,20 @@ export function problemToMarkdown(problem: Problem, language: Language): string 
       parts.push(`- [${s.title}](${s.url})${s.by !== undefined ? ` — ${s.by}` : ''}, ${s.date}. ${s.takes}`);
     parts.push('');
   }
-  parts.push('## Architecture');
-  parts.push('');
-  parts.push('```mermaid');
-  parts.push(diagramToMermaid(problem.diagram));
-  parts.push('```');
-  parts.push('');
+  const figure =
+    problem.architecture !== undefined
+      ? architectureToMermaid(problem.architecture)
+      : problem.diagram !== undefined
+      ? diagramToMermaid(problem.diagram)
+      : null;
+  if (figure !== null) {
+    parts.push('## Architecture');
+    parts.push('');
+    parts.push('```mermaid');
+    parts.push(figure);
+    parts.push('```');
+    parts.push('');
+  }
   parts.push('## Steps');
   parts.push('');
   problem.steps.forEach((step, i) => {

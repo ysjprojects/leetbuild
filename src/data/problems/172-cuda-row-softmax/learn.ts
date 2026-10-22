@@ -12,19 +12,25 @@ runs it over every row of the attention scores \`QKᵀ / √d\`, over the vocabu
 the cross-entropy loss. On a GPU it is one kernel launch over a \`rows × cols\` matrix, and the whole design
 follows from one fact: the formula as written overflows, and the fix needs the row max before the first \`exp\`.
 
-:::diagram
+One block per row, bottom to top:
+
+:::architecture
 {
-  "nodes": [
-    {"id": "host", "kind": "client", "label": "Host · main()", "sub": "fills x · row 0 at 1e4 · masks rows 1, 2 · CPU double reference", "x": 8, "y": 50},
-    {"id": "kernel", "kind": "service", "label": "softmax_rows<<<rows, 256>>>", "sub": "block r owns row r · pass 1 max · pass 2 sum · pass 3 write", "x": 38, "y": 50},
-    {"id": "smem", "kind": "db", "label": "Shared memory", "sub": "s_max[8] · s_sum[8] — one slot per warp", "x": 66, "y": 22},
-    {"id": "hbm", "kind": "db", "label": "Global memory", "sub": "x and y · 4096 × 1000 fp32 · 16 MB each", "x": 66, "y": 78}
+  "input": "x · 4096 × 1000 fp32",
+  "output": "y · each row sums to 1",
+  "items": [
+    {"id": "a-x", "label": "Global memory", "sub": "x[r] · 1000 floats · 4 KB", "kind": "memory", "detail": "Read from DRAM once per row; the 32 lanes of a warp read 32 consecutive floats per round."},
+    {"tone": "block", "repeat": "4096 ×", "label": "Block r · 256 threads", "items": [
+      {"id": "a-max", "label": "Pass 1 · block max", "sub": "m = max_c x[r][c]", "kind": "kernel", "detail": "Warp shuffles, then one shared slot per warp and warp 0. It must finish before any thread takes an exp."},
+      {"id": "a-sum", "label": "Pass 2 · block sum", "sub": "sum = Σ_c __expf(x − m)", "kind": "kernel", "side": {"label": "x[r] again", "sub": "from L1/L2"}, "detail": "The same block reduction with + and identity 0, over terms in (0, 1]."},
+      {"id": "a-write", "label": "Pass 3 · write", "sub": "y = __expf(x − m) / sum", "kind": "kernel", "side": {"label": "x[r] again", "sub": "from L1/L2"}, "detail": "Recomputes the exponent instead of storing it; zeros for a fully masked row."}
+    ]},
+    {"id": "a-y", "label": "Global memory", "sub": "y[r] · 4 KB written", "kind": "memory"}
   ],
-  "edges": [
-    {"from": "host", "to": "hbm", "kind": "plain", "label": "cudaMemcpy x in · y out"},
-    {"from": "host", "to": "kernel", "kind": "plain", "label": "LAUNCH · 50 timed launches"},
-    {"from": "kernel", "to": "smem", "kind": "plain", "label": "warp partials · __syncthreads"},
-    {"from": "kernel", "to": "hbm", "kind": "plain", "label": "read x row · write y row"}
+  "notes": [
+    {"at": "a-x", "text": "**16.4 MB** read from DRAM once"},
+    {"at": "a-max", "text": "The max comes first: no exp before **m**"},
+    {"at": "a-y", "text": "**16.4 MB** written: **8** bytes per element"}
   ]
 }
 :::
@@ -61,19 +67,14 @@ numbers break at modest magnitudes:
 | \`x = 1e4\` (row 0) | \`inf\` | NaN for the whole row |
 | \`x = −104\` everywhere | 0 (below the denormals) | \`0 / 0 = NaN\` |
 
-:::sequence
-{
-  "participants": ["block 0", "global mem"],
-  "messages": [
-    {"from": "block 0", "to": "global mem", "label": "naive: sum += expf(x[0][c]) — x up to 1e4", "kind": "sync"},
-    {"from": "block 0", "to": "block 0", "label": "expf(x) = inf for any x > 88.7 → sum = inf", "kind": "sync"},
-    {"from": "block 0", "to": "global mem", "label": "y = inf / inf = NaN, other entries 0 / inf → row 0 garbage", "kind": "sync"},
-    {"from": "block 0", "to": "global mem", "label": "shifted: pass 1 finds m ≈ 1e4 first", "kind": "sync"},
-    {"from": "block 0", "to": "block 0", "label": "__expf(x − m) ∈ (0, 1], max term = 1 → sum ∈ [1, 1000]", "kind": "sync"},
-    {"from": "block 0", "to": "global mem", "label": "y = __expf(x − m) / sum — finite, sums to 1", "kind": "sync"}
-  ]
-}
-:::
+Row 0 of the self-test, both ways:
+
+| Row 0, x up to 1e4 | Naive \`expf(x)\` | Shifted \`__expf(x − m)\` |
+| --- | --- | --- |
+| Before the first \`exp\` | nothing | pass 1 finds \`m ≈ 1e4\` |
+| Each term | \`inf\` for any \`x > 88.7\` | in \`(0, 1]\`, the max term exactly 1 |
+| Sum | \`inf\` | in \`[1, 1000]\` |
+| \`y\` | \`inf / inf = NaN\`, the rest \`0 / inf\`: row 0 is garbage | finite, sums to 1 |
 
 The cost of the shift is ordering, not arithmetic: the max is a reduction over the whole row and must finish
 before any thread may take an \`exp\`. That is why softmax is two reductions rather than one. Frameworks
@@ -107,18 +108,31 @@ A block reduction has two levels:
    lanes 8–31), warp-reduces again, thread 0 writes \`shared[0]\`, a second \`__syncthreads()\`, and every thread
    reads the result.
 
-:::sequence
+The max, bottom to top:
+
+:::architecture
 {
-  "participants": ["warps 0–7", "s_max[8]", "warp 0"],
-  "messages": [
-    {"from": "warps 0–7", "to": "warps 0–7", "label": "local max over c = t, t+256, t+512, t+768", "kind": "sync"},
-    {"from": "warps 0–7", "to": "warps 0–7", "label": "fmaxf + __shfl_xor_sync, offsets 16 … 1 → 8 warp maxima", "kind": "sync"},
-    {"from": "warps 0–7", "to": "s_max[8]", "label": "lane 0 writes s_max[warp]", "kind": "sync"},
-    {"from": "warps 0–7", "to": "warps 0–7", "label": "__syncthreads() — all 8 slots written", "kind": "sync"},
-    {"from": "s_max[8]", "to": "warp 0", "label": "lanes 0–7 load partials, lanes 8–31 load -INFINITY", "kind": "reply"},
-    {"from": "warp 0", "to": "s_max[8]", "label": "warp_max → thread 0 writes s_max[0] = m", "kind": "sync"},
-    {"from": "warps 0–7", "to": "warps 0–7", "label": "__syncthreads() — m published", "kind": "sync"},
-    {"from": "s_max[8]", "to": "warps 0–7", "label": "every thread reads m", "kind": "reply"}
+  "input": "a local max per thread over c = t, t + 256, …",
+  "output": "m in every thread",
+  "items": [
+    {"tone": "block", "repeat": "4096 ×", "label": "One block · 8 warps", "items": [
+      {"columns": [
+        [{"id": "b-w0", "label": "Warp 0 max", "sub": "__shfl_xor_sync 16 … 1", "kind": "kernel"}],
+        [{"id": "b-w1", "label": "Warp 1 max", "sub": "__shfl_xor_sync 16 … 1", "kind": "kernel"}],
+        [{"id": "b-w7", "label": "… warp 7 max", "sub": "__shfl_xor_sync 16 … 1", "kind": "kernel"}]
+      ]},
+      {"id": "b-slots", "label": "__shared__ s_max[8]", "sub": "lane 0 of each warp writes", "kind": "memory"},
+      {"id": "b-sync1", "label": "__syncthreads()", "sub": "all 8 slots written", "kind": "kernel"},
+      {"id": "b-warp0", "label": "Warp 0 reduces the slots", "sub": "lanes 8–31 load -INFINITY", "kind": "kernel", "detail": "A full 32-lane shuffle needs every lane; the lanes past the warp count contribute the identity."},
+      {"id": "b-pub", "label": "Thread 0 writes s_max[0]", "sub": "m published", "kind": "memory"},
+      {"id": "b-sync2", "label": "__syncthreads()", "sub": "nobody reads m early", "kind": "kernel"},
+      {"id": "b-read", "label": "Every thread reads m", "kind": "kernel"}
+    ]}
+  ],
+  "notes": [
+    {"at": "b-sync1", "text": "Barrier **1** guards the 8 slots"},
+    {"at": "b-warp0", "text": "Identity: **-inf** for the max, **0** for the sum"},
+    {"at": "b-sync2", "text": "Barrier **2** guards **m**"}
   ]
 }
 :::
@@ -155,19 +169,14 @@ probability. A **partially masked** row — a causal mask cutting off the second
 ordinary: \`m\` is finite, \`exp(-inf − m) = 0\`, the rest normalises. A **fully masked** row is not. Padding
 can mask every key for a query (an all-padding sequence, an empty segment), and then:
 
-:::sequence
-{
-  "participants": ["block 1", "global mem"],
-  "messages": [
-    {"from": "global mem", "to": "block 1", "label": "x[1][c] = -inf for all c", "kind": "reply"},
-    {"from": "block 1", "to": "block 1", "label": "pass 1: m = fmaxf over -inf = -inf", "kind": "sync"},
-    {"from": "block 1", "to": "block 1", "label": "naive pass 2: __expf(-inf − (-inf)) = __expf(NaN) = NaN", "kind": "sync"},
-    {"from": "block 1", "to": "global mem", "label": "y[1][c] = NaN → NaN loss, NaN gradients, the run is dead", "kind": "sync"},
-    {"from": "block 1", "to": "block 1", "label": "guarded: if (m == -INFINITY) m = 0 → __expf(-inf) = 0, sum = 0", "kind": "sync"},
-    {"from": "block 1", "to": "global mem", "label": "inv = sum > 0 ? 1 / sum : 0 → y = 0 × 0 = 0", "kind": "sync"}
-  ]
-}
-:::
+| Step on row 1 (all \`-inf\`) | Naive | Guarded |
+| --- | --- | --- |
+| Pass 1 | \`m\` = \`fmaxf\` over \`-inf\` = \`-inf\` | the same |
+| Shift | \`x − m = -inf − (-inf) = NaN\` | \`if (m == -INFINITY) m = 0\`, so \`x − m = -inf\` |
+| Pass 2 | \`__expf(NaN) = NaN\`, the sum is NaN | \`__expf(-inf) = 0\`, the sum is 0 |
+| Write | \`y = NaN\`: NaN loss, NaN gradients, the run is dead | \`inv = sum > 0 ? 1 / sum : 0\`, \`y = 0 × 0 = 0\` |
+
+Over the three kinds of row:
 
 | Row | m | sum | Without guards | With guards |
 | --- | --- | --- | --- | --- |
@@ -218,6 +227,11 @@ online version is still a single block reduction, of a pair instead of a scalar.
 For a 4 KB row that sits in cache the saving is small. The idea matters where the row does **not** fit:
 FlashAttention never materialises a row of \`QKᵀ\` at all, computing it tile by tile and keeping \`(m, d)\` and
 an output accumulator that is rescaled by \`exp(m_old − m_new)\` whenever a new tile raises the max.
+
+The same recurrence over one row of scores in tiles, step by step. The widget names the running sum \`l\`
+instead of \`d\` and, as FlashAttention does, carries an output accumulator rescaled by the same factor:
+
+:::widget online-softmax
 
 :::quiz
 Q: In the online update, why is d multiplied by exp(m − m_new)?

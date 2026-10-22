@@ -5,7 +5,7 @@ export const gpt2ModelStep: Step = {
   title: 'The model: embeddings, blocks, tied head, loss',
   concept: 'pytorch',
   file: 'gpt2_model',
-  focus: ['tokens', 'embed', 'blocks', 'head'],
+  focus: ['wte', 'wpe', 'drop0', 'ln1', 'attn', 'drop1', 'add1', 'ln2', 'mlp', 'drop2', 'add2', 'lnf', 'head'],
   task: `## Task
 
 Write GPT-2 as nanoGPT does: a config, three small modules and the model, every tensor in the
@@ -19,6 +19,23 @@ shapes the paper fixes. No \`nn.MultiheadAttention\`, \`nn.TransformerEncoderLay
   \`torch.tril\` mask registered as a non-persistent buffer and applied with \`masked_fill(…, -inf)\`
   **before** the softmax; \`c_proj\` back to \`n_embd\`; dropout on the attention weights and on the
   output. Input and output are \`(B, T, n_embd)\`.
+
+:::architecture
+{
+  "input": "ln_1(x) · (B, T, 768)",
+  "output": "y · (B, T, 768), added to x",
+  "items": [
+    {"id": "c-attn", "label": "c_attn", "sub": "768 → 2,304 · one matmul", "shape": "(B, T, 3C)"},
+    {"id": "heads", "label": "split · view · transpose", "sub": "q, k, v: (B, 12, T, 64)", "shape": "(B, nh, T, hd)"},
+    {"id": "scores", "label": "Scores q @ kᵀ / √64", "kind": "attention", "sub": "(B, 12, T, T)", "side": {"label": "tril mask", "sub": "masked_fill(−inf)"}, "detail": "The mask buffer is sliced to \`[:, :, :T, :T]\` and applied before the softmax."},
+    {"id": "softmax", "label": "Softmax · dropout", "kind": "attention", "sub": "over the last axis"},
+    {"id": "av", "label": "att @ v", "sub": "(B, 12, T, 64)"},
+    {"id": "merge", "label": "Merge heads", "sub": "transpose · contiguous · view"},
+    {"id": "c-proj", "label": "c_proj · dropout", "sub": "768 → 768 · std 0.02/√24"}
+  ]
+}
+:::
+
 - \`MLP(config)\`: \`c_fc\` to \`4 * n_embd\`, \`nn.GELU()\`, \`c_proj\` back, dropout.
 - \`Block(config)\`: pre-norm residuals — \`x = x + attn(ln_1(x))\`, \`x = x + mlp(ln_2(x))\` with
   \`nn.LayerNorm(n_embd, bias=config.bias)\` (PyTorch ≥ 2.1).
@@ -35,6 +52,8 @@ shapes the paper fixes. No \`nn.MultiheadAttention\`, \`nn.TransformerEncoderLay
 - \`num_params(non_embedding=True)\`: every parameter once (the tied tensor counts once), minus
   \`wpe.weight.numel()\` when \`non_embedding\` — nanoGPT's "123.65M" for GPT-2 small (124.44M with it).
 
+:::widget model-size {"preset": "gpt2"}
+
 The self-test builds \`GPTConfig(64, 16, 2, 2, 8)\`, checks shapes, \`lm_head.weight is wte.weight\`,
 the loss against a manual log-softmax to 1e-6 and \`F.cross_entropy\`, the count
 \`V·d + n_layer·(12d² + 13d) + 2d\`, the residual-projection std, causality, the \`block_size\`
@@ -42,23 +61,6 @@ assertion and that every parameter receives a gradient, then prints \`PASS\`.
 
 > One tensor, two jobs: the token table maps ids to vectors on the way in and vectors to logits on
 > the way out — 38.6M of GPT-2 small's parameters saved, and the model's largest matrix trained from both ends.`,
-  sequence: {
-    participants: ['idx (B, T)', 'wte + wpe', 'Block × n_layer', 'ln_f · lm_head', 'loss'],
-    messages: [
-      {from: 'idx (B, T)', to: 'wte + wpe', label: 'wte[idx] + wpe[0..T)  → x (B, T, d)', kind: 'sync'},
-      {from: 'wte + wpe', to: 'Block × n_layer', label: 'drop(x)', kind: 'sync'},
-      {
-        from: 'Block × n_layer',
-        to: 'Block × n_layer',
-        label: 'x += attn(ln_1(x)): qkv → mask → softmax → @ v → c_proj',
-        kind: 'sync',
-      },
-      {from: 'Block × n_layer', to: 'Block × n_layer', label: 'x += mlp(ln_2(x)): c_fc → GELU → c_proj', kind: 'sync'},
-      {from: 'Block × n_layer', to: 'ln_f · lm_head', label: 'x (B, T, d)', kind: 'sync'},
-      {from: 'ln_f · lm_head', to: 'loss', label: 'logits (B, T, V) = ln_f(x) @ wteᵀ', kind: 'sync'},
-      {from: 'loss', to: 'idx (B, T)', label: 'cross_entropy(logits, targets) — or None', kind: 'reply'},
-    ],
-  },
   hints: [
     'Build attention in the shape order `(B, T, 3C)` → split → `view(B, T, nh, hd)` → `transpose(1, 2)` → `(B, nh, T, hd)`; after `att @ v` reverse it: `transpose(1, 2).contiguous().view(B, T, C)`. Slice the mask buffer to `[:, :, :T, :T]`.',
     'Tie after both modules exist: create `lm_head`, then assign `self.lm_head.weight = self.transformer.wte.weight`. `self.apply(self._init_weights)` initialises the shared tensor twice, harmlessly; the `c_proj` rescale is a loop over `named_parameters()` after `apply`.',

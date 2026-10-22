@@ -64,7 +64,7 @@ export const ddpmSampleStep: Step = {
   title: 'The reverse step, the T → 0 sampler, and DDIM on a strided schedule',
   concept: 'pytorch',
   file: 'ddpm_sample',
-  focus: ['sampler', 'model', 'schedule'],
+  focus: ['eps-pred', 'mean', 'noise-step', 'samples'],
   task: `## Task
 
 Turn the trained ε-predictor into a generator. \`ddpm_sample.py\` imports \`NoiseSchedule\`, \`train_toy\` and
@@ -85,6 +85,21 @@ Turn the trained ε-predictor into a generator. \`ddpm_sample.py\` imports \`Noi
   when \`eta > 0\`. At \`eta = 0\` the only randomness is \`x_T\`.
 - No \`diffusers\`, no scheduler classes, no calls back into training.
 
+One DDIM step reuses the same \`ε̂\` twice: once to estimate \`x_0\`, once as the direction back to the
+noise level \`ᾱ_prev\` twenty steps down.
+
+:::architecture
+{"input": "x at timestep t", "items": [
+  {"tone": "block", "repeat": "50 ×", "label": "ddim_sample step", "items": [
+    {"id": "d-eps", "label": "ε_θ(x, t)", "kind": "ffn", "sub": "one network call"},
+    {"id": "d-x0", "label": "Estimate x0_pred", "kind": "attention", "sub": "(x − √(1 − a_t) · ε̂) / √a_t"},
+    {"id": "d-jump", "label": "Jump to ᾱ_prev", "kind": "attention", "sub": "√a_prev·x0_pred + √(1−a_prev−σ²)·ε̂"},
+    {"id": "d-noise", "label": "Add σ · z", "sub": "only when eta > 0"}
+  ]},
+  {"id": "d-out", "label": "x at t_prev = t − 20", "kind": "io", "sub": "x0_pred itself at the last step"}
+]}
+:::
+
 The file ends with a self-test: train the toy model with \`train_toy\`; shapes and dtype of both samplers;
 \`p_sample\` deterministic at \`t = 0\` and noisy at \`t = 500\`; \`ddim_sample(eta=0)\` reproducible under one
 seed and drawing no random numbers after \`x_T\`; \`ddim_sample(steps=T, eta=1)\` equal to \`sample\` under one
@@ -94,33 +109,6 @@ distance of \`0.05\` of the two-moons data (75th percentile under \`0.1\`) — t
 > The network only ever predicts noise; the sampler turns that prediction into an estimate of \`x_0\` and
 > walks back along the posterior. DDPM re-injects fresh noise at every one of the T steps; DDIM, at
 > \`eta = 0\`, follows a deterministic path through the same marginals and can skip most of the steps.`,
-  sequence: {
-    participants: ['sample', 'p_sample', 'TinyDenoiser', 'NoiseSchedule'],
-    messages: [
-      {from: 'sample', to: 'sample', label: 'x_T = torch.randn(shape)  (2000, 2)', kind: 'sync'},
-      {
-        from: 'sample',
-        to: 'p_sample',
-        label: 'for t in reversed(range(T)): p_sample(model, x, t, schedule)',
-        kind: 'sync',
-      },
-      {from: 'p_sample', to: 'TinyDenoiser', label: 'model(x_t, full((B,), t))', kind: 'sync'},
-      {from: 'TinyDenoiser', to: 'p_sample', label: 'ε̂: (B, 2)', kind: 'reply'},
-      {
-        from: 'p_sample',
-        to: 'NoiseSchedule',
-        label: 'betas[t] · sqrt_one_minus_alphas_cumprod[t] · alphas[t]',
-        kind: 'sync',
-      },
-      {from: 'p_sample', to: 'p_sample', label: 'mean = (x_t − β_t/√(1−ᾱ_t) · ε̂) / √α_t', kind: 'sync'},
-      {
-        from: 'p_sample',
-        to: 'sample',
-        label: 't > 0: mean + √posterior_variance[t] · z  ·  t = 0: mean',
-        kind: 'reply',
-      },
-    ],
-  },
   hints: [
     '`t` is a Python `int` here, so `schedule.betas[t]` is a 0-dim tensor that broadcasts over the whole batch; only the model needs a `(B,)` tensor: `torch.full((x_t.shape[0],), t, dtype=torch.long, device=x_t.device)`.',
     'The posterior mean is `(x_t - schedule.betas[t] / schedule.sqrt_one_minus_alphas_cumprod[t] * eps) / schedule.alphas[t].sqrt()`; the `if t == 0: return mean` branch is what makes the last step clean.',

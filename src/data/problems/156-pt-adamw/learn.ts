@@ -11,22 +11,46 @@ running averages of the gradient and its square — with one change from Loshchi
 *Decoupled Weight Decay Regularization*: weight decay shrinks the parameter directly instead of being
 added to the gradient. The drill implements \`AdamW.step(self, closure=None)\` on a
 \`torch.optim.Optimizer\` subclass whose constructor already stores \`lr\`, \`betas\`, \`eps\`,
-\`weight_decay\` and \`amsgrad\` as group defaults.
+\`weight_decay\` and \`amsgrad\` as group defaults. One training step through it, read bottom to top, with
+what AdamW changes in the accent colour:
 
-:::diagram
+:::architecture
 {
-  "nodes": [
-    {"id": "loop", "kind": "client", "label": "Training loop", "sub": "zero_grad · backward · step(closure)", "x": 10, "y": 50},
-    {"id": "optim", "kind": "service", "label": "AdamW.step()", "sub": "decay · moments · bias-correct · update, under no_grad", "x": 40, "y": 50},
-    {"id": "params", "kind": "db", "label": "Parameters", "sub": "p shrinks by (1 − lr·wd), then moves by addcdiv_", "x": 70, "y": 25},
-    {"id": "state", "kind": "db", "label": "self.state[p]", "sub": "step · exp_avg · exp_avg_sq (· max_exp_avg_sq) — 2× the params", "x": 70, "y": 75},
-    {"id": "ref", "kind": "external", "label": "torch.optim.AdamW", "sub": "the same trajectory, within 1e-7 in float64", "x": 40, "y": 90}
+  "input": "MLP params · lr = 1e-2 · wd = 0.1",
+  "items": [
+    {"tone": "block", "repeat": "for each step", "label": "Training loop", "items": [
+      {"id": "backward", "label": "loss.backward()", "sub": "mse_loss(model(x), y) → p.grad", "kind": "loss"},
+      {"tone": "dotted", "label": "AdamW.step() · each p with a grad", "items": [
+        {"id": "grad", "label": "Gradient g_t", "sub": "g = p.grad · skip if None", "kind": "io"},
+        {"id": "count", "label": "Step count t", "sub": "state[\\"step\\"] += 1", "kind": "memory",
+         "side": {"label": "self.state[p]", "sub": "created on first sight"},
+         "detail": "Empty until \`step\` first meets \`p\` with a gradient; then \`step = 0\` and zero tensors for the moments."},
+        {"columns": [
+          [{"id": "m", "label": "First moment m_t", "sub": "m = β₁m + (1 − β₁)g", "kind": "memory",
+            "detail": "\`exp_avg\`: an EMA of the gradient, momentum."}],
+          [{"id": "v", "label": "Second moment v_t", "sub": "v = β₂v + (1 − β₂)g²", "kind": "memory",
+            "detail": "\`exp_avg_sq\`: an EMA of the squared gradient; \`√v\` is the coordinate's gradient scale."},
+           {"id": "amsgrad", "label": "AMSGrad running max", "sub": "only when amsgrad=True", "kind": "memory",
+            "detail": "\`max_exp_avg_sq\`, used in place of \`exp_avg_sq\` in the denominator."}]
+        ]},
+        {"id": "bias", "label": "Bias correction", "sub": "bc1 = 1 − β₁ᵗ · bc2 = 1 − β₂ᵗ",
+         "detail": "\`step_size = lr / bc1\`; \`bc2\` divides \`v\` under the root."},
+        {"id": "denom", "label": "Denominator", "sub": "√v / √bc2 + eps",
+         "detail": "\`eps\` is added after the square root, a floor on the gradient scale."},
+        {"id": "decay", "label": "Decoupled weight decay", "sub": "p.mul_(1 − lr·wd)", "kind": "attention",
+         "detail": "The one change from Adam. The reference runs it first; neither moment reads \`p\`, so the result is the same."},
+        {"id": "update", "label": "Adam update", "sub": "p.addcdiv_(m, denom, −lr/bc1)",
+         "detail": "\`p ← p − (lr / bc1) · m / denom\`, in place under \`@torch.no_grad()\`."}
+      ]}
+    ]},
+    {"id": "trained", "label": "Trained parameters", "sub": "p after 25 steps", "kind": "io"}
   ],
-  "edges": [
-    {"from": "loop", "to": "optim", "kind": "plain", "label": "step(closure)"},
-    {"from": "optim", "to": "params", "kind": "plain", "label": "read grad · mul_ · addcdiv_"},
-    {"from": "optim", "to": "state", "kind": "plain", "label": "create once · update in place"},
-    {"from": "loop", "to": "ref", "kind": "plain", "label": "same batch, compare every step"}
+  "notes": [
+    {"at": "v", "text": "Two fp32 moments: **8** bytes per parameter"},
+    {"at": "bias", "text": "Uncorrected step 1 is **3.2 ×** too large"},
+    {"at": "denom", "text": "eps = **1e-8**, added after the root"},
+    {"at": "decay", "text": "The same **lr · wd** shrink for every weight"},
+    {"at": "trained", "text": "Within **1e-7** of torch.optim.AdamW"}
   ]
 }
 :::
@@ -50,21 +74,14 @@ p     ← p − (lr / bc1) · m / denom              p.addcdiv_(exp_avg, denom, 
 - Everything is in place under \`@torch.no_grad()\`; a closure runs under \`torch.enable_grad()\` and
   its loss is returned.
 
-:::sequence
-{
-  "participants": ["training loop", "AdamW.step", "self.state[p]", "parameter p"],
-  "messages": [
-    {"from": "training loop", "to": "AdamW.step", "label": "step(closure) — under torch.no_grad()", "kind": "sync"},
-    {"from": "AdamW.step", "to": "training loop", "label": "closure() under enable_grad → loss, p.grad", "kind": "reply"},
-    {"from": "AdamW.step", "to": "self.state[p]", "label": "first sight: step=0, exp_avg=0, exp_avg_sq=0", "kind": "sync"},
-    {"from": "AdamW.step", "to": "self.state[p]", "label": "step += 1 → t", "kind": "sync"},
-    {"from": "AdamW.step", "to": "parameter p", "label": "p.mul_(1 − lr·wd)", "kind": "sync"},
-    {"from": "AdamW.step", "to": "self.state[p]", "label": "m, v updated in place", "kind": "sync"},
-    {"from": "AdamW.step", "to": "parameter p", "label": "p.addcdiv_(m, denom, value=−lr/bc1)", "kind": "sync"},
-    {"from": "AdamW.step", "to": "training loop", "label": "loss", "kind": "reply"}
-  ]
-}
-:::
+What \`self.state[p]\` holds over a run:
+
+| When | \`step\` | \`exp_avg\` | \`exp_avg_sq\` | \`max_exp_avg_sq\` |
+|---|---|---|---|---|
+| before its first gradient | absent | absent | absent | absent |
+| first sight, before the update | \`0\` | \`zeros_like(p)\` | \`zeros_like(p)\` | \`zeros_like(p)\`, only with \`amsgrad\` |
+| after step \`t\` | \`t\` | \`m_t\` | \`v_t\` | \`max(v_1, …, v_t)\` |
+| a frozen parameter, ever | absent | absent | absent | absent |
 
 # Two moments and why they need correcting
 
@@ -72,7 +89,10 @@ p     ← p − (lr / bc1) · m / denom              p.addcdiv_(exp_avg, denom, 
 coordinate. \`m\` estimates the gradient's mean — momentum. \`v\` estimates its uncentred second
 moment, so \`√v\` is the typical size of that coordinate's gradient. The step \`m / √v\` is then roughly
 unit-sized whatever the gradient's scale: a coordinate with tiny gradients moves as far as one with huge
-ones, and \`lr\` becomes a step length in parameter units.
+ones, and \`lr\` becomes a step length in parameter units. Compare Adam's path with plain SGD's and
+momentum's on an ill-conditioned loss:
+
+:::widget optimizer-paths
 
 Both averages start at zero, so early on they are biased towards zero. After \`t\` steps of a constant
 gradient \`g\`, \`m = (1 − β1^t) · g\` and \`v = (1 − β2^t) · g²\`. Dividing by those factors removes the
@@ -110,17 +130,28 @@ Q: Without bias correction, what happens on the very first step with the default
 For plain SGD, adding \`wd · p\` to the gradient and shrinking \`p\` by \`lr · wd\` are the same thing.
 Under Adam they are not: whatever is added to the gradient also passes through \`m / √v\`. The decay
 term is divided by the coordinate's gradient scale, so weights with large gradients — the ones that
-most need regularising — are barely decayed, and weights with tiny gradients are decayed hard.
+most need regularising — are barely decayed, and weights with tiny gradients are decayed hard. That is
+L2-regularised Adam, \`torch.optim.Adam(weight_decay=…)\`; set it beside the AdamW figure at the top:
 
-:::sequence
+:::architecture
 {
-  "participants": ["AdamW.step", "grad", "self.state[p]", "parameter p"],
-  "messages": [
-    {"from": "AdamW.step", "to": "grad", "label": "naive: g ← g + wd·p (L2 regularised Adam)", "kind": "sync"},
-    {"from": "AdamW.step", "to": "self.state[p]", "label": "wd·p enters m and v", "kind": "sync"},
-    {"from": "self.state[p]", "to": "AdamW.step", "label": "decay term divided by √v — large-gradient weights barely shrink", "kind": "reply"},
-    {"from": "AdamW.step", "to": "parameter p", "label": "AdamW: p.mul_(1 − lr·wd) — same shrink for every weight", "kind": "sync"},
-    {"from": "AdamW.step", "to": "self.state[p]", "label": "moments see only the loss gradient", "kind": "sync"}
+  "input": "p.grad",
+  "items": [
+    {"id": "g", "label": "Loss gradient g", "sub": "g = p.grad", "kind": "io"},
+    {"id": "l2", "label": "L2 term added", "sub": "g ← g + wd·p", "kind": "attention",
+     "side": {"label": "wd · p", "sub": "from the weight"},
+     "detail": "The gradient of \`wd/2 · ‖p‖²\`: the decay now travels with the gradient."},
+    {"columns": [
+      [{"id": "m", "label": "First moment", "sub": "m = β₁m + (1 − β₁)g", "kind": "memory"}],
+      [{"id": "v", "label": "Second moment", "sub": "v = β₂v + (1 − β₂)g²", "kind": "memory"}]
+    ]},
+    {"id": "norm", "label": "Normalised step", "sub": "m̂ / (√v̂ + eps)",
+     "detail": "Whatever entered \`g\` is divided by the coordinate's own gradient scale, the decay term included."},
+    {"id": "update", "label": "Update", "sub": "p.addcdiv_(m, denom, −lr/bc1)", "kind": "io"}
+  ],
+  "notes": [
+    {"at": "l2", "text": "The decay enters **m** and **v**"},
+    {"at": "norm", "text": "Decay ÷ **√v**: large-gradient weights barely shrink"}
   ]
 }
 :::

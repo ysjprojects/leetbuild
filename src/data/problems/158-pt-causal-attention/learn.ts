@@ -13,22 +13,35 @@ positions \`0..t\` and nothing after it. The drill implements
 \`CausalSelfAttention(d_model, n_heads, dropout=0.0, max_len=1024)\` with \`forward(x, attn_mask=None)\`,
 \`x\` of shape \`[B, T, d_model]\`, returning the same shape.
 
-:::diagram
+It is the first sublayer of every decoder block; the figure opens it up on the right.
+
+:::architecture
 {
-  "nodes": [
-    {"id": "x", "kind": "client", "label": "x", "sub": "[B, T, d_model] · float32, bfloat16 or float64", "x": 6, "y": 50},
-    {"id": "qkv", "kind": "service", "label": "qkv", "sub": "one Linear(D, 3D) · split · heads as a view", "x": 28, "y": 50},
-    {"id": "attn", "kind": "service", "label": "scores → softmax", "sub": "q @ kᵀ / √hd · -inf where masked · float32 softmax", "x": 52, "y": 50},
-    {"id": "mask", "kind": "db", "label": "causal_mask", "sub": "tril buffer · not trained · not saved", "x": 52, "y": 85},
-    {"id": "proj", "kind": "service", "label": "probs @ v → proj", "sub": "merge heads · Linear(D, D)", "x": 76, "y": 50},
-    {"id": "ref", "kind": "external", "label": "F.scaled_dot_product_attention", "sub": "the reference: is_causal=True, 1e-5", "x": 96, "y": 50}
+  "input": "token and position embeddings",
+  "output": "to the next block",
+  "items": [
+    {"tone": "block", "repeat": "N ×", "label": "Decoder block", "items": [
+      {"id": "ln1", "label": "LayerNorm 1", "kind": "norm", "detail": "Pre-norm: the sublayer sees a normalised copy of the residual stream."},
+      {"id": "attn", "label": "Causal self-attention", "kind": "attention", "sub": "this drill · H heads × hd", "shape": "[B, T, D]", "detail": "\`CausalSelfAttention(d_model, n_heads)\`: fused qkv, heads as a view, scaled scores, the tril mask as \`-inf\`, a float32 softmax, \`probs @ v\`, output projection."},
+      {"id": "add1", "op": "+", "from": "ln1", "detail": "\`x = x + attn(ln_1(x))\`"},
+      {"id": "ln2", "label": "LayerNorm 2", "kind": "norm"},
+      {"id": "mlp", "label": "Feed forward", "kind": "ffn", "sub": "D → 4D → D", "detail": "Applied to every position on its own: the only place tokens mix is the attention below it."},
+      {"id": "add2", "op": "+", "from": "ln2", "detail": "\`x = x + mlp(ln_2(x))\`"}
+    ]}
   ],
-  "edges": [
-    {"from": "x", "to": "qkv", "kind": "plain", "label": "x"},
-    {"from": "qkv", "to": "attn", "kind": "plain", "label": "q, k, v [B, H, T, hd]"},
-    {"from": "mask", "to": "attn", "kind": "plain", "label": "tril[:T, :T] & attn_mask"},
-    {"from": "attn", "to": "proj", "kind": "plain", "label": "probs [B, H, T, T]"},
-    {"from": "proj", "to": "ref", "kind": "plain", "label": "self-test"}
+  "notes": [
+    {"at": "attn", "text": "Position t reads keys **0..t**", "side": "left"},
+    {"at": "add1", "text": "Residual stream", "side": "left"}
+  ],
+  "insets": [
+    {"for": "attn", "title": "CausalSelfAttention", "items": [
+      {"id": "in-qkv", "label": "Fused QKV projection", "sub": "Linear(D, 3D) · split · heads"},
+      {"id": "in-scores", "label": "Scaled dot product", "kind": "attention", "sub": "q · kᵀ / √hd"},
+      {"id": "in-mask", "label": "Causal mask", "kind": "attention", "sub": "tril → −inf"},
+      {"id": "in-softmax", "label": "Softmax in float32", "kind": "attention"},
+      {"id": "in-wsum", "label": "Weighted sum of values", "sub": "probs @ v · merge heads"},
+      {"id": "in-proj", "label": "Output projection", "sub": "Linear(D, D)"}
+    ], "note": "Scores of **[B, H, T, T]**, materialised on purpose"}
   ]
 }
 :::
@@ -119,35 +132,22 @@ output must depend on tokens \`0..t\` only. The mask is the lower triangle; the 
 whole point. Fill masked scores with \`-inf\`, then softmax: \`exp(-inf) = 0\` exactly, the future gets no
 probability, and the denominator sums over the past alone.
 
-:::sequence
-{
-  "participants": ["forward", "causal_mask", "softmax", "probs @ v"],
-  "messages": [
-    {"from": "forward", "to": "forward", "label": "S = q @ kᵀ / √hd — row t holds scores for keys 0..T−1", "kind": "sync"},
-    {"from": "forward", "to": "causal_mask", "label": "tril[:T, :T] & attn_mask[:, None, None, :]", "kind": "sync"},
-    {"from": "causal_mask", "to": "forward", "label": "S.masked_fill(~mask, -inf)", "kind": "reply"},
-    {"from": "forward", "to": "softmax", "label": "softmax(S, dim=-1) in float32", "kind": "sync"},
-    {"from": "softmax", "to": "forward", "label": "P[t, s] = 0 for s > t, row sums to 1 over 0..t", "kind": "reply"},
-    {"from": "forward", "to": "probs @ v", "label": "dropout(P) @ v — the future contributes nothing", "kind": "sync"}
-  ]
-}
-:::
+Toggle the mask in the heatmap below: with it on, row \`t\` puts all its weight on keys \`0..t\`, the upper
+triangle is empty, and every row still sums to 1.
 
-The failure: mask the *probabilities* instead.
+:::widget attention-heatmap {"causal": true}
 
-:::sequence
-{
-  "participants": ["forward", "softmax", "mask after", "probs @ v"],
-  "messages": [
-    {"from": "forward", "to": "softmax", "label": "softmax(S) over all T keys, future included", "kind": "sync"},
-    {"from": "softmax", "to": "forward", "label": "P[t, s] = exp(S[t, s]) / Σ over 0..T−1", "kind": "reply"},
-    {"from": "forward", "to": "mask after", "label": "P.masked_fill(~tril, 0)", "kind": "sync"},
-    {"from": "mask after", "to": "forward", "label": "future weights zeroed — but the denominator still summed them", "kind": "reply"},
-    {"from": "forward", "to": "probs @ v", "label": "row t sums to < 1, by an amount set by tokens after t", "kind": "sync"},
-    {"from": "probs @ v", "to": "forward", "label": "output at t changes when token t+1 changes: the future leaks", "kind": "reply"}
-  ]
-}
-:::
+The failure: mask the *probabilities* instead. Take three tokens whose queries all score the three keys
+\`[1, 2, 3]\`, and apply the lower triangle both ways:
+
+| query t | visible keys | mask, then softmax | row sum | softmax, then mask | row sum |
+|---|---|---|---|---|---|
+| 0 | 0 | 1, 0, 0 | 1 | 0.090, 0, 0 | 0.090 |
+| 1 | 0, 1 | 0.269, 0.731, 0 | 1 | 0.090, 0.245, 0 | 0.335 |
+| 2 | 0, 1, 2 | 0.090, 0.245, 0.665 | 1 | 0.090, 0.245, 0.665 | 1 |
+
+Masked after the softmax, row 0 keeps only 0.090 because its denominator still summed \`exp\` over keys 1 and
+2: raise the score of key 2 and the output at position 0 moves. The future leaks through the normaliser.
 
 - The leak is quiet: shapes are right, loss goes down, and the model learns to read the next token through
   the normaliser. At generation time that token does not exist and quality collapses.
@@ -217,19 +217,15 @@ Training also keeps the probabilities for backward and computes their gradient, 
 softmax and \`probs @ v\` is a round trip through HBM. The arithmetic is cheap; the memory traffic is the
 cost.
 
-:::sequence
-{
-  "participants": ["HBM", "this module", "FlashAttention kernel", "SRAM"],
-  "messages": [
-    {"from": "this module", "to": "HBM", "label": "write S [B, H, T, T]", "kind": "sync"},
-    {"from": "HBM", "to": "this module", "label": "read S → softmax → write P", "kind": "reply"},
-    {"from": "HBM", "to": "this module", "label": "read P → P @ v", "kind": "reply"},
-    {"from": "FlashAttention kernel", "to": "SRAM", "label": "load a q tile; stream k, v tiles", "kind": "sync"},
-    {"from": "SRAM", "to": "FlashAttention kernel", "label": "online softmax: running max and sum, rescale partial O", "kind": "reply"},
-    {"from": "FlashAttention kernel", "to": "HBM", "label": "write O [B, H, T, hd] only — O(T) memory", "kind": "sync"}
-  ]
-}
-:::
+The same layer as a fused kernel moves very different bytes:
+
+| | this module | a FlashAttention kernel |
+|---|---|---|
+| scores \`S\`, \`[B, H, T, T]\` | written to HBM, read back for the softmax | one tile at a time in SRAM, never written |
+| probabilities \`P\` | written to HBM, read back for \`P @ v\` | computed per tile and folded into the output |
+| softmax | over a whole row at once | online: a running max and sum per row, the partial \`O\` rescaled |
+| written to HBM | \`S\`, \`P\` and \`O\` | \`O\` only, \`[B, H, T, hd]\` |
+| memory beyond q, k, v | \`O(T²)\` | \`O(T)\` |
 
 - [FlashAttention-2](https://arxiv.org/abs/2307.08691) never writes \`S\` or \`P\`: it tiles, keeps per-row
   max and sum, and recomputes probabilities in backward from those statistics.

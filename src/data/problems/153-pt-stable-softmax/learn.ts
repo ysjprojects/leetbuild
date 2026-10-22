@@ -12,23 +12,42 @@ export const learn = `# The mechanism at a glance
 distribution against the right answer. A transformer runs the pair on every token: once per head over
 the attention scores, and once over the output head's logits, where \`-log p\` of the next token is the
 pre-training loss. The output-head version is the expensive one — a row is as wide as the vocabulary,
-32k to 150k entries — and the one the drill models:
+32k to 150k entries — and the one the drill models. Read it bottom to top: one \`log_softmax\` feeds both
+outputs.
 
-:::diagram
+:::architecture
 {
-  "nodes": [
-    {"id": "logits", "kind": "client", "label": "logits", "sub": "(N, C) · float32 / float64 · one row near 1e4", "x": 10, "y": 50},
-    {"id": "logsoftmax", "kind": "service", "label": "log_softmax", "sub": "x − max · log-sum-exp · the one place numerics live", "x": 35, "y": 50},
-    {"id": "softmax", "kind": "service", "label": "softmax", "sub": "exp(log p) · never a second formula", "x": 60, "y": 25},
-    {"id": "ce", "kind": "service", "label": "cross_entropy", "sub": "gather · smoothing · ignore_index · mean over kept rows", "x": 60, "y": 75},
-    {"id": "ref", "kind": "external", "label": "torch.nn.functional", "sub": "allclose · gradcheck", "x": 90, "y": 50}
+  "input": "logits x · (N, C) · one row near 1e4",
+  "items": [
+    {"id": "logits", "label": "Logits", "sub": "(N, C) · float32 or float64", "kind": "io", "shape": "[N, C]"},
+    {"tone": "dotted", "label": "log_softmax(x, dim=-1)", "items": [
+      {"id": "shift", "label": "Subtract the row max", "sub": "s = x − m ≤ 0", "shape": "[N, C]",
+       "side": {"label": "Row max m", "sub": "x.amax(-1, keepdim)", "detail": "Shape (N, 1), broadcast back over the row; its gradient cancels, so it may be detached."},
+       "detail": "A shared shift leaves the ratio of exponentials unchanged and makes the largest exponent exactly 0."},
+      {"id": "exp", "label": "Exponentiate", "sub": "exp(s) ∈ (0, 1]", "detail": "Nothing can overflow; terms far below the max underflow to 0, the right probability."},
+      {"id": "sum", "label": "Sum over the row", "sub": "Σ exp(s) ∈ [1, C]", "shape": "[N, 1]", "detail": "The max term is exactly 1, so the sum is never 0."},
+      {"id": "log", "label": "Log, negated", "sub": "−log Σ exp(s) ∈ [−log C, 0]"},
+      {"id": "logp", "op": "+", "from": "exp", "detail": "log p = s − log Σ exp(s): the shifted row comes around and the log-sum-exp is subtracted."}
+    ]},
+    {"columns": [
+      [{"id": "softmax", "label": "softmax", "sub": "p = exp(log p)", "kind": "io", "shape": "[N, C]", "detail": "One more exp over the log-probabilities, never a second formula."}],
+      [
+        {"columns": [
+          [{"id": "gather", "label": "Gather the target", "sub": "(1 − ε) · −logp[t]", "shape": "[N]", "detail": "logp.gather(1, t.unsqueeze(1)): one entry per row, no one-hot."}],
+          [{"id": "smooth", "label": "Uniform term", "sub": "ε · −logp.mean(-1)", "shape": "[N]", "detail": "Label smoothing's share: ε times minus the row mean of logp."}]
+        ]},
+        {"id": "mix", "op": "+", "detail": "(1 − ε) · nll + ε · smooth, per row."},
+        {"id": "mask", "label": "Mask ignored rows", "sub": "loss = 0 where target is −100", "detail": "Applied after the mixture: an ignored row contributes neither term."},
+        {"id": "loss", "label": "cross_entropy", "sub": "Σ loss / count of kept rows", "kind": "loss", "shape": "scalar", "detail": "reduction=\\"mean\\" with ignored targets: divide by the kept rows, not N."}
+      ]
+    ]}
   ],
-  "edges": [
-    {"from": "logits", "to": "logsoftmax", "kind": "plain", "label": "x, dim"},
-    {"from": "logsoftmax", "to": "softmax", "kind": "plain", "label": "log p"},
-    {"from": "logsoftmax", "to": "ce", "kind": "plain", "label": "log p (N, C)"},
-    {"from": "softmax", "to": "ref", "kind": "plain", "label": "F.softmax"},
-    {"from": "ce", "to": "ref", "kind": "plain", "label": "F.cross_entropy"}
+  "notes": [
+    {"at": "shift", "text": "exp(1e4) is **inf**; exp(x − m) is at most **1**"},
+    {"at": "sum", "text": "Never **0**, so its log is finite"},
+    {"at": "logp", "text": "**log p**: the one (N, C) tensor, no one-hot"},
+    {"at": "mix", "text": "Label smoothing is **a target**, not a new loss"},
+    {"at": "loss", "text": "Divide by **kept rows**, not N"}
   ]
 }
 :::
@@ -61,16 +80,19 @@ temperature of \`0.01\` on ordinary scores — exponentiates to \`inf\` in every
 \`inf / inf\` is \`nan\`. The loss is \`nan\`, the gradient is \`nan\`, every parameter is \`nan\` after one
 step:
 
-:::sequence
+:::architecture
 {
-  "participants": ["naive softmax", "exp", "sum", "divide"],
-  "messages": [
-    {"from": "naive softmax", "to": "exp", "label": "exp([1e4, 1e4 + 1, 1e4 − 3])", "kind": "sync"},
-    {"from": "exp", "to": "naive softmax", "label": "[inf, inf, inf] — 1e4 > 88.72", "kind": "reply"},
-    {"from": "naive softmax", "to": "sum", "label": "sum([inf, inf, inf])", "kind": "sync"},
-    {"from": "sum", "to": "naive softmax", "label": "inf", "kind": "reply"},
-    {"from": "naive softmax", "to": "divide", "label": "[inf, inf, inf] / inf", "kind": "sync"},
-    {"from": "divide", "to": "naive softmax", "label": "[nan, nan, nan] — and backward is nan too", "kind": "reply"}
+  "input": "x = [1e4, 1e4 + 1, 1e4 − 3] · float32",
+  "output": "loss nan, gradient nan",
+  "items": [
+    {"id": "n-exp", "label": "exp(x)", "sub": "[inf, inf, inf]", "detail": "Every entry is above 88.72, where float32's exp overflows."},
+    {"id": "n-sum", "label": "Sum over the row", "sub": "inf"},
+    {"id": "n-div", "label": "Divide", "sub": "[inf, inf, inf] / inf"},
+    {"id": "n-p", "label": "Probabilities", "sub": "[nan, nan, nan]", "kind": "loss", "detail": "inf / inf is nan; the backward pass is nan too, and one optimizer step spreads it to every parameter."}
+  ],
+  "notes": [
+    {"at": "n-exp", "text": "**1e4 > 88.72**: every term overflows"},
+    {"at": "n-p", "text": "**inf / inf = nan**, forward and backward"}
   ]
 }
 :::
@@ -87,21 +109,20 @@ Choose \`m = max_j x_j\`. Every exponent is now \`≤ 0\`, so every \`exp\` is i
 overflow. The largest term is exactly \`exp(0) = 1\`, so the sum is in \`[1, C]\` — it cannot be \`0\`, and
 its log is a small non-negative number. Same inputs, same result in exact arithmetic, no \`inf\` anywhere:
 
-:::sequence
-{
-  "participants": ["log_softmax", "amax", "exp · sum · log", "subtract"],
-  "messages": [
-    {"from": "log_softmax", "to": "amax", "label": "amax([1e4, 1e4 + 1, 1e4 − 3], keepdim=True)", "kind": "sync"},
-    {"from": "amax", "to": "log_softmax", "label": "m = 1e4 + 1", "kind": "reply"},
-    {"from": "log_softmax", "to": "subtract", "label": "x − m", "kind": "sync"},
-    {"from": "subtract", "to": "log_softmax", "label": "[−1, 0, −4] — all ≤ 0", "kind": "reply"},
-    {"from": "log_softmax", "to": "exp · sum · log", "label": "log(sum(exp([−1, 0, −4])))", "kind": "sync"},
-    {"from": "exp · sum · log", "to": "log_softmax", "label": "log(0.368 + 1 + 0.018) = 0.327", "kind": "reply"},
-    {"from": "log_softmax", "to": "subtract", "label": "(x − m) − 0.327", "kind": "sync"},
-    {"from": "subtract", "to": "log_softmax", "label": "[−1.327, −0.327, −4.327] — finite, exp sums to 1", "kind": "reply"}
-  ]
-}
-:::
+| Stage | Value |
+| --- | --- |
+| \`m = amax(x, keepdim=True)\` | \`1e4 + 1\` |
+| \`s = x − m\` | \`[−1, 0, −4]\`: all \`≤ 0\` |
+| \`exp(s)\` | \`[0.368, 1, 0.018]\` |
+| \`log Σ exp(s)\` | \`log 1.386 = 0.327\` |
+| \`log p = s − 0.327\` | \`[−1.327, −0.327, −4.327]\`: finite |
+| \`p = exp(log p)\` | \`[0.265, 0.721, 0.013]\`: sums to \`1\` |
+
+The widget starts on four logits near \`1e4\`: every naive bar is NaN, the shifted bars are finite and sum
+to \`1\`. Switch to small logits and the two agree; the temperature and \`ε\` sliders move the distribution,
+the smoothed target and the cross-entropy.
+
+:::widget softmax-stability {"preset": "huge"}
 
 - The shift is **free**: one reduction and one broadcast subtract per row, next to an \`exp\` and a
   \`sum\` that were needed anyway. Fused kernels do it in the same pass.

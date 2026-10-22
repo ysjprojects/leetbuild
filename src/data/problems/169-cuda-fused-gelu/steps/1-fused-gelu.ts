@@ -5,7 +5,7 @@ export const fusedGeluStep: Step = {
   title: 'gelu_bias_kernel: bias + GELU in one pass, sixteen bytes at a time',
   concept: 'cuda',
   file: 'fused_gelu',
-  focus: ['kernel', 'tail', 'hbm'],
+  focus: ['ld-x', 'ld-b', 'add', 'gelu', 'st-y', 'tail'],
   task: `## Task
 
 Implement \`y[i] = gelu(x[i] + bias[i % cols])\` for \`0 ≤ i < n\` as one fused, vectorised kernel plus a
@@ -32,27 +32,13 @@ scalar tail, with the **tanh approximation** of GELU that GPT-2 and BERT use.
   (a tail of 3); both compared against a double-precision CPU reference with **max abs error < 1e-5**;
   prints \`PASS\`.
 
+What one \`float4\` per thread does to a warp's memory requests: compare the contiguous scalar pattern with
+the \`float4\` one. Every fetched byte is still used, and each load instruction now moves four times the bytes.
+
+:::widget coalescing
+
 > A GELU is a dozen instructions per element against eight bytes of HBM traffic. The kernel is bound by
 > bytes, so the whole design is about touching them once — and sixteen at a time.`,
-  sequence: {
-    participants: ['Host', 'gelu_bias_kernel', 'Device memory', 'tail kernel', 'CPU reference'],
-    messages: [
-      {from: 'Host', to: 'Device memory', label: 'cudaMemcpy x[n], bias[cols] (H2D)', kind: 'sync'},
-      {from: 'Host', to: 'gelu_bias_kernel', label: '<<<n4 / 256, 256>>>(x4, bias4, y4, n4, cols4)', kind: 'async'},
-      {from: 'gelu_bias_kernel', to: 'Device memory', label: 'LDG.128 x[i] · LDG.128 bias[i % cols4]', kind: 'sync'},
-      {from: 'gelu_bias_kernel', to: 'gelu_bias_kernel', label: '4 × gelu_tanh(v + b)', kind: 'sync'},
-      {from: 'gelu_bias_kernel', to: 'Device memory', label: 'STG.128 y[i]', kind: 'sync'},
-      {
-        from: 'Host',
-        to: 'tail kernel',
-        label: '<<<1, n % 4>>>(x, bias, y, 4·n4, n, cols) — if n % 4 > 0',
-        kind: 'async',
-      },
-      {from: 'tail kernel', to: 'Device memory', label: 'y[i] = gelu_tanh(x[i] + bias[i % cols])', kind: 'sync'},
-      {from: 'Host', to: 'Device memory', label: 'cudaMemcpy y (D2H) · 20 timed launches → GB/s', kind: 'sync'},
-      {from: 'Host', to: 'CPU reference', label: 'max |y − gelu(x + b)| < 1e-5 → PASS', kind: 'reply'},
-    ],
-  },
   hints: [
     'Cast the buffers once on the host: `reinterpret_cast<const float4*>(x)`. `cudaMalloc` memory is 256-byte aligned, so every `float4` index is a legal 16-byte load. With `cols % 4 == 0`, the four lanes of `x[i]` sit in columns `4 · (i % cols4) … + 3` — exactly the four lanes of `bias[i % cols4]`.',
     'Write `gelu_tanh` once as `__device__ __forceinline__ float` and call it four times on `v.x + b.x … v.w + b.w`; build a local `float4 r` and store it with one `y[i] = r`. Use `tanhf`: `tanh` is the double routine, a different and far slower instruction sequence.',

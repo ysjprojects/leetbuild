@@ -15,22 +15,31 @@ and the ancestor of every cuBLAS and CUTLASS kernel. It keeps the naive mapping 
 element) and changes only where the operands come from: a block stages slabs of \`A\` and \`B\` in shared
 memory and reuses each float 32 times.
 
-:::diagram
+Read the figure bottom to top: both kernels read the same global memory and write the same \`C\`; only the
+tiled one stages each slab of \`K\` in shared memory between two barriers.
+
+:::architecture
 {
-  "nodes": [
-    {"id": "host", "kind": "client", "label": "host", "sub": "main() · CPU reference · cudaEvent timing · PASS", "x": 8, "y": 50},
-    {"id": "gmem", "kind": "db", "label": "global memory", "sub": "A[M×K] · B[K×N] · C[M×N] · slow, large", "x": 40, "y": 20},
-    {"id": "tiled", "kind": "service", "label": "matmul_tiled", "sub": "one 32 × 32 block per 32 × 32 tile of C", "x": 40, "y": 60},
-    {"id": "smem", "kind": "db", "label": "shared memory", "sub": "As[32][32] · Bs[32][32] · 8 KB · on-chip, per block", "x": 72, "y": 60},
-    {"id": "naive", "kind": "external", "label": "matmul_naive", "sub": "baseline · 2K global loads per output", "x": 72, "y": 20}
+  "input": "A[M×K] · B[K×N] float32",
+  "output": "C = A · B, timed in GFLOP/s",
+  "items": [
+    {"id": "host", "label": "Host · main()", "kind": "host", "sub": "CPU reference · cudaEvent timing", "detail": "Copies A and B in, launches both kernels on the same grid, checks them on 97 × 75 × 131 and times them on 1024³."},
+    {"id": "gmem-in", "label": "Global memory", "kind": "memory", "sub": "A · B · off-chip, slow, large", "detail": "DRAM (HBM). Tens of TFLOP/s of arithmetic against 2 to 3 TB/s of bandwidth."},
+    {"columns": [
+      [{"id": "naive", "label": "matmul_naive", "kind": "kernel", "sub": "acc += A[row][k] · B[k][col]", "detail": "The baseline: one thread, one output, every operand straight from global memory."}],
+      [{"tone": "block", "repeat": "⌈K/32⌉ ×", "label": "matmul_tiled · per slab", "items": [
+        {"id": "smem", "label": "Shared memory", "kind": "memory", "sub": "As[32][32] · Bs[32][32] · 8 KB", "detail": "On-chip, per block. Each thread loads one float of A and one of B per slab, coalesced."},
+        {"id": "sync1", "label": "__syncthreads()", "kind": "kernel", "sub": "slab complete"},
+        {"id": "fma", "label": "32 FMAs per thread", "kind": "kernel", "sub": "acc += As[ty][k] · Bs[k][tx]", "detail": "Out of shared memory into a register accumulator."},
+        {"id": "sync2", "label": "__syncthreads()", "kind": "kernel", "sub": "everyone done with the slab"}
+      ]}]
+    ]},
+    {"id": "gmem-out", "label": "Global memory", "kind": "memory", "sub": "C[M×N] · one store per output"}
   ],
-  "edges": [
-    {"from": "host", "to": "gmem", "kind": "plain", "label": "cudaMemcpy H2D · D2H"},
-    {"from": "host", "to": "tiled", "kind": "plain", "label": "<<<grid, block>>>"},
-    {"from": "tiled", "to": "gmem", "kind": "plain", "label": "1 coalesced load of A and B per thread per slab · 1 store"},
-    {"from": "tiled", "to": "smem", "kind": "plain", "label": "load · __syncthreads · 32 FMAs · __syncthreads"},
-    {"from": "host", "to": "naive", "kind": "plain", "label": "same grid · timed for comparison"},
-    {"from": "naive", "to": "gmem", "kind": "plain", "label": "A and B re-read per output"}
+  "notes": [
+    {"at": "naive", "text": "**2K** global loads per output: **0.25** FLOP/byte", "side": "left"},
+    {"at": "smem", "text": "**2K / 32** global loads per output"},
+    {"at": "fma", "text": "Each staged float is reused **32** times"}
   ]
 }
 :::
@@ -73,6 +82,11 @@ C[row * N + col] = acc;
   but it stays a memory benchmark.
 - The data is reused \`N\` times (each element of \`A\`) and \`M\` times (each element of \`B\`) across the
   whole product. The naive kernel leaves that reuse to the cache; tiling makes it explicit.
+
+Place the kernels on the roofline: the naive GEMM sits far left, under the bandwidth slope; the tiled one moves
+right, toward the compute roof.
+
+:::widget roofline
 
 :::quiz
 Q: The naive kernel reaches a small fraction of the GPU's peak FLOP/s on 1024³. What is the bottleneck?
@@ -117,6 +131,11 @@ if (row < M && col < N) C[row * N + col] = acc;
 | 97 × 75 × 131 | ⌈75/32⌉ × ⌈97/32⌉ = 3 × 4 | ⌈131/32⌉ = 5 | 3 of 32 columns |
 | 1024 × 1024 × 1024 | 32 × 32 | 32 | all 32 |
 
+Pick an output tile and step through its slabs: one tile of \`A\` and one of \`B\` per slab, each float read by
+\`TILE\` threads (32 in the drill).
+
+:::widget tiled-matmul
+
 :::quiz
 Q: Why does the tiled kernel load zeros past the matrix edges instead of skipping those threads with an early return?
 - [ ] Zeros are faster to load than real values
@@ -145,10 +164,15 @@ The \`[ty][tx]\` map is chosen for exactly this.
 - The shared reads are conflict-free too: \`As[ty][k]\` is one address per warp (a broadcast), \`Bs[k][tx]\`
   spans 32 consecutive banks. Storing \`Bs\` transposed would make it a 32-way bank conflict.
 
+Set the stride to 1 for \`Bs[k][tx]\` and to 32 for a transposed read, then toggle the padding that removes the
+conflict:
+
+:::widget bank-conflicts
+
 :::quiz
 Q: In a warp, ty is fixed and tx runs 0…31. Which load of A is coalesced?
-- [x] As[ty][tx] = A[row * K + t * TILE + tx] — consecutive tx, consecutive addresses
-- [ ] As[tx][ty] = A[(blockIdx.y * TILE + tx) * K + t * TILE + ty] — consecutive tx, addresses K apart
+- [x] \`As[ty][tx] = A[row * K + t * TILE + tx]\`: consecutive tx, consecutive addresses
+- [ ] \`As[tx][ty] = A[(blockIdx.y * TILE + tx) * K + t * TILE + ty]\`: consecutive tx, addresses K apart
 - [ ] Both are, because shared memory absorbs the difference
 > Coalescing is about the global addresses one warp touches in one instruction. The first form reads 128 contiguous bytes; the second reads 32 floats each a row apart, one transaction apiece. Shared memory is written after the load, so it cannot fix a scattered global read.
 :::
@@ -164,22 +188,16 @@ writes visible to each other. The slab loop needs it twice, for two different ha
   every thread has finished reading slab \`t\`.
 
 The first one is obvious; the second is the one that gets dropped, because a 32 × 32 block is 32 warps and
-it is easy to picture them moving together. They do not:
+it is easy to picture them moving together. They do not. Follow a fast and a slow warp through one slab with
+the second barrier missing:
 
-:::sequence
-{
-  "participants": ["warp 0 (fast)", "shared As / Bs", "warp 7 (slow)"],
-  "messages": [
-    {"from": "warp 0 (fast)", "to": "shared As / Bs", "label": "slab t: store As[0][·], Bs[0][·]", "kind": "sync"},
-    {"from": "warp 7 (slow)", "to": "shared As / Bs", "label": "slab t: store As[7][·], Bs[7][·]", "kind": "sync"},
-    {"from": "warp 0 (fast)", "to": "warp 7 (slow)", "label": "__syncthreads() — slab t complete", "kind": "sync"},
-    {"from": "shared As / Bs", "to": "warp 0 (fast)", "label": "acc += As[0][k] · Bs[k][·], k = 0…31 — done", "kind": "reply"},
-    {"from": "warp 0 (fast)", "to": "shared As / Bs", "label": "no second barrier → slab t + 1: overwrite Bs[0][·]", "kind": "sync"},
-    {"from": "shared As / Bs", "to": "warp 7 (slow)", "label": "warp 7 at k = 0 reads Bs[0][·] — now slab t + 1's row", "kind": "reply"},
-    {"from": "warp 7 (slow)", "to": "warp 7 (slow)", "label": "acc gets a wrong product · wrong only sometimes", "kind": "sync"}
-  ]
-}
-:::
+| Moment | Warp 0 (fast) | Warp 7 (slow) | Row \`Bs[0][·]\` holds |
+| --- | --- | --- | --- |
+| 1 | stores \`As[0][·]\`, \`Bs[0][·]\` for slab \`t\` | stores \`As[7][·]\`, \`Bs[7][·]\` | slab \`t\` |
+| 2 | first \`__syncthreads()\`: slab \`t\` complete | same barrier | slab \`t\` |
+| 3 | done: \`acc += As[0][k] · Bs[k][·]\` for \`k = 0…31\` | still at \`k = 0\` | slab \`t\` |
+| 4 | no second barrier: stores slab \`t + 1\` into \`Bs[0][·]\` | reads \`Bs[0][·]\` for \`k = 0\` | **slab t + 1** |
+| 5 | | adds a wrong product: wrong only sometimes | |
 
 With the second barrier, warp 0 waits after its products until warp 7 has finished slab \`t\`; only then does
 anyone overwrite the tiles. The failure is timing-dependent: on one GPU, one size or one run the warps may

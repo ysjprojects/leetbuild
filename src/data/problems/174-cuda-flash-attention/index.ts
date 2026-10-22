@@ -71,20 +71,130 @@ The backward pass and the \`logsumexp\` it needs, multiple heads and a batch dim
 axis), bf16/fp16 inputs and tensor-core matmuls (\`wmma\`, \`mma.sync\`), warp-level work partitioning
 and the register-tile sizes of FlashAttention-2, the asynchronous pipelining of FlashAttention-3,
 dropout, ALiBi/sliding-window masks, and the KV-cache layout of inference.`,
-  diagram: {
-    nodes: [
-      {id: 'host', kind: 'client', label: 'Host', sub: 'fills Q K V · launches · max|err|', x: 10, y: 50},
-      {id: 'hbm', kind: 'db', label: 'Global memory', sub: 'Q K V O · T × d each', x: 40, y: 20},
-      {id: 'kernel', kind: 'service', label: 'flash_attn_fwd', sub: 'one block per BQ query rows', x: 40, y: 70},
-      {id: 'smem', kind: 'db', label: 'Shared memory', sub: 'Ks, Vs · BK × D_MAX per tile', x: 70, y: 70},
-      {id: 'ref', kind: 'external', label: 'CPU reference', sub: 'double · materialised softmax', x: 70, y: 20},
+  architecture: {
+    input: 'Q, K, V · T × d float32',
+    output: 'O = softmax(Q Kᵀ / √d) V',
+    items: [
+      {
+        id: 'host',
+        label: 'Host',
+        sub: 'cudaMemcpy Q K V · <<<⌈T/64⌉, 64>>>',
+        kind: 'host',
+        detail:
+          'Fills `Q`, `K`, `V` with deterministic values in `[−1, 1]`, copies them to the device, launches `flash_attn_fwd` with `scale = 1/√d` (non-causal, then causal) and compares `O` with a double-precision CPU reference.',
+      },
+      {
+        id: 'hbm-in',
+        label: 'Global memory (HBM)',
+        sub: 'Q K V · T × d float each',
+        kind: 'memory',
+        shape: '3 × [T, d]',
+        detail:
+          'Row-major `T × d` arrays: 65,536 bytes each at `T = 256`, `d = 64`. There is no `T × T` buffer anywhere on the device.',
+      },
+      {
+        tone: 'block',
+        repeat: '⌈T/64⌉ ×',
+        label: 'Thread block · BQ = 64 query rows',
+        items: [
+          {
+            id: 'q-reg',
+            label: 'Registers: query row',
+            sub: 'q[k] = Q[row][k] · scale',
+            kind: 'memory',
+            shape: 'q: [64]',
+            detail:
+              'Thread `threadIdx.x` owns `row = blockIdx.x · 64 + threadIdx.x`. It keeps `q[D_MAX]` (pre-scaled, zero past `d`), the accumulator `o[D_MAX] = 0`, the running max `m = −∞` and the running sum `l = 0`, all in registers.',
+          },
+          {
+            tone: 'block',
+            repeat: '⌈T/32⌉ ×',
+            label: 'K/V tile loop · BK = 32',
+            items: [
+              {
+                id: 'skip',
+                label: 'Causal tile skip',
+                sub: 'break if kv0 > q_last',
+                kind: 'kernel',
+                detail:
+                  'A tile whose first key is past the block’s last query row is entirely above the diagonal. The test depends on `blockIdx` only, so the whole block leaves together and no barrier is half-reached.',
+              },
+              {
+                id: 'smem',
+                label: 'Shared memory: Ks, Vs',
+                sub: '2 × [32][64] float · __syncthreads',
+                kind: 'memory',
+                shape: 'Ks, Vs: [32, 64]',
+                detail:
+                  'Every thread loads a strided share of rows `kv0 … kv0 + 31` of `K` and `V` (zero past `T` and `d`), consecutive threads on consecutive floats, then `__syncthreads()` so no thread reads a half-filled tile.',
+              },
+              {
+                id: 'scores',
+                label: 'Scores in registers',
+                sub: 's[j] = q · Ks[j], −∞ if masked',
+                kind: 'kernel',
+                shape: 's: [32]',
+                detail:
+                  'One row of `S = Q Kᵀ` for this tile: 32 dot products of length `d`. Padding keys (`key ≥ T`) and causal keys (`key > row`) get `−∞`, so they contribute `exp(−∞) = 0`. Every lane reads the same `Ks[j][k]`: a broadcast, not a conflict.',
+              },
+              {
+                id: 'rescale',
+                label: 'Online softmax rescale',
+                sub: 'α = exp(m − m_new); o *= α',
+                kind: 'kernel',
+                detail:
+                  '`m_new = fmaxf(m, tile_max)`, `alpha = __expf(m − m_new)`: the past accumulator and sum are re-expressed under the new maximum by one multiply. On the first tile `m = −∞`, so `alpha = 0`.',
+              },
+              {
+                id: 'accum',
+                label: 'Accumulate O in registers',
+                sub: 'o += p · Vs[j]; l = l·α + Σp',
+                kind: 'kernel',
+                shape: 'o: [64]',
+                detail:
+                  '`p = __expf(s[j] − m_new) ≤ 1` for each key; `o[k] += p · Vs[j][k]`, `p_sum += p`; then `l = l · alpha + p_sum`, `m = m_new`. A second `__syncthreads()` ends the tile, so nobody overwrites `Ks`/`Vs` while a neighbour still reads them.',
+              },
+            ],
+          },
+          {
+            id: 'normalise',
+            label: 'Normalise once',
+            sub: 'O[row][k] = o[k] / l',
+            kind: 'kernel',
+            shape: 'O[row]: [d]',
+            detail:
+              'One division per row after the last tile, exact because every term carries the same `exp(−m)`. Threads with `row ≥ T` skip the write but have reached every barrier.',
+          },
+        ],
+      },
+      {
+        id: 'hbm-out',
+        label: 'Global memory (HBM)',
+        sub: 'O · T × d · written once',
+        kind: 'memory',
+        shape: '[T, d]',
+        detail:
+          'The only output: `T × d` floats. The `logsumexp` per row (`m + log l`) that a backward pass would need is left out of this drill.',
+      },
     ],
-    edges: [
-      {from: 'host', to: 'hbm', kind: 'plain', label: 'cudaMemcpy Q K V · O back'},
-      {from: 'host', to: 'kernel', kind: 'plain', label: '<<<⌈T/BQ⌉, BQ>>>'},
-      {from: 'kernel', to: 'hbm', kind: 'plain', label: 'read K/V tiles · write O once'},
-      {from: 'kernel', to: 'smem', kind: 'plain', label: 'stage tile · __syncthreads'},
-      {from: 'host', to: 'ref', kind: 'plain', label: 'max|err| < 1e-3'},
+    notes: [
+      {at: 'hbm-out', text: 'No **T × T** buffer: 256 × 256 would be **256 KB**'},
+      {at: 'smem', text: '**16 KB** of shared memory per block'},
+      {at: 'skip', text: 'Causal: about **half** the tiles never loaded'},
+      {at: 'q-reg', text: '**64** threads per block, one query row each'},
+    ],
+    insets: [
+      {
+        for: 'rescale',
+        title: 'Online softmax, one tile',
+        items: [
+          {id: 'fold-max', label: 'New running max', sub: 'm_new = max(m, max_j s[j])'},
+          {id: 'fold-alpha', label: 'Rescale the past', sub: 'α = exp(m − m_new); o, l *= α'},
+          {id: 'fold-p', label: 'Weights for this tile', sub: 'p_j = exp(s[j] − m_new) ≤ 1'},
+          {id: 'fold-add', label: 'Add the tile', sub: 'o += Σ p_j·Vs[j]; l += Σ p_j'},
+        ],
+        note: 'The past is rescaled by **exp(m_old − m_new)**',
+      },
     ],
   },
   steps: [flashAttentionStep],

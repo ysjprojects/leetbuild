@@ -19,23 +19,33 @@ The drill implements this as \`LoRALinear(base, r, alpha, dropout=0.0)\` plus th
 \`mark_only_lora_trainable(model)\` freezes everything without \`lora_\` in its name and returns the trainable
 count, and \`lora_state_dict(model)\` returns the adapter checkpoint.
 
-:::diagram
-{
-  "nodes": [
-    {"id": "trainer", "kind": "client", "label": "Training loop", "sub": "wraps q_proj, v_proj · trains A, B with AdamW", "x": 10, "y": 50},
-    {"id": "lora", "kind": "service", "label": "LoRALinear", "sub": "base(x) + dropout(x) @ Aᵀ @ Bᵀ · alpha / r", "x": 42, "y": 50},
-    {"id": "base", "kind": "db", "label": "base nn.Linear", "sub": "W, b — frozen, shared by every adapter", "x": 75, "y": 22},
-    {"id": "adapter", "kind": "db", "label": "lora_A · lora_B", "sub": "r · (in + out) scalars — the only gradients and Adam state", "x": 75, "y": 78},
-    {"id": "ckpt", "kind": "external", "label": "lora_state_dict", "sub": "megabytes, not gigabytes · load strict=False", "x": 42, "y": 90}
-  ],
-  "edges": [
-    {"from": "trainer", "to": "lora", "kind": "plain", "label": "forward · backward"},
-    {"from": "lora", "to": "base", "kind": "plain", "label": "W x + b · merge: W += B A · s"},
-    {"from": "lora", "to": "adapter", "kind": "plain", "label": "x → (…, r) → (…, out)"},
-    {"from": "adapter", "to": "ckpt", "kind": "plain", "label": "ship the adapter"}
-  ]
-}
+:::architecture
+{"input": "x · (…, in)", "output": "y · (…, out)", "items": [
+  {"tone": "dotted", "label": "LoRALinear(base, r, alpha)", "items": [
+    {"columns": [
+      [
+        {"id": "base", "label": "Frozen base nn.Linear", "sub": "W (out, in) · b", "shape": "(…, out)", "detail": "\`base.requires_grad_(False)\`: \`W\` and \`b\` get no gradient and no optimizer state, and every adapter on this model shares them."}
+      ],
+      [
+        {"id": "drop", "label": "Dropout", "sub": "adapter path only", "shape": "(…, in)"},
+        {"id": "lora-a", "label": "lora_A", "kind": "attention", "sub": "(r, in) · Kaiming", "shape": "(…, r)", "detail": "\`x @ lora_A.T\`: down to \`r\` dimensions."},
+        {"id": "lora-b", "label": "lora_B", "kind": "attention", "sub": "(out, r) · zeros", "shape": "(…, out)", "detail": "\`@ lora_B.T\`: back up to \`out\`. Zero at the start, so the branch adds 0."},
+        {"id": "scale", "label": "Scale by alpha / r", "kind": "attention", "sub": "scaling = alpha / r"}
+      ]
+    ]},
+    {"id": "add", "op": "+", "detail": "\`base(x) + (dropout(x) @ Aᵀ @ Bᵀ) · alpha / r\`; the dense \`B @ A\` is never formed in \`forward\`."}
+  ]}
+],
+"notes": [
+  {"at": "base", "text": "Frozen: no gradient, no Adam state", "side": "left"},
+  {"at": "lora-a", "text": "Trainable: **r · (in + out)** scalars"},
+  {"at": "lora-b", "text": "**B = 0**: the identity at step 0"},
+  {"at": "add", "text": "merge(): W += B·A·alpha/r, then **one** matmul"}
+]}
 :::
+
+Read it bottom to top: the input splits, the frozen path and the thin adapter path run side by side, and
+they meet at the sum. \`lora_state_dict\` ships only \`lora_A\` and \`lora_B\`: megabytes, not gigabytes.
 
 - **Frozen base.** \`base.requires_grad_(False)\`: \`W\` and \`b\` get no gradient and no optimizer state.
 - **Identity at step 0.** \`B = 0\`, so the wrapped layer returns exactly what the original did.
@@ -98,21 +108,10 @@ The update is a product, and a product of two matrices has a symmetry the initia
 | \`A = 0\`, \`B = 0\` | pre-trained model | both zero | never moves |
 | \`A\` random, \`B\` random | pre-trained model plus noise \`s · B A x\` | both | the first steps undo damage before learning |
 
-:::sequence
-{
-  "participants": ["init", "LoRALinear", "loss", "AdamW"],
-  "messages": [
-    {"from": "init", "to": "LoRALinear", "label": "naive: A, B both random", "kind": "sync"},
-    {"from": "LoRALinear", "to": "loss", "label": "y = W x + s · B A x — the pre-trained output is perturbed", "kind": "sync"},
-    {"from": "loss", "to": "AdamW", "label": "loss starts above the base model's", "kind": "reply"},
-    {"from": "init", "to": "LoRALinear", "label": "naive: A = 0, B = 0", "kind": "sync"},
-    {"from": "loss", "to": "AdamW", "label": "∂L/∂A = s · Bᵀ g xᵀ = 0, ∂L/∂B = s · g (A x)ᵀ = 0 — stuck forever", "kind": "reply"},
-    {"from": "init", "to": "LoRALinear", "label": "LoRA: A Kaiming, B = 0", "kind": "sync"},
-    {"from": "LoRALinear", "to": "loss", "label": "y = W x + b exactly — torch.equal with the base layer", "kind": "sync"},
-    {"from": "loss", "to": "AdamW", "label": "∂L/∂B ≠ 0 — step 1 moves B, then A follows", "kind": "reply"}
-  ]
-}
-:::
+Set the rank in the widget and watch what each factor costs, and why the zero \`B\` keeps the layer's
+output untouched at step 0:
+
+:::widget lora-rank
 
 - The paper initialises \`A\` with a random Gaussian; the drill uses \`nn.init.kaiming_uniform_(a=math.sqrt(5))\`,
   the same init \`nn.Linear\` gives its weight and Hugging Face PEFT's default. Either works: what matters
@@ -179,20 +178,33 @@ def merge(self):
     self.merged = True
 \`\`\`
 
-:::sequence
-{
-  "participants": ["caller", "LoRALinear", "base.weight", "lora_A · lora_B"],
-  "messages": [
-    {"from": "caller", "to": "LoRALinear", "label": "merge()", "kind": "sync"},
-    {"from": "LoRALinear", "to": "lora_A · lora_B", "label": "B @ A · alpha / r → (out, in)", "kind": "sync"},
-    {"from": "LoRALinear", "to": "base.weight", "label": "W += ΔW under no_grad; merged = True", "kind": "sync"},
-    {"from": "caller", "to": "LoRALinear", "label": "forward(x) → base(x) alone", "kind": "sync"},
-    {"from": "caller", "to": "LoRALinear", "label": "merge() again → no-op, the flag guards it", "kind": "sync"},
-    {"from": "caller", "to": "LoRALinear", "label": "unmerge()", "kind": "sync"},
-    {"from": "LoRALinear", "to": "base.weight", "label": "W -= ΔW; merged = False — the original W", "kind": "sync"}
-  ]
-}
+:::architecture
+{"output": "a plain nn.Linear again", "items": [
+  {"columns": [
+    [
+      {"id": "m-w", "label": "Frozen W", "sub": "(out, in)"}
+    ],
+    [
+      {"id": "m-ab", "label": "lora_B @ lora_A", "kind": "attention", "sub": "(out, r) @ (r, in) → (out, in)"},
+      {"id": "m-scale", "label": "Scale by alpha / r", "kind": "attention", "sub": "ΔW"}
+    ]
+  ]},
+  {"id": "m-add", "op": "+", "detail": "\`self.base.weight += ΔW\` under \`torch.no_grad()\`, guarded by \`merged\`."},
+  {"id": "m-merged", "label": "Merged weight W + ΔW", "sub": "base(x) alone · same latency"}
+],
+"notes": [
+  {"at": "m-add", "text": "In place, under **no_grad**, once: the flag guards it"}
+]}
 :::
+
+The fold is guarded by the \`merged\` flag, and \`unmerge()\` is its exact inverse:
+
+| call | \`merged\` before | effect on \`W\` | \`forward(x)\` after |
+|---|---|---|---|
+| \`merge()\` | False | \`W += ΔW\` | \`base(x)\` alone |
+| \`merge()\` | True | none, a no-op | \`base(x)\` alone |
+| \`unmerge()\` | True | \`W -= ΔW\`, the original \`W\` | \`base(x)\` plus the adapter path |
+| \`unmerge()\` | False | none, a no-op | \`base(x)\` plus the adapter path |
 
 - **The flag is the correctness.** Without \`merged\`, a second \`merge()\` adds \`ΔW\` twice, and an unmerged
   forward after a merge adds it twice through the adapter path.

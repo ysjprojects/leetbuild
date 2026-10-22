@@ -68,35 +68,113 @@ The BPE tokenizer (\`tiktoken\`), loading OpenAI's checkpoint (its \`Conv1D\` we
 relative to \`nn.Linear\`), \`F.scaled_dot_product_attention\` / FlashAttention, \`torch.compile\`,
 gradient accumulation, DDP/FSDP, data loading from a memory-mapped token file, and serving concerns —
 continuous batching, paged KV caches, speculative decoding.`,
-  diagram: {
-    nodes: [
-      {id: 'tokens', kind: 'client', label: 'Token ids', sub: 'get_batch windows · prompt + sampled ids', x: 8, y: 50},
-      {id: 'embed', kind: 'db', label: 'wte + wpe', sub: 'token table (tied) · learned positions', x: 30, y: 25},
+  architecture: {
+    input: 'Every effort moves you',
+    output: 'next-token logits',
+    items: [
       {
-        id: 'blocks',
-        kind: 'service',
-        label: 'Block × n_layer',
-        sub: 'ln · causal attn · ln · MLP — KV cache per block',
-        x: 55,
-        y: 25,
+        id: 'tokens',
+        label: 'Tokenized text',
+        kind: 'io',
+        sub: 'BPE ids',
+        shape: '[B, T] int64',
+        detail:
+          'GPT-2 byte-level BPE: 50,257 token ids. Training windows come from `get_batch`; generation feeds the prompt plus every sampled id.',
       },
-      {id: 'head', kind: 'service', label: 'ln_f · lm_head', sub: 'logits (B, T, V) → loss or sample', x: 80, y: 50},
       {
-        id: 'train',
-        kind: 'service',
-        label: 'Training loop',
-        sub: 'AdamW groups · clip 1.0 · warmup + cosine · bf16',
-        x: 45,
-        y: 80,
+        tone: 'model',
+        items: [
+          {
+            id: 'wte',
+            label: 'Token embedding layer',
+            kind: 'embed',
+            sub: 'wte · 50,257 × 768',
+            shape: '[B, T, 768]',
+            detail:
+              'A lookup table: row `i` is token `i`’s vector. The same matrix is the output layer’s weight (tied), so 38.6 M parameters serve twice.',
+          },
+          {
+            id: 'wpe',
+            label: 'Positional embedding layer',
+            kind: 'embed',
+            sub: 'wpe · 1,024 × 768',
+            shape: '[B, T, 768]',
+            detail:
+              'Learned absolute positions, added to the token vectors. Their 1,024 rows are the context length: a 1,025th position has no row.',
+          },
+          {id: 'drop0', label: 'Dropout', shape: '[B, T, 768]'},
+          {
+            tone: 'block',
+            repeat: '12 ×',
+            label: 'Transformer block',
+            items: [
+              {
+                id: 'ln1',
+                label: 'LayerNorm 1',
+                kind: 'norm',
+                detail:
+                  'Pre-norm: the sublayer sees a normalised copy; the residual stream itself is never normalised inside the block.',
+              },
+              {
+                id: 'attn',
+                label: 'Masked multi-head attention',
+                kind: 'attention',
+                sub: '12 heads × 64',
+                shape: '[B, T, 768]',
+                detail:
+                  'One fused `c_attn` projection to Q, K, V; 12 heads of 64 dims; a causal mask so position `t` sees `0..t`; `c_proj` back to 768. The KV cache keeps K and V for every past position.',
+              },
+              {id: 'drop1', label: 'Dropout'},
+              {
+                id: 'add1',
+                op: '+',
+                from: 'ln1',
+                detail: '`x = x + attn(ln_1(x))`: the residual stream carries the input around the sublayer.',
+              },
+              {id: 'ln2', label: 'LayerNorm 2', kind: 'norm'},
+              {
+                id: 'mlp',
+                label: 'Feed forward',
+                kind: 'ffn',
+                sub: '768 → 3,072 → 768',
+                detail:
+                  'Two linear layers with a GELU between, applied to every position independently: two thirds of the block’s parameters.',
+              },
+              {id: 'drop2', label: 'Dropout'},
+              {id: 'add2', op: '+', from: 'ln2', detail: '`x = x + mlp(ln_2(x))`'},
+            ],
+          },
+          {id: 'lnf', label: 'Final LayerNorm', kind: 'norm', shape: '[B, T, 768]'},
+          {
+            id: 'head',
+            label: 'Linear output layer',
+            kind: 'head',
+            sub: '768 → 50,257 · tied to wte',
+            shape: '[B, T, 50,257]',
+            detail:
+              'Logits for every position: training scores all T positions against the shifted targets with cross-entropy; generation reads only the last row.',
+          },
+        ],
       },
     ],
-    edges: [
-      {from: 'tokens', to: 'embed', kind: 'plain', label: 'idx (B, T)'},
-      {from: 'embed', to: 'blocks', kind: 'plain', label: 'x (B, T, d)'},
-      {from: 'blocks', to: 'head', kind: 'plain', label: 'residual stream'},
-      {from: 'head', to: 'embed', kind: 'plain', label: 'lm_head.weight = wte.weight'},
-      {from: 'head', to: 'train', kind: 'plain', label: 'cross-entropy'},
-      {from: 'head', to: 'tokens', kind: 'plain', label: 'multinomial → next id'},
+    notes: [
+      {at: 'head', text: 'Vocabulary size of **50,257**'},
+      {at: 'attn', text: '**12** heads of **64** dimensions'},
+      {at: 'wpe', text: 'Context length of **1,024** tokens, learned absolute positions'},
+      {at: 'wte', text: 'Embedding dimension of **768**', side: 'left'},
+      {at: 'add1', text: 'Residual stream', side: 'left'},
+    ],
+    insets: [
+      {
+        for: 'mlp',
+        title: 'Feed forward',
+        items: [
+          {id: 'fc', label: 'Linear layer', sub: 'c_fc · 768 → 3,072'},
+          {id: 'gelu', label: 'GELU activation', sub: 'nn.GELU() · exact erf form'},
+          {id: 'proj', label: 'Linear layer', sub: 'c_proj · 3,072 → 768'},
+        ],
+        note: 'Hidden layer dimension of **3,072**',
+      },
     ],
   },
   steps: [gpt2ModelStep, gpt2TrainStep, gpt2GenerateStep],

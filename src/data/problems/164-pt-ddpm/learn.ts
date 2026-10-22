@@ -13,24 +13,39 @@ noised sample. A **sampler** starts from pure noise and uses that prediction to 
 problem builds all three over 2-D points: \`NoiseSchedule\` with \`q_sample\` and \`ddpm_loss\`, then
 \`p_sample\`, \`sample\` and \`ddim_sample\`.
 
-:::diagram
-{
-  "nodes": [
-    {"id": "data", "kind": "client", "label": "two_moons · train_toy", "sub": "x0 batches (512, 2), Adam on the loss", "x": 10, "y": 30},
-    {"id": "forward", "kind": "service", "label": "q_sample · ddpm_loss", "sub": "noise x0 to a random t in one step, MSE on ε", "x": 40, "y": 30},
-    {"id": "model", "kind": "service", "label": "TinyDenoiser", "sub": "ε_θ(x_t, t) — the only learned part", "x": 70, "y": 30},
-    {"id": "schedule", "kind": "db", "label": "NoiseSchedule buffers", "sub": "seven (T,) tensors, computed once in float64", "x": 40, "y": 75},
-    {"id": "sampler", "kind": "service", "label": "sample · ddim_sample", "sub": "x_T ~ N(0, I) → x_0 in 1000 or 50 calls", "x": 75, "y": 75}
-  ],
-  "edges": [
-    {"from": "data", "to": "forward", "kind": "plain", "label": "x0"},
-    {"from": "forward", "to": "model", "kind": "plain", "label": "model(x_t, t)"},
-    {"from": "schedule", "to": "forward", "kind": "plain", "label": "ᾱ_t[t]"},
-    {"from": "sampler", "to": "model", "kind": "plain", "label": "ε̂ per step"},
-    {"from": "schedule", "to": "sampler", "kind": "plain", "label": "β_t · α_t · σ_t"}
-  ]
-}
+:::architecture
+{"output": "2,000 samples on the two moons", "items": [
+  {"id": "x0", "label": "Clean data x₀", "kind": "io", "sub": "two_moons · (512, 2) batches"},
+  {"tone": "block", "repeat": "3,000 ×", "label": "Training step · ddpm_loss", "items": [
+    {"id": "draw", "label": "Draw t and ε", "sub": "t ~ U{0 … 999} · ε ~ N(0, I)"},
+    {"id": "q-sample", "label": "Forward process q(x_t | x₀)", "kind": "attention", "sub": "√ᾱ_t · x₀ + √(1 − ᾱ_t) · ε", "side": {"label": "NoiseSchedule", "sub": "7 buffers · (T,) fp32"}, "detail": "\`q_sample\`: index two buffers with the \`(B,)\` tensor \`t\`, reshape to \`(B, 1)\`, multiply."},
+    {"id": "eps-train", "label": "Noise predictor ε_θ(x_t, t)", "kind": "ffn", "sub": "TinyDenoiser · the learned part", "side": {"label": "Timestep embedding", "sub": "sinusoidal · 64"}},
+    {"id": "loss", "label": "MSE(ε̂, ε)", "kind": "loss", "sub": "L_simple · Adam on the loss", "shape": "trained ε_θ"}
+  ]},
+  {"tone": "block", "repeat": "1,000 ×", "label": "Reverse step · p_sample", "items": [
+    {"id": "eps-pred", "label": "Trained ε_θ(x_t, t)", "kind": "ffn", "sub": "t = 999, 998, … 0", "side": {"label": "Pure noise x_T", "sub": "randn · (2,000, 2)"}},
+    {"id": "mean", "label": "Posterior mean μ", "kind": "attention", "sub": "(x_t − β_t/√(1−ᾱ_t)·ε̂) / √α_t"},
+    {"id": "noise-step", "label": "Add posterior noise", "kind": "attention", "sub": "x_{t−1} = μ + σ_t · z", "side": {"label": "z ~ N(0, I)", "sub": "σ_t² from the buffers"}}
+  ]},
+  {"id": "samples", "label": "Samples x₀", "kind": "io", "sub": "1,000 calls, or 50 with DDIM"}
+],
+"notes": [
+  {"at": "x0", "text": "Training noises to any t in **one** step", "side": "left"},
+  {"at": "eps-pred", "text": "Sampling always runs the chain, from x_T"},
+  {"at": "noise-step", "text": "σ_t = **0** at t = 0: the mean is the sample"}
+],
+"insets": [
+  {"for": "eps-train", "title": "TinyDenoiser", "items": [
+    {"id": "td-cat", "label": "Concatenate [x_t, emb(t)]", "sub": "2 + 64 = 66"},
+    {"id": "td-fc1", "label": "Linear + SiLU", "sub": "66 → 256"},
+    {"id": "td-fc2", "label": "Linear + SiLU", "sub": "256 → 256"},
+    {"id": "td-out", "label": "Linear", "sub": "256 → 2 · predicted ε"}
+  ], "note": "**83,458** parameters serve all **1,000** noise levels"}
+]}
 :::
+
+Read it bottom to top: training teaches one network to predict the noise in a sample noised in a single
+step; sampling hands it pure noise \`x_T\` from the side and runs it once per timestep.
 
 The whole method in five lines of math:
 
@@ -60,6 +75,10 @@ The schedule decides how fast \`ᾱ_t\` falls. Two are standard:
 | linear (Ho et al.) | \`β = linspace(1e-4, 0.02, T)\` | ≈ 1 | falls fast, ≈ 0.08 at t = 500 | ≈ 4e-5 |
 | cosine ([Nichol & Dhariwal](https://arxiv.org/abs/2102.09672)) | \`ᾱ = cos²((t/T + s)/(1 + s) · π/2) / f(0)\`, \`s = 0.008\` | ≈ 1 | ≈ 0.5 near the middle | ≈ 0, β clamped at 0.999 |
 
+Slide the timestep to watch each schedule turn the two moons into noise, and compare where \`ᾱ_t\` falls:
+
+:::widget diffusion-noise
+
 - The linear schedule destroys most of the signal by the middle; its last few hundred steps are almost
   pure noise, so a model trained on them learns little. The cosine schedule spends its steps more evenly.
 - The cosine schedule is defined through \`ᾱ\`; \`betas = 1 − ᾱ[1:] / ᾱ[:-1]\` recovers the per-step
@@ -85,18 +104,24 @@ Gaussians. Ho et al. noticed that with the reverse mean written in terms of a pr
 term becomes a weighted \`‖ε − ε_θ‖²\` — and that dropping the weights trains better. \`L_simple\` is
 the whole training objective:
 
-:::sequence
-{
-  "participants": ["train_toy", "NoiseSchedule", "TinyDenoiser"],
-  "messages": [
-    {"from": "train_toy", "to": "NoiseSchedule", "label": "ddpm_loss(model, x0)  x0: (512, 2)", "kind": "sync"},
-    {"from": "NoiseSchedule", "to": "NoiseSchedule", "label": "t ~ randint(0, T, (512,)) · noise ~ randn_like(x0)", "kind": "sync"},
-    {"from": "NoiseSchedule", "to": "NoiseSchedule", "label": "x_t = √ᾱ_t · x0 + √(1 − ᾱ_t) · noise", "kind": "sync"},
-    {"from": "NoiseSchedule", "to": "TinyDenoiser", "label": "model(x_t, t)", "kind": "sync"},
-    {"from": "TinyDenoiser", "to": "NoiseSchedule", "label": "ε̂: (512, 2)", "kind": "reply"},
-    {"from": "NoiseSchedule", "to": "train_toy", "label": "F.mse_loss(ε̂, noise)", "kind": "reply"}
-  ]
-}
+:::architecture
+{"items": [
+  {"tone": "block", "repeat": "3,000 ×", "label": "train_toy step", "items": [
+    {"columns": [
+      [{"id": "l-x0", "label": "x₀ batch", "kind": "io", "sub": "(512, 2)"}],
+      [{"id": "l-t", "label": "t ~ U{0 … 999}", "kind": "io", "sub": "(512,) int64"}],
+      [{"id": "l-eps", "label": "noise ~ N(0, I)", "kind": "io", "sub": "(512, 2) · also the target"}]
+    ]},
+    {"id": "l-q", "label": "q_sample(x₀, t, noise)", "kind": "attention", "sub": "√ᾱ_t · x₀ + √(1 − ᾱ_t) · noise", "side": {"label": "Buffers at t", "sub": "two (B,) gathers"}},
+    {"id": "l-net", "label": "model(x_t, t)", "kind": "ffn", "sub": "TinyDenoiser · ε̂ (512, 2)"},
+    {"id": "l-loss", "label": "F.mse_loss(ε̂, noise)", "kind": "loss", "sub": "one scalar"},
+    {"id": "l-adam", "label": "backward · Adam step", "sub": "lr 2e-3"}
+  ]}
+],
+"notes": [
+  {"at": "l-q", "text": "**512** samples, **512** noise levels"},
+  {"at": "l-loss", "text": "About **0.55** at the start, **0.25** at the end"}
+]}
 :::
 
 The network could predict three things; given \`x_t\` and \`t\` they are affine in each other:
@@ -129,19 +154,19 @@ as \`posterior_variance[t]\`. The sampler does not know \`x_0\`, but \`ε̂\` gi
 substituting yields the mean \`(x_t − β_t / √(1 − ᾱ_t) · ε̂) / √α_t\`. \`sample\` applies this from
 \`t = T − 1\` down to \`0\`:
 
-:::sequence
-{
-  "participants": ["sample", "p_sample", "TinyDenoiser", "NoiseSchedule"],
-  "messages": [
-    {"from": "sample", "to": "sample", "label": "x_T = torch.randn(shape)", "kind": "sync"},
-    {"from": "sample", "to": "p_sample", "label": "for t in reversed(range(T))", "kind": "sync"},
-    {"from": "p_sample", "to": "TinyDenoiser", "label": "model(x_t, full((B,), t))", "kind": "sync"},
-    {"from": "TinyDenoiser", "to": "p_sample", "label": "ε̂", "kind": "reply"},
-    {"from": "p_sample", "to": "NoiseSchedule", "label": "betas[t] · sqrt_one_minus_alphas_cumprod[t] · alphas[t]", "kind": "sync"},
-    {"from": "p_sample", "to": "sample", "label": "t > 0: mean + √posterior_variance[t] · z", "kind": "reply"},
-    {"from": "p_sample", "to": "sample", "label": "t = 0: mean, no noise", "kind": "reply"}
-  ]
-}
+:::architecture
+{"input": "x_T ~ N(0, I) · (2,000, 2)", "items": [
+  {"tone": "block", "repeat": "1,000 ×", "label": "p_sample · t = 999 … 0", "items": [
+    {"id": "r-net", "label": "model(x_t, full((B,), t))", "kind": "ffn", "sub": "ε̂ · under torch.no_grad()"},
+    {"id": "r-mean", "label": "Posterior mean", "kind": "attention", "sub": "(x_t − β_t/√(1−ᾱ_t)·ε̂) / √α_t", "side": {"label": "Buffers at t", "sub": "β_t · α_t · √(1 − ᾱ_t)"}},
+    {"id": "r-noise", "label": "Add σ_t · z when t > 0", "kind": "attention", "sub": "σ_t² = posterior_variance[t]"}
+  ]},
+  {"id": "r-out", "label": "Samples x₀", "kind": "io", "sub": "after the t = 0 step"}
+],
+"notes": [
+  {"at": "r-net", "text": "**1,000** network calls per sample batch"},
+  {"at": "r-noise", "text": "At t = 0, σ_0 = **0**: return the mean"}
+]}
 :::
 
 - The noise injected at each step is what makes this *ancestral* sampling: every run from the same
@@ -168,19 +193,10 @@ A thousand network calls per sample is the cost of DDPM. Skipping steps naively 
 assumes the next noise level is one step away, so jumping from \`t\` to \`t − 20\` with its formula
 removes one step's worth of noise and adds the wrong amount back.
 
-:::sequence
-{
-  "participants": ["sampler", "p_sample formula", "x"],
-  "messages": [
-    {"from": "sampler", "to": "p_sample formula", "label": "naive: call at t = 980, 960, … with DDPM's one-step mean", "kind": "sync"},
-    {"from": "p_sample formula", "to": "x", "label": "removes β_t worth of noise per call, not ᾱ_t → ᾱ_{t−20}", "kind": "sync"},
-    {"from": "x", "to": "sampler", "label": "after 50 calls x is still mostly noise", "kind": "reply"},
-    {"from": "sampler", "to": "p_sample formula", "label": "DDIM: x0_pred from ε̂, then jump to ᾱ_prev", "kind": "sync"},
-    {"from": "p_sample formula", "to": "x", "label": "√ᾱ_prev · x0_pred + √(1 − ᾱ_prev − σ²) · ε̂", "kind": "sync"},
-    {"from": "x", "to": "sampler", "label": "on the data after 50 calls", "kind": "reply"}
-  ]
-}
-:::
+| sampler on \`t = 980, 960, …\` | what one call does | after 50 calls |
+|---|---|---|
+| naive: DDPM's one-step mean | removes \`β_t\` worth of noise, not the gap from \`ᾱ_t\` to \`ᾱ_{t−20}\` | still mostly noise |
+| DDIM | estimates \`x0_pred\` from \`ε̂\`, then jumps to \`ᾱ_prev\`: \`√ᾱ_prev · x0_pred + √(1 − ᾱ_prev − σ²) · ε̂\` | on the data |
 
 [Song et al.](https://arxiv.org/abs/2010.02502) observed that the training loss only depends on the
 marginals \`q(x_t | x_0)\`, not on the chain between them. Any process with the same marginals can use

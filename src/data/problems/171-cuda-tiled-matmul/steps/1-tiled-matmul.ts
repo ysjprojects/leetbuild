@@ -168,7 +168,7 @@ export const tiledMatmulStep: Step = {
   title: 'matmul_tiled: 32 × 32 shared tiles, two barriers per slab of K',
   concept: 'cuda',
   file: 'tiled_matmul',
-  focus: ['tiled', 'smem', 'gmem'],
+  focus: ['index', 'as', 'bs', 'sync1', 'fma', 'sync2', 'store'],
   task: `## Task
 
 Implement \`__global__ void matmul_tiled(const float* A, const float* B, float* C, int M, int N, int K)\`:
@@ -197,42 +197,14 @@ Implement \`__global__ void matmul_tiled(const float* A, const float* B, float* 
   results within \`1e-2\` of each other; prints \`PASS\`. Build with
   \`nvcc -O2 -o tiled_matmul tiled_matmul.cu && ./tiled_matmul\`.
 
+Step through one output tile below: per slab, the block loads one \`TILE × TILE\` tile of \`A\` and one of \`B\`,
+and every float in them feeds \`TILE\` outputs (32 in the drill). The global-load count compares naive against
+tiled.
+
+:::widget tiled-matmul
+
 > The naive kernel fetches \`2K\` floats from global memory per output; the tiled one fetches \`2K / TILE\`.
 > That 32× cut in traffic is the whole speedup, and the two barriers are what make sharing a slab safe.`,
-  sequence: {
-    participants: ['host', 'block (32 × 32)', 'global memory', 'shared memory'],
-    messages: [
-      {from: 'host', to: 'global memory', label: 'cudaMemcpy A[97×131], B[131×75] (H2D)', kind: 'sync'},
-      {from: 'host', to: 'block (32 × 32)', label: 'matmul_tiled<<<grid(3, 4), block(32, 32)>>>', kind: 'async'},
-      {
-        from: 'block (32 × 32)',
-        to: 'global memory',
-        label: 'slab t: thread (ty, tx) reads A[row][32t + tx], B[32t + ty][col] — coalesced, 0 past the edge',
-        kind: 'sync',
-      },
-      {from: 'block (32 × 32)', to: 'shared memory', label: 'As[ty][tx], Bs[ty][tx]', kind: 'sync'},
-      {
-        from: 'block (32 × 32)',
-        to: 'block (32 × 32)',
-        label: '__syncthreads() — slab visible to all 1024 threads',
-        kind: 'sync',
-      },
-      {from: 'shared memory', to: 'block (32 × 32)', label: 'acc += Σ_k As[ty][k] · Bs[k][tx]', kind: 'reply'},
-      {
-        from: 'block (32 × 32)',
-        to: 'block (32 × 32)',
-        label: '__syncthreads() — everyone done; next slab (t = 0 … 4)',
-        kind: 'sync',
-      },
-      {
-        from: 'block (32 × 32)',
-        to: 'global memory',
-        label: 'if (row < M && col < N) C[row][col] = acc — once',
-        kind: 'sync',
-      },
-      {from: 'global memory', to: 'host', label: 'cudaMemcpy C (D2H) · max|C − C_cpu| < 1e-3 · PASS', kind: 'reply'},
-    ],
-  },
   hints: [
     'Index math first: `row = blockIdx.y * TILE + ty`, `col = blockIdx.x * TILE + tx`; in slab `t` the element this thread fetches of `A` is column `t * TILE + tx` of its own `row`, and of `B` is row `t * TILE + ty` of its own `col`. Both land in the same slot `[ty][tx]` of their tile; a ternary with `0.0f` handles the edges.',
     'Two barriers per slab, not one: the first so nobody multiplies before every thread has written its element, the second so nobody overwrites the tiles for slab `t + 1` while a slower warp is still reading slab `t`. Dropping the second one gives results that are wrong only sometimes.',

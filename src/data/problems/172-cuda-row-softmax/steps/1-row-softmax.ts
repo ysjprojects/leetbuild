@@ -20,7 +20,7 @@ export const rowSoftmaxStep: Step = {
   title: 'softmax_rows: one block per row, two block reductions, exp(x − max)',
   concept: 'cuda',
   file: 'row_softmax',
-  focus: ['kernel', 'smem', 'hbm'],
+  focus: ['max-local', 'max-warp', 's-max', 'guard', 'sum-local', 'sum-warp', 's-sum', 'write'],
   task: `## Task
 
 Implement \`__global__ void softmax_rows(const float* x, float* y, int rows, int cols)\`: \`y[r][c] = exp(x[r][c] − m_r) / Σ_c exp(x[r][c] − m_r)\`
@@ -32,6 +32,11 @@ with \`m_r = max_c x[r][c]\`, for a row-major fp32 matrix of \`rows × cols\`, a
 - **Pass 1, the max**: a per-thread local max (start at \`-INFINITY\`), then a block-wide max: \`fmaxf\` across
   the warp with \`__shfl_xor_sync\` (or \`__shfl_down_sync\`), lane 0 of each warp into \`__shared__\` memory,
   \`__syncthreads()\`, one warp reduces the partials, and every thread reads the result back.
+
+The warp level in its \`__shfl_down_sync\` tree form, stepped through as a sum; the max is the same tree with \`fmaxf\`:
+
+:::widget warp-reduce
+
 - **Pass 2, the sum**: each thread accumulates \`__expf(x − m)\` (or \`expf\`) over its elements — write the
   subtraction *inside* the call — then a second block reduction, \`+\` instead of \`fmaxf\`, through its own
   shared slots.
@@ -51,36 +56,6 @@ with \`m_r = max_c x[r][c]\`, for a row-major fp32 matrix of \`rows × cols\`, a
 > \`exp(x − m) / Σ exp(x − m)\` is the same number as \`exp(x) / Σ exp(x)\` — the shift cancels — but its largest
 > exponent is \`0\`, so nothing overflows and the sum sits in \`[1, cols]\`. That one subtraction is why the
 > row max has to be known before the first \`exp\`, and why softmax is two reductions, not one.`,
-  sequence: {
-    participants: ['host', 'block r', 'shared mem', 'global mem'],
-    messages: [
-      {from: 'host', to: 'global mem', label: 'cudaMemcpy x (rows × cols fp32, H2D)', kind: 'sync'},
-      {from: 'host', to: 'block r', label: 'LAUNCH(softmax_rows, rows, 256) — block r owns row r', kind: 'async'},
-      {
-        from: 'block r',
-        to: 'global mem',
-        label: 'pass 1: thread t reads x[r][t], x[r][t+256], … → local max',
-        kind: 'sync',
-      },
-      {from: 'block r', to: 'block r', label: 'warp max: fmaxf + __shfl_xor_sync, offsets 16 … 1', kind: 'sync'},
-      {
-        from: 'block r',
-        to: 'shared mem',
-        label: 'lane 0 → s_max[warp] · __syncthreads · warp 0 reduces 8 → m',
-        kind: 'sync',
-      },
-      {from: 'shared mem', to: 'block r', label: 'm (every thread)', kind: 'reply'},
-      {from: 'block r', to: 'global mem', label: 'pass 2: sum += __expf(x[r][c] − m)', kind: 'sync'},
-      {
-        from: 'block r',
-        to: 'shared mem',
-        label: 'warp sum via shuffles · s_sum[warp] · __syncthreads → sum',
-        kind: 'sync',
-      },
-      {from: 'block r', to: 'global mem', label: 'pass 3: y[r][c] = __expf(x[r][c] − m) / sum', kind: 'sync'},
-      {from: 'global mem', to: 'host', label: 'cudaMemcpy y (D2H) · compare with CPU double · PASS', kind: 'reply'},
-    ],
-  },
   hints: [
     'Write `warp_max(v)` and `warp_sum(v)` first: five rounds of `v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, offset))` (or `v +=`) for `offset = 16, 8, 4, 2, 1`. After the loop every lane holds the warp’s result, so lane 0 can write it to `shared[warp]` with no further exchange.',
     'A block reduction is: warp reduce → `if (lane == 0) shared[warp] = v` → `__syncthreads()` → warp 0 loads `shared[lane]` (or the identity, `-INFINITY` / `0.f`, for lanes past the warp count) and warp-reduces again → thread 0 writes `shared[0]` → `__syncthreads()` → everyone returns `shared[0]`. Give the max and the sum separate shared arrays so the second never races the first.',

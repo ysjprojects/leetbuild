@@ -14,6 +14,7 @@
  */
 import {resolve} from 'node:path';
 
+import {architectureIds, architectureProblems} from '../src/lib/architecture';
 import {describePattern, judge, matches, stripComments} from '../src/lib/judge';
 import {malformedBlocksOf, widgetsOf} from '../src/lib/markdown';
 import {type NodeRuntime, createNodePythonRuntime, createNodeTypeScriptRuntime} from '../src/lib/runtime/node';
@@ -85,11 +86,29 @@ function judgeSelfTest(): string[] {
   return failures;
 }
 
+/** The ids a step's `focus` may name: the diagram's nodes, or the architecture's blocks and ops. */
+const figureIds = (problem: Problem): Set<string> =>
+  problem.architecture !== undefined
+    ? architectureIds(problem.architecture)
+    : new Set((problem.diagram?.nodes ?? []).map(n => n.id));
+
 function verifyStep(problem: Problem, step: Step, index: number): string[] {
   const errors: string[] = [];
   const tag = `${problem.id}/${step.id}`;
-  const nodeIds = new Set(problem.diagram.nodes.map(n => n.id));
+  const nodeIds = figureIds(problem);
   if (!/^[a-z0-9-]+$/.test(step.id)) errors.push(`${tag}: step id must be kebab-case`);
+  if (problem.track === 'dl' && step.sequence !== undefined)
+    errors.push(
+      `${tag}: a deep-learning step has no request/reply sequence (use an :::architecture figure or a widget)`,
+    );
+  if (problem.track === 'dl')
+    for (const [where, text] of [
+      ['task', step.task],
+      ['debrief', step.debrief],
+    ] as const)
+      if (/^:::(sequence|diagram)\b/m.test(text))
+        errors.push(`${tag}: ${where} uses a systems figure (:::sequence / :::diagram) in the deep-learning track`);
+  for (const what of malformedBlocksOf(step.task)) errors.push(`${tag}: task: ${what}`);
   if (!/^[a-z][a-z0-9_]*$/.test(step.file)) errors.push(`${tag}: file stem must be snake_case`);
   if (step.task.trim() === '') errors.push(`${tag}: empty task`);
   if (step.debrief.trim() === '') errors.push(`${tag}: empty debrief`);
@@ -174,14 +193,36 @@ function verifyProblem(problem: Problem): string[] {
       if (WIDGETS[w] === undefined) errors.push(`${problem.id}: learning guide: unknown widget '${w}'`);
     for (const what of malformedBlocksOf(problem.learn)) errors.push(`${problem.id}: learning guide: ${what}`);
   }
+  for (const what of malformedBlocksOf(problem.statement)) errors.push(`${problem.id}: statement: ${what}`);
+  // One figure per problem: a system diagram, or for the deep-learning track a layer stack.
+  if (problem.track === 'dl') {
+    if (problem.architecture === undefined) errors.push(`${problem.id}: a deep-learning problem draws an architecture`);
+    if (problem.diagram !== undefined) errors.push(`${problem.id}: a deep-learning problem has no system diagram`);
+    for (const [where, text] of [
+      ['statement', problem.statement],
+      ['learning guide', problem.learn ?? ''],
+    ] as const)
+      if (/^:::(sequence|diagram)\b/m.test(text))
+        errors.push(
+          `${problem.id}: ${where} uses a systems figure (:::sequence / :::diagram) in the deep-learning track`,
+        );
+    if (problem.learn !== undefined) {
+      if (!/^:::architecture\b/m.test(problem.learn))
+        errors.push(`${problem.id}: the learning guide draws no :::architecture figure`);
+      if (widgetsOf(problem.learn).length === 0)
+        errors.push(`${problem.id}: the learning guide has no interactive widget`);
+    }
+  } else if (problem.diagram === undefined) errors.push(`${problem.id}: draws no system diagram`);
+  if (problem.architecture !== undefined)
+    for (const what of architectureProblems(problem.architecture)) errors.push(`${problem.id}: architecture: ${what}`);
   const nodeIds = new Set<string>();
-  for (const node of problem.diagram.nodes) {
+  for (const node of problem.diagram?.nodes ?? []) {
     if (nodeIds.has(node.id)) errors.push(`${problem.id}: duplicate diagram node '${node.id}'`);
     nodeIds.add(node.id);
     if (node.x < 0 || node.x > 100 || node.y < 0 || node.y > 100)
       errors.push(`${problem.id}: node '${node.id}' is off the canvas (x/y are percentages)`);
   }
-  for (const edge of problem.diagram.edges) {
+  for (const edge of problem.diagram?.edges ?? []) {
     if (!nodeIds.has(edge.from)) errors.push(`${problem.id}: edge from unknown node '${edge.from}'`);
     if (!nodeIds.has(edge.to)) errors.push(`${problem.id}: edge to unknown node '${edge.to}'`);
   }

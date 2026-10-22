@@ -13,21 +13,31 @@ arithmetic, reordered so that each byte of \`K\` and \`V\` is read from global m
 queries and the softmax is finished one tile at a time. Every long-context model since 2022 trains and
 serves on a descendant of it; \`torch.nn.functional.scaled_dot_product_attention\` dispatches to one.
 
-:::diagram
+:::architecture
 {
-  "nodes": [
-    {"id": "host", "kind": "client", "label": "Host", "sub": "fills Q K V · launches · compares to a CPU reference", "x": 10, "y": 50},
-    {"id": "hbm", "kind": "db", "label": "Global memory (HBM)", "sub": "Q K V O · T × d each · no T × T buffer", "x": 40, "y": 20},
-    {"id": "kernel", "kind": "service", "label": "flash_attn_fwd", "sub": "one block per 64 query rows · one thread per row", "x": 40, "y": 70},
-    {"id": "smem", "kind": "db", "label": "Shared memory (SRAM)", "sub": "Ks, Vs · 32 × 64 floats each per tile", "x": 72, "y": 70},
-    {"id": "ref", "kind": "external", "label": "CPU reference", "sub": "double · materialised softmax", "x": 72, "y": 20}
+  "input": "Q, K, V · T × d float32",
+  "output": "O = softmax(Q Kᵀ / √d) V",
+  "items": [
+    {"id": "host", "label": "Host", "sub": "cudaMemcpy Q K V · <<<⌈T/64⌉, 64>>>", "kind": "host", "detail": "Fills Q, K, V, launches the kernel non-causal and causal, compares O with a double-precision CPU reference."},
+    {"id": "hbm-in", "label": "Global memory (HBM)", "sub": "Q K V · T × d float each", "kind": "memory", "shape": "3 × [T, d]", "detail": "Row-major T × d arrays, 65,536 bytes each at T = 256, d = 64. No T × T buffer exists."},
+    {"tone": "block", "repeat": "⌈T/64⌉ ×", "label": "Thread block · BQ = 64 query rows", "items": [
+      {"id": "q-reg", "label": "Registers: query row", "sub": "q[k] = Q[row][k] · scale", "kind": "memory", "shape": "q: [64]", "detail": "One thread per query row. Registers also hold o[64] = 0, the running max m = −∞ and the running sum l = 0."},
+      {"tone": "block", "repeat": "⌈T/32⌉ ×", "label": "K/V tile loop · BK = 32", "items": [
+        {"id": "skip", "label": "Causal tile skip", "sub": "break if kv0 > q_last", "kind": "kernel", "detail": "Block-uniform: it depends on blockIdx only, so the whole block leaves the loop together."},
+        {"id": "smem", "label": "Shared memory: Ks, Vs", "sub": "2 × [32][64] float · __syncthreads", "kind": "memory", "shape": "Ks, Vs: [32, 64]", "detail": "Each K/V tile is read from HBM once and used by all 64 query rows of the block."},
+        {"id": "scores", "label": "Scores in registers", "sub": "s[j] = q · Ks[j], −∞ if masked", "kind": "kernel", "shape": "s: [32]", "detail": "One row of S = Q Kᵀ for this tile; padding and causal keys get −∞."},
+        {"id": "rescale", "label": "Online softmax rescale", "sub": "α = exp(m − m_new); o *= α", "kind": "kernel", "detail": "Re-expresses the accumulator and the sum under the new running max with one multiply."},
+        {"id": "accum", "label": "Accumulate O in registers", "sub": "o += p · Vs[j]; l = l·α + Σp", "kind": "kernel", "shape": "o: [64]", "detail": "p = exp(s[j] − m_new) ≤ 1 never overflows. A second __syncthreads() ends the tile."}
+      ]},
+      {"id": "normalise", "label": "Normalise once", "sub": "O[row][k] = o[k] / l", "kind": "kernel", "shape": "O[row]: [d]", "detail": "One division per row after the last tile, exact because every term carries the same exp(−m)."}
+    ]},
+    {"id": "hbm-out", "label": "Global memory (HBM)", "sub": "O · T × d · written once", "kind": "memory", "shape": "[T, d]", "detail": "The only output. A backward pass would also want logsumexp = m + log l per row; the drill leaves it out."}
   ],
-  "edges": [
-    {"from": "host", "to": "hbm", "kind": "plain", "label": "cudaMemcpy Q K V · O back"},
-    {"from": "host", "to": "kernel", "kind": "plain", "label": "<<<⌈T/BQ⌉, BQ>>>"},
-    {"from": "kernel", "to": "hbm", "kind": "plain", "label": "read each K/V tile once · write O once"},
-    {"from": "kernel", "to": "smem", "kind": "plain", "label": "stage tile · __syncthreads"},
-    {"from": "host", "to": "ref", "kind": "plain", "label": "max|err| < 1e-3"}
+  "notes": [
+    {"at": "q-reg", "text": "**64** threads per block, one query row each"},
+    {"at": "smem", "text": "**16 KB** of shared memory per block"},
+    {"at": "scores", "text": "The **T × T** scores never leave registers"},
+    {"at": "hbm-out", "text": "A 256 × 256 score matrix would be **256 KB**"}
   ]
 }
 :::
@@ -117,20 +127,18 @@ m = m_new;
   exact: every term was scaled by the same \`exp(−m)\`.
 
 The failure the max avoids is overflow. A naive one-pass softmax that sums \`exp(s)\` directly works
-until a score passes about 88, where \`expf\` overflows float:
+until a score passes about 88, where \`expf\` overflows float. Follow one row when a score of 95 arrives:
 
-:::sequence
-{
-  "participants": ["thread (row i)", "registers"],
-  "messages": [
-    {"from": "thread (row i)", "to": "registers", "label": "naive: l += exp(s[j]), o += exp(s[j]) · v_j", "kind": "sync"},
-    {"from": "thread (row i)", "to": "registers", "label": "s = 95 → exp(95) = inf", "kind": "sync"},
-    {"from": "registers", "to": "thread (row i)", "label": "O = inf / inf = NaN for the whole row", "kind": "reply"},
-    {"from": "thread (row i)", "to": "registers", "label": "online: m_new = 95, alpha = exp(m − 95), o *= alpha, l = l·alpha + Σ exp(s − 95)", "kind": "sync"},
-    {"from": "registers", "to": "thread (row i)", "label": "every exp ≤ 1 · O = o / l finite and exact", "kind": "reply"}
-  ]
-}
-:::
+| | Naive one pass | Online, with a running max |
+|---|---|---|
+| Per score | \`l += exp(s[j])\`, \`o += exp(s[j]) · v_j\` | \`m_new = max(m, s[j])\`, \`o, l *= exp(m − m_new)\`, add \`exp(s[j] − m_new)\` |
+| \`s = 95\` arrives | \`exp(95) = inf\` | \`m_new = 95\`, every exponent is ≤ 0 |
+| Result | \`O = inf / inf = NaN\` for the whole row | \`O = o / l\`, finite and exact |
+
+Step through the fold on one row of scores, tile by tile; the rescale fires whenever a tile raises the
+running max:
+
+:::widget online-softmax {"tile": 4}
 
 Forgetting \`o[k] *= alpha\` is the subtler bug: the output is finite but wrong, because contributions
 from earlier tiles stay weighted against a stale maximum while \`l\` is corrected.
@@ -154,7 +162,11 @@ exponentials become the bottleneck, which is why FlashAttention-3 works hard to 
 
 Tiling is what turns the identity into bandwidth. A block owns \`BQ = 64\` query rows and walks the keys
 in tiles of \`BK = 32\`: each tile of \`K\` and \`V\` is read from HBM once into shared memory and used by
-all 64 rows, so \`K\` and \`V\` are read \`⌈T / BQ⌉\` times in total instead of \`T\` times.
+all 64 rows, so \`K\` and \`V\` are read \`⌈T / BQ⌉\` times in total instead of \`T\` times. It is the reuse of a
+shared-memory tiled matmul (\`S = Q Kᵀ\` is one, with the \`Q\` tile held in registers); step through the
+plain matmul version to see the global loads it saves:
+
+:::widget tiled-matmul
 
 | Buffer | Where | Size in the drill |
 |---|---|---|
@@ -171,21 +183,16 @@ all 64 rows, so \`K\` and \`V\` are read \`⌈T / BQ⌉\` times in total instead
 - **Two barriers.** \`__syncthreads()\` after the load so no thread reads a half-filled tile, and again
   after the fold so no thread overwrites the tile a neighbour is still reading.
 
-The second barrier is the one people drop. Without it, the race is:
+The second barrier is the one people drop. Without it, the race runs like this:
 
-:::sequence
-{
-  "participants": ["warp 0", "Ks / Vs (shared)", "warp 1"],
-  "messages": [
-    {"from": "warp 0", "to": "Ks / Vs (shared)", "label": "stage tile kv0 = 0", "kind": "sync"},
-    {"from": "warp 1", "to": "Ks / Vs (shared)", "label": "stage tile kv0 = 0", "kind": "sync"},
-    {"from": "warp 0", "to": "warp 1", "label": "__syncthreads()", "kind": "sync"},
-    {"from": "warp 0", "to": "Ks / Vs (shared)", "label": "finishes its fold first, loops, stages tile kv0 = 32", "kind": "sync"},
-    {"from": "Ks / Vs (shared)", "to": "warp 1", "label": "still folding tile 0 — reads rows of tile 1", "kind": "reply"},
-    {"from": "warp 1", "to": "warp 1", "label": "scores mix two tiles: wrong O, varies run to run", "kind": "sync"}
-  ]
-}
-:::
+| Time | warp 0 | \`Ks\` / \`Vs\` (shared) | warp 1 |
+|---|---|---|---|
+| 1 | stages its share of tile 0 | tile 0 filling | stages its share of tile 0 |
+| 2 | \`__syncthreads()\` | tile 0 complete | \`__syncthreads()\` |
+| 3 | finishes its fold first, loops, stages tile 1 (\`kv0 = 32\`) | rows of tile 1 over tile 0 | still folding tile 0 |
+| 4 | | | reads rows of tile 1 as if they were tile 0 |
+
+Warp 1's scores mix two tiles: \`O\` is wrong, and differently wrong from run to run.
 
 **Causal tile skipping.** Under the causal mask query \`i\` sees keys \`0 … i\`. Masking is per element, but
 whole tiles can be dropped: with \`q_last = min(blockIdx.x × BQ + BQ, T) − 1\`, a tile with

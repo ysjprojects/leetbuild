@@ -5,7 +5,7 @@ export const gpt2BlockStep: Step = {
   title: 'Block: pre-LN, two residuals, a 4× GELU MLP, GPT-2 init',
   concept: 'pytorch',
   file: 'gpt2_block',
-  focus: ['attn', 'mlp', 'params'],
+  focus: ['ln1', 'add1', 'ln2', 'mlp', 'add2'],
   task: `## Task
 
 Implement the layer GPT-2 stacks \`n_layer\` times: \`MLP(cfg)\` and \`Block(cfg)\` over a \`GPTConfig\`
@@ -36,20 +36,6 @@ sibling problem — and so is the self-test; everything else in the file is your
 
 > A block is the identity plus two small corrections. Pre-LN keeps the corrections small at init, and
 > scaling \`c_proj\` by \`1/√(2·n_layer)\` keeps the sum of \`2·n_layer\` corrections from outgrowing the stream.`,
-  sequence: {
-    participants: ['caller', 'Block', 'attn', 'mlp'],
-    messages: [
-      {from: 'caller', to: 'Block', label: 'x  (B, T, C)', kind: 'sync'},
-      {from: 'Block', to: 'attn', label: 'ln_1(x)  — normalised copy, x untouched', kind: 'sync'},
-      {from: 'attn', to: 'Block', label: 'a = resid_dropout(c_proj(softmax(qkᵀ/√d, causal) v))', kind: 'reply'},
-      {from: 'Block', to: 'Block', label: 'x = x + a', kind: 'sync'},
-      {from: 'Block', to: 'mlp', label: 'ln_2(x)', kind: 'sync'},
-      {from: 'mlp', to: 'mlp', label: 'c_fc → (B, T, 4C) · gelu_tanh · c_proj → (B, T, C) · dropout', kind: 'sync'},
-      {from: 'mlp', to: 'Block', label: 'm', kind: 'reply'},
-      {from: 'Block', to: 'Block', label: 'x = x + m', kind: 'sync'},
-      {from: 'Block', to: 'caller', label: 'x  (B, T, C)', kind: 'reply'},
-    ],
-  },
   hints: [
     'The MLP is two `nn.Linear`s and the formula: `0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))`. Write `gelu_tanh` first and run the file — the first assertion checks only that.',
     '`self.apply(fn)` calls `fn` on every submodule, including the attention’s linears. Branch on `isinstance(module, nn.Linear)` / `nn.LayerNorm`; `nn.Linear` has a bias here, but guard `module.bias is not None` anyway. The `c_proj` rescale is a loop over `self.named_parameters()` placed *after* `apply`, or `apply` overwrites it.',

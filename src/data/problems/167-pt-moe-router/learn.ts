@@ -14,23 +14,39 @@ pays for \`k\` FFNs of compute, but the model carries \`E\` FFNs of parameters: 
 1.6 T parameters at the cost of a 1 B dense model, Mixtral 8×7B activates 2 of 8 experts per token,
 DeepSeek-V3 activates 8 of 256. The layer the drill builds is the one those models share:
 
-:::diagram
-{
-  "nodes": [
-    {"id": "tokens", "kind": "client", "label": "tokens", "sub": "x (B, S, D) flattened to (T, D)", "x": 8, "y": 50},
-    {"id": "router", "kind": "service", "label": "TopKRouter", "sub": "gate (D → E) · softmax · top-k · aux loss", "x": 32, "y": 50},
-    {"id": "experts", "kind": "service", "label": "E experts", "sub": "where(idx == e) · first capacity rows · FFN", "x": 58, "y": 50},
-    {"id": "combine", "kind": "service", "label": "combine", "sub": "index_add_ of weight × output · (y, aux)", "x": 82, "y": 50},
-    {"id": "reference", "kind": "external", "label": "moe_reference", "sub": "one token at a time · same answer", "x": 58, "y": 85}
-  ],
-  "edges": [
-    {"from": "tokens", "to": "router", "kind": "plain", "label": "logits (T, E)"},
-    {"from": "router", "to": "experts", "kind": "plain", "label": "idx, weights (T, k)"},
-    {"from": "experts", "to": "combine", "kind": "plain", "label": "out (n_e, D)"},
-    {"from": "combine", "to": "reference", "kind": "plain", "label": "allclose 1e-5"}
-  ]
-}
+:::architecture
+{"input": "h · (B, S, D) = (2, 16, 32)", "items": [
+  {"tone": "block", "label": "Transformer block · MoE", "items": [
+    {"id": "ln1", "label": "LayerNorm 1", "kind": "norm"},
+    {"id": "attn", "label": "Masked self-attention", "sub": "dense · every token"},
+    {"id": "add1", "op": "+", "from": "ln1"},
+    {"id": "ln2", "label": "LayerNorm 2", "kind": "norm"},
+    {"tone": "dotted", "label": "MoE layer · the FFN slot", "items": [
+      {"id": "gate", "label": "Router gate", "kind": "attention", "sub": "nn.Linear D → E · float32", "shape": "logits (T, E)"},
+      {"id": "topk", "label": "Softmax, top-k, renormalise", "kind": "attention", "sub": "idx, weights (T, k)", "detail": "Softmax over the \`E\` experts, \`torch.topk\`, and the \`k\` probabilities divided by their sum."},
+      {"id": "dispatch", "label": "Dispatch under capacity", "kind": "attention", "sub": "where(idx == e)[:capacity]", "side": {"label": "Capacity", "sub": "⌈cf · T · k / E⌉"}},
+      {"columns": [
+        [{"id": "expert-0", "label": "Expert 0", "kind": "ffn", "sub": "D → d_ff → D"}],
+        [{"id": "expert-1", "label": "Expert 1", "kind": "ffn", "sub": "D → d_ff → D"}],
+        [{"id": "expert-e", "label": "… Expert E − 1", "kind": "ffn", "sub": "D → d_ff → D"}]
+      ]},
+      {"id": "combine", "label": "Weighted sum", "kind": "attention", "sub": "index_add_(0, tok, w · out)"}
+    ]},
+    {"id": "add2", "op": "+", "from": "ln2", "detail": "\`h + moe(norm(h))\`: the block's residual, not the layer's."}
+  ]},
+  {"id": "loss", "label": "Training loss", "kind": "loss", "sub": "LM loss + α · aux", "side": {"label": "Load-balancing aux", "sub": "E · Σ_e f_e · P_e"}}
+],
+"notes": [
+  {"at": "topk", "text": "Each token pays for **k** experts; the model stores **E**"},
+  {"at": "dispatch", "text": "Overflow beyond capacity is **dropped**"},
+  {"at": "combine", "text": "Gate weights carry the gradient to the router"},
+  {"at": "loss", "text": "aux = **1** balanced, **E** collapsed"},
+  {"at": "add2", "text": "A dropped token rides the residual", "side": "left"}
+]}
 :::
+
+Read it bottom to top: the block is a dense transformer block whose feed-forward slot now holds a router
+and \`E\` experts, and the router's auxiliary loss joins the training loss.
 
 The contract the drill implements:
 
@@ -90,20 +106,11 @@ describes why: an expert that received slightly more tokens early trains slightl
 outputs help slightly more, so the gate sends it more tokens. The rich get richer until one expert is
 the model and the others are untouched parameters:
 
-:::sequence
-{
-  "participants": ["router", "expert 0", "experts 1–3", "optimizer"],
-  "messages": [
-    {"from": "router", "to": "expert 0", "label": "step 1: 30 % of tokens (a little above 25 %)", "kind": "sync"},
-    {"from": "router", "to": "experts 1–3", "label": "70 % shared", "kind": "sync"},
-    {"from": "optimizer", "to": "expert 0", "label": "more gradient → better outputs", "kind": "async"},
-    {"from": "optimizer", "to": "router", "label": "∂loss/∂weights: expert 0 helped → raise its logit", "kind": "async"},
-    {"from": "router", "to": "expert 0", "label": "step 1000: 80 % of tokens", "kind": "sync"},
-    {"from": "router", "to": "experts 1–3", "label": "20 % — barely trained, so barely chosen", "kind": "sync"},
-    {"from": "router", "to": "expert 0", "label": "step 10000: 100 % — a dense model with E − 1 dead experts", "kind": "sync"}
-  ]
-}
-:::
+| training step | expert 0's share | experts 1 to 3 | what happens |
+|---|---|---|---|
+| 1 | 30 %, a little above 25 % | 70 % shared | expert 0 gets more gradient, so its outputs improve |
+| 1,000 | 80 % | 20 % | the combine weights reward expert 0, so the gate raises its logit |
+| 10,000 | 100 % | 0 %, barely trained, so never chosen | a dense model with \`E − 1\` dead experts |
 
 The fix is a loss that is small when the load is even and large when it is not. The difficulty is
 that the thing you want to balance — how many tokens each expert *got* — is a count, and counts have
@@ -131,6 +138,11 @@ aux = E · Σ_e f_e · P_e
 - **Measured per batch of tokens.** \`f\` and \`P\` are means over the \`T\` tokens in the forward pass, so
   the loss balances this batch, not a running average. Production trainers also sum a copy per device
   and per sequence.
+
+Skew the routing in the widget: the loss sits at 1 while the load is even and climbs toward \`E\` as one
+expert takes over.
+
+:::widget moe-routing {"experts": 4, "k": 2}
 
 :::details Why not just penalise the counts?
 Because a count is a step function of the logits: nudging a logit by ε changes nothing until the
@@ -177,17 +189,26 @@ capacity = ceil(capacity_factor · T · k / E)
   perfect balance; above 1.25 most buffers sit mostly empty. Training commonly uses 1.25 and inference
   2.0, where dropping a token hurts more than padding a buffer.
 
-:::sequence
-{
-  "participants": ["MoE", "expert 1 (capacity 4)", "y"],
-  "messages": [
-    {"from": "MoE", "to": "MoE", "label": "tok, slot = where(idx == 1) → 14 tokens in order", "kind": "sync"},
-    {"from": "MoE", "to": "expert 1 (capacity 4)", "label": "tokens[tok[:4]] — one (4, D) call", "kind": "sync"},
-    {"from": "expert 1 (capacity 4)", "to": "MoE", "label": "out (4, D)", "kind": "reply"},
-    {"from": "MoE", "to": "y", "label": "index_add_(0, tok[:4], weights[tok, slot] · out)", "kind": "sync"},
-    {"from": "MoE", "to": "y", "label": "tok[4:] — 10 tokens: no write, rows stay zero", "kind": "async"}
-  ]
-}
+One expert of the drill's drop test, with a capacity of 4 and 14 tokens that chose it:
+
+:::architecture
+{"input": "idx (32, 1) · k = 1, capacity_factor 0.5", "items": [
+  {"id": "c-where", "label": "where(idx == 1)", "kind": "attention", "sub": "14 tokens, in token order"},
+  {"columns": [
+    [
+      {"id": "c-keep", "label": "Keep tok[:4]", "kind": "attention", "sub": "capacity = ⌈0.5 · 32 · 1 / 4⌉ = 4"},
+      {"id": "c-expert", "label": "Expert 1", "kind": "ffn", "sub": "one (4, D) call"},
+      {"id": "c-add", "label": "index_add_ into y", "kind": "attention", "sub": "weights[tok, slot] · out"}
+    ],
+    [
+      {"id": "c-drop", "label": "Drop tok[4:]", "kind": "loss", "sub": "10 tokens · no write"}
+    ]
+  ]},
+  {"id": "c-y", "label": "y", "kind": "io", "sub": "4 rows filled · 10 rows stay zero"}
+],
+"notes": [
+  {"at": "c-drop", "text": "Their rows stay **0**; the residual carries them"}
+]}
 :::
 
 :::quiz

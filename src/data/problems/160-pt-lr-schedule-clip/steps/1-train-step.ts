@@ -11,7 +11,7 @@ export const trainStepStep: Step = {
   title: 'train_step(): accumulate, clip by the global norm, set the LR, step',
   concept: 'pytorch',
   file: 'train_step',
-  focus: ['step', 'grads', 'clip', 'optimizer'],
+  focus: ['zero', 'loss', 'backward', 'grads', 'norm', 'clip', 'lr', 'optimizer', 'log', 'warmup', 'cosine', 'floor'],
   task: `## Task
 
 Implement the three functions that wrap one optimizer step of an LLM training loop, by hand, in
@@ -23,10 +23,16 @@ implementation (the self-test uses it as the reference).
   0 — then **cosine decay**: \`progress = (step − warmup_steps) / (total_steps − warmup_steps)\`,
   \`lr = min_lr + 0.5 × (1 + cos(π × progress)) × (max_lr − min_lr)\`; \`min_lr\` for every
   \`step >= total_steps\`. Pure \`math\`, no tensors.
+
+:::widget lr-schedule {"warmup": 10, "total": 100}
+
 - \`clip_grad_norm_(params, max_norm) -> Tensor\`: the **global** L2 norm of every \`.grad\` that is not
   \`None\` (the norm of the per-tensor norms); \`clip_coef = max_norm / (total_norm + 1e-6)\`; when
   \`clip_coef < 1\` scale every grad **in place** with \`mul_\`; return the norm **before** clipping. Under
   \`torch.no_grad()\`. \`params\` may be a generator — read it once.
+
+:::widget grad-clip
+
 - \`train_step(model, batch_iter, optimizer, accum_steps, step, *, warmup_steps, total_steps, max_lr,
   min_lr, max_norm=1.0) -> dict\`: \`optimizer.zero_grad(set_to_none=True)\` **once**, then
   \`accum_steps\` times \`x, y = next(batch_iter)\`, \`loss = F.cross_entropy(model(x), y) / accum_steps\`,
@@ -42,26 +48,6 @@ implementation (the self-test uses it as the reference).
 > The gradient of a mean over 16 examples is the mean of four gradients over 4 — only if each
 > micro-batch loss is divided by four before \`backward()\` and the \`.grad\` buffers are cleared once
 > per optimizer step, not once per micro-batch.`,
-  sequence: {
-    participants: ['train_step', 'model', '.grad buffers', 'optimizer'],
-    messages: [
-      {from: 'train_step', to: 'optimizer', label: 'zero_grad(set_to_none=True) — once per step', kind: 'sync'},
-      {from: 'train_step', to: 'model', label: 'micro-batch 1 of 4: forward · loss / 4 · backward()', kind: 'sync'},
-      {from: 'model', to: '.grad buffers', label: '.grad = ∂(loss₁/4)/∂θ', kind: 'async'},
-      {from: 'train_step', to: 'model', label: 'micro-batches 2, 3, 4: forward · loss / 4 · backward()', kind: 'sync'},
-      {from: 'model', to: '.grad buffers', label: '.grad += ∂(lossₖ/4)/∂θ', kind: 'async'},
-      {
-        from: 'train_step',
-        to: '.grad buffers',
-        label: 'clip_grad_norm_(max_norm=1.0): norm of norms = 2.3 → mul_(0.43)',
-        kind: 'sync',
-      },
-      {from: '.grad buffers', to: 'train_step', label: 'total_norm 2.3 (pre-clip)', kind: 'reply'},
-      {from: 'train_step', to: 'train_step', label: 'lr = lr_at(step, warmup, total, max_lr, min_lr)', kind: 'sync'},
-      {from: 'train_step', to: 'optimizer', label: 'param_groups[*]["lr"] = lr · step()', kind: 'sync'},
-      {from: 'optimizer', to: 'train_step', label: '{loss, grad_norm: 2.3, lr}', kind: 'reply'},
-    ],
-  },
   hints: [
     'Three branches in `lr_at`: `step < warmup_steps` → `max_lr * (step + 1) / warmup_steps`; `step >= total_steps` → `min_lr`; otherwise `progress` in `[0, 1)` and `min_lr + 0.5 * (1.0 + math.cos(math.pi * progress)) * (max_lr - min_lr)`. Check it in your head: progress 0 gives `max_lr`, progress 1 gives `min_lr`.',
     'In `clip_grad_norm_`: `grads = [p.grad for p in params if p.grad is not None]` (a generator is consumed once), `total_norm = torch.stack([g.norm(2.0) for g in grads]).norm(2.0)`, `clip_coef = max_norm / (total_norm + 1e-6)`, and `g.mul_(clip_coef)` for every grad only `if clip_coef < 1.0`. Decorate with `@torch.no_grad()` and return the norm you computed before scaling.',

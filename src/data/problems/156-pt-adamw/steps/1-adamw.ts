@@ -105,7 +105,7 @@ export const adamwStep: Step = {
   title: 'AdamW.step(): lazy state, two moments, bias correction, decoupled decay',
   concept: 'pytorch',
   file: 'adamw',
-  focus: ['optim', 'params', 'state'],
+  focus: ['count', 'm', 'v', 'amsgrad', 'bias', 'denom', 'decay', 'update'],
   task: `## Task
 
 Implement \`AdamW.step(self, closure=None)\` on the given \`torch.optim.Optimizer\` subclass. The constructor
@@ -133,26 +133,11 @@ reads them from \`group\` while looping over \`self.param_groups\` and \`group["
 
 > Adam normalises each coordinate's step by its own gradient scale. Weight decay added to the gradient
 > goes through that normalisation too and all but vanishes for weights with large gradients; applied to
-> the parameter directly, it shrinks every weight by the same \`lr × wd\` — that one move is AdamW.`,
-  sequence: {
-    participants: ['training loop', 'AdamW.step', 'self.state[p]', 'parameter p'],
-    messages: [
-      {from: 'training loop', to: 'AdamW.step', label: 'step(closure) — under torch.no_grad()', kind: 'sync'},
-      {from: 'AdamW.step', to: 'training loop', label: 'closure() under enable_grad → loss, p.grad', kind: 'reply'},
-      {
-        from: 'AdamW.step',
-        to: 'self.state[p]',
-        label: 'first sight: step=0, exp_avg=0, exp_avg_sq=0 (max_exp_avg_sq if amsgrad)',
-        kind: 'sync',
-      },
-      {from: 'AdamW.step', to: 'self.state[p]', label: 'step += 1 → t', kind: 'sync'},
-      {from: 'AdamW.step', to: 'parameter p', label: 'p.mul_(1 − lr·wd) — decoupled decay', kind: 'sync'},
-      {from: 'AdamW.step', to: 'self.state[p]', label: 'm ← β1·m + (1−β1)·g · v ← β2·v + (1−β2)·g²', kind: 'sync'},
-      {from: 'AdamW.step', to: 'AdamW.step', label: 'bc1 = 1−β1^t · bc2 = 1−β2^t · denom = √(v/bc2) + ε', kind: 'sync'},
-      {from: 'AdamW.step', to: 'parameter p', label: 'p.addcdiv_(m, denom, value=−lr/bc1)', kind: 'sync'},
-      {from: 'AdamW.step', to: 'training loop', label: 'loss', kind: 'reply'},
-    ],
-  },
+> the parameter directly, it shrinks every weight by the same \`lr × wd\` — that one move is AdamW.
+
+Turn the weight decay up below and compare Adam's path with AdamW's on an ill-conditioned loss:
+
+:::widget optimizer-paths`,
   hints: [
     'Shape of the loop: `for group in self.param_groups:` unpack `lr`, `beta1, beta2 = group["betas"]`, `eps`, `weight_decay`, `amsgrad`; then `for p in group["params"]:` with `if p.grad is None: continue` and `grad = p.grad`. `state = self.state[p]` is a dict that is empty the first time — fill it then.',
     'Order inside the parameter loop: `state["step"] += 1` → `p.mul_(1 - lr * weight_decay)` → the two moments in place → `bias_correction1 = 1 - beta1**step`, `bias_correction2 = 1 - beta2**step` → `denom` → `p.addcdiv_(exp_avg, denom, value=-lr / bias_correction1)`. The reference applies decay before the moments, so match that order.',

@@ -63,41 +63,123 @@ fp16 on a GPU (the mechanism is the same; the test runs anywhere), keeping the s
 overflow check never syncs, the fused \`_amp_foreach_non_finite_check_and_unscale_\` kernel, multiple
 optimizers sharing one scaler, gradient accumulation across micro-batches, FSDP's \`MixedPrecision\`
 policy, and fp8 matmuls with per-tensor scaling (Transformer Engine).`,
-  diagram: {
-    nodes: [
-      {id: 'loop', kind: 'client', label: 'train_step', sub: 'zero_grad · forward · backward · step', x: 10, y: 50},
+  architecture: {
+    input: 'batch (x, y) · 16→32→4 MLP',
+    output: '(loss, grad_norm, stepped)',
+    items: [
       {
-        id: 'autocast',
-        kind: 'service',
-        label: 'torch.autocast',
-        sub: 'bf16 matmuls · loss on logits.float()',
-        x: 40,
-        y: 20,
-      },
-      {
-        id: 'scaler',
-        kind: 'service',
-        label: 'DynamicLossScaler',
-        sub: 'scale · unscale_ · isfinite · backoff · growth',
-        x: 40,
-        y: 75,
-      },
-      {
-        id: 'optimizer',
-        kind: 'db',
+        id: 'master',
         label: 'fp32 master weights',
-        sub: 'p · p.grad (fp32) · SGD step',
-        x: 72,
-        y: 50,
+        sub: 'p and p.grad stay float32',
+        kind: 'io',
+        detail:
+          'The optimizer only ever updates float32 weights. Casting the model with `.half()` or `.bfloat16()` would round small updates away: bf16’s spacing near 1.0 is `2**-7`.',
       },
-      {id: 'ref', kind: 'external', label: 'torch.amp.GradScaler', sub: 'same weights · same scale', x: 72, y: 90},
+      {
+        tone: 'block',
+        repeat: 'for each step',
+        label: 'train_step',
+        items: [
+          {id: 'zero', label: 'zero_grad', sub: 'set_to_none=True'},
+          {
+            id: 'forward',
+            label: 'Forward under autocast',
+            sub: 'matmuls in bf16 · logits bf16',
+            kind: 'ffn',
+            side: {
+              label: 'bf16 weight copies',
+              sub: 'cast once per region',
+              detail:
+                'Autocast casts each fp32 parameter to the autocast dtype for matmul-like ops and caches the copy; the backward of the cast delivers an fp32 `.grad`.',
+            },
+            detail:
+              '`with torch.autocast(device_type=x.device.type, dtype=dtype)`: linear layers run on 16-bit copies, activations are 16-bit, the parameters are untouched.',
+          },
+          {
+            id: 'loss',
+            label: 'Cross-entropy in fp32',
+            sub: 'F.cross_entropy(logits.float(), y)',
+            kind: 'loss',
+            detail:
+              'The loss is a sum of logs and exponentials: computed on upcast logits so it is float32 on every device.',
+          },
+          {
+            id: 'scale',
+            label: 'Scale the loss',
+            sub: 'scaler.scale(loss) = loss × S',
+            kind: 'attention',
+            detail:
+              'Backpropagation is linear in the loss, so every gradient is multiplied by `S`. A power of two only shifts exponents: no rounding.',
+          },
+          {
+            id: 'backward',
+            label: 'Backward',
+            sub: 'every .grad fp32, × S',
+            detail:
+              'Autograd replays each op in the dtype its forward used; the gradients that land on the parameters are float32 and carry the factor `S`.',
+          },
+          {
+            id: 'unscale',
+            label: 'unscale_',
+            sub: 'grads ÷ S in place',
+            kind: 'attention',
+            detail:
+              'Every `p.grad` of every parameter group divided by the scale, in place. At most once per step: a second call raises `RuntimeError`.',
+          },
+          {
+            id: 'check',
+            label: 'Overflow check',
+            sub: 'one isfinite per param group',
+            kind: 'attention',
+            detail:
+              'Stack `isfinite(g).all()` over the group and reduce once: one host sync per group, not one per tensor. Records `found_inf`.',
+          },
+          {
+            id: 'clip',
+            label: 'clip_grad_norm_',
+            sub: 'max_norm=1.0 on true grads',
+            detail: 'After `unscale_`, so the norm is of the real gradients; returned as `grad_norm`.',
+          },
+          {
+            columns: [
+              [
+                {
+                  id: 'skip',
+                  label: 'inf / NaN: skip',
+                  sub: 'no optimizer.step()',
+                  kind: 'attention',
+                  detail:
+                    'A skipped step costs one batch and leaves every weight bit-equal; an applied `inf` would cost the run.',
+                },
+              ],
+              [
+                {
+                  id: 'step',
+                  label: 'Finite: step',
+                  sub: 'optimizer.step() on fp32',
+                  kind: 'attention',
+                  detail: 'SGD updates the float32 master weights with the unscaled, clipped gradients.',
+                },
+              ],
+            ],
+          },
+          {
+            id: 'update',
+            label: 'Update the scale',
+            sub: '× 0.5 and reset, or count; × 2',
+            kind: 'attention',
+            detail:
+              'Overflow: `scale × backoff_factor`, good-step counter to 0. Otherwise the counter grows, and after `growth_interval` consecutive good steps the scale is multiplied by `growth_factor` and the counter resets.',
+          },
+        ],
+      },
     ],
-    edges: [
-      {from: 'loop', to: 'autocast', kind: 'plain', label: 'forward in dtype'},
-      {from: 'autocast', to: 'optimizer', kind: 'plain', label: 'bf16 copy of each weight'},
-      {from: 'loop', to: 'scaler', kind: 'plain', label: 'scale(loss) · unscale_ · step'},
-      {from: 'scaler', to: 'optimizer', kind: 'plain', label: 'grads ÷ scale · step or skip'},
-      {from: 'scaler', to: 'ref', kind: 'plain', label: 'compared on CPU'},
+    notes: [
+      {at: 'scale', text: 'S = **65,536** lifts a 2^-30 gradient to fp16’s 2^-14'},
+      {at: 'check', text: '**1** host sync per parameter group'},
+      {at: 'clip', text: 'Scaled norms would be **65,536×** too large'},
+      {at: 'skip', text: 'Skipped: every weight **bit-equal**', side: 'left'},
+      {at: 'update', text: '**× 0.5** on overflow, **× 2** after 2,000 clean steps'},
     ],
   },
   steps: [lossScalerStep],

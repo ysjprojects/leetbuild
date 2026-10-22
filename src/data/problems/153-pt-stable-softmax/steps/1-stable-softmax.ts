@@ -13,7 +13,7 @@ export const stableSoftmaxStep: Step = {
   title: 'log_softmax, softmax and cross_entropy, stable by construction',
   concept: 'pytorch',
   file: 'stable_softmax',
-  focus: ['logsoftmax', 'softmax', 'ce'],
+  focus: ['shift', 'exp', 'sum', 'log', 'logp', 'softmax', 'gather', 'smooth', 'mix', 'mask', 'loss'],
   task: `## Task
 
 Implement three functions in \`stable_softmax.py\`, with plain tensor ops only — none of
@@ -39,40 +39,12 @@ no \`nn.CrossEntropyLoss\`. They are what the self-test at the bottom compares y
 
 > Softmax is a ratio of exponentials, and a ratio is unchanged when every term is scaled by the same
 > constant. Subtracting the row max picks the constant that makes the largest exponent exactly \`0\`:
-> nothing overflows, and the sum is at least \`1\`, so its log is finite too.`,
-  sequence: {
-    participants: ['caller', 'cross_entropy', 'log_softmax', 'torch.nn.functional'],
-    messages: [
-      {
-        from: 'caller',
-        to: 'cross_entropy',
-        label: 'cross_entropy(logits (8, 5), row 0 ≈ 1e4 · targets with two −100 · label_smoothing=0.1)',
-        kind: 'sync',
-      },
-      {from: 'cross_entropy', to: 'log_softmax', label: 'log_softmax(logits, dim=-1)', kind: 'sync'},
-      {
-        from: 'log_softmax',
-        to: 'log_softmax',
-        label: 'm = amax(keepdim) · s = x − m ≤ 0 · lse = log Σ exp(s) ≥ 0',
-        kind: 'sync',
-      },
-      {from: 'log_softmax', to: 'cross_entropy', label: 'logp (8, 5) — finite, row 0 included', kind: 'reply'},
-      {
-        from: 'cross_entropy',
-        to: 'cross_entropy',
-        label: 'nll = −gather(logp, t) · smooth = −mean(logp) · 0.9·nll + 0.1·smooth · mask 2 rows · sum / 6',
-        kind: 'sync',
-      },
-      {from: 'cross_entropy', to: 'caller', label: 'loss (scalar)', kind: 'reply'},
-      {
-        from: 'caller',
-        to: 'torch.nn.functional',
-        label: 'F.cross_entropy(logits, targets, label_smoothing=0.1, ignore_index=-100)',
-        kind: 'sync',
-      },
-      {from: 'torch.nn.functional', to: 'caller', label: 'allclose ✓ · gradcheck (float64) ✓', kind: 'reply'},
-    ],
-  },
+> nothing overflows, and the sum is at least \`1\`, so its log is finite too.
+
+The widget starts on four logits near \`1e4\`: every naive bar is NaN, the shifted bars are finite and sum
+to \`1\`. Switch to small logits and the two agree.
+
+:::widget softmax-stability {"preset": "huge"}`,
   hints: [
     'Write `log_softmax` first and make `softmax` and `cross_entropy` call it. `m = x.amax(dim=dim, keepdim=True)` broadcasts back over the row; `m.detach()` is fine — the gradient through the max cancels exactly — and saves autograd a node.',
     'For the gather, `targets` must be `(N, 1)` and `int64`: `logp.gather(1, targets.unsqueeze(1)).squeeze(1)`. Ignored rows hold `-100`, which is not a valid column: build `valid = targets != ignore_index`, gather with `targets.masked_fill(~valid, 0)`, and zero those rows afterwards.',

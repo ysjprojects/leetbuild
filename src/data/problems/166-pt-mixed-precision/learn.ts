@@ -12,44 +12,54 @@ recipe every framework still follows: an fp32 **master copy** of the weights, 16
 in fp32, and **loss scaling** so small gradients survive fp16. The drill writes the training step and the
 scaler by hand: \`train_step(model, batch, optimizer, scaler, dtype=torch.bfloat16, max_norm=1.0)\` and
 \`DynamicLossScaler(init_scale=2.0**16, growth_factor=2.0, backoff_factor=0.5, growth_interval=2000)\`
-with \`scale\`, \`unscale_\`, \`step\`, \`state_dict\` and \`load_state_dict\`.
+with \`scale\`, \`unscale_\`, \`step\`, \`state_dict\` and \`load_state_dict\`. One training step, read bottom
+to top, with the scaler's stages in the accent colour:
 
-:::diagram
+:::architecture
 {
-  "nodes": [
-    {"id": "loop", "kind": "client", "label": "train_step", "sub": "zero_grad · forward · backward · clip · step", "x": 10, "y": 50},
-    {"id": "autocast", "kind": "service", "label": "torch.autocast", "sub": "matmuls on bf16 copies · loss on logits.float()", "x": 40, "y": 20},
-    {"id": "scaler", "kind": "service", "label": "DynamicLossScaler", "sub": "loss × scale · grads ÷ scale · skip or step · resize", "x": 40, "y": 75},
-    {"id": "optimizer", "kind": "db", "label": "fp32 master weights", "sub": "p and p.grad never leave float32", "x": 72, "y": 50},
-    {"id": "ref", "kind": "external", "label": "torch.amp.GradScaler", "sub": "same weights, same scale after six steps", "x": 72, "y": 90}
+  "input": "batch (x, y) · 16→32→4 MLP",
+  "output": "(loss, grad_norm, stepped)",
+  "items": [
+    {"id": "master", "label": "fp32 master weights", "sub": "p and p.grad stay float32", "kind": "io", "detail": "The optimizer only ever updates float32 weights; 16-bit copies exist only inside the forward."},
+    {"tone": "block", "repeat": "for each step", "label": "train_step", "items": [
+      {"id": "zero", "label": "zero_grad", "sub": "set_to_none=True"},
+      {"id": "forward", "label": "Forward under autocast", "sub": "matmuls in bf16 · logits bf16", "kind": "ffn",
+       "side": {"label": "bf16 weight copies", "sub": "cast once per region", "detail": "Each fp32 parameter is cast for matmul-like ops and the copy cached; the cast's backward delivers an fp32 grad."},
+       "detail": "Linear layers run on 16-bit copies; activations are 16-bit; the parameters are untouched."},
+      {"id": "loss", "label": "Cross-entropy in fp32", "sub": "F.cross_entropy(logits.float(), y)", "kind": "loss"},
+      {"id": "scale", "label": "Scale the loss", "sub": "scaler.scale(loss) = loss × S", "kind": "attention", "detail": "Backpropagation is linear in the loss, so every gradient carries the factor S."},
+      {"id": "backward", "label": "Backward", "sub": "every .grad fp32, × S"},
+      {"id": "unscale", "label": "unscale_", "sub": "grads ÷ S in place", "kind": "attention", "detail": "At most once per step; a second call raises RuntimeError."},
+      {"id": "check", "label": "Overflow check", "sub": "one isfinite per param group", "kind": "attention", "detail": "Stack isfinite(g).all() over the group and reduce once: records found_inf."},
+      {"id": "clip", "label": "clip_grad_norm_", "sub": "max_norm=1.0 on true grads", "detail": "Returned as grad_norm."},
+      {"columns": [
+        [{"id": "skip", "label": "inf / NaN: skip", "sub": "no optimizer.step()", "kind": "attention"}],
+        [{"id": "step", "label": "Finite: step", "sub": "optimizer.step() on fp32", "kind": "attention"}]
+      ]},
+      {"id": "update", "label": "Update the scale", "sub": "× 0.5 and reset, or count; × 2", "kind": "attention", "detail": "Overflow: scale × backoff_factor and the counter to 0. Otherwise count, and after growth_interval good steps in a row, scale × growth_factor."}
+    ]}
   ],
-  "edges": [
-    {"from": "loop", "to": "autocast", "kind": "plain", "label": "forward in dtype"},
-    {"from": "autocast", "to": "optimizer", "kind": "plain", "label": "bf16 copy of each weight"},
-    {"from": "loop", "to": "scaler", "kind": "plain", "label": "scale(loss) · unscale_ · step"},
-    {"from": "scaler", "to": "optimizer", "kind": "plain", "label": "grads ÷ scale · step or skip"},
-    {"from": "scaler", "to": "ref", "kind": "plain", "label": "compared on CPU"}
+  "notes": [
+    {"at": "scale", "text": "S = **65,536** lifts a 2^-30 gradient to fp16’s 2^-14"},
+    {"at": "check", "text": "**1** host sync per parameter group"},
+    {"at": "clip", "text": "Scaled norms would be **65,536×** too large"},
+    {"at": "skip", "text": "Skipped: every weight **bit-equal**", "side": "left"},
+    {"at": "update", "text": "**× 0.5** on overflow, **× 2** after 2,000 clean steps"}
   ]
 }
 :::
 
 The order of a step is fixed by what each stage needs to see:
 
-:::sequence
-{
-  "participants": ["train_step", "autocast", "fp32 weights", "DynamicLossScaler", "optimizer"],
-  "messages": [
-    {"from": "train_step", "to": "optimizer", "label": "zero_grad(set_to_none=True)", "kind": "sync"},
-    {"from": "train_step", "to": "autocast", "label": "with torch.autocast(device_type, dtype): model(x)", "kind": "sync"},
-    {"from": "autocast", "to": "fp32 weights", "label": "cast a bf16 copy, matmul in bf16", "kind": "sync"},
-    {"from": "fp32 weights", "to": "train_step", "label": "cross_entropy(logits.float(), y) in fp32", "kind": "reply"},
-    {"from": "train_step", "to": "DynamicLossScaler", "label": "scale(loss).backward(): every grad × 65536", "kind": "sync"},
-    {"from": "train_step", "to": "DynamicLossScaler", "label": "unscale_: grads ÷ 65536 in place, isfinite per group", "kind": "sync"},
-    {"from": "train_step", "to": "fp32 weights", "label": "clip_grad_norm_ on true gradients", "kind": "sync"},
-    {"from": "DynamicLossScaler", "to": "optimizer", "label": "finite: step(); else skip and halve the scale", "kind": "sync"}
-  ]
-}
-:::
+| Stage | What it sees | Why it sits here |
+| --- | --- | --- |
+| \`optimizer.zero_grad(set_to_none=True)\` | last step's gradients | backward accumulates into \`.grad\` |
+| \`model(x)\` under \`torch.autocast(device_type, dtype)\` | bf16 copies of fp32 weights | matmuls at the 16-bit rate, parameters untouched |
+| \`cross_entropy(logits.float(), y)\` | fp32 logits | a sum of logs and exponentials needs fp32 |
+| \`scaler.scale(loss).backward()\` | every grad × 65536, in fp32 | small gradients must be lifted before the chain rule runs |
+| \`scaler.unscale_(optimizer)\` | grads ÷ 65536 in place, one \`isfinite\` per group | the clipper and the optimizer need true gradients |
+| \`clip_grad_norm_(parameters, 1.0)\` | true gradients | the norm of scaled ones is 65536× too large |
+| \`scaler.step(optimizer)\` | \`found_inf\` | finite: \`step()\`; otherwise skip and halve the scale |
 
 - Parameters and their \`.grad\` are float32 from start to end; only activations are 16-bit.
 - \`unscale_\` runs before \`clip_grad_norm_\`: the norm of scaled gradients is 65536× too large.
@@ -91,17 +101,11 @@ histograms show it: in a Mandarin speech model about 5% of weight-gradient value
 -24 — zero in fp16 — and in an SSD detector most activation gradients sat below fp16's range while the
 top of the range went unused.
 
-:::sequence
-{
-  "participants": ["loss", "backward (fp16)", "p.grad", "optimizer"],
-  "messages": [
-    {"from": "loss", "to": "backward (fp16)", "label": "loss.backward(), no scale", "kind": "sync"},
-    {"from": "backward (fp16)", "to": "p.grad", "label": "true gradient 2**-30 → rounds to 0.0", "kind": "sync"},
-    {"from": "p.grad", "to": "optimizer", "label": "step(): the weight does not move", "kind": "sync"},
-    {"from": "optimizer", "to": "loss", "label": "training stalls or diverges from fp32 — silently", "kind": "reply"}
-  ]
-}
-:::
+The widget draws the same picture. At a loss scale of 1 the left tail of the gradient histogram sits below
+fp16's smallest subnormal, \`2**-24\`: a true gradient of \`2**-30\` rounds to \`0.0\` and the weight it belongs
+to never moves, silently. Raise the scale and the tail lifts into range:
+
+:::widget float-formats
 
 Backpropagation is linear in the loss, so multiplying the loss by \`S\` multiplies every gradient of the
 chain rule by \`S\`. Choose \`S\` a power of two and the multiplication and the later division are exact —
@@ -134,17 +138,29 @@ A scale that is too large turns a gradient into \`inf\` (or an \`inf - inf\` int
 to raise on; it is the signal that \`S\` is too big. The scaler checks after \`unscale_\`, once per
 parameter group, with one \`torch.isfinite\` reduction over the group's gradients:
 
-:::sequence
+:::architecture
 {
-  "participants": ["train_step", "DynamicLossScaler", "optimizer", "weights"],
-  "messages": [
-    {"from": "train_step", "to": "DynamicLossScaler", "label": "naive: unscale_ without a check", "kind": "sync"},
-    {"from": "DynamicLossScaler", "to": "optimizer", "label": "step() with an inf gradient", "kind": "sync"},
-    {"from": "optimizer", "to": "weights", "label": "w − lr·inf = −inf; next forward is nan", "kind": "sync"},
-    {"from": "train_step", "to": "DynamicLossScaler", "label": "correct: unscale_ → found_inf = True", "kind": "sync"},
-    {"from": "DynamicLossScaler", "to": "train_step", "label": "no step(); scale × 0.5; counter = 0", "kind": "reply"},
-    {"from": "train_step", "to": "DynamicLossScaler", "label": "growth_interval finite steps in a row", "kind": "sync"},
-    {"from": "DynamicLossScaler", "to": "optimizer", "label": "step(); scale × 2; counter = 0", "kind": "sync"}
+  "input": "scaled grads after backward",
+  "output": "next step",
+  "items": [
+    {"id": "d-unscale", "label": "unscale_", "sub": "grads ÷ S in place", "kind": "attention"},
+    {"id": "d-check", "label": "isfinite, once per group", "sub": "found_inf = any non-finite", "kind": "attention", "detail": "Without this check the optimizer applies the inf: w − lr·inf = −inf, and the next forward is nan."},
+    {"columns": [
+      [
+        {"id": "d-skip", "label": "Non-finite: skip", "sub": "no optimizer.step() · bit-equal"},
+        {"id": "d-back", "label": "Back off", "sub": "scale × 0.5 · counter = 0"}
+      ],
+      [
+        {"id": "d-step", "label": "Finite: optimizer.step()", "sub": "counter += 1"},
+        {"id": "d-grow", "label": "Grow at the interval", "sub": "N in a row: scale × 2, reset"}
+      ]
+    ]},
+    {"id": "d-clear", "label": "Clear found_inf", "sub": "unscale_ allowed again", "kind": "io"}
+  ],
+  "notes": [
+    {"at": "d-check", "text": "No check: w − lr·inf = **−inf**, then nan"},
+    {"at": "d-skip", "text": "Costs **one batch**, not the run", "side": "left"},
+    {"at": "d-grow", "text": "N = **2,000** by default, **4** in the self-test"}
   ]
 }
 :::

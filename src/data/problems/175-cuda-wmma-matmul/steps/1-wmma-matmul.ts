@@ -11,7 +11,7 @@ export const wmmaMatmulStep: Step = {
   title: 'wmma_matmul: one warp, one 16×16 tile, fragments, mma_sync',
   concept: 'cuda',
   file: 'wmma_matmul',
-  focus: ['kernel', 'smem', 'gmem'],
+  focus: ['host', 'acc0', 'frag-a', 'frag-b', 'mma', 'acc', 'store'],
   task: `## Task
 
 Implement \`C = A · B\` on tensor cores with \`nvcuda::wmma\` (\`#include <mma.h>\`): \`A\` is \`M × K\` and \`B\` is
@@ -48,45 +48,13 @@ Implement \`C = A · B\` on tensor cores with \`nvcuda::wmma\` (\`#include <mma.
   kernels, then the benchmark, and prints \`PASS\`. Build: \`nvcc -O2 -arch=sm_80 -o wmma_matmul wmma_matmul.cu\`
   (\`sm_70\` or later works).
 
+fp16 keeps 11 significant bits against fp32's 24: slide a value through both formats below to see the rounding
+the inputs take on the way in, and why the accumulator has to stay \`float\`.
+
+:::widget float-formats
+
 > A fragment is the warp's share of a 16 × 16 tile in an undocumented register layout; the only things you may
 > do with it are \`load\`, \`mma\`, \`store\` — and all 32 lanes must do them together.`,
-  sequence: {
-    participants: ['Host', 'Warp', 'Global memory', 'Tensor core'],
-    messages: [
-      {
-        from: 'Host',
-        to: 'Global memory',
-        label: 'cudaMemcpy2D A (M×K → Mp×Kp), B (K×N → Kp×Np), zero-padded',
-        kind: 'sync',
-      },
-      {from: 'Host', to: 'Warp', label: 'wmma_matmul<<<(Np/16/4, Mp/16), 128>>>', kind: 'async'},
-      {
-        from: 'Warp',
-        to: 'Warp',
-        label: 'warpId = threadIdx.x / 32 → tile (blockIdx.y, blockIdx.x·4 + warpId); fill_fragment(acc, 0)',
-        kind: 'sync',
-      },
-      {
-        from: 'Warp',
-        to: 'Global memory',
-        label: 'load_matrix_sync a ← A + tileRow·16·K + k (ldm K); b ← B + k·N + tileCol·16 (ldm N)',
-        kind: 'sync',
-      },
-      {from: 'Warp', to: 'Tensor core', label: 'mma_sync(acc, a, b, acc) — ×K/16', kind: 'sync'},
-      {
-        from: 'Warp',
-        to: 'Global memory',
-        label: 'store_matrix_sync(C + tileRow·16·N + tileCol·16, acc, N, mem_row_major)',
-        kind: 'sync',
-      },
-      {
-        from: 'Host',
-        to: 'Global memory',
-        label: 'cudaMemcpy2D C (M×N corner) back; max|C − ref| ≤ 2e-5·K; TFLOP/s vs tiled fp32',
-        kind: 'sync',
-      },
-    ],
-  },
   hints: [
     'Three fragment declarations and four calls carry the direct kernel: `fill_fragment(acc, 0.0f)`, then per 16 of K `load_matrix_sync(a, A + tileRow * 16 * K + k, K)`, `load_matrix_sync(b, B + k * N + tileCol * 16, N)`, `mma_sync(acc, a, b, acc)`, and once at the end `store_matrix_sync(C + tileRow * 16 * N + tileCol * 16, acc, N, wmma::mem_row_major)`. The pointer is the tile’s top-left element; `ldm` is the full row length of the matrix it sits in.',
     'In the staged kernel the leading dimension is the padded row length of the shared array (`BK + 8 = 40` for `As`, `BN + 8 = 72` for `Bs`), not `K` or `N`. Each warp loads two `a` fragments (`&As[warpRow * 32 + i * 16][kk]`) and two `b` fragments (`&Bs[kk][warpCol * 32 + j * 16]`) and does four `mma_sync` into `acc[i][j]`.',

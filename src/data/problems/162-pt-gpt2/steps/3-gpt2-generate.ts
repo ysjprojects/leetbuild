@@ -5,7 +5,7 @@ export const gpt2GenerateStep: Step = {
   title: 'Generation: temperature, top-k, nucleus and a KV cache',
   concept: 'pytorch',
   file: 'gpt2_generate',
-  focus: ['tokens', 'blocks', 'head'],
+  focus: ['tokens', 'wte', 'wpe', 'attn', 'head'],
   task: `## Task
 
 Sample from the step-1 model (\`from gpt2_model import GPT, GPTConfig, CausalSelfAttention\`), first by
@@ -33,6 +33,23 @@ re-running the whole context for every token, then with a per-block KV cache tha
   \`cache.pos == block_size\` the learned positions are exhausted — reset \`pos\` to 0 and re-encode the last
   \`block_size\` tokens, exactly what the uncached crop computes.
 
+:::architecture
+{
+  "input": "prompt idx · (B, T)",
+  "output": "to the tokenizer's decode",
+  "items": [
+    {"id": "prefill", "label": "Prefill the prompt", "kind": "attention", "sub": "forward_cached · positions 0..T−1", "detail": "The prompt's last \`block_size\` tokens at once: every block writes its k and v rows into the cache; only the last position's logits come back."},
+    {"tone": "block", "repeat": "max_new_tokens ×", "label": "One decode step", "items": [
+      {"id": "filter", "label": "filter_logits", "sub": "÷ temperature · top-k · top-p"},
+      {"id": "sample", "label": "Sample", "sub": "softmax → multinomial → (B, 1)", "detail": "Exactly one \`torch.multinomial\` per new token, in both paths: that is what makes cached and uncached draws identical."},
+      {"id": "append", "label": "Append to idx", "kind": "io", "sub": "torch.cat((idx, idx_next), 1)"},
+      {"id": "decode", "label": "Decode one token", "kind": "attention", "sub": "forward_cached(idx_next) at pos", "side": {"label": "KV cache", "sub": "rows 0..pos", "detail": "\`(n_layer, B, n_head, block_size, hd)\` for k and for v; this step appends row \`pos\` and its one query attends over all \`pos + 1\` rows."}, "detail": "Skipped after the last token. When \`cache.pos == block_size\`, reset \`pos\` to 0 and re-encode the last \`block_size\` tokens."}
+    ]},
+    {"id": "out", "label": "Generated ids", "kind": "io", "sub": "(B, T + max_new_tokens)"}
+  ]
+}
+:::
+
 The self-test (float64, \`eval()\`, \`GPTConfig(32, 16, 2, 2, 16)\`) checks the filters on a known
 distribution, shapes and the crop past \`block_size\`, that \`top_k=1\` ignores the seed, that the cached
 prefill and one decode step match the full forward to 1e-10, that \`generate_cached\` and \`generate\` draw
@@ -41,19 +58,6 @@ the cache size \`2 · n_layer · B · block_size · n_embd · 8\` bytes, then pr
 
 > Decoding is a loop of one-row matmuls: with the cache, token *t* costs one position of compute and *t*
 > rows of reading keys and values — the bottleneck moves from FLOPs to memory bandwidth.`,
-  sequence: {
-    participants: ['generate_cached', 'KVCache', 'Block × n_layer', 'lm_head', 'sampler'],
-    messages: [
-      {from: 'generate_cached', to: 'Block × n_layer', label: 'prefill: prompt (B, T) at positions 0..T', kind: 'sync'},
-      {from: 'Block × n_layer', to: 'KVCache', label: 'k, v → [:, :, 0:T] per block', kind: 'sync'},
-      {from: 'Block × n_layer', to: 'lm_head', label: 'last position only', kind: 'sync'},
-      {from: 'lm_head', to: 'sampler', label: 'logits / T → top-k → top-p → softmax', kind: 'sync'},
-      {from: 'sampler', to: 'generate_cached', label: 'torch.multinomial → idx_next (B, 1)', kind: 'reply'},
-      {from: 'generate_cached', to: 'Block × n_layer', label: 'decode: idx_next at position pos', kind: 'sync'},
-      {from: 'Block × n_layer', to: 'KVCache', label: 'append row pos; attend over [0, pos]', kind: 'sync'},
-      {from: 'generate_cached', to: 'KVCache', label: 'pos == block_size → pos = 0, re-encode window', kind: 'async'},
-    ],
-  },
   hints: [
     'Top-k in two lines: `v, _ = torch.topk(logits, k)` then `logits.masked_fill(logits < v[:, [-1]], float("-inf"))`. For top-p, `remove = torch.cumsum(probs, -1) - probs > top_p` on the sorted probabilities keeps the token that crosses the threshold; `torch.full_like(logits, -inf).scatter(-1, sorted_idx, sorted_logits)` undoes the sort.',
     'The cached attention is the step-1 attention with offsets: queries are the T new rows, keys and values are the first `pos + T` rows of the cache, and the causal mask is the slice `mask[:, :, pos : pos + T, : pos + T]` — for a single decode token that row is all ones.',

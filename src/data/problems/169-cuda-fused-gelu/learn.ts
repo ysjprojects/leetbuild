@@ -11,19 +11,39 @@ step — add the bias, apply the GELU — over an activation of \`tokens × 4·d
 4096 tokens that is 4096 × 3072 = 12,582,912 elements, 48 MiB. The step does almost no arithmetic per byte,
 so its speed is set by how many bytes it moves and how it asks for them.
 
-:::diagram
+Bottom to top, one launch: the activation and the bias come in from global memory as 16-byte vectors, the
+bias add and the GELU happen in registers, and \`y\` goes out once. A scalar kernel picks up the last
+\`n % 4\` elements.
+
+:::architecture
 {
-  "nodes": [
-    {"id": "host", "kind": "client", "label": "Host · gelu_bias()", "sub": "splits n into n / 4 vectors and an n % 4 tail", "x": 8, "y": 50},
-    {"id": "kernel", "kind": "service", "label": "gelu_bias_kernel", "sub": "one thread per float4 · bias + GELU in registers", "x": 40, "y": 28},
-    {"id": "tail", "kind": "service", "label": "gelu_bias_tail_kernel", "sub": "the last 0–3 elements, one float each", "x": 40, "y": 74},
-    {"id": "hbm", "kind": "db", "label": "Device memory (HBM)", "sub": "x read once · y written once · bias cached", "x": 82, "y": 50}
+  "input": "x: 4096 × 3072 float32 · bias: 3072",
+  "output": "y = gelu(x + bias)",
+  "items": [
+    {"id": "gmem-in", "label": "Global memory x, bias", "kind": "memory", "sub": "x 48 MiB · bias 12 KiB", "shape": "float4[3,145,728] · float4[768]", "detail": "Reinterpreted as float4: n4 = n / 4 vectors of x, cols4 = 768 of the bias."},
+    {"columns": [
+      [{"tone": "block", "repeat": "12,288 ×", "label": "Thread block · 256 threads", "items": [
+        {"columns": [
+          [{"id": "ld-x", "label": "float4 load x[i]", "kind": "memory", "sub": "LDG.128 · 16 B", "detail": "Returns first when i >= n4. A warp asks for 512 contiguous bytes."}],
+          [{"id": "ld-b", "label": "float4 load bias[i % 768]", "kind": "memory", "sub": "LDG.128 · cache-resident", "detail": "The four lanes of x[i] are the four lanes of bias[i % cols4] when cols % 4 == 0."}]
+        ]},
+        {"tone": "dotted", "label": "Registers · four lanes", "items": [
+          {"id": "add", "op": "+", "detail": "v.x + b.x … v.w + b.w: the fused bias add."},
+          {"id": "gelu", "label": "gelu_tanh × 4 lanes", "kind": "kernel", "sub": "0.5v(1+tanh(√(2/π)(v+0.044715v³)))", "detail": "Single precision, tanhf, inlined: about 20 FLOPs per element."}
+        ]},
+        {"id": "st-y", "label": "float4 store y[i]", "kind": "kernel", "sub": "STG.128 · 16 B"}
+      ]}],
+      [{"tone": "dotted", "label": "Tail kernel · 1 block", "items": [
+        {"id": "tail", "label": "Scalar tail", "kind": "kernel", "sub": "y[i] = gelu(x[i] + bias[i % cols])", "detail": "Launched with n % 4 threads from 4 · n4, only when n % 4 > 0."}
+      ]}]
+    ]},
+    {"id": "gmem-y", "label": "Global memory y", "kind": "memory", "sub": "48 MiB · written once", "shape": "float[4096 × 3072]"}
   ],
-  "edges": [
-    {"from": "host", "to": "kernel", "kind": "plain", "label": "<<<⌈n4/256⌉, 256>>> over float4*"},
-    {"from": "host", "to": "tail", "kind": "plain", "label": "<<<1, n % 4>>> if any"},
-    {"from": "kernel", "to": "hbm", "kind": "plain", "label": "16-byte loads and stores"},
-    {"from": "tail", "to": "hbm", "kind": "plain", "label": "4-byte loads and stores"}
+  "notes": [
+    {"at": "ld-x", "text": "**16 B** per load: 512 B in flight per warp", "side": "left"},
+    {"at": "gelu", "text": "~**2.5 FLOP/B** against a ridge near 20: memory-bound"},
+    {"at": "tail", "text": "Only when **n % 4 > 0**"},
+    {"at": "gmem-y", "text": "**8 B** of HBM per element: one read, one write"}
   ]
 }
 :::
@@ -99,6 +119,11 @@ crossover — the ridge point — is peak FLOP/s ÷ peak bandwidth.
 - A GEMM sits at the opposite end: hundreds of FLOP/byte. That is why the MLP's time goes to the matmuls
   and why the elementwise step between them must not add a second or third pass over the activation.
 
+The kernels of this track on one roofline; pick a GPU and see how far left of the ridge an elementwise
+op sits next to a matmul:
+
+:::widget roofline
+
 :::quiz
 Q: You replace tanhf with a cheaper polynomial and halve the FLOPs per element. Roughly how much faster does the kernel get on an H100?
 - [ ] About 2× — half the work
@@ -110,32 +135,31 @@ Q: You replace tanhf with a cheaper polynomial and halve the FLOPs per element. 
 # Fusion: one read, one write
 
 Eager PyTorch runs \`x + b\` and \`F.gelu\` as two kernels. The intermediate \`x + b\` is a full activation
-that has to be written to HBM by the first and read back by the second:
+that has to be written to HBM by the first and read back by the second. Side by side, from the same \`x\`
+to the same \`y\`:
 
-:::sequence
+:::architecture
 {
-  "participants": ["Host", "add kernel", "gelu kernel", "HBM"],
-  "messages": [
-    {"from": "Host", "to": "add kernel", "label": "t = x + b", "kind": "async"},
-    {"from": "add kernel", "to": "HBM", "label": "read x (48 MiB)", "kind": "sync"},
-    {"from": "add kernel", "to": "HBM", "label": "write t (48 MiB)", "kind": "sync"},
-    {"from": "Host", "to": "gelu kernel", "label": "y = F.gelu(t, approximate=\\"tanh\\")", "kind": "async"},
-    {"from": "gelu kernel", "to": "HBM", "label": "read t (48 MiB) — the bytes just written", "kind": "sync"},
-    {"from": "gelu kernel", "to": "HBM", "label": "write y (48 MiB)", "kind": "sync"},
-    {"from": "Host", "to": "Host", "label": "192 MiB moved, two launches", "kind": "reply"}
-  ]
-}
-:::
-
-:::sequence
-{
-  "participants": ["Host", "gelu_bias_kernel", "HBM"],
-  "messages": [
-    {"from": "Host", "to": "gelu_bias_kernel", "label": "<<<12288, 256>>>(x4, bias4, y4, n4, cols4)", "kind": "async"},
-    {"from": "gelu_bias_kernel", "to": "HBM", "label": "read x (48 MiB) · bias from cache", "kind": "sync"},
-    {"from": "gelu_bias_kernel", "to": "gelu_bias_kernel", "label": "v + b and gelu_tanh in registers", "kind": "sync"},
-    {"from": "gelu_bias_kernel", "to": "HBM", "label": "write y (48 MiB)", "kind": "sync"},
-    {"from": "Host", "to": "Host", "label": "96 MiB moved, one launch", "kind": "reply"}
+  "input": "x, bias",
+  "output": "y = gelu(x + bias)",
+  "items": [
+    {"id": "gmem-x", "label": "Global memory x", "kind": "memory", "sub": "48 MiB", "detail": "Read once by either version; the bias comes from cache."},
+    {"columns": [
+      [{"tone": "dotted", "label": "Eager · 2 kernels", "items": [
+        {"id": "e-add", "label": "add kernel", "kind": "kernel", "sub": "t = x + b"},
+        {"id": "e-t", "label": "Global memory t", "kind": "memory", "sub": "48 MiB written, then read back", "detail": "The intermediate makes a full round trip through HBM: the bytes just written are read straight back."},
+        {"id": "e-gelu", "label": "gelu kernel", "kind": "kernel", "sub": "F.gelu(t), tanh form"}
+      ]}],
+      [{"tone": "dotted", "label": "Fused · 1 kernel", "items": [
+        {"id": "f-add", "label": "Registers: v + b", "kind": "memory", "sub": "t never leaves the thread"},
+        {"id": "f-gelu", "label": "gelu_tanh × 4 lanes", "kind": "kernel", "sub": "in registers"}
+      ]}]
+    ]},
+    {"id": "gmem-y", "label": "Global memory y", "kind": "memory", "sub": "48 MiB"}
+  ],
+  "notes": [
+    {"at": "e-t", "text": "**192 MiB** moved, two launches", "side": "left"},
+    {"at": "f-gelu", "text": "**96 MiB** moved, one launch"}
   ]
 }
 :::
@@ -173,15 +197,29 @@ The rules that make \`reinterpret_cast<const float4*>(x)\` legal:
   \`4·(i % cols4)\` … \`+3\` of one row — exactly the four lanes of \`bias[i % cols4]\`.
 - **The tail.** \`n / 4\` vectors cover \`4 · n4\` elements; the last \`n % 4\` need scalar code.
 
-:::sequence
+For \`n = 1,000,003\` the split is two launches over two ranges of \`y\`; the notes mark what each missing
+piece costs:
+
+:::architecture
 {
-  "participants": ["Host", "gelu_bias_kernel", "HBM"],
-  "messages": [
-    {"from": "Host", "to": "gelu_bias_kernel", "label": "n = 1,000,003 → n4 = 250,000, <<<977, 256>>>", "kind": "async"},
-    {"from": "gelu_bias_kernel", "to": "HBM", "label": "threads 0 … 249,999: y[0 … 999,999]", "kind": "sync"},
-    {"from": "gelu_bias_kernel", "to": "gelu_bias_kernel", "label": "112 spare threads: no i >= n4 guard → x[250,000 …] past the end", "kind": "sync"},
-    {"from": "Host", "to": "Host", "label": "no tail launch: y[1,000,000 … 1,000,002] stay 0", "kind": "sync"},
-    {"from": "Host", "to": "Host", "label": "illegal address, or max abs err > 1e-5 → FAIL", "kind": "reply"}
+  "input": "n = 1,000,003 · n4 = 250,000",
+  "output": "all 1,000,003 elements of y",
+  "items": [
+    {"id": "gmem-x", "label": "Global memory x, bias", "kind": "memory", "sub": "x: 1,000,003 floats"},
+    {"columns": [
+      [{"tone": "block", "repeat": "977 ×", "label": "Vector kernel · 256 threads", "items": [
+        {"id": "guard", "label": "Guard: i >= n4 returns", "kind": "kernel", "sub": "250,112 threads, 112 spare"},
+        {"id": "vec", "label": "float4 path", "kind": "kernel", "sub": "y[0 … 999,999]"}
+      ]}],
+      [{"tone": "dotted", "label": "Tail kernel · 3 threads", "items": [
+        {"id": "tk", "label": "Scalar tail", "kind": "kernel", "sub": "y[1,000,000 … 1,000,002]", "detail": "gelu_bias_tail_kernel with start = 4 · n4 = 1,000,000."}
+      ]}]
+    ]},
+    {"id": "gmem-y", "label": "Global memory y", "kind": "memory", "sub": "every element written once"}
+  ],
+  "notes": [
+    {"at": "vec", "text": "No guard: **112** threads load past the end", "side": "left"},
+    {"at": "tk", "text": "No tail launch: the last **3** stay 0, FAIL"}
   ]
 }
 :::

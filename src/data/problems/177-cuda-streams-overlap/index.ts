@@ -82,39 +82,172 @@ far above \`1e-4\` and it prints \`FAIL\`.
 CUDA Graphs capture of the schedule, choosing \`NSTREAMS\` and the chunk size from a measured
 copy-to-compute ratio, double-buffered device memory for an unbounded input stream, and
 \`cudaMemcpyPeerAsync\` between GPUs. The three ingredients here are the ones all of those build on.`,
-  diagram: {
-    nodes: [
+  architecture: {
+    input: 'N = 4,194,304 float32 · 4 chunks of 4 MiB',
+    output: 'h_out · speedup over the baseline · PASS',
+    items: [
       {
-        id: 'host',
-        kind: 'client',
-        label: 'Host · pinned h_in / h_out',
-        sub: 'cudaMallocHost · enqueue 4 chunks · events',
-        x: 8,
-        y: 50,
+        id: 'h-in',
+        label: 'Pinned host buffer h_in',
+        kind: 'host',
+        sub: 'cudaMallocHost · 16 MiB',
+        detail:
+          'Page-locked, so the copy engine can DMA it directly and `cudaMemcpyAsync` returns at once. The host loop enqueues every chunk’s calls in microseconds, then waits once.',
       },
       {
-        id: 'copy',
-        kind: 'service',
-        label: 'Copy engines',
-        sub: 'H2D chunk c + 1 ∥ D2H chunk c − 1',
-        x: 36,
-        y: 30,
+        columns: [
+          [
+            {
+              id: 'h2d-0',
+              label: 'H2D · chunk 0',
+              kind: 'io',
+              sub: 'cudaMemcpyAsync · s0',
+              detail:
+                '`cudaMemcpyAsync(d_in + off, h_in + off, 4 MiB, cudaMemcpyHostToDevice, streams[0])`: a DMA queued on the stream; the call returns in microseconds.',
+            },
+            {
+              id: 'heavy-0',
+              label: 'heavy',
+              kind: 'kernel',
+              sub: '<<<4096, 256, 0, s0>>>',
+              detail:
+                '64 iterations of `e = m + 0.5f * sinf(e)` per element over chunk 0’s 1,048,576 floats: compute-heavy, so the copies hide under it.',
+            },
+            {
+              id: 'carry-0',
+              label: 'add_carry',
+              kind: 'kernel',
+              sub: 'carry = null',
+              detail: 'Chunk 0 has no carry. `cudaEventRecord(computed[0], s0)` after it.',
+            },
+            {
+              id: 'd2h-0',
+              label: 'D2H · chunk 0',
+              kind: 'io',
+              sub: 'then record landed[0]',
+              detail:
+                '`cudaMemcpyAsync` device to host on `s0`, then `cudaEventRecord(landed[0], s0)`: the chunk’s landing time.',
+            },
+          ],
+          [
+            {
+              id: 'h2d-1',
+              label: 'H2D · chunk 1',
+              kind: 'io',
+              sub: 'cudaMemcpyAsync · s1',
+              detail:
+                '`cudaMemcpyAsync(d_in + off, h_in + off, 4 MiB, cudaMemcpyHostToDevice, streams[1])`: a DMA queued on the stream; the call returns in microseconds.',
+            },
+            {
+              id: 'heavy-1',
+              label: 'heavy',
+              kind: 'kernel',
+              sub: '<<<4096, 256, 0, s1>>>',
+              detail:
+                '64 iterations of `e = m + 0.5f * sinf(e)` per element over chunk 1’s 1,048,576 floats: compute-heavy, so the copies hide under it.',
+            },
+            {
+              id: 'carry-1',
+              label: 'add_carry',
+              kind: 'kernel',
+              sub: 'after wait computed[0]',
+              detail:
+                '`cudaStreamWaitEvent(s1, computed[0], 0)` first, then add `d_out[off − 1]`, the last output of chunk 0, to every element; then `cudaEventRecord(computed[1], s1)`.',
+            },
+            {
+              id: 'd2h-1',
+              label: 'D2H · chunk 1',
+              kind: 'io',
+              sub: 'then record landed[1]',
+              detail:
+                '`cudaMemcpyAsync` device to host on `s1`, then `cudaEventRecord(landed[1], s1)`: the chunk’s landing time.',
+            },
+          ],
+          [
+            {
+              id: 'h2d-2',
+              label: 'H2D · chunk 2',
+              kind: 'io',
+              sub: 'cudaMemcpyAsync · s2',
+              detail:
+                '`cudaMemcpyAsync(d_in + off, h_in + off, 4 MiB, cudaMemcpyHostToDevice, streams[2])`: a DMA queued on the stream; the call returns in microseconds.',
+            },
+            {
+              id: 'heavy-2',
+              label: 'heavy',
+              kind: 'kernel',
+              sub: '<<<4096, 256, 0, s2>>>',
+              detail:
+                '64 iterations of `e = m + 0.5f * sinf(e)` per element over chunk 2’s 1,048,576 floats: compute-heavy, so the copies hide under it.',
+            },
+            {
+              id: 'carry-2',
+              label: 'add_carry',
+              kind: 'kernel',
+              sub: 'after wait computed[1]',
+              detail:
+                '`cudaStreamWaitEvent(s2, computed[1], 0)` first, then add `d_out[off − 1]`, the last output of chunk 1, to every element; then `cudaEventRecord(computed[2], s2)`.',
+            },
+            {
+              id: 'd2h-2',
+              label: 'D2H · chunk 2',
+              kind: 'io',
+              sub: 'then record landed[2]',
+              detail:
+                '`cudaMemcpyAsync` device to host on `s2`, then `cudaEventRecord(landed[2], s2)`: the chunk’s landing time.',
+            },
+          ],
+          [
+            {
+              id: 'h2d-3',
+              label: 'H2D · chunk 3',
+              kind: 'io',
+              sub: 'cudaMemcpyAsync · s3',
+              detail:
+                '`cudaMemcpyAsync(d_in + off, h_in + off, 4 MiB, cudaMemcpyHostToDevice, streams[3])`: a DMA queued on the stream; the call returns in microseconds.',
+            },
+            {
+              id: 'heavy-3',
+              label: 'heavy',
+              kind: 'kernel',
+              sub: '<<<4096, 256, 0, s3>>>',
+              detail:
+                '64 iterations of `e = m + 0.5f * sinf(e)` per element over chunk 3’s 1,048,576 floats: compute-heavy, so the copies hide under it.',
+            },
+            {
+              id: 'carry-3',
+              label: 'add_carry',
+              kind: 'kernel',
+              sub: 'after wait computed[2]',
+              detail:
+                '`cudaStreamWaitEvent(s3, computed[2], 0)` first, then add `d_out[off − 1]`, the last output of chunk 2, to every element; then `cudaEventRecord(computed[3], s3)`.',
+            },
+            {
+              id: 'd2h-3',
+              label: 'D2H · chunk 3',
+              kind: 'io',
+              sub: 'then record landed[3]',
+              detail:
+                '`cudaMemcpyAsync` device to host on `s3`, then `cudaEventRecord(landed[3], s3)`: the chunk’s landing time.',
+            },
+          ],
+        ],
       },
       {
-        id: 'sm',
-        kind: 'service',
-        label: 'SMs · heavy, add_carry',
-        sub: 'chunk c · <<<GRID, BLOCK, 0, s>>>',
-        x: 64,
-        y: 70,
+        id: 'h-out',
+        label: 'Pinned host buffer h_out',
+        kind: 'host',
+        sub: 'sync streams · stop · ElapsedTime',
+        detail:
+          'After the loop: `cudaStreamSynchronize` on every stream, record `stop`, read `start → stop` and `start → landed[c]` with `cudaEventElapsedTime`, destroy streams and events. Compared with the CPU reference and the baseline time.',
       },
-      {id: 'dmem', kind: 'db', label: 'Device memory', sub: 'd_in · d_out · 16 MiB each', x: 92, y: 50},
     ],
-    edges: [
-      {from: 'host', to: 'copy', kind: 'plain', label: 'cudaMemcpyAsync(…, s)'},
-      {from: 'copy', to: 'dmem', kind: 'plain', label: 'DMA, no host involvement'},
-      {from: 'host', to: 'sm', kind: 'plain', label: 'launch on s · cudaStreamWaitEvent'},
-      {from: 'sm', to: 'dmem', kind: 'plain', label: 'read d_in · write d_out'},
+    notes: [
+      {at: 'h2d-3', text: 'H2D **copy engine**: chunk c + 1 during compute of c'},
+      {at: 'heavy-3', text: '**SMs**: 64 sinf iterations per element, chunk c'},
+      {at: 'carry-3', text: '**cudaStreamWaitEvent**: the one cross-stream edge'},
+      {at: 'd2h-3', text: 'D2H **copy engine**: chunk c − 1, the other direction'},
+      {at: 'h-out', text: '**≈ 1.5×** faster than the one-stream baseline'},
     ],
   },
   steps: [streamsPipelineStep],

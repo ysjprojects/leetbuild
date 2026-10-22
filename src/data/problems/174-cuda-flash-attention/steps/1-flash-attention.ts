@@ -141,7 +141,7 @@ export const flashAttentionStep: Step = {
   title: 'flash_attn_fwd: tiled scores, online softmax, one write of O',
   concept: 'cuda',
   file: 'flash_attention',
-  focus: ['kernel', 'smem', 'hbm'],
+  focus: ['q-reg', 'skip', 'smem', 'scores', 'rescale', 'accum', 'normalise'],
   task: `## Task
 
 Implement the kernel
@@ -168,7 +168,11 @@ and \`d ≤ D_MAX\`.
   the tile.
 - **Online softmax.** \`m_new = fmaxf(m, tile_max)\`, \`alpha = __expf(m - m_new)\`, scale the accumulator
   \`o[k] *= alpha\`, then for every \`j\`: \`p = __expf(s[j] - m_new)\`, \`p_sum += p\`, \`o[k] += p · Vs[j][k]\`.
-  Finish the tile with \`l = l * alpha + p_sum\` and \`m = m_new\`. Use \`__expf\`, not \`expf\`.
+  Finish the tile with \`l = l * alpha + p_sum\` and \`m = m_new\`. Use \`__expf\`, not \`expf\`. The fold on
+  one row of scores, tile by tile:
+
+:::widget online-softmax {"tile": 4}
+
 - **A second \`__syncthreads()\`** after the tile is consumed, so no thread overwrites \`Ks\`/\`Vs\` while
   a neighbour still reads them.
 - **Causal tile skip.** With \`q_last = min(blockIdx.x × BQ + BQ, T) − 1\` the block's last query row, a
@@ -184,52 +188,6 @@ and \`d ≤ D_MAX\`.
 
 > The whole kernel is one identity: \`exp(s − m_new) = exp(s − m_old) · exp(m_old − m_new)\`. It lets a
 > row's softmax be finished one tile at a time, so the \`T × T\` matrix is never written anywhere.`,
-  sequence: {
-    participants: ['host', 'block (BQ rows)', 'shared memory', 'global memory'],
-    messages: [
-      {from: 'host', to: 'global memory', label: 'cudaMemcpy Q, K, V (T × d each)', kind: 'sync'},
-      {from: 'host', to: 'block (BQ rows)', label: 'flash_attn_fwd<<<⌈T/BQ⌉, BQ>>>(…, scale, causal)', kind: 'async'},
-      {
-        from: 'block (BQ rows)',
-        to: 'global memory',
-        label: 'q[k] = Q[row][k] · scale → registers; m = −∞, l = 0',
-        kind: 'sync',
-      },
-      {
-        from: 'block (BQ rows)',
-        to: 'shared memory',
-        label: 'tile kv0: Ks[j][k], Vs[j][k] ← K, V rows kv0 … kv0+BK−1',
-        kind: 'sync',
-      },
-      {from: 'block (BQ rows)', to: 'block (BQ rows)', label: '__syncthreads()', kind: 'sync'},
-      {
-        from: 'block (BQ rows)',
-        to: 'shared memory',
-        label: 's[j] = q · Ks[j]; −∞ if causal && key > row',
-        kind: 'sync',
-      },
-      {
-        from: 'block (BQ rows)',
-        to: 'block (BQ rows)',
-        label: 'm_new = max(m, tile_max); alpha = __expf(m − m_new); o *= alpha',
-        kind: 'sync',
-      },
-      {
-        from: 'block (BQ rows)',
-        to: 'shared memory',
-        label: 'p = __expf(s[j] − m_new); o += p · Vs[j]; l = l·alpha + Σp',
-        kind: 'sync',
-      },
-      {
-        from: 'block (BQ rows)',
-        to: 'block (BQ rows)',
-        label: '__syncthreads(); next tile … until kv0 > q_last (causal) or kv0 ≥ T',
-        kind: 'sync',
-      },
-      {from: 'block (BQ rows)', to: 'global memory', label: 'O[row][k] = o[k] / l — written once', kind: 'sync'},
-      {from: 'global memory', to: 'host', label: 'cudaMemcpy O; CPU reference; max|err| < 1e-3 → PASS', kind: 'reply'},
-    ],
-  },
   hints: [
     'Lay the kernel out as two loops and a tail: `for (kv0 …) { stage tile; __syncthreads(); if (row < T) { score; fold; } __syncthreads(); }` then normalise. The stage loop is `for (idx = threadIdx.x; idx < BK * D_MAX; idx += BQ)` with `j = idx / D_MAX`, `k = idx % D_MAX`, so consecutive threads read consecutive floats of one K row.',
     'The fold is three statements around the `j` loop: `m_new = fmaxf(m, tile_max)`, `alpha = __expf(m - m_new)`, `o[k] *= alpha`; inside, `p = __expf(s[j] - m_new)` accumulates `p_sum` and `o[k] += p * Vs[j][k]`; after, `l = l * alpha + p_sum; m = m_new;`. The first tile has `m = -INFINITY`, so `alpha` is 0 and a masked `s[j] = -INFINITY` gives `p = 0` — no special cases.',

@@ -154,6 +154,7 @@ const blockContent = (block: Block): Content | null => {
       };
     case 'sequence':
     case 'diagram':
+    case 'architecture':
       return null;
     case 'malformed':
       return {text: block.what, style: 'body', color: MUTED, italics: true};

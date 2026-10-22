@@ -83,55 +83,139 @@ does the last one.
 memory, \`ldmatrix\` and the PTX \`mma.sync\` instructions, Hopper's \`wgmma\` and TMA, bf16/tf32/fp8 inputs,
 split-K, fused epilogues (bias, activation, residual) and transposed operands. These are what cuBLAS and
 CUTLASS add on top of the warp-level contract written here.`,
-  diagram: {
-    nodes: [
+  architecture: {
+    input: 'A[M×K] · B[K×N] fp16',
+    output: 'C[M×N] fp32',
+    items: [
       {
         id: 'host',
-        kind: 'client',
-        label: 'Host · main()',
-        sub: 'fp16 inputs · pad16 · CPU reference · TFLOP/s · PASS',
-        x: 8,
-        y: 50,
+        label: 'Host · pad16 + upload',
+        kind: 'host',
+        sub: 'cudaMemcpy2D into zeroed buffers',
+        detail:
+          '`pad16(x) = (x + 15) / 16 * 16` rounds M, N, K up; the real rows are copied into zeroed `Mp × Kp` and `Kp × Np` buffers, so 250 × 375 × 500 runs as 256 × 384 × 512. The zeros add nothing to the products.',
       },
       {
-        id: 'gmem',
-        kind: 'db',
+        id: 'gmem-in',
         label: 'Global memory',
-        sub: 'A Mp×Kp · B Kp×Np (half) · C Mp×Np (float)',
-        x: 34,
-        y: 50,
+        kind: 'memory',
+        sub: 'A[Mp×Kp] · B[Kp×Np] half',
+        shape: 'A[256×512] · B[512×384]',
+        detail:
+          'Row-major `half`, every dimension a multiple of 16, so every fragment pointer is 32-byte aligned and every `ldm` a multiple of 8 halves.',
       },
       {
-        id: 'smem',
-        kind: 'db',
-        label: 'Shared memory',
-        sub: 'As[64][32+8] · Bs[32][64+8], 32-byte aligned',
-        x: 60,
-        y: 22,
+        tone: 'block',
+        repeat: '⌈Np/64⌉ · Mp/16 ×',
+        label: 'Thread block · 128 threads',
+        items: [
+          {
+            tone: 'dotted',
+            label: 'each of 4 warps',
+            items: [
+              {
+                id: 'acc0',
+                label: 'Zero the accumulator',
+                kind: 'kernel',
+                sub: 'fill_fragment(acc, 0.0f)',
+                detail:
+                  '`warpId = threadIdx.x / warpSize`, `tileRow = blockIdx.y`, `tileCol = blockIdx.x * 4 + warpId`. A warp whose tile is past `N` returns as a whole.',
+              },
+              {
+                tone: 'dotted',
+                repeat: 'K/16 ×',
+                label: 'k += 16',
+                items: [
+                  {
+                    columns: [
+                      [
+                        {
+                          id: 'frag-a',
+                          label: 'load_matrix_sync a',
+                          kind: 'kernel',
+                          sub: 'A + tileRow·16·K + k · ldm K',
+                          detail:
+                            '`fragment<matrix_a, 16, 16, 16, half, row_major>`: the warp’s share of a 16 × 16 fp16 tile of `A`, spread over the 32 lanes’ registers in an opaque layout.',
+                        },
+                      ],
+                      [
+                        {
+                          id: 'frag-b',
+                          label: 'load_matrix_sync b',
+                          kind: 'kernel',
+                          sub: 'B + k·N + tileCol·16 · ldm N',
+                          detail:
+                            '`fragment<matrix_b, 16, 16, 16, half, row_major>`: a 16 × 16 fp16 tile of `B`. `ldm` is the row length of the matrix it sits in, not the tile width.',
+                        },
+                      ],
+                    ],
+                  },
+                  {
+                    id: 'mma',
+                    label: 'mma_sync(acc, a, b, acc)',
+                    kind: 'kernel',
+                    sub: 'tensor cores · m16n16k16',
+                    detail:
+                      'Warp-collective: all 32 lanes issue it together. `acc = a · b + acc`, 16 · 16 · 16 = 4,096 multiply-adds per instruction; fp16 products are exact in fp32.',
+                  },
+                  {
+                    id: 'acc',
+                    label: 'Accumulator fragment',
+                    kind: 'memory',
+                    sub: '16 × 16 float · registers',
+                    detail:
+                      '`fragment<accumulator, 16, 16, 16, float>`: the sum stays in fp32 registers across all K/16 steps, so the only error left is summation order.',
+                  },
+                ],
+              },
+              {
+                id: 'store',
+                label: 'store_matrix_sync',
+                kind: 'kernel',
+                sub: 'C + tileRow·16·N + tileCol·16',
+                detail:
+                  'Once per tile: `store_matrix_sync(…, acc, N, wmma::mem_row_major)`. The accumulator has no layout; the store names one.',
+              },
+            ],
+          },
+        ],
       },
       {
-        id: 'kernel',
-        kind: 'service',
-        label: 'wmma_matmul / _smem',
-        sub: 'one warp per 16×16 tile · fragments a, b, acc',
-        x: 60,
-        y: 78,
-      },
-      {
-        id: 'tc',
-        kind: 'service',
-        label: 'Tensor cores',
-        sub: 'mma_sync: 16×16×16, fp16 in, fp32 acc',
-        x: 90,
-        y: 50,
+        id: 'gmem-out',
+        label: 'Global memory',
+        kind: 'memory',
+        sub: 'C[Mp×Np] float · M × N corner back',
+        shape: 'C[250×375]',
+        detail:
+          '`cudaMemcpy2D` copies the real `M × N` corner back; the host checks `max |C − ref| ≤ 2e-5 × K` against an fp32 CPU reference over the same rounded inputs.',
       },
     ],
-    edges: [
-      {from: 'host', to: 'gmem', kind: 'plain', label: 'cudaMemcpy2D into zeroed, padded buffers'},
-      {from: 'gmem', to: 'smem', kind: 'plain', label: 'cooperative fill, zero past M/N/K'},
-      {from: 'gmem', to: 'kernel', kind: 'plain', label: 'load_matrix_sync (ldm K, N) · store (ldm N)'},
-      {from: 'smem', to: 'kernel', kind: 'plain', label: 'load_matrix_sync (ldm 40, 72)'},
-      {from: 'kernel', to: 'tc', kind: 'plain', label: 'mma_sync(acc, a, b, acc)'},
+    notes: [
+      {at: 'store', text: 'One warp owns one **16 × 16** tile of C', side: 'left'},
+      {at: 'mma', text: '**16 × 16 × 16**: **4,096** multiply-adds', side: 'left'},
+      {at: 'frag-a', text: 'fp16 tiles in, **fp32** accumulator', side: 'left'},
+      {at: 'gmem-in', text: 'Pointers **32-byte** aligned, ldm a multiple of **8**', side: 'left'},
+    ],
+    insets: [
+      {
+        for: 'frag-b',
+        title: 'wmma_matmul_smem: staged loads',
+        items: [
+          {
+            tone: 'dotted',
+            repeat: 'K/32 ×',
+            items: [
+              {id: 's-fill', label: 'Cooperative fill', kind: 'kernel', sub: '128 threads · zero past M, N, K'},
+              {id: 's-smem', label: 'Shared memory', kind: 'memory', sub: 'As[64][40] · Bs[32][72] half'},
+              {id: 's-sync1', label: '__syncthreads()', kind: 'kernel'},
+              {id: 's-load', label: 'load_matrix_sync', kind: 'kernel', sub: '2 a (ldm 40) · 2 b (ldm 72)'},
+              {id: 's-mma', label: '4 × mma_sync', kind: 'kernel', sub: '2 × 2 accumulators per warp'},
+              {id: 's-sync2', label: '__syncthreads()', kind: 'kernel'},
+            ],
+          },
+        ],
+        note: '64 × 64 block tile, **32 × 32** per warp: **32** FLOP per byte',
+      },
     ],
   },
   steps: [wmmaMatmulStep],

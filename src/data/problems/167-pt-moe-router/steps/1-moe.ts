@@ -189,7 +189,7 @@ export const moeStep: Step = {
   title: 'TopKRouter and MoE: route, balance, dispatch under capacity, combine',
   concept: 'pytorch',
   file: 'moe',
-  focus: ['router', 'experts', 'combine'],
+  focus: ['gate', 'softmax', 'topk', 'dispatch', 'combine', 'loss'],
   task: `## Task
 
 Implement a sparse mixture-of-experts feed-forward sub-layer in PyTorch: the router that picks \`k\` of
@@ -225,37 +225,14 @@ Implement a sparse mixture-of-experts feed-forward sub-layer in PyTorch: the rou
   \`capacity_factor = 0.5\` the number of zero rows equals \`Σ_e max(0, count_e − capacity)\`; and
   \`gate.weight.grad\` is non-zero after \`(y.sum() + aux).backward()\` and after \`aux.backward()\` alone.
 
+Skew the routing and shrink the capacity factor to see which tokens overflow and how the balancing loss
+climbs from 1 toward \`E\`:
+
+:::widget moe-routing {"experts": 4, "k": 2}
+
 > A router is a classifier that nobody labels: the hard choice \`f_e\` has no gradient, so the balancing
 > loss multiplies it by the soft \`P_e\` — pushing probability away from crowded experts is the only
 > signal that keeps the gate from collapsing onto one.`,
-  sequence: {
-    participants: ['tokens (T, D)', 'TopKRouter', 'MoE', 'expert e', 'y'],
-    messages: [
-      {from: 'tokens (T, D)', to: 'TopKRouter', label: 'gate → logits (T, E) · softmax · topk(k)', kind: 'sync'},
-      {
-        from: 'TopKRouter',
-        to: 'TopKRouter',
-        label: 'f = one_hot(idx).sum / (T·k) · P = probs.mean(0) · aux = E·Σ f·P',
-        kind: 'sync',
-      },
-      {from: 'TopKRouter', to: 'MoE', label: 'idx (T, k) · weights (T, k) · aux', kind: 'reply'},
-      {from: 'MoE', to: 'MoE', label: 'capacity = ceil(cf · T · k / E) · y = zeros (T, D)', kind: 'sync'},
-      {
-        from: 'MoE',
-        to: 'expert e',
-        label: 'for e: tok, slot = where(idx == e) → [:capacity] → expert(tokens[tok])',
-        kind: 'sync',
-      },
-      {from: 'expert e', to: 'MoE', label: 'out (n_e, D)', kind: 'reply'},
-      {from: 'MoE', to: 'y', label: 'y.index_add_(0, tok, out · weights[tok, slot])', kind: 'sync'},
-      {
-        from: 'y',
-        to: 'tokens (T, D)',
-        label: 'reshape (B, S, D); dropped rows stay 0 — the residual carries them',
-        kind: 'reply',
-      },
-    ],
-  },
   hints: [
     'Router first, in float32: `probs = F.softmax(self.gate(tokens).float(), -1)`, `topk_probs, idx = torch.topk(probs, self.k, -1)`, `weights = topk_probs / topk_probs.sum(-1, keepdim=True)`. For the loss build `mask = F.one_hot(idx, E).sum(1).float()` of shape `(T, E)`; `f = mask.sum(0) / (T * k)`, `P = probs.mean(0)`.',
     '`torch.where(idx == e)` on the `(T, k)` index tensor gives two vectors in row-major order: the token ids that chose `e` and which of their `k` slots did. Slicing both with `[:capacity]` keeps the earliest tokens — the same tokens a per-token loop with a counter would keep.',

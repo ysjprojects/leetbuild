@@ -78,35 +78,120 @@ tiling, double-buffered loads (\`cp.async\`, TMA), tensor cores (\`mma.sync\`, \
 shared-memory layouts, split-K, transposed and batched layouts, half precision — everything that takes
 this kernel from a few times the naive one to cuBLAS. Each of those sits on top of exactly the tile
 loop and the two barriers you write here.`,
-  diagram: {
-    nodes: [
+  architecture: {
+    input: 'A[M×K] · B[K×N] float32',
+    output: 'C = A · B',
+    items: [
       {
         id: 'host',
-        kind: 'client',
-        label: 'host',
-        sub: 'main() · fill A, B · cudaEvent timing · CPU reference',
-        x: 8,
-        y: 50,
+        label: 'Host · main()',
+        kind: 'host',
+        sub: 'cudaMemcpy H2D · launch',
+        detail:
+          'Fills `A` and `B`, copies them to the device, launches `matmul_tiled<<<grid, block>>>` with `block(32, 32)` and `grid(⌈N/32⌉, ⌈M/32⌉)`, then checks against a CPU reference and times both kernels on `1024³`.',
       },
-      {id: 'gmem', kind: 'db', label: 'global memory', sub: 'A[M×K] · B[K×N] · C[M×N]', x: 40, y: 20},
-      {id: 'tiled', kind: 'service', label: 'matmul_tiled', sub: 'grid ⌈N/32⌉ × ⌈M/32⌉ · block 32 × 32', x: 40, y: 60},
-      {id: 'smem', kind: 'db', label: 'shared memory', sub: 'As[32][32] · Bs[32][32] · 8 KB per block', x: 72, y: 60},
       {
-        id: 'naive',
-        kind: 'external',
-        label: 'matmul_naive',
-        sub: 'baseline · 2K global loads per output',
-        x: 72,
-        y: 20,
+        id: 'gmem-in',
+        label: 'Global memory',
+        kind: 'memory',
+        sub: 'A[M×K] · B[K×N] float32',
+        shape: 'A[97×131] · B[131×75]',
+        detail:
+          'Off-chip DRAM (HBM): large and slow. The naive kernel reads `2K` floats from here per output; the tiled one reads `2K / 32`.',
+      },
+      {
+        tone: 'block',
+        repeat: '⌈N/32⌉ · ⌈M/32⌉ ×',
+        label: 'Thread block · 32 × 32',
+        items: [
+          {
+            id: 'index',
+            label: 'Thread → output element',
+            kind: 'kernel',
+            sub: 'row = by·32 + ty, col = bx·32 + tx',
+            detail:
+              '`row = blockIdx.y * TILE + threadIdx.y`, `col = blockIdx.x * TILE + threadIdx.x`: `x` runs along columns, so a warp (fixed `ty`) covers 32 consecutive columns and every global access is coalesced.',
+          },
+          {
+            tone: 'dotted',
+            repeat: '⌈K/32⌉ ×',
+            label: 'slab t of K',
+            items: [
+              {
+                columns: [
+                  [
+                    {
+                      id: 'as',
+                      label: 'Shared tile As',
+                      kind: 'memory',
+                      sub: 'As[ty][tx] = A[row][32t + tx]',
+                      detail:
+                        '`__shared__ float As[32][32]`. Each thread loads one float, `0.0f` past the edge. A warp (fixed `ty`) reads 32 consecutive floats of one row of `A`: one coalesced transaction.',
+                    },
+                  ],
+                  [
+                    {
+                      id: 'bs',
+                      label: 'Shared tile Bs',
+                      kind: 'memory',
+                      sub: 'Bs[ty][tx] = B[32t + ty][col]',
+                      detail:
+                        '`__shared__ float Bs[32][32]`. Each thread loads one float, `0.0f` past the edge. A warp reads 32 consecutive floats of one row of `B`: coalesced.',
+                    },
+                  ],
+                ],
+              },
+              {
+                id: 'sync1',
+                label: '__syncthreads()',
+                kind: 'kernel',
+                sub: 'slab written: read after write',
+                detail: 'No thread multiplies until all 1,024 threads have written their slot of `As` and `Bs`.',
+              },
+              {
+                id: 'fma',
+                label: 'FMA loop in registers',
+                kind: 'kernel',
+                sub: 'acc += As[ty][k] · Bs[k][tx]',
+                side: {label: 'acc', sub: 'float register'},
+                detail:
+                  '`for k = 0…31`: 32 multiply-adds out of shared memory into a register accumulator. `As[ty][k]` is a broadcast per warp, `Bs[k][tx]` spans 32 banks: no bank conflicts.',
+              },
+              {
+                id: 'sync2',
+                label: '__syncthreads()',
+                kind: 'kernel',
+                sub: 'all done: write after read',
+                detail:
+                  'No thread overwrites `As`/`Bs` with slab `t + 1` while a slower warp is still reading slab `t`. Dropping it gives results that are wrong only sometimes.',
+              },
+            ],
+          },
+          {
+            id: 'store',
+            label: 'Store C once',
+            kind: 'kernel',
+            sub: 'if (row < M && col < N) C = acc',
+            detail:
+              'One guarded, coalesced store per output after the slab loop. No early `return`: every thread reaches every barrier.',
+          },
+        ],
+      },
+      {
+        id: 'gmem-out',
+        label: 'Global memory',
+        kind: 'memory',
+        sub: 'C[M×N] float32',
+        shape: 'C[97×75]',
+        detail: 'Copied back to the host and compared with the CPU reference: max abs error `< 1e-3`.',
       },
     ],
-    edges: [
-      {from: 'host', to: 'gmem', kind: 'plain', label: 'cudaMemcpy H2D · D2H'},
-      {from: 'host', to: 'tiled', kind: 'plain', label: '<<<grid, block>>>'},
-      {from: 'tiled', to: 'gmem', kind: 'plain', label: '1 coalesced load of A and B per thread per slab · 1 store'},
-      {from: 'tiled', to: 'smem', kind: 'plain', label: 'load slab · __syncthreads · 32 FMAs · __syncthreads'},
-      {from: 'host', to: 'naive', kind: 'plain', label: 'same grid · timed for comparison'},
-      {from: 'naive', to: 'gmem', kind: 'plain', label: 'A and B re-read per output'},
+    notes: [
+      {at: 'gmem-in', text: 'Global reads per output: **2K** naive, **2K / 32** tiled'},
+      {at: 'as', text: 'Two **32 × 32** float tiles: **8 KB** per block', side: 'left'},
+      {at: 'fma', text: 'Each staged float is reused **32** times'},
+      {at: 'sync2', text: 'The second barrier stops a write-after-read race'},
+      {at: 'store', text: '**97 × 75 × 131**: **12** blocks, **5** slabs', side: 'left'},
     ],
   },
   steps: [tiledMatmulStep],

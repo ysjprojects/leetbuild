@@ -5,7 +5,7 @@ export const gpt2TrainStep: Step = {
   title: 'Training: decay groups, warmup + cosine, clipping, bf16, checkpoints',
   concept: 'pytorch',
   file: 'gpt2_train',
-  focus: ['tokens', 'head', 'train'],
+  focus: ['tokens', 'head'],
   task: `## Task
 
 Train the step-1 model the way nanoGPT trains GPT-2 small (\`from gpt2_model import GPT, GPTConfig\`).
@@ -18,6 +18,29 @@ Use \`torch.optim.AdamW\` itself — the optimizer is not the point here; how it
 - \`get_batch(data, block_size, batch_size, device="cpu") -> (x, y)\`: \`data\` is a 1-D \`long\` token
   tensor; \`batch_size\` random start offsets from \`torch.randint(len(data) - block_size, …)\`;
   \`x[b] = data[i : i + block_size]\`, \`y[b] = data[i + 1 : i + 1 + block_size]\`, both \`(B, block_size)\`.
+
+:::architecture
+{
+  "input": "data · one 1-D long token stream",
+  "output": "loss → backward → clip → step",
+  "items": [
+    {"id": "window", "label": "Random window", "kind": "io", "sub": "data[i : i + block_size + 1]", "detail": "\`batch_size\` start offsets from \`torch.randint(len(data) - block_size, …)\`; one window holds \`block_size\` training examples."},
+    {"columns": [
+      [
+        {"id": "x", "label": "x = window[:-1]", "sub": "(B, T) inputs"},
+        {"id": "gpt", "label": "GPT forward", "sub": "bf16 autocast on CUDA"},
+        {"id": "logits", "label": "logits.view(-1, V)", "kind": "head", "sub": "(B·T, V)"}
+      ],
+      [
+        {"id": "y", "label": "y = window[1:]", "sub": "(B, T) shifted by one"},
+        {"id": "y-flat", "label": "y.view(-1)", "sub": "(B·T,) targets"}
+      ]
+    ]},
+    {"id": "ce", "label": "F.cross_entropy", "kind": "loss", "sub": "mean over all B·T positions", "detail": "Position t is scored against token t + 1; the causal mask guarantees it saw only \`x[:t+1]\`."}
+  ]
+}
+:::
+
 - \`get_lr(it, warmup_iters, lr_decay_iters, max_lr, min_lr)\`: \`max_lr · (it + 1) / warmup_iters\` while
   \`it < warmup_iters\`; then \`min_lr + ½(1 + cos(π · ratio)) · (max_lr − min_lr)\` with
   \`ratio = (it − warmup) / (decay − warmup)\`; \`min_lr\` from \`lr_decay_iters\` on.
@@ -44,24 +67,6 @@ endpoints and midpoint, then overfits a periodic token stream (\`randperm(16)\` 
 > A training loop is mostly bookkeeping around three lines — forward, backward, step — and each piece of
 > bookkeeping (which tensors decay, how big a step may be, how fast the learning rate moves) is a
 > stability decision made once for every run.`,
-  sequence: {
-    participants: ['train()', 'get_batch', 'GPT', 'AdamW', 'checkpoint'],
-    messages: [
-      {from: 'train()', to: 'AdamW', label: 'group["lr"] = get_lr(it): warmup, then cosine', kind: 'sync'},
-      {from: 'train()', to: 'GPT', label: 'every eval_interval: estimate_loss (no_grad, eval)', kind: 'sync'},
-      {
-        from: 'train()',
-        to: 'checkpoint',
-        label: 'val improved → torch.save({model, optimizer, config, step})',
-        kind: 'async',
-      },
-      {from: 'train()', to: 'get_batch', label: 'random windows of block_size + 1 tokens', kind: 'sync'},
-      {from: 'get_batch', to: 'train()', label: 'x, y = window[:-1], window[1:]', kind: 'reply'},
-      {from: 'train()', to: 'GPT', label: 'autocast(bf16): logits, loss = model(x, y)', kind: 'sync'},
-      {from: 'train()', to: 'GPT', label: 'zero_grad · loss.backward() · clip_grad_norm_(…, 1.0)', kind: 'sync'},
-      {from: 'train()', to: 'AdamW', label: 'step(): decay on matrices only', kind: 'sync'},
-    ],
-  },
   hints: [
     'The groups are a list of dicts — `[{"params": decay, "weight_decay": wd}, {"params": no_decay, "weight_decay": 0.0}]` — passed as AdamW\'s first argument; `model.parameters()` already yields the tied tensor once, so no de-duplication is needed.',
     'Shift by slicing the stream, not the batch: `y` is `data[i + 1 : i + 1 + block_size]`. The schedule is set by hand each iteration (`for group in optimizer.param_groups: group["lr"] = lr`), which is why `torch.optim.lr_scheduler` is not needed.',

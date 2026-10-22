@@ -8,7 +8,7 @@ export const vectorAddStep: Step = {
   title: 'vector_add: grid-stride loop, checked launch, timed, compared',
   concept: 'cuda',
   file: 'vector_add',
-  focus: ['launch', 'kernel', 'dmem'],
+  focus: ['h2d', 'idx', 'ld-a', 'ld-b', 'add', 'st-c', 'd2h'],
   task: `## Task
 
 Write \`vector_add.cu\`: a kernel \`__global__ void vector_add(const float* a, const float* b, float* c, int n)\`
@@ -38,27 +38,13 @@ computing \`c[i] = a[i] + b[i]\` for every \`i < n\`, the host code around it, a
   \`PASS\` — or \`FAIL\` and exit code 1.
 - No Thrust, no cuBLAS, no unified memory: the point is the plain runtime API.
 
+Who handles which element, on a small array: with fewer blocks than \`⌈n / block⌉\` the loop takes extra
+passes, and the last pass stops at the bounds.
+
+:::widget cuda-grid {"n": 50, "block": 8}
+
 > A grid is a finite resource and \`n\` is not: the loop, not the grid, covers the data — and every call
 > that can fail is checked at the line where it failed.`,
-  sequence: {
-    participants: ['Host', 'Device memory', 'vector_add'],
-    messages: [
-      {
-        from: 'Host',
-        to: 'Device memory',
-        label: 'cudaMalloc d_a, d_b, d_c · cudaMemcpy a, b host→device',
-        kind: 'sync',
-      },
-      {from: 'Host', to: 'vector_add', label: 'vector_add<<<1024, 256>>>(d_a, d_b, d_c, n)  — async', kind: 'async'},
-      {from: 'Host', to: 'Host', label: 'CUDA_CHECK(cudaGetLastError())  — configuration ok?', kind: 'sync'},
-      {from: 'vector_add', to: 'Device memory', label: 'thread t: c[t], c[t + 262144], … while < n', kind: 'sync'},
-      {from: 'Host', to: 'Host', label: 'cudaEventRecord start · 20 launches · stop · ElapsedTime', kind: 'sync'},
-      {from: 'Host', to: 'Host', label: 'CUDA_CHECK(cudaDeviceSynchronize())  — execution ok?', kind: 'sync'},
-      {from: 'Host', to: 'Device memory', label: 'cudaMemcpy c device→host · cudaFree ×3', kind: 'sync'},
-      {from: 'Device memory', to: 'Host', label: '16 MiB of c', kind: 'reply'},
-      {from: 'Host', to: 'Host', label: 'max |c − (a + b)| = 0 → PASS', kind: 'sync'},
-    ],
-  },
   hints: [
     'The kernel is four lines: `int start = blockIdx.x * blockDim.x + threadIdx.x; int stride = gridDim.x * blockDim.x; for (int i = start; i < n; i += stride) c[i] = a[i] + b[i];`. With 1024 × 256 = 262,144 threads and n = 4,194,341, each thread does 16 or 17 elements.',
     'The macro is a `do { cudaError_t err_ = (call); if (err_ != cudaSuccess) { fprintf(stderr, "... %s:%d: %s\\n", __FILE__, __LINE__, cudaGetErrorString(err_)); exit(EXIT_FAILURE); } } while (0)` — every line of it ending in a backslash. A kernel launch is a statement, not a call: check it with `CUDA_CHECK(cudaGetLastError())` on the next line.',

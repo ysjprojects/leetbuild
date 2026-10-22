@@ -21,34 +21,29 @@ The drill implements three pieces in \`rope.py\`:
 - \`RoPE(nn.Module)\` holding \`cos\` and \`sin\` as \`register_buffer(..., persistent=False)\`, with
   \`forward(x, positions=None)\` calling \`apply_rope(x, self.cos, self.sin, positions)\`.
 
-:::diagram
-{
-  "nodes": [
-    {"id": "attn", "kind": "client", "label": "Attention layer", "sub": "q = x Wq, k = x Wk · [B, H, L, D]", "x": 10, "y": 50},
-    {"id": "rope", "kind": "service", "label": "RoPE / apply_rope", "sub": "gather rows by position · rotate pairs", "x": 42, "y": 50},
-    {"id": "cache", "kind": "db", "label": "cos / sin buffers", "sub": "computed once in float32, never trained", "x": 75, "y": 25},
-    {"id": "kv", "kind": "db", "label": "KV cache", "sub": "keys stored already rotated", "x": 75, "y": 75},
-    {"id": "ref", "kind": "external", "label": "Complex reference", "sub": "each pair × e^{i m theta}, float64", "x": 42, "y": 90}
-  ],
-  "edges": [
-    {"from": "attn", "to": "rope", "kind": "plain", "label": "q, k, positions"},
-    {"from": "rope", "to": "cache", "kind": "plain", "label": "cos[positions], sin[positions]"},
-    {"from": "rope", "to": "kv", "kind": "plain", "label": "k_rot appended"},
-    {"from": "attn", "to": "ref", "kind": "plain", "label": "same x, allclose 1e-5"}
-  ]
-}
-:::
+One call of \`apply_rope\` on a query or key, with the cos/sin rows opened up on the right:
 
-:::sequence
+:::architecture
 {
-  "participants": ["attention layer", "RoPE", "cos/sin cache"],
-  "messages": [
-    {"from": "attention layer", "to": "RoPE", "label": "q [B, H, L, D] · positions = arange(offset, offset + L)", "kind": "sync"},
-    {"from": "RoPE", "to": "cos/sin cache", "label": "cos[positions], sin[positions]", "kind": "sync"},
-    {"from": "cos/sin cache", "to": "RoPE", "label": "[L, D/2] each → .to(q.dtype)[None, None]", "kind": "reply"},
-    {"from": "RoPE", "to": "RoPE", "label": "x1, x2 = chunk(2) · cat(x1 c − x2 s, x2 c + x1 s)", "kind": "sync"},
-    {"from": "RoPE", "to": "attention layer", "label": "q_rot; the same for k → KV cache", "kind": "reply"},
-    {"from": "attention layer", "to": "attention layer", "label": "q_rot k_rotᵀ: score[m, n] depends on m − n only", "kind": "sync"}
+  "input": "from the q or k projection",
+  "output": "into q_rot · k_rotᵀ",
+  "items": [
+    {"id": "x", "label": "Query or key heads", "kind": "io", "sub": "x · [B, H, L, D]", "shape": "[B, H, L, D]", "detail": "Any float dtype; values are never passed through RoPE."},
+    {"id": "halves", "label": "Split into halves", "sub": "x1, x2 = x.chunk(2, dim=-1)", "shape": "[B, H, L, D/2] each", "detail": "Half-split layout: dimension \`i\` pairs with \`i + D/2\`, so both halves are contiguous views."},
+    {"id": "rotate", "label": "Rotate every pair", "kind": "attention", "sub": "x1·c − x2·s,  x2·c + x1·s", "shape": "[B, H, L, D/2] each", "side": {"label": "cos, sin rows", "sub": "[1, 1, L, D/2]"}, "detail": "The 2×2 rotation \`[[c, −s], [s, c]]\` applied to all pairs at once; the length of each pair is unchanged."},
+    {"id": "concat", "label": "Concatenate halves", "sub": "cat(dim=-1) · x’s shape and dtype", "shape": "[B, H, L, D]"}
+  ],
+  "notes": [
+    {"at": "halves", "text": "Dimension i pairs with **i + D/2**", "side": "left"},
+    {"at": "rotate", "text": "**4** multiplies and **2** adds per pair", "side": "left"}
+  ],
+  "insets": [
+    {"for": "rotate", "title": "Where c and s come from", "items": [
+      {"id": "inv-freq", "label": "Inverse frequencies", "sub": "θᵢ = base^(−2i/D) · [D/2]", "detail": "\`base ** (-torch.arange(0, D, 2) / D)\`: 1 for the first pair, just above \`1 / base\` for the last."},
+      {"id": "angles", "label": "Angle table", "sub": "outer(arange(max_len), θ)"},
+      {"id": "cache", "label": "cos / sin buffers", "kind": "embed", "sub": "[max_len, D/2] float32", "detail": "Registered with \`persistent=False\`: they follow \`.to(device)\` but stay out of \`state_dict\`."},
+      {"id": "gather", "label": "Gather rows by position", "sub": "cos[positions].to(x.dtype)", "detail": "Explicit positions, so a decode step passes \`arange(offset, offset + L)\` and rotates its token at its true offset against the KV cache."}
+    ], "note": "Built **once**, gathered by **positions**"}
   ]
 }
 :::
@@ -112,6 +107,11 @@ absolute positions cancel. That is the property the self-test checks numerically
 \`k\` to all 64 positions, form \`scores[m, n]\`, and shifting both indices by 1, 7 or 40 must leave the matrix
 unchanged to \`1e-4\` — while the scores still vary with the distance.
 
+Move the position slider in the widget: every pair turns at its own frequency, and the plot shows the
+rotated \`q · k\` depending only on the distance between the two positions.
+
+:::widget rope-rotation
+
 | scheme | where position enters | relative? | parameters | longer than trained |
 |---|---|---|---|---|
 | learned absolute (GPT-2) | added to the input once | no — learned at best | \`max_len × d_model\` | no row exists |
@@ -142,32 +142,15 @@ positions \`0..L−1\`, then decodes one token at a time. The new token's query 
 its true position \`L\`, \`L + 1\`, … — not at 0. That is why \`apply_rope\` gathers \`cos[positions]\` rather
 than slicing \`cos[:seq]\`, and why its default (\`torch.arange(seq)\`) is only right for a full sequence.
 
-:::sequence
-{
-  "participants": ["decode loop", "apply_rope", "KV cache", "scores"],
-  "messages": [
-    {"from": "decode loop", "to": "KV cache", "label": "prefill: keys rotated at 0..43, stored", "kind": "sync"},
-    {"from": "decode loop", "to": "apply_rope", "label": "naive: new token, seq = 1, positions=None", "kind": "sync"},
-    {"from": "apply_rope", "to": "decode loop", "label": "rotated at position 0 — the identity", "kind": "reply"},
-    {"from": "decode loop", "to": "scores", "label": "q at 0 vs k at n: distance looks like −n", "kind": "sync"},
-    {"from": "scores", "to": "decode loop", "label": "the newest token attends as if it were first: garbage text", "kind": "reply"}
-  ]
-}
-:::
+Decoding the 45th token after a 44-token prompt, without and with its offset:
 
-:::sequence
-{
-  "participants": ["decode loop", "apply_rope", "KV cache", "scores"],
-  "messages": [
-    {"from": "decode loop", "to": "KV cache", "label": "prefill: keys rotated at 0..43, stored", "kind": "sync"},
-    {"from": "decode loop", "to": "apply_rope", "label": "new token, positions = arange(44, 45)", "kind": "sync"},
-    {"from": "apply_rope", "to": "decode loop", "label": "q, k rotated at 44 via cos[44], sin[44]", "kind": "reply"},
-    {"from": "decode loop", "to": "KV cache", "label": "append k_rot at slot 44", "kind": "sync"},
-    {"from": "decode loop", "to": "scores", "label": "q at 44 vs k at n: distance 44 − n", "kind": "sync"},
-    {"from": "scores", "to": "decode loop", "label": "same scores as a full forward pass", "kind": "reply"}
-  ]
-}
-:::
+| | \`positions=None\` (the bug) | \`positions = torch.arange(44, 45)\` |
+|---|---|---|
+| cached keys | rotated at 0..43 | rotated at 0..43 |
+| new q and k rotated at | 0, the identity | 44, by \`cos[44]\`, \`sin[44]\` |
+| key appended at slot 44 | rotated at 0 | rotated at 44 |
+| distance a score sees, query vs key n | \`0 − n = −n\` | \`44 − n\` |
+| result | the newest token attends as if it came first: degraded text | the same scores as a full forward pass |
 
 - The rotation is elementwise per position, so a token rotated alone at offset 44 is bit-for-bit its slot in
   a sequence rotated at \`37..44\` — the self-test asserts \`torch.equal\`, not \`allclose\`.

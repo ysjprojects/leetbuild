@@ -75,39 +75,156 @@ The exact \`erf\` GELU, the backward pass, \`half\`/\`bfloat16\` inputs (\`__hal
 load), a grid-stride loop, unaligned pointers and \`cols % 4 != 0\`, inline-PTX \`tanh.approx.f32\`, and
 fusing the GELU into the GEMM epilogue itself. The kernel is the standalone fused elementwise op a compiler
 emits when it cannot reach into the matmul.`,
-  diagram: {
-    nodes: [
+  architecture: {
+    input: 'x: 4096 × 3072 float32 · bias: 3072',
+    output: 'y = gelu(x + bias) · max abs err < 1e-5',
+    items: [
       {
-        id: 'host',
-        kind: 'client',
-        label: 'Host · gelu_bias()',
-        sub: 'n4 = n / 4 · tail = n % 4 · CPU reference · GB/s · PASS',
-        x: 8,
-        y: 50,
+        id: 'host-in',
+        label: 'Host buffers x, bias',
+        kind: 'host',
+        sub: '48 MiB + 12 KiB',
+        detail:
+          '`main` fills the GPT-2 small MLP activation (4096 tokens × 3072 columns) and its bias, and computes the reference `0.5·v·(1 + tanh(…))` in double.',
       },
       {
-        id: 'kernel',
-        kind: 'service',
-        label: 'gelu_bias_kernel<<<⌈n4/256⌉, 256>>>',
-        sub: 'float4 load x, bias · 4 × gelu_tanh · float4 store',
-        x: 40,
-        y: 28,
+        id: 'h2d',
+        label: 'cudaMemcpy host → device',
+        kind: 'io',
+        sub: 'x, bias',
+        detail: 'Into `cudaMalloc` buffers, 256-byte aligned: every `float4` index is a legal 16-byte load.',
       },
       {
-        id: 'tail',
-        kind: 'service',
-        label: 'gelu_bias_tail_kernel<<<1, n % 4>>>',
-        sub: 'scalar, from 4 · n4 to n',
-        x: 40,
-        y: 74,
+        id: 'gmem-in',
+        label: 'Global memory x, bias',
+        kind: 'memory',
+        sub: 'x 48 MiB · bias 12 KiB',
+        shape: 'float4[3,145,728] · float4[768]',
+        detail:
+          '`gelu_bias` reinterprets both as `float4*`: `n4 = n / 4` vectors of `x`, `cols4 = cols / 4 = 768` of the bias. The bias is read by every row, so after the first it is served from L2/L1.',
       },
-      {id: 'hbm', kind: 'db', label: 'Device memory (HBM)', sub: 'x, y: 48 MiB each · bias: 12 KiB', x: 82, y: 50},
+      {
+        columns: [
+          [
+            {
+              tone: 'block',
+              repeat: '12,288 ×',
+              label: 'Thread block · 256 threads',
+              items: [
+                {
+                  columns: [
+                    [
+                      {
+                        id: 'ld-x',
+                        label: 'float4 load x[i]',
+                        kind: 'memory',
+                        sub: 'LDG.128 · 16 B',
+                        detail:
+                          'Thread `i = blockIdx.x · 256 + threadIdx.x` returns when `i >= n4`; otherwise one 128-bit load of four consecutive elements. A warp asks for 512 contiguous bytes.',
+                      },
+                    ],
+                    [
+                      {
+                        id: 'ld-b',
+                        label: 'float4 load bias[i % 768]',
+                        kind: 'memory',
+                        sub: 'LDG.128 · cache-resident',
+                        detail:
+                          'With `cols % 4 == 0` the four lanes of `x[i]` are columns `4·(i % cols4) … + 3` of one row: exactly the lanes of `bias[i % cols4]`.',
+                      },
+                    ],
+                  ],
+                },
+                {
+                  tone: 'dotted',
+                  label: 'Registers · four lanes',
+                  items: [
+                    {
+                      id: 'add',
+                      op: '+',
+                      detail: '`v.x + b.x … v.w + b.w`: the bias add, fused. The sum `t` lives in registers only.',
+                    },
+                    {
+                      id: 'gelu',
+                      label: 'gelu_tanh × 4 lanes',
+                      kind: 'kernel',
+                      sub: '0.5v(1+tanh(√(2/π)(v+0.044715v³)))',
+                      detail:
+                        '`__forceinline__`, single precision, `tanhf` (not `tanh`, not `erff`): the tanh approximation GPT-2 was trained with. About 20 FLOPs per element.',
+                    },
+                  ],
+                },
+                {
+                  id: 'st-y',
+                  label: 'float4 store y[i]',
+                  kind: 'kernel',
+                  sub: 'STG.128 · 16 B',
+                  detail: 'The four results assembled into one `float4 r` and stored once.',
+                },
+              ],
+            },
+          ],
+          [
+            {
+              tone: 'dotted',
+              label: 'Tail kernel · 1 block',
+              items: [
+                {
+                  id: 'tail',
+                  label: 'Scalar tail',
+                  kind: 'kernel',
+                  sub: 'y[i] = gelu(x[i] + bias[i % cols])',
+                  detail:
+                    '`gelu_bias_tail_kernel<<<1, n % 4>>>` from `start = 4 · n4`, guarded by `i >= n`, launched only when `n % 4 > 0`. Plain 4-byte loads and stores.',
+                },
+              ],
+            },
+          ],
+        ],
+      },
+      {
+        id: 'gmem-y',
+        label: 'Global memory y',
+        kind: 'memory',
+        sub: '48 MiB · written once',
+        shape: 'float[4096 × 3072]',
+        detail:
+          'Twenty timed launches between two `cudaEvent`s; `8 × n` bytes (x read once, y written once) over the time is the GB/s line.',
+      },
+      {
+        id: 'd2h',
+        label: 'cudaMemcpy device → host',
+        kind: 'io',
+        sub: 'y · 48 MiB',
+      },
+      {
+        id: 'host-out',
+        label: 'Host buffer y',
+        kind: 'host',
+        sub: 'vs double reference → PASS',
+        detail:
+          'Max abs error against the double-precision CPU reference, below `1e-5`, for n = 4096 × 3072 and for n = 1,000,003.',
+      },
     ],
-    edges: [
-      {from: 'host', to: 'kernel', kind: 'plain', label: 'reinterpret_cast<float4*> · cols / 4'},
-      {from: 'host', to: 'tail', kind: 'plain', label: 'only if n % 4 > 0'},
-      {from: 'kernel', to: 'hbm', kind: 'plain', label: 'LDG.128 ×2 · STG.128'},
-      {from: 'tail', to: 'hbm', kind: 'plain', label: '≤ 3 scalar elements'},
+    notes: [
+      {at: 'ld-x', text: '**16 B** per load: 512 B in flight per warp', side: 'left'},
+      {at: 'add', text: 'Bias add in registers: **t** never reaches HBM', side: 'left'},
+      {at: 'gelu', text: '~**2.5 FLOP/B** against a ridge near 20: memory-bound', side: 'left'},
+      {at: 'gmem-y', text: '**96 MiB** per launch: one read of x, one write of y', side: 'left'},
+    ],
+    insets: [
+      {
+        for: 'gelu',
+        title: 'Unfused: two kernels',
+        items: [
+          {id: 'u-x', label: 'Read x from HBM', kind: 'memory', sub: '48 MiB'},
+          {id: 'u-add', label: 'add kernel', kind: 'kernel', sub: 't = x + b'},
+          {id: 'u-t', label: 'Write t, read it back', kind: 'memory', sub: '2 × 48 MiB round trip'},
+          {id: 'u-gelu', label: 'gelu kernel', kind: 'kernel', sub: 'F.gelu(t, approximate="tanh")'},
+          {id: 'u-y', label: 'Write y to HBM', kind: 'memory', sub: '48 MiB'},
+        ],
+        note: '**192 MiB** of HBM traffic against **96 MiB** fused',
+      },
     ],
   },
   steps: [fusedGeluStep],

@@ -14,21 +14,36 @@ introduced with Volta in CUDA 9: a warp of 32 threads loads a 16 × 16 tile of A
 **fragments**, issues \`mma_sync\`, and stores a 16 × 16 tile of C. Every linear layer of a transformer
 ends up here — through cuBLAS, which is built from the same instructions.
 
-:::diagram
+Read the figure bottom to top: the operands climb from global memory through an optional shared-memory
+block tile into each warp's fragments, the tensor cores accumulate into an fp32 fragment, and one store
+writes the tile of C.
+
+:::architecture
 {
-  "nodes": [
-    {"id": "host", "kind": "client", "label": "Host · main()", "sub": "fp16 inputs · pad16 · CPU reference · PASS", "x": 8, "y": 50},
-    {"id": "gmem", "kind": "db", "label": "Global memory", "sub": "A, B half (padded) · C float", "x": 34, "y": 50},
-    {"id": "smem", "kind": "db", "label": "Shared memory", "sub": "staged tiles As, Bs · reused by 4 warps", "x": 60, "y": 22},
-    {"id": "kernel", "kind": "service", "label": "One warp per tile", "sub": "fragments a, b, acc live in registers", "x": 60, "y": 78},
-    {"id": "tc", "kind": "service", "label": "Tensor cores", "sub": "16×16×16 per mma_sync, fp32 accumulate", "x": 90, "y": 50}
+  "input": "A[M×K] · B[K×N] fp16",
+  "output": "C[M×N] fp32",
+  "items": [
+    {"id": "host", "label": "Host · main()", "kind": "host", "sub": "fp16 inputs · pad16 · CPU reference", "detail": "Rounds every dimension up to a multiple of 16, copies the inputs into zeroed padded buffers with cudaMemcpy2D, checks against an fp32 CPU reference and prints TFLOP/s."},
+    {"id": "gmem-in", "label": "Global memory", "kind": "memory", "sub": "A, B half · padded to ×16"},
+    {"tone": "block", "repeat": "grid ×", "label": "Thread block · 4 warps", "items": [
+      {"id": "smem", "label": "Shared memory", "kind": "memory", "sub": "As, Bs block tile · staged kernel", "detail": "Only in wmma_matmul_smem: a 64 × 64 block tile filled once per K-step and read by all four warps. The direct kernel loads fragments straight from global memory."},
+      {"tone": "dotted", "label": "each warp · K/16 steps", "items": [
+        {"columns": [
+          [{"id": "frag-a", "label": "Fragment a", "kind": "memory", "sub": "matrix_a · 16 × 16 half", "detail": "Spread over the 32 lanes' registers in an opaque layout."}],
+          [{"id": "frag-b", "label": "Fragment b", "kind": "memory", "sub": "matrix_b · 16 × 16 half"}]
+        ]},
+        {"id": "tc", "label": "Tensor cores", "kind": "kernel", "sub": "mma_sync(acc, a, b, acc)", "detail": "One warp-collective instruction: D = A·B + C on the m16n16k16 shape."},
+        {"id": "acc", "label": "Accumulator fragment", "kind": "memory", "sub": "16 × 16 float · registers"}
+      ]},
+      {"id": "store", "label": "store_matrix_sync", "kind": "kernel", "sub": "ldm N · mem_row_major"}
+    ]},
+    {"id": "gmem-out", "label": "Global memory", "kind": "memory", "sub": "C float · M × N corner to host"}
   ],
-  "edges": [
-    {"from": "host", "to": "gmem", "kind": "plain", "label": "cudaMemcpy2D, zero-padded to ×16"},
-    {"from": "gmem", "to": "smem", "kind": "plain", "label": "cooperative fill"},
-    {"from": "gmem", "to": "kernel", "kind": "plain", "label": "load_matrix_sync · store_matrix_sync"},
-    {"from": "smem", "to": "kernel", "kind": "plain", "label": "load_matrix_sync (ldm 40, 72)"},
-    {"from": "kernel", "to": "tc", "kind": "plain", "label": "mma_sync(acc, a, b, acc)"}
+  "notes": [
+    {"at": "smem", "text": "Staged: one tile reused by **4** warps"},
+    {"at": "tc", "text": "**16 × 16 × 16** = **4,096** multiply-adds"},
+    {"at": "acc", "text": "fp16 in, **fp32** accumulate", "side": "left"},
+    {"at": "gmem-in", "text": "Every dimension padded to a multiple of **16**"}
   ]
 }
 :::
@@ -49,6 +64,11 @@ instructions there. That ratio is where the speed comes from:
 | V100 (sm_70) | 1st, 8 per SM | 125 TFLOP/s | 15.7 TFLOP/s |
 | A100 (sm_80) | 3rd, 4 per SM, + bf16, tf32 | 312 TFLOP/s | 19.5 TFLOP/s |
 | H100 SXM (sm_90) | 4th, + fp8, \`wgmma\` | ≈ 990 TFLOP/s | 67 TFLOP/s |
+
+On the roofline the tensor-core roof sits an order of magnitude above the fp32 one, and a kernel only reaches
+it with enough FLOP per byte; compare the tiled fp32 matmul with the tensor-core GEMM:
+
+:::widget roofline
 
 The WMMA API in four types and four calls:
 
@@ -95,19 +115,16 @@ the error in a WMMA matmul with an fp32 accumulator therefore comes from two pla
 At K = 512 a typical entry of C here is about 7.5 in magnitude, where an fp16 ulp is 2⁻⁷ ≈ 0.008 and an
 fp32 ulp about 1e-6: \`2e-5 × K\` (1e-2) is generous for fp32 order noise and out of reach for fp16.
 
-:::sequence
-{
-  "participants": ["Warp", "Accumulator (half)", "Accumulator (float)", "Host check"],
-  "messages": [
-    {"from": "Warp", "to": "Accumulator (half)", "label": "fragment<accumulator, 16,16,16, half> — 32 mma_sync for K = 512", "kind": "sync"},
-    {"from": "Accumulator (half)", "to": "Accumulator (half)", "label": "|acc| ≈ 8: each add rounds to 2⁻⁷ ≈ 0.008", "kind": "sync"},
-    {"from": "Accumulator (half)", "to": "Host check", "label": "max|C − ref| well above 1e-2 → FAIL", "kind": "reply"},
-    {"from": "Warp", "to": "Accumulator (float)", "label": "fragment<accumulator, 16,16,16, float> — same 32 mma_sync", "kind": "sync"},
-    {"from": "Accumulator (float)", "to": "Accumulator (float)", "label": "products exact, each add rounds to ≈ 1e-6", "kind": "sync"},
-    {"from": "Accumulator (float)", "to": "Host check", "label": "max|C − ref| orders below 1e-2 → ok", "kind": "reply"}
-  ]
-}
-:::
+The two accumulator types side by side at K = 512, 32 \`mma_sync\` per tile:
+
+| Accumulator fragment | Each add rounds to | max abs error against the reference | Check at \`2e-5 × K\` |
+| --- | --- | --- | --- |
+| \`fragment<accumulator, 16, 16, 16, half>\` | 2⁻⁷ ≈ 0.008 | well above 1e-2 | FAIL |
+| \`fragment<accumulator, 16, 16, 16, float>\` | ≈ 1e-6 (products exact) | orders below 1e-2 | ok |
+
+Slide a value through fp32 and fp16 to see the 11 significant bits and the 65,504 ceiling for yourself:
+
+:::widget float-formats
 
 This is the split [mixed-precision training](https://arxiv.org/abs/1710.03740) relies on: multiply in half
 precision, accumulate in fp32.
@@ -138,21 +155,13 @@ width.
 | B tile (row-major K × N) | \`B + k·N + tileCol·16\` | \`N\` | \`wmma::row_major\` |
 | C tile (row-major M × N) | \`C + tileRow·16·N + tileCol·16\` | \`N\` | \`wmma::mem_row_major\` at the store |
 
-The failure is silent: a wrong \`ldm\` still loads 256 valid elements, just the wrong ones.
+The failure is silent: a wrong \`ldm\` still loads 256 valid elements, just the wrong ones. With \`A\` row-major
+and \`K = 512\`:
 
-:::sequence
-{
-  "participants": ["Warp", "A (row-major, ldm K = 512)", "Tensor core"],
-  "messages": [
-    {"from": "Warp", "to": "A (row-major, ldm K = 512)", "label": "load_matrix_sync(a, A + k, 16) — ldm = tile width", "kind": "sync"},
-    {"from": "A (row-major, ldm K = 512)", "to": "Warp", "label": "fragment row 1 = A[0][k+16 … k+31], not A[1][k … k+15]", "kind": "reply"},
-    {"from": "Warp", "to": "Tensor core", "label": "mma_sync on a scrambled tile — no fault, no warning", "kind": "sync"},
-    {"from": "Warp", "to": "A (row-major, ldm K = 512)", "label": "load_matrix_sync(a, A + tileRow·16·K + k, K)", "kind": "sync"},
-    {"from": "A (row-major, ldm K = 512)", "to": "Warp", "label": "fragment row r = A[tileRow·16 + r][k … k+15]", "kind": "reply"},
-    {"from": "Warp", "to": "Tensor core", "label": "mma_sync(acc, a, b, acc) → within tolerance", "kind": "sync"}
-  ]
-}
-:::
+| Load | Fragment row \`r\` holds | Outcome |
+| --- | --- | --- |
+| \`load_matrix_sync(a, A + k, 16)\`: \`ldm\` = tile width | row 1 = \`A[0][k+16 … k+31]\`, not \`A[1][k … k+15]\` | \`mma_sync\` on a scrambled tile: no fault, no warning |
+| \`load_matrix_sync(a, A + tileRow·16·K + k, K)\` | \`A[tileRow·16 + r][k … k+15]\` | within tolerance |
 
 The loads also have hard **alignment** rules: the pointer must be 256-bit (32-byte) aligned and \`ldm\` a
 multiple of 8 for \`half\` and 4 for \`float\` (16 bytes either way). There is no bounds check and no slow
@@ -184,22 +193,39 @@ larger tile once per block and letting every warp reuse it:
 | Staged, per block (64 × 64, BK = 32) | 64×32 + 32×64 halves = 8 KiB | 2 · 64 · 64 · 32 = 262,144 | 32 |
 | CUTLASS-style 128 × 128, BK = 32 | 16 KiB | 1,048,576 | 64 |
 
+Step through the K slabs of one block tile to see the reuse: every staged element feeds a whole row or column
+of output tiles instead of one.
+
+:::widget tiled-matmul
+
 The staged loop has two barriers, and each prevents a different race:
 
-:::sequence
+:::architecture
 {
-  "participants": ["128 threads", "Shared As, Bs", "Warp 0 … 3", "Tensor core"],
-  "messages": [
-    {"from": "128 threads", "to": "Shared As, Bs", "label": "fill As[64][32], Bs[32][64] for k0 (zero past M, N, K)", "kind": "sync"},
-    {"from": "128 threads", "to": "128 threads", "label": "__syncthreads() — no warp reads a half-written tile", "kind": "sync"},
-    {"from": "Warp 0 … 3", "to": "Shared As, Bs", "label": "for kk in 0, 16: load 2 a (ldm 40), 2 b (ldm 72)", "kind": "sync"},
-    {"from": "Warp 0 … 3", "to": "Tensor core", "label": "4 × mma_sync(acc[i][j], a[i], b[j], acc[i][j])", "kind": "sync"},
-    {"from": "128 threads", "to": "128 threads", "label": "__syncthreads() — nobody refills while a warp still reads", "kind": "sync"},
-    {"from": "128 threads", "to": "Shared As, Bs", "label": "next k0 → fill", "kind": "async"}
+  "input": "A, B half in global memory",
+  "output": "C: one 64 × 64 fp32 tile per block",
+  "items": [
+    {"tone": "block", "repeat": "K/32 ×", "label": "one K-step · k0 += 32", "items": [
+      {"columns": [
+        [{"id": "fill-a", "label": "Fill As[64][40]", "kind": "kernel", "sub": "64 × 32 halves · 0 past M, K", "detail": "The 128 threads copy the slab cooperatively; rows past M and columns past K are zero-filled."}],
+        [{"id": "fill-b", "label": "Fill Bs[32][72]", "kind": "kernel", "sub": "32 × 64 halves · 0 past K, N"}]
+      ]},
+      {"id": "sync1", "label": "__syncthreads()", "kind": "kernel", "sub": "no warp reads a half-written tile"},
+      {"tone": "dotted", "label": "each of 2 × 2 warps", "items": [
+        {"id": "ld", "label": "load_matrix_sync", "kind": "kernel", "sub": "2 a (ldm 40) · 2 b (ldm 72)", "detail": "For kk = 0 and 16: a fragments from &As[warpRow·32 + i·16][kk], b fragments from &Bs[kk][warpCol·32 + j·16]."},
+        {"id": "mma4", "label": "4 × mma_sync", "kind": "kernel", "sub": "acc[i][j] += a[i] · b[j]"}
+      ]},
+      {"id": "sync2", "label": "__syncthreads()", "kind": "kernel", "sub": "nobody refills while a warp reads"}
+    ]},
+    {"id": "store", "label": "store_matrix_sync × 4", "kind": "kernel", "sub": "each tile inside M × N"}
+  ],
+  "notes": [
+    {"at": "fill-b", "text": "**8 KiB** per K-step feeds **262,144** FLOP"},
+    {"at": "ld", "text": "Warp tile **32 × 32** as 2 × 2 fragments"},
+    {"at": "sync2", "text": "The second barrier: write after read", "side": "left"}
   ]
 }
 :::
-
 
 - **Skew.** \`As[64][32 + 8]\` and \`Bs[32][64 + 8]\`: the 8 extra halves keep every row start a multiple of 16
   bytes (so \`ldm\` = 40 and 72 stay legal and \`&As[16·i][kk]\` stays 32-byte aligned) and shift consecutive

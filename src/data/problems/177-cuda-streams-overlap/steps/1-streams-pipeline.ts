@@ -14,7 +14,26 @@ export const streamsPipelineStep: Step = {
   title: 'run_pipelined(): NSTREAMS chunks in flight, one event between neighbours',
   concept: 'cuda',
   file: 'streams_pipeline',
-  focus: ['host', 'copy', 'sm', 'dmem'],
+  focus: [
+    'h-in',
+    'h2d-0',
+    'heavy-0',
+    'carry-0',
+    'd2h-0',
+    'h2d-1',
+    'heavy-1',
+    'carry-1',
+    'd2h-1',
+    'h2d-2',
+    'heavy-2',
+    'carry-2',
+    'd2h-2',
+    'h2d-3',
+    'heavy-3',
+    'carry-3',
+    'd2h-3',
+    'h-out',
+  ],
   task: `## Task
 
 Process \`N = 1 << 22\` floats in \`NSTREAMS = 4\` chunks of \`CHUNK = N / NSTREAMS\` through two kernels,
@@ -22,6 +41,11 @@ with every chunk's copies and kernels on its own stream, so that the copy engine
 and chunk \`c − 1\` out while the SMs compute chunk \`c\`. A synchronous single-stream version of the same
 work is the baseline; the program times both with events, prints the speedup, validates both against the
 CPU and prints \`PASS\`.
+
+The schedule you are building, one stream against several (try one copy engine against two, and a
+copy-heavy ratio against a compute-heavy one):
+
+:::widget stream-timeline
 
 - **Kernels.** \`heavy(const float* in, float* out, int n)\`: for each element solve Kepler's equation
   \`E = M + ECC · sin E\` by \`ITERS = 64\` fixed-point iterations of \`e = m + ECC * sinf(e)\` starting from
@@ -53,40 +77,6 @@ CPU and prints \`PASS\`.
 > One stream serialises copies and kernels; several streams let the copy engines and the SMs work on
 > different chunks at once — and an event, not a host sync, is how chunk \`c\` learns that chunk \`c − 1\`
 > is done.`,
-  sequence: {
-    participants: ['host', 'stream 0', 'stream 1', 'GPU'],
-    messages: [
-      {
-        from: 'host',
-        to: 'stream 0',
-        label: 'cudaMemcpyAsync H2D chunk 0 · heavy · add_carry · record computed[0] · D2H · record landed[0]',
-        kind: 'async',
-      },
-      {
-        from: 'host',
-        to: 'stream 1',
-        label:
-          'cudaMemcpyAsync H2D chunk 1 · heavy · cudaStreamWaitEvent(computed[0]) · add_carry · D2H · record landed[1]',
-        kind: 'async',
-      },
-      {from: 'stream 0', to: 'GPU', label: 'copy engine: H2D 0 → SMs: heavy 0', kind: 'sync'},
-      {from: 'stream 1', to: 'GPU', label: 'copy engine: H2D 1 while SMs run heavy 0; then heavy 1', kind: 'sync'},
-      {
-        from: 'stream 0',
-        to: 'stream 1',
-        label: 'computed[0] fires → add_carry 1 may read d_out[CHUNK − 1]',
-        kind: 'async',
-      },
-      {from: 'stream 0', to: 'host', label: 'landed[0]: chunk 0 is in h_out (D2H overlapped heavy 1)', kind: 'reply'},
-      {from: 'stream 1', to: 'host', label: 'landed[1]', kind: 'reply'},
-      {
-        from: 'host',
-        to: 'GPU',
-        label: 'cudaStreamSynchronize × NSTREAMS · record stop · cudaEventElapsedTime',
-        kind: 'sync',
-      },
-    ],
-  },
   hints: [
     'The pinned buffers are the precondition: `cudaMallocHost(&h_in, bytes)` for both host arrays, `cudaFreeHost` at the end. With pageable memory `cudaMemcpyAsync` silently degrades to a staged, host-blocking copy and nothing overlaps.',
     'Per chunk, everything goes on `streams[c]`: `cudaMemcpyAsync(d_in + off, h_in + off, bytes, cudaMemcpyHostToDevice, s)`, `heavy<<<GRID, BLOCK, 0, s>>>`, `add_carry<<<GRID, BLOCK, 0, s>>>`, `cudaMemcpyAsync(h_out + off, d_out + off, bytes, cudaMemcpyDeviceToHost, s)`. A launch without the fourth `<<<>>>` argument goes to stream 0, which the other streams wait for.',

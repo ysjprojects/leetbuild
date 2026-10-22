@@ -62,19 +62,132 @@ The attention layer around it (projections, scores, softmax, the KV cache itself
 \`head_dim\`, as GPT-NeoX and Phi do), context extension by rescaling the frequencies (position
 interpolation, NTK-aware scaling, YaRN, Llama 3's smoothing), multimodal RoPE over 2-D or 3-D positions,
 and fused kernels that rotate \`q\` and \`k\` inside the QKV projection.`,
-  diagram: {
-    nodes: [
-      {id: 'attn', kind: 'client', label: 'Attention layer', sub: 'q, k [B, H, L, D] · positions', x: 10, y: 50},
-      {id: 'rope', kind: 'service', label: 'RoPE / apply_rope', sub: 'gather · chunk · rotate · cat', x: 42, y: 50},
-      {id: 'cache', kind: 'db', label: 'cos / sin buffers', sub: '[max_seq_len, D/2] float32', x: 75, y: 25},
-      {id: 'kv', kind: 'db', label: 'KV cache', sub: 'keys rotated at their own positions', x: 75, y: 75},
-      {id: 'ref', kind: 'external', label: 'Complex reference', sub: 'pair × e^{i m theta} · float64', x: 42, y: 90},
+  architecture: {
+    input: 'from LayerNorm 1',
+    output: 'into the residual ⊕',
+    items: [
+      {
+        id: 'x',
+        label: 'Hidden states',
+        kind: 'io',
+        sub: 'x · positions m = 0..L−1',
+        shape: '[B, L, d_model]',
+        detail:
+          'The tokens entering an attention layer, plus their positions. A decode step passes `positions = arange(offset, offset + L)` so new tokens line up with the KV cache.',
+      },
+      {
+        tone: 'model',
+        label: 'Attention layer with RoPE',
+        items: [
+          {
+            columns: [
+              [
+                {
+                  columns: [
+                    [
+                      {
+                        id: 'q-proj',
+                        label: 'Query projection',
+                        sub: 'W_q · 4 heads × 16',
+                        shape: '[B, 4, L, 16]',
+                        detail: 'An ordinary linear layer, split into heads. RoPE leaves it untouched.',
+                      },
+                      {
+                        id: 'rope-q',
+                        label: 'RoPE on q',
+                        kind: 'attention',
+                        sub: 'pair i turned by m·θᵢ',
+                        shape: '[B, 4, L, 16]',
+                        side: {
+                          label: 'cos / sin cache',
+                          sub: '[64, 8] float32',
+                          detail:
+                            '`precompute_rope_cache(16, 64)`: the angle table `m · θᵢ` for every position and pair, computed once and registered with `persistent=False`. Both rotations gather their rows from it by position.',
+                        },
+                        detail:
+                          '`apply_rope(q, cos, sin, positions)`: dimension `i` pairs with `i + 8`, and each pair is rotated by its position times its own frequency. Length is preserved; only the direction turns.',
+                      },
+                    ],
+                    [
+                      {
+                        id: 'k-proj',
+                        label: 'Key projection',
+                        sub: 'W_k · 4 heads × 16',
+                        shape: '[B, 4, L, 16]',
+                        detail: 'An ordinary linear layer, split into heads.',
+                      },
+                      {
+                        id: 'rope-k',
+                        label: 'RoPE on k',
+                        kind: 'attention',
+                        sub: 'pair i turned by n·θᵢ',
+                        shape: '[B, 4, L, 16]',
+                        detail:
+                          'The same rotation with the same cache. Keys go into the KV cache **already rotated**, at their own positions, and are never rotated again.',
+                      },
+                    ],
+                  ],
+                },
+                {
+                  id: 'scores',
+                  label: 'Attention scores',
+                  sub: 'q_rot · k_rotᵀ / √16',
+                  shape: '[B, 4, L, L]',
+                  detail:
+                    'An ordinary dot product of rotated vectors: `R(mθ)q · R(nθ)k = q · R((n − m)θ)k`, so the score depends on the content and the distance `m − n` alone.',
+                },
+                {
+                  id: 'softmax',
+                  label: 'Causal softmax',
+                  sub: 'over keys 0..m',
+                  shape: '[B, 4, L, L]',
+                },
+              ],
+              [
+                {
+                  id: 'v-proj',
+                  label: 'Value projection',
+                  sub: 'W_v · never rotated',
+                  shape: '[B, 4, L, 16]',
+                  detail:
+                    'Values carry content, not position: rotating them would stamp absolute angles into the weighted sum.',
+                },
+              ],
+            ],
+          },
+          {
+            id: 'wsum',
+            label: 'Weighted sum of values',
+            sub: 'probs @ v',
+            shape: '[B, 4, L, 16]',
+          },
+          {
+            id: 'out-proj',
+            label: 'Output projection',
+            sub: 'W_o · heads merged',
+            shape: '[B, L, d_model]',
+          },
+        ],
+      },
     ],
-    edges: [
-      {from: 'attn', to: 'rope', kind: 'plain', label: 'q, k, arange(offset, offset + L)'},
-      {from: 'rope', to: 'cache', kind: 'plain', label: 'cos[positions], sin[positions]'},
-      {from: 'rope', to: 'kv', kind: 'plain', label: 'k_rot appended'},
-      {from: 'attn', to: 'ref', kind: 'plain', label: 'same x, allclose 1e-5'},
+    notes: [
+      {at: 'rope-q', text: '**8** pairs per head, each at its own θᵢ', side: 'left'},
+      {at: 'scores', text: 'The score depends on **m − n** alone', side: 'left'},
+      {at: 'x', text: 'A decode step passes its **offset**', side: 'left'},
+    ],
+    insets: [
+      {
+        for: 'rope-q',
+        title: 'apply_rope, half-split',
+        items: [
+          {id: 'gather', label: 'Gather cache rows', sub: 'cos[positions], sin[positions]'},
+          {id: 'cast', label: 'Cast and broadcast', sub: '.to(x.dtype) · [1, 1, L, 8]'},
+          {id: 'halves', label: 'Split into halves', sub: 'x1, x2 = x.chunk(2, dim=-1)'},
+          {id: 'rotate', label: 'Rotate every pair', kind: 'attention', sub: 'x1·c − x2·s,  x2·c + x1·s'},
+          {id: 'concat', label: 'Concatenate', sub: 'cat(dim=-1) · x’s shape and dtype'},
+        ],
+        note: '**4** multiplies and **2** adds per pair, nothing transcendental',
+      },
     ],
   },
   steps: [ropeStep],

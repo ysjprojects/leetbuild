@@ -5,6 +5,7 @@ import {githubSlug} from '@/lib/export';
 import {leetbuildHighlighter} from '@/lib/highlight';
 import {type Block, type PopQuizSpec, inlineTokens, parseBlocks} from '@/lib/markdown';
 
+import ArchitectureDiagram from './ArchitectureDiagram';
 import SequenceDiagram from './SequenceDiagram';
 import SystemDiagram from './SystemDiagram';
 
@@ -12,7 +13,7 @@ import SystemDiagram from './SystemDiagram';
  * The course Markdown dialect, drawn: the dialect itself is parsed in lib/markdown.ts (one parser
  * for the pane, the learning guide and the exports). Fenced code is highlighted through
  * `highlight`; `try` on a fence adds "Load into editor"; `:::widget` goes through `renderWidget`;
- * `:::sequence` / `:::diagram` draw like a step's figures.
+ * `:::sequence` / `:::diagram` draw like a step's figures, `:::architecture` as a layer stack.
  */
 
 /** Turns a fenced block into spans; `info` is the word after the opening fence (`cuda`, `python`…), lower-cased. */
@@ -306,6 +307,12 @@ const Blocks: FC<{
           return (
             <div className="my-4" key={index}>
               <SystemDiagram compact diagram={block.diagram} focus={NO_FOCUS} />
+            </div>
+          );
+        case 'architecture':
+          return (
+            <div className="my-4" key={index}>
+              <ArchitectureDiagram spec={block.architecture} />
             </div>
           );
         case 'malformed':

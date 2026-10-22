@@ -13,7 +13,7 @@ export const blellochScanStep: Step = {
   title: 'scan_block + add_block_offsets: a work-efficient exclusive scan of any length',
   concept: 'cuda',
   file: 'prefix_scan',
-  focus: ['scan', 'sums', 'add'],
+  focus: ['host', 'smem', 'up', 'root', 'down', 'scan-sums', 'add', 'incl'],
   task: `## Task
 
 Implement an **exclusive prefix sum** of \`n\` \`int\`s on the device, for any \`n ≥ 1\`, as three kernels
@@ -28,7 +28,10 @@ and one host function. \`BLOCK_THREADS = 512\` and \`ELEMS_PER_BLOCK = 2 * BLOCK
   (\`for (int d = 1; d < ELEMS_PER_BLOCK; d <<= 1)\`) halves \`offset\` each level and swaps-and-adds:
   \`t = temp[a]; temp[a] = temp[b]; temp[b] += t\`. A \`__syncthreads()\` before every level and one
   before the guarded store to \`out\`. The result is the exclusive scan of the block, as if the block were
-  the whole array.
+  the whole array. The two sweeps on 16 values, level by level:
+
+:::widget scan-sweep
+
 - **Bank-conflict-free indexing**: \`#define LOG_NUM_BANKS 5\` and
   \`#define CONFLICT_FREE_OFFSET(i) ((i) >> LOG_NUM_BANKS)\`; every index into \`temp\` is padded,
   \`a += CONFLICT_FREE_OFFSET(a)\`, and \`temp\` is declared
@@ -52,35 +55,6 @@ and one host function. \`BLOCK_THREADS = 512\` and \`ELEMS_PER_BLOCK = 2 * BLOCK
 > A scan looks sequential — every output depends on every input before it — but the sum is associative,
 > so a tree reduces the array in log n levels and a second tree walks the partial sums back down. Two
 > trees, 2n adds, no element waits for its predecessor.`,
-  sequence: {
-    participants: ['Host', 'scan_block', 'Device memory', 'add_block_offsets'],
-    messages: [
-      {from: 'Host', to: 'Device memory', label: 'cudaMemcpy in[n]  (n = 1,000,003)', kind: 'sync'},
-      {from: 'Host', to: 'scan_block', label: '<<<977, 512>>>(in, out, block_sums, n)', kind: 'async'},
-      {
-        from: 'scan_block',
-        to: 'scan_block',
-        label: 'load 1024 → temp (zero past n) · up-sweep ×10 · root → block_sums[b], root = 0 · down-sweep ×10',
-        kind: 'sync',
-      },
-      {
-        from: 'scan_block',
-        to: 'Device memory',
-        label: 'out[b·1024 …] = exclusive scan of the block · block_sums[b] = total',
-        kind: 'sync',
-      },
-      {from: 'Host', to: 'scan_block', label: 'exclusive_scan(block_sums, offsets, 977) → <<<1, 512>>>', kind: 'async'},
-      {from: 'scan_block', to: 'Device memory', label: 'offsets[b] = sum of totals of blocks 0 … b−1', kind: 'sync'},
-      {from: 'Host', to: 'add_block_offsets', label: '<<<977, 512>>>(out, offsets, n)', kind: 'async'},
-      {from: 'add_block_offsets', to: 'Device memory', label: 'out[i] += offsets[blockIdx.x]', kind: 'sync'},
-      {
-        from: 'Device memory',
-        to: 'Host',
-        label: 'cudaMemcpy out[n] · compare with the CPU loop · max abs error 0',
-        kind: 'reply',
-      },
-    ],
-  },
   hints: [
     'Load `temp[ai + CONFLICT_FREE_OFFSET(ai)]` and `temp[bi + CONFLICT_FREE_OFFSET(bi)]` with `ai = tid`, `bi = tid + BLOCK_THREADS`, zero when `base + ai >= n`. Up-sweep: `offset = 1`; for `d` from `ELEMS_PER_BLOCK >> 1` down to 1, after a `__syncthreads()` threads `tid < d` take `a = offset * (2 * tid + 1) - 1`, `b = offset * (2 * tid + 2) - 1`, pad both, `temp[b] += temp[a]`; then `offset <<= 1`.',
     'Between the sweeps thread 0 saves `temp[last]` (`last = ELEMS_PER_BLOCK - 1` padded) to `block_sums[blockIdx.x]` and sets it to 0. Down-sweep mirrors the up-sweep: `d` from 1 doubling, `offset >>= 1` first, `__syncthreads()`, the same `a`/`b`, then `t = temp[a]; temp[a] = temp[b]; temp[b] += t`. One more `__syncthreads()` before writing `out`.',

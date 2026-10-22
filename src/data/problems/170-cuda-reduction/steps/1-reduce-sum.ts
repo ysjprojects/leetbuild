@@ -9,7 +9,7 @@ export const reduceSumStep: Step = {
   title: 'reduce_sum: grid-stride partials, warp shuffles, one slot per warp, one atomic per block',
   concept: 'cuda',
   file: 'reduce_sum',
-  focus: ['kernel', 'smem', 'gmem'],
+  focus: ['stride', 'shfl', 'smem', 'warp0', 'atomic'],
   task: `## Task
 
 Implement \`__global__ void reduce_sum(const float* in, float* out, int n)\`: on entry \`*out\` is 0, on exit it
@@ -33,29 +33,13 @@ reference at a relative tolerance of \`1e-5\`.
 - The self-test zeroes \`*out\` with \`cudaMemset\` before **every** launch (atomics accumulate), checks the
   launch, copies the float back, reports ms per launch and GB/s over 20 launches, and prints \`PASS\`.
 
+Step through the warp's five shuffles beside the shared-memory tree they replace:
+
+:::widget warp-reduce
+
 > A sum of 16 M floats moves 64 MiB and does 16 M adds: it is bandwidth-bound, so the kernel reads each
 > element exactly once, coalesced, and keeps every later step — shuffles, 32 shared slots, one atomic —
 > off the memory bus.`,
-  sequence: {
-    participants: ['Host', 'Block', 'Warp', 'Shared memory', 'Global memory'],
-    messages: [
-      {from: 'Host', to: 'Global memory', label: 'cudaMemcpy in (H2D) · cudaMemset(out, 0)', kind: 'sync'},
-      {from: 'Host', to: 'Block', label: 'reduce_sum<<<512, 256>>>(in, out, n)', kind: 'async'},
-      {from: 'Block', to: 'Global memory', label: 'v += in[i], i += gridDim.x × blockDim.x (coalesced)', kind: 'sync'},
-      {
-        from: 'Warp',
-        to: 'Warp',
-        label: '__shfl_down_sync(0xffffffff, v, 16 … 1) → lane 0 has the warp sum',
-        kind: 'sync',
-      },
-      {from: 'Warp', to: 'Shared memory', label: 'lane 0: warp_sums[warp] = v', kind: 'sync'},
-      {from: 'Block', to: 'Block', label: '__syncthreads()', kind: 'sync'},
-      {from: 'Shared memory', to: 'Warp', label: 'warp 0: warp_sums[lane] (0 past blockDim.x / 32)', kind: 'reply'},
-      {from: 'Warp', to: 'Warp', label: 'shuffle again → lane 0 has the block sum', kind: 'sync'},
-      {from: 'Warp', to: 'Global memory', label: 'atomicAdd(out, v) — once per block', kind: 'sync'},
-      {from: 'Host', to: 'Global memory', label: 'cudaMemcpy out (D2H) · |out − ref| / ref ≤ 1e-5', kind: 'sync'},
-    ],
-  },
   hints: [
     'Write `warp_reduce_sum` first: `for (int offset = 16; offset > 0; offset >>= 1) v += __shfl_down_sync(0xffffffff, v, offset);`. After it only lane 0 is meaningful; the other lanes hold partial sums you never read.',
     'The kernel is three stages in one register `v`: the grid-stride loop, `v = warp_reduce_sum(v)` then `if (lane == 0) warp_sums[warp] = v;`, `__syncthreads()`, and `if (warp == 0) { v = lane < blockDim.x / 32 ? warp_sums[lane] : 0.0f; v = warp_reduce_sum(v); if (lane == 0) atomicAdd(out, v); }`.',

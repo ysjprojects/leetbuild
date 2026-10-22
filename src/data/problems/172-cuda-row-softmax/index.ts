@@ -74,32 +74,128 @@ Fp16/bf16 inputs with fp32 accumulation, the warp-per-row and register-resident 
 vectorised \`float4\` loads, fusing the scale and mask into the kernel, the backward pass
 \`dx = y ⊙ (dy − Σ y ⊙ dy)\`, and the online softmax that fuses max and sum into one pass — the guide covers
 it, FlashAttention is built on it.`,
-  diagram: {
-    nodes: [
+  architecture: {
+    input: 'x · 4096 × 1000 fp32 logits',
+    output: 'y · every row sums to 1',
+    items: [
       {
         id: 'host',
-        kind: 'client',
         label: 'Host · main()',
-        sub: 'U(−3,3) · row 0 at 1e4 · masked rows · CPU double ref · PASS',
-        x: 8,
-        y: 50,
+        kind: 'host',
+        sub: 'LAUNCH(softmax_rows, rows, 256)',
+        detail:
+          'Fills `x` with `U(−3, 3)`, row 0 at magnitudes of `1e4`, row 1 all `-inf`, the second half of row 2 `-inf`; one block per row; compares with a double CPU reference and times 50 launches.',
       },
       {
-        id: 'kernel',
-        kind: 'service',
-        label: 'softmax_rows<<<rows, 256>>>',
-        sub: 'block r owns row r · max → sum → write',
-        x: 38,
-        y: 50,
+        id: 'gmem-x',
+        label: 'Global memory',
+        sub: 'x · 4096 × 1000 fp32 · 16.4 MB',
+        kind: 'memory',
+        shape: 'x[r]: 1000 floats',
+        detail:
+          'Row-major. A row is 4 KB; on each round of the strided loop a warp reads 32 consecutive floats, one 128-byte transaction.',
       },
-      {id: 'smem', kind: 'db', label: 'Shared memory', sub: 's_max[8] · s_sum[8] warp partials', x: 66, y: 22},
-      {id: 'hbm', kind: 'db', label: 'Global memory', sub: 'd_x · d_y · 4096 × 1000 fp32 (16 MB each)', x: 66, y: 78},
+      {
+        tone: 'block',
+        repeat: '4096 ×',
+        label: 'Thread block · one row',
+        items: [
+          {
+            tone: 'dotted',
+            label: 'pass 1 · max',
+            items: [
+              {
+                id: 'max-local',
+                label: 'Strided local max',
+                sub: 'fmaxf over c = t, t + 256, …',
+                kind: 'kernel',
+                detail:
+                  '`row = blockIdx.x`; thread `t` starts at `-INFINITY` and visits columns `t, t + blockDim.x, …` below `cols`: 4 rounds for 1000 columns.',
+              },
+              {
+                id: 'max-warp',
+                label: 'Warp max',
+                sub: 'fmaxf + __shfl_xor_sync 16 … 1',
+                kind: 'kernel',
+                detail:
+                  '`v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, offset))` for offsets 16, 8, 4, 2, 1: a butterfly, every lane ends with the warp max.',
+              },
+              {
+                id: 's-max',
+                label: 'Shared s_max[8]',
+                sub: 'warp 0 reduces the 8 → m',
+                kind: 'memory',
+                shape: 'm: one float per row',
+                detail:
+                  'Lane 0 of each warp writes its slot, `__syncthreads()`, warp 0 reduces them (lanes 8–31 load `-INFINITY`), thread 0 publishes `m`, a second `__syncthreads()`, every thread reads it.',
+              },
+            ],
+          },
+          {
+            id: 'guard',
+            label: 'Masked-row guard',
+            sub: 'if (m == -INFINITY) m = 0',
+            kind: 'kernel',
+            detail:
+              'A fully masked row has `m = -inf` and `-inf − (-inf) = NaN`. Shifting by 0 makes every term `__expf(-inf) = 0` instead.',
+          },
+          {
+            tone: 'dotted',
+            label: 'pass 2 · sum',
+            items: [
+              {
+                id: 'sum-local',
+                label: 'Strided local sum',
+                sub: 'Σ __expf(x[c] − m)',
+                kind: 'kernel',
+                detail:
+                  'The same strided walk over the row, now served from L1/L2. Every exponent is at most 0, so every term lies in (0, 1].',
+              },
+              {
+                id: 'sum-warp',
+                label: 'Warp sum',
+                sub: '+ __shfl_xor_sync 16 … 1',
+                kind: 'kernel',
+                detail: 'The same five-round butterfly with `+` and identity `0`.',
+              },
+              {
+                id: 's-sum',
+                label: 'Shared s_sum[8]',
+                sub: 'warp 0 reduces the 8 → sum',
+                kind: 'memory',
+                shape: 'sum ∈ [1, 1000]',
+                detail:
+                  'Its own slots, not `s_max`: a fast warp may write its partial sum while a slow one is still reading `m`.',
+              },
+            ],
+          },
+          {
+            id: 'write',
+            label: 'Pass 3 · normalise',
+            sub: 'y = __expf(x − m) · inv',
+            kind: 'kernel',
+            shape: 'y[r]: 1000 floats',
+            detail:
+              'Recomputes the exponent from the cached row rather than storing it. `inv` is 0 for a fully masked row, so it is written as zeros, never `0 / 0`.',
+            side: {label: 'inv', sub: 'sum > 0 ? 1 / sum : 0'},
+          },
+        ],
+      },
+      {
+        id: 'gmem-y',
+        label: 'Global memory',
+        sub: 'y · 4096 × 1000 fp32 · 16.4 MB',
+        kind: 'memory',
+        detail:
+          'Copied back and compared: `max |gpu − cpu| < 1e-5`, `max |row sum − 1| < 1e-4`, row 1 all zeros, no NaN.',
+      },
     ],
-    edges: [
-      {from: 'host', to: 'hbm', kind: 'plain', label: 'cudaMemcpy x in · y out'},
-      {from: 'host', to: 'kernel', kind: 'plain', label: 'LAUNCH · 50 timed launches'},
-      {from: 'kernel', to: 'smem', kind: 'plain', label: 'lane 0 partials · __syncthreads'},
-      {from: 'kernel', to: 'hbm', kind: 'plain', label: 'read x (×3, cached) · write y'},
+    notes: [
+      {at: 'gmem-x', text: '**16.4 MB** from DRAM once; re-reads hit L1/L2'},
+      {at: 'max-warp', text: '**5** shuffles per warp, **8** warps per row'},
+      {at: 'guard', text: 'All -inf row: shift by **0**, not by -inf'},
+      {at: 's-sum', text: 'Sum in **[1, 1000]** when unmasked'},
+      {at: 'gmem-y', text: '**8 bytes** per element: memory-bound'},
     ],
   },
   steps: [rowSoftmaxStep],

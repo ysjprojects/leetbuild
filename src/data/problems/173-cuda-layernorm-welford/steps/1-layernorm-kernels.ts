@@ -250,7 +250,21 @@ export const layernormKernelsStep: Step = {
   title: 'layernorm_fwd and layernorm_bwd: Welford, Chan merge, saved statistics, two reductions',
   concept: 'cuda',
   file: 'layernorm_kernels',
-  focus: ['fwd', 'stats', 'bwd', 'reduce'],
+  focus: [
+    'welford',
+    'warp-merge',
+    's-warp',
+    'warp0',
+    'norm',
+    'saved',
+    'bwd',
+    'bwd-load',
+    'sum2',
+    'dx',
+    'acc',
+    'partials',
+    'reduce',
+  ],
   task: `## Task
 
 Write \`layernorm_kernels.cu\`: LayerNorm over the last dimension of a row-major \`float\` matrix
@@ -267,6 +281,25 @@ and the self-test are given; the device code is yours.
   \`count = a.count + b.count\`, \`delta = b.mean − a.mean\`, \`mean = a.mean + delta * b.count / count\`,
   \`m2 = a.m2 + b.m2 + delta * delta * a.count * b.count / count\`. Two empty states (\`count == 0\`, threads
   past the end of a short row) merge to an empty state, not to \`0 / 0\`.
+
+The merge, bottom to top:
+
+:::architecture
+{
+  "output": "the merged state",
+  "items": [
+    {"columns": [
+      [{"id": "ca", "label": "State a", "sub": "n_a, mean_a, M2_a", "kind": "memory"}],
+      [{"id": "cb", "label": "State b", "sub": "n_b, mean_b, M2_b", "kind": "memory"}]
+    ]},
+    {"id": "cn", "label": "Count", "sub": "n = n_a + n_b", "kind": "kernel"},
+    {"id": "cd", "label": "Gap between the means", "sub": "δ = mean_b − mean_a", "kind": "kernel"},
+    {"id": "cm", "label": "Merged mean", "sub": "mean_a + δ·n_b / n", "kind": "kernel"},
+    {"id": "cm2", "label": "Merged M2", "sub": "M2_a + M2_b + δ²·n_a·n_b / n", "kind": "kernel"}
+  ]
+}
+:::
+
 - **\`warp_welford(Welford s)\`.** A tree over \`offset = 16, 8, 4, 2, 1\`: \`__shfl_down_sync(FULL_MASK, …)\` of
   \`s.count\`, \`s.mean\` and \`s.m2\`, then \`welford_merge\`; lane 0 ends with the warp's statistics.
 - **\`__global__ void layernorm_fwd(x, gamma, beta, y, mean, rstd, rows, cols, eps)\`.** One block per row
@@ -294,58 +327,12 @@ and the self-test are given; the device code is yours.
   \`y\`, \`mean\`, \`rstd\`, \`dx\`, \`dgamma\`, \`dbeta\` must each be \`≤ 1e-3\`; it prints the timings, the six errors,
   row 0's variance against the reference, and \`PASS\`.
 
+Why the naive formula is forbidden: the same variance in float32, both ways, as the offset grows:
+
+:::widget variance-cancellation
+
 > A row's variance is not \`E[x²] − E[x]²\` on a GPU: in float that is two numbers near 10⁶ subtracted to find
 > one near 0.33. Welford keeps deviations small, and Chan's merge lets 256 threads combine theirs exactly.`,
-  sequence: {
-    participants: ['Host', 'layernorm_fwd', 'layernorm_bwd', 'Device memory'],
-    messages: [
-      {
-        from: 'Host',
-        to: 'Device memory',
-        label: 'cudaMemcpy x, dy, gamma, beta host→device',
-        kind: 'sync',
-      },
-      {from: 'Host', to: 'layernorm_fwd', label: 'layernorm_fwd<<<rows, 256>>>  — one block per row', kind: 'async'},
-      {
-        from: 'layernorm_fwd',
-        to: 'layernorm_fwd',
-        label: 'thread: welford_update over its columns · warp: shfl_down + Chan merge · block: shared slots',
-        kind: 'sync',
-      },
-      {
-        from: 'layernorm_fwd',
-        to: 'Device memory',
-        label: 'mean[row], rstd[row] = rsqrtf(m2 / cols + eps) · y = xhat * gamma + beta',
-        kind: 'sync',
-      },
-      {
-        from: 'Host',
-        to: 'layernorm_bwd',
-        label: 'layernorm_bwd<<<64, 256>>>  — rows b, b + 64, …',
-        kind: 'async',
-      },
-      {from: 'Device memory', to: 'layernorm_bwd', label: 'dy, x, gamma, saved mean[row], rstd[row]', kind: 'reply'},
-      {
-        from: 'layernorm_bwd',
-        to: 'layernorm_bwd',
-        label: 'block_reduce_sum2(sum_g, sum_gx)  — Σ dy·γ, Σ dy·γ·xhat',
-        kind: 'sync',
-      },
-      {
-        from: 'layernorm_bwd',
-        to: 'Device memory',
-        label: 'dx = rstd · (g − (sum_g + xhat · sum_gx) / cols) · partials += dy·xhat, dy',
-        kind: 'sync',
-      },
-      {
-        from: 'Host',
-        to: 'Device memory',
-        label: 'layernorm_bwd_reduce: dgamma[c] = Σ_p partial[p, c] · cudaMemcpy back',
-        kind: 'sync',
-      },
-      {from: 'Host', to: 'Host', label: 'six max errors vs the double CPU reference ≤ 1e-3 → PASS', kind: 'sync'},
-    ],
-  },
   hints: [
     'Welford and Chan are five lines each: update `count += 1; delta = v - mean; mean += delta / count; m2 += delta * (v - mean);`, merge `delta = b.mean - a.mean; mean = a.mean + delta * b.count / count; m2 = a.m2 + b.m2 + delta * delta * a.count * b.count / count`. Return `a` when `a.count + b.count == 0` — empty lanes exist whenever `cols < blockDim.x` and the warp tree merges them.',
     'The forward reduction: `warp_welford` shuffles the three fields with `__shfl_down_sync(FULL_MASK, s.count, offset)` and merges; lane 0 of warp `w` writes `s_warp[w]` (a `__shared__ Welford s_warp[32]`); `__syncthreads()`; warp 0 loads `s_warp[lane]` for `lane < 8` (an empty state otherwise) and runs `warp_welford` again; thread 0 writes `mean[row]`, `rstd[row] = rsqrtf(w.m2 / cols + eps)` and two `__shared__` floats; a second `__syncthreads()` before anyone reads them.',

@@ -11,21 +11,30 @@ each partial lives: a register per thread, registers passed between the 32 lanes
 kilobytes of shared memory per block, and global memory between blocks. A good reduction uses each level
 once, in that order, and moves as little as possible to the next.
 
-:::diagram
+Bottom to top, how many partials are left at each level for the 512 × 256 launch:
+
+:::architecture
 {
-  "nodes": [
-    {"id": "host", "kind": "client", "label": "Host", "sub": "2^24 floats · zero out · launch · Kahan reference", "x": 8, "y": 50},
-    {"id": "gmem", "kind": "db", "label": "Global memory", "sub": "in[n] read once, coalesced · out: one float", "x": 36, "y": 22},
-    {"id": "kernel", "kind": "service", "label": "reduce_sum<<<blocks, threads>>>", "sub": "register → warp → block → grid", "x": 62, "y": 50},
-    {"id": "smem", "kind": "db", "label": "Shared memory", "sub": "warp_sums[32] · one __syncthreads()", "x": 88, "y": 50},
-    {"id": "cpu", "kind": "external", "label": "CPU reference", "sub": "Kahan sum in double · rel tol 1e-5", "x": 36, "y": 78}
+  "input": "2²⁴ floats · 512 blocks × 256 threads",
+  "output": "one float",
+  "items": [
+    {"id": "g-in", "label": "Global memory", "sub": "in[n] · 16,777,216 floats", "kind": "memory", "shape": "16.8 M values", "detail": "Read once, coalesced: 64 MiB for 16 M adds, so the kernel is as fast as it reads."},
+    {"tone": "block", "repeat": "512 ×", "label": "Thread block · 256 threads", "items": [
+      {"id": "g-reg", "label": "Register per thread", "sub": "grid-stride: 128 adds each", "kind": "kernel", "shape": "131,072 partials", "detail": "Each thread folds every 131,072nd element into one register before any tree starts."},
+      {"tone": "dotted", "label": "each of 8 warps", "items": [
+        {"id": "g-warp", "label": "Warp shuffles", "sub": "32 lanes → lane 0", "kind": "kernel", "shape": "4,096 warp sums", "detail": "Five \`__shfl_down_sync\` steps: registers move lane to lane, no shared memory, no barrier."}
+      ]},
+      {"id": "g-smem", "label": "Shared memory", "sub": "warp_sums[8] per block", "kind": "memory", "shape": "8 slots per block", "detail": "Lane 0 of each warp writes its slot; one \`__syncthreads()\` makes them visible."},
+      {"id": "g-block", "label": "Warp 0 per block", "sub": "8 slots → lane 0", "kind": "kernel", "shape": "512 block sums", "detail": "Warp 0 reads the slots (0 past the warp count) and shuffles again."}
+    ]},
+    {"id": "g-atomic", "label": "atomicAdd into out", "sub": "one per block", "kind": "kernel", "shape": "1 float", "detail": "Blocks cannot synchronise inside a launch; their totals meet in global memory."},
+    {"id": "g-out", "label": "Global memory", "sub": "out · 4 bytes", "kind": "memory"}
   ],
-  "edges": [
-    {"from": "host", "to": "gmem", "kind": "plain", "label": "cudaMemcpy H2D · cudaMemset(out, 0)"},
-    {"from": "host", "to": "kernel", "kind": "plain", "label": "512 × 256 and 64 × 128"},
-    {"from": "kernel", "to": "gmem", "kind": "plain", "label": "in[i] · one atomicAdd per block"},
-    {"from": "kernel", "to": "smem", "kind": "plain", "label": "lane 0 writes its warp's sum"},
-    {"from": "host", "to": "cpu", "kind": "plain", "label": "compare the float read back"}
+  "notes": [
+    {"at": "g-reg", "text": "**131,072** partials, one register each"},
+    {"at": "g-warp", "text": "**4,096** warp sums, no barrier"},
+    {"at": "g-block", "text": "**512** block sums after **1** barrier each"},
+    {"at": "g-atomic", "text": "**512** atomics into one address"}
   ]
 }
 :::
@@ -70,19 +79,10 @@ walks seven kernels from the textbook tree to near-peak bandwidth; the first thr
 - Every level still costs a \`__syncthreads()\` and a round trip through shared memory. That is what the
   next two ideas remove.
 
-:::sequence
-{
-  "participants": ["Warp 0 (32 lanes)", "Shared memory", "Barrier"],
-  "messages": [
-    {"from": "Warp 0 (32 lanes)", "to": "Shared memory", "label": "s = 1: lanes 0,2,4,… add sdata[tid+1] — 16 lanes masked", "kind": "sync"},
-    {"from": "Warp 0 (32 lanes)", "to": "Barrier", "label": "__syncthreads()", "kind": "sync"},
-    {"from": "Warp 0 (32 lanes)", "to": "Shared memory", "label": "s = 2: lanes 0,4,8,… — 24 lanes masked", "kind": "sync"},
-    {"from": "Warp 0 (32 lanes)", "to": "Barrier", "label": "__syncthreads()", "kind": "sync"},
-    {"from": "Warp 0 (32 lanes)", "to": "Shared memory", "label": "s = 16: lane 0 alone — 31 lanes masked, same issue cost", "kind": "sync"},
-    {"from": "Shared memory", "to": "Warp 0 (32 lanes)", "label": "sdata[0]: correct, after 8 barriers for 256 threads", "kind": "reply"}
-  ]
-}
-:::
+Step through a shared-memory tree and watch the idle threads pile up level by level; beside it is the warp
+shuffle of the next section, which needs neither the barriers nor the shared memory:
+
+:::widget warp-reduce
 
 :::quiz
 Q: Kernel 1 (\`tid % (2*s) == 0\`) and kernel 3 (\`tid < s\`) do exactly the same number of adds. Why is kernel 3 faster?
@@ -158,16 +158,30 @@ for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * bloc
   and shuffles again. With at most 1024 threads there are at most 32 warps, so one warp finishes any block.
 - The guard matters: a 128-thread block fills four slots and leaves 28 uninitialised.
 
-:::sequence
+The hand-off inside one 256-thread block, bottom to top:
+
+:::architecture
 {
-  "participants": ["Block", "Warp", "Shared memory", "Global memory"],
-  "messages": [
-    {"from": "Warp", "to": "Global memory", "label": "grid-stride loads in[i] → register v", "kind": "sync"},
-    {"from": "Warp", "to": "Warp", "label": "warp_reduce_sum(v): 5 shuffles", "kind": "sync"},
-    {"from": "Warp", "to": "Shared memory", "label": "lane 0: warp_sums[warp] = v", "kind": "sync"},
-    {"from": "Block", "to": "Block", "label": "__syncthreads()", "kind": "sync"},
-    {"from": "Shared memory", "to": "Warp", "label": "warp 0 reads the blockDim.x / 32 slots", "kind": "reply"},
-    {"from": "Warp", "to": "Global memory", "label": "lane 0 of warp 0: atomicAdd(out, v)", "kind": "async"}
+  "input": "one grid-stride partial v per thread",
+  "output": "*out += block sum",
+  "items": [
+    {"tone": "block", "repeat": "512 ×", "label": "One block · 8 warps", "items": [
+      {"columns": [
+        [{"id": "h-w0", "label": "Warp 0 shuffles", "sub": "lane 0 → warp_sums[0]", "kind": "kernel"}],
+        [{"id": "h-w1", "label": "Warp 1 shuffles", "sub": "lane 0 → warp_sums[1]", "kind": "kernel"}],
+        [{"id": "h-w7", "label": "… warp 7", "sub": "lane 0 → warp_sums[7]", "kind": "kernel"}]
+      ]},
+      {"id": "h-smem", "label": "__shared__ warp_sums[32]", "sub": "slots 0–7 written, 8–31 stale", "kind": "memory", "detail": "Shared memory is not initialised: only the slots of existing warps hold sums."},
+      {"id": "h-sync", "label": "__syncthreads()", "sub": "every slot visible to warp 0", "kind": "kernel", "detail": "The only barrier in the kernel. Every thread must reach it, including those whose loop did zero iterations."},
+      {"id": "h-read", "label": "Warp 0 reads the slots", "sub": "lane < 8 ? warp_sums[lane] : 0", "kind": "kernel", "detail": "Lanes past \`blockDim.x / 32\` contribute 0, the identity of the sum."},
+      {"id": "h-shfl", "label": "warp_reduce_sum again", "sub": "5 shuffles → lane 0", "kind": "kernel"},
+      {"id": "h-atomic", "label": "atomicAdd(out, v)", "sub": "lane 0 of warp 0 only", "kind": "kernel"}
+    ]},
+    {"id": "h-out", "label": "Global memory", "sub": "out · 4 bytes", "kind": "memory"}
+  ],
+  "notes": [
+    {"at": "h-smem", "text": "A 128-thread block: **4** slots written, **28** stale"},
+    {"at": "h-read", "text": "The guard reads **0** past blockDim.x / 32"}
   ]
 }
 :::

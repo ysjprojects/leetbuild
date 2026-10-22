@@ -59,41 +59,112 @@ named after it (\`"reference"\` for post-LN, \`"residual identity"\` for adding 
 The attention itself (given here; its own problem), the embeddings, the final LayerNorm and the tied
 unembedding, weight decay groups and the optimiser, the KV cache, FlashAttention, mixed precision and
 \`torch.compile\`. The block is the unit; the model is a \`nn.ModuleList\` of it.`,
-  diagram: {
-    nodes: [
-      {id: 'x', kind: 'client', label: 'residual stream', sub: 'x · (B, T, C) · float32', x: 10, y: 50},
-      {id: 'attn', kind: 'service', label: 'ln_1 → attn → + x', sub: 'causal self-attention (given)', x: 35, y: 30},
+  architecture: {
+    input: 'from the embedding or the block below',
+    output: 'to the next block, or ln_f',
+    items: [
       {
-        id: 'mlp',
-        kind: 'service',
-        label: 'ln_2 → mlp → + x',
-        sub: 'c_fc 4C · gelu_tanh · c_proj · dropout',
-        x: 60,
-        y: 30,
+        id: 'x-in',
+        label: 'Residual stream',
+        kind: 'io',
+        sub: 'x · C = n_embd = 64',
+        shape: '[2, 16, 64]',
+        detail:
+          'One vector per position, only ever added to: the self-test feeds `B = 2`, `T = 16` at `n_embd = 64`, float32.',
       },
       {
-        id: 'params',
-        kind: 'db',
-        label: 'parameters',
-        sub: 'N(0, 0.02) · c_proj ÷ √(2·n_layer) · LN = 1, 0',
-        x: 48,
-        y: 75,
+        tone: 'block',
+        repeat: '12 ×',
+        label: 'Block · gpt2_block.py',
+        items: [
+          {
+            id: 'ln1',
+            label: 'LayerNorm ln_1',
+            kind: 'norm',
+            sub: 'nn.LayerNorm(64) · γ = 1, β = 0',
+            shape: '[2, 16, 64]',
+            detail:
+              'Pre-LN: a normalised copy for the attention to read. The stream `x` itself is not touched; `ln_1(x + …)` (post-LN) fails the reference.',
+          },
+          {
+            id: 'attn',
+            label: 'Causal self-attention',
+            kind: 'attention',
+            sub: '4 heads × 16 · given',
+            shape: '[2, 16, 64]',
+            side: {
+              label: 'tril mask',
+              sub: 'block_size 32',
+              detail:
+                'A non-persistent `(1, 1, 32, 32)` boolean buffer; future scores become `-inf` before the softmax.',
+            },
+            detail:
+              '`c_attn` 64 → 192 splits into q, k, v; scores `q @ kᵀ / √16`, masked, softmax, `@ v`; `c_proj` 64 → 64 and `resid_dropout`. Given in the file; its `c_proj.weight` takes the rescaled init too.',
+          },
+          {
+            id: 'add1',
+            op: '+',
+            from: 'ln1',
+            detail: '`x = x + attn(ln_1(x))`: with `attn.c_proj` zeroed this adds exactly zero.',
+          },
+          {
+            id: 'ln2',
+            label: 'LayerNorm ln_2',
+            kind: 'norm',
+            sub: 'nn.LayerNorm(64) · γ = 1, β = 0',
+            shape: '[2, 16, 64]',
+            detail: 'The MLP’s normalised copy of the stream, after the attention’s write.',
+          },
+          {
+            id: 'mlp',
+            label: 'MLP',
+            kind: 'ffn',
+            sub: '64 → 256 → 64',
+            shape: '[2, 16, 64]',
+            detail:
+              '`c_fc` to `4 · n_embd`, `gelu_tanh`, `c_proj` back, dropout; each position on its own. 33,088 of the block’s 49,984 parameters.',
+          },
+          {
+            id: 'add2',
+            op: '+',
+            from: 'ln2',
+            detail: '`x = x + mlp(ln_2(x))`: the second write into the stream.',
+          },
+        ],
       },
       {
-        id: 'ref',
-        kind: 'external',
-        label: 'self-test',
-        sub: 'SDPA(is_causal) · F.gelu(tanh) · gradcheck',
-        x: 85,
-        y: 50,
+        id: 'x-out',
+        label: 'Residual stream',
+        kind: 'io',
+        sub: 'x + attn(…) + mlp(…)',
+        shape: '[2, 16, 64]',
+        detail:
+          'Same shape as the input: the block is a function from the stream to the stream, stacked `n_layer` times.',
       },
     ],
-    edges: [
-      {from: 'x', to: 'attn', kind: 'plain', label: 'x'},
-      {from: 'attn', to: 'mlp', kind: 'plain', label: 'x + a'},
-      {from: 'params', to: 'attn', kind: 'plain', label: 'c_attn · c_proj · ln_1'},
-      {from: 'params', to: 'mlp', kind: 'plain', label: 'c_fc · c_proj · ln_2'},
-      {from: 'mlp', to: 'ref', kind: 'plain', label: 'allclose · equal'},
+    notes: [
+      {at: 'attn', text: 'c_proj std **0.02 / √24 ≈ 0.0041**'},
+      {at: 'mlp', text: '**2/3** of the block’s **49,984** parameters', side: 'left'},
+      {at: 'ln1', text: 'Pre-LN: normalise the **input**, add to the raw stream'},
+      {at: 'add1', text: 'Residual stream, never normalised', side: 'left'},
+    ],
+    insets: [
+      {
+        for: 'mlp',
+        title: 'MLP',
+        items: [
+          {id: 'c-fc', label: 'Linear c_fc', sub: '64 → 256 · N(0, 0.02)', shape: '[2, 16, 256]'},
+          {
+            id: 'gelu',
+            label: 'gelu_tanh',
+            sub: 'tanh(√(2/π)(x + 0.044715x³))',
+            detail: 'Written out with `torch.tanh`; held to `F.gelu(approximate="tanh")` at `1e-12` in float64.',
+          },
+          {id: 'c-proj', label: 'Linear c_proj', sub: '256 → 64 · N(0, 0.02/√24)', shape: '[2, 16, 64]'},
+          {id: 'mlp-drop', label: 'Dropout', sub: 'cfg.dropout = 0.0'},
+        ],
+        note: 'Hidden width **4 × 64 = 256**; linears **N(0, 0.02)**, biases **0**',
+      },
     ],
   },
   steps: [gpt2BlockStep],

@@ -13,19 +13,44 @@ runs on the GPU as thousands of threads at once. Vector add is the smallest kern
 — \`c[i] = a[i] + b[i]\` — and the host code around it is the shape every custom kernel in a training
 stack sits inside: allocate, copy in, pick a grid, launch, check, synchronise, copy out, compare, free.
 
-:::diagram
+Read the figure bottom to top: the data's path from host memory across the link, through one thread
+block's registers and back.
+
+:::architecture
 {
-  "nodes": [
-    {"id": "host", "kind": "client", "label": "Host · main()", "sub": "fills a, b · CPU reference · max abs err · PASS", "x": 8, "y": 50},
-    {"id": "launch", "kind": "service", "label": "launch_vector_add", "sub": "blocks = min(⌈n/256⌉, 1024) · cudaGetLastError", "x": 36, "y": 50},
-    {"id": "kernel", "kind": "service", "label": "vector_add<<<blocks, 256>>>", "sub": "grid-stride loop over n", "x": 64, "y": 50},
-    {"id": "dmem", "kind": "db", "label": "Device memory", "sub": "d_a · d_b · d_c · 16 MiB each", "x": 92, "y": 50}
+  "input": "h_a, h_b · n = 4,194,341 float32",
+  "output": "h_c · max abs err 0 → PASS",
+  "items": [
+    {"id": "host-in", "label": "Host buffers h_a, h_b", "kind": "host", "sub": "pageable · 2 × 16 MiB", "detail": "Filled by main, which also computes the CPU reference. The kernel cannot dereference host memory."},
+    {"id": "h2d", "label": "cudaMemcpy host → device", "kind": "io", "sub": "2 × 16 MiB · blocking", "detail": "After three cudaMallocs; every call goes through CUDA_CHECK."},
+    {"id": "gmem-in", "label": "Global memory d_a, d_b", "kind": "memory", "sub": "cudaMalloc · 2 × 16 MiB", "shape": "float[4,194,341] × 2", "detail": "HBM, 256-byte aligned. Each launch reads both once."},
+    {"tone": "block", "repeat": "1,024 ×", "label": "Thread block · 256 threads", "items": [
+      {"id": "idx", "label": "Global index", "kind": "kernel", "sub": "i = blockIdx.x·256 + threadIdx.x", "side": {"label": "launch_vector_add", "sub": "<<<1024, 256>>>", "detail": "min(⌈n / 256⌉, 1024) blocks, then CUDA_CHECK(cudaGetLastError())."}, "detail": "Adjacent threads start at adjacent elements."},
+      {"tone": "dotted", "repeat": "16–17 ×", "label": "Grid-stride loop", "items": [
+        {"columns": [
+          [{"id": "ld-a", "label": "Load a[i]", "kind": "memory", "sub": "into a register", "detail": "A warp loads 32 consecutive floats: 128 bytes, fully coalesced."}],
+          [{"id": "ld-b", "label": "Load b[i]", "kind": "memory", "sub": "into a register"}]
+        ]},
+        {"id": "add", "op": "+", "detail": "One FADD in registers, the only arithmetic."},
+        {"id": "st-c", "label": "Store c[i]", "kind": "kernel", "sub": "then i += gridDim.x · blockDim.x", "detail": "The loop condition is the bounds test: nothing past c[n − 1]."}
+      ]}
+    ]},
+    {"id": "gmem-out", "label": "Global memory d_c", "kind": "memory", "sub": "16 MiB · each element written once", "shape": "float[4,194,341]"},
+    {"id": "d2h", "label": "cudaMemcpy device → host", "kind": "io", "sub": "16 MiB · after the synchronise", "detail": "CUDA_CHECK(cudaDeviceSynchronize()) first, then the copy and three cudaFrees."},
+    {"id": "host-out", "label": "Host buffer h_c", "kind": "host", "sub": "max |h_c − h_ref| → PASS"}
   ],
-  "edges": [
-    {"from": "host", "to": "dmem", "kind": "plain", "label": "cudaMalloc · cudaMemcpy H2D / D2H · cudaFree"},
-    {"from": "host", "to": "launch", "kind": "plain", "label": "warm-up · 20 timed launches"},
-    {"from": "launch", "to": "kernel", "kind": "plain", "label": "<<<blocks, BLOCK_SIZE>>>"},
-    {"from": "kernel", "to": "dmem", "kind": "plain", "label": "c[i] = a[i] + b[i]"}
+  "notes": [
+    {"at": "idx", "text": "**1,024 × 256** = 262,144 threads: a capped grid"},
+    {"at": "st-c", "text": "**16 or 17** passes per thread for n = 4,194,341"},
+    {"at": "gmem-in", "text": "**12 B** of HBM per FLOP: bandwidth-bound"},
+    {"at": "h2d", "text": "Every runtime call wrapped in **CUDA_CHECK**"},
+    {"at": "d2h", "text": "**cudaDeviceSynchronize** first: kernel faults surface there"}
+  ],
+  "insets": [
+    {"for": "ld-b", "title": "One warp, one load", "items": [
+      {"id": "lanes", "label": "32 lanes, threads t … t + 31", "kind": "kernel", "sub": "addresses &b[i] … &b[i] + 124 B"},
+      {"id": "sectors", "label": "4 × 32-byte sectors", "kind": "memory", "sub": "one 128-byte request"}
+    ], "note": "**100 %** of the fetched bytes are used"}
   ]
 }
 :::
@@ -86,20 +111,10 @@ The obvious kernel gives each thread one element: \`int i = blockIdx.x * blockDi
 It is wrong twice. The last block's spare threads write past the end of \`c\`, and once the grid is capped,
 elements beyond \`gridDim.x * blockDim.x\` are never visited at all:
 
-:::sequence
-{
-  "participants": ["Host", "vector_add (1 per thread)", "Device memory"],
-  "messages": [
-    {"from": "Host", "to": "vector_add (1 per thread)", "label": "<<<1024, 256>>> — 262,144 threads for n = 4,194,341", "kind": "async"},
-    {"from": "vector_add (1 per thread)", "to": "Device memory", "label": "c[0 … 262,143] = a + b", "kind": "sync"},
-    {"from": "vector_add (1 per thread)", "to": "Device memory", "label": "c[262,144 … 4,194,340] never written", "kind": "sync"},
-    {"from": "Host", "to": "Host", "label": "max abs err ≈ 2 → FAIL", "kind": "sync"},
-    {"from": "Host", "to": "vector_add (1 per thread)", "label": "<<<16385, 256>>> uncapped, no bounds test", "kind": "async"},
-    {"from": "vector_add (1 per thread)", "to": "Device memory", "label": "c[4,194,341 … 4,194,559] = 219 writes past the end", "kind": "sync"},
-    {"from": "Host", "to": "Host", "label": "cudaDeviceSynchronize → illegal address, or silent corruption", "kind": "sync"}
-  ]
-}
-:::
+| Launch, one element per thread | Threads | Elements of \`c\` written | Result |
+| --- | --- | --- | --- |
+| \`<<<1024, 256>>>\`, capped | 262,144 | \`c[0 … 262,143]\`; \`c[262,144 … 4,194,340]\` never written | max abs err ≈ 2, \`FAIL\` |
+| \`<<<16385, 256>>>\`, uncapped, no bounds test | 4,194,560 | all of \`c\`, plus \`c[4,194,341 … 4,194,559]\`: 219 writes past the end | illegal address at the synchronise, or silent corruption |
 
 The [grid-stride loop](https://developer.nvidia.com/blog/cuda-pro-tip-write-flexible-kernels-grid-stride-loops/)
 fixes both with the same four lines:
@@ -112,17 +127,12 @@ for (int i = start; i < n; i += stride) {
 }
 \`\`\`
 
-:::sequence
-{
-  "participants": ["Host", "vector_add (grid-stride)", "Device memory"],
-  "messages": [
-    {"from": "Host", "to": "vector_add (grid-stride)", "label": "<<<1024, 256>>> — 262,144 threads, stride 262,144", "kind": "async"},
-    {"from": "vector_add (grid-stride)", "to": "Device memory", "label": "thread 0: c[0], c[262,144], … c[3,932,160]  (16 elements)", "kind": "sync"},
-    {"from": "vector_add (grid-stride)", "to": "Device memory", "label": "thread 5: c[5], … c[4,194,245], c[4,194,389] < n? no → stop  (17 elements)", "kind": "sync"},
-    {"from": "Host", "to": "Host", "label": "every i < n exactly once, nothing past n → max abs err 0 → PASS", "kind": "sync"}
-  ]
-}
-:::
+Thread \`t\` visits \`t\`, \`t + stride\`, \`t + 2·stride\`, … while the index is below \`n\`. With 1024 × 256
+threads, threads 0 … 36 write 17 elements (thread 0: \`c[0]\`, \`c[262,144]\`, … \`c[4,194,304]\`) and every
+other thread writes 16; every \`i < n\` is written exactly once and nothing past it. The same loop on a small
+array, where you can shrink the grid and watch the passes and the bounds check at the tail:
+
+:::widget cuda-grid {"n": 50, "block": 8}
 
 | Property | One thread per element | Grid-stride loop |
 | --- | --- | --- |
@@ -138,6 +148,11 @@ the loop keeps the **coalesced** access pattern that makes the kernel run at mem
 that instead walked its own contiguous chunk (\`i = t * 16 … t * 16 + 15\`) would scatter a warp's loads
 across 16 cache lines.
 
+The same warp under other access patterns (strided, misaligned, \`float4\`), with the sectors each one
+touches:
+
+:::widget coalescing
+
 :::quiz
 Q: The grid is 1024 × 256 threads and n = 4,194,341. How many elements does thread 5 handle, and why not thread 100,000?
 - [ ] Exactly 16 each — n / 262,144 rounded down
@@ -150,22 +165,15 @@ Q: The grid is 1024 × 256 threads and n = 4,194,341. How many elements does thr
 
 Almost every function in the runtime API returns a \`cudaError_t\`, and C++ lets you ignore it. The
 [error-checking](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#error-checking) rules
-are simple but the consequences of skipping them are not:
+are simple but the consequences of skipping them are not. An unchecked program, call by call:
 
-:::sequence
-{
-  "participants": ["Host (unchecked)", "Runtime", "Device"],
-  "messages": [
-    {"from": "Host (unchecked)", "to": "Runtime", "label": "cudaMalloc(&d_c, 16 MiB)", "kind": "sync"},
-    {"from": "Runtime", "to": "Host (unchecked)", "label": "cudaErrorMemoryAllocation — return value dropped, d_c stays nullptr", "kind": "reply"},
-    {"from": "Host (unchecked)", "to": "Runtime", "label": "cudaMemcpy(d_a, …) ok · cudaMemcpy(d_b, …) ok", "kind": "sync"},
-    {"from": "Host (unchecked)", "to": "Device", "label": "vector_add<<<1024, 256>>>(d_a, d_b, nullptr, n)", "kind": "async"},
-    {"from": "Device", "to": "Runtime", "label": "illegal address at c[0] — asynchronous, nobody is listening", "kind": "async"},
-    {"from": "Host (unchecked)", "to": "Runtime", "label": "cudaMemcpy(h_c, d_c, …) — returns cudaErrorIllegalAddress, also dropped", "kind": "sync"},
-    {"from": "Host (unchecked)", "to": "Host (unchecked)", "label": "compares zeros to the reference → FAIL, three calls from the cause, no line", "kind": "sync"}
-  ]
-}
-:::
+| Call, unchecked | What it returns | What the program does next |
+| --- | --- | --- |
+| \`cudaMalloc(&d_c, 16 MiB)\` | \`cudaErrorMemoryAllocation\` | drops it; \`d_c\` stays \`nullptr\` |
+| \`cudaMemcpy(d_a, …)\`, \`cudaMemcpy(d_b, …)\` | \`cudaSuccess\` | carries on |
+| \`vector_add<<<1024, 256>>>(d_a, d_b, nullptr, n)\` | nothing: a launch has no return value | carries on; the kernel faults at \`c[0]\` on the device, and nobody is listening |
+| \`cudaMemcpy(h_c, d_c, …)\` | \`cudaErrorIllegalAddress\` | drops it too |
+| the comparison | zeros against the reference | prints \`FAIL\`, three calls from the cause, with no line number |
 
 The macro turns that into one line on \`stderr\` at the \`cudaMalloc\`:
 

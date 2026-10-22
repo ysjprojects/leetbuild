@@ -12,21 +12,26 @@ learned vectors. A transformer applies it before every attention and every MLP, 
 it 64 times per token forward and 64 times backward. On a GPU it is one block per row: a reduction for the
 row's statistics, then an elementwise pass.
 
-:::diagram
+Three kernels, bottom to top:
+
+:::architecture
 {
-  "nodes": [
-    {"id": "host", "kind": "client", "label": "Host · main()", "sub": "fills x, dy, γ, β · rows at 1000 · CPU reference in double", "x": 8, "y": 50},
-    {"id": "fwd", "kind": "service", "label": "layernorm_fwd<<<rows, 256>>>", "sub": "Welford per thread · Chan merge across the block · rsqrtf", "x": 34, "y": 22},
-    {"id": "stats", "kind": "db", "label": "mean[rows] · rstd[rows]", "sub": "two floats per row, kept for the backward", "x": 60, "y": 50},
-    {"id": "bwd", "kind": "service", "label": "layernorm_bwd<<<64, 256>>>", "sub": "two row reductions → dx · partial rows of dγ, dβ", "x": 34, "y": 78},
-    {"id": "reduce", "kind": "service", "label": "layernorm_bwd_reduce", "sub": "one thread per column sums 64 partials", "x": 88, "y": 78}
+  "input": "x, γ, β · 256 × 1000 fp32",
+  "output": "compared with a double reference",
+  "items": [
+    {"id": "g-host", "label": "Host · main()", "sub": "4 rows at 1000 · CPU reference", "kind": "host"},
+    {"id": "g-x", "label": "Global memory", "sub": "x[256, 1000] · γ, β [1000]", "kind": "memory"},
+    {"id": "g-fwd", "label": "layernorm_fwd<<<256, 256>>>", "sub": "Welford · Chan merge · rsqrtf", "kind": "kernel", "detail": "One block per row: Welford per thread, Chan's merge across the warp and through shared memory, then y = x̂ · γ + β."},
+    {"id": "g-stats", "label": "mean[row], rstd[row]", "sub": "saved · y[256, 1000] written", "kind": "memory", "detail": "Two floats per row, kept for the backward."},
+    {"id": "g-bwd", "label": "layernorm_bwd<<<64, 256>>>", "sub": "Σ dy·γ, Σ dy·γ·x̂ → dx", "kind": "kernel", "side": {"label": "dy", "sub": "[256, 1000]"}, "detail": "Block b handles rows b, b + 64, …: two row reductions, then dx and a partial row of dγ, dβ."},
+    {"id": "g-part", "label": "dγ, dβ partial rows", "sub": "[64, 1000] · dx written", "kind": "memory"},
+    {"id": "g-red", "label": "layernorm_bwd_reduce", "sub": "one thread per column", "kind": "kernel", "detail": "Thread c sums the 64 partial rows of column c."},
+    {"id": "g-out", "label": "dγ, dβ", "sub": "[1000] each", "kind": "memory"}
   ],
-  "edges": [
-    {"from": "host", "to": "fwd", "kind": "plain", "label": "x, γ, β"},
-    {"from": "fwd", "to": "stats", "kind": "plain", "label": "mean[row], rstd[row]"},
-    {"from": "host", "to": "bwd", "kind": "plain", "label": "dy"},
-    {"from": "stats", "to": "bwd", "kind": "plain", "label": "no second variance"},
-    {"from": "bwd", "to": "reduce", "kind": "plain", "label": "dgamma_partial, dbeta_partial"}
+  "notes": [
+    {"at": "g-fwd", "text": "**256** blocks, one per row"},
+    {"at": "g-stats", "text": "**2** floats per row: no second variance"},
+    {"at": "g-part", "text": "**64** partial rows instead of atomics"}
   ]
 }
 :::
@@ -72,6 +77,10 @@ the last dimension, including the biased variance. In memory, for the self-test'
 - **Bandwidth-bound.** About 8 bytes moved per element forward and 12 backward, for a handful of FLOPs. The
   kernel's speed is how few times it touches HBM; its correctness is all in the reduction.
 
+LayerNorm beside its mean-free cousin RMSNorm, on one vector of activations:
+
+:::widget norm-compare
+
 :::quiz
 Q: Why does the forward write mean[row] and rstd[row] to global memory when y is all the next layer needs?
 - [ ] cuDNN requires them as outputs
@@ -83,27 +92,24 @@ Q: Why does the forward write mean[row] and rstd[row] to global memory when y is
 # Why E[x²] − E[x]² fails in float
 
 The one-pass formula everyone writes first is \`var = Σx²/N − (Σx/N)²\`. It is exact in real numbers and
-useless in float when the mean is large next to the spread. Row 0 of the self-test is \`1000 + U(−1, 1)\`:
+useless in float when the mean is large next to the spread. Row 0 of the self-test is \`1000 + U(−1, 1)\`, and
+the naive kernel goes through it like this:
 
-:::sequence
-{
-  "participants": ["256 threads", "Block reduction", "Thread 0"],
-  "messages": [
-    {"from": "256 threads", "to": "256 threads", "label": "sum += x · sumsq += x * x  — each x² ≈ 10⁶", "kind": "sync"},
-    {"from": "256 threads", "to": "Block reduction", "label": "partials: Σx ≈ 4000, Σx² ≈ 4·10⁶ per thread", "kind": "sync"},
-    {"from": "Block reduction", "to": "Thread 0", "label": "Σx ≈ 999 994 · Σx² ≈ 9.9999·10⁸ — float ulp there is 64", "kind": "reply"},
-    {"from": "Thread 0", "to": "Thread 0", "label": "E[x²] ≈ 999 989.3 · E[x]² ≈ 999 988.9 — float grid 0.0625 apart", "kind": "sync"},
-    {"from": "Thread 0", "to": "Thread 0", "label": "var = 0.375 (true 0.328) · rstd 6% off on every element", "kind": "sync"},
-    {"from": "Thread 0", "to": "Thread 0", "label": "flatter row 1000 ± 0.01: var = −0.125 → rsqrtf → NaN", "kind": "sync"}
-  ]
-}
-:::
+| Stage, row 0 in float | What the kernel holds |
+| --- | --- |
+| Per thread | \`sum += x\`, \`sumsq += x * x\`, each \`x²\` ≈ 10⁶ |
+| After the block reduction | Σx ≈ 999 994, Σx² ≈ 9.9999·10⁸, where the float spacing is 64 |
+| Thread 0 | E[x²] ≈ 999 989.3, E[x]² ≈ 999 988.9, on a float grid 0.0625 apart |
+| Result | var = 0.375 against a true 0.328: \`rstd\` 6% off on every element |
+| A flatter row, 1000 ± 0.01 | var = −0.125, and \`rsqrtf\` returns NaN |
 
 This is catastrophic cancellation:
 two large numbers that agree in most of their digits are subtracted, and what is left is the rounding error
 of each. A float carries 24 bits, about seven decimal digits; near 10⁶ adjacent floats are 0.0625 apart, so
 the difference of two such numbers can only be a multiple of 0.0625 before any accumulation error is
-counted.
+counted. The two float32 formulas, side by side as the offset grows:
+
+:::widget variance-cancellation
 
 | Row | True variance | \`E[x²] − E[x]²\` in float | Welford + Chan in float |
 | --- | --- | --- | --- |
@@ -156,16 +162,29 @@ The last term is what a naive "add the two variances" misses: two halves with th
 different means have a larger combined variance. The merge is associative in real arithmetic, so any
 tree of merges gives the same answer — which is what lets a block reduce it like a sum:
 
-:::sequence
+:::architecture
 {
-  "participants": ["Thread t", "Warp (32 lanes)", "__shared__ s_warp[32]", "Warp 0 · thread 0"],
-  "messages": [
-    {"from": "Thread t", "to": "Thread t", "label": "welford_update over columns t, t+256, t+512, t+768 (< 1000)", "kind": "sync"},
-    {"from": "Thread t", "to": "Warp (32 lanes)", "label": "offset 16, 8, 4, 2, 1: __shfl_down_sync count, mean, m2 → welford_merge", "kind": "sync"},
-    {"from": "Warp (32 lanes)", "to": "__shared__ s_warp[32]", "label": "lane 0 writes s_warp[warp] · __syncthreads()", "kind": "sync"},
-    {"from": "__shared__ s_warp[32]", "to": "Warp 0 · thread 0", "label": "lanes 0–7 load the 8 states, lanes 8–31 empty → warp_welford", "kind": "reply"},
-    {"from": "Warp 0 · thread 0", "to": "Warp 0 · thread 0", "label": "rstd = rsqrtf(m2 / 1000 + eps) · mean[row], rstd[row] = …", "kind": "sync"},
-    {"from": "Warp 0 · thread 0", "to": "Thread t", "label": "via __shared__ s_mean, s_rstd · __syncthreads() · y = x̂ · γ + β", "kind": "reply"}
+  "input": "x[row] · 1000 floats",
+  "output": "y[row]",
+  "items": [
+    {"tone": "block", "repeat": "256 ×", "label": "One block · one row", "items": [
+      {"id": "w-thr", "label": "welford_update per thread", "sub": "c = t, t + 256, t + 512, t + 768", "kind": "kernel", "shape": "256 states (n, mean, M2)"},
+      {"columns": [
+        [{"id": "w-w0", "label": "Warp 0 · warp_welford", "sub": "shfl n, mean, M2 → merge", "kind": "kernel"}],
+        [{"id": "w-w1", "label": "Warp 1 · warp_welford", "sub": "shfl n, mean, M2 → merge", "kind": "kernel"}],
+        [{"id": "w-w7", "label": "… warp 7", "sub": "shfl n, mean, M2 → merge", "kind": "kernel"}]
+      ]},
+      {"id": "w-slots", "label": "__shared__ s_warp[32]", "sub": "lane 0 writes · __syncthreads()", "kind": "memory"},
+      {"id": "w-merge", "label": "Warp 0 merges 8 states", "sub": "lanes 8–31: count = 0", "kind": "kernel", "detail": "Lanes past the warp count load empty states, which merge to the other state, not to 0 / 0."},
+      {"id": "w-rstd", "label": "Thread 0: the statistics", "sub": "rstd = rsqrtf(M2 / 1000 + eps)", "kind": "kernel"},
+      {"id": "w-pub", "label": "s_mean, s_rstd · mean[row]", "sub": "shared and global · barrier", "kind": "memory"},
+      {"id": "w-y", "label": "Every thread writes y", "sub": "y = x̂ · γ + β", "kind": "kernel"}
+    ]}
+  ],
+  "notes": [
+    {"at": "w-w7", "text": "**5** merges per warp, no shared memory"},
+    {"at": "w-merge", "text": "Empty states merge cleanly, never **0 / 0**"},
+    {"at": "w-pub", "text": "**2** barriers per row"}
   ]
 }
 :::
@@ -207,16 +226,29 @@ variance (stretching the row changes \`rstd\`). So the backward has the forward'
 block reduction of two sums, then an elementwise pass; and across rows, a reduction per column for \`dγ\` and
 \`dβ\`.
 
-:::sequence
+Bottom to top, one backward block and the column reduce after it:
+
+:::architecture
 {
-  "participants": ["layernorm_bwd block b", "Device memory", "layernorm_bwd_reduce"],
-  "messages": [
-    {"from": "layernorm_bwd block b", "to": "Device memory", "label": "zero partial row b of dgamma_partial, dbeta_partial", "kind": "sync"},
-    {"from": "Device memory", "to": "layernorm_bwd block b", "label": "row b, b+64, b+128, b+192: dy, x, saved mean[row], rstd[row]", "kind": "reply"},
-    {"from": "layernorm_bwd block b", "to": "layernorm_bwd block b", "label": "sum_g += g · sum_gx += g * xhat → block_reduce_sum2", "kind": "sync"},
-    {"from": "layernorm_bwd block b", "to": "Device memory", "label": "dx = rstd · (g − (sum_g + xhat · sum_gx) / cols)", "kind": "sync"},
-    {"from": "layernorm_bwd block b", "to": "Device memory", "label": "partial[b, c] += dy · xhat, dy  — thread t owns columns ≡ t mod 256", "kind": "sync"},
-    {"from": "layernorm_bwd_reduce", "to": "Device memory", "label": "thread c: dgamma[c] = Σ_p partial[p, c] over 64 rows", "kind": "sync"}
+  "input": "dy, x · saved mean, rstd",
+  "output": "parameter gradients",
+  "items": [
+    {"tone": "block", "repeat": "64 ×", "label": "layernorm_bwd · block b", "items": [
+      {"id": "k-zero", "label": "Zero partial row b", "sub": "dgamma_partial, dbeta_partial", "kind": "kernel"},
+      {"tone": "dotted", "label": "4 rows each", "items": [
+        {"id": "k-load", "label": "Load dy, x, mean, rstd", "sub": "x̂ = (x − mean)·rstd, g = dy·γ", "kind": "kernel"},
+        {"id": "k-sum", "label": "block_reduce_sum2", "sub": "sum_g = Σ g, sum_gx = Σ g·x̂", "kind": "kernel"},
+        {"id": "k-dx", "label": "Write dx", "sub": "rstd·(g − (sum_g + x̂·sum_gx)/N)", "kind": "kernel"},
+        {"id": "k-acc", "label": "Add to partial row b", "sub": "+= dy·x̂, dy · c ≡ t (mod 256)", "kind": "kernel"}
+      ]}
+    ]},
+    {"id": "k-part", "label": "dγ, dβ partial rows", "sub": "[64, 1000] each", "kind": "memory"},
+    {"id": "k-red", "label": "layernorm_bwd_reduce", "sub": "dγ[c] = Σ_p partial[p, c]", "kind": "kernel"},
+    {"id": "k-out", "label": "dγ, dβ", "sub": "[1000] each", "kind": "memory"}
+  ],
+  "notes": [
+    {"at": "k-sum", "text": "dx needs the **row totals**: a barrier first"},
+    {"at": "k-red", "text": "**64** partials in a fixed order: deterministic"}
   ]
 }
 :::

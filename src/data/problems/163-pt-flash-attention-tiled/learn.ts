@@ -17,21 +17,37 @@ that max. The drill writes that loop in PyTorch:
 \`[B, H, block_q, block_k]\` tiles, the causal mask is applied inside a tile, tiles entirely after the query
 tile are skipped, the arithmetic is float32, and \`torch.autograd.gradcheck\` passes through the loop.
 
-:::diagram
+The same loop in the shape of a kernel, with the tiles in on-chip memory and the per-tile update opened up on
+the right:
+
+:::architecture
 {
-  "nodes": [
-    {"id": "inputs", "kind": "client", "label": "q · k · v", "sub": "[B, H, T, hd] · T = 37 in the self-test", "x": 6, "y": 50},
-    {"id": "qloop", "kind": "service", "label": "query tiles", "sub": "rows q0:q1 · one output tile each", "x": 30, "y": 50},
-    {"id": "kloop", "kind": "service", "label": "key/value tiles", "sub": "s = q kᵀ/√hd · mask · p = exp(s − m_new)", "x": 54, "y": 50},
-    {"id": "stats", "kind": "db", "label": "m · l · o", "sub": "running max · running sum · accumulator", "x": 78, "y": 26},
-    {"id": "ref", "kind": "external", "label": "F.scaled_dot_product_attention", "sub": "the fused kernel the test compares against", "x": 78, "y": 74}
+  "input": "from the QKV projection",
+  "output": "exact softmax(q kᵀ / √hd) v",
+  "items": [
+    {"id": "hbm-in", "label": "q, k, v in HBM", "kind": "memory", "sub": "[B, H, T, hd] · read once", "detail": "The self-test runs \`B, H, T, hd = 2, 3, 37, 16\`."},
+    {"tone": "block", "repeat": "⌈T / block_q⌉ ×", "label": "One query tile", "items": [
+      {"id": "q-sram", "label": "Q tile in SRAM", "kind": "memory", "sub": "[block_q, hd]", "detail": "Loaded once and reused against every key tile; \`m = −inf\`, \`l = 0\`, \`o = 0\` per row."},
+      {"tone": "block", "repeat": "while k0 < q1", "label": "One key/value tile", "items": [
+        {"id": "kv-sram", "label": "K, V tiles in SRAM", "kind": "memory", "sub": "[block_k, hd] each"},
+        {"id": "s-tile", "label": "Score tile", "kind": "attention", "sub": "q kᵀ / √hd · [block_q, block_k]", "side": {"label": "Causal mask", "sub": "diagonal tiles only"}, "detail": "The only scores that ever exist: one \`[block_q, block_k]\` tile, masked in place when it crosses the diagonal."},
+        {"id": "online", "label": "Online softmax update", "kind": "attention", "sub": "m, l, o rescaled by alpha", "detail": "Fold the tile into the three per-row statistics; nothing is written back to HBM."}
+      ]},
+      {"id": "divide", "label": "Normalise once", "sub": "o / l", "detail": "After the last key tile, when \`l\` is complete."}
+    ]},
+    {"id": "hbm-out", "label": "Output in HBM", "kind": "memory", "sub": "[B, H, T, hd] · written once"}
   ],
-  "edges": [
-    {"from": "inputs", "to": "qloop", "kind": "plain", "label": "q[:, :, q0:q1]"},
-    {"from": "qloop", "to": "kloop", "kind": "plain", "label": "k, v [k0:k1] · skip if k0 ≥ q1"},
-    {"from": "kloop", "to": "stats", "kind": "plain", "label": "alpha = exp(m − m_new) · l, o rescaled"},
-    {"from": "stats", "to": "qloop", "kind": "plain", "label": "o / l"},
-    {"from": "inputs", "to": "ref", "kind": "plain", "label": "allclose(atol=1e-5) · gradcheck"}
+  "notes": [
+    {"at": "hbm-in", "text": "No **[T, T]** tensor anywhere"},
+    {"at": "hbm-out", "text": "Bytes written: **O(T)**, not **O(T²)**"}
+  ],
+  "insets": [
+    {"for": "online", "title": "Online softmax update", "items": [
+      {"id": "u-max", "label": "New running max", "sub": "m_new = max(m, rowmax s)"},
+      {"id": "u-alpha", "label": "Rescale factor", "kind": "attention", "sub": "alpha = exp(m − m_new)"},
+      {"id": "u-exp", "label": "Exponentials", "sub": "p = exp(s − m_new)"},
+      {"id": "u-acc", "label": "Rescale and add", "kind": "attention", "sub": "l = alpha·l + Σp · o = alpha·o + p v"}
+    ], "note": "**alpha ≤ 1**: it only shrinks what came before"}
   ]
 }
 :::
@@ -103,7 +119,12 @@ A row whose scores arrive as \`[1, 3]\` then \`[5, 2]\`:
 | After tile | m | l | compare with the one-shot sum |
 | --- | --- | --- | --- |
 | \`[1, 3]\` | 3 | \`e⁻² + e⁰ = 1.1353\` | — |
-| \`[5, 2]\` | 5 | \`e⁻² · 1.1353 + e⁰ + e⁻³ = 1.2035\` | \`e⁻⁴ + e⁻² + e⁰ + e⁻³ = 1.2035\` |
+| \`[5, 2]\` | 5 | \`e⁻² · 1.1353 + e⁰ + e⁻³ = 1.2034\` | \`e⁻⁴ + e⁻² + e⁰ + e⁻³ = 1.2034\` |
+
+Step through a longer row in the widget: the running max, the running sum and the rescale of what was already
+accumulated, tile by tile, ending at the full softmax.
+
+:::widget online-softmax {"tile": 4}
 
 The properties that make this safe:
 
@@ -134,20 +155,24 @@ property of **absolute positions**, and a tile knows where it sits:
 - Otherwise the tile crosses the diagonal: \`rows = arange(q0, q1)[:, None]\`, \`cols = arange(k0, k1)[None, :]\`,
   \`s.masked_fill(cols > rows, -inf)\` — an \`[block_q, block_k]\` mask, built from two small index vectors.
 
-:::sequence
-{
-  "participants": ["flash_attention", "keys 0..7", "keys 8..15", "keys 16..23", "m · l · o"],
-  "messages": [
-    {"from": "flash_attention", "to": "m · l · o", "label": "query rows 8..15: m = −inf, l = 0, o = 0", "kind": "sync"},
-    {"from": "flash_attention", "to": "keys 0..7", "label": "s = q₈₋₁₅ k₀₋₇ᵀ / √hd — k1 = 8 ≤ q0 + 1: no mask", "kind": "sync"},
-    {"from": "keys 0..7", "to": "m · l · o", "label": "alpha = 0 · l = Σp · o = p v₀₋₇", "kind": "sync"},
-    {"from": "flash_attention", "to": "keys 8..15", "label": "crosses the diagonal → masked_fill(col > row, −inf)", "kind": "sync"},
-    {"from": "keys 8..15", "to": "m · l · o", "label": "alpha = exp(m − m_new) · l = alpha l + Σp · o = alpha o + p v₈₋₁₅", "kind": "sync"},
-    {"from": "flash_attention", "to": "keys 16..23", "label": "k0 = 16 ≥ q1 = 16 → break", "kind": "async"},
-    {"from": "m · l · o", "to": "flash_attention", "label": "out[8:16] = o / l", "kind": "reply"}
-  ]
-}
-:::
+For \`T = 37\` and \`8 × 8\` tiles, the loop's work over the tile grid (rows are query tiles, columns key tiles):
+
+| | keys 0:8 | 8:16 | 16:24 | 24:32 | 32:37 |
+| --- | --- | --- | --- | --- | --- |
+| **queries 0:8** | mask | break | · | · | · |
+| **8:16** | full | mask | break | · | · |
+| **16:24** | full | full | mask | break | · |
+| **24:32** | full | full | full | mask | break |
+| **32:37** | full | full | full | full | mask |
+
+*full*: computed with no mask; *mask*: crosses the diagonal and is masked inside the tile; *break*: the first
+tile with \`k0 ≥ q1\`, where the inner loop stops; *·*: never visited. Query rows 8..15 in detail:
+
+| key tile | test | what the loop does | alpha |
+| --- | --- | --- | --- |
+| 0:8 | k1 = 8 ≤ q0 + 1 = 9 | no mask; l = Σp, o = p v₀₋₇ | 0, since m was −inf |
+| 8:16 | crosses the diagonal | mask cols > rows; l = αl + Σp, o = αo + p v₈₋₁₅ | exp(m − m_new) ≤ 1 |
+| 16:24 | k0 = 16 ≥ q1 = 16 | \`break\`, then out[8:16] = o / l | none |
 
 Masked entries become \`exp(-inf − m_new) = 0\` in \`p\`: they add nothing to \`l\` or \`o\`. A row that is entirely
 masked in some tile has \`s.amax = -inf\`, so \`m_new = m\` and \`alpha = 1\` — harmless. The one case that would
@@ -178,19 +203,16 @@ trained model, scaled by \`1 / √hd\`, routinely exceed that at a few positions
 **A max but no rescaling.** Subtract each tile's own max before \`exp\`, then add the tiles together. Every term is
 now safe, but terms from different tiles are measured against different maxes and cannot be summed.
 
-:::sequence
-{
-  "participants": ["naive loop", "tile A (max 3)", "tile B (max 5)", "sum"],
-  "messages": [
-    {"from": "naive loop", "to": "tile A (max 3)", "label": "p = exp(s − 3) · l += Σp · o += p v", "kind": "sync"},
-    {"from": "naive loop", "to": "tile B (max 5)", "label": "p = exp(s − 5) · l += Σp · o += p v", "kind": "sync"},
-    {"from": "sum", "to": "naive loop", "label": "o / l mixes exp(s − 3) and exp(s − 5) terms: tile A weighted e² too high", "kind": "reply"},
-    {"from": "naive loop", "to": "tile A (max 3)", "label": "online: p = exp(s − 3), m = 3", "kind": "sync"},
-    {"from": "naive loop", "to": "tile B (max 5)", "label": "online: alpha = exp(3 − 5) · l = alpha l + Σ exp(s − 5) · o = alpha o + p v", "kind": "sync"},
-    {"from": "sum", "to": "naive loop", "label": "o / l — every term under max 5, equal to the one-shot softmax", "kind": "reply"}
-  ]
-}
-:::
+The same row as above, scores \`[1, 3]\` then \`[5, 2]\`, both ways:
+
+| | tile A, scores 1 and 3 | tile B, scores 5 and 2 | final l | weight of score 1 | weight of score 5 |
+| --- | --- | --- | --- | --- | --- |
+| no rescale | 1.1353, under max 3 | 1.0498, under max 5 | 2.1851 | 0.0619 | 0.4576 |
+| online | 1.1353 × e⁻² = 0.1536 | 1.0498 | 1.2034 | 0.0152 | 0.8310 |
+| one-shot softmax | | | 1.2034 | 0.0152 | 0.8310 |
+
+Without the rescale, every tile A term counts \`e² ≈ 7.4\` times too much against tile B's, and the row is not a
+softmax under any max; with it, every term is under max 5 and the weights match the one-shot softmax.
 
 The self-test catches both: the first by comparing against \`F.scaled_dot_product_attention\` at \`atol=1e-5\`
 across tile shapes that split rows differently (\`(8, 8)\`, \`(16, 4)\`, \`(5, 7)\`, \`(32, 16)\` on \`T = 37\`),

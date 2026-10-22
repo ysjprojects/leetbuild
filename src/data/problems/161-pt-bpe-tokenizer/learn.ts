@@ -12,24 +12,50 @@ produces back into a string — is the **tokenizer**, and since GPT-2 the tokeni
 large model is **byte-level byte-pair encoding** (BPE). It has no neural network in it. It is a list
 of **merges** learned from a corpus by one greedy loop, and the list is the whole model:
 
-:::diagram
+:::architecture
 {
-  "nodes": [
-    {"id": "text", "kind": "client", "label": "Text", "sub": "str → UTF-8 bytes · every string is 0..255", "x": 8, "y": 50},
-    {"id": "train", "kind": "service", "label": "train", "sub": "count adjacent pairs · merge the most frequent · repeat", "x": 32, "y": 22},
-    {"id": "merges", "kind": "db", "label": "merges · vocab", "sub": "rank r → id 256 + r · id → bytes", "x": 56, "y": 50},
-    {"id": "codec", "kind": "service", "label": "encode · decode", "sub": "replay merges lowest rank first · bytes → str", "x": 32, "y": 78},
-    {"id": "model", "kind": "external", "label": "Language model", "sub": "one embedding row per id", "x": 84, "y": 78}
+  "input": "\\"naïve café 🙂\\"",
+  "output": "decode(encode(s)) == s",
+  "items": [
+    {"id": "text", "label": "Text", "kind": "io", "sub": "str · any script"},
+    {"tone": "dotted", "label": "GPT-2 only · not in the drill", "items": [
+      {"id": "regex", "label": "Pre-tokenizer regex", "sub": "'s|'t| ?\\\\p{L}+| ?\\\\p{N}+|…", "detail": "Splits the string into chunks; BPE runs inside each, so no merge crosses a word boundary."}
+    ]},
+    {"id": "utf8", "label": "UTF-8 bytes", "kind": "embed", "sub": "list(text.encode(\\"utf-8\\"))", "shape": "list[int] in 0..255", "detail": "The base vocabulary: ids 0..255 are the bytes themselves."},
+    {"tone": "dotted", "label": "GPT-2 only · not in the drill", "items": [
+      {"id": "byte-map", "label": "byte → unicode map", "sub": "bytes_to_unicode() · 256 chars", "detail": "A printable stand-in per byte, so the merge file is text. No effect on which merges happen."}
+    ]},
+    {"columns": [
+      [{"tone": "block", "repeat": "vocab_size − 256 ×", "label": "train: one merge", "items": [
+        {"id": "count", "label": "Count adjacent pairs", "sub": "Counter(zip(ids, ids[1:]))"},
+        {"id": "pick", "label": "Most frequent pair", "sub": "max · ties to the first seen"},
+        {"id": "record", "label": "Record the merge", "sub": "merges[r] · vocab[256 + r]"},
+        {"id": "replace", "label": "Replace every occurrence", "sub": "_merge(ids, pair, 256 + r)"}
+      ]}],
+      [{"tone": "block", "repeat": "until no rank ×", "label": "encode: one merge", "items": [
+        {"id": "lowest", "label": "Lowest-ranked pair", "sub": "min(pairs, key=ranks.get)", "detail": "Pairs without a rank key to infinity; when the winner has none, encoding stops."},
+        {"id": "apply", "label": "Merge it everywhere", "sub": "_merge(ids, pair, 256 + rank)"}
+      ]}]
+    ]},
+    {"id": "ids", "label": "Token ids", "kind": "io", "sub": "list[int] · each < vocab_size", "detail": "One embedding row per id in the model."},
+    {"tone": "dotted", "label": "decode(ids)", "items": [
+      {"id": "lookup", "label": "Join the tokens' bytes", "sub": "b\\"\\".join(vocab[i] for i in ids)"},
+      {"id": "utf8-decode", "label": "UTF-8 decode", "sub": ".decode(\\"utf-8\\", errors=\\"replace\\")"}
+    ]},
+    {"id": "text-out", "label": "Text", "kind": "io", "sub": "str · U+FFFD for a split char"}
   ],
-  "edges": [
-    {"from": "text", "to": "train", "kind": "plain", "label": "corpus bytes"},
-    {"from": "train", "to": "merges", "kind": "plain", "label": "append (a, b) · vocab[256 + r]"},
-    {"from": "text", "to": "codec", "kind": "plain", "label": "encode(text)"},
-    {"from": "merges", "to": "codec", "kind": "plain", "label": "ranks · vocab"},
-    {"from": "codec", "to": "model", "kind": "plain", "label": "ids"}
+  "notes": [
+    {"at": "utf8", "text": "**256** base ids: nothing is out of vocabulary"},
+    {"at": "record", "text": "The **ordered** merge list is the model"},
+    {"at": "lowest", "text": "Replays training: **lowest** rank first"},
+    {"at": "utf8-decode", "text": "A split character becomes **U+FFFD**"}
   ]
 }
 :::
+
+Read it bottom to top: \`train\` and \`encode\` are two loops around the same \`_merge\` helper, one choosing
+pairs by frequency and recording them, the other replaying the recorded list by rank. The dotted stages
+are GPT-2's and are left out of the drill.
 
 The contract the drill implements, as one class:
 
@@ -103,19 +129,10 @@ rounds go:
 | 2 | \`(257, 32)\` = \`est ␣\` | 8 | \`258\` = \`b"est "\` | the last \`newest\` has no trailing space |
 | … | | | | until \`vocab_size\` ids, or no pair occurs twice |
 
-:::sequence
-{
-  "participants": ["train", "ids", "merges · vocab"],
-  "messages": [
-    {"from": "train", "to": "ids", "label": "text.encode(\\"utf-8\\") → 98 byte ids", "kind": "sync"},
-    {"from": "train", "to": "ids", "label": "Counter(zip(ids, ids[1:])) → (101, 115) × 9, first among ties", "kind": "sync"},
-    {"from": "train", "to": "merges · vocab", "label": "merges[0] = (101, 115) · vocab[256] = b\\"es\\"", "kind": "sync"},
-    {"from": "train", "to": "ids", "label": "replace every (101, 115) by 256", "kind": "sync"},
-    {"from": "train", "to": "merges · vocab", "label": "merges[1] = (256, 116) · vocab[257] = b\\"est\\"", "kind": "sync"},
-    {"from": "ids", "to": "train", "label": "final ids — the segmentation the model will be trained on", "kind": "reply"}
-  ]
-}
-:::
+Step through the same loop one merge at a time on a small word corpus, with the pair counts, the
+winning pair and the corpus re-tokenised after each round:
+
+:::widget bpe-merges
 
 Three properties of the loop matter more than its speed:
 
@@ -166,25 +183,20 @@ is the same as replaying the training rounds, and why it must be:
   tokenised the way the corpus was, so the embedding the model learned for that id is the right one.
 
 The tempting alternative is greedy longest match — scan from the left, take the longest token in the
-vocabulary that matches here. It uses the same vocabulary and produces *different* ids:
+vocabulary that matches here. It uses the same vocabulary and produces *different* ids. On \`" lowest"\`,
+with the drill's 17 merges:
 
-:::sequence
-{
-  "participants": ["greedy longest-match", "vocab", "rank-ordered BPE"],
-  "messages": [
-    {"from": "greedy longest-match", "to": "vocab", "label": "at \\"lowest\\": longest token starting here → b\\"low\\"", "kind": "sync"},
-    {"from": "vocab", "to": "greedy longest-match", "label": "then b\\"es\\", b\\"t\\" → 3 ids; the model trained on b\\"lo\\" b\\"west\\"", "kind": "reply"},
-    {"from": "rank-ordered BPE", "to": "vocab", "label": "lowest rank present: (e, s) → es; then (es, t) → est; then (w, est) → west …", "kind": "sync"},
-    {"from": "vocab", "to": "rank-ordered BPE", "label": "b\\"lo\\" b\\"west\\" — the ids the corpus produced", "kind": "reply"}
-  ]
-}
-:::
+| Encoder | Tokens | Ids |
+| --- | --- | --- |
+| greedy longest match | \`b" lowe"\` \`b"s"\` \`b"t"\` | 269, 115, 116 |
+| rank-ordered BPE | \`b" low"\` \`b"est"\` | 261, 257 |
 
 The greedy output is a valid spelling of the same bytes, and \`decode\` returns the same string from
-it. But the model never saw \`low\` followed by \`est\` in that context; its embeddings and its
-predictions for that sequence are untrained. The failure is silent: nothing errors, perplexity is
-simply worse. The same holds for any scheme that merges by frequency *in the input* rather than by
-rank — the only order that is a function of the model is the training order.
+it. But the model never saw \`b" lowe"\` followed by \`b"s"\` and \`b"t"\`: in the corpus \`" lowe"\` only ever
+begins \`" lower"\`. Its embeddings and its predictions for that sequence are untrained. The failure is
+silent: nothing errors, perplexity is simply worse. The same holds for any scheme that merges by
+frequency *in the input* rather than by rank — the only order that is a function of the model is the
+training order.
 
 | Encoder | Order | Matches training segmentation | Cost per word of length n |
 | --- | --- | --- | --- |

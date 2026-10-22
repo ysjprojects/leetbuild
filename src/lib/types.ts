@@ -14,6 +14,8 @@
  * `LANGUAGES`; `cuda` only appears in the deep-learning track, whose problems fix their language
  * (`Problem.language`) — nobody switches a kernel to Scala.
  */
+import type {Architecture} from './architecture';
+
 export type Language = 'python' | 'typescript' | 'go' | 'scala' | 'cpp' | 'cuda';
 
 /** The languages every course is written in, and the header lets the learner choose between. */
@@ -264,7 +266,13 @@ export interface Problem {
    * at `/<problem>/learn`, linked from the description, downloadable as Markdown and printable.
    */
   learn?: string;
-  diagram: Diagram;
+  /** The system's architecture: services, stores and the calls between them (systems and AI-era courses). */
+  diagram?: Diagram;
+  /**
+   * The model or kernel as a stack of layers read bottom to top (the deep-learning track), drawn in
+   * place of `diagram`; step `focus` names its block ids.
+   */
+  architecture?: Architecture;
   steps: Step[];
   /**
    * Modules every step of the course can import when it runs, per language: generated protobuf

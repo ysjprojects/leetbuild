@@ -17,7 +17,7 @@ export const sgdMomentumStep: Step = {
   title: 'SGD.step(): decay the weight, update the buffer, look ahead, add in place',
   concept: 'pytorch',
   file: 'sgd_momentum',
-  focus: ['step', 'state', 'params'],
+  focus: ['buffer', 'classical', 'nesterov', 'decay', 'update'],
   task: `## Task
 
 Implement \`class SGD(torch.optim.Optimizer)\` with \`__init__(self, params, lr=1e-2, momentum=0.0, nesterov=False,
@@ -31,6 +31,11 @@ buf ← momentum · buf + g                               in place: buf.mul_(mom
 d   ← g + momentum · buf   if nesterov   else   buf    (d = g when momentum = 0)
 p   ← p − lr · d                                       in place: p.add_(d, alpha=-lr)
 \`\`\`
+
+What those five lines buy, on a ravine-shaped loss: plain SGD zig-zags across, momentum runs along the floor, and
+Nesterov damps the overshoot.
+
+:::widget optimizer-paths
 
 - \`__init__\` validates (\`lr\`, \`momentum\`, \`weight_decay\` ≥ 0; \`nesterov\` needs \`momentum > 0\`), builds
   \`defaults = dict(lr=…, momentum=…, nesterov=…, weight_decay=…)\` and calls \`super().__init__(params, defaults)\`.
@@ -56,25 +61,6 @@ step by hand — \`w1 = w0 · (1 − lr · wd) − lr · g\`, buffer equal to \`
 
 > The optimizer is a loop over \`param_groups\` that mutates \`p\` and \`state[p]\` in place under \`no_grad\`;
 > decoupling the decay means it multiplies the *weight*, so the momentum buffer only ever carries gradients.`,
-  sequence: {
-    participants: ['training loop', 'autograd', 'SGD.step', 'state[p]', 'parameter p'],
-    messages: [
-      {from: 'training loop', to: 'autograd', label: 'loss.backward()', kind: 'sync'},
-      {from: 'autograd', to: 'parameter p', label: 'p.grad = g', kind: 'async'},
-      {from: 'training loop', to: 'SGD.step', label: 'step()  — @torch.no_grad()', kind: 'sync'},
-      {from: 'SGD.step', to: 'parameter p', label: 'p.mul_(1 − lr·wd)   (weight_decay ≠ 0)', kind: 'sync'},
-      {
-        from: 'SGD.step',
-        to: 'state[p]',
-        label: 'momentum_buffer: clone(g) first, else buf.mul_(μ).add_(g)',
-        kind: 'sync',
-      },
-      {from: 'state[p]', to: 'SGD.step', label: 'buf', kind: 'reply'},
-      {from: 'SGD.step', to: 'SGD.step', label: 'd = g + μ·buf if nesterov else buf', kind: 'sync'},
-      {from: 'SGD.step', to: 'parameter p', label: 'p.add_(d, alpha=−lr)', kind: 'sync'},
-      {from: 'SGD.step', to: 'training loop', label: 'loss (from the closure) or None', kind: 'reply'},
-    ],
-  },
   hints: [
     'The skeleton is three loops deep: `for group in self.param_groups` → `for p in group["params"]` → `if p.grad is None: continue`. Read `lr`, `momentum`, `nesterov`, `weight_decay` from `group`, and the buffer from `self.state[p]`, a dict that starts empty.',
     'First step: `buf = state["momentum_buffer"] = torch.clone(g).detach()`; later: `buf.mul_(momentum).add_(g)`. Then `d = g.add(buf, alpha=momentum) if nesterov else buf` and `p.add_(d, alpha=-lr)`. With `momentum == 0` skip the buffer entirely and use `d = g`.',

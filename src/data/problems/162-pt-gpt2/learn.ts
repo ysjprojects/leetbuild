@@ -12,25 +12,41 @@ by sampling one token, appending it, and running again. The problem implements i
 files: \`GPT.forward(idx, targets=None) -> (logits, loss)\`, \`train(…)\` around \`torch.optim.AdamW\`, and
 \`generate\` / \`generate_cached\` with temperature, \`top_k\`, \`top_p\` and a KV cache.
 
-:::diagram
+:::architecture
 {
-  "nodes": [
-    {"id": "tokens", "kind": "client", "label": "Token ids", "sub": "training windows · or prompt + sampled ids", "x": 8, "y": 50},
-    {"id": "embed", "kind": "db", "label": "wte + wpe", "sub": "50257 × 768 token table, 1024 × 768 positions", "x": 30, "y": 25},
-    {"id": "blocks", "kind": "service", "label": "Block × n_layer", "sub": "x += attn(ln_1 x); x += mlp(ln_2 x) — caches k, v", "x": 55, "y": 25},
-    {"id": "head", "kind": "service", "label": "ln_f · lm_head", "sub": "logits at every position → loss, or the last → sample", "x": 80, "y": 50},
-    {"id": "train", "kind": "service", "label": "Training loop", "sub": "AdamW, decay on matrices · clip 1.0 · warmup + cosine · bf16", "x": 45, "y": 80}
+  "input": "idx · (B, T) token ids",
+  "output": "logits · (B, T, 50,257)",
+  "items": [
+    {"id": "tokens", "label": "Token ids", "kind": "io", "sub": "windows, or prompt + samples"},
+    {"tone": "model", "items": [
+      {"columns": [
+        [{"id": "wte", "label": "Token embedding wte", "kind": "embed", "sub": "50,257 × 768", "detail": "Row i is token i's vector; the same tensor is the output layer's weight."}],
+        [{"id": "wpe", "label": "Position embedding wpe", "kind": "embed", "sub": "1,024 × 768 · arange(T)", "detail": "Learned absolute positions: the context length is its number of rows."}]
+      ]},
+      {"id": "emb", "op": "+", "detail": "x = wte(idx) + wpe(arange(T)), then dropout."},
+      {"tone": "block", "repeat": "12 ×", "label": "Pre-norm block", "items": [
+        {"id": "ln1", "label": "LayerNorm ln_1", "kind": "norm"},
+        {"id": "attn", "label": "Causal self-attention", "kind": "attention", "sub": "12 heads × 64"},
+        {"id": "add1", "op": "+", "from": "ln1"},
+        {"id": "ln2", "label": "LayerNorm ln_2", "kind": "norm"},
+        {"id": "mlp", "label": "MLP", "kind": "ffn", "sub": "768 → 3,072 → 768"},
+        {"id": "add2", "op": "+", "from": "ln2"}
+      ]},
+      {"id": "lnf", "label": "Final LayerNorm ln_f", "kind": "norm"},
+      {"id": "head", "label": "lm_head", "kind": "head", "sub": "768 → 50,257 · weight = wte", "detail": "Training scores every position against the shifted targets; generation reads only the last row."}
+    ]}
   ],
-  "edges": [
-    {"from": "tokens", "to": "embed", "kind": "plain", "label": "idx (B, T)"},
-    {"from": "embed", "to": "blocks", "kind": "plain", "label": "x (B, T, d)"},
-    {"from": "blocks", "to": "head", "kind": "plain", "label": "residual stream"},
-    {"from": "head", "to": "embed", "kind": "plain", "label": "lm_head.weight = wte.weight"},
-    {"from": "head", "to": "train", "kind": "plain", "label": "cross-entropy"},
-    {"from": "head", "to": "tokens", "kind": "plain", "label": "multinomial → next id"}
+  "notes": [
+    {"at": "wpe", "text": "**1,024** rows: the context length"},
+    {"at": "attn", "text": "tril mask: position t sees **0..t** only"},
+    {"at": "add2", "text": "Both c_proj start at std **0.02 / √24**"},
+    {"at": "head", "text": "Tied: **one** 50,257 × 768 tensor, **38.6 M**"}
   ]
 }
 :::
+
+Training reads every row of the logits with cross-entropy against the next token; generation reads the
+last row, samples one id, appends it and runs again. The family:
 
 | model | n_layer | n_embd | n_head | parameters |
 |---|---|---|---|---|
@@ -40,7 +56,10 @@ files: \`GPT.forward(idx, targets=None) -> (logits, loss)\`, \`train(…)\` arou
 | GPT-2 XL | 48 | 1600 | 25 | 1558M |
 
 All four share \`vocab_size = 50257\` (byte-level BPE) and \`block_size = 1024\`. Nothing in the design
-changes with size except these three numbers.
+changes with size except these three numbers. The calculator splits any of them by component, with the
+weight and KV-cache memory:
+
+:::widget model-size {"preset": "gpt2"}
 
 # The model: shapes, tying and the init
 
@@ -115,21 +134,44 @@ decisions around that one line:
 
 The order inside an iteration is fixed: forward under autocast, \`zero_grad\`, \`backward\`, clip, step.
 
-:::sequence
+:::architecture
 {
-  "participants": ["train()", "GPT", "grads", "AdamW"],
-  "messages": [
-    {"from": "train()", "to": "GPT", "label": "naive: lr = 6e-4 from step 0, no clipping", "kind": "sync"},
-    {"from": "GPT", "to": "grads", "label": "an unlucky batch: global norm 40× the typical", "kind": "sync"},
-    {"from": "grads", "to": "AdamW", "label": "v from a handful of steps — the step is near full lr in every coordinate", "kind": "sync"},
-    {"from": "AdamW", "to": "GPT", "label": "weights jump; logits saturate; loss spikes to 10+", "kind": "reply"},
-    {"from": "train()", "to": "GPT", "label": "correct: lr = 6e-4 · (it + 1) / warmup", "kind": "sync"},
-    {"from": "GPT", "to": "grads", "label": "same batch", "kind": "sync"},
-    {"from": "grads", "to": "AdamW", "label": "clip_grad_norm_(…, 1.0): direction kept, length bounded", "kind": "sync"},
-    {"from": "AdamW", "to": "GPT", "label": "a small step; v keeps learning the scale", "kind": "reply"}
+  "input": "it = 0, 1, …, max_iters − 1",
+  "output": "every training loss, as a list",
+  "items": [
+    {"id": "lr", "label": "Set the learning rate", "sub": "group[\\"lr\\"] = get_lr(it)", "detail": "By hand on every parameter group: linear warmup, then cosine to min_lr."},
+    {"tone": "dotted", "label": "every eval_interval", "items": [
+      {"id": "eval", "label": "estimate_loss", "sub": "no_grad · eval() · train and val", "detail": "The mean of eval_iters batches per split, then model.train() again."},
+      {"id": "ckpt", "label": "Checkpoint if val improved", "kind": "io", "sub": "{model, optimizer, config, step}"}
+    ]},
+    {"id": "batch", "label": "get_batch", "kind": "io", "sub": "x, y = window[:-1], window[1:]"},
+    {"id": "fwd", "label": "Forward under autocast", "sub": "logits, loss = model(x, y)"},
+    {"id": "zero", "label": "zero_grad", "sub": "set_to_none=True"},
+    {"id": "bwd", "label": "loss.backward()", "kind": "loss", "sub": "one .grad per parameter"},
+    {"id": "clip", "label": "clip_grad_norm_", "sub": "one global norm ≤ 1.0", "detail": "All parameters at once: the direction is kept, only the length is bounded."},
+    {"id": "step", "label": "AdamW step", "sub": "decay on p.dim() ≥ 2 only"}
+  ],
+  "notes": [
+    {"at": "lr", "text": "Peak **6e-4**, cosine to **6e-5**"},
+    {"at": "fwd", "text": "**bf16** matmuls, fp32 weights, no GradScaler"},
+    {"at": "clip", "text": "Bounds the step after an **unlucky** batch"},
+    {"at": "step", "text": "betas **(0.9, 0.95)**, weight decay **0.1**"}
   ]
 }
 :::
+
+Each piece answers one way an early step goes wrong:
+
+| an unlucky batch, global gradient norm 40× the typical | naive: \`lr = 6e-4\` from step 0, no clipping | the recipe: warmup and \`clip_grad_norm_(…, 1.0)\` |
+| --- | --- | --- |
+| learning rate | full from the first step | \`6e-4 · (it + 1) / warmup\`: tiny |
+| Adam's \`v\` | a handful of steps old, so the step is near full \`lr\` in every coordinate | still noisy, but the step is scaled down |
+| gradient | used as is | rescaled to norm 1.0, direction kept |
+| outcome | weights jump, logits saturate, the loss spikes to 10+ | a small step; \`v\` keeps learning the scale |
+
+The schedule with the drill's defaults (100 warmup iterations of a 300-iteration overfit run):
+
+:::widget lr-schedule {"warmup": 100, "total": 300}
 
 Two details matter for resuming. A checkpoint stores \`{model, optimizer, config, step}\`: without the
 optimizer's two moments per parameter a resumed run is a cold start at full learning rate, and without
@@ -167,6 +209,10 @@ p = softmax(sorted logits); remove = cumsum(p) - p > top_p                  # nu
 next_id = torch.multinomial(softmax(logits), num_samples=1)
 \`\`\`
 
+Try the three knobs on a toy next-token distribution, and sample from what survives:
+
+:::widget sampling
+
 Top-k's weakness is that *k* is fixed: when the model is confident, k = 40 still admits 39 bad tokens;
 when it is uncertain, 40 may cut real options. [Nucleus sampling](https://arxiv.org/abs/1904.09751)
 (Holtzman et al.) sizes the head by probability mass instead, which is why it became the default in
@@ -190,37 +236,17 @@ the causal mask means position *i* never sees anything after *i* — so their ke
 stored per block and reused. A decode step then embeds one token at position \`pos\`, computes one row of
 q, k, v per block, writes k and v into the cache at \`pos\`, and attends one query over \`pos + 1\` keys.
 
-:::sequence
-{
-  "participants": ["generate_cached", "Block × n_layer", "KVCache", "sampler"],
-  "messages": [
-    {"from": "generate_cached", "to": "Block × n_layer", "label": "prefill: prompt (B, T) at positions 0..T−1", "kind": "sync"},
-    {"from": "Block × n_layer", "to": "KVCache", "label": "k, v → rows 0..T−1 of every block", "kind": "sync"},
-    {"from": "Block × n_layer", "to": "sampler", "label": "last position's logits", "kind": "sync"},
-    {"from": "sampler", "to": "generate_cached", "label": "idx_next (B, 1)", "kind": "reply"},
-    {"from": "generate_cached", "to": "Block × n_layer", "label": "decode: idx_next only, wpe(pos)", "kind": "sync"},
-    {"from": "Block × n_layer", "to": "KVCache", "label": "write row pos; attend over rows 0..pos", "kind": "sync"},
-    {"from": "generate_cached", "to": "KVCache", "label": "pos == block_size → pos = 0, re-encode last 1024", "kind": "async"}
-  ]
-}
-:::
+Step through decoding with and without the cache, and watch the work and the memory counters diverge:
+
+:::widget kv-cache
 
 The obvious cached version gets the positions wrong. Feeding one token through the unmodified
 \`forward\` embeds it with \`wpe(arange(1))\` — position 0 — and slices the mask's row 0:
 
-:::sequence
-{
-  "participants": ["decode step", "wpe", "attention", "logits"],
-  "messages": [
-    {"from": "decode step", "to": "wpe", "label": "naive: wpe(arange(T)) with T = 1 → position 0 every time", "kind": "sync"},
-    {"from": "wpe", "to": "attention", "label": "mask[:1, :1] — one key, not pos + 1", "kind": "sync"},
-    {"from": "attention", "to": "logits", "label": "every token looks like the start of a document", "kind": "reply"},
-    {"from": "decode step", "to": "wpe", "label": "correct: wpe(arange(pos, pos + T))", "kind": "sync"},
-    {"from": "wpe", "to": "attention", "label": "mask[pos:pos+T, :pos+T] over cached keys", "kind": "sync"},
-    {"from": "attention", "to": "logits", "label": "identical to the full forward (1e-10 in float64)", "kind": "reply"}
-  ]
-}
-:::
+| decode step | positions embedded | mask rows | result |
+| --- | --- | --- | --- |
+| naive: the unmodified \`forward\` on one token | \`wpe(arange(1))\`: position 0 every time | \`mask[:1, :1]\`: one key, not \`pos + 1\` | every token looks like the start of a document |
+| correct: \`forward_cached\` | \`wpe(arange(pos, pos + T))\` | \`mask[pos : pos + T, : pos + T]\` over the cached keys | identical to the full forward (1e-10 in float64) |
 
 The cost is memory, \`2 · n_layer · T · n_embd\` numbers per sequence:
 

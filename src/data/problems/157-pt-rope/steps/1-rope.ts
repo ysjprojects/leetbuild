@@ -16,12 +16,14 @@ export const ropeStep: Step = {
   title: 'precompute_rope_cache, apply_rope and the RoPE module',
   concept: 'pytorch',
   file: 'rope',
-  focus: ['cache', 'rope'],
+  focus: ['rope-q', 'rope-k', 'gather', 'cast', 'halves', 'rotate', 'concat'],
   task: `## Task
 
 Implement rotary position embeddings in \`rope.py\`, in the half-split convention of Llama and GPT-NeoX:
 dimension \`i\` of a head pairs with dimension \`i + head_dim // 2\`, and each pair is rotated by an angle
 proportional to the token's position.
+
+:::widget rope-rotation
 
 - \`precompute_rope_cache(head_dim, max_seq_len, base=10000.0) -> (cos, sin)\`: two float32 tensors of shape
   \`[max_seq_len, head_dim // 2]\`. Pair \`i\` turns at \`theta_i = base ** (-2 i / head_dim)\` — build the
@@ -51,29 +53,6 @@ proportional to the token's position.
 
 > Rotate q by \`m·theta\` and k by \`n·theta\` and their dot product is a function of \`m − n\` alone: the
 > position reaches the attention score as a distance, with no table of pairs and no learned parameter.`,
-  sequence: {
-    participants: ['attention layer', 'RoPE', 'cos/sin cache'],
-    messages: [
-      {
-        from: 'attention layer',
-        to: 'RoPE',
-        label: 'q [B, H, L, D] · positions = arange(offset, offset + L)',
-        kind: 'sync',
-      },
-      {from: 'RoPE', to: 'cos/sin cache', label: 'cos[positions], sin[positions]', kind: 'sync'},
-      {from: 'cos/sin cache', to: 'RoPE', label: '[L, D/2] each → .to(q.dtype)[None, None]', kind: 'reply'},
-      {from: 'RoPE', to: 'RoPE', label: 'x1, x2 = chunk(2) · cat(x1 c − x2 s, x2 c + x1 s)', kind: 'sync'},
-      {from: 'RoPE', to: 'attention layer', label: 'q_rot [B, H, L, D]', kind: 'reply'},
-      {from: 'attention layer', to: 'RoPE', label: 'k [B, H, L, D], same positions', kind: 'sync'},
-      {from: 'RoPE', to: 'attention layer', label: 'k_rot → KV cache', kind: 'reply'},
-      {
-        from: 'attention layer',
-        to: 'attention layer',
-        label: 'q_rot k_rotᵀ: score[m, n] depends on m − n only',
-        kind: 'sync',
-      },
-    ],
-  },
   hints: [
     '`inv_freq = base ** (-torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)` is `[head_dim // 2]`: 1, then falling geometrically to just above `1 / base`. `torch.outer(torch.arange(max_seq_len, dtype=torch.float32), inv_freq)` is the angle table `m · theta_i`; its `.cos()` and `.sin()` are the cache.',
     'In `apply_rope`, `c = cos[positions].to(x.dtype)[None, None]` is `[1, 1, seq, head_dim // 2]` and broadcasts against each half of `x`. `x1, x2 = x.chunk(2, dim=-1)`; the output halves are `x1 * c - x2 * s` and `x2 * c + x1 * s`, concatenated in that order. Default `positions = torch.arange(seq, device=x.device)` when `None`.',
