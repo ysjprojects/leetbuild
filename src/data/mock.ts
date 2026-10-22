@@ -2324,6 +2324,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'support-automation-guardrails',
+    problemId: 'support-automation',
+    stepId: 'guardrails',
+    title: 'The guardrail that waves everything through',
+    blurb: 'A hallucinated refund policy reached a guest while the guardrail service was slow. Make the gate a gate.',
+    role: 'AI platform engineer · 25 min',
+    minutes: 25,
+    prompt:
+      'You own the Guardrails Framework behind the support assistant. Last night the guardrail service had a slow hour; every answer the model produced in that hour went out, including one that promised a full refund the policy does not allow. The model-generated gate below checks relevance and returns the answer. Review it, fix it, and prove the fix: every configured guardrail, in parallel, under one deadline, failing closed, escalating to a human on any verdict that is not PASS.',
+    signals: ['Secure', 'Specify', 'Verify', 'Operate'],
+    aiNote:
+      'The draft runs one guardrail (relevance) with no deadline, catches the exception and continues as if it had passed, and on an explicit FAIL logs a warning and returns the draft anyway. Groundedness and pii never run. A guardrail outage is indistinguishable from no guardrail.',
+    testIdea:
+      'Stub the guardrail service so groundedness sleeps past 2 s and pii returns FAIL. Assert the gate returns within the deadline, that the verdict map has three entries with groundedness = ERROR, that handoff.escalate was called with those verdicts, and that the result field is absent from the response.',
+    followUps: [
+      'Which guardrails should block and which should only annotate the answer, and where does that severity live?',
+      'The post describes tool guardrails that use rules to stop a bad execution. Where in the Chain of Thought loop would you run them, and what do they see that the answer guardrails do not?',
+      'If the guardrail service is down for an hour, every turn escalates to a human. What do you build so the queue does not drown the agents, without reopening the gate?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
