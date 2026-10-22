@@ -27,6 +27,7 @@ import LrSchedule from './LrSchedule';
 import ModelSize from './ModelSize';
 import MoeRouting from './MoeRouting';
 import NormCompare from './NormCompare';
+import Nvfp4Block from './Nvfp4Block';
 import OnlineSoftmax from './OnlineSoftmax';
 import OptimizerPaths from './OptimizerPaths';
 import OrderBook from './OrderBook';
@@ -41,6 +42,7 @@ import SequencePacking from './SequencePacking';
 import SoftmaxStability from './SoftmaxStability';
 import SpeculativeDecoding from './SpeculativeDecoding';
 import StatusCodes from './StatusCodes';
+import StochasticRounding from './StochasticRounding';
 import StreamTimeline from './StreamTimeline';
 import TensorParallel from './TensorParallel';
 import TiledMatmul from './TiledMatmul';
@@ -91,6 +93,8 @@ export const WIDGET_COMPONENTS: Record<string, FC<WidgetProps>> = {
   'dpo-loss': DpoLoss,
   'sequence-packing': SequencePacking,
   'int4-quant': Int4Quant,
+  'nvfp4-block': Nvfp4Block,
+  'stochastic-rounding': StochasticRounding,
   'speculative-decoding': SpeculativeDecoding,
   'grpo-advantages': GrpoAdvantages,
   'gqa-heads': GqaHeads,

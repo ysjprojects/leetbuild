@@ -202,6 +202,24 @@ export const WIDGETS: Record<string, WidgetSpec> = {
       group: 'starting group size: 8, 16, 32, 64 or 128 (default 32)',
     },
   },
+  'nvfp4-block': {
+    about:
+      'Interactive: 32 seeded Gaussian values quantized two ways on one shared value axis. NVFP4 above: two blocks of 16, each with its E4M3 scale e4m3(amax_block / 6 / s_global) under the FP32 s_global = amax / (6 · 448), its own scaled E2M1 grid ±{0, 0.5, 1, 1.5, 2, 3, 4, 6} · scale, each value’s round-to-nearest-even point and error. MXFP4 below: one block of 32 with the OCP E8M0 scale X = 2^floor(log2 amax) / 4, its grid, points and errors. Readout: s_global, both E4M3 scales, X, and the MSE of each format with their ratio. Toggle between plain Gaussian values and one 7.5 outlier in NVFP4 block 0, and a resample button.',
+    params: {
+      outlier: 'start with the outlier in block 0 (default false)',
+      seed: 'starting seed, an integer ≥ 1 (default 4)',
+    },
+  },
+  'stochastic-rounding': {
+    about:
+      'Interactive, two tabs. Rounding: 2,048 seeded gradient-like values (Gaussian times a log-normal spread) in canonical NVFP4 1 × 16 blocks (E4M3 block scales under the FP32 s_global = amax / (6 · 448)); per 0.25-wide bin of |x| / scale, the mean error of round-to-nearest-even and of the mean of K stochastic draws, over the RNE sawtooth and a count of values per bin; beside it the histogram of one draw’s error divided by the local grid gap for both. Readout: the share of values below half the smallest code, the share RNE stores as 0, the relative bias each rounding puts on those small values, and the RMS error of one draw of each. Sliders for the tail spread σ (0–2) and K (1, 4, 16, 64, 256). Hadamard: one 16-value block with an outlier at a chosen multiple of the other values’ rms, as stored and after x·H with the 16 × 16 Sylvester Hadamard and random signs, each with its NVFP4 values, its E2M1 levels, the values flushed to 0, the crest factor (max / rms) and the relative error. A resample button in both.',
+    params: {
+      mode: '"rounding" or "hadamard" (default "rounding")',
+      tail: 'starting log-normal spread σ of the gradient values, 0–2 (default 1)',
+      outlier: 'starting outlier in multiples of the rms, 1–30 (default 12)',
+      seed: 'starting seed, an integer ≥ 1 (default 1)',
+    },
+  },
   'speculative-decoding': {
     about:
       'Interactive: sliders for the acceptance rate α (0–0.99), the draft length γ (1–10) and the draft cost ratio c (0–1) give the expected tokens per target call (1 − α^(γ+1))/(1 − α), the cost of a call γc + 1 and the speedup, with a bar per γ marking the best; a step-through of a seeded run under the i.i.d. model (draft i accepted iff u_i < α) shows each round’s accepts, the first rejection, the residual resample or the bonus token on a 40-token strip, with measured tokens per call against the formula, and a resample button.',

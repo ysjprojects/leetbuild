@@ -192,6 +192,9 @@ import {httpConditionalRequestsProblem} from './193-http-conditional-requests/in
 import {httpRangeRequestsProblem} from './194-http-range-requests/index';
 import {grpcOutlierEjectionProblem} from './195-grpc-outlier-ejection/index';
 import {grpcResumableStreamProblem} from './196-grpc-resumable-stream/index';
+import {ptNvfp4FormatProblem} from './197-pt-nvfp4-format/index';
+import {ptNvfp4LinearProblem} from './198-pt-nvfp4-linear/index';
+import {ptNvfp4TrainingProblem} from './199-pt-nvfp4-training/index';
 
 /**
  * Problem order on the list page: the classic systems track first, in its catalogue order, then the
@@ -362,6 +365,7 @@ export const problems: Problem[] = [
   ptStableSoftmaxProblem,
   ptSgdMomentumProblem,
   ptLayernormRmsnormProblem,
+  ptNvfp4FormatProblem,
   ptAdamwProblem,
   ptRopeProblem,
   ptCausalAttentionProblem,
@@ -371,6 +375,7 @@ export const problems: Problem[] = [
   ptLlama3Problem,
   ptSftPackingProblem,
   ptDpoProblem,
+  ptNvfp4LinearProblem,
   ptGpt2Problem,
   ptFlashAttentionTiledProblem,
   ptDdpmProblem,
@@ -383,6 +388,7 @@ export const problems: Problem[] = [
   ptGptqProblem,
   ptZeroProblem,
   ptTensorParallelProblem,
+  ptNvfp4TrainingProblem,
   cudaVectorAddProblem,
   cudaFusedGeluProblem,
   cudaReductionProblem,
