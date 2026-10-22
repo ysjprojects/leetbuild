@@ -2,15 +2,19 @@
  * Markdown export of one course (a problem's step-by-step tutorial) in one language: the
  * statement, the architecture as a Mermaid flowchart, and per step the sequence diagram, the task,
  * the checks, the starter, hints and the reference solution behind `<details>` spoilers, and the
- * debrief. Interactive widgets become a note with a link back to the live step.
+ * debrief. Interactive widgets become a note with a link back to the live step. The learning
+ * guide exports the same way: widgets become notes, pop quizzes keep their answer behind a spoiler.
  */
 import {night} from '@/styles/palette';
 
 import {
+  type Concept,
   type Diagram,
+  type Difficulty,
   type Language,
   type Problem,
   type Sequence,
+  type Source,
   type Step,
   CONCEPT_LABEL,
   fileName,
@@ -103,6 +107,49 @@ export function widgetsToNotes(markdown: string, stepUrl: string): string {
     const about = WIDGETS[name]?.about ?? name;
     return `> **Interactive (${name}):** ${about} [Open it in LeetBuild.](${stepUrl})`;
   });
+}
+
+/**
+ * `:::quiz` blocks become the question, its options as a task list, and the answer with its
+ * explanation behind a `<details>` spoiler; `:::details Title` blocks become `<details>` elements;
+ * `:::sequence` and `:::diagram` blocks become Mermaid fences.
+ */
+export function blocksToMarkdown(markdown: string): string {
+  return markdown.replace(
+    /^:::(quiz|details|sequence|diagram)([^\n]*)\n([\s\S]*?)^:::\s*$/gm,
+    (_, kind: string, rest: string, body: string) => {
+      if (kind === 'details')
+        return `<details>\n<summary>${rest.trim() || 'Details'}</summary>\n\n${body.trim()}\n\n</details>`;
+      if (kind === 'sequence') return `\`\`\`mermaid\n${sequenceToMermaid(JSON.parse(body) as Sequence)}\n\`\`\``;
+      if (kind === 'diagram') return `\`\`\`mermaid\n${diagramToMermaid(JSON.parse(body) as Diagram)}\n\`\`\``;
+      const prompt: string[] = [];
+      const options: string[] = [];
+      const explanation: string[] = [];
+      let answer = '';
+      for (const raw of body.split('\n')) {
+        const line = raw.trim();
+        const option = /^-\s*\[( |x|X)\]\s*(.*)$/.exec(line);
+        if (option !== null) {
+          options.push(`- [ ] ${option[2]}`);
+          if (option[1] !== ' ') answer = option[2];
+        } else if (line.startsWith('>')) explanation.push(line.replace(/^>\s?/, ''));
+        else if (line.startsWith('Q:')) prompt.push(line.slice(2).trim());
+        else if (line !== '') prompt.push(line);
+      }
+      return [
+        `**Pop quiz.** ${prompt.join(' ')}`,
+        ``,
+        ...options,
+        ``,
+        `<details>`,
+        `<summary>Answer</summary>`,
+        ``,
+        `**${answer}** — ${explanation.join(' ')}`,
+        ``,
+        `</details>`,
+      ].join('\n');
+    },
+  );
 }
 
 /** GitHub's heading anchor: lower-case, drop everything but letters/digits/spaces/hyphens, spaces → hyphens. */
@@ -228,6 +275,62 @@ export function problemToMarkdown(problem: Problem, language: Language): string 
 export function exportFileName(problemId: string, language: Language): string {
   return `leetbuild-${problemId}-${language}.md`;
 }
+
+/** The learning guide's page: `/<problem>/learn`. */
+export const learnPath = (problemId: string): string => `/${problemId}/learn`;
+
+/** What the guide's page needs of a course — serializable, so the page is pre-rendered without the course data. */
+export interface Guide {
+  problemId: string;
+  title: string;
+  tagline: string;
+  difficulty: Difficulty;
+  concepts: Concept[];
+  steps: number;
+  learn: string;
+  sources: Source[];
+}
+
+export const guideOf = (problem: Problem): Guide | null =>
+  problem.learn === undefined
+    ? null
+    : {
+        problemId: problem.id,
+        title: problem.title,
+        tagline: problem.tagline,
+        difficulty: problem.difficulty,
+        concepts: problem.concepts,
+        steps: problem.steps.length,
+        learn: problem.learn,
+        sources: problem.sources ?? [],
+      };
+
+/** The learning guide as a standalone Markdown document: title, provenance, the guide with figures as Mermaid. */
+export function learnToMarkdown(guide: Guide): string {
+  const url = `${siteUrl()}${learnPath(guide.problemId)}`;
+  const parts: string[] = [
+    `# ${guide.title}: the learning guide`,
+    ``,
+    `*LeetBuild · ${guide.difficulty} · ${guide.concepts
+      .map(c => CONCEPT_LABEL[c])
+      .join(', ')} · [interactive version](${url}) · [the course](${siteUrl()}/${guide.problemId})*`,
+    ``,
+    guide.tagline,
+    ``,
+    blocksToMarkdown(widgetsToNotes(shiftHeadings(guide.learn, 1), url)).trim(),
+    ``,
+  ];
+  if (guide.sources.length > 0) {
+    parts.push('## Sources', '');
+    for (const s of guide.sources)
+      parts.push(`- [${s.title}](${s.url})${s.by !== undefined ? ` — ${s.by}` : ''}, ${s.date}.`);
+    parts.push('');
+  }
+  return parts.join('\n');
+}
+
+/** File name for a learning-guide download: `leetbuild-dropbox-gates-guide.md`. */
+export const learnFileName = (problemId: string): string => `leetbuild-${problemId}-guide.md`;
 
 /** Trigger a browser download of `text` as a Markdown file. */
 export function downloadMarkdown(name: string, text: string): void {

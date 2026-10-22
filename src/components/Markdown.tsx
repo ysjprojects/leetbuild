@@ -1,7 +1,12 @@
 import {type FC, type ReactNode, memo, useCallback, useMemo, useState} from 'react';
 
 import type {HighlightedSpan} from '@/lib/editor';
+import {githubSlug} from '@/lib/export';
 import {leetbuildHighlighter} from '@/lib/highlight';
+import type {Diagram, Sequence} from '@/lib/types';
+
+import SequenceDiagram from './SequenceDiagram';
+import SystemDiagram from './SystemDiagram';
 
 /**
  * Markdown dialect for problem statements, step tasks, hints and debriefs.
@@ -14,6 +19,7 @@ import {leetbuildHighlighter} from '@/lib/highlight';
  *   :::quiz               pop quiz: `Q: prompt`, options `- [ ]` / `- [x]`, `> explanation`, `:::`
  *   :::widget name {json} interactive visual (rendered through `renderWidget`)
  *   :::details Title      collapsible section until the closing `:::`
+ *   :::sequence / :::diagram  a JSON `Sequence` / `Diagram` (lib/types) up to the closing `:::`, drawn like a step's
  *   inline: **bold**, *em*, `code`, [text](url)
  */
 
@@ -37,7 +43,24 @@ type Block =
   | {kind: 'rule'}
   | {kind: 'quiz'; quiz: PopQuizSpec}
   | {kind: 'widget'; name: string; params: Record<string, unknown>}
-  | {kind: 'details'; title: string; body: Block[]};
+  | {kind: 'details'; title: string; body: Block[]}
+  | {kind: 'sequence'; sequence: Sequence}
+  | {kind: 'diagram'; diagram: Diagram}
+  | {kind: 'malformed'; what: string};
+
+/** A `:::sequence` / `:::diagram` body: JSON with the arrays the drawing needs, or a malformed block. */
+const parseFigure = (name: 'sequence' | 'diagram', body: string[]): Block => {
+  try {
+    const value = JSON.parse(body.join('\n')) as Record<string, unknown>;
+    if (name === 'sequence' && Array.isArray(value.participants) && Array.isArray(value.messages))
+      return {kind: 'sequence', sequence: value as unknown as Sequence};
+    if (name === 'diagram' && Array.isArray(value.nodes) && Array.isArray(value.edges))
+      return {kind: 'diagram', diagram: value as unknown as Diagram};
+  } catch {
+    // Reported below.
+  }
+  return {kind: 'malformed', what: `${name} block: not the JSON a ${name} needs`};
+};
 
 const BLOCK_START = /^(```|#{1,3}\s|> |-\s|\d+\.\s|\||---\s*$|:::)/;
 
@@ -112,6 +135,7 @@ const parseBlocks = (source: string): Block[] => {
       if (name === 'quiz') blocks.push({kind: 'quiz', quiz: parseQuiz(body)});
       else if (name === 'details')
         blocks.push({kind: 'details', title: rest || 'Details', body: parseBlocks(body.join('\n'))});
+      else if (name === 'sequence' || name === 'diagram') blocks.push(parseFigure(name, body));
       else blocks.push({kind: 'paragraph', text: body.join(' ')});
       continue;
     }
@@ -312,9 +336,10 @@ export const PopQuiz: FC<{quiz: PopQuizSpec; onAnswered?: (correct: boolean) => 
 });
 PopQuiz.displayName = 'PopQuiz';
 
-const Details: FC<{title: string; children: ReactNode}> = memo(({title, children}) => {
-  const [open, setOpen] = useState(false);
-  const toggle = useCallback(() => setOpen(o => !o), []);
+const Details: FC<{title: string; expanded: boolean; children: ReactNode}> = memo(({title, expanded, children}) => {
+  const [chosen, setChosen] = useState(false);
+  const toggle = useCallback(() => setChosen(o => !o), []);
+  const open = chosen || expanded;
   return (
     <div className="border-ink-700 bg-ink-850 my-3 rounded-lg border">
       <button
@@ -344,7 +369,11 @@ interface Props {
   onQuiz?: (correct: boolean) => void;
   /** Fenced-code highlighter; defaults to the CUDA/C++ one. */
   highlight?: Highlighter;
+  /** Open every `:::details` section (for print); the reader can still fold none of them back. */
+  expandDetails?: boolean;
 }
+
+const NO_FOCUS: readonly string[] = [];
 
 const Blocks: FC<{
   blocks: Block[];
@@ -352,21 +381,26 @@ const Blocks: FC<{
   onTry?: (code: string) => void;
   renderWidget?: WidgetRenderer;
   onQuiz?: (correct: boolean) => void;
-}> = memo(({blocks, highlight, onTry, renderWidget, onQuiz}) => (
+  expandDetails: boolean;
+}> = memo(({blocks, highlight, onTry, renderWidget, onQuiz, expandDetails}) => (
   <>
     {blocks.map((block, index) => {
       switch (block.kind) {
         case 'heading':
+          // Anchored like GitHub would, so a table of contents can link into the text.
           return block.level === 1 ? (
-            <h2 className="text-ink-50 pt-2 text-xl font-bold" key={index}>
+            <h2 className="text-ink-50 scroll-mt-20 pt-2 text-xl font-bold" id={githubSlug(block.text)} key={index}>
               {renderInline(block.text)}
             </h2>
           ) : block.level === 2 ? (
-            <h3 className="text-iris-300 pt-2 text-base font-bold" key={index}>
+            <h3 className="text-iris-300 scroll-mt-20 pt-2 text-base font-bold" id={githubSlug(block.text)} key={index}>
               {renderInline(block.text)}
             </h3>
           ) : (
-            <h4 className="text-ink-300 pt-1 text-sm font-semibold uppercase tracking-wide" key={index}>
+            <h4
+              className="text-ink-300 scroll-mt-20 pt-1 text-sm font-semibold uppercase tracking-wide"
+              id={githubSlug(block.text)}
+              key={index}>
               {renderInline(block.text)}
             </h4>
           );
@@ -448,12 +482,33 @@ const Blocks: FC<{
               )}
             </div>
           );
+        case 'sequence':
+          return (
+            <div className="my-4" key={index}>
+              <SequenceDiagram sequence={block.sequence} />
+            </div>
+          );
+        case 'diagram':
+          return (
+            <div className="my-4" key={index}>
+              <SystemDiagram compact diagram={block.diagram} focus={NO_FOCUS} />
+            </div>
+          );
+        case 'malformed':
+          return (
+            <div
+              className="border-danger-400/60 text-danger-200 rounded-lg border border-dashed p-3 text-[12px]"
+              key={index}>
+              {block.what}
+            </div>
+          );
         case 'details':
           return (
-            <Details key={index} title={block.title}>
+            <Details expanded={expandDetails} key={index} title={block.title}>
               <div className="text-ink-200 space-y-3 text-[14px] leading-relaxed">
                 <Blocks
                   blocks={block.body}
+                  expandDetails={expandDetails}
                   highlight={highlight}
                   onQuiz={onQuiz}
                   onTry={onTry}
@@ -468,14 +523,23 @@ const Blocks: FC<{
 ));
 Blocks.displayName = 'MarkdownBlocks';
 
-const Markdown: FC<Props> = memo(({source, onTry, renderWidget, onQuiz, highlight = leetbuildHighlighter}) => {
-  const blocks = useMemo(() => parseBlocks(source), [source]);
-  return (
-    <div className="text-ink-200 space-y-3 text-[14px] leading-relaxed">
-      <Blocks blocks={blocks} highlight={highlight} onQuiz={onQuiz} onTry={onTry} renderWidget={renderWidget} />
-    </div>
-  );
-});
+const Markdown: FC<Props> = memo(
+  ({source, onTry, renderWidget, onQuiz, highlight = leetbuildHighlighter, expandDetails = false}) => {
+    const blocks = useMemo(() => parseBlocks(source), [source]);
+    return (
+      <div className="text-ink-200 space-y-3 text-[14px] leading-relaxed">
+        <Blocks
+          blocks={blocks}
+          expandDetails={expandDetails}
+          highlight={highlight}
+          onQuiz={onQuiz}
+          onTry={onTry}
+          renderWidget={renderWidget}
+        />
+      </div>
+    );
+  },
+);
 Markdown.displayName = 'Markdown';
 
 export default Markdown;
@@ -486,6 +550,19 @@ export function popQuizzesOf(source: string): PopQuizSpec[] {
   const visit = (blocks: Block[]): void => {
     for (const b of blocks) {
       if (b.kind === 'quiz') out.push(b.quiz);
+      if (b.kind === 'details') visit(b.body);
+    }
+  };
+  visit(parseBlocks(source));
+  return out;
+}
+
+/** What the parser could not make sense of — `:::sequence` / `:::diagram` bodies that are not the JSON they need. */
+export function malformedBlocksOf(source: string): string[] {
+  const out: string[] = [];
+  const visit = (blocks: Block[]): void => {
+    for (const b of blocks) {
+      if (b.kind === 'malformed') out.push(b.what);
       if (b.kind === 'details') visit(b.body);
     }
   };

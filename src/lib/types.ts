@@ -215,6 +215,12 @@ export interface Problem {
   track?: Track;
   /** Problem statement: the real system, the simplified abstraction built here, what is out of scope. */
   statement: string;
+  /**
+   * The learning guide: the concepts the course rests on, walked through in the course markdown
+   * dialect (sections start at `#`; `:::widget`, `:::quiz` and `:::details` welcome). Its own page
+   * at `/<problem>/learn`, linked from the description, downloadable as Markdown and printable.
+   */
+  learn?: string;
   diagram: Diagram;
   steps: Step[];
   /**

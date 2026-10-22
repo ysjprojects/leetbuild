@@ -14,7 +14,7 @@
  */
 import {resolve} from 'node:path';
 
-import {widgetsOf} from '../src/components/Markdown';
+import {malformedBlocksOf, widgetsOf} from '../src/components/Markdown';
 import {describePattern, judge, matches, stripComments} from '../src/lib/judge';
 import {type NodeRuntime, createNodePythonRuntime, createNodeTypeScriptRuntime} from '../src/lib/runtime/node';
 import {type RunJob, type RunResult} from '../src/lib/runtime/types';
@@ -156,6 +156,12 @@ function verifyProblem(problem: Problem): string[] {
   if (problem.statement.trim() === '') errors.push(`${problem.id}: empty statement`);
   for (const w of widgetsOf(problem.statement))
     if (WIDGETS[w] === undefined) errors.push(`${problem.id}: unknown widget '${w}'`);
+  if (problem.learn !== undefined) {
+    if (!/^#\s+\S/m.test(problem.learn)) errors.push(`${problem.id}: the learning guide has no '#' section`);
+    for (const w of widgetsOf(problem.learn))
+      if (WIDGETS[w] === undefined) errors.push(`${problem.id}: learning guide: unknown widget '${w}'`);
+    for (const what of malformedBlocksOf(problem.learn)) errors.push(`${problem.id}: learning guide: ${what}`);
+  }
   const nodeIds = new Set<string>();
   for (const node of problem.diagram.nodes) {
     if (nodeIds.has(node.id)) errors.push(`${problem.id}: duplicate diagram node '${node.id}'`);

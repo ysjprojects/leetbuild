@@ -338,3 +338,19 @@ dialog[open] {
     color: var(--lb-muted);
   }
 }
+
+/* The learning guide's static version: the print dialog's "Save as PDF" (components/LearnPage.tsx). */
+@media print {
+  @page {
+    margin: 16mm;
+  }
+
+  html,
+  body {
+    background: #fff;
+  }
+
+  a {
+    text-decoration: none;
+  }
+}

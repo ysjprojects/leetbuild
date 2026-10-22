@@ -1,6 +1,7 @@
 import {DROPBOX} from '@/data/companies';
 import type {Problem} from '@/lib/types';
 
+import {learn} from './learn';
 import {protoFiles, protoModules} from './proto';
 import {gateApiStep} from './steps/1-gate-api';
 import {gateSnapshotStep} from './steps/2-gate-snapshot';
@@ -109,4 +110,5 @@ dependency on the critical path of every request.`,
   },
   steps: [gateApiStep, gateSnapshotStep, gatesRpcStep, exposureLogStep],
   support: {python: protoModules, typescript: protoFiles},
+  learn,
 };

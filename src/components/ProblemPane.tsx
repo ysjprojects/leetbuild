@@ -1,5 +1,7 @@
+import Link from 'next/link';
 import {type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 
+import {learnPath} from '@/lib/export';
 import {leetbuildHighlighter} from '@/lib/highlight';
 import {type ProblemScore, type StepAttempt, HINT_COST, potentialScore, problemScore, STEP_POINTS} from '@/lib/scoring';
 import {
@@ -226,6 +228,34 @@ const Solution: FC<{
 Solution.displayName = 'Solution';
 
 /** Company-tagged courses open with the company: whose writing this is, and where it appears. */
+/** A page with lines on it: the learning guide's mark. */
+const DocumentGlyph: FC = memo(() => (
+  <svg
+    aria-hidden
+    className="h-3.5 w-3.5 shrink-0"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.6"
+    viewBox="0 0 16 16">
+    <path d="M4 1.5h5.5L13 5v9.5H4z" strokeLinejoin="round" />
+    <path d="M9.5 1.5V5H13" strokeLinejoin="round" />
+    <path d="M6 8h5M6 10.5h5" strokeLinecap="round" />
+  </svg>
+));
+DocumentGlyph.displayName = 'DocumentGlyph';
+
+/** The course's learning guide, when it has one: the concepts walked through, on their own page. */
+const GuideLink: FC<{problemId: string}> = memo(({problemId}) => (
+  <Link
+    className="border-iris-400/40 bg-iris-400/10 text-iris-200 hover:border-iris-400/70 hover:text-ink-50 ml-auto inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold transition"
+    href={learnPath(problemId)}
+    title="The concepts behind this course, walked through with demos and quizzes">
+    <DocumentGlyph />
+    Learning guide
+  </Link>
+));
+GuideLink.displayName = 'GuideLink';
+
 const CompanyHeader: FC<{company: Company}> = memo(({company}) => (
   <div className="border-ink-700 bg-ink-800/60 mb-3 flex items-center gap-3 rounded-xl border p-3">
     <CompanyMark company={company} size="lg" />
@@ -527,6 +557,7 @@ const ProblemPane: FC<{
                 <span>
                   {problem.steps.length} steps · {points} pts each
                 </span>
+                {problem.learn !== undefined ? <GuideLink problemId={problem.id} /> : null}
               </div>
               {score.done === score.total ? (
                 <CourseComplete certified={certified} onCertificate={onCertificate} problem={problem} score={score} />
