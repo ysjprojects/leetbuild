@@ -1487,6 +1487,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'feature-flags-the-flag-that-flipped-per-request',
+    problemId: 'feature-flags',
+    stepId: 'endpoint',
+    title: 'The flag that flipped per request',
+    blurb: 'Per-flag caches and a keyless hash made rollouts inconsistent.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      "A canary flag flapped on and off for the same user, because the draft's bucket hash ignored the flag key and its cache updated one flag at a time. A kill switch also took minutes to reach one instance. Review it, fix it, and prove evaluation is deterministic and kill switches land fast.",
+    signals: ['Specify', 'Operate', 'Verify'],
+    aiNote:
+      'The draft buckets users with a hash that omits the flag key, so every flag applies the identical split and users fall in the same tail everywhere, and it rewrites cache entries per flag so readers observe a torn rule set mid-update; an older snapshot can also overwrite a kill memo with no version ordering.',
+    testIdea:
+      'Evaluate one user ten times across a version change and assert no flip without a rule change; swap a snapshot mid-read and assert every evaluation used one full version; issue a kill switch and assert every instance observes it within the staleness bound.',
+    followUps: [
+      'How do you make bucketing stable across flag renames?',
+      'What staleness bound is acceptable for a kill switch versus a rollout?',
+      'Should evaluations be cached on the server or the caller?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
