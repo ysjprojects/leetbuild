@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'refund-service-the-refund-that-paid-twice',
+    problemId: 'refund-service',
+    stepId: 'endpoint',
+    title: 'The refund that paid twice',
+    blurb: 'A retry generated a new PSP idempotency key.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A customer received two refunds for one return, because the draft generated a fresh idempotency key per PSP attempt and retried after a timeout. The same ledger let two partial refunds pass the same remaining balance. Review it, fix it, and prove retries share a key and the lifetime cap holds.',
+    signals: ['Verify', 'Specify', 'Operate'],
+    aiNote:
+      'The draft creates a new idempotency key for every PSP retry, so the provider sees two independent refunds, and its ledger check-then-add is non-atomic, so two concurrent partial refunds both pass against one remaining balance.',
+    testIdea:
+      'Time out the PSP call and assert the retry carries the same key and the provider records one refund; race two partial refunds that together exceed the balance and assert one is refused; reconcile the read endpoint against PSP records after a crash.',
+    followUps: [
+      'When should a refund be manual instead of automatic?',
+      'How would you handle a PSP that does not support idempotency keys?',
+      'What does the customer see while a refund is pending reconciliation?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
