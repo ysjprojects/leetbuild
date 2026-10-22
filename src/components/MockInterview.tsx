@@ -14,7 +14,8 @@ import ModeSwitch from './ModeSwitch';
 import {CompanyChip, DifficultyChip, ghostButtonClass, selectClass} from './paneShared';
 import StepEditor from './StepEditor';
 
-type Phase = 'setup' | 'running' | 'report';
+/** `ready` is the scenario page with the clock not yet running, behind the start dialog. */
+type Phase = 'setup' | 'ready' | 'running' | 'report';
 
 interface AssistantMessage {
   id: number;
@@ -199,6 +200,7 @@ const ScenarioBrief: FC<{scenario: ResolvedMockScenario; initial: Language; onLa
     );
     return (
       <div className="space-y-3">
+        <p className="text-ink-50 text-[14px] font-bold leading-snug">{scenario.title}</p>
         <div className="flex flex-wrap items-center gap-2 text-[12px]">
           <span className="text-ink-100 font-semibold">{scenario.problem.title}</span>
           <DifficultyChip difficulty={scenario.problem.difficulty} />
@@ -370,7 +372,8 @@ const MockInterview: FC = memo(() => {
     return () => window.clearTimeout(timer);
   }, [phase, secondsLeft]);
 
-  const start = useCallback((next: ResolvedMockScenario, chosen: Language) => {
+  /** Open a scenario on its own page with the clock not yet running: the draft loads, the brief shows, nothing counts. */
+  const prepare = useCallback((next: ResolvedMockScenario, chosen: Language) => {
     const starters = startersFor(next);
     setScenarioId(next.id);
     setLanguage(chosen);
@@ -392,29 +395,8 @@ const MockInterview: FC = memo(() => {
         text: 'I drafted a first version. It passes the happy path. Review it before you trust it.',
       },
     ]);
-    setPhase('running');
+    setPhase('ready');
   }, []);
-
-  // The card opens a brief, not the clock: the scenario, its course, the language, and one Start.
-  const [dialog, openDialog] = useDialog();
-  const languageChoice = useRef<Language>('python');
-  const onLanguageChoice = useCallback((chosen: Language) => {
-    languageChoice.current = chosen;
-  }, []);
-  const confirmStart = useCallback(
-    (next: ResolvedMockScenario) => {
-      languageChoice.current = next.defaultLanguage;
-      void openDialog({
-        title: next.title,
-        body: <ScenarioBrief initial={next.defaultLanguage} onLanguage={onLanguageChoice} scenario={next} />,
-        confirm: `Start the clock · ${next.minutes}:00`,
-        cancel: 'Not yet',
-      }).then(ok => {
-        if (ok) start(next, languageChoice.current);
-      });
-    },
-    [openDialog, onLanguageChoice, start],
-  );
 
   const backToSetup = useCallback(() => {
     setPhase('setup');
@@ -423,6 +405,24 @@ const MockInterview: FC = memo(() => {
     setVerdict(null);
     setMessages([]);
   }, []);
+
+  // The ready page sits behind a blurred backdrop until the brief is confirmed: Start runs the clock, anything else returns to the picker.
+  const [dialog, openDialog] = useDialog();
+  useEffect(() => {
+    if (phase !== 'ready' || scenario === null) return;
+    void openDialog({
+      title: 'Start the timed assessment?',
+      body: <ScenarioBrief initial={scenario.defaultLanguage} onLanguage={setLanguage} scenario={scenario} />,
+      confirm: `Start the clock · ${scenario.minutes}:00`,
+      cancel: 'Back to scenarios',
+      conceal: true,
+    }).then(ok => (ok ? setPhase('running') : backToSetup()));
+  }, [phase, scenario, openDialog, backToSetup]);
+
+  const openScenario = useCallback((next: ResolvedMockScenario) => prepare(next, next.defaultLanguage), [prepare]);
+  const retry = useCallback(() => {
+    if (scenario !== null) prepare(scenario, language);
+  }, [prepare, scenario, language]);
 
   const changeLanguage = useCallback((event: ChangeEvent<HTMLSelectElement>) => {
     setLanguage(event.target.value as Language);
@@ -598,9 +598,8 @@ const MockInterview: FC = memo(() => {
               </div>
             </div>
           </div>
-          <ScenarioPicker onStart={confirmStart} scenarios={resolvedMockScenarios} />
+          <ScenarioPicker onStart={openScenario} scenarios={resolvedMockScenarios} />
         </main>
-        {dialog}
       </div>
     );
   }
@@ -694,7 +693,7 @@ const MockInterview: FC = memo(() => {
               </div>
             </details>
             <div className="flex flex-wrap items-center gap-3">
-              <button className={MOCK_PRIMARY} onClick={() => start(scenario, language)} type="button">
+              <button className={MOCK_PRIMARY} onClick={retry} type="button">
                 Retry this scenario
               </button>
               <button className={ghostButtonClass} onClick={backToSetup} type="button">
@@ -895,6 +894,7 @@ const MockInterview: FC = memo(() => {
           </p>
         </aside>
       </main>
+      {dialog}
     </div>
   );
 });

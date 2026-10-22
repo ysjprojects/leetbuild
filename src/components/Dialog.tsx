@@ -17,6 +17,8 @@ export interface DialogSpec {
   danger?: boolean;
   /** A catalog or table rather than a sentence: wider panel, body scrolls. */
   wide?: boolean;
+  /** The page behind is what is being confirmed (a timed assessment about to start): the backdrop blurs and darkens it. */
+  conceal?: boolean;
 }
 
 const buttonClass = 'rounded-lg px-3 py-1.5 text-[12px] font-semibold transition';
@@ -42,9 +44,9 @@ const Dialog: FC<{spec: DialogSpec; onClose: (ok: boolean) => void}> = memo(({sp
   return (
     <dialog
       aria-labelledby="lb-dialog-title"
-      className={`border-ink-600 bg-ink-800 text-ink-200 backdrop:bg-ink-950/70 rounded-xl border p-0 shadow-2xl ${
-        spec.wide === true ? 'w-[min(94vw,40rem)]' : 'w-[min(92vw,26rem)]'
-      }`}
+      className={`border-ink-600 bg-ink-800 text-ink-200 rounded-xl border p-0 shadow-2xl ${
+        spec.conceal === true ? 'backdrop:bg-ink-950/65 backdrop:backdrop-blur-md' : 'backdrop:bg-ink-950/70'
+      } ${spec.wide === true ? 'w-[min(94vw,40rem)]' : 'w-[min(92vw,26rem)]'}`}
       onClick={onClick}
       onClose={cancel}
       ref={ref}>
