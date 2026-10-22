@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'red-team-runner-the-red-team-that-attacked-production',
+    problemId: 'red-team-runner',
+    stepId: 'endpoint',
+    title: 'The red-team that attacked production',
+    blurb: 'The draft resolved an arbitrary URL and probes hit production.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A red-team run accidentally sent adversarial probes to production, because the draft accepted any target URL and never enforced the non-production registry. The same draft re-ran probes on retry and skipped coverage silently. Review it, fix it, and prove targets are registered and coverage is honest.',
+    signals: ['Secure', 'Evaluate', 'Verify'],
+    aiNote:
+      'The draft accepts an arbitrary URL as a target with no registry check, so a typo in the target field points the entire probe set at production, and its probe dedupe is a non-atomic check-then-set that re-executes concurrent probes.',
+    testIdea:
+      'Submit a production URL and assert 400 before any probe is sent; fire the kill switch mid-run and assert every runner stops before its next probe; assert a run with skipped categories never reports pass.',
+    followUps: [
+      'How would you scope a probe category before it runs?',
+      'What evidence bundle should a finding carry to be reproducible?',
+      'When should a kill switch require a human to reset?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
