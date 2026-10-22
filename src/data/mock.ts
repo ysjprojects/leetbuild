@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'drift-monitor-the-monitor-that-alerted-forever',
+    problemId: 'drift-monitor',
+    stepId: 'endpoint',
+    title: 'The monitor that alerted forever',
+    blurb: 'The baseline was live traffic and alerts never cooled down.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'An on-call got 400 pages in an hour from one monitor, because the draft evaluated on every batch with no cooldown and compared live traffic against a baseline that was itself live traffic. The same draft alerted on 20-sample batches. Review it, fix it, and prove alerts are significant and deduplicated.',
+    signals: ['Operate', 'Evaluate', 'Verify'],
+    aiNote:
+      'The draft writes the baseline into the same mutable sketch as live traffic, so the reference drifts with the signal and eventually nothing can be detected, and it alerts per batch tick with no cooldown or minimum sample size.',
+    testIdea:
+      'Feed one batch that crosses the threshold and assert one alert per window; feed a 20-sample batch and assert insufficient data; move live traffic and assert the baseline stays fixed.',
+    followUps: [
+      'What distance measure fits which feature type?',
+      'How many samples make a drift alert actionable?',
+      'What is the right cooldown before the next page?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
