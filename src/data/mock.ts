@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'training-scheduler-the-training-run-that-could-not-start',
+    problemId: 'training-scheduler',
+    stepId: 'endpoint',
+    title: 'The training run that could not start',
+    blurb: 'A worker died during startup and the run vanished from the queue.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A priority boost duplicated a run, one copy was popped and its worker died during startup, and the dashboard said queued forever while the position drifted. The draft also killed preempted jobs before they could checkpoint. Review it, fix it, and prove starts are leased, preemptions checkpoint and state reconciles.',
+    signals: ['Operate', 'Specify', 'Verify'],
+    aiNote:
+      'The draft pops a run and treats it as started with no lease, so a crash between pop and process start loses the run silently, and it terminates preempted jobs immediately, discarding training progress instead of waiting for a checkpoint id.',
+    testIdea:
+      'Kill a worker between pop and start and assert the run returns to the queue; preempt a checkpointing job and assert the kill happens only after the checkpoint id; boost a priority concurrently and assert one queue position remains.',
+    followUps: [
+      'What priority bands prevent starvation without letting callers jump?',
+      'How long should a start lease be and what renews it?',
+      'What has to be true before a checkpoint is trusted?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
