@@ -77,6 +77,7 @@ import {sessionStoreProblem} from './73-session-store/index';
 import {metricsPipelineProblem} from './74-metrics-pipeline/index';
 import {logIndexerProblem} from './75-log-indexer/index';
 import {traceCollectorProblem} from './76-trace-collector/index';
+import {jobQueueProblem} from './77-job-queue/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -145,6 +146,7 @@ export const problems: Problem[] = [
   metricsPipelineProblem,
   logIndexerProblem,
   traceCollectorProblem,
+  jobQueueProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
