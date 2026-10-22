@@ -276,6 +276,44 @@ copy-to-compute ratio, double-buffered device memory for an unbounded input stre
       },
     },
   ],
+  sources: [
+    {
+      kind: 'post',
+      title: 'How to Overlap Data Transfers in CUDA C/C++',
+      url: 'https://developer.nvidia.com/blog/how-overlap-data-transfers-cuda-cc/',
+      by: 'Mark Harris',
+      date: '2012-12-13',
+      venue: 'NVIDIA Technical Blog',
+      takes:
+        'The chunked pipeline of `run_pipelined`: one stream per chunk, `cudaMemcpyAsync` in, the kernel, `cudaMemcpyAsync` out, so one chunk’s copies run under another chunk’s compute.',
+    },
+    {
+      kind: 'post',
+      title: 'How to Optimize Data Transfers in CUDA C/C++',
+      url: 'https://developer.nvidia.com/blog/how-optimize-data-transfers-cuda-cc/',
+      by: 'Mark Harris',
+      date: '2012-12-04',
+      venue: 'NVIDIA Technical Blog',
+      takes:
+        'Why `h_in` and `h_out` come from `cudaMallocHost`: pinned memory is faster to copy and is what lets `cudaMemcpyAsync` run asynchronously at all.',
+    },
+    {
+      kind: 'docs',
+      title: 'Asynchronous Execution',
+      url: 'https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/asynchronous-execution.html',
+      venue: 'CUDA Programming Guide',
+      takes:
+        'Streams as ordered queues, `cudaEventRecord` and `cudaStreamWaitEvent` for the `computed` chain that carries each chunk’s last output to the next, and `cudaEventElapsedTime` for the `landed` times.',
+    },
+    {
+      kind: 'docs',
+      title: 'Asynchronous and Overlapping Transfers with Computation',
+      url: 'https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#asynchronous-and-overlapping-transfers-with-computation',
+      venue: 'CUDA C++ Best Practices Guide',
+      takes:
+        'The staged concurrent copy and execute that splits `N` into `NSTREAMS` chunks, and the copy-engine conditions under which the speedup over `run_baseline` appears.',
+    },
+  ],
   steps: [streamsPipelineStep],
   learn,
 };

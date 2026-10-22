@@ -166,6 +166,55 @@ optimizer state across devices.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'On the importance of initialization and momentum in deep learning',
+      url: 'https://proceedings.mlr.press/v28/sutskever13.html',
+      by: 'Ilya Sutskever et al.',
+      date: '2013-05-26',
+      venue: 'ICML 2013',
+      takes:
+        'Nesterov momentum as a gradient taken after the momentum step, the look-ahead that `nesterov=True` turns into `g + μ · buf`.',
+    },
+    {
+      kind: 'paper',
+      title: 'Decoupled Weight Decay Regularization',
+      url: 'https://arxiv.org/abs/1711.05101',
+      by: 'Ilya Loshchilov and Frank Hutter',
+      date: '2017-11-14',
+      venue: 'ICLR 2019',
+      takes:
+        'SGDW: the weight shrunk by `p ← p · (1 − lr · wd)` before the update instead of `wd · p` added to the gradient and fed through the momentum buffer.',
+    },
+    {
+      kind: 'code',
+      title: 'AdamW-and-SGDW',
+      url: 'https://github.com/loshchil/AdamW-and-SGDW',
+      by: 'Ilya Loshchilov',
+      date: '2017-11-07',
+      venue: 'GitHub',
+      takes: "The authors' Torch code for SGDW, the decoupled decay this optimizer's `step()` applies first.",
+    },
+    {
+      kind: 'post',
+      title: 'Why Momentum Really Works',
+      url: 'https://distill.pub/2017/momentum/',
+      by: 'Gabriel Goh',
+      date: '2017-04-04',
+      venue: 'Distill',
+      takes:
+        'The heavy ball in a ravine: why `buf ← μ · buf + g` damps the zig-zag across the valley and speeds the walk along its floor.',
+    },
+    {
+      kind: 'docs',
+      title: 'torch.optim.SGD',
+      url: 'https://docs.pytorch.org/docs/stable/generated/torch.optim.SGD.html',
+      venue: 'PyTorch documentation',
+      takes:
+        'The update rule matched step for step over 25 steps: the lazily created `momentum_buffer`, the Nesterov branch and the `step(closure)` contract.',
+    },
+  ],
   steps: [sgdMomentumStep],
   learn,
 };

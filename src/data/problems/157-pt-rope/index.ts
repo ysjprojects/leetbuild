@@ -195,6 +195,38 @@ and fused kernels that rotate \`q\` and \`k\` inside the QKV projection.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'RoFormer: Enhanced Transformer with Rotary Position Embedding',
+      url: 'https://arxiv.org/abs/2104.09864',
+      by: 'Jianlin Su et al.',
+      date: '2021-04-20',
+      venue: 'Neurocomputing 2024',
+      takes:
+        'Rotary embeddings: pair `i` rotated by `m · theta_i` with `theta_i = base^(−2i / head_dim)`, so `q_m · k_n` depends on `m − n` alone.',
+    },
+    {
+      kind: 'code',
+      title: 'roformer',
+      url: 'https://github.com/ZhuiyiTechnology/roformer',
+      by: 'ZhuiyiTechnology',
+      date: '2021-03-22',
+      venue: 'GitHub',
+      takes:
+        "The authors' RoFormer, with the interleaved `(2i, 2i + 1)` pairing this problem swaps for the half split.",
+    },
+    {
+      kind: 'post',
+      title: 'Rotary Embeddings: A Relative Revolution',
+      url: 'https://blog.eleuther.ai/rotary-embeddings/',
+      by: 'Stella Biderman et al.',
+      date: '2021-04-20',
+      venue: 'EleutherAI Blog',
+      takes:
+        "The complex-number derivation the self-test's reference uses, and GPT-NeoX's `rotate_half` with a cached cos/sin table, the half-split layout `apply_rope` follows.",
+    },
+  ],
   steps: [ropeStep],
   learn,
 };

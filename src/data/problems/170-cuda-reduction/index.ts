@@ -296,6 +296,46 @@ multi-GPU (all-reduce) forms.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'code',
+      title: 'CCCL',
+      url: 'https://github.com/NVIDIA/cccl',
+      by: 'NVIDIA',
+      date: '2020-09-17',
+      venue: 'GitHub',
+      takes:
+        "CUB's `cub::WarpReduce`, `cub::BlockReduce` and `cub::DeviceReduce::Sum`, the production form of the warp, block and grid levels `reduce_sum` builds by hand.",
+    },
+    {
+      kind: 'post',
+      title: 'Optimizing Parallel Reduction in CUDA',
+      url: 'https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf',
+      by: 'Mark Harris',
+      date: '2010-03',
+      venue: 'NVIDIA CUDA webinar',
+      takes:
+        'The seven-kernel walk from divergent interleaved addressing to sequential addressing, first add during load and many elements per thread, the shared-memory tree under the shuffle version.',
+    },
+    {
+      kind: 'post',
+      title: 'Faster Parallel Reductions on Kepler',
+      url: 'https://developer.nvidia.com/blog/faster-parallel-reductions-kepler/',
+      by: 'Justin Luitjens',
+      date: '2014-02-13',
+      venue: 'NVIDIA Technical Blog',
+      takes:
+        'The exact design of `reduce_sum`: a grid-stride register sum, `warp_reduce_sum` with `__shfl_down_sync`, one shared slot per warp, warp 0 reducing the slots and one `atomicAdd` per block.',
+    },
+    {
+      kind: 'docs',
+      title: 'Warp Shuffle Functions',
+      url: 'https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cpp-language-extensions.html#warp-shuffle-functions',
+      venue: 'CUDA Programming Guide',
+      takes:
+        'The semantics of `__shfl_down_sync(0xffffffff, v, offset)`: the full-warp mask, and why lanes whose source is out of range keep their own value so only lane 0 holds the sum.',
+    },
+  ],
   steps: [reduceSumStep],
   learn,
 };

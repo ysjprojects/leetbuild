@@ -344,6 +344,56 @@ CUTLASS add on top of the warp-level contract written here.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Mixed Precision Training',
+      url: 'https://arxiv.org/abs/1710.03740',
+      by: 'Paulius Micikevicius et al.',
+      date: '2017-10-10',
+      venue: 'ICLR 2018',
+      takes:
+        'The split the kernel relies on: `half` inputs multiplied, products accumulated in an fp32 `accumulator` fragment.',
+    },
+    {
+      kind: 'code',
+      title: 'CUTLASS',
+      url: 'https://github.com/NVIDIA/cutlass',
+      by: 'NVIDIA',
+      date: '2017-11-30',
+      venue: 'GitHub',
+      takes:
+        'The block tile, warp tile and `mma` hierarchy that `wmma_matmul_smem` sketches with a 64 × 64 block tile split into 2 × 2 warps of 32 × 32.',
+    },
+    {
+      kind: 'post',
+      title: 'Programming Tensor Cores in CUDA 9',
+      url: 'https://developer.nvidia.com/blog/programming-tensor-cores-cuda-9/',
+      by: 'Jeremy Appleyard and Scott Yokim',
+      date: '2017-10-17',
+      venue: 'NVIDIA Technical Blog',
+      takes:
+        'The `nvcuda::wmma` pattern of `wmma_matmul`: one warp per 16 × 16 tile of `C`, `fill_fragment` to zero, `load_matrix_sync` with the leading dimension, `mma_sync` along K and `store_matrix_sync`.',
+    },
+    {
+      kind: 'post',
+      title: 'CUTLASS: Fast Linear Algebra in CUDA C++',
+      url: 'https://developer.nvidia.com/blog/cutlass-linear-algebra-cuda/',
+      by: 'Andrew Kerr, Duane Merrill and Julien Demouth',
+      date: '2017-12-05',
+      venue: 'NVIDIA Technical Blog',
+      takes:
+        'Why the shared-memory version is faster: tiles of A and B staged once per block and reused by every warp, as the GEMM hierarchy from block to warp to tensor-core instruction.',
+    },
+    {
+      kind: 'docs',
+      title: 'Warp Matrix Functions',
+      url: 'https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cpp-language-extensions.html#warp-matrix-functions',
+      venue: 'CUDA Programming Guide',
+      takes:
+        'The fragment types `matrix_a`, `matrix_b` and `accumulator`, the `m16n16k16` shape for `half`, `ldm` a multiple of 8 and the 256-bit alignment that `__align__(32)` gives the shared tiles.',
+    },
+  ],
   steps: [wmmaMatmulStep],
   learn,
 };

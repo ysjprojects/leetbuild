@@ -292,6 +292,54 @@ track builds on.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'post',
+      title: 'An Even Easier Introduction to CUDA (Updated)',
+      url: 'https://developer.nvidia.com/blog/even-easier-introduction-cuda/',
+      by: 'Mark Harris',
+      date: '2025-05-02',
+      venue: 'NVIDIA Technical Blog',
+      takes:
+        'The host-side shape of `run_vector_add`: allocate, launch `<<<blocks, threads>>>`, synchronise before reading, then the grid-stride `add` kernel the step generalises.',
+    },
+    {
+      kind: 'post',
+      title: 'CUDA Pro Tip: Write Flexible Kernels with Grid-Stride Loops',
+      url: 'https://developer.nvidia.com/blog/cuda-pro-tip-write-flexible-kernels-grid-stride-loops/',
+      by: 'Mark Harris',
+      date: '2013-04-22',
+      venue: 'NVIDIA Technical Blog',
+      takes:
+        'The loop in `vector_add` that starts at the global thread index and advances by `gridDim.x * blockDim.x`, so the grid capped at `MAX_BLOCKS = 1024` still covers all 4,194,341 floats.',
+    },
+    {
+      kind: 'post',
+      title: 'How to Implement Performance Metrics in CUDA C/C++',
+      url: 'https://developer.nvidia.com/blog/how-implement-performance-metrics-cuda-cc/',
+      by: 'Mark Harris',
+      date: '2012-11-07',
+      venue: 'NVIDIA Technical Blog',
+      takes:
+        'The two `cudaEvent`s around the 20 timed launches and the effective-bandwidth line: three arrays of `n` floats over the elapsed milliseconds.',
+    },
+    {
+      kind: 'docs',
+      title: 'Error Checking in CUDA',
+      url: 'https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/intro-to-cuda-cpp.html#intro-cpp-error-checking',
+      venue: 'CUDA Programming Guide',
+      takes:
+        'Why `CUDA_CHECK` wraps every runtime call and why a launch needs `cudaGetLastError()` right after it: launch errors are reported there, kernel faults only at the next synchronise.',
+    },
+    {
+      kind: 'docs',
+      title: 'Thread and Grid Index Intrinsics',
+      url: 'https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/intro-to-cuda-cpp.html#intro-cpp-thread-indexing',
+      venue: 'CUDA Programming Guide',
+      takes:
+        '`blockIdx`, `blockDim`, `threadIdx` and `gridDim`, and the bounds check against `n` that keeps the last partial block from writing past the end.',
+    },
+  ],
   steps: [vectorAddStep],
   learn,
 };

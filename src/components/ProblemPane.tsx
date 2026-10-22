@@ -10,6 +10,7 @@ import {
   type Problem,
   type ProblemFigure,
   type Source,
+  type SourceKind,
   type Step,
   codeFor,
   CONCEPT_LABEL,
@@ -17,13 +18,14 @@ import {
   fileName,
   isArchitectureFigure,
   LANGUAGE_LABEL,
+  sourceCredit,
   stepKey,
 } from '@/lib/types';
 
 import ArchitectureDiagram from './ArchitectureDiagram';
 import {useDialog} from './Dialog';
 import GpuDiagram from './GpuDiagram';
-import Markdown from './Markdown';
+import Markdown, {InlineMarkdown} from './Markdown';
 import {CompanyMark, ConceptChip, DifficultyChip, ghostButtonClass, linkClass, primaryButtonClass} from './paneShared';
 import SequenceDiagram from './SequenceDiagram';
 import {mod} from './Shortcuts';
@@ -358,14 +360,34 @@ const formatSourceDate = (date: string): string => {
   });
 };
 
-/** The pieces a company-tagged course is derived from, each with what the course takes from it. */
+/** Each kind of source in its own tint, so papers, code and posts scan apart. */
+const SOURCE_KIND_TONE: Record<SourceKind, string> = {
+  paper: 'border-iris-400/40 text-iris-300',
+  code: 'border-success-400/40 text-success-300',
+  post: 'border-warning-400/40 text-warning-300',
+  docs: 'border-ink-500 text-ink-300',
+};
+
+/**
+ * The pieces a problem is built on, each with what it takes from them: a company-tagged course's posts
+ * beside the company's mark, a deep-learning problem's papers, code and posts tagged with their kind.
+ */
 const Sources: FC<{company: Company | undefined; sources: readonly Source[]}> = memo(({company, sources}) => (
   <section className="border-ink-700 mt-6 border-t pt-4">
     <h2 className="text-iris-400 text-[11px] font-bold uppercase tracking-wider">Sources</h2>
     <ol className="mt-2 space-y-3">
       {sources.map(source => (
         <li className="flex gap-3" key={source.url}>
-          {company !== undefined ? <CompanyMark company={company} /> : null}
+          {company !== undefined ? (
+            <CompanyMark company={company} />
+          ) : source.kind !== undefined ? (
+            <span
+              className={`font-code mt-0.5 flex h-4 w-11 shrink-0 items-center justify-center rounded border text-[9px] font-semibold uppercase tracking-wider ${
+                SOURCE_KIND_TONE[source.kind]
+              }`}>
+              {source.kind}
+            </span>
+          ) : null}
           <div className="min-w-0">
             <a
               className="text-ink-50 hover:text-iris-200 decoration-ink-500 text-[13px] font-semibold underline underline-offset-2"
@@ -375,10 +397,11 @@ const Sources: FC<{company: Company | undefined; sources: readonly Source[]}> = 
               {source.title}
             </a>
             <p className="text-ink-400 font-code mt-0.5 text-[10.5px]">
-              {company?.publication ?? ''}
-              {source.by !== undefined ? ` · ${source.by}` : ''} · {formatSourceDate(source.date)}
+              {sourceCredit(source, company?.publication, formatSourceDate)}
             </p>
-            <p className="text-ink-200 mt-1 text-[12px] leading-relaxed">{source.takes}</p>
+            <p className="text-ink-200 mt-1 text-[12px] leading-relaxed">
+              <InlineMarkdown source={source.takes} />
+            </p>
           </div>
         </li>
       ))}

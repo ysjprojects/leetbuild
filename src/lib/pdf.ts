@@ -9,6 +9,7 @@ import type {Content, ContentTable, ContentText, TableCell, TDocumentDefinitions
 
 import type {Guide} from './export';
 import {type Block, type InlineLeaf, type InlineToken, inlineTokens, parseBlocks} from './markdown';
+import {sourceCredit} from './types';
 import {WIDGETS} from './widgets';
 
 // A4 is 595 × 842 pt; the text column is what is left inside the margins.
@@ -218,15 +219,16 @@ export function guideDocument(guide: Guide): TDocumentDefinitions {
         ? []
         : [
             {text: 'Sources', style: 'h1'},
-            ...guide.sources.map(
-              (s): Content => ({
+            ...guide.sources.map((s): Content => {
+              const credit = sourceCredit(s);
+              return {
                 text: [
                   {text: s.title, link: s.url, color: ACCENT, decoration: 'underline'},
-                  {text: `${s.by !== undefined ? ` — ${s.by}` : ''}, ${s.date}.`},
+                  {text: credit === '' ? '.' : ` · ${credit}.`},
                 ],
                 style: 'source',
-              }),
-            ),
+              };
+            }),
           ]),
     ],
   };

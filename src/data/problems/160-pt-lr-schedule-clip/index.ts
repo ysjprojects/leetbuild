@@ -187,6 +187,66 @@ recent runs. The schedule, the norm and the accumulation arithmetic are the same
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour',
+      url: 'https://arxiv.org/abs/1706.02677',
+      by: 'Priya Goyal et al.',
+      date: '2017-06-08',
+      venue: 'arXiv',
+      takes:
+        'Linear warmup: ramp from a fraction of the target LR so large-batch training survives its first steps, the first branch of `lr_at`.',
+    },
+    {
+      kind: 'paper',
+      title: 'On the Variance of the Adaptive Learning Rate and Beyond',
+      url: 'https://arxiv.org/abs/1908.03265',
+      by: 'Liyuan Liu et al.',
+      date: '2019-08-08',
+      venue: 'ICLR 2020',
+      takes:
+        "Why Adam needs the warmup too: the adaptive LR's variance is unbounded while `v` rests on a handful of gradients.",
+    },
+    {
+      kind: 'paper',
+      title: 'SGDR: Stochastic Gradient Descent with Warm Restarts',
+      url: 'https://arxiv.org/abs/1608.03983',
+      by: 'Ilya Loshchilov and Frank Hutter',
+      date: '2016-08-13',
+      venue: 'ICLR 2017',
+      takes:
+        'Cosine annealing, `min_lr + ½(1 + cos(π · progress))(max_lr − min_lr)`, which `lr_at` runs once without the restarts.',
+    },
+    {
+      kind: 'paper',
+      title: 'On the difficulty of training Recurrent Neural Networks',
+      url: 'https://arxiv.org/abs/1211.5063',
+      by: 'Razvan Pascanu, Tomas Mikolov and Yoshua Bengio',
+      date: '2012-11-21',
+      venue: 'ICML 2013',
+      takes:
+        'Gradient-norm clipping: when the norm exceeds the threshold, rescale the whole gradient to it, which `clip_grad_norm_` does in place.',
+    },
+    {
+      kind: 'code',
+      title: 'nanoGPT',
+      url: 'https://github.com/karpathy/nanoGPT',
+      by: 'Andrej Karpathy',
+      date: '2022-12-28',
+      venue: 'GitHub',
+      takes:
+        '`train.py`: `get_lr` with linear warmup and cosine decay to `min_lr`, the loss divided by `gradient_accumulation_steps`, and `grad_clip = 1.0`, the loop `train_step` rebuilds.',
+    },
+    {
+      kind: 'docs',
+      title: 'torch.nn.utils.clip_grad_norm_',
+      url: 'https://docs.pytorch.org/docs/stable/generated/torch.nn.utils.clip_grad_norm_.html',
+      venue: 'PyTorch documentation',
+      takes:
+        'The reference the hand-written clip is checked against: the total norm over all gradients, returned before clipping, `0.6876` → `0.1000` here.',
+    },
+  ],
   steps: [trainStepStep],
   learn,
 };

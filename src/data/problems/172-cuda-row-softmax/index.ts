@@ -227,6 +227,54 @@ it, FlashAttention is built on it.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Online normalizer calculation for softmax',
+      url: 'https://arxiv.org/abs/1805.02867',
+      by: 'Maxim Milakov and Natalia Gimelshein',
+      date: '2018-05-08',
+      venue: 'arXiv',
+      takes:
+        'The safe softmax `exp(x − m) / Σ exp(x − m)` that `softmax_rows` computes with a max pass, a sum pass and a write, and the one-pass online normaliser that would fuse the first two.',
+    },
+    {
+      kind: 'code',
+      title: 'online-softmax',
+      url: 'https://github.com/NVIDIA/online-softmax',
+      by: 'NVIDIA',
+      date: '2018-07-26',
+      venue: 'GitHub',
+      takes:
+        'The paper’s CUDA benchmark: naive, safe and online softmax kernels over a row per block, the same layout as `softmax_rows`.',
+    },
+    {
+      kind: 'post',
+      title: 'Faster Parallel Reductions on Kepler',
+      url: 'https://developer.nvidia.com/blog/faster-parallel-reductions-kepler/',
+      by: 'Justin Luitjens',
+      date: '2014-02-13',
+      venue: 'NVIDIA Technical Blog',
+      takes:
+        'The block reduction used twice, once with `fmaxf` and once with `+`: shuffle within each warp, one shared slot per warp, then the eight slots reduced by one warp.',
+    },
+    {
+      kind: 'docs',
+      title: 'Warp Shuffle Functions',
+      url: 'https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cpp-language-extensions.html#warp-shuffle-functions',
+      venue: 'CUDA Programming Guide',
+      takes:
+        '`__shfl_xor_sync` and `__shfl_down_sync`: the butterfly that leaves the row max in every lane, against the tree that leaves it only in lane 0.',
+    },
+    {
+      kind: 'docs',
+      title: 'Fused Softmax',
+      url: 'https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html',
+      venue: 'Triton documentation',
+      takes:
+        'The same row-per-program softmax in Triton, with the bandwidth argument for keeping the row on chip between the max, the sum and the write.',
+    },
+  ],
   steps: [rowSoftmaxStep],
   learn,
 };

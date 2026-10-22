@@ -187,6 +187,55 @@ state across devices.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Adam: A Method for Stochastic Optimization',
+      url: 'https://arxiv.org/abs/1412.6980',
+      by: 'Diederik P. Kingma and Jimmy Ba',
+      date: '2014-12-22',
+      venue: 'ICLR 2015',
+      takes:
+        'The two moments `exp_avg` and `exp_avg_sq`, the bias correction by `1 − β1^t` and `1 − β2^t`, and the step `m̂ / (√v̂ + ε)`.',
+    },
+    {
+      kind: 'paper',
+      title: 'Decoupled Weight Decay Regularization',
+      url: 'https://arxiv.org/abs/1711.05101',
+      by: 'Ilya Loshchilov and Frank Hutter',
+      date: '2017-11-14',
+      venue: 'ICLR 2019',
+      takes:
+        "AdamW's one change: `p.mul_(1 - lr * weight_decay)` on the parameter, so the decay is not rescaled by `√v` as `wd · p` in the gradient would be.",
+    },
+    {
+      kind: 'paper',
+      title: 'On the Convergence of Adam and Beyond',
+      url: 'https://arxiv.org/abs/1904.09237',
+      by: 'Sashank J. Reddi, Satyen Kale and Sanjiv Kumar',
+      date: '2019-04-19',
+      venue: 'ICLR 2018',
+      takes:
+        'AMSGrad: the running maximum `max_exp_avg_sq` that `amsgrad=True` divides by, so a rare large gradient is not forgotten.',
+    },
+    {
+      kind: 'code',
+      title: 'AdamW-and-SGDW',
+      url: 'https://github.com/loshchil/AdamW-and-SGDW',
+      by: 'Ilya Loshchilov',
+      date: '2017-11-07',
+      venue: 'GitHub',
+      takes: "The authors' code for the decoupled update this `AdamW.step` implements.",
+    },
+    {
+      kind: 'docs',
+      title: 'torch.optim.AdamW',
+      url: 'https://docs.pytorch.org/docs/stable/generated/torch.optim.AdamW.html',
+      venue: 'PyTorch documentation',
+      takes:
+        'The signature and the update matched to `1e-7` after every step, `eps` added after the square root and the AMSGrad branch included.',
+    },
+  ],
   steps: [adamwStep],
   learn,
 };

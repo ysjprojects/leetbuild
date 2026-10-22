@@ -189,6 +189,58 @@ production trainers add to the token-level one built here.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Outrageously Large Neural Networks: The Sparsely-Gated Mixture-of-Experts Layer',
+      url: 'https://arxiv.org/abs/1701.06538',
+      by: 'Noam Shazeer et al.',
+      date: '2017-01-23',
+      venue: 'ICLR 2017',
+      takes:
+        'The layer itself: a trainable gate that keeps the top `k` of `E` experts per token, softmax over the kept scores, and an auxiliary loss against expert imbalance.',
+    },
+    {
+      kind: 'paper',
+      title: 'GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding',
+      url: 'https://arxiv.org/abs/2006.16668',
+      by: 'Dmitry Lepikhin et al.',
+      date: '2020-06-30',
+      venue: 'ICLR 2021',
+      takes:
+        'Top-2 routing under an expert capacity: tokens past the capacity are dropped and carried on by the residual, as `MoE` does.',
+    },
+    {
+      kind: 'paper',
+      title: 'Switch Transformers: Scaling to Trillion Parameter Models with Simple and Efficient Sparsity',
+      url: 'https://arxiv.org/abs/2101.03961',
+      by: 'William Fedus, Barret Zoph and Noam Shazeer',
+      date: '2021-01-11',
+      venue: 'JMLR 2022',
+      takes:
+        'The load-balancing loss `n_experts · Σ_e f_e · P_e`, the `capacity_factor` of 1.25, and the router computed in float32.',
+    },
+    {
+      kind: 'paper',
+      title: 'ST-MoE: Designing Stable and Transferable Sparse Expert Models',
+      url: 'https://arxiv.org/abs/2202.08906',
+      by: 'Barret Zoph et al.',
+      date: '2022-02-17',
+      venue: 'arXiv',
+      takes:
+        'The router z-loss `z_loss_coef` weights: the mean squared logsumexp of the gate logits, which keeps them small and the router stable.',
+    },
+    {
+      kind: 'paper',
+      title: 'Mixtral of Experts',
+      url: 'https://arxiv.org/abs/2401.04088',
+      by: 'Albert Q. Jiang et al.',
+      date: '2024-01-08',
+      venue: 'arXiv',
+      takes:
+        '2 of 8 experts per token with the gate weights renormalised over the chosen `k`, the routing `TopKRouter` returns.',
+    },
+  ],
   steps: [moeStep],
   learn,
 };

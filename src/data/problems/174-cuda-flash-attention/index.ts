@@ -373,6 +373,56 @@ dropout, ALiBi/sliding-window masks, and the KV-cache layout of inference.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness',
+      url: 'https://arxiv.org/abs/2205.14135',
+      by: 'Tri Dao et al.',
+      date: '2022-05-27',
+      venue: 'NeurIPS 2022',
+      takes:
+        'The tiled forward pass of `flash_attn_fwd`: K and V staged in shared memory a tile at a time, the softmax finished with a running max and sum, and only `O` written to HBM.',
+    },
+    {
+      kind: 'paper',
+      title: 'FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning',
+      url: 'https://arxiv.org/abs/2307.08691',
+      by: 'Tri Dao',
+      date: '2023-07-17',
+      venue: 'ICLR 2024',
+      takes:
+        'The loop order of the kernel: a block owns its `BQ = 64` query rows and walks the keys, rescales the accumulator by `alpha` and divides by `l` once at the end, and skips tiles above the causal diagonal.',
+    },
+    {
+      kind: 'paper',
+      title: 'Online normalizer calculation for softmax',
+      url: 'https://arxiv.org/abs/1805.02867',
+      by: 'Maxim Milakov and Natalia Gimelshein',
+      date: '2018-05-08',
+      venue: 'arXiv',
+      takes:
+        'The online-softmax recurrence `m_new = max(m, s)`, `l = l · exp(m − m_new) + exp(s − m_new)` that the per-thread fold is built on.',
+    },
+    {
+      kind: 'code',
+      title: 'FlashAttention',
+      url: 'https://github.com/Dao-AILab/flash-attention',
+      by: 'Dao-AILab',
+      date: '2022-05-19',
+      venue: 'GitHub',
+      takes:
+        'The production kernels behind the same algorithm, with tensor-core matmuls, half-precision inputs and the backward pass this drill leaves out.',
+    },
+    {
+      kind: 'docs',
+      title: 'torch.nn.functional.scaled_dot_product_attention',
+      url: 'https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html',
+      venue: 'PyTorch documentation',
+      takes:
+        'The reference semantics `softmax(Q Kᵀ · scale) V` with `is_causal`, the call that dispatches to a FlashAttention kernel in PyTorch.',
+    },
+  ],
   steps: [flashAttentionStep],
   learn,
 };

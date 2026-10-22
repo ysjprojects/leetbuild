@@ -77,6 +77,11 @@ course content, `AGENTS.md`, or the mock-interview feature unless the user names
   are unique across a problem's figures); no step `sequence`, no `:::diagram` / `:::sequence` in its
   Markdown. Its guide carries a widget and at least one `:::architecture` (PyTorch) or `:::gpu`
   (CUDA) figure. `yarn verify` enforces all of it.
+- Every deep-learning problem cites its `sources`, not company tagged: the paper the mechanism comes
+  from (the arXiv abstract page, first-version date), the code that implements it (the repository,
+  dated by its creation) and the posts or docs that explain it, each with its `kind`, `venue` and
+  what the problem takes from it. Every link is checked against the live page, never written from
+  memory; `yarn verify` enforces the shape.
 - The AI-era courses currently use static review checks only. The classic courses have Python and
   TypeScript harnesses that execute in the browser runtime. If you add AI-era harnesses, keep the
   checks outcome-based and update the README.

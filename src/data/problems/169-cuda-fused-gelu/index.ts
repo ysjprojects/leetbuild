@@ -387,6 +387,46 @@ emits when it cannot reach into the matmul.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Gaussian Error Linear Units (GELUs)',
+      url: 'https://arxiv.org/abs/1606.08415',
+      by: 'Dan Hendrycks and Kevin Gimpel',
+      date: '2016-06-27',
+      venue: 'arXiv',
+      takes:
+        'The tanh approximation `0.5 v (1 + tanh(√(2/π) (v + 0.044715 v³)))` that `gelu_tanh` evaluates in single precision.',
+    },
+    {
+      kind: 'paper',
+      title: 'Roofline: an insightful visual performance model for multicore architectures',
+      url: 'https://dl.acm.org/doi/10.1145/1498765.1498785',
+      by: 'Samuel Williams, Andrew Waterman and David Patterson',
+      date: '2009-04-01',
+      venue: 'Communications of the ACM',
+      takes:
+        'Arithmetic intensity: a dozen FLOPs per 8 bytes moved puts GELU far left of the ridge point, so fusing the bias add to save a round trip through HBM is the whole speedup.',
+    },
+    {
+      kind: 'post',
+      title: 'CUDA Pro Tip: Increase Performance with Vectorized Memory Access',
+      url: 'https://developer.nvidia.com/blog/cuda-pro-tip-increase-performance-with-vectorized-memory-access/',
+      by: 'Justin Luitjens and Rajeshwari Devaramani',
+      date: '2025-08-04',
+      venue: 'NVIDIA Technical Blog',
+      takes:
+        'The `float4` loads and stores of `gelu_bias_kernel` through `reinterpret_cast` buffers, their 16-byte alignment, and the scalar `gelu_bias_tail_kernel` for the last `n % 4` elements.',
+    },
+    {
+      kind: 'docs',
+      title: 'Effective Bandwidth Calculation',
+      url: 'https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#effective-bandwidth-calculation',
+      venue: 'CUDA C++ Best Practices Guide',
+      takes:
+        'The GB/s line of the self-test: bytes read plus bytes written over the event-timed seconds, compared with the GPU peak.',
+    },
+  ],
   steps: [fusedGeluStep],
   learn,
 };

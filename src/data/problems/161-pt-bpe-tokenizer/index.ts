@@ -232,6 +232,56 @@ byte fallback are the same.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Neural Machine Translation of Rare Words with Subword Units',
+      url: 'https://arxiv.org/abs/1508.07909',
+      by: 'Rico Sennrich, Barry Haddow and Alexandra Birch',
+      date: '2015-08-31',
+      venue: 'ACL 2016',
+      takes:
+        'The training loop `train` runs: count every adjacent pair, merge the most frequent everywhere, record the merge, repeat to the vocabulary size.',
+    },
+    {
+      kind: 'paper',
+      title: 'Language Models are Unsupervised Multitask Learners',
+      url: 'https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf',
+      by: 'Alec Radford et al.',
+      date: '2019-02-14',
+      venue: 'OpenAI technical report',
+      takes:
+        'Byte-level BPE (section 2.2): a base vocabulary of the 256 byte values, so any string encodes with nothing out of vocabulary.',
+    },
+    {
+      kind: 'code',
+      title: 'minbpe',
+      url: 'https://github.com/karpathy/minbpe',
+      by: 'Andrej Karpathy',
+      date: '2024-02-16',
+      venue: 'GitHub',
+      takes:
+        'The `BPETokenizer` surface in miniature: merges as ids `256 + rank`, `vocab[id] = vocab[a] + vocab[b]`, encode by applying the lowest-ranked pair present, save and load.',
+    },
+    {
+      kind: 'code',
+      title: 'gpt-2',
+      url: 'https://github.com/openai/gpt-2',
+      by: 'OpenAI',
+      date: '2019-02-11',
+      venue: 'GitHub',
+      takes:
+        "`src/encoder.py`: the production encoder that replays merges by rank (`bpe_ranks`) and decodes with `errors='replace'` when a token ends inside a UTF-8 character.",
+    },
+    {
+      kind: 'docs',
+      title: 'Tokenization algorithms',
+      url: 'https://huggingface.co/docs/transformers/en/tokenizer_summary',
+      venue: 'Hugging Face Transformers docs',
+      takes:
+        'Byte-level BPE set beside WordPiece, Unigram and SentencePiece: what each scores a merge by, and why GPT-2 needs no unknown token.',
+    },
+  ],
   steps: [bpeStep],
   learn,
 };

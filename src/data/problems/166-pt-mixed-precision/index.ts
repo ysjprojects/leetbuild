@@ -187,6 +187,54 @@ policy, and fp8 matmuls with per-tensor scaling (Transformer Engine).`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Mixed Precision Training',
+      url: 'https://arxiv.org/abs/1710.03740',
+      by: 'Paulius Micikevicius et al.',
+      date: '2017-10-10',
+      venue: 'ICLR 2018',
+      takes:
+        'The three pieces `train_step` puts together: fp32 master weights, 16-bit arithmetic accumulated in fp32, and loss scaling for the gradients fp16 would flush to zero.',
+    },
+    {
+      kind: 'paper',
+      title: 'A Study of BFLOAT16 for Deep Learning Training',
+      url: 'https://arxiv.org/abs/1905.12322',
+      by: 'Dhiraj Kalamkar et al.',
+      date: '2019-05-29',
+      venue: 'arXiv',
+      takes:
+        "Why the default `dtype=torch.bfloat16` rarely needs the scaler: bfloat16 has fp32's range, so training converges with no extra tuning, where fp16 needs it.",
+    },
+    {
+      kind: 'code',
+      title: 'torch/amp/grad_scaler.py',
+      url: 'https://github.com/pytorch/pytorch/blob/v2.3.0/torch/amp/grad_scaler.py',
+      by: 'PyTorch',
+      date: '2024-04-24',
+      venue: 'GitHub',
+      takes:
+        'The `GradScaler` the self-test matches over six steps: `init_scale=2**16`, `growth_factor`, `backoff_factor`, `growth_interval`, and `unscale_` then `step` that skips on inf or nan.',
+    },
+    {
+      kind: 'docs',
+      title: 'Automatic Mixed Precision package - torch.amp',
+      url: 'https://docs.pytorch.org/docs/stable/amp.html',
+      venue: 'PyTorch documentation',
+      takes:
+        '`torch.autocast` and its op lists: which ops run in the 16-bit type and which stay in float32, while the parameters remain float32.',
+    },
+    {
+      kind: 'docs',
+      title: 'Train With Mixed Precision',
+      url: 'https://docs.nvidia.com/deeplearning/performance/mixed-precision-training/index.html',
+      venue: 'NVIDIA Deep Learning Performance docs',
+      takes:
+        'The dynamic loss-scaling recipe the scaler follows: skip the step and lower the scale on overflow, raise it after N clean iterations.',
+    },
+  ],
   steps: [lossScalerStep],
   learn,
 };

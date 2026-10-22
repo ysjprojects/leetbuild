@@ -186,6 +186,45 @@ systems (S-LoRA, Punica, vLLM).`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'LoRA: Low-Rank Adaptation of Large Language Models',
+      url: 'https://arxiv.org/abs/2106.09685',
+      by: 'Edward J. Hu et al.',
+      date: '2021-06-17',
+      venue: 'ICLR 2022',
+      takes:
+        'The method `LoRALinear` implements: frozen `W` plus `B @ A` scaled by `alpha / r`, `B = 0` at start, adapters on `q_proj` and `v_proj`, and the merge that adds no inference latency.',
+    },
+    {
+      kind: 'paper',
+      title: 'Intrinsic Dimensionality Explains the Effectiveness of Language Model Fine-Tuning',
+      url: 'https://arxiv.org/abs/2012.13255',
+      by: 'Armen Aghajanyan, Luke Zettlemoyer and Sonal Gupta',
+      date: '2020-12-22',
+      venue: 'ACL 2021',
+      takes: 'Why a rank of 4 is enough: fine-tuning a pre-trained model moves it in a subspace of very low dimension.',
+    },
+    {
+      kind: 'code',
+      title: 'LoRA',
+      url: 'https://github.com/microsoft/LoRA',
+      by: 'Microsoft',
+      date: '2021-06-18',
+      venue: 'GitHub',
+      takes:
+        "The authors' `loralib`: Kaiming-init `lora_A`, zero `lora_B`, the `merged` flag, `mark_only_lora_as_trainable` and `lora_state_dict`, the names the three functions here follow.",
+    },
+    {
+      kind: 'docs',
+      title: 'LoRA',
+      url: 'https://huggingface.co/docs/peft/en/package_reference/lora',
+      venue: 'Hugging Face PEFT docs',
+      takes:
+        'How the production library does the same surgery: `target_modules` picks the layers `apply_lora` swaps, and `merge_and_unload` is `merge()` for a whole model.',
+    },
+  ],
   steps: [loraStep],
   learn,
 };

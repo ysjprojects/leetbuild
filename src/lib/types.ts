@@ -251,17 +251,41 @@ export interface Company {
   url: string;
 }
 
-/** A post or paper a company-tagged course is derived from. */
+/** What a source is: the paper a mechanism comes from, the code that implements it, a post that explains it, documentation. */
+export type SourceKind = 'paper' | 'code' | 'post' | 'docs';
+
+/**
+ * A piece a problem is built on. A company-tagged course is derived from the company's own posts and
+ * papers, published where its `company` says; a deep-learning problem cites the paper behind its
+ * mechanism, the code that implements it and the writing that explains it, each with a `kind` and
+ * the `venue` it appeared in.
+ */
 export interface Source {
   title: string;
   url: string;
   /** Author(s), when the piece names them. */
   by?: string;
-  /** Publication date, `YYYY-MM-DD` (or `YYYY-MM` when the day is not published). */
-  date: string;
-  /** One sentence: what the course takes from this piece. */
+  /**
+   * Publication date, `YYYY-MM-DD` (or `YYYY-MM` when the day is not published): a paper's first
+   * version, a repository's creation, a post's publication. Only undated documentation omits it.
+   */
+  date?: string;
+  /** One sentence: what the problem takes from this piece. */
   takes: string;
+  /** What the piece is; every source of a problem not tagged with a company has one. */
+  kind?: SourceKind;
+  /** Where it appeared, for a problem not tagged with a company: `arXiv`, `SOSP 2023`, `GitHub`, `vLLM blog`. */
+  venue?: string;
 }
+
+/**
+ * A source's credit line: where it appeared (the tagged company's publication, else its venue), who
+ * wrote it and when, joined by ` · `; `date` formats the date for the surface showing it.
+ */
+export const sourceCredit = (source: Source, publication?: string, date: (d: string) => string = d => d): string =>
+  [publication ?? source.venue, source.by, source.date === undefined ? undefined : date(source.date)]
+    .filter((part): part is string => part !== undefined && part !== '')
+    .join(' · ');
 
 export interface Problem {
   id: string;
@@ -302,8 +326,12 @@ export interface Problem {
    * code (`resizer_pb2.py`), provided helpers (`payments/db.py`). Path → source.
    */
   support?: Partial<Record<Language, Record<string, string>>>;
-  /** Company-tagged courses: the company whose writing the course is derived from, and the pieces themselves. */
+  /** Company-tagged courses: the company whose writing the course is derived from. */
   company?: Company;
+  /**
+   * The pieces the problem is built on: a company-tagged course's posts and papers, or a deep-learning
+   * problem's papers, code, posts and docs (every one of those problems cites some).
+   */
   sources?: Source[];
 }
 

@@ -375,6 +375,56 @@ partitioning — the kernel engineering on top of the algorithm written here.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness',
+      url: 'https://arxiv.org/abs/2205.14135',
+      by: 'Tri Dao et al.',
+      date: '2022-05-27',
+      venue: 'NeurIPS 2022',
+      takes:
+        'The algorithm `flash_attention` writes: Q, K, V walked in tiles, a running max and sum per row, the accumulator rescaled when the max moves, and no `[T, T]` matrix.',
+    },
+    {
+      kind: 'paper',
+      title: 'Online normalizer calculation for softmax',
+      url: 'https://arxiv.org/abs/1805.02867',
+      by: 'Maxim Milakov and Natalia Gimelshein',
+      date: '2018-05-08',
+      venue: 'arXiv',
+      takes:
+        'The one-pass softmax underneath: the sum is rescaled by `exp(m_old - m_new)` whenever the running max rises, which is the `alpha` of each tile.',
+    },
+    {
+      kind: 'paper',
+      title: 'FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning',
+      url: 'https://arxiv.org/abs/2307.08691',
+      by: 'Tri Dao',
+      date: '2023-07-17',
+      venue: 'ICLR 2024',
+      takes:
+        'The loop order and the bookkeeping: query tiles outside, one `o / l` per query tile at the end, and causal tiles above the diagonal skipped.',
+    },
+    {
+      kind: 'code',
+      title: 'FlashAttention',
+      url: 'https://github.com/Dao-AILab/flash-attention',
+      by: 'Dao-AILab',
+      date: '2022-05-19',
+      venue: 'GitHub',
+      takes:
+        'The CUDA kernels this PyTorch loop models, where the tiles live in shared memory and the matmuls run on tensor cores.',
+    },
+    {
+      kind: 'docs',
+      title: 'torch.nn.functional.scaled_dot_product_attention',
+      url: 'https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html',
+      venue: 'PyTorch documentation',
+      takes:
+        'The reference the self-test matches within `atol=1e-5`, its `is_causal` mask and `1 / sqrt(hd)` scale, and the fused backends it dispatches to.',
+    },
+  ],
   steps: [flashAttentionStep],
   learn,
 };

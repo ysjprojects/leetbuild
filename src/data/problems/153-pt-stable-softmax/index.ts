@@ -193,6 +193,36 @@ online (tiled, running-max) softmax that FlashAttention uses inside attention.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Rethinking the Inception Architecture for Computer Vision',
+      url: 'https://arxiv.org/abs/1512.00567',
+      by: 'Christian Szegedy et al.',
+      date: '2015-12-02',
+      venue: 'CVPR 2016',
+      takes:
+        'Label-smoothing regularisation: `1 - ε` on the label and `ε` spread over all `C` classes, which `cross_entropy` writes as `(1 - ε) · (-logp[target]) + ε · (-mean_c logp[c])`.',
+    },
+    {
+      kind: 'paper',
+      title: 'When Does Label Smoothing Help?',
+      url: 'https://arxiv.org/abs/1906.02629',
+      by: 'Rafael Müller, Simon Kornblith and Geoffrey Hinton',
+      date: '2019-06-06',
+      venue: 'NeurIPS 2019',
+      takes:
+        'Why the `-mean_c logp[c]` term helps: it stops the target logit growing without bound, giving smaller logit gaps and better-calibrated probabilities.',
+    },
+    {
+      kind: 'docs',
+      title: 'torch.nn.functional.cross_entropy',
+      url: 'https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.cross_entropy.html',
+      venue: 'PyTorch documentation',
+      takes:
+        'The reference the drill matches to `1e-5`: `ignore_index=-100` rows dropped from both the sum and the count, and `label_smoothing` over all `C` classes.',
+    },
+  ],
   steps: [stableSoftmaxStep],
   learn,
 };

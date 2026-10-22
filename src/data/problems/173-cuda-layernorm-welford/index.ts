@@ -370,6 +370,56 @@ reduction written here.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Layer Normalization',
+      url: 'https://arxiv.org/abs/1607.06450',
+      by: 'Jimmy Lei Ba, Jamie Ryan Kiros and Geoffrey E. Hinton',
+      date: '2016-07-21',
+      venue: 'arXiv',
+      takes:
+        'The per-row normalisation `(x − mean) · rstd · gamma + beta` that `layernorm_fwd` computes and `layernorm_bwd` differentiates.',
+    },
+    {
+      kind: 'paper',
+      title: 'Note on a Method for Calculating Corrected Sums of Squares and Products',
+      url: 'https://www.tandfonline.com/doi/abs/10.1080/00401706.1962.10490022',
+      by: 'B. P. Welford',
+      date: '1962-08',
+      venue: 'Technometrics',
+      takes:
+        'The one-pass running mean and `m2` of `welford_update`, which never forms `E[x²] − E[x]²` and so stays exact on rows at 1000 ± 1.',
+    },
+    {
+      kind: 'paper',
+      title: 'Updating formulae and a pairwise algorithm for computing sample variances',
+      url: 'https://purl.stanford.edu/mw925sv9975',
+      by: 'Tony F. Chan, Gene H. Golub and Randall J. LeVeque',
+      date: '1979-11',
+      venue: 'Stanford CS technical report',
+      takes:
+        'The merge `m2 = m2_a + m2_b + delta² · n_a · n_b / n` in `welford_merge`, which lets `warp_welford` and the block combine per-thread partials pairwise.',
+    },
+    {
+      kind: 'code',
+      title: 'apex',
+      url: 'https://github.com/NVIDIA/apex',
+      by: 'NVIDIA',
+      date: '2018-04-23',
+      venue: 'GitHub',
+      takes:
+        'The fused LayerNorm in `csrc/layer_norm_cuda_kernel.cu`: `cuWelfordOnlineSum` and `cuChanOnlineSum` across a warp, saved `mean` and `invvar`, and backward partial rows of `dgamma` and `dbeta` reduced in a second kernel.',
+    },
+    {
+      kind: 'docs',
+      title: 'Layer Normalization',
+      url: 'https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html',
+      venue: 'Triton documentation',
+      takes:
+        'The backward pass written out: `dx` from the two row sums `Σ dy·γ` and `Σ dy·γ·x̂`, and `dγ`, `dβ` accumulated as partial rows then summed per column.',
+    },
+  ],
   steps: [layernormKernelsStep],
   learn,
 };

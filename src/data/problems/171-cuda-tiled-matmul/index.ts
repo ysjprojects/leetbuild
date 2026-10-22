@@ -286,6 +286,66 @@ loop and the two barriers you write here.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Roofline: an insightful visual performance model for multicore architectures',
+      url: 'https://dl.acm.org/doi/10.1145/1498765.1498785',
+      by: 'Samuel Williams, Andrew Waterman and David Patterson',
+      date: '2009-04-01',
+      venue: 'Communications of the ACM',
+      takes:
+        'Why tiling pays: reusing each staged float `TILE` times raises the arithmetic intensity from the naive kernel’s memory-bound corner towards the compute roof.',
+    },
+    {
+      kind: 'code',
+      title: 'CUTLASS',
+      url: 'https://github.com/NVIDIA/cutlass',
+      by: 'NVIDIA',
+      date: '2017-11-30',
+      venue: 'GitHub',
+      takes:
+        'The block tile, K-slab loop and shared-memory staging of `matmul_tiled`, grown into the warp and thread tiles a cuBLAS-class GEMM adds.',
+    },
+    {
+      kind: 'post',
+      title: 'How to Access Global Memory Efficiently in CUDA C/C++ Kernels',
+      url: 'https://developer.nvidia.com/blog/how-access-global-memory-efficiently-cuda-c-kernels/',
+      by: 'Mark Harris',
+      date: '2013-01-07',
+      venue: 'NVIDIA Technical Blog',
+      takes:
+        'Coalescing: why each slab load maps `threadIdx.x` to the column so a warp reads 32 consecutive floats of `A` and of `B`.',
+    },
+    {
+      kind: 'post',
+      title: 'Using Shared Memory in CUDA C/C++',
+      url: 'https://developer.nvidia.com/blog/using-shared-memory-cuda-cc/',
+      by: 'Mark Harris',
+      date: '2013-01-28',
+      venue: 'NVIDIA Technical Blog',
+      takes:
+        'The `__shared__` tiles `As[32][32]` and `Bs[32][32]`, and the two `__syncthreads()` per slab: one before the reads, one before the next overwrite.',
+    },
+    {
+      kind: 'post',
+      title: 'How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog',
+      url: 'https://siboehm.com/articles/22/CUDA-MMM',
+      by: 'Simon Boehm',
+      date: '2022-12',
+      venue: 'siboehm.com',
+      takes:
+        'The measured path from the naive kernel through coalescing to shared-memory blocking that the GFLOP/s comparison on `1024³` retraces, and where register tiling goes next.',
+    },
+    {
+      kind: 'docs',
+      title: 'Shared Memory in Matrix Multiplication (C=AB)',
+      url: 'https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#shared-memory-in-matrix-multiplication-c-ab',
+      venue: 'CUDA C++ Best Practices Guide',
+      takes:
+        'The unoptimised kernel against the tiled one that stages a tile of `A` and `B` in shared memory, with the effective bandwidth of each.',
+    },
+  ],
   steps: [tiledMatmulStep],
   learn,
 };

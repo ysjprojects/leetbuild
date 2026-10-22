@@ -194,6 +194,45 @@ is the thing the fused kernels exist to avoid, and you should see it once.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Attention Is All You Need',
+      url: 'https://arxiv.org/abs/1706.03762',
+      by: 'Ashish Vaswani et al.',
+      date: '2017-06-12',
+      venue: 'NeurIPS 2017',
+      takes:
+        "Scaled dot-product attention `softmax(q kᵀ / √hd) v`, multi-head attention as parallel slices of `d_model`, and the decoder's mask that sets illegal scores to `-inf` before the softmax.",
+    },
+    {
+      kind: 'code',
+      title: 'Tensor2Tensor',
+      url: 'https://github.com/tensorflow/tensor2tensor',
+      by: 'TensorFlow',
+      date: '2017-06-15',
+      venue: 'GitHub',
+      takes: "The paper's reference Transformer implementation.",
+    },
+    {
+      kind: 'code',
+      title: 'nanoGPT',
+      url: 'https://github.com/karpathy/nanoGPT',
+      by: 'Andrej Karpathy',
+      date: '2022-12-28',
+      venue: 'GitHub',
+      takes:
+        '`CausalSelfAttention` in PyTorch: one fused `c_attn` linear, heads as a view, a `torch.tril` buffer applied with `masked_fill(-inf)`, and SDPA when it is available.',
+    },
+    {
+      kind: 'docs',
+      title: 'torch.nn.functional.scaled_dot_product_attention',
+      url: 'https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html',
+      venue: 'PyTorch documentation',
+      takes:
+        'The reference the module equals to `1e-5`: `is_causal=True`, the boolean `attn_mask` for padding, and its math fallback.',
+    },
+  ],
   steps: [causalAttentionStep],
   learn,
 };

@@ -189,6 +189,68 @@ and higher-order ODE solvers (DPM-Solver, UniPC).`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Denoising Diffusion Probabilistic Models',
+      url: 'https://arxiv.org/abs/2006.11239',
+      by: 'Jonathan Ho, Ajay Jain and Pieter Abbeel',
+      date: '2020-06-19',
+      venue: 'NeurIPS 2020',
+      takes:
+        'The linear schedule from `1e-4` to `0.02` over `T = 1000`, the closed-form `q_sample`, the plain ε-MSE `ddpm_loss`, and the ancestral sampler `p_sample` with posterior-variance noise.',
+    },
+    {
+      kind: 'paper',
+      title: 'Improved Denoising Diffusion Probabilistic Models',
+      url: 'https://arxiv.org/abs/2102.09672',
+      by: 'Alex Nichol and Prafulla Dhariwal',
+      date: '2021-02-18',
+      venue: 'ICML 2021',
+      takes:
+        'The cosine schedule `kind="cosine"` builds: ᾱ_t from a squared cosine, betas derived from it and clipped below 1.',
+    },
+    {
+      kind: 'paper',
+      title: 'Denoising Diffusion Implicit Models',
+      url: 'https://arxiv.org/abs/2010.02502',
+      by: 'Jiaming Song, Chenlin Meng and Stefano Ermon',
+      date: '2020-10-06',
+      venue: 'ICLR 2021',
+      takes:
+        '`ddim_sample`: the same trained ε-predictor sampled on a strided subsequence, deterministic at `eta = 0` and DDPM again at `eta = 1`.',
+    },
+    {
+      kind: 'code',
+      title: 'diffusion',
+      url: 'https://github.com/hojonathanho/diffusion',
+      by: 'Jonathan Ho',
+      date: '2020-06-19',
+      venue: 'GitHub',
+      takes:
+        "The authors' `diffusion_utils_2.py`, where the precomputed buffers `alphas_cumprod`, `sqrt_one_minus_alphas_cumprod` and `posterior_variance` take their names.",
+    },
+    {
+      kind: 'code',
+      title: 'ddim',
+      url: 'https://github.com/ermongroup/ddim',
+      by: 'Stefano Ermon group',
+      date: '2020-10-05',
+      venue: 'GitHub',
+      takes:
+        "The authors' `generalized_steps`: the DDIM update with its `eta`-scaled noise, the loop `ddim_sample` reproduces.",
+    },
+    {
+      kind: 'post',
+      title: 'What are Diffusion Models?',
+      url: 'https://lilianweng.github.io/posts/2021-07-11-diffusion-models/',
+      by: 'Lilian Weng',
+      date: '2021-07-11',
+      venue: "Lil'Log",
+      takes:
+        'The derivations the papers compress: why `x_t` has a one-step marginal, the posterior mean and variance, and how DDIM samples in far fewer steps than `T`.',
+    },
+  ],
   steps: [ddpmForwardStep, ddpmSampleStep],
   learn,
 };

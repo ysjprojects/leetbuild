@@ -334,6 +334,57 @@ continuous batching, paged KV caches, speculative decoding.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Language Models are Unsupervised Multitask Learners',
+      url: 'https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf',
+      by: 'Alec Radford et al.',
+      date: '2019-02-14',
+      venue: 'OpenAI technical report',
+      takes:
+        'The model `GPTConfig` describes: pre-norm blocks, the final LayerNorm, 50,257 tokens, a 1024 context, and residual weights scaled by `1 / sqrt(N)` at init.',
+    },
+    {
+      kind: 'paper',
+      title: 'Using the Output Embedding to Improve Language Models',
+      url: 'https://arxiv.org/abs/1608.05859',
+      by: 'Ofir Press and Lior Wolf',
+      date: '2016-08-20',
+      venue: 'EACL 2017',
+      takes:
+        'Weight tying: `lm_head.weight` is the same tensor as `transformer.wte.weight`, one matrix for reading and writing tokens.',
+    },
+    {
+      kind: 'paper',
+      title: 'Decoupled Weight Decay Regularization',
+      url: 'https://arxiv.org/abs/1711.05101',
+      by: 'Ilya Loshchilov and Frank Hutter',
+      date: '2017-11-14',
+      venue: 'ICLR 2019',
+      takes: 'AdamW, the optimizer `configure_optimizers` builds, with weight decay applied to the matrices only.',
+    },
+    {
+      kind: 'paper',
+      title: 'The Curious Case of Neural Text Degeneration',
+      url: 'https://arxiv.org/abs/1904.09751',
+      by: 'Ari Holtzman et al.',
+      date: '2019-04-22',
+      venue: 'ICLR 2020',
+      takes:
+        'Nucleus sampling: `top_p` keeps the smallest set of tokens whose probability reaches p, the filter `generate` applies after top-k.',
+    },
+    {
+      kind: 'code',
+      title: 'nanoGPT',
+      url: 'https://github.com/karpathy/nanoGPT',
+      by: 'Andrej Karpathy',
+      date: '2022-12-28',
+      venue: 'GitHub',
+      takes:
+        'The three files follow its `model.py` and `train.py`: the `c_proj` init at `0.02 / sqrt(2 · n_layer)`, decay groups, warmup plus cosine `get_lr`, clipping at 1.0, checkpoints and `generate`.',
+    },
+  ],
   steps: [gpt2ModelStep, gpt2TrainStep, gpt2GenerateStep],
   learn,
 };

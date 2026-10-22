@@ -284,20 +284,35 @@ function verifyProblem(problem: Problem): string[] {
     stepIds.add(step.id);
     errors.push(...verifyStep(problem, step, i));
   }
-  // Company tagged: the company and at least one source, each a real https link with a dated, explained take.
-  if (problem.company !== undefined || problem.sources !== undefined) {
-    if (problem.company === undefined) errors.push(`${problem.id}: lists sources but names no company`);
-    if (problem.sources === undefined || problem.sources.length === 0)
-      errors.push(`${problem.id}: company tagged but lists no source`);
+  // Sources. A company-tagged course is derived from the company's writing and says so in a "From the
+  // source" section; a deep-learning problem cites the paper, code and posts behind its mechanism, each
+  // with its kind and venue. Every source is a real https link, listed once, dated (only documentation
+  // may go undated), with what the problem takes from it.
+  const sources = problem.sources ?? [];
+  const tagged = problem.company !== undefined;
+  if (tagged) {
+    if (sources.length === 0) errors.push(`${problem.id}: company tagged but lists no source`);
     if (!/^## From the source\b/m.test(problem.statement))
       errors.push(`${problem.id}: company tagged but the statement has no "## From the source" section`);
-    for (const s of problem.sources ?? []) {
-      if (!/^https:\/\/\S+$/.test(s.url)) errors.push(`${problem.id}: source '${s.title}' needs an https URL`);
-      if (!/^\d{4}-\d{2}(-\d{2})?$/.test(s.date))
-        errors.push(`${problem.id}: source '${s.title}' date must be YYYY-MM-DD or YYYY-MM (got '${s.date}')`);
-      if (s.title.trim() === '' || s.takes.trim() === '')
-        errors.push(`${problem.id}: a source needs a title and what the course takes from it`);
-    }
+  } else if (problem.track === 'dllm') {
+    if (sources.length === 0)
+      errors.push(`${problem.id}: a deep-learning problem cites its sources (paper, code, posts)`);
+  } else if (problem.sources !== undefined) errors.push(`${problem.id}: lists sources but names no company`);
+  const urls = new Set<string>();
+  for (const s of sources) {
+    if (!/^https:\/\/\S+$/.test(s.url)) errors.push(`${problem.id}: source '${s.title}' needs an https URL`);
+    if (urls.has(s.url)) errors.push(`${problem.id}: source ${s.url} is listed twice`);
+    urls.add(s.url);
+    if (s.date !== undefined ? !/^\d{4}-\d{2}(-\d{2})?$/.test(s.date) : tagged || s.kind !== 'docs')
+      errors.push(
+        `${problem.id}: source '${
+          s.title
+        }' needs a date, YYYY-MM-DD or YYYY-MM (only documentation may go undated; got '${s.date ?? ''}')`,
+      );
+    if (s.title.trim() === '' || s.takes.trim() === '')
+      errors.push(`${problem.id}: a source needs a title and what the problem takes from it`);
+    if (!tagged && (s.kind === undefined || (s.venue ?? '').trim() === ''))
+      errors.push(`${problem.id}: source '${s.title}' names its kind and venue`);
   }
   return errors;
 }
@@ -309,7 +324,7 @@ async function loadProblems(): Promise<Problem[]> {
   if (onlyFile !== null) {
     const mod = (await import(resolve(onlyFile))) as Record<string, unknown>;
     const found = Object.values(mod).filter(
-      (v): v is Problem => typeof v === 'object' && v !== null && 'steps' in v && 'diagram' in v,
+      (v): v is Problem => typeof v === 'object' && v !== null && 'steps' in v && 'statement' in v,
     );
     if (found.length === 0) throw new Error(`${onlyFile} exports no Problem`);
     return found;

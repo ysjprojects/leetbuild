@@ -172,6 +172,58 @@ unembedding, weight decay groups and the optimiser, the KV cache, FlashAttention
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Language Models are Unsupervised Multitask Learners',
+      url: 'https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf',
+      by: 'Alec Radford et al.',
+      date: '2019-02-14',
+      venue: 'OpenAI technical report',
+      takes:
+        "GPT-2's block: LayerNorm moved to the input of each sub-block, and residual-layer weights scaled at initialisation by `1/√N`, the `0.02 / √(2·n_layer)` on every `c_proj`.",
+    },
+    {
+      kind: 'paper',
+      title: 'Gaussian Error Linear Units (GELUs)',
+      url: 'https://arxiv.org/abs/1606.08415',
+      by: 'Dan Hendrycks and Kevin Gimpel',
+      date: '2016-06-27',
+      venue: 'arXiv',
+      takes:
+        'GELU `x · Φ(x)` and its tanh approximation `0.5 · x · (1 + tanh(√(2/π) · (x + 0.044715 · x³)))`, which `gelu_tanh` computes.',
+    },
+    {
+      kind: 'paper',
+      title: 'On Layer Normalization in the Transformer Architecture',
+      url: 'https://arxiv.org/abs/2002.04745',
+      by: 'Ruibin Xiong et al.',
+      date: '2020-02-12',
+      venue: 'ICML 2020',
+      takes:
+        'Why `x = x + attn(ln_1(x))` and not post-LN: pre-LN gradients at initialisation stay well behaved, so the block stacks without a warm-up crutch.',
+    },
+    {
+      kind: 'code',
+      title: 'gpt-2',
+      url: 'https://github.com/openai/gpt-2',
+      by: 'OpenAI',
+      date: '2019-02-11',
+      venue: 'GitHub',
+      takes:
+        "OpenAI's released TensorFlow model: the pre-LN block, `c_fc`/`c_proj` names and the tanh GELU the drill keeps.",
+    },
+    {
+      kind: 'code',
+      title: 'nanoGPT',
+      url: 'https://github.com/karpathy/nanoGPT',
+      by: 'Andrej Karpathy',
+      date: '2022-12-28',
+      venue: 'GitHub',
+      takes:
+        'The same `Block`, `MLP` and `_init_weights` in PyTorch, including the `c_proj.weight` re-draw at `std = 0.02 / √(2·n_layer)`.',
+    },
+  ],
   steps: [gpt2BlockStep],
   learn,
 };

@@ -3,6 +3,7 @@ import {type FC, memo, useCallback, useEffect, useMemo, useState} from 'react';
 
 import {type Guide, downloadMarkdown, githubSlug, learnFileName, learnToMarkdown} from '@/lib/export';
 import {leetbuildHighlighter} from '@/lib/highlight';
+import {sourceCredit} from '@/lib/types';
 
 import {BrandLockup} from './LoadingScreen';
 import Markdown from './Markdown';
@@ -121,14 +122,17 @@ const LearnPage: FC<{guide: Guide}> = memo(({guide}) => {
             <section className="border-ink-700 mt-10 border-t pt-4">
               <p className="text-ink-400 text-[10px] font-bold uppercase tracking-wider">Sources</p>
               <ul className="mt-2 space-y-1 text-[13px]">
-                {guide.sources.map(s => (
-                  <li className="text-ink-300" key={s.url}>
-                    <a className={linkClass} href={s.url} rel="noreferrer" target="_blank">
-                      {s.title}
-                    </a>
-                    {s.by !== undefined ? ` — ${s.by}` : ''}, {s.date}
-                  </li>
-                ))}
+                {guide.sources.map(s => {
+                  const credit = sourceCredit(s);
+                  return (
+                    <li className="text-ink-300" key={s.url}>
+                      <a className={linkClass} href={s.url} rel="noreferrer" target="_blank">
+                        {s.title}
+                      </a>
+                      {credit === '' ? null : <span className="text-ink-400"> · {credit}</span>}
+                    </li>
+                  );
+                })}
               </ul>
             </section>
           ) : null}

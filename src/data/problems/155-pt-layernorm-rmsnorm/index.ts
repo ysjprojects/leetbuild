@@ -192,6 +192,65 @@ every one of those starts from.`,
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Layer Normalization',
+      url: 'https://arxiv.org/abs/1607.06450',
+      by: 'Jimmy Lei Ba, Jamie Ryan Kiros and Geoffrey E. Hinton',
+      date: '2016-07-21',
+      venue: 'arXiv',
+      takes:
+        "`LayerNorm`: the mean and variance of one row's own `D` features, then the learned per-feature `weight` and `bias`.",
+    },
+    {
+      kind: 'paper',
+      title: 'Root Mean Square Layer Normalization',
+      url: 'https://arxiv.org/abs/1910.07467',
+      by: 'Biao Zhang and Rico Sennrich',
+      date: '2019-10-16',
+      venue: 'NeurIPS 2019',
+      takes:
+        '`RMSNorm`: drop the mean, divide by the root mean square, keep one learned scale, since re-scaling invariance does the work.',
+    },
+    {
+      kind: 'paper',
+      title: 'On Layer Normalization in the Transformer Architecture',
+      url: 'https://arxiv.org/abs/2002.04745',
+      by: 'Ruibin Xiong et al.',
+      date: '2020-02-12',
+      venue: 'ICML 2020',
+      takes:
+        'Why the norm sits before each sublayer: pre-norm gradients at initialisation stay bounded at any depth, post-norm ones do not.',
+    },
+    {
+      kind: 'code',
+      title: 'rmsnorm',
+      url: 'https://github.com/bzhangGo/rmsnorm',
+      by: 'Biao Zhang',
+      date: '2019-09-24',
+      venue: 'GitHub',
+      takes: "The authors' RMSNorm implementations, the formula `RMSNorm.forward` reproduces.",
+    },
+    {
+      kind: 'code',
+      title: 'llama/model.py',
+      url: 'https://github.com/meta-llama/llama/blob/v2/llama/model.py',
+      by: 'Meta',
+      date: '2023-09-01',
+      venue: 'GitHub',
+      takes:
+        "Llama's `RMSNorm`: `x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)` on `x.float()`, cast back with `type_as(x)`, the upcast rule the drill tests in `bfloat16`.",
+    },
+    {
+      kind: 'docs',
+      title: 'torch.nn.LayerNorm',
+      url: 'https://docs.pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html',
+      venue: 'PyTorch documentation',
+      takes:
+        'The reference definition the module matches: the biased variance, `eps` inside the square root, `normalized_shape` as the trailing dims.',
+    },
+  ],
   steps: [normsStep],
   learn,
 };

@@ -22,6 +22,7 @@ import {
   isArchitectureFigure,
   LANGUAGE_LABEL,
   LANGUAGE_STACK,
+  sourceCredit,
   stepPath,
 } from './types';
 import {WIDGETS} from './widgets';
@@ -255,8 +256,10 @@ export function problemToMarkdown(problem: Problem, language: Language): string 
   if (problem.sources !== undefined && problem.sources.length > 0) {
     parts.push('## Sources');
     parts.push('');
-    for (const s of problem.sources)
-      parts.push(`- [${s.title}](${s.url})${s.by !== undefined ? ` — ${s.by}` : ''}, ${s.date}. ${s.takes}`);
+    for (const s of problem.sources) {
+      const credit = sourceCredit(s);
+      parts.push(`- [${s.title}](${s.url})${credit === '' ? '' : ` · ${credit}`}. ${s.takes}`);
+    }
     parts.push('');
   }
   const figures: {title: string; mermaid: string}[] =
@@ -336,8 +339,10 @@ export function learnToMarkdown(guide: Guide): string {
   ];
   if (guide.sources.length > 0) {
     parts.push('## Sources', '');
-    for (const s of guide.sources)
-      parts.push(`- [${s.title}](${s.url})${s.by !== undefined ? ` — ${s.by}` : ''}, ${s.date}.`);
+    for (const s of guide.sources) {
+      const credit = sourceCredit(s);
+      parts.push(`- [${s.title}](${s.url})${credit === '' ? '' : ` · ${credit}`}.`);
+    }
     parts.push('');
   }
   return parts.join('\n');

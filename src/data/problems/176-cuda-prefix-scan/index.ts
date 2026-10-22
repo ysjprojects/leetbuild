@@ -281,6 +281,56 @@ segmented scans, operators other than \`+\`, 64-bit sums and \`n\` beyond \`int\
       },
     },
   ],
+  sources: [
+    {
+      kind: 'paper',
+      title: 'Prefix Sums and Their Applications',
+      url: 'https://www.cs.cmu.edu/~scandal/papers/CMU-CS-90-190.html',
+      by: 'Guy E. Blelloch',
+      date: '1990-11',
+      venue: 'CMU technical report CMU-CS-90-190',
+      takes:
+        'The work-efficient exclusive scan: an up-sweep that builds partial sums in a tree, the root cleared, and a down-sweep that hands each node its prefix, 2n adds in 2·log₂n levels.',
+    },
+    {
+      kind: 'paper',
+      title: 'Parallel Prefix Sum (Scan) with CUDA',
+      url: 'https://developer.nvidia.com/gpugems/gpugems3/part-vi-gpu-computing/chapter-39-parallel-prefix-sum-scan-cuda',
+      by: 'Mark Harris, Shubhabrata Sengupta and John D. Owens',
+      date: '2007-08',
+      venue: 'GPU Gems 3',
+      takes:
+        'The kernel `scan_block` follows: 512 threads scanning 1024 elements in shared memory, `CONFLICT_FREE_OFFSET` padding against bank conflicts, and block sums scanned then added back for any length.',
+    },
+    {
+      kind: 'paper',
+      title: 'Single-pass Parallel Prefix Scan with Decoupled Look-back',
+      url: 'https://research.nvidia.com/publication/2016-03_single-pass-parallel-prefix-scan-decoupled-look-back',
+      by: 'Duane Merrill and Michael Garland',
+      date: '2016-03',
+      venue: 'NVIDIA technical report NVR-2016-002',
+      takes:
+        'What replaces the recursive carry of `exclusive_scan` in production: one pass in which each block looks back at its predecessors’ published aggregates, about 2n data movement instead of 3n.',
+    },
+    {
+      kind: 'code',
+      title: 'CCCL',
+      url: 'https://github.com/NVIDIA/cccl',
+      by: 'NVIDIA',
+      date: '2020-09-17',
+      venue: 'GitHub',
+      takes:
+        "CUB's `cub::DeviceScan::ExclusiveSum` and `cub::BlockScan`, the decoupled look-back scan the self-test's times can be compared against.",
+    },
+    {
+      kind: 'docs',
+      title: 'Shared Memory Bank Conflicts',
+      url: 'https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html#writing-cuda-kernels-shared-memory-bank-conflicts',
+      venue: 'CUDA Programming Guide',
+      takes:
+        'The 32 banks behind `LOG_NUM_BANKS = 5`, and why the tree’s power-of-two strides serialise a warp unless every index is padded by `i >> 5`.',
+    },
+  ],
   steps: [blellochScanStep],
   learn,
 };
