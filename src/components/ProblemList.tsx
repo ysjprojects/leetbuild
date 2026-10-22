@@ -540,7 +540,8 @@ const ProblemList: FC<{
                     </span>
                   </div>
                   <p className="text-ink-200 mt-3 max-w-3xl text-[13px] leading-6">
-                    Two courses, ten review-first steps, and the six signals AI-era interviews probe.
+                    {ai.length} courses, {ai.reduce((n, p) => n + p.steps.length, 0)} review-first steps, and the six
+                    signals AI-era interviews probe.
                   </p>
                   <div className="mt-3 flex flex-wrap gap-1.5">
                     {AI_SKILLS.map(skill => (
