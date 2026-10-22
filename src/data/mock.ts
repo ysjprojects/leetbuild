@@ -321,6 +321,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'feedback-collector-the-rating-that-rewrote-history',
+    problemId: 'feedback-collector',
+    stepId: 'endpoint',
+    title: 'The rating that rewrote history',
+    blurb: 'Feedback was attributed to the active model instead of the one that served it.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      "After a model rollout, last week's feedback silently moved to the new model because attribution fell back to the active version, and a double-clicked thumbs-up counted twice. The model-generated draft misattributes on lookup failure and dedupes with SISMEMBER-then-SADD. Review it, fix it, and prove feedback stays pinned to the request that earned it and counts once.",
+    signals: ['Specify', 'Verify', 'Secure'],
+    aiNote:
+      'The draft attributes unattributable feedback to whatever model is active at read time, so a rollout rewrites the past, and its non-atomic dedupe lets a double submit store two ratings under a key that ignores the tenant.',
+    testIdea:
+      'Submit feedback for a request served by v1 after v2 becomes active and assert the record still reads v1; double-submit concurrently and assert one row; stub attribution to time out and assert the rating is stored as unattributed.',
+    followUps: [
+      "Should unattributed feedback count toward any model's score, and how do you decide?",
+      'How would you weight feedback from a power user versus a long-tail user?',
+      'What fingerprint of a comment is safe to keep for dedupe?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */

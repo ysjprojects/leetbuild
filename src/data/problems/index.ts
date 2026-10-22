@@ -27,6 +27,7 @@ import {embeddingServiceProblem} from './23-embedding-service/index';
 import {vectorSearchProblem} from './24-vector-search/index';
 import {promptRegistryProblem} from './25-prompt-registry/index';
 import {costMeterProblem} from './26-cost-meter/index';
+import {feedbackCollectorProblem} from './27-feedback-collector/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -45,6 +46,7 @@ export const problems: Problem[] = [
   vectorSearchProblem,
   promptRegistryProblem,
   costMeterProblem,
+  feedbackCollectorProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
