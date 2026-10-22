@@ -83,9 +83,9 @@ the same static checks the course uses. Accepted or not, the report shows the ch
 wrong, follow-up questions, a debrief and copyable notes. There is no login, no hosted model, no
 solution reveal and no effect on course points: it is a practice session, not an assessment product.
 
-The four scenarios live in `src/data/mock.ts` and point at real AI-era steps:
-`ai-gateway/tenant-budget`, `ai-gateway/streaming-cancel`, `rag-service/hybrid-retrieve` and
-`rag-service/grounded-answer`.
+Every AI-era course contributes a scenario; they live in `src/data/mock.ts` and point at real steps
+(`ai-gateway/tenant-budget`, `rag-service/grounded-answer`, …). The picker lists them in threes,
+each card naming its course and difficulty, with a search and the six signals to narrow by.
 
 ## Content
 

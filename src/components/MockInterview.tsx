@@ -4,12 +4,13 @@ import {type ChangeEvent, type FC, memo, useCallback, useEffect, useMemo, useRef
 import {type ResolvedMockScenario, resolvedMockScenarios} from '@/data/mock';
 import {type Verdict, judge} from '@/lib/judge';
 import {formatClock} from '@/lib/timer';
-import {type Language, fileName, LANGUAGE_LABEL, LANGUAGES} from '@/lib/types';
+import {type Difficulty, type Language, fileName, LANGUAGE_LABEL, LANGUAGES} from '@/lib/types';
 
+import {SearchIcon} from './ListControls';
 import {BrandLockup} from './LoadingScreen';
 import Markdown from './Markdown';
 import ModeSwitch from './ModeSwitch';
-import {ghostButtonClass, selectClass} from './paneShared';
+import {CompanyChip, DifficultyChip, ghostButtonClass, selectClass} from './paneShared';
 import StepEditor from './StepEditor';
 
 type Phase = 'setup' | 'running' | 'report';
@@ -91,29 +92,176 @@ const AI_ACTIONS = {
   test: `${ACTION_BUTTON} border-ink-600 bg-ink-850 text-ink-200 hover:bg-ink-800`,
 } as const;
 
-/** One accent per scenario, so the picker reads as four distinct exercises rather than a wall of cards. */
-const SCENARIO_ACCENTS = [
-  {
-    rail: 'from-danger-400 to-danger-300',
-    number: 'border-danger-400/40 bg-danger-400/10 text-danger-200',
-    hover: 'hover:border-danger-400/60 hover:bg-ink-800/80',
+/** The card's rail and number take the course's difficulty colour, as the catalogue rows do. */
+const DIFFICULTY_ACCENT: Record<Difficulty, {rail: string; number: string; hover: string}> = {
+  easy: {
+    rail: 'from-success-400 to-success-300',
+    number: 'border-success-400/40 bg-success-400/10 text-success-300',
+    hover: 'hover:border-success-400/50 hover:bg-ink-800/80',
   },
-  {
+  medium: {
     rail: 'from-warning-400 to-warning-300',
     number: 'border-warning-400/40 bg-warning-400/10 text-warning-300',
     hover: 'hover:border-warning-400/50 hover:bg-ink-800/80',
   },
-  {
-    rail: 'from-danger-300 to-danger-200',
-    number: 'border-danger-300/40 bg-danger-300/10 text-danger-300',
-    hover: 'hover:border-danger-300/50 hover:bg-ink-800/80',
+  hard: {
+    rail: 'from-danger-400 to-danger-300',
+    number: 'border-danger-400/40 bg-danger-400/10 text-danger-200',
+    hover: 'hover:border-danger-400/60 hover:bg-ink-800/80',
   },
-  {
-    rail: 'from-warning-300 to-warning-200',
-    number: 'border-warning-300/40 bg-warning-300/10 text-warning-300',
-    hover: 'hover:border-warning-300/50 hover:bg-ink-800/80',
+};
+
+/** The six signals the scenarios are tagged with, in the order the AI-era track lists them. */
+const SIGNALS = ['Specify', 'Delegate', 'Verify', 'Evaluate', 'Secure', 'Operate'] as const;
+
+const signalChip = (on: boolean): string =>
+  `rounded-full px-3 py-1 text-[12px] font-semibold transition ${
+    on ? 'bg-danger-400 text-ink-950' : 'bg-ink-800 text-ink-200 hover:bg-ink-700 hover:text-ink-50'
+  }`;
+
+const SignalToggle: FC<{signal: string; on: boolean; toggle: (signal: string) => void}> = memo(
+  ({signal, on, toggle}) => {
+    const onClick = useCallback(() => toggle(signal), [toggle, signal]);
+    return (
+      <button aria-pressed={on} className={signalChip(on)} onClick={onClick} type="button">
+        {signal}
+      </button>
+    );
   },
-] as const;
+);
+SignalToggle.displayName = 'SignalToggle';
+
+/** Words of the search, lower-cased, against title, brief, role, signals and the course the scenario comes from. */
+const matchesScenario = (scenario: ResolvedMockScenario, q: string): boolean => {
+  const words = q.toLowerCase().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return true;
+  const text = [scenario.title, scenario.blurb, scenario.role, scenario.problem.title, ...scenario.signals]
+    .join('\n')
+    .toLowerCase();
+  return words.every(w => text.includes(w));
+};
+
+/** One scenario: the whole card starts it. The course it comes from sits above the title, so a wall of cards still reads. */
+const ScenarioCard: FC<{scenario: ResolvedMockScenario; number: number; onStart: (s: ResolvedMockScenario) => void}> =
+  memo(({scenario, number, onStart}) => {
+    const accent = DIFFICULTY_ACCENT[scenario.problem.difficulty];
+    const onClick = useCallback(() => onStart(scenario), [onStart, scenario]);
+    return (
+      <button
+        className={`border-ink-700 bg-ink-850 group relative flex flex-col overflow-hidden rounded-2xl border p-4 text-left transition ${accent.hover}`}
+        onClick={onClick}
+        type="button">
+        <span aria-hidden className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${accent.rail}`} />
+        <span className="flex w-full items-center gap-2">
+          <span
+            className={`font-code flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border text-[11px] font-bold ${accent.number}`}>
+            {number}
+          </span>
+          <span className="text-ink-300 min-w-0 flex-1 truncate text-[11px] font-semibold">
+            {scenario.problem.title}
+          </span>
+          <DifficultyChip difficulty={scenario.problem.difficulty} />
+          {scenario.problem.company !== undefined ? <CompanyChip company={scenario.problem.company} /> : null}
+        </span>
+        <span className="text-ink-50 mt-3 block text-[14px] font-bold leading-snug">{scenario.title}</span>
+        <span className="text-ink-200 mt-1.5 block flex-1 text-[12px] leading-5">{scenario.blurb}</span>
+        <span className="mt-3 flex flex-wrap gap-1.5">
+          {scenario.signals.map(signal => (
+            <SignalChip key={signal} signal={signal} />
+          ))}
+        </span>
+        <span className="border-ink-700/70 mt-3 flex w-full items-center justify-between border-t pt-2.5 text-[11px]">
+          <span className="text-ink-400 truncate">{scenario.role}</span>
+          <span className="text-danger-300 group-hover:text-danger-200 font-code shrink-0 font-semibold transition">
+            {scenario.minutes}:00 · Start ›
+          </span>
+        </span>
+      </button>
+    );
+  });
+ScenarioCard.displayName = 'ScenarioCard';
+
+/** The setup page's list: a search pill and the six signals to narrow by, then the cards in threes. */
+const ScenarioPicker: FC<{scenarios: readonly ResolvedMockScenario[]; onStart: (s: ResolvedMockScenario) => void}> =
+  memo(({scenarios, onStart}) => {
+    const [q, setQ] = useState('');
+    const [on, setOn] = useState<readonly string[]>([]);
+    const onSearch = useCallback((e: ChangeEvent<HTMLInputElement>) => setQ(e.target.value), []);
+    const toggle = useCallback(
+      (signal: string) =>
+        setOn(current => (current.includes(signal) ? current.filter(s => s !== signal) : [...current, signal])),
+      [],
+    );
+    const clear = useCallback(() => {
+      setQ('');
+      setOn([]);
+    }, []);
+    const numbers = useMemo(() => new Map(scenarios.map((s, i) => [s.id, i + 1])), [scenarios]);
+    const visible = useMemo(
+      () => scenarios.filter(s => matchesScenario(s, q) && on.every(signal => s.signals.includes(signal))),
+      [scenarios, q, on],
+    );
+    const filtering = q.trim() !== '' || on.length > 0;
+    return (
+      <div className="mx-auto w-full max-w-5xl px-5 pb-10 pt-6">
+        <div className="mb-4 flex flex-wrap items-center gap-2">
+          <label className="bg-ink-800 text-ink-400 focus-within:bg-ink-700 flex h-10 w-full items-center gap-2 rounded-full px-4 transition sm:w-64">
+            <SearchIcon />
+            <input
+              aria-label="search scenarios"
+              className="text-ink-50 placeholder:text-ink-400 w-full border-0 bg-transparent p-0 text-[13px] focus:outline-none focus:ring-0 [&::-webkit-search-cancel-button]:hidden"
+              onChange={onSearch}
+              placeholder="Search scenarios"
+              type="search"
+              value={q}
+            />
+          </label>
+          <div aria-label="signals" className="flex flex-wrap gap-1.5" role="group">
+            {SIGNALS.map(signal => (
+              <SignalToggle key={signal} on={on.includes(signal)} signal={signal} toggle={toggle} />
+            ))}
+          </div>
+          <span className="text-ink-300 ml-auto flex items-center gap-2 text-[13px]">
+            {filtering ? (
+              <>
+                <span>
+                  <span className="font-code text-ink-100">{visible.length}</span> of {scenarios.length}
+                </span>
+                <button
+                  className="text-danger-300 hover:text-danger-200 text-[12px] transition"
+                  onClick={clear}
+                  type="button">
+                  clear
+                </button>
+              </>
+            ) : (
+              <span>
+                <span className="font-code text-ink-100">{scenarios.length}</span> scenarios
+              </span>
+            )}
+          </span>
+        </div>
+        {visible.length === 0 ? (
+          <p className="border-ink-700 text-ink-300 rounded-xl border border-dashed px-4 py-6 text-center text-[12px]">
+            No scenario matches.{' '}
+            <button className="text-danger-300 hover:text-danger-200 transition" onClick={clear} type="button">
+              Clear the search ›
+            </button>
+          </p>
+        ) : (
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {visible.map(s => (
+              <ScenarioCard key={s.id} number={numbers.get(s.id) ?? 0} onStart={onStart} scenario={s} />
+            ))}
+          </div>
+        )}
+        <p className="text-ink-400 border-ink-700 mt-6 border-t pt-4 text-[11px]">
+          Offline AI pair · no login · no model API · no solution reveal.
+        </p>
+      </div>
+    );
+  });
+ScenarioPicker.displayName = 'ScenarioPicker';
 
 /**
  * The AI-assisted mock interview. It is deliberately offline: the "AI pair" is a deterministic
@@ -358,8 +506,8 @@ const MockInterview: FC = memo(() => {
                 Fix the AI draft. <span className="text-danger-300">Beat the clock.</span>
               </h1>
               <p className="text-ink-200 mt-4 max-w-2xl text-[14px] leading-7">
-                Four scenarios for the AI-era interview loop: review a model-generated patch, use an AI pair, fix the
-                flaw, and prove it before time runs out.
+                {resolvedMockScenarios.length} scenarios for the AI-era interview loop: review a model-generated patch,
+                use an AI pair, fix the flaw, and prove it before time runs out.
               </p>
               <div className="mt-5 flex flex-wrap gap-2">
                 {[
@@ -377,50 +525,7 @@ const MockInterview: FC = memo(() => {
               </div>
             </div>
           </div>
-          <div className="mx-auto w-full max-w-5xl px-5 pb-10 pt-6">
-            <div className="mb-4 flex flex-wrap items-end justify-between gap-2">
-              <h2 className="text-ink-50 text-lg font-extrabold">Pick a scenario</h2>
-              <span className="text-ink-400 text-[12px]">Each starts from a flawed draft</span>
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              {resolvedMockScenarios.map((next, index) => {
-                const accent = SCENARIO_ACCENTS[index % SCENARIO_ACCENTS.length];
-                return (
-                  <article
-                    className={`border-ink-700 bg-ink-850 group relative flex flex-col overflow-hidden rounded-2xl border p-5 transition ${accent.hover}`}
-                    key={next.id}>
-                    <span className={`absolute inset-x-0 top-0 h-1 bg-gradient-to-r ${accent.rail}`} />
-                    <div className="flex items-start gap-3">
-                      <span
-                        className={`font-code flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border text-[12px] font-bold ${accent.number}`}>
-                        {index + 1}
-                      </span>
-                      <div className="min-w-0 flex-1">
-                        <h3 className="text-ink-50 text-[15px] font-bold leading-snug">{next.title}</h3>
-                        <p className="text-ink-400 mt-1 text-[12px]">{next.role}</p>
-                      </div>
-                      <span className="font-code text-ink-300 shrink-0 text-[11px]">{next.minutes}:00</span>
-                    </div>
-                    <p className="text-ink-200 mt-3 flex-1 text-[13px] leading-6">{next.blurb}</p>
-                    <div className="mt-3 flex flex-wrap gap-1.5">
-                      {next.signals.map(signal => (
-                        <SignalChip key={signal} signal={signal} />
-                      ))}
-                    </div>
-                    <button
-                      className={`${MOCK_PRIMARY} mt-4 w-full shadow-[0_8px_24px_rgba(244,114,129,0.22)]`}
-                      onClick={() => start(next)}
-                      type="button">
-                      Start →
-                    </button>
-                  </article>
-                );
-              })}
-            </div>
-            <p className="text-ink-400 border-ink-700 mt-6 border-t pt-4 text-[11px]">
-              Offline AI pair · no login · no model API · no solution reveal.
-            </p>
-          </div>
+          <ScenarioPicker onStart={start} scenarios={resolvedMockScenarios} />
         </main>
       </div>
     );

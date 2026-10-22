@@ -43,8 +43,7 @@ const chip = (on: boolean): string =>
   `rounded-full px-3 py-1 text-[12px] font-semibold transition ${
     on ? 'bg-iris-400 text-ink-950' : 'bg-ink-700/70 text-ink-200 hover:bg-ink-600 hover:text-ink-50'
   }`;
-
-const SearchIcon: FC = memo(() => (
+export const SearchIcon: FC = memo(() => (
   <svg aria-hidden fill="none" height={14} stroke="currentColor" strokeWidth={1.7} viewBox="0 0 16 16" width={14}>
     <circle cx={7} cy={7} r={4.5} />
     <path d="M10.5 10.5 14 14" strokeLinecap="round" />
