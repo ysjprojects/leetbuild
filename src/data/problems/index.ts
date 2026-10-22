@@ -21,6 +21,7 @@ import {ragServiceProblem} from './17-rag-service/index';
 import {modelRouterProblem} from './18-model-router/index';
 import {chatMemoryProblem} from './19-chat-memory/index';
 import {evalHarnessProblem} from './20-eval-harness/index';
+import {guardrailServiceProblem} from './21-guardrail-service/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -33,6 +34,7 @@ export const problems: Problem[] = [
   modelRouterProblem,
   chatMemoryProblem,
   evalHarnessProblem,
+  guardrailServiceProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
