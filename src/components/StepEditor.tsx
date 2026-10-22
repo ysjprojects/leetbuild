@@ -11,13 +11,19 @@ import {type Extension, Compartment, EditorState} from '@codemirror/state';
 import {EditorView, keymap} from '@codemirror/view';
 import {type MutableRefObject, memo, useEffect, useRef} from 'react';
 
-import {editorExtensions, editorLanguage, INDENT, settingsExtensions, viewerExtensions} from '@/lib/editor';
+import {
+  type Syntax,
+  editorExtensions,
+  editorLanguage,
+  INDENT,
+  settingsExtensions,
+  viewerExtensions,
+} from '@/lib/editor';
 import {useEditorSettings} from '@/lib/editorSettings';
-import type {Language} from '@/lib/types';
 
 interface Props {
   value: string;
-  language: Language;
+  language: Syntax;
   /** Editable editors emit `onChange`; viewers replace their document whenever `value` changes. */
   readOnly?: boolean;
   onChange?: (value: string) => void;
@@ -39,7 +45,7 @@ interface Props {
   className?: string;
 }
 
-const languageExtensions = (language: Language): Extension => [
+const languageExtensions = (language: Syntax): Extension => [
   editorLanguage(language),
   EditorState.tabSize.of(INDENT[language].tabSize),
   indentUnit.of(INDENT[language].unit),

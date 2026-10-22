@@ -7,6 +7,7 @@ import {downloadCertificate} from '@/lib/certificate';
 import {downloadMarkdown, exportFileName, problemToMarkdown, problemUrl, siteUrl} from '@/lib/export';
 import {type Badge, badgeOf, dayKey, earnedBadges, streakOf} from '@/lib/gamify';
 import {type Verdict, exampleCheck, judge, narrow, withRuntime} from '@/lib/judge';
+import {type ProvidedFile, isProvidedId, providedFiles, providedId, providedPath} from '@/lib/provided';
 import {stepIssueUrl} from '@/lib/report';
 import {type RuntimeStatus, getRunner} from '@/lib/runtime/client';
 import type {RunJob} from '@/lib/runtime/types';
@@ -244,19 +245,73 @@ const FileTab: FC<{
 });
 FileTab.displayName = 'FileTab';
 
+/** A provided file's tab: read-only, so it carries a lock instead of the task dot. */
+const ProvidedTab: FC<{path: string; active: boolean; onOpen: (id: string) => void; onClose: (id: string) => void}> =
+  memo(({path, active, onOpen, onClose}) => {
+    const id = providedId(path);
+    const onClick = useCallback(() => onOpen(id), [onOpen, id]);
+    const onCloseClick = useCallback(() => onClose(id), [onClose, id]);
+    return (
+      <div
+        aria-selected={active}
+        className={`border-ink-700 group relative flex shrink-0 items-stretch border-r text-[11px] transition-colors ${
+          active ? 'bg-ink-850 text-ink-200' : 'text-ink-400 hover:bg-ink-800/50 hover:text-ink-200 border-b'
+        }`}
+        role="tab">
+        {active ? <span aria-hidden className="bg-ink-500 absolute inset-x-0 top-0 h-0.5" /> : null}
+        <button
+          className="font-code flex items-center gap-1.5 pl-3 pr-1 italic"
+          onClick={onClick}
+          title="provided by the course — read-only"
+          type="button">
+          <LockGlyph />
+          <span className="whitespace-nowrap">{path}</span>
+        </button>
+        <button
+          aria-label={`close ${path}`}
+          className={`hover:bg-ink-700 hover:text-ink-50 touch:h-6 touch:w-6 touch:opacity-100 mr-1.5 flex h-5 w-5 items-center justify-center self-center rounded transition ${
+            active ? 'text-ink-300 opacity-80 hover:opacity-100' : 'opacity-0 focus:opacity-100 group-hover:opacity-100'
+          }`}
+          onClick={onCloseClick}
+          title="close"
+          type="button">
+          <svg
+            aria-hidden
+            fill="none"
+            height={9}
+            stroke="currentColor"
+            strokeLinecap="round"
+            strokeWidth={1.5}
+            viewBox="0 0 10 10"
+            width={9}>
+            <path d="M1.5 1.5l7 7M8.5 1.5l-7 7" />
+          </svg>
+        </button>
+      </div>
+    );
+  });
+ProvidedTab.displayName = 'ProvidedTab';
+
 /** The open files, in the order they were opened; the step's own file opens itself when the step does. */
 const FileTabs: FC<{
   problem: Problem;
   language: Language;
+  provided: readonly ProvidedFile[];
   openTabs: readonly string[];
   openFile: string | null;
   /** The step being played: its file is marked. */
   stepId: string;
   onOpen: (id: string) => void;
   onClose: (id: string) => void;
-}> = memo(({problem, language, openTabs, openFile, stepId, onOpen, onClose}) => (
+}> = memo(({problem, language, provided, openTabs, openFile, stepId, onOpen, onClose}) => (
   <div className="flex min-w-0 flex-1 items-stretch overflow-x-auto overflow-y-hidden" role="tablist">
     {openTabs.map(id => {
+      if (isProvidedId(id)) {
+        const path = providedPath(id);
+        return provided.some(f => f.path === path) ? (
+          <ProvidedTab active={id === openFile} key={id} onClose={onClose} onOpen={onOpen} path={path} />
+        ) : null;
+      }
       const index = problem.steps.findIndex(s => s.id === id);
       return index < 0 ? null : (
         <FileTab
@@ -275,6 +330,38 @@ const FileTabs: FC<{
   </div>
 ));
 FileTabs.displayName = 'FileTabs';
+
+const LockGlyph: FC = memo(() => (
+  <svg aria-hidden fill="none" height={10} stroke="currentColor" strokeWidth={1.4} viewBox="0 0 10 10" width={10}>
+    <rect height={5} rx={1} width={7} x={1.5} y={4.5} />
+    <path d="M3 4.5V3a2 2 0 0 1 4 0v1.5" strokeLinecap="round" />
+  </svg>
+));
+LockGlyph.displayName = 'LockGlyph';
+
+/** A provided file in the tree: muted, in italics, a lock for the glyph — readable, not editable. */
+const ProvidedRow: FC<{file: ProvidedFile; active: boolean; onOpen: (id: string) => void}> = memo(
+  ({file, active, onOpen}) => {
+    const onClick = useCallback(() => onOpen(providedId(file.path)), [onOpen, file.path]);
+    return (
+      <li>
+        <button
+          className={`flex w-full items-center gap-1.5 py-0.5 pl-5 pr-2 text-left text-[11px] transition ${
+            active ? 'bg-ink-800 text-ink-200' : 'text-ink-400 hover:bg-ink-800/60 hover:text-ink-200'
+          }`}
+          onClick={onClick}
+          title={`${file.path} — provided by the course, read-only`}
+          type="button">
+          <span aria-hidden className="flex w-3 shrink-0 justify-center">
+            <LockGlyph />
+          </span>
+          <span className="font-code min-w-0 truncate italic">{file.path}</span>
+        </button>
+      </li>
+    );
+  },
+);
+ProvidedRow.displayName = 'ProvidedRow';
 
 const STATUS_GLYPH: Record<StepAttempt['status'], {glyph: string; className: string; word: string}> = {
   accepted: {glyph: '✓', className: 'text-success-300', word: 'accepted'},
@@ -326,19 +413,43 @@ ExplorerRow.displayName = 'ExplorerRow';
 /**
  * The problem's virtual filesystem — one file per step, in the current language — as a file tree.
  * Every file is listed so the shape of the system is visible from step 1; locked ones wait for
- * their step, every other one opens in a tab and is editable from any step.
+ * their step, every other one opens in a tab and is editable from any step. Under them, what the
+ * course provides and no step builds (generated protobuf modules, helpers, the `.proto` behind a
+ * generated package): readable in a tab, never editable.
  */
 const Explorer: FC<{
   problem: Problem;
   language: Language;
+  provided: readonly ProvidedFile[];
   attempts: Record<string, StepAttempt>;
   stepId: string;
   openFile: string | null;
   onOpen: (id: string) => void;
-}> = memo(({problem, language, attempts, stepId, openFile, onOpen}) => (
+  /** Fold the explorer into a strip beside the editor (`lg` and up), as the problem pane folds. */
+  onCollapse: () => void;
+}> = memo(({problem, language, provided, attempts, stepId, openFile, onOpen, onCollapse}) => (
   <nav aria-label="files" className="flex h-full min-h-0 flex-col">
-    <div className="text-ink-400 flex h-9 shrink-0 items-center px-3 text-[10px] font-bold uppercase tracking-wider">
+    <div className="text-ink-400 flex h-9 shrink-0 items-center justify-between pl-3 pr-1.5 text-[10px] font-bold uppercase tracking-wider">
       Explorer
+      <button
+        aria-label="hide the file explorer"
+        className="text-ink-400 hover:text-ink-50 hidden h-6 w-6 items-center justify-center rounded-md transition lg:flex"
+        onClick={onCollapse}
+        title={`hide the file explorer (${mod('B')})`}
+        type="button">
+        <svg
+          aria-hidden
+          fill="none"
+          height={13}
+          stroke="currentColor"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth={1.8}
+          viewBox="0 0 16 16"
+          width={13}>
+          <path d="M10 3 5 8l5 5" />
+        </svg>
+      </button>
     </div>
     <div className="min-h-0 flex-1 overflow-y-auto pb-2">
       <div className="text-ink-100 flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold">
@@ -362,6 +473,23 @@ const Explorer: FC<{
           />
         ))}
       </ul>
+      {provided.length > 0 ? (
+        <>
+          <div
+            className="text-ink-400 mt-2 flex items-center gap-1 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider"
+            title="files the course provides; your imports resolve to them">
+            <span aria-hidden className="w-3 text-center text-[9px]">
+              ▼
+            </span>
+            provided · read-only
+          </div>
+          <ul>
+            {provided.map(f => (
+              <ProvidedRow active={providedId(f.path) === openFile} file={f} key={f.path} onOpen={onOpen} />
+            ))}
+          </ul>
+        </>
+      ) : null}
     </div>
   </nav>
 ));
@@ -381,6 +509,21 @@ const CollapsedPane: FC<{title: string; onExpand: () => void}> = memo(({title, o
   </button>
 ));
 CollapsedPane.displayName = 'CollapsedPane';
+
+/** The explorer folded into a strip (`lg` and up): "Explorer" on its side, click to expand. */
+const CollapsedExplorer: FC<{onExpand: () => void}> = memo(({onExpand}) => (
+  <button
+    className="border-ink-700 text-ink-300 hover:bg-ink-800 hover:text-ink-50 hidden h-full w-7 shrink-0 flex-col items-center gap-3 overflow-hidden border-r py-2 transition lg:flex"
+    onClick={onExpand}
+    title={`show the file explorer (${mod('B')})`}
+    type="button">
+    <span aria-hidden className="text-[14px] leading-none">
+      ›
+    </span>
+    <span className="min-h-0 text-[10px] font-bold uppercase tracking-wider [writing-mode:vertical-rl]">Explorer</span>
+  </button>
+));
+CollapsedExplorer.displayName = 'CollapsedExplorer';
 
 /** `problemId`/`stepId` come from the address (`/`, `/<problem>`, `/<problem>/<step>`); the URL is the source of truth. */
 const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}> = memo(({problemId, stepId}) => {
@@ -452,6 +595,10 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   /** The step's own file — what Submit judges and the solution diffs against, whichever tab is open. */
   const stepCode = step === null ? '' : files[step.id] ?? step.code[language].starter;
   const openCode = openFile === null ? '' : files[openFile] ?? '';
+  /** What the course provides beside the learner's files in this language; read-only in the explorer. */
+  const provided = useMemo(() => (problem === null ? [] : providedFiles(problem, language)), [problem, language]);
+  const openProvided =
+    openFile !== null && isProvidedId(openFile) ? provided.find(f => f.path === providedPath(openFile)) ?? null : null;
   const profile = useMemo(
     () => computeProfile(problems, progress.attempts, progress.submissions, progress.acceptedSubmissions),
     [progress.attempts, progress.submissions, progress.acceptedSubmissions],
@@ -521,7 +668,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
         next[s.id] = workspaces.current[workspaceKey(target.id, s.id, lang)]?.code ?? s.code[lang].starter;
       }
       setFiles(next);
-      if (mounted.current !== target.id) setOpenTabs([]);
+      // Tabs of the same problem stay open, except provided files this language does not have.
+      const kept = new Set(providedFiles(target, lang).map(f => providedId(f.path)));
+      setOpenTabs(t => (mounted.current === target.id ? t.filter(id => !isProvidedId(id) || kept.has(id)) : []));
       mounted.current = target.id;
       openTab(targetStep.id);
       setResetKey(k => k + 1);
@@ -1348,13 +1497,17 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                 <Explorer
                   attempts={progress.attempts}
                   language={language}
+                  onCollapse={toggleExplorer}
                   onOpen={openTab}
                   openFile={openFile}
                   problem={problem}
+                  provided={provided}
                   stepId={step.id}
                 />
               </aside>
-            ) : null}
+            ) : (
+              <CollapsedExplorer onExpand={toggleExplorer} />
+            )}
             <div
               className="flex min-h-0 min-w-0 flex-1 flex-col lg:grid lg:h-full lg:grid-rows-[var(--lb-rows)]"
               ref={ideRef}
@@ -1391,6 +1544,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                     openFile={openFile}
                     openTabs={openTabs}
                     problem={problem}
+                    provided={provided}
                     stepId={step.id}
                   />
                   <div className="border-ink-700 flex shrink-0 items-center gap-2 border-b pl-2 pr-2">
@@ -1409,7 +1563,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                     </button>
                     <button
                       className="text-ink-300 hover:text-ink-50 rounded-md px-2 py-1 text-[11px] transition disabled:cursor-not-allowed disabled:opacity-30"
-                      disabled={openFile === null}
+                      disabled={openFile === null || openProvided !== null}
                       onClick={onResetCode}
                       title="restore this file's starting code"
                       type="button">
@@ -1445,6 +1599,24 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                       open {fileName(step.file, language)}
                     </button>
                   </div>
+                ) : openProvided !== null ? (
+                  <>
+                    <div className="border-ink-700 bg-ink-850/60 text-ink-300 flex shrink-0 items-start gap-2 border-b px-3 py-1.5 text-[11px] leading-5">
+                      <span aria-hidden className="mt-1 shrink-0">
+                        <LockGlyph />
+                      </span>
+                      <span>
+                        <span className="text-ink-100 font-semibold">Provided · read-only.</span> {openProvided.note}
+                      </span>
+                    </div>
+                    <StepEditor
+                      className="min-h-0 min-w-0 flex-1"
+                      fileKey={`${problem.id}/${openFile}/${language}`}
+                      language={openProvided.syntax}
+                      readOnly
+                      value={openProvided.text}
+                    />
+                  </>
                 ) : (
                   <StepEditor
                     className="min-h-0 min-w-0 flex-1"

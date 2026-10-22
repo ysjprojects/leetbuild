@@ -18,6 +18,7 @@ import {
   syntaxHighlighting,
 } from '@codemirror/language';
 import {scala} from '@codemirror/legacy-modes/mode/clike';
+import {protobuf} from '@codemirror/legacy-modes/mode/protobuf';
 import {highlightSelectionMatches, searchKeymap} from '@codemirror/search';
 import {type Extension, EditorState} from '@codemirror/state';
 import {
@@ -35,28 +36,33 @@ import {vim} from '@replit/codemirror-vim';
 import type {EditorSettings} from './editorSettings';
 import type {Language} from './types';
 
+/** What an editor can highlight: the five languages, plus `.proto` for the provided contracts. */
+export type Syntax = Language | 'proto';
+
 // ---- grammars ---------------------------------------------------------------------------------
 
-const grammars: Record<Language, LanguageSupport | StreamLanguage<unknown>> = {
+const grammars: Record<Syntax, LanguageSupport | StreamLanguage<unknown>> = {
   python: python(),
   typescript: javascript({typescript: true}),
   go: go(),
   scala: StreamLanguage.define(scala),
   cpp: cpp(),
+  proto: StreamLanguage.define(protobuf),
 };
 
 /** Grammar + language data for the editor. */
-export function editorLanguage(language: Language): Extension {
-  return grammars[language];
+export function editorLanguage(syntax: Syntax): Extension {
+  return grammars[syntax];
 }
 
 /** Indentation the language community expects; Go is tabs (gofmt). */
-export const INDENT: Record<Language, {unit: string; tabSize: number}> = {
+export const INDENT: Record<Syntax, {unit: string; tabSize: number}> = {
   cpp: {unit: '  ', tabSize: 2},
   go: {unit: '\t', tabSize: 4},
   python: {unit: '    ', tabSize: 4},
   typescript: {unit: '  ', tabSize: 2},
   scala: {unit: '  ', tabSize: 2},
+  proto: {unit: '  ', tabSize: 2},
 };
 
 // ---- token classes ------------------------------------------------------------------------------
