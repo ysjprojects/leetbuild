@@ -563,6 +563,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'connector-hub-the-connector-that-replayed-the-whole-vendor',
+    problemId: 'connector-hub',
+    stepId: 'endpoint',
+    title: 'The connector that replayed the whole vendor',
+    blurb: 'A cursor with a TTL expired and the sync restarted from zero.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      "After a quiet weekend, a connector re-fetched three months of vendor history and tripped the vendor's rate limit, because the draft stored its cursor with a 24-hour TTL. The same draft retried 429s in a tight loop. Review it, fix it, and prove cursors are durable and retries are polite.",
+    signals: ['Operate', 'Specify', 'Verify'],
+    aiNote:
+      'The draft stores the sync cursor with a 24-hour TTL so a period of quiet silently resets it to the beginning of history, and it advances the cursor before the page is processed, so a crash can skip data as well as re-fetch it; the 429 handler retries with no backoff.',
+    testIdea:
+      'Expire the cursor key and assert the next sync refuses to start rather than restarting from zero; crash between page commit and cursor move and assert the page is re-fetched and deduped; answer 429 and assert the next attempt waits with backoff.',
+    followUps: [
+      'Should a connector stop entirely after a 401, and how does a human re-enable it?',
+      'How would you detect a cursor that silently stopped advancing?',
+      'What would you record per page to make a disputed sync reconstructable?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
