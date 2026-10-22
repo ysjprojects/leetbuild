@@ -50,8 +50,11 @@ export interface ArchBlock {
   detail?: string;
   /** The tensor it hands to the next item, shown on its outgoing arrow when shapes are switched on. */
   shape?: string;
-  /** A box to its left feeding into it: RoPE into attention, a mask into the softmax. */
-  side?: {label: string; sub?: string; detail?: string};
+  /**
+   * A box to its left feeding into it: RoPE into attention, a mask into the softmax. With an `id` a
+   * step's `focus` can light it on its own; without one it lights with the block it feeds.
+   */
+  side?: {id?: string; label: string; sub?: string; detail?: string};
 }
 
 /** ⊕ or ⊗ on the main path; with `from`, a residual connection carries the input of that block around to it. */
@@ -121,7 +124,7 @@ export function architectureProblems(spec: unknown): string[] {
   if (typeof spec !== 'object' || spec === null || !Array.isArray((spec as Architecture).items))
     return ['an architecture is an object with an `items` array'];
   const arch = spec as Architecture;
-  const ids = new Map<string, 'block' | 'op'>();
+  const ids = new Map<string, 'block' | 'op' | 'side'>();
   const note = (id: unknown, what: string): void => {
     if (typeof id !== 'string' || id === '') problems.push(`${what} has no id`);
     else if (ids.has(id)) problems.push(`duplicate id '${id}'`);
@@ -161,16 +164,22 @@ export function architectureProblems(spec: unknown): string[] {
           problems.push(`${where}: block '${raw.id}' has unknown kind '${String(raw.kind)}'`);
         ids.set(raw.id, 'block');
         below.add(raw.id);
+        if (raw.side?.id !== undefined) {
+          note(raw.side.id, `${where}: the side box of '${raw.id}'`);
+          ids.set(raw.side.id, 'side');
+        }
       } else problems.push(`${where}: an item is neither a block, an op, a group nor a branch`);
     }
   };
   walk(arch.items, 'items');
   for (const inset of arch.insets ?? []) {
-    if (!ids.has(inset.for)) problems.push(`an inset opens up '${inset.for}', which is not a block`);
+    if (ids.get(inset.for) !== 'block') problems.push(`an inset opens up '${inset.for}', which is not a block`);
     walk(inset.items, `inset for ${inset.for}`);
   }
   for (const n of arch.notes ?? []) {
-    if (!ids.has(n.at)) problems.push(`a note points at '${n.at}', which is not a block or an op`);
+    const kind = ids.get(n.at);
+    if (kind === undefined || kind === 'side')
+      problems.push(`a note points at '${n.at}', which is not a block or an op`);
     if (typeof n.text !== 'string' || n.text.trim() === '') problems.push(`the note at '${n.at}' has no text`);
     if (n.side !== undefined && n.side !== 'left' && n.side !== 'right')
       problems.push(`the note at '${n.at}' has side '${String(n.side)}'`);
@@ -178,14 +187,17 @@ export function architectureProblems(spec: unknown): string[] {
   return problems;
 }
 
-/** Every block and op id of the figure, insets included (step `focus` names them). */
+/** Every block, op and named side-box id of the figure, insets included (step `focus` names them). */
 export function architectureIds(arch: Architecture): Set<string> {
   const out = new Set<string>();
   const walk = (items: ArchItem[]): void => {
     for (const item of items) {
       if (isBranch(item)) item.columns.forEach(walk);
       else if (isGroup(item)) walk(item.items);
-      else out.add(item.id);
+      else {
+        out.add(item.id);
+        if (isBlock(item) && item.side?.id !== undefined) out.add(item.side.id);
+      }
     }
   };
   walk(arch.items);
@@ -435,7 +447,7 @@ function blockFragment(b: ArchBlock): Fragment {
     const sx = -w / 2 - SIDE_GAP - sw;
     const sy = (h - sh) / 2;
     f.blocks.push({
-      id: `${b.id}:side`,
+      id: b.side.id ?? `${b.id}:side`,
       label: b.side.label,
       sub: b.side.sub,
       kind: 'layer',

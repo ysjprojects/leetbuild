@@ -28,6 +28,17 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* Code shows the characters a learner types: JetBrains Mono's ligatures would draw `<|eot_id|>` as
+ * ◁eot_id▷ and `->`, `!=`, `>=` as single glyphs. */
+code,
+pre,
+kbd,
+samp,
+.font-code,
+.cm-scroller {
+  font-variant-ligatures: none;
+}
+
 /* The LinkedIn [in] logo may only be blue, black or white (brand.linkedin.com/in-logo): white on the
  * Night palette, LinkedIn blue on Day. Buttons are LinkedIn's own blue in both themes. */
 html {

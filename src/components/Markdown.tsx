@@ -274,7 +274,8 @@ const Blocks: FC<{
           return (
             <div className="border-ink-700 my-3 overflow-x-auto rounded-lg border" key={index}>
               <table className="w-full border-collapse text-[13px]">
-                <thead className="bg-ink-800 text-ink-300 text-left text-[11px] uppercase tracking-wide">
+                {/* No text-transform: uppercase would turn μ into Μ, π into Π and `d = buf` into D = BUF. */}
+                <thead className="bg-ink-800 text-ink-200 text-left text-[12px]">
                   <tr>
                     {block.header.map((cell, j) => (
                       <th className="px-3 py-1.5 font-semibold" key={j}>

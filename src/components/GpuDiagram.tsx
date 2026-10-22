@@ -55,6 +55,10 @@ const MARK: Record<GpuMarkTone, {fill: string; stroke: string}> = {
   register: {fill: alpha(iris[400], 0.45), stroke: iris[300]},
   muted: {fill: alpha(ink[400], 0.42), stroke: ink[300]},
   bad: {fill: alpha(danger[400], 0.35), stroke: danger[400]},
+  // Categories (whose a slice is), in hues no memory level uses.
+  a: {fill: alpha(concept.kafka, 0.4), stroke: concept.kafka},
+  b: {fill: alpha(concept.grpc, 0.4), stroke: concept.grpc},
+  c: {fill: alpha(concept.redis, 0.4), stroke: concept.redis},
 };
 
 const LEGEND: {tone: GpuDataTone; label: string}[] = [

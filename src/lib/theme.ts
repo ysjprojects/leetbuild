@@ -4,7 +4,7 @@
  * choice the OS preference applies. `THEME_BOOT_SCRIPT` runs inline before first paint so a saved
  * choice never flashes the other theme.
  */
-import {useCallback, useEffect, useState} from 'react';
+import {useCallback, useEffect, useSyncExternalStore} from 'react';
 
 import {type Theme, PALETTE} from '@/styles/palette';
 
@@ -43,21 +43,35 @@ function saved(): Theme | null {
   }
 }
 
+/** What the server renders: it cannot know the saved choice, which the boot script applies before paint. */
+const SERVER_THEME: Theme = 'dark';
+
+const subscribe = (onChange: () => void): (() => void) => {
+  const observer = new MutationObserver(onChange);
+  observer.observe(document.documentElement, {attributes: true, attributeFilter: ['data-theme']});
+  return () => observer.disconnect();
+};
+
+/**
+ * The theme as the document shows it, for components that draw it (a canvas, an icon) rather than
+ * paint through CSS variables: follows every `data-theme` change, whichever component made it.
+ * Hydration renders the server's theme first and then the document's, so the markup always matches.
+ */
+export function useDocumentTheme(): Theme {
+  return useSyncExternalStore(subscribe, current, () => SERVER_THEME);
+}
+
 /** The active theme and a toggle. The choice is saved, shared with other tabs, and until one is made the OS preference is followed. */
 export function useTheme(): [Theme, () => void] {
-  const [theme, setTheme] = useState<Theme>(current);
+  const theme = useDocumentTheme();
 
   useEffect(() => {
-    const set = (next: Theme): void => {
-      apply(next);
-      setTheme(next);
-    };
     const onStorage = (e: StorageEvent): void => {
-      if (e.key === THEME_KEY && isTheme(e.newValue)) set(e.newValue);
+      if (e.key === THEME_KEY && isTheme(e.newValue)) apply(e.newValue);
     };
     const query = matchMedia(LIGHT_QUERY);
     const onPreference = (e: MediaQueryListEvent): void => {
-      if (saved() === null) set(e.matches ? 'light' : 'dark');
+      if (saved() === null) apply(e.matches ? 'light' : 'dark');
     };
     window.addEventListener('storage', onStorage);
     query.addEventListener('change', onPreference);
@@ -70,7 +84,6 @@ export function useTheme(): [Theme, () => void] {
   const toggle = useCallback(() => {
     const next: Theme = current() === 'light' ? 'dark' : 'light';
     apply(next);
-    setTheme(next);
     try {
       localStorage.setItem(THEME_KEY, next);
     } catch {
@@ -79,18 +92,4 @@ export function useTheme(): [Theme, () => void] {
   }, []);
 
   return [theme, toggle];
-}
-
-/**
- * The theme as the document shows it, for components that paint with it (a canvas) rather than
- * through CSS variables: follows every `data-theme` change, whichever component made it.
- */
-export function useDocumentTheme(): Theme {
-  const [theme, setTheme] = useState<Theme>(current);
-  useEffect(() => {
-    const observer = new MutationObserver(() => setTheme(current()));
-    observer.observe(document.documentElement, {attributes: true, attributeFilter: ['data-theme']});
-    return () => observer.disconnect();
-  }, []);
-  return theme;
 }

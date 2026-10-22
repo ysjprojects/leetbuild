@@ -15,9 +15,24 @@
 export type GpuTone = 'scope' | 'compute' | 'host' | 'global' | 'shared' | 'register';
 export const GPU_TONES: readonly GpuTone[] = ['scope', 'compute', 'host', 'global', 'shared', 'register'];
 
-/** Where data lives (an array's own tint) or what a marked slice is: about to move there, idle, wrong. */
-export type GpuMarkTone = 'host' | 'global' | 'shared' | 'register' | 'muted' | 'bad';
-export const GPU_MARK_TONES: readonly GpuMarkTone[] = ['host', 'global', 'shared', 'register', 'muted', 'bad'];
+/**
+ * What a marked slice is: about to move to, or living in, a memory level (`host` … `register`), idle
+ * or padding (`muted`), wrong (`bad`), or whose it is (`a`, `b`, `c`: a sequence, a rank, a group).
+ * The three categories are not memory levels, so the legend leaves them out; say in a label or the
+ * detail what each one is.
+ */
+export type GpuMarkTone = 'host' | 'global' | 'shared' | 'register' | 'muted' | 'bad' | 'a' | 'b' | 'c';
+export const GPU_MARK_TONES: readonly GpuMarkTone[] = [
+  'host',
+  'global',
+  'shared',
+  'register',
+  'muted',
+  'bad',
+  'a',
+  'b',
+  'c',
+];
 export type GpuDataTone = 'host' | 'global' | 'shared' | 'register';
 const DATA_TONES: readonly GpuDataTone[] = ['host', 'global', 'shared', 'register'];
 
