@@ -2346,6 +2346,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'data-classification-verify',
+    problemId: 'data-classification',
+    stepId: 'verify-endpoint',
+    title: 'The tier that came from the request body',
+    blurb: 'A producer marked a passport table Tier 4 and the catalogue believed them. Fix the verification endpoint.',
+    role: 'Data platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'You are the engineer on the metadata service that classifies every table in the lake. Yesterday a table with a passport_no column went from Tier 1 to Tier 4 and opened to the whole company; the audit trail shows a verification call and nothing else. The model-generated handler below is what served it. Review it, fix it, and prove the fix.',
+    signals: ['Secure', 'Specify', 'Verify'],
+    aiNote:
+      'The draft reads X-User-Id but never checks it against the entity owner, so anyone can verify any table. It copies `tier` from the request body instead of deriving it from the tags and the privacy rules, so the caller sets the access level. It accepts any string as a tag, so an unknown tag has no rule and no tier. And it records nothing about who verified, so the incident has no name on it.',
+    testIdea:
+      'POST a verification for an entity whose owner is team-a with X-User-Id: team-b and assert 403. Then, as team-a, send `{"action": "edit", "tags": {"passport_no": "Personal.ID"}, "tier": 4}` and assert the response tier is 1 and the stored audit row names team-a. Send a tag outside the taxonomy and assert 400.',
+    followUps: [
+      'An edit that lowers the tier is the dangerous direction. Would you require a second approver for downgrades, and where in the handler would that gate live?',
+      'The source feeds verification edits back into prompt evaluation. What would you record per edit so the next prompt version can be measured against it?',
+      'The owner is one person and tables outlive people. How does the handler behave when owner_of returns a team instead of a user, and when the owner has left?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */

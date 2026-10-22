@@ -119,6 +119,7 @@ import {copilotContextProblem} from './118-copilot-context/index';
 import {aiFirewallProblem} from './119-ai-firewall/index';
 import {textToSqlProblem} from './120-text-to-sql/index';
 import {supportAutomationProblem} from './121-support-automation/index';
+import {dataClassificationProblem} from './122-data-classification/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -229,6 +230,7 @@ export const problems: Problem[] = [
   aiFirewallProblem,
   textToSqlProblem,
   supportAutomationProblem,
+  dataClassificationProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
