@@ -70,6 +70,7 @@ import {sandboxRunnerProblem} from './66-sandbox-runner/index';
 import {syntheticDataProblem} from './67-synthetic-data/index';
 import {browserAgentProblem} from './68-browser-agent/index';
 import {bookingEngineProblem} from './69-booking-engine/index';
+import {inventoryServiceProblem} from './70-inventory-service/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -131,6 +132,7 @@ export const problems: Problem[] = [
   syntheticDataProblem,
   browserAgentProblem,
   bookingEngineProblem,
+  inventoryServiceProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
