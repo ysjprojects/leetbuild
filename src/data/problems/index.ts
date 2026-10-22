@@ -74,6 +74,7 @@ import {inventoryServiceProblem} from './70-inventory-service/index';
 import {refundServiceProblem} from './71-refund-service/index';
 import {productSearchProblem} from './72-product-search/index';
 import {sessionStoreProblem} from './73-session-store/index';
+import {metricsPipelineProblem} from './74-metrics-pipeline/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -139,6 +140,7 @@ export const problems: Problem[] = [
   refundServiceProblem,
   productSearchProblem,
   sessionStoreProblem,
+  metricsPipelineProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
