@@ -1,0 +1,16 @@
+{
+  "title": "The purge that never propagated",
+  "blurb": "Accepted meant done, and a wildcard purged the whole domain.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "A pricing fix stayed broken on some edges for six hours because the draft marked the purge done at provider acceptance, and a normal-token wildcard purge hammered the origin into an outage. Review it, fix it, and prove status is honest and blast radius is gated.",
+  "signals": ["Operate", "Verify", "Secure"],
+  "aiNote": "The draft reports done when the provider accepts the request, so propagation failures are invisible and on-call believes the cache is clean, and it lets a normal token request a domain-wide wildcard, turning one request into an origin stampede.",
+  "testIdea": "Return partial failure from the provider and assert the status reports partially failed with paths; request a wildcard with a normal token and assert 403; retry a purge with the same key and assert the provider is called once.",
+  "followUps": [
+    "When does a targeted purge beat a versioned URL?",
+    "How would you purge without knowing every path?",
+    "What budget keeps deploys from DDoSing the provider?"
+  ],
+  "stepId": "endpoint"
+}
