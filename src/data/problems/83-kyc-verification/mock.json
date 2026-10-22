@@ -1,0 +1,16 @@
+{
+  "title": "The KYC that approved on a timeout",
+  "blurb": "Timeout meant approved, and document URLs never expired.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "A burst of auto-approvals hit during a vendor outage, and permanent document URLs were indexed by a search engine after a leak. The model-generated draft maps vendor timeouts to approved and returns unexpiring links. Review it, fix it, and prove failure means humans and links expire.",
+  "signals": ["Secure", "Verify", "Specify"],
+  "aiNote": "The draft maps vendor timeouts and errors to approved to protect conversion, creating a path where an outage silently verifies applicants, and its status responses carry permanent document URLs that survive any share.",
+  "testIdea": "Time out the vendor and assert the case lands in manual review marked degraded; exceed the attempt cap concurrently and assert the sixth attempt is refused atomically; assert a document link expires and cannot be replayed.",
+  "followUps": [
+    "Which failure modes may never approve, no matter the conversion cost?",
+    "How do you store document images so no API ever proxies them?",
+    "What does a reviewer need versus what a customer support agent may see?"
+  ],
+  "stepId": "endpoint"
+}

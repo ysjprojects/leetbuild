@@ -83,6 +83,7 @@ import {cronSchedulerProblem} from './79-cron-scheduler/index';
 import {featureFlagsProblem} from './80-feature-flags/index';
 import {experimentsPlatformProblem} from './81-experiments-platform/index';
 import {fraudScoringProblem} from './82-fraud-scoring/index';
+import {kycVerificationProblem} from './83-kyc-verification/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -157,6 +158,7 @@ export const problems: Problem[] = [
   featureFlagsProblem,
   experimentsPlatformProblem,
   fraudScoringProblem,
+  kycVerificationProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
