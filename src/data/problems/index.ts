@@ -87,6 +87,7 @@ import {kycVerificationProblem} from './83-kyc-verification/index';
 import {productCatalogProblem} from './84-product-catalog/index';
 import {warehouseLoaderProblem} from './85-warehouse-loader/index';
 import {cdcStreamerProblem} from './86-cdc-streamer/index';
+import {replicatorProblem} from './87-replicator/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -165,6 +166,7 @@ export const problems: Problem[] = [
   productCatalogProblem,
   warehouseLoaderProblem,
   cdcStreamerProblem,
+  replicatorProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
