@@ -116,6 +116,7 @@ import {returnsProcessingProblem} from './114-returns-processing/index';
 import {adServingProblem} from './115-ad-serving/index';
 import {realtimeBiddingProblem} from './116-realtime-bidding/index';
 import {dynamicPricingProblem} from './117-dynamic-pricing/index';
+import {copilotContextProblem} from './118-copilot-context/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -223,6 +224,7 @@ export const problems: Problem[] = [
   adServingProblem,
   realtimeBiddingProblem,
   dynamicPricingProblem,
+  copilotContextProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,

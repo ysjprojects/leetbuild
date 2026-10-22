@@ -2279,6 +2279,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'copilot-context-tabs',
+    problemId: 'copilot-context',
+    stepId: 'neighboring-tabs',
+    title: 'The context cache that leaks between developers',
+    blurb: 'A developer saw a stranger’s code in a suggestion. Fix the neighboring-tabs cache.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'You own the completion service behind the editor’s ghost text. A developer reported a suggestion that contained a function from a file they have never seen; another reported that completions ignore the helper open in the next tab; the Redis instance is at 90 % memory. The neighboring-tabs cache below was generated from a one-line description and merged because the demo showed context from other files. Review it, fix it, and prove the fix.',
+    signals: ['Secure', 'Evaluate', 'Operate', 'Verify'],
+    aiNote:
+      'The draft keys tabs by file path only, so any developer with a `db/conn.py` open shares one entry — a cross-tenant leak. The entries have no TTL, so every closed tab stays in Redis forever. The match is an exact substring test on the cursor line, a bar so high that the feature includes nothing on most keystrokes, where GitHub’s A/B tests found a very low bar — even a weak best match — was what lifted acceptance. And it issues one GET per open tab on every keystroke instead of a single MGET.',
+    testIdea:
+      'Two sessions each remember a tab at the same path with different contents; pick snippets for session A and assert only A’s text can appear. Remember a tab, advance the clock 601 s, assert the key is gone. Score a tab that shares two identifiers out of forty with the cursor window and assert it is still included as the best match. Count Redis commands for a request with eight open tabs and assert one MGET.',
+    followUps: [
+      'The editor sends the full text of every open tab on every keystroke. What would you change in the protocol so the cache is updated only when a tab changes?',
+      'Jaccard over identifiers ignores order and structure. Where would you put a smarter similarity — an embedding, a language-aware tokenizer — and what would it cost on a 300 ms keystroke budget?',
+      'How would you evict a tab the instant the editor closes it, and what happens to your TTL design if the editor crashes without reporting?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
