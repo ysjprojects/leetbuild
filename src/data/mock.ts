@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'fine-tune-orchestrator-the-fine-tune-that-trained-on-the-wrong-data',
+    problemId: 'fine-tune-orchestrator',
+    stepId: 'endpoint',
+    title: 'The fine-tune that trained on the wrong data',
+    blurb: 'Caller-supplied data files and blind restarts discarded progress.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A fine-tune trained on an unregistered export, and the same job restarted three times from scratch after missed heartbeats, burning a week of GPU budget. The model-generated draft accepts raw data references and restarts silent trainers blind. Review it, fix it, and prove data is versioned and restarts resume.',
+    signals: ['Specify', 'Operate', 'Verify'],
+    aiNote:
+      'The draft accepts a caller-supplied dataset file, bypassing registry provenance entirely, and restarts a trainer on a missed heartbeat from scratch rather than requesting a checkpoint, so transient unresponsiveness silently multiplies compute cost.',
+    testIdea:
+      'Submit a raw file reference and assert 400; simulate a missed heartbeat and assert a checkpoint request precedes any restart; finish a job with a failing eval and assert it reports not promotable.',
+    followUps: [
+      'What hyperparameters must stay fixed for reproducibility?',
+      "How do you price a job's budget before it runs?",
+      "What belongs in a job's lineage so a result can be reproduced a year later?",
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
