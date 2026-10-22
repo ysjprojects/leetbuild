@@ -1,33 +1,20 @@
 /**
  * The learning guide as a PDF of its own: an A4 document laid out for paper — title page with a
- * table of contents, sections with running footers, figures as images at page width, code and
- * callouts in boxes, pop quizzes with the answer printed — built from the same parsed dialect the
- * page draws (lib/markdown.ts). Pure: the figures arrive as images; nothing here touches the DOM.
+ * table of contents, sections with running footers, code and callouts in boxes, pop quizzes with
+ * the answer printed — built from the same parsed dialect the page draws (lib/markdown.ts). The
+ * page's figures and interactive demos stay on the page: a demo is a one-line note here, a figure
+ * nothing at all. Pure: nothing here touches the DOM.
  */
 import type {Content, ContentTable, ContentText, TableCell, TDocumentDefinitions} from 'pdfmake/interfaces';
 
 import type {Guide} from './export';
-import {type Block, type InlineToken, inlineTokens} from './markdown';
+import {type Block, type InlineToken, inlineTokens, parseBlocks} from './markdown';
 import {WIDGETS} from './widgets';
-
-/** One panel of a figure (`:::sequence` / `:::diagram`) rasterized by the browser: a PNG data URL and its pixel size. */
-export interface FigureImage {
-  dataUrl: string;
-  width: number;
-  height: number;
-}
-
-/** A figure's panels, top to bottom — one for most figures, several for a diagram cut to fit the column. */
-export type Figures = Map<Block, FigureImage[]>;
 
 // A4 is 595 × 842 pt; the text column is what is left inside the margins.
 const PAGE_WIDTH = 595;
 const MARGIN_X = 56;
 const COLUMN = PAGE_WIDTH - 2 * MARGIN_X;
-/** The rasterizer's pixels per CSS pixel of the drawing. */
-export const RASTER_SCALE = 3;
-/** The widest slice of a diagram (in its own pixels) that stays legible when fitted to the column. */
-export const MAX_PANEL_PX = Math.round(COLUMN / 0.75);
 
 const INK = '#1c2030';
 const MUTED = '#5c6478';
@@ -68,13 +55,12 @@ const runs = (text: string): ContentText[] =>
   });
 
 /** A one-cell box: a panel with a fill and no borders, or a callout with a bar down its left edge. */
-const box = (body: Content[], kind: 'panel' | 'code' | 'callout' | 'figure'): ContentTable => ({
-  table: {widths: ['*'], body: [[{stack: body, margin: kind === 'figure' ? [4, 4, 4, 4] : [10, 8, 10, 8]}]]},
+const box = (body: Content[], kind: 'panel' | 'code' | 'callout'): ContentTable => ({
+  table: {widths: ['*'], body: [[{stack: body, margin: [10, 8, 10, 8]}]]},
   layout: {
-    hLineWidth: () => (kind === 'figure' ? 0.5 : 0),
-    vLineWidth: (i: number) => (kind === 'callout' ? (i === 0 ? 2 : 0) : kind === 'figure' ? 0.5 : 0),
-    hLineColor: () => RULE,
-    vLineColor: () => (kind === 'callout' ? ACCENT : RULE),
+    hLineWidth: () => 0,
+    vLineWidth: (i: number) => (kind === 'callout' && i === 0 ? 2 : 0),
+    vLineColor: () => ACCENT,
     fillColor: () => (kind === 'code' ? CODE_PANEL : kind === 'panel' ? PANEL : null),
     paddingLeft: () => 0,
     paddingRight: () => 0,
@@ -87,7 +73,8 @@ const box = (body: Content[], kind: 'panel' | 'code' | 'callout' | 'figure'): Co
 
 const LETTERS = 'ABCDEFGH';
 
-const blockContent = (block: Block, figures: Figures, guideUrl: string): Content => {
+/** One block of the dialect as pdfmake content; `null` for what the PDF leaves out. */
+const blockContent = (block: Block): Content | null => {
   switch (block.kind) {
     case 'heading':
       return block.level === 1
@@ -153,17 +140,8 @@ const blockContent = (block: Block, figures: Figures, guideUrl: string): Content
     case 'widget':
       return box(
         [
-          {text: 'INTERACTIVE DEMO', style: 'label'},
-          {
-            text: [
-              {text: `${WIDGETS[block.name]?.about ?? block.name} `},
-              {text: 'Open the guide at ', color: MUTED},
-              {text: guideUrl, link: guideUrl, color: ACCENT, decoration: 'underline'},
-              {text: ' to use it.', color: MUTED},
-            ],
-            style: 'body',
-            margin: [0, 2, 0, 0],
-          },
+          {text: 'INTERACTIVE DEMO · ON THE PAGE', style: 'label'},
+          {text: WIDGETS[block.name]?.about ?? block.name, style: 'body', margin: [0, 2, 0, 0]},
         ],
         'panel',
       );
@@ -171,31 +149,20 @@ const blockContent = (block: Block, figures: Figures, guideUrl: string): Content
       return {
         stack: [
           {text: block.title, style: 'h3', margin: [0, 4, 0, 4]},
-          ...block.body.map(b => blockContent(b, figures, guideUrl)),
+          ...block.body.map(blockContent).filter((c): c is Content => c !== null),
         ],
       };
     case 'sequence':
-    case 'diagram': {
-      const images = figures.get(block);
-      if (images === undefined) return {text: ''};
-      // Each panel at the column's width — but never blown up past its own drawing size.
-      return box(
-        images.map(image => ({
-          image: image.dataUrl,
-          width: Math.min(COLUMN - 8, image.width / RASTER_SCALE),
-          alignment: 'center',
-          margin: [0, 2, 0, 2],
-        })),
-        'figure',
-      );
-    }
+    case 'diagram':
+      return null;
     case 'malformed':
       return {text: block.what, style: 'body', color: MUTED, italics: true};
   }
 };
 
-/** The whole document from the guide's parsed blocks (the figures are keyed by them); `guideUrl` is where the interactive version lives. */
-export function guideDocument(guide: Guide, blocks: Block[], figures: Figures, guideUrl: string): TDocumentDefinitions {
+/** The whole document. */
+export function guideDocument(guide: Guide): TDocumentDefinitions {
+  const blocks = parseBlocks(guide.learn);
   const footerLabel = `${guide.title} — a LeetBuild learning guide`;
   return {
     pageSize: 'A4',
@@ -230,7 +197,7 @@ export function guideDocument(guide: Guide, blocks: Block[], figures: Figures, g
       {text: guide.tagline, style: 'tagline'},
       {toc: {title: {text: 'Contents', style: 'contents'}, textMargin: [0, 1, 0, 1]}},
       {text: '', pageBreak: 'after'},
-      ...blocks.map(block => blockContent(block, figures, guideUrl)),
+      ...blocks.map(blockContent).filter((c): c is Content => c !== null),
       ...(guide.sources.length === 0
         ? []
         : [
@@ -239,7 +206,7 @@ export function guideDocument(guide: Guide, blocks: Block[], figures: Figures, g
               (s): Content => ({
                 text: [
                   {text: s.title, link: s.url, color: ACCENT, decoration: 'underline'},
-                  {text: `${s.by !== undefined ? ` — ${s.by}` : ''}, ${s.date}. ${s.url}`},
+                  {text: `${s.by !== undefined ? ` — ${s.by}` : ''}, ${s.date}.`},
                 ],
                 style: 'source',
               }),

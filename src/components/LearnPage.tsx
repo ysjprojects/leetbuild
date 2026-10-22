@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import {type FC, memo, useCallback, useEffect, useMemo, useState} from 'react';
 
-import {type Guide, downloadMarkdown, githubSlug, learnFileName, learnPath, learnToMarkdown} from '@/lib/export';
+import {type Guide, downloadMarkdown, githubSlug, learnFileName, learnToMarkdown} from '@/lib/export';
 import {leetbuildHighlighter} from '@/lib/highlight';
 
 import {BrandLockup} from './LoadingScreen';
@@ -16,8 +16,6 @@ import {renderWidget} from './widgets';
  * take away — the Markdown (figures as Mermaid, quizzes with the answer behind a spoiler) and a PDF
  * laid out for paper (lib/pdf.ts; figures as images, demos as notes, answers printed).
  */
-
-const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL;
 
 /** The guide's sections: every `#` heading outside fenced code, with the anchor the heading renders. */
 const sectionsOf = (markdown: string): {title: string; id: string}[] => {
@@ -37,11 +35,6 @@ const LearnPage: FC<{guide: Guide}> = memo(({guide}) => {
   const sections = useMemo(() => sectionsOf(guide.learn), [guide.learn]);
   const [active, setActive] = useState<string | null>(null);
   const [preparing, setPreparing] = useState(false);
-  // Where this page lives, for the printed notes; the server does not know the origin unless configured.
-  const [origin, setOrigin] = useState(SITE_URL ?? '');
-  useEffect(() => {
-    if (SITE_URL === undefined) setOrigin(window.location.origin);
-  }, []);
 
   // The section in view, for the table of contents: the last heading above the top third of the viewport.
   useEffect(() => {
@@ -63,15 +56,13 @@ const LearnPage: FC<{guide: Guide}> = memo(({guide}) => {
   // The PDF machinery (pdfmake, the figure rasterizer) loads only when someone asks for a PDF.
   const onPdf = useCallback(() => {
     setPreparing(true);
-    import('./guidePdf')
-      .then(({downloadGuidePdf}) =>
-        downloadGuidePdf(guide, `${origin}${learnPath(guide.problemId)}`, learnFileName(guide.problemId, 'pdf')),
-      )
+    import('@/lib/guidePdf')
+      .then(({downloadGuidePdf}) => downloadGuidePdf(guide, learnFileName(guide.problemId, 'pdf')))
       .catch((error: unknown) => {
         console.error(error);
       })
       .finally(() => setPreparing(false));
-  }, [guide, origin]);
+  }, [guide]);
 
   return (
     <main className="mx-auto w-full max-w-6xl px-4 py-6">

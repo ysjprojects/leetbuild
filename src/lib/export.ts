@@ -99,11 +99,13 @@ export function shiftHeadings(markdown: string, by: number): string {
   });
 }
 
-/** Replace `:::widget name {json}` lines with a note and a link to the interactive version. */
-export function widgetsToNotes(markdown: string, stepUrl: string): string {
+/** Replace `:::widget name {json}` lines with a note — and a link to the interactive version, when given one. */
+export function widgetsToNotes(markdown: string, stepUrl?: string): string {
   return markdown.replace(/^:::widget\s+([\w-]+)[^\n]*$/gm, (_, name: string) => {
     const about = WIDGETS[name]?.about ?? name;
-    return `> **Interactive (${name}):** ${about} [Open it in LeetBuild.](${stepUrl})`;
+    return stepUrl === undefined
+      ? `> **Interactive (${name}):** ${about}`
+      : `> **Interactive (${name}):** ${about} [Open it in LeetBuild.](${stepUrl})`;
   });
 }
 
@@ -297,17 +299,14 @@ export const guideOf = (problem: Problem): Guide | null =>
         sources: problem.sources ?? [],
       };
 
-/** The learning guide as a standalone Markdown document: title, provenance, the guide with figures as Mermaid. */
+/** The learning guide as a standalone Markdown document: title, tagline, the guide with figures as Mermaid and demos as notes. */
 export function learnToMarkdown(guide: Guide): string {
-  const url = `${siteUrl()}${learnPath(guide.problemId)}`;
   const parts: string[] = [
     `# ${guide.title}: the learning guide`,
     ``,
-    `*A LeetBuild learning guide · [interactive version](${url}) · [the course](${siteUrl()}/${guide.problemId})*`,
-    ``,
     guide.tagline,
     ``,
-    blocksToMarkdown(widgetsToNotes(shiftHeadings(guide.learn, 1), url)).trim(),
+    blocksToMarkdown(widgetsToNotes(shiftHeadings(guide.learn, 1))).trim(),
     ``,
   ];
   if (guide.sources.length > 0) {
