@@ -1,0 +1,92 @@
+[
+  {
+    "id": "router-policy",
+    "stepId": "route-endpoint",
+    "title": "The route endpoint that trusts its caller",
+    "blurb": "The draft returns the caller's policy as the model name — fix the trust boundary.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 20,
+    "prompt": "You are the AI platform engineer on call. A tenant's integration sent `policy: \"gpt-4o\"` and the draft echoed it back as the model name, so any client can select any model the provider serves. The same handler also skips the prompt caps and the Idempotency-Key. Review it, fix it, and prove the fix.",
+    "signals": ["Specify", "Secure", "Verify"],
+    "aiNote": "The draft treats the caller's `policy` string as the model name, validates neither the 256 KiB prompt cap nor `max_tokens`, ignores `Idempotency-Key` so a client retry routes twice, and logs the prompt on every request.",
+    "testIdea": "Post an unknown policy and expect 400; post a prompt over 256 KiB and expect 413; replay one request with the same Idempotency-Key and assert the second response is the stored decision rather than a new route.",
+    "followUps": [
+      "Where should the policy-to-model mapping live so a config change does not need a code deploy?",
+      "Is char-count over 4 a good token estimate, and what would you use when the provider disagrees?",
+      "What would you log for a replayed request so on-call can tell a duplicate from a new route?"
+    ],
+    "defaultLanguage": "python"
+  },
+  {
+    "id": "router-budget",
+    "stepId": "tenant-limits",
+    "title": "The budget that overspends under load",
+    "blurb": "Two requests raced past the window budget and both reached the provider.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 20,
+    "prompt": "Two requests from the same tenant arrived together, both passed the window check, and both reached the provider. The model-generated patch does GET-then-DECRBY with no expiry on the key and charges after the call. Review it, fix it, and prove the fix.",
+    "signals": ["Specify", "Operate", "Verify"],
+    "aiNote": "The draft reads the counters with GET and decrements from the client, so two concurrent requests both observe budget that only one can spend; the key has no TTL and no window bucket, so it never resets; and the charge happens after the provider call, so rejected requests are already paid for.",
+    "testIdea": "Fire two reservations concurrently for a tenant with room for one — exactly one must succeed — then assert the 429 carries Retry-After and X-RateLimit-Remaining, and that the window key expires after 60 seconds.",
+    "followUps": [
+      "How would you make the concurrent test deterministic instead of hoping the race reproduces?",
+      "Should the reservation count input plus max output tokens, and what do you do when the provider reports usage after the call?",
+      "What changes if the window becomes a sliding one — which data structure would you reach for?"
+    ],
+    "defaultLanguage": "python"
+  },
+  {
+    "id": "router-provider",
+    "stepId": "model-call",
+    "title": "The retry loop that never stops",
+    "blurb": "The draft catches every error and loops forever — bound the failure policy.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 25,
+    "prompt": "The provider had a bad deploy and the router turned it into a hot loop: the draft catches every exception, retries forever, and has no deadline. It also replays the stream from the start when a request fails after the first token. Find the flaws, fix them, and prove the fix.",
+    "signals": ["Operate", "Verify", "Evaluate"],
+    "aiNote": "The draft retries every error forever with no deadline, never fails over to the fallback model, never opens a breaker after repeated failures, and replays the stream after delivering tokens — duplicating output and usage.",
+    "testIdea": "Return INVALID_ARGUMENT from the primary and assert exactly one attempt and an immediate error; return UNAVAILABLE five times and assert the breaker skips the provider for 30 seconds; deliver one token then fail and assert nothing is replayed.",
+    "followUps": [
+      "Which failures are safe to retry, and which ones must never be retried?",
+      "What does half-open mean for the breaker, and how would you probe recovery without a thundering herd?",
+      "How do you account for tokens streamed before a failure when the provider bills per token?"
+    ],
+    "defaultLanguage": "python"
+  },
+  {
+    "id": "router-feedback",
+    "stepId": "feedback-events",
+    "title": "The feedback event that leaks the prompt",
+    "blurb": "The event scatters tenants, carries the prompt, and commits too early.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 25,
+    "prompt": "The analytics team noticed that one tenant's quality counters jump around and that the feedback topic contains prompt text. The model-generated draft keys by request id, logs and publishes the prompt, and the consumer commits the offset before updating counters. Review it, fix it, and prove the fix.",
+    "signals": ["Secure", "Delegate", "Verify"],
+    "aiNote": "The draft keys by request id so one tenant's events scatter across partitions, logs and publishes the prompt into a retained topic, configures no idempotence or acks, skips the outbox when the broker rejects the produce, and commits the offset before the HINCRBY — so a crash loses the counter update.",
+    "testIdea": "Produce two events for one tenant and assert they share a partition; point the producer at a dead broker and assert an outbox row is written; crash the consumer between the counter update and the commit and assert the replay does not double-count.",
+    "followUps": [
+      "How would you replay outbox rows after the broker recovers without publishing duplicates?",
+      "What schema would you enforce on the topic so a future producer cannot smuggle content in?",
+      "Should the counter key include the model version? What changes when a new version ships?"
+    ],
+    "defaultLanguage": "python"
+  },
+  {
+    "id": "router-rollout",
+    "stepId": "rollout",
+    "title": "The rollout that trusts the request body",
+    "blurb": "The draft ships any version at any percentage with no eval gate.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 20,
+    "prompt": "An operator moved a policy to 100% of an unevaluated model version by calling the rollout endpoint, and the model-generated draft let it through. The same endpoint has no rollback and no per-tenant pins. Review it, fix it, and prove the fix.",
+    "signals": ["Specify", "Evaluate", "Operate"],
+    "aiNote": "The draft applies whatever version and percentage the request body contains, never consults the eval record before increasing traffic, has no rollback path or per-tenant pins, and answers by echoing the request instead of the caller's active assignment.",
+    "testIdea": "Request 100% of an unevaluated version and expect 409; request a rollback and assert the tenant's pin is written before traffic drops to zero; assert the response body is the active assignment, not a restatement of the request.",
+    "followUps": [
+      "How many eval samples should a pass require before it can open the gate, and why?",
+      "What would you pin for a tenant that has already seen the canary and now must roll back?",
+      "How would you roll a policy forward again once the rolled-back version is fixed?"
+    ],
+    "defaultLanguage": "python"
+  }
+]
