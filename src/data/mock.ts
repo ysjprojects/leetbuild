@@ -1619,6 +1619,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'cdc-streamer-the-stream-that-skipped-a-weekend',
+    problemId: 'cdc-streamer',
+    stepId: 'endpoint',
+    title: 'The stream that skipped a weekend',
+    blurb: 'A cursor TTL reset the LSN and batches were skipped under pressure.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      "An incident review showed a tenant's changes missing for two days, because the draft stored the LSN with a TTL and skipped failing batches to keep up. The same stream keyed by table, scrambling per-row order. Review it, fix it, and prove the cursor never skips and order holds per row.",
+    signals: ['Operate', 'Verify', 'Specify'],
+    aiNote:
+      'The draft keeps the confirmed LSN in an expiring cache key, so a quiet period resets the stream to the source head and the backlog is never delivered, and under lag it skips failed batches and advances the cursor, silently losing changes rather than applying back-pressure.',
+    testIdea:
+      'Expire the cursor key and assert the subscription halts rather than resuming at the head; fail a mid-stream batch and assert it retries from its first LSN; publish changes to one row and assert consumers see them in order.',
+    followUps: [
+      "How do you size a replication slot's retention before it forces a halt?",
+      'What does exactly-once mean for a sink that is not transactional?',
+      'When is skipping a batch ever legitimate?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
