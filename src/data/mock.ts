@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'guardrail-service-the-guardrail-that-fails-open',
+    problemId: 'guardrail-service',
+    stepId: 'endpoint',
+    title: 'The guardrail that fails open',
+    blurb: 'The classifier timed out and the draft allowed the prompt through.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'During a classifier outage the guardrail allowed everything, and the review queue missed blocks because the violation events were fire-and-forget. The model-generated draft returns allow on any exception and publishes violations with no outbox. Review it, fix it, and prove the gate fails safe and loses no violation.',
+    signals: ['Secure', 'Operate', 'Verify'],
+    aiNote:
+      'The draft maps every classifier exception and timeout to allow, so an outage silently disables the gate instead of failing safe, and it publishes violation events without an outbox so a broker rejection loses the block record.',
+    testIdea:
+      'Kill the classifier stub and assert high-risk tenants get the conservative deny while low-risk tenants use their configured fallback; reject the produce and assert an outbox row exists; replay the queue and assert no duplicate review entries.',
+    followUps: [
+      'Which tenants should fail closed and which should fail open, and who decides?',
+      'How would you version a rule set so a rollback cannot resurrect a retracted rule?',
+      'What goes in the span offsets so reviewers can find the exact offending phrase?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
