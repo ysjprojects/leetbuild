@@ -1905,6 +1905,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'maps-routing-the-route-that-survived-rush-hour',
+    problemId: 'maps-routing',
+    stepId: 'endpoint',
+    title: 'The route that survived rush hour',
+    blurb: 'Cache keys lacked the traffic epoch and fallbacks served stale routes.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'Navigation kept recommending a highway exit that had been closed for hours, because the draft cached routes without a traffic epoch and served an old route whenever the engine timed out. The same cache never hit on raw float coordinates. Review it, fix it, and prove cache freshness and honest degradation.',
+    signals: ['Specify', 'Operate', 'Verify'],
+    aiNote:
+      'The draft builds cache keys from raw floating-point coordinates so hits essentially never occur, while the entries that do exist omit any traffic epoch, so once a key matches it serves an arbitrarily old route as current; engine timeouts are answered with those stale routes and no marker.',
+    testIdea:
+      'Compute the same route twice with a tiny coordinate difference and assert a hit with cell rounding; advance the epoch and assert recomputation; time out the engine and assert a marked degraded estimate, not a cached route.',
+    followUps: [
+      'How coarse can a coordinate cell be before routes go wrong?',
+      'What does a degraded estimate owe the caller?',
+      'How do you expire traffic state across regions?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
