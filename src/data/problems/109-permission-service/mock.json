@@ -1,0 +1,16 @@
+{
+  "title": "The permission that survived revocation",
+  "blurb": "Delete-after-write cache invalidation resurrected revoked grants.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "A removed contractor kept access for twenty minutes because a concurrent read repopulated the permission cache after the draft deleted it. The same service failed open on policy-engine timeouts and let team admins grant org-wide roles. Review it, fix it, and prove revocation is immediate and grants cannot escalate.",
+  "signals": ["Secure", "Verify", "Operate"],
+  "aiNote": "The draft invalidates the cache by deleting keys after a grant change, so a racing read can re-derive and store the pre-change set, and it falls back to cached allow when the policy engine times out, turning an outage into broad access.",
+  "testIdea": "Revoke a permission and immediately call the same check on another connection and assert denial; time out the policy engine and assert denial; attempt a grant exceeding the assigner's permissions and assert 403.",
+  "followUps": [
+    "What does fail closed cost during a policy outage?",
+    "How do you audit who could grant what?",
+    "Should effective permissions ever be cached client-side?"
+  ],
+  "stepId": "endpoint"
+}
