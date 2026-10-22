@@ -1,0 +1,18 @@
+[
+  {
+    "stepId": "endpoint",
+    "title": "The inventory that went negative",
+    "blurb": "Read-check-write let the last unit sell twice.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 20,
+    "prompt": "Flash sale traffic sold the last unit three times over, because the draft read the stock counter, compared in the handler, and decremented after. The same draft released stock on warehouse timeouts. Review it, fix it, and prove the counter transition is atomic and timeouts keep holds.",
+    "signals": ["Specify", "Operate", "Verify"],
+    "aiNote": "The draft reads available stock and then decrements in a second step, so concurrent buyers all spot the same free unit, and it releases the hold when the warehouse call times out, destroying a reservation whose confirmation may still arrive.",
+    "testIdea": "Race two reservations against the last unit and assert one success and a non-negative counter; time out the warehouse and assert the reservation is pending, not released; replay a confirmation and assert the hold releases once.",
+    "followUps": [
+      "How would you model multi-warehouse allocation?",
+      "What TTL should a reservation have versus a warehouse confirmation window?",
+      "How do you reconcile Redis counters with the warehouse of record?"
+    ]
+  }
+]

@@ -1,0 +1,12 @@
+{
+  "title": "The telemetry that scaled a graph to zero",
+  "blurb": "Wild values and double-counted retries poisoned rollups.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "A dashboard metric collapsed to zero after one device sent a 64-bit overflow value, and retried batches doubled a fleet's totals because the store had no batch dedupe. The draft validates nothing before acking. Review it, fix it, and prove validation precedes acks and retries are batch-scoped.",
+  "signals": ["Verify", "Specify", "Operate"],
+  "aiNote": "The draft acknowledges batches before validating, so out-of-range values and unknown devices are silently absorbed into aggregates that then look plausible, and on a partial store failure it re-sends the whole batch, double-counting the points that already landed.",
+  "testIdea": "Send an out-of-range reading and assert the batch is rejected with the metric named; fail one sub-batch and assert only it is retried under the same batch id; query a 3-day range and assert 400.",
+  "followUps": ["What ranges protect downstream scaling?", "How do you downsample without lying about peaks?", "Where should per-device rate limits live, device or pipeline?"],
+  "stepId": "endpoint"
+}

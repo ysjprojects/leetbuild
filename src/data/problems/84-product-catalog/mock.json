@@ -1,0 +1,16 @@
+{
+  "stepId": "endpoint",
+  "title": "The product that half published",
+  "blurb": "Per-field swaps and best-effort renditions tore the page.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "Shoppers saw a new price with the old description for a full hour, and one SKU published without its main image because the draft treated renditions as best-effort. The model-generated draft swaps fields into a shared hash. Review it, fix it, and prove publishing is atomic and all-or-nothing.",
+  "signals": ["Specify", "Operate", "Verify"],
+  "aiNote": "The draft applies publish changes field by field into the shared catalog hash, so readers observe a product assembled from two versions, and it declares publish success when one rendition lands, leaving the storefront with missing media.",
+  "testIdea": "Swap a price and title concurrently and read repeatedly to assert every read shows one full version; fail the main rendition and assert the publish is held back; inspect storefront responses for draft fields.",
+  "followUps": [
+    "How do you preview a draft to the right audience?",
+    "What cache-control pattern keeps CDNs from mixing versions?",
+    "When should a rollback re-publish an old version versus unreleasing it?"
+  ]
+}

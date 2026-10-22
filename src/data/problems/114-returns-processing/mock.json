@@ -1,0 +1,16 @@
+{
+  "stepId": "endpoint",
+  "title": "The return that over-refunded a line",
+  "blurb": "Non-atomic eligibility and auto-refund on timeouts.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "One order line was returned three times over because eligibility was checked and decremented in separate steps, and a warehouse outage refunded claims that were later graded unsellable. The draft also showed pending refunds as complete. Review it, fix it, and prove returns are counted and refunds are gated.",
+  "signals": ["Verify", "Operate", "Secure"],
+  "aiNote": "The draft reads remaining returnable quantity and registers the return in two steps, so concurrent returns overdraw the line, and it refunds on inspection timeouts, converting warehouse outages into automatic payouts for unverified claims.",
+  "testIdea": "Race two returns against the last unit and assert one succeeds; time out inspection and assert the refund holds as awaiting inspection; move a refund to failed and assert the state does not read refunded.",
+  "followUps": [
+    "How do partial refunds map to grades?",
+    "What window and evidence should a return require?",
+    "How does a cancel restore eligibility safely?"
+  ]
+}

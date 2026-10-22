@@ -1,0 +1,18 @@
+[
+  {
+    "stepId": "endpoint",
+    "title": "The report that doxxed the reporter",
+    "blurb": "The draft exposed reporter identity and auto-removed at 0.6 confidence.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 20,
+    "prompt": "A reporter was harassed after a moderation case file showed their identity to the reported user, and borderline posts were auto-removed on weak classifier scores. The model-generated draft stores reporter data unredacted and auto-acts below a safe threshold. Review it, fix it, and prove reporter data is isolated and auto-actions need strong evidence.",
+    "signals": ["Secure", "Specify", "Verify"],
+    "aiNote": "The draft returns the case file to any caller who knows the id, embeds the reporter id and verbatim report text in the response and the action event, and auto-removes content from a 0.6 classifier score with no corroboration.",
+    "testIdea": "Fetch a case id belonging to another tenant and assert 404; request a case as a non-surveyor and assert no reporter identifiers appear; feed the classifier a 0.7 score and assert the item lands in the human queue instead of auto-removal.",
+    "followUps": [
+      "Who should ever see reporter identity, and under what process?",
+      "How would you audit an auto-removal decision after the model version changes?",
+      "What queue metrics reveal a moderator working two claims at once?"
+    ]
+  }
+]

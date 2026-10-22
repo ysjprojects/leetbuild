@@ -1,0 +1,21 @@
+[
+  {
+    "id": "upload-resume",
+    "problemId": "resumable-upload",
+    "stepId": "endpoint",
+    "title": "The upload that restarted from zero",
+    "blurb": "Parts were marked stored before verification and the manifest double-counted.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 20,
+    "prompt": "A mobile client on a flaky network re-uploaded an entire multi-gigabyte file after one part failed, because the draft's resume endpoint returned only a percentage and the client had no choice. A double-registered part also inflated the byte accounting. Review it, fix it, and prove resume is part-exact.",
+    "signals": ["Operate", "Verify", "Specify"],
+    "aiNote": "The draft marks each part stored when the store accepts the write, not when the checksum verifies, so corruption is found at finalize and costs a full re-upload, and its non-idempotent manifest registration lets a re-sent part inflate the byte count.",
+    "testIdea": "Fail one part and assert only it is missing from the resume list; re-register the same part and assert the manifest bytes are unchanged; mark a part stored and then corrupt it and assert finalize fails with the part named.",
+    "followUps": [
+      "What minimum part size keeps manifests sane?",
+      "How should resumable uploads work for mobile networks that change IPs?",
+      "When is server-side checksum verification too expensive?"
+    ],
+    "defaultLanguage": "python"
+  }
+]
