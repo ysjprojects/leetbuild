@@ -1,0 +1,18 @@
+[
+  {
+    "stepId": "endpoint",
+    "title": "The agent that never stops paying",
+    "blurb": "A timeout on a payment tool was retried, so the customer was charged twice.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 20,
+    "prompt": "An agent run timed out during a payment tool call and the draft retried it, charging the customer twice; the same run also kept consuming budget while stalled behind a dead worker. The model-generated draft retries every tool and has no lease. Review it, fix it, and prove side-effecting tools are never replayed and stalled runs get recovered.",
+    "signals": ["Specify", "Operate", "Secure"],
+    "aiNote": "The draft retries every tool call, including non-idempotent side effects, counts budget before acceptance so retries burn steps, and lets a second worker advance the same run because state transitions are plain SETs with no lease.",
+    "testIdea": "Force a timeout on a payment tool and assert exactly one call; claim a leased run from a second worker and assert rejection; kill the lease holder and assert recovery reopens the run without replaying completed side effects.",
+    "followUps": [
+      "How would you make a payment tool idempotent so a retry is safe?",
+      "What should happen to a run when its budget hits zero mid-tool?",
+      "How do you distinguish a crashed worker from a slow one without a lease?"
+    ]
+  }
+]
