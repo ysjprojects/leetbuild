@@ -1,0 +1,16 @@
+{
+  "stepId": "endpoint",
+  "title": "The player who was in two games",
+  "blurb": "Ticket claims were not atomic and failures stranded tickets.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "A player spawned into two matches simultaneously, because the draft claimed tickets one at a time and a retry rebuilt a roster from the same pool, and a failed server allocation left a whole roster's tickets claimed forever. Review it, fix it, and prove claims are all-or-nothing and releases are certain.",
+  "signals": ["Operate", "Verify", "Specify"],
+  "aiNote": "The draft claims tickets sequentially, so a mid-claim failure or a concurrent matchmaker leaves one player in two rosters, and a failed allocation never releases the claimed tickets, stranding players in a queue position that no longer exists.",
+  "testIdea": "Race two matchmakers over an overlapping pool and assert no player appears twice; fail allocation and assert every participant ticket returns to the pool and can be matched again; count pool depth against the ticket set.",
+  "followUps": [
+    "What skill delta keeps matches fast and fair?",
+    "How long may a player wait before the pool widens?",
+    "What does an abandoned match owe its participants?"
+  ]
+}
