@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'ticketing-system-the-ticket-that-two-agents-answered',
+    problemId: 'ticketing-system',
+    stepId: 'endpoint',
+    title: 'The ticket that two agents answered',
+    blurb: 'Assignment races and duplicated CRM notes.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'Two agents answered the same ticket simultaneously because the draft assigned with a plain SET, and each answer landed twice in the CRM because sync retries used fresh keys. The same read exposed internal notes to the customer. Review it, fix it, and prove assignment is exclusive, sync is idempotent and visibility holds.',
+    signals: ['Operate', 'Secure', 'Verify'],
+    aiNote:
+      'The draft marks assignment with a non-atomic SET so both agents believe they own the ticket, and its CRM sync creates a new note per retry instead of keying by note id, duplicating replies; timeline reads ignore requester visibility.',
+    testIdea:
+      'Race two agent claims and assert one lease; retry a CRM sync three times and assert one CRM note; fetch a ticket as a requester and assert no internal notes appear.',
+    followUps: [
+      'What does reopening window depend on?',
+      'How should SLA clocks interact with pending states?',
+      'Which fields may a requester ever edit?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
