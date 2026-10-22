@@ -1,0 +1,16 @@
+{
+  "stepId": "endpoint",
+  "title": "The package that un-delivered itself",
+  "blurb": "Polls applied stale states and failures looked healthy.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "A delivered shipment flipped back to in transit because a delayed carrier scan arrived after the delivery scan, and a truly stuck shipment looked in transit for days because the draft treated poll failures as no news. Review it, fix it, and prove transitions are monotonic and staleness is visible.",
+  "signals": ["Verify", "Operate", "Specify"],
+  "aiNote": "The draft writes whatever status the latest poll returns, so an out-of-order scan can regress a terminal shipment, and it maps poll failures to the previous status without any staleness marker, so a stalled carrier feed is invisible.",
+  "testIdea": "Deliver a shipment then deliver an older in-transit scan and assert the state stays delivered; fail carrier polls for an hour and assert the shipment surfaces as stale; attempt a second active shipment and assert 409.",
+  "followUps": [
+    "How are returns represented in the state machine?",
+    "When should tracking stop polling?",
+    "What address data may a timeline ever carry?"
+  ]
+}
