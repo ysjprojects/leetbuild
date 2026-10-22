@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'sandbox-runner-the-sandbox-that-leaked-its-host',
+    problemId: 'sandbox-runner',
+    stepId: 'endpoint',
+    title: 'The sandbox that leaked its host',
+    blurb: 'The draft allowed undeclared network and ran the default weaker profile.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A model-authored job reached the metadata service from the sandbox, because the draft allowed undeclared network access and ran with the default profile when the container start timed out. The same draft re-executed jobs on client retries. Review it, fix it, and prove capabilities are default-deny and isolation is enforced.',
+    signals: ['Secure', 'Operate', 'Verify'],
+    aiNote:
+      'The draft treats undeclared capabilities as allowed and falls back to the default isolation profile on a container start timeout, so a slow start silently weakens the boundary, and replayed submissions re-execute the job body.',
+    testIdea:
+      'Submit code that attempts an undeclared network call and assert it is blocked; time out the container start and assert the job fails rather than running with a weaker profile; replay a submit and assert the job runs once.',
+    followUps: [
+      'What capability model keeps useful jobs possible without opening the host?',
+      'How would you handle jobs that need more time than the hard limit?',
+      'What does an audit of a sandbox execution need to contain?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
