@@ -2368,6 +2368,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'fair-housing-guardrail-tiers',
+    problemId: 'fair-housing-guardrail',
+    stepId: 'classifier-tiers',
+    title: 'The guard that approves when it is down',
+    blurb: 'The classifier had a bad afternoon and every steering query passed. Fix the tiers.',
+    role: 'AI platform engineer · 25 min',
+    minutes: 25,
+    prompt:
+      "You own the Fair Housing guardrail in front of the real-estate assistant. Yesterday the classifier pods were overloaded for forty minutes; the dashboard shows zero blocks in that window and legal has asked why. The model-generated decision function below looks reasonable and the demo refuses the obvious queries. Review it against Zillow's design — stop list, fast classifier tuned for recall, a slower reader for the uncertain cases — fix it, and prove the fix.",
+    signals: ['Specify', 'Secure', 'Operate', 'Verify'],
+    aiNote:
+      'The draft catches every exception and returns allowed, so an outage is indistinguishable from approval. It has no stop list, so the phrases that must be caught every time depend on a probabilistic model. Its single 0.5 threshold optimises precision when the domain needs recall, and it calls the LLM judge on every request with no deadline, so the fast tier buys nothing and a slow judge pins the conversation.',
+    testIdea:
+      'Point the classifier stub at a server that sleeps 2 s and assert the decision is blocked with reason guard_unavailable within ~250 ms. Feed a stop-list phrase and assert tier stoplist with zero RPCs. Return scores 0.40, 0.20 and 0.10 and assert blocked / judge called / allowed without a judge call.',
+    followUps: [
+      'The judge is down for an hour: do you want every band request to wait 2 s and fail closed, or should a breaker short-circuit the band to blocked? What changes in the audit?',
+      'Legal moves the block threshold to 0.30 for a new policy version. How does a running instance pick it up, and what happens to decisions cached under the old version?',
+      'How would you measure recall in production when you cannot see the true label? What does the sampled human-review loop from the post give you that metrics do not?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
