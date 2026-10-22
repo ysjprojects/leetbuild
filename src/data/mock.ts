@@ -190,50 +190,6 @@ export const mockScenarios: readonly MockScenario[] = [
     defaultLanguage: 'python',
   },
   {
-    id: 'guardrail-service-the-guardrail-that-fails-open',
-    problemId: 'guardrail-service',
-    stepId: 'endpoint',
-    title: 'The guardrail that fails open',
-    blurb: 'The classifier timed out and the draft allowed the prompt through.',
-    role: 'AI platform engineer · 20 min',
-    minutes: 20,
-    prompt:
-      'During a classifier outage the guardrail allowed everything, and the review queue missed blocks because the violation events were fire-and-forget. The model-generated draft returns allow on any exception and publishes violations with no outbox. Review it, fix it, and prove the gate fails safe and loses no violation.',
-    signals: ['Secure', 'Operate', 'Verify'],
-    aiNote:
-      'The draft maps every classifier exception and timeout to allow, so an outage silently disables the gate instead of failing safe, and it publishes violation events without an outbox so a broker rejection loses the block record.',
-    testIdea:
-      'Kill the classifier stub and assert high-risk tenants get the conservative deny while low-risk tenants use their configured fallback; reject the produce and assert an outbox row exists; replay the queue and assert no duplicate review entries.',
-    followUps: [
-      'Which tenants should fail closed and which should fail open, and who decides?',
-      'How would you version a rule set so a rollback cannot resurrect a retracted rule?',
-      'What goes in the span offsets so reviewers can find the exact offending phrase?',
-    ],
-    defaultLanguage: 'python',
-  },
-  {
-    id: 'agent-orchestrator-the-agent-that-never-stops-paying',
-    problemId: 'agent-orchestrator',
-    stepId: 'endpoint',
-    title: 'The agent that never stops paying',
-    blurb: 'A timeout on a payment tool was retried, so the customer was charged twice.',
-    role: 'AI platform engineer · 20 min',
-    minutes: 20,
-    prompt:
-      'An agent run timed out during a payment tool call and the draft retried it, charging the customer twice; the same run also kept consuming budget while stalled behind a dead worker. The model-generated draft retries every tool and has no lease. Review it, fix it, and prove side-effecting tools are never replayed and stalled runs get recovered.',
-    signals: ['Specify', 'Operate', 'Secure'],
-    aiNote:
-      'The draft retries every tool call, including non-idempotent side effects, counts budget before acceptance so retries burn steps, and lets a second worker advance the same run because state transitions are plain SETs with no lease.',
-    testIdea:
-      'Force a timeout on a payment tool and assert exactly one call; claim a leased run from a second worker and assert rejection; kill the lease holder and assert recovery reopens the run without replaying completed side effects.',
-    followUps: [
-      'How would you make a payment tool idempotent so a retry is safe?',
-      'What should happen to a run when its budget hits zero mid-tool?',
-      'How do you distinguish a crashed worker from a slow one without a lease?',
-    ],
-    defaultLanguage: 'python',
-  },
-  {
     id: 'embedding-service-the-cache-that-forgot-the-model',
     problemId: 'embedding-service',
     stepId: 'endpoint',

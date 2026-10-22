@@ -21,8 +21,6 @@ import {ragServiceProblem} from './17-rag-service/index';
 import {modelRouterProblem} from './18-model-router/index';
 import {chatMemoryProblem} from './19-chat-memory/index';
 import {evalHarnessProblem} from './20-eval-harness/index';
-import {guardrailServiceProblem} from './21-guardrail-service/index';
-import {agentOrchestratorProblem} from './22-agent-orchestrator/index';
 import {embeddingServiceProblem} from './23-embedding-service/index';
 import {vectorSearchProblem} from './24-vector-search/index';
 import {promptRegistryProblem} from './25-prompt-registry/index';
@@ -132,8 +130,6 @@ export const problems: Problem[] = [
   modelRouterProblem,
   chatMemoryProblem,
   evalHarnessProblem,
-  guardrailServiceProblem,
-  agentOrchestratorProblem,
   embeddingServiceProblem,
   vectorSearchProblem,
   promptRegistryProblem,
