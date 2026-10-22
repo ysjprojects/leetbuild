@@ -472,24 +472,10 @@ const Explorer: FC<{
             task={s.id === stepId}
           />
         ))}
+        {provided.map(f => (
+          <ProvidedRow active={providedId(f.path) === openFile} file={f} key={f.path} onOpen={onOpen} />
+        ))}
       </ul>
-      {provided.length > 0 ? (
-        <>
-          <div
-            className="text-ink-400 mt-2 flex items-center gap-1 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider"
-            title="files the course provides; your imports resolve to them">
-            <span aria-hidden className="w-3 text-center text-[9px]">
-              ▼
-            </span>
-            provided
-          </div>
-          <ul>
-            {provided.map(f => (
-              <ProvidedRow active={providedId(f.path) === openFile} file={f} key={f.path} onOpen={onOpen} />
-            ))}
-          </ul>
-        </>
-      ) : null}
     </div>
   </nav>
 ));
