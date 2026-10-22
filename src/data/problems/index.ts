@@ -66,6 +66,7 @@ import {semanticCacheProblem} from './62-semantic-cache/index';
 import {humanReviewQueueProblem} from './63-human-review-queue/index';
 import {fineTuneOrchestratorProblem} from './64-fine-tune-orchestrator/index';
 import {redTeamRunnerProblem} from './65-red-team-runner/index';
+import {sandboxRunnerProblem} from './66-sandbox-runner/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -123,6 +124,7 @@ export const problems: Problem[] = [
   humanReviewQueueProblem,
   fineTuneOrchestratorProblem,
   redTeamRunnerProblem,
+  sandboxRunnerProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
