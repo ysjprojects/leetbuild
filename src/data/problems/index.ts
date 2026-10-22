@@ -81,6 +81,7 @@ import {jobQueueProblem} from './77-job-queue/index';
 import {workflowEngineProblem} from './78-workflow-engine/index';
 import {cronSchedulerProblem} from './79-cron-scheduler/index';
 import {featureFlagsProblem} from './80-feature-flags/index';
+import {experimentsPlatformProblem} from './81-experiments-platform/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -153,6 +154,7 @@ export const problems: Problem[] = [
   workflowEngineProblem,
   cronSchedulerProblem,
   featureFlagsProblem,
+  experimentsPlatformProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
