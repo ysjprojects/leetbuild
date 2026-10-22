@@ -497,6 +497,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'recommendation-ranking-the-list-that-ranked-the-wrong-user',
+    problemId: 'recommendation-ranking',
+    stepId: 'endpoint',
+    title: 'The list that ranked the wrong user',
+    blurb: "A body user id let one caller see another's personalization.",
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      "A support escalation showed one user's recommendations rendering with another user's recently viewed items, because the draft read the user id from the request body. The same model returns an empty list whenever ranking times out. Review it, fix it, and prove identity comes from auth and degradation still recommends.",
+    signals: ['Secure', 'Specify', 'Verify'],
+    aiNote:
+      "The draft resolves the user from the request body when present, so a caller can request any user's ranking, and it returns an empty list on ranking timeout with no fallback tag, so degradation is invisible to metrics.",
+    testIdea:
+      'Send a body user id different from the authenticated one and assert it is ignored; force a ranking timeout and assert the response is popularity order with the fallback tag set and the tag appears in the impression event.',
+    followUps: [
+      'When is popularity an acceptable fallback and when should the surface fail instead?',
+      'How would you debias popularity so it does not collapse into a loop?',
+      'What would you log per impression to replay a ranking decision later?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
