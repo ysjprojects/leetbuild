@@ -1377,6 +1377,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'log-indexer-the-logs-that-quietly-truncated',
+    problemId: 'log-indexer',
+    stepId: 'endpoint',
+    title: 'The logs that quietly truncated',
+    blurb: 'Oversized records were cut silently and completeness was overclaimed.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'An incident review found stack traces missing their final frames, because the draft truncated overly long records at 16 KiB with no marker, and the completeness page still said 100 percent. The same buffer had no back-pressure. Review it, fix it, and prove truncation is visible and completeness is honest.',
+    signals: ['Operate', 'Specify', 'Verify'],
+    aiNote:
+      'The draft truncates records silently, so consumers cannot tell a complete stack trace from a mangled one, and it counts only accepted records toward completeness, so rejected and shed records are invisible in the number.',
+    testIdea:
+      'Ingest a 20 MiB record and assert the response marks truncation; shed a batch under pressure and assert completeness drops in the report; retry a shard-unavailable write and assert one document, not two.',
+    followUps: [
+      'How much back-pressure belongs in the agent versus the pipeline?',
+      'What retention and sampling keep index costs sane?',
+      'How do you prove no logs were lost in an incident window?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
