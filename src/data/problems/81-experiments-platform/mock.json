@@ -1,0 +1,20 @@
+{
+  "stepId": "endpoint",
+  "title": "The experiment that re-randomized users",
+  "blurb": "Editable splits re-bucketed users mid-flight and reports peeked.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "A rollout looked great because an operator shifted traffic mid-experiment, and the final report ignored a metric whose traffic had gone 70/30 instead of 50/50. The model-generated draft recomputes buckets against a mutable salt and never checks sample ratio mismatch. Review it, fix it, and prove assignment is frozen and reports are honest.",
+  "signals": [
+    "Specify",
+    "Evaluate",
+    "Verify"
+  ],
+  "aiNote": "The draft derives buckets from a hash over a salt that changes when splits are edited, so users move between variants mid-experiment and treatment effects are contaminated, and the report happily names a winner on a peek or on a mismatched split.",
+  "testIdea": "Edit the split mid-experiment and assert the request is rejected; evaluate one unit before and after a salt change and assert the variant is unchanged; feed 70/30 traffic and assert the winner call is blocked with an SRM caveat.",
+  "followUps": [
+    "Which unit is right for which experiment?",
+    "How do sequential tests change the peek problem?",
+    "What guardrail metrics belong in every experiment?"
+  ]
+}
