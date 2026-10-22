@@ -8,9 +8,7 @@
 import {night} from '@/styles/palette';
 
 import {
-  type Concept,
   type Diagram,
-  type Difficulty,
   type Language,
   type Problem,
   type Sequence,
@@ -284,8 +282,6 @@ export interface Guide {
   problemId: string;
   title: string;
   tagline: string;
-  difficulty: Difficulty;
-  concepts: Concept[];
   learn: string;
   sources: Source[];
 }
@@ -297,8 +293,6 @@ export const guideOf = (problem: Problem): Guide | null =>
         problemId: problem.id,
         title: problem.title,
         tagline: problem.tagline,
-        difficulty: problem.difficulty,
-        concepts: problem.concepts,
         learn: problem.learn,
         sources: problem.sources ?? [],
       };
@@ -309,9 +303,7 @@ export function learnToMarkdown(guide: Guide): string {
   const parts: string[] = [
     `# ${guide.title}: the learning guide`,
     ``,
-    `*LeetBuild · ${guide.difficulty} · ${guide.concepts
-      .map(c => CONCEPT_LABEL[c])
-      .join(', ')} · [interactive version](${url}) · [the course](${siteUrl()}/${guide.problemId})*`,
+    `*A LeetBuild learning guide · [interactive version](${url}) · [the course](${siteUrl()}/${guide.problemId})*`,
     ``,
     guide.tagline,
     ``,
@@ -327,8 +319,9 @@ export function learnToMarkdown(guide: Guide): string {
   return parts.join('\n');
 }
 
-/** File name for a learning-guide download: `leetbuild-dropbox-gates-guide.md`. */
-export const learnFileName = (problemId: string): string => `leetbuild-${problemId}-guide.md`;
+/** File name for a learning-guide download: `leetbuild-dropbox-gates-guide.md` / `.pdf`. */
+export const learnFileName = (problemId: string, extension: 'md' | 'pdf' = 'md'): string =>
+  `leetbuild-${problemId}-guide.${extension}`;
 
 /** Trigger a browser download of `text` as a Markdown file. */
 export function downloadMarkdown(name: string, text: string): void {

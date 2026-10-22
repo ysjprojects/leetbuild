@@ -339,19 +339,6 @@ Q: The Kafka brokers are away for ten minutes. What must be true of the app serv
 > The gate decision never depended on Kafka and must not start to during an outage. Dropped and counted is the honest outcome; a growing in-memory queue would only turn a broker outage into an app-server outage later.
 :::
 
-# The four steps, in order
-
-| Step | File | Builds | The property the checks look for |
-| --- | --- | --- | --- |
-| 1 · HTTPS | \`gate_api\` | \`PUT\`/\`GET /gates/{name}\`, \`/history\` | 400 before any write; 201 then 200 with \`ETag\`; 412 on a stale \`If-Match\`; history newest first; one \`MULTI\` |
-| 2 · Redis | \`gates\` | the snapshot, the loader, \`get_variant\` | one \`GET\` per poll, \`HGETALL\` only on change; the sha256 bucket; cumulative edges in mix order; overrides first; no I/O per decision |
-| 3 · gRPC | \`gate_service\` | \`Gates.GetVariants\` | every feature answered, \`OFF\` for unknown gates, the snapshot version, \`INVALID_ARGUMENT\` only for an empty user |
-| 4 · Kafka | \`exposures\` | \`get_exposed_variant\`, \`shutdown\` | keyed by gate, stamped with the version, returned before the ack, bounded by \`MAX_PENDING\`, flushed within five seconds |
-
-Each step imports the one before: the gRPC service and the exposure logger call step 2's
-\`get_variant\`; step 2's loader reads what step 1 wrote. The dependency graph is a straight line with
-the pure function in the middle.
-
 # What to take away
 
 - **Separate deploy from release.** The code ships with the check in it; \`OFF\` is the answer for a

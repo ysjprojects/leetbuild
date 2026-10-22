@@ -35,6 +35,7 @@
     "@replit/codemirror-vim": "^6.4.0",
     "fengari": "0.1.5",
     "next": "14",
+    "pdfmake": "^0.2",
     "pyodide": "314.0.7",
     "react": "18",
     "react-dom": "18"
@@ -44,6 +45,7 @@
     "@tailwindcss/forms": "^0.5.0",
     "@tailwindcss/typography": "^0.5.2",
     "@types/node": "^17.0.21",
+    "@types/pdfmake": "^0.3.3",
     "@types/react": "^18",
     "@types/react-dom": "^18",
     "@typescript-eslint/eslint-plugin": "^5.14.0",

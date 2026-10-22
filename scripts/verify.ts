@@ -14,8 +14,8 @@
  */
 import {resolve} from 'node:path';
 
-import {malformedBlocksOf, widgetsOf} from '../src/components/Markdown';
 import {describePattern, judge, matches, stripComments} from '../src/lib/judge';
+import {malformedBlocksOf, widgetsOf} from '../src/lib/markdown';
 import {type NodeRuntime, createNodePythonRuntime, createNodeTypeScriptRuntime} from '../src/lib/runtime/node';
 import {type RunJob, type RunResult} from '../src/lib/runtime/types';
 import {STEP_POINTS} from '../src/lib/scoring';
