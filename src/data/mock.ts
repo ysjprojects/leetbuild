@@ -2390,6 +2390,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'catalog-enrichment-extract',
+    problemId: 'catalog-enrichment',
+    stepId: 'extract-attributes',
+    title: 'The brand the model made up',
+    blurb: 'A grocery feed came back tagged with brands that do not exist. Constrain the extraction call.',
+    role: 'Catalog ML platform engineer · 25 min',
+    minutes: 25,
+    prompt:
+      'You own the catalog enrichment service. Overnight a new grocery merchant was onboarded and this morning search is showing "Doove" and "Dove Glow Co." as brands, a 500 ml body wash tagged as 500 lb, and every one of the 40 000 SKUs marked accepted — nothing reached the review queue. The model-generated extraction client below is what ran. Review it against the taxonomy we already have, fix it, and prove the fix.',
+    signals: ['Specify', 'Verify', 'Evaluate', 'Operate'],
+    aiNote:
+      'The draft sends the title alone and lets the model name any brand instead of retrieving the 20 nearest brands from the taxonomy and making it choose among them. It asks for free text and splits lines on ":", so a rephrased answer silently drops attributes. It has no deadline and no retry on UNAVAILABLE. It copies whatever brand, unit and category the model returns without checking them against the taxonomy, and it marks every result accepted, so the confidence gate that should route unresolved SKUs to human review never fires.',
+    testIdea:
+      'Feed a title whose true brand is not in the candidate list the taxonomy returns and assert the result has brand null, a problem recorded, status review and one review-queue entry. Feed a stub reply with confidence 0.60 and a clean payload and assert the same routing. Stub the extractor to answer UNAVAILABLE once and then succeed: exactly two calls, each with a deadline. Stub it to answer INVALID_ARGUMENT: exactly one call and the error is raised.',
+    followUps: [
+      'The taxonomy is never complete: where in this flow does a genuinely new brand get proposed, and who approves it before it becomes a candidate?',
+      'A taxonomy release renames a category. Which cached results are still valid, and how does the cache key from the next step decide that?',
+      'The reviewers correct 3% of SKUs. How do those corrections reach the next model, and how do you keep a re-extraction from undoing them?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
