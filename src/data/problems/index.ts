@@ -176,8 +176,8 @@ import {cudaStreamsOverlapProblem} from './177-cuda-streams-overlap/index';
 
 /**
  * Problem order on the list page: the classic systems track first, in its catalogue order, then the
- * deep-learning track (PyTorch, then CUDA, each by difficulty), then the AI-era track in the order
- * its courses were added (the directory numbers). The list's track tabs show each on its own; "All
+ * AI-era track in the order its courses were added (the directory numbers), then the deep-learning
+ * track (PyTorch, then CUDA, each by difficulty). The list's track tabs show each on its own; "All
  * topics" shows this order. Company-tagged courses (derived from engineering blogs, see
  * `Problem.company`) and the single-topic drills (one concept, one step) sit with the courses of
  * their difficulty, after them.
@@ -224,31 +224,6 @@ export const problems: Problem[] = [
   kafkaChangelogRestoreProblem,
   kafkaOrderedMergeWatermarkProblem,
   kafkaGracefulShutdownProblem,
-  ptStableSoftmaxProblem,
-  ptSgdMomentumProblem,
-  ptLayernormRmsnormProblem,
-  ptAdamwProblem,
-  ptRopeProblem,
-  ptCausalAttentionProblem,
-  ptGpt2BlockProblem,
-  ptLrScheduleClipProblem,
-  ptBpeTokenizerProblem,
-  ptGpt2Problem,
-  ptFlashAttentionTiledProblem,
-  ptDdpmProblem,
-  ptLoraProblem,
-  ptMixedPrecisionProblem,
-  ptMoeRouterProblem,
-  cudaVectorAddProblem,
-  cudaFusedGeluProblem,
-  cudaReductionProblem,
-  cudaTiledMatmulProblem,
-  cudaRowSoftmaxProblem,
-  cudaLayernormWelfordProblem,
-  cudaFlashAttentionProblem,
-  cudaWmmaMatmulProblem,
-  cudaPrefixScanProblem,
-  cudaStreamsOverlapProblem,
   aiGatewayProblem,
   ragServiceProblem,
   modelRouterProblem,
@@ -356,4 +331,29 @@ export const problems: Problem[] = [
   fairHousingGuardrailProblem,
   catalogEnrichmentProblem,
   promptDefenceProblem,
+  ptStableSoftmaxProblem,
+  ptSgdMomentumProblem,
+  ptLayernormRmsnormProblem,
+  ptAdamwProblem,
+  ptRopeProblem,
+  ptCausalAttentionProblem,
+  ptGpt2BlockProblem,
+  ptLrScheduleClipProblem,
+  ptBpeTokenizerProblem,
+  ptGpt2Problem,
+  ptFlashAttentionTiledProblem,
+  ptDdpmProblem,
+  ptLoraProblem,
+  ptMixedPrecisionProblem,
+  ptMoeRouterProblem,
+  cudaVectorAddProblem,
+  cudaFusedGeluProblem,
+  cudaReductionProblem,
+  cudaTiledMatmulProblem,
+  cudaRowSoftmaxProblem,
+  cudaLayernormWelfordProblem,
+  cudaFlashAttentionProblem,
+  cudaWmmaMatmulProblem,
+  cudaPrefixScanProblem,
+  cudaStreamsOverlapProblem,
 ];

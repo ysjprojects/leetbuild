@@ -24,8 +24,8 @@ import {
 import {type Difficulty, DIFFICULTIES} from '@/lib/types';
 
 /**
- * The rows above the problem list, LeetCode-style: a row of track tabs (All topics · Systems · Deep
- * learning · AI era, each with its icon; the active one is inverted), then a search pill, a sort menu and a
+ * The rows above the problem list, LeetCode-style: a row of track tabs (All topics · Systems · AI era ·
+ * Deep learning, each with its icon; the active one is inverted), then a search pill, a sort menu and a
  * filter menu behind two round buttons (a dot marks one that is in effect), and at the right how
  * many courses of the track are solved — or, while filtering, how many rows match and the way out.
  * Every control writes to the URL through `update`; the search box keeps its own text so the caret

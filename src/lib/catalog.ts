@@ -9,7 +9,7 @@ import {type Difficulty, type Problem, CONCEPT_LABEL, DIFFICULTIES} from './type
 export type StatusFilter = 'all' | 'open' | 'started' | 'solved';
 export type SortKey = 'order' | 'difficulty' | 'points' | 'minutes' | 'progress' | 'title';
 /** The tabs above the list, LeetCode-style: every course, the classic systems track, or the AI-era track. */
-export type TrackFilter = 'all' | 'systems' | 'dl' | 'ai';
+export type TrackFilter = 'all' | 'systems' | 'ai' | 'dl';
 
 export interface ListQuery {
   /** Which track the list shows; a view rather than a filter, so `reset` and "clear" leave it alone. */
@@ -38,8 +38,8 @@ export const DEFAULT_LIST_QUERY: ListQuery = {
 export const TRACKS: readonly {key: TrackFilter; label: string}[] = [
   {key: 'all', label: 'All topics'},
   {key: 'systems', label: 'Systems'},
-  {key: 'dl', label: 'Deep learning'},
   {key: 'ai', label: 'AI era'},
+  {key: 'dl', label: 'Deep learning'},
 ];
 
 export const inTrack = (problem: Problem, track: TrackFilter): boolean =>
