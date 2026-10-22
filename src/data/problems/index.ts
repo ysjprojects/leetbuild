@@ -96,6 +96,7 @@ import {fileStorageProblem} from './92-file-storage/index';
 import {syncEngineProblem} from './93-sync-engine/index';
 import {commentsServiceProblem} from './94-comments-service/index';
 import {subscriptionBillingProblem} from './95-subscription-billing/index';
+import {ticketingSystemProblem} from './96-ticketing-system/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -183,6 +184,7 @@ export const problems: Problem[] = [
   syncEngineProblem,
   commentsServiceProblem,
   subscriptionBillingProblem,
+  ticketingSystemProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
