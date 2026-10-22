@@ -1443,6 +1443,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'workflow-engine-the-workflow-that-sent-two-welcome-emails',
+    problemId: 'workflow-engine',
+    stepId: 'endpoint',
+    title: 'The workflow that sent two welcome emails',
+    blurb: 'Effect replays and unconditional checkpoints caused double effects.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A customer got two welcome emails and an order never shipped, because the draft retried a timed-out effect without the ledger and overwrote checkpoints unconditionally. The same run floated to a new definition mid-flight. Review it, fix it, and prove effects are exactly-once under replay.',
+    signals: ['Verify', 'Operate', 'Specify'],
+    aiNote:
+      'The draft retries side effects without consulting the effect ledger, so a timeout that actually sent the email sends it again, and it writes checkpoints unconditionally so a duplicate worker advances a run past a step whose effect never ran.',
+    testIdea:
+      'Crash after effect commit but before checkpoint advance and assert replay skips the effect; run two workers over one run and assert one advance; compare step events against the checkpoint trail for a completed run.',
+    followUps: [
+      'What goes in a checkpoint versus the event log?',
+      'How would you version a definition without stranding in-flight runs?',
+      'When is a step safe to skip on replay?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
