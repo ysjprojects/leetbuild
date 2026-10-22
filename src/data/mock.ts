@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'batch-inference-the-batch-that-lost-a-shard',
+    problemId: 'batch-inference',
+    stepId: 'endpoint',
+    title: 'The batch that lost a shard',
+    blurb: 'A crashed worker lost its shard and the batch still reported success.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A worker died mid-shard, the batch completed with 999 of 1000 shards, and the dashboard still said success because the shard was popped without a lease. The model-generated draft also counts a shard as done before flushing its output. Review it, fix it, and prove lost shards are reclaimed and honesty is enforced in the status.',
+    signals: ['Specify', 'Operate', 'Verify'],
+    aiNote:
+      'The draft pops shards with no lease, so a worker crash loses a shard from every set, and it publishes the completion event before flushing the output object, so the checksum can reference an unreadable file.',
+    testIdea:
+      'Kill a worker mid-shard and assert the shard is reclaimed by another worker; assert a batch with any non-terminal shard never reports success; assert the checksum of a published shard matches the flushed object.',
+    followUps: [
+      'What retry semantics should a shard have when its worker dies after a partial write?',
+      'How would you make one million model calls cost-aware?',
+      'What does the manifest need so a downstream consumer can trust a batch?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
