@@ -5,7 +5,7 @@ export type Mode = 'practice' | 'mock';
 
 const ITEMS: readonly {mode: Mode; href: string; label: string; short: string}[] = [
   {mode: 'practice', href: '/', label: 'Practice', short: 'Practice'},
-  {mode: 'mock', href: '/mock-interview', label: 'AI mock interview', short: 'Mock'},
+  {mode: 'mock', href: '/mock-interview', label: 'Mock interview', short: 'Mock'},
 ];
 
 /**

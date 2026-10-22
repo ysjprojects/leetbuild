@@ -7,9 +7,9 @@ import {type FC, memo} from 'react';
  * is loaded client-side; the route itself is pre-rendered with its metadata like the playground.
  */
 
-const TITLE = 'AI-assisted mock interview — LeetBuild';
+const TITLE = 'Mock interview — LeetBuild';
 const DESCRIPTION =
-  'Practice the AI-era interview loop: start from a flawed model-generated draft, use an offline AI pair to review it, fix the code under a clock, and submit to the same checks the judge uses.';
+  'A timed mock interview: start from a flawed model-generated draft, use an offline AI pair to review it, fix the code under a clock, and submit to the same checks the judge uses.';
 const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL;
 
 // CodeMirror is browser-only; the experience never renders on the server.
