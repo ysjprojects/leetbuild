@@ -68,6 +68,7 @@ import {fineTuneOrchestratorProblem} from './64-fine-tune-orchestrator/index';
 import {redTeamRunnerProblem} from './65-red-team-runner/index';
 import {sandboxRunnerProblem} from './66-sandbox-runner/index';
 import {syntheticDataProblem} from './67-synthetic-data/index';
+import {browserAgentProblem} from './68-browser-agent/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -127,6 +128,7 @@ export const problems: Problem[] = [
   redTeamRunnerProblem,
   sandboxRunnerProblem,
   syntheticDataProblem,
+  browserAgentProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
