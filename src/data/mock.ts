@@ -1795,6 +1795,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'comments-service-the-thread-that-showed-one-comment-twice',
+    problemId: 'comments-service',
+    stepId: 'endpoint',
+    title: 'The thread that showed one comment twice',
+    blurb: 'Offset pagination and a cache key without the tenant.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      "Users saw the same comment twice and missed another while scrolling a busy thread, and one tenant's trending list leaked into a second tenant's homepage because the cache key was unscoped. The draft counts comments after the write. Review it, fix it, and prove pagination is stable and caches are scoped.",
+    signals: ['Specify', 'Verify', 'Secure'],
+    aiNote:
+      "The draft paginates by offset, so concurrent inserts shift the window and comments are duplicated or skipped mid-scroll, and its hot-thread cache key omits the tenant, letting one tenant's trends surface in another tenant's feed.",
+    testIdea:
+      'Page through a thread while concurrently posting and assert every comment appears exactly once; increment across a crash and assert the counter reconciles with the store; warm a hot thread for tenant A and assert tenant B sees its own list.',
+    followUps: [
+      'What cursor makes comment order stable under edits?',
+      'How should a tombstone interact with reply counts?',
+      'When should moderation run synchronously versus asynchronously?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */

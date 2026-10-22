@@ -94,6 +94,7 @@ import {emailDeliveryProblem} from './90-email-delivery/index';
 import {calendarServiceProblem} from './91-calendar-service/index';
 import {fileStorageProblem} from './92-file-storage/index';
 import {syncEngineProblem} from './93-sync-engine/index';
+import {commentsServiceProblem} from './94-comments-service/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -179,6 +180,7 @@ export const problems: Problem[] = [
   calendarServiceProblem,
   fileStorageProblem,
   syncEngineProblem,
+  commentsServiceProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
