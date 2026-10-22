@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'file-storage-the-upload-that-grieved-the-quota',
+    problemId: 'file-storage',
+    stepId: 'endpoint',
+    title: 'The upload that grieved the quota',
+    blurb: 'Bytes were counted before storage and whole restarts re-sent everything.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      "A tenant's quota filled with data that never landed because the draft counted chunks before they were stored, and a flaky connection cost a multi-gigabyte re-upload per failed chunk. The model-generated draft also returned a permanent file URL. Review it, fix it, and prove accounting follows storage and retries are chunk-scoped.",
+    signals: ['Operate', 'Specify', 'Verify'],
+    aiNote:
+      'The draft increments quota when a chunk is acknowledged rather than when it is stored, so crash loops consume quota for bytes that do not exist, and its retry path restarts the entire multipart upload instead of the failed chunk.',
+    testIdea:
+      'Crash a chunk after ack and assert quota reflects stored bytes only; fail one chunk and assert the retry re-sends only that chunk; assert a download URL is dead after 10 minutes and that issuance is audited.',
+    followUps: [
+      'What does a quota reservation protect against versus actual usage?',
+      'How would you dedupe identical chunks across tenants safely?',
+      'When is client-side encryption the right call?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
