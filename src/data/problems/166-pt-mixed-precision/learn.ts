@@ -72,11 +72,11 @@ them differently:
 
 | format | exp / mantissa bits | largest | smallest normal | smallest subnormal | spacing at 1.0 |
 |---|---|---|---|---|---|
-| float32 | 8 / 23 | 3.4e38 | 1.2e-38 | 1.4e-45 | 2**-23 ≈ 1.2e-7 |
-| float16 | 5 / 10 | 65504 | 2**-14 ≈ 6.1e-5 | 2**-24 ≈ 6.0e-8 | 2**-10 ≈ 9.8e-4 |
-| bfloat16 | 8 / 7 | 3.4e38 | 1.2e-38 | 9.2e-41 | 2**-7 ≈ 7.8e-3 |
+| float32 | 8 / 23 | 3.4e38 | 1.2e-38 | 1.4e-45 | 2⁻²³ ≈ 1.2e-7 |
+| float16 | 5 / 10 | 65504 | 2⁻¹⁴ ≈ 6.1e-5 | 2⁻²⁴ ≈ 6.0e-8 | 2⁻¹⁰ ≈ 9.8e-4 |
+| bfloat16 | 8 / 7 | 3.4e38 | 1.2e-38 | 9.2e-41 | 2⁻⁷ ≈ 7.8e-3 |
 
-- **fp16** (IEEE half) has more precision but a range of about 2**-24 to 2**16. Activations fit; many
+- **fp16** (IEEE half) has more precision but a range of about 2⁻²⁴ to 2¹⁶. Activations fit; many
   gradients do not.
 - **bf16** (Google Brain's "brain float") is float32 with the mantissa cut to 7 bits: the same exponent,
   so the same range, and about three significant decimal digits. Converting fp32 → bf16 is a truncation of
@@ -128,7 +128,7 @@ Q: Why is the scale a power of two rather than, say, 50000?
 - [ ] Optimizers require integer-valued scales
 - [x] Multiplying and dividing by a power of two only shifts the exponent, so scaling adds no rounding error
 - [ ] Powers of two are the only values that never overflow fp16
-> S × g changes only the exponent bits when S = 2**k; the mantissa is untouched, so g / S recovers g
+> S × g changes only the exponent bits when S is a power of two; the mantissa is untouched, so g / S recovers g
 > exactly unless the product left the range. Any other S rounds every gradient twice.
 :::
 
@@ -183,7 +183,7 @@ The self-test's trajectory with \`growth_interval=4\`:
 - \`unscale_\` runs at most once per step and \`step\` calls it when the caller did not; a second call raises
   \`RuntimeError\`, because dividing twice would hand the clipper gradients 65536× too small.
 - \`state_dict\` holds \`scale\`, \`growth_factor\`, \`backoff_factor\`, \`growth_interval\` and
-  \`growth_tracker\`: a resumed run that restarts at 2**16 overflows its first steps again.
+  \`growth_tracker\`: a resumed run that restarts at 2¹⁶ overflows its first steps again.
 
 :::details Why one check per group, not one per tensor
 \`bool(t)\` or \`t.item()\` on a GPU tensor waits for every queued kernel to finish. A 7B model has hundreds
@@ -205,9 +205,9 @@ Q: The scaler sees an inf gradient on step 2 of a run with growth_interval=4, af
 # Master weights, and what autocast casts
 
 The second failure is in the update, not the gradient. bf16 has about three significant digits: the
-spacing between representable values near 1.0 is 2**-7 ≈ 0.0078. An SGD update of \`1e-4\` to a weight of
+spacing between representable values near 1.0 is 2⁻⁷ ≈ 0.0078. An SGD update of \`1e-4\` to a weight of
 \`1.0\` stored in bf16 (or fp16, spacing 9.8e-4) rounds back to \`1.0\` — every step. The paper puts the
-limit at an update-to-weight ratio of 2**-11 for fp16. Hence the master copy: the optimizer updates fp32
+limit at an update-to-weight ratio of 2⁻¹¹ for fp16. Hence the master copy: the optimizer updates fp32
 weights, and only the forward sees 16-bit copies. Casting the model with \`.half()\` or \`.bfloat16()\`
 throws that away.
 
@@ -235,7 +235,7 @@ Q: A model is cast with model.bfloat16() and trained with AdamW at lr=1e-5. What
 - [ ] The forward overflows, because bf16 cannot hold activations above 65504
 - [x] Small updates round away: a weight near 1.0 cannot move by less than about 0.004 in bf16
 - [ ] Nothing: bf16 has fp32's range, so no master copy is needed
-> bf16 fixes range, not precision. With spacing 2**-7 near 1.0, any update below half of that rounds back
+> bf16 fixes range, not precision. With spacing 2⁻⁷ near 1.0, any update below half of that rounds back
 > to the old value. The fp32 master copy keeps the small updates and only the matmuls see bf16.
 :::
 
@@ -264,13 +264,13 @@ Q: Why does fp8 training need a scale per tensor rather than the loss scaler's s
 - [ ] fp8 has no exponent bits, so every value must be rescaled
 - [x] Its range is so narrow that tensors with different magnitudes cannot share one factor without some overflowing and others underflowing
 - [ ] fp8 gradients are computed in fp32 and only stored in fp8
-> E4M3 spans roughly 2**-9 to 448. Activations, weights and gradients differ by orders of magnitude, so each
+> E4M3 spans roughly 2⁻⁹ to 448. Activations, weights and gradients differ by orders of magnitude, so each
 > tensor gets its own factor, picked from its own amax history.
 :::
 
 # What to take away
 
-- fp16 has the range of about 2**-24 to 65504; gradients below it flush to zero. bf16 has fp32's range and
+- fp16 has the range of about 2⁻²⁴ to 65504; gradients below it flush to zero. bf16 has fp32's range and
   rarely needs scaling.
 - Loss scaling multiplies the loss by a power of two before \`backward\` and divides the gradients in place
   before clipping and the step — exact, because only exponents change.

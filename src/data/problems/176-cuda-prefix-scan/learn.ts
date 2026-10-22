@@ -73,7 +73,7 @@ There are two classic parallel scans, and the chapter this drill follows
 ([GPU Gems 3, ch. 39](https://developer.nvidia.com/gpugems/gpugems3/part-vi-gpu-computing/chapter-39-parallel-prefix-sum-scan-cuda))
 starts with the wrong one.
 
-**Hillis–Steele** (1986): at level k every element adds the one 2ᵏ behind it. After log₂n levels each
+**Hillis–Steele** (1986): at level k every element adds the one \`2^k\` places behind it. After log₂n levels each
 element holds its inclusive prefix.
 
 \`\`\`text

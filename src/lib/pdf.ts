@@ -8,7 +8,7 @@
 import type {Content, ContentTable, ContentText, TableCell, TDocumentDefinitions} from 'pdfmake/interfaces';
 
 import type {Guide} from './export';
-import {type Block, type InlineToken, inlineTokens, parseBlocks} from './markdown';
+import {type Block, type InlineLeaf, type InlineToken, inlineTokens, parseBlocks} from './markdown';
 import {WIDGETS} from './widgets';
 
 // A4 is 595 × 842 pt; the text column is what is left inside the margins.
@@ -27,8 +27,11 @@ const SUCCESS = '#1f7a4d';
 
 const MONO = 'JetBrainsMono';
 
-/** Glyphs the body font's subset lacks; they come from the code font instead. */
-const SYMBOLS = /([→←↔⇒✓▸])/;
+/**
+ * Glyphs the body font's subset lacks; they come from the code font instead. A combining hat goes
+ * with the letter it sits on (`x̂`), or it would land on nothing.
+ */
+const SYMBOLS = /(\S\u0302|[→←↔⇒✓▸∩≲⊕⊗⌈⌉‖∅])/;
 
 /** A prose run with its symbols set in the code font, which has them. */
 const withSymbols = (run: ContentText & {text: string}): ContentText[] =>
@@ -37,18 +40,26 @@ const withSymbols = (run: ContentText & {text: string}): ContentText[] =>
     .filter(part => part !== '')
     .map(part => (SYMBOLS.test(part) ? {...run, text: part, font: MONO} : {...run, text: part}));
 
+/** The runs inside bold, emphasis or a link: prose in `style`, code spans in the code font with it. */
+const leafRuns = (parts: InlineLeaf[], style: Omit<ContentText, 'text'>): ContentText[] =>
+  parts.flatMap(leaf =>
+    leaf.kind === 'code'
+      ? [{...style, text: leaf.text, font: MONO, fontSize: 9, color: ACCENT}]
+      : withSymbols({...style, text: leaf.text}),
+  );
+
 /** Inline runs → pdfmake text runs. */
 const runs = (text: string): ContentText[] =>
   inlineTokens(text).flatMap((token: InlineToken): ContentText[] => {
     switch (token.kind) {
       case 'bold':
-        return withSymbols({text: token.text, bold: true});
+        return leafRuns(token.parts, {bold: true});
       case 'em':
-        return withSymbols({text: token.text, italics: true});
+        return leafRuns(token.parts, {italics: true});
       case 'code':
         return [{text: token.text, font: MONO, fontSize: 9, color: ACCENT}];
       case 'link':
-        return withSymbols({text: token.text, link: token.url, color: ACCENT, decoration: 'underline'});
+        return leafRuns(token.parts, {link: token.url, color: ACCENT, decoration: 'underline'});
       case 'text':
         return withSymbols({text: token.text});
     }
@@ -73,6 +84,9 @@ const box = (body: Content[], kind: 'panel' | 'code' | 'callout'): ContentTable 
 
 const LETTERS = 'ABCDEFGH';
 
+/** A heading or title: plain text, with its symbols set in the code font when it has any. */
+const plain = (text: string): string | ContentText[] => (SYMBOLS.test(text) ? withSymbols({text}) : text);
+
 /** One block of the dialect as pdfmake content; `null` for what the PDF leaves out. */
 const blockContent = (block: Block): Content | null => {
   switch (block.kind) {
@@ -80,8 +94,8 @@ const blockContent = (block: Block): Content | null => {
       return block.level === 1
         ? {text: block.text, style: 'h1', tocItem: true, tocStyle: 'toc'}
         : block.level === 2
-        ? {text: block.text, style: 'h2'}
-        : {text: block.text, style: 'h3'};
+        ? {text: plain(block.text), style: 'h2'}
+        : {text: plain(block.text), style: 'h3'};
     case 'paragraph':
       return {text: runs(block.text), style: 'body'};
     case 'quote':
@@ -141,14 +155,14 @@ const blockContent = (block: Block): Content | null => {
       return box(
         [
           {text: 'INTERACTIVE DEMO · ON THE PAGE', style: 'label'},
-          {text: WIDGETS[block.name]?.about ?? block.name, style: 'body', margin: [0, 2, 0, 0]},
+          {text: runs(WIDGETS[block.name]?.about ?? block.name), style: 'body', margin: [0, 2, 0, 0]},
         ],
         'panel',
       );
     case 'details':
       return {
         stack: [
-          {text: block.title, style: 'h3', margin: [0, 4, 0, 4]},
+          {text: plain(block.title), style: 'h3', margin: [0, 4, 0, 4]},
           ...block.body.map(blockContent).filter((c): c is Content => c !== null),
         ],
       };
@@ -194,8 +208,8 @@ export function guideDocument(guide: Guide): TDocumentDefinitions {
     }),
     content: [
       {text: 'LEETBUILD · LEARNING GUIDE', style: 'eyebrow'},
-      {text: guide.title, style: 'title'},
-      {text: guide.tagline, style: 'tagline'},
+      {text: plain(guide.title), style: 'title'},
+      {text: plain(guide.tagline), style: 'tagline'},
       {toc: {title: {text: 'Contents', style: 'contents'}, textMargin: [0, 1, 0, 1]}},
       {text: '', pageBreak: 'after'},
       ...blocks.map(blockContent).filter((c): c is Content => c !== null),

@@ -3,7 +3,7 @@ import {type FC, type ReactNode, memo, useCallback, useMemo, useState} from 'rea
 import type {HighlightedSpan} from '@/lib/editor';
 import {githubSlug} from '@/lib/export';
 import {leetbuildHighlighter} from '@/lib/highlight';
-import {type Block, type PopQuizSpec, inlineTokens, parseBlocks} from '@/lib/markdown';
+import {type Block, type InlineLeaf, type PopQuizSpec, inlineTokens, parseBlocks} from '@/lib/markdown';
 
 import ArchitectureDiagram from './ArchitectureDiagram';
 import SequenceDiagram from './SequenceDiagram';
@@ -19,25 +19,39 @@ import SystemDiagram from './SystemDiagram';
 /** Turns a fenced block into spans; `info` is the word after the opening fence (`cuda`, `python`…), lower-cased. */
 export type Highlighter = (code: string, info: string) => HighlightedSpan[];
 
+const CODE_CLASS = 'bg-ink-800 font-code text-iris-200 rounded px-1.5 py-0.5 text-[0.85em]';
+
+/** The runs inside bold, emphasis or a link: text as is, code spans as code. */
+const renderLeaves = (parts: InlineLeaf[]): ReactNode[] =>
+  parts.map((leaf, index) =>
+    leaf.kind === 'code' ? (
+      <code className={CODE_CLASS} key={index}>
+        {leaf.text}
+      </code>
+    ) : (
+      leaf.text
+    ),
+  );
+
 const renderInline = (text: string): ReactNode[] =>
   inlineTokens(text).map((token, index) => {
     switch (token.kind) {
       case 'bold':
         return (
           <strong className="text-ink-50 font-semibold" key={index}>
-            {token.text}
+            {renderLeaves(token.parts)}
           </strong>
         );
       case 'code':
         return (
-          <code className="bg-ink-800 font-code text-iris-200 rounded px-1.5 py-0.5 text-[0.85em]" key={index}>
+          <code className={CODE_CLASS} key={index}>
             {token.text}
           </code>
         );
       case 'em':
         return (
           <em className="text-ink-200" key={index}>
-            {token.text}
+            {renderLeaves(token.parts)}
           </em>
         );
       case 'link':
@@ -48,7 +62,7 @@ const renderInline = (text: string): ReactNode[] =>
             key={index}
             rel="noreferrer"
             target="_blank">
-            {token.text}
+            {renderLeaves(token.parts)}
           </a>
         );
       case 'text':

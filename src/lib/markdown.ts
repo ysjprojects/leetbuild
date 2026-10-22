@@ -5,14 +5,14 @@
  *   # / ## / ###          headings
  *   paragraphs, > callouts, - bullets, 1. numbered lists (continuation lines indented)
  *   ```python try           fenced code (`try` adds "Load into editor" where there is one)
- *   | a | b |             pipe tables with a |---| separator row
+ *   | a | b |             pipe tables with a |---| separator row; `\|` is a pipe inside a cell
  *   ---                   horizontal rule
  *   :::quiz               pop quiz: `Q: prompt`, options `- [ ]` / `- [x]`, `> explanation`, `:::`
  *   :::widget name {json} interactive visual (the renderer decides what to draw)
  *   :::details Title      collapsible section until the closing `:::`
  *   :::sequence / :::diagram  a JSON `Sequence` / `Diagram` (lib/types) up to the closing `:::`
  *   :::architecture       a JSON `Architecture` (lib/architecture): layers read bottom to top
- *   inline: **bold**, *em*, `code`, [text](url)
+ *   inline: **bold**, *em*, `code`, [text](url); code spans bind first and may sit inside the other three
  */
 import {type Architecture, architectureProblems} from './architecture';
 import type {Diagram, Sequence} from './types';
@@ -69,6 +69,18 @@ const parseFigure = (name: 'sequence' | 'diagram', body: string[]): Block => {
 };
 
 const BLOCK_START = /^(```|#{1,3}\s|> |-\s|\d+\.\s|\||---\s*$|:::)/;
+
+/**
+ * A table row's cells, split on `|`. As in GitHub tables, `\|` is a literal pipe, inside a code span
+ * too: `|x|` in a cell is written `\|x\|`. Escaped pipes wait out the split as a private-use character.
+ */
+const tableCells = (line: string): string[] =>
+  line
+    .trim()
+    .replace(/^\||\|$/g, '')
+    .replace(/\\\|/g, '\uE002')
+    .split('|')
+    .map(cell => cell.replace(/\uE002/g, '|').trim());
 
 const parseQuiz = (lines: string[]): PopQuizSpec => {
   const promptLines: string[] = [];
@@ -166,11 +178,7 @@ export const parseBlocks = (source: string): Block[] => {
     if (line.startsWith('|')) {
       const rows: string[][] = [];
       while (i < lines.length && lines[i].startsWith('|')) {
-        const cells = lines[i]
-          .trim()
-          .replace(/^\||\|$/g, '')
-          .split('|')
-          .map(c => c.trim());
+        const cells = tableCells(lines[i]);
         if (!cells.every(c => /^:?-{2,}:?$/.test(c))) rows.push(cells);
         i++;
       }
@@ -201,28 +209,51 @@ export const parseBlocks = (source: string): Block[] => {
   return blocks;
 };
 
-const INLINE = /(\*\*[^*]+\*\*|`[^`]+`|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g;
+/** Code spans first: their contents are literal, so a `*` inside one never opens or closes emphasis. */
+const CODE = /`[^`]+`/g;
+/** Bold, emphasis and links, matched over the line with its code spans set aside. */
+const SPAN = /(\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g;
+/** Where a code span was set aside: its index between two private-use characters. */
+const HOLE = /\uE000(\d+)\uE001/;
+
+/** A run inside bold, emphasis or a link: plain text, or a code span (`**\`run()\` returns**`). */
+export type InlineLeaf = {kind: 'text'; text: string} | {kind: 'code'; text: string};
 
 export type InlineToken =
-  | {kind: 'text'; text: string}
-  | {kind: 'bold'; text: string}
-  | {kind: 'em'; text: string}
-  | {kind: 'code'; text: string}
-  | {kind: 'link'; text: string; url: string};
+  | InlineLeaf
+  | {kind: 'bold'; parts: InlineLeaf[]}
+  | {kind: 'em'; parts: InlineLeaf[]}
+  | {kind: 'link'; parts: InlineLeaf[]; url: string};
 
 /** The inline runs of one line of the dialect, in order. */
-export const inlineTokens = (text: string): InlineToken[] =>
-  text
-    .split(INLINE)
+export const inlineTokens = (text: string): InlineToken[] => {
+  const codes: string[] = [];
+  const masked = text.replace(CODE, span => `\uE000${codes.push(span.slice(1, -1)) - 1}\uE001`);
+  // Odd indices of the split are the captured indices of the code spans.
+  const leaves = (s: string): InlineLeaf[] =>
+    s
+      .split(HOLE)
+      .flatMap((part, i): InlineLeaf[] =>
+        i % 2 === 1 ? [{kind: 'code', text: codes[Number(part)]}] : part === '' ? [] : [{kind: 'text', text: part}],
+      );
+  return masked
+    .split(SPAN)
     .filter(part => part !== '')
-    .map(part => {
-      if (part.startsWith('**') && part.endsWith('**')) return {kind: 'bold', text: part.slice(2, -2)};
-      if (part.startsWith('`') && part.endsWith('`')) return {kind: 'code', text: part.slice(1, -1)};
-      if (part.startsWith('*') && part.endsWith('*') && part.length > 2) return {kind: 'em', text: part.slice(1, -1)};
+    .flatMap((part): InlineToken[] => {
+      if (part.startsWith('**') && part.endsWith('**') && part.length > 4)
+        return [{kind: 'bold', parts: leaves(part.slice(2, -2))}];
+      if (part.startsWith('*') && part.endsWith('*') && part.length > 2)
+        return [{kind: 'em', parts: leaves(part.slice(1, -1))}];
       const link = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(part);
-      if (link !== null) return {kind: 'link', text: link[1], url: link[2]};
-      return {kind: 'text', text: part};
+      if (link !== null) {
+        const url = leaves(link[2])
+          .map(leaf => (leaf.kind === 'code' ? `\`${leaf.text}\`` : leaf.text))
+          .join('');
+        return [{kind: 'link', parts: leaves(link[1]), url}];
+      }
+      return leaves(part);
     });
+};
 
 /** Parsed pop quizzes of a lesson body (for authoring checks). */
 export function popQuizzesOf(source: string): PopQuizSpec[] {
@@ -237,13 +268,25 @@ export function popQuizzesOf(source: string): PopQuizSpec[] {
   return out;
 }
 
-/** What the parser could not make sense of — `:::sequence` / `:::diagram` bodies that are not the JSON they need. */
+/**
+ * What the parser could not make sense of: figure bodies that are not the JSON they need, and table
+ * rows whose cells do not line up with the header (usually an unescaped `|` inside a cell).
+ */
 export function malformedBlocksOf(source: string): string[] {
   const out: string[] = [];
   const visit = (blocks: Block[]): void => {
     for (const b of blocks) {
       if (b.kind === 'malformed') out.push(b.what);
       if (b.kind === 'details') visit(b.body);
+      if (b.kind === 'table')
+        b.rows.forEach((row, k) => {
+          if (row.length !== b.header.length)
+            out.push(
+              `table "${b.header.join(' | ')}": row ${k + 1} has ${row.length} cells, the header ${
+                b.header.length
+              } (a pipe inside a cell is written \\|)`,
+            );
+        });
     }
   };
   visit(parseBlocks(source));

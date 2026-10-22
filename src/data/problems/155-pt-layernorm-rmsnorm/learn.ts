@@ -222,8 +222,8 @@ them:
 
 | dtype | exponent bits | mantissa bits | largest finite | \`x²\` overflows at |
 | --- | --- | --- | --- | --- |
-| float16 | 5 | 10 | 65 504 | \`|x| > 256\` |
-| bfloat16 | 8 | 7 | 3.4 × 10³⁸ | \`|x| > 1.8 × 10¹⁹\` — never in practice |
+| float16 | 5 | 10 | 65 504 | \`\\|x\\| > 256\` |
+| bfloat16 | 8 | 7 | 3.4 × 10³⁸ | \`\\|x\\| > 1.8 × 10¹⁹\` — never in practice |
 | float32 | 8 | 23 | 3.4 × 10³⁸ | never |
 
 The naive module squares in the input dtype:
