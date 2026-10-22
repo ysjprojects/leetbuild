@@ -1817,6 +1817,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'subscription-billing-the-change-that-charged-two-plans-in-one-day',
+    problemId: 'subscription-billing',
+    stepId: 'endpoint',
+    title: 'The change that charged two plans in one day',
+    blurb: 'Proration double-billed the switch day and retries re-charged.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A plan change on the 31st billed both plans for that day, and a processor timeout retry created a second charge under a fresh idempotency key. The billing run also charged before recording its marker. Review it, fix it, and prove proration is exclusive and charging is idempotent.',
+    signals: ['Specify', 'Verify', 'Operate'],
+    aiNote:
+      'The draft prorates with a fixed 30-day divisor and charges both plans on the switch day, and its billing run charges before claiming its idempotency marker and retries timeouts under fresh keys, so retries can double-charge.',
+    testIdea:
+      'Change plans mid-month and assert the two line amounts sum to exactly one month; crash between charge and marker and assert the retry run does not charge again; time out a charge and assert reconciliation precedes any retry.',
+    followUps: [
+      'What proration policy is fairest and why?',
+      'How do credits flow into a later invoice?',
+      'What state must survive a processor outage mid-run?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
