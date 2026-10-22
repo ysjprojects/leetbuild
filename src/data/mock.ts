@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'warehouse-loader-the-load-that-counted-itself-done',
+    problemId: 'warehouse-loader',
+    stepId: 'endpoint',
+    title: 'The load that counted itself done',
+    blurb: 'Completion was marked before partitions committed and merges doubled.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A finance table was missing two partitions while the load reported complete, and a retried merge doubled a day of orders. The model-generated draft marks complete at read time and appends on retry. Review it, fix it, and prove completion follows partitions and retries are idempotent.',
+    signals: ['Verify', 'Operate', 'Specify'],
+    aiNote:
+      'The draft flips the completion flag when the source file is read rather than when the final partition commits, so readers can consume a load that is missing data, and its merge retry re-runs an append, duplicating rows on every timeout.',
+    testIdea:
+      'Crash after reading the manifest and assert the load is not visible as complete; force a merge timeout and assert one row set after the retry; compare reported written counts against the warehouse.',
+    followUps: [
+      'How do you reconcile a load without re-reading the source?',
+      'What partition size keeps retries cheap?',
+      'When is merge safer than replace, and vice versa?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
