@@ -31,6 +31,7 @@ import {feedbackCollectorProblem} from './27-feedback-collector/index';
 import {distillationPipelineProblem} from './28-distillation-pipeline/index';
 import {batchInferenceProblem} from './29-batch-inference/index';
 import {multimodalIngestProblem} from './30-multimodal-ingest/index';
+import {voiceAgentProblem} from './31-voice-agent/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -53,6 +54,7 @@ export const problems: Problem[] = [
   distillationPipelineProblem,
   batchInferenceProblem,
   multimodalIngestProblem,
+  voiceAgentProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
