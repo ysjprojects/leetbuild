@@ -871,6 +871,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'gpu-scheduler-the-gpu-that-was-allocated-twice',
+    problemId: 'gpu-scheduler',
+    stepId: 'endpoint',
+    title: 'The GPU that was allocated twice',
+    blurb: 'Counters were decremented after the record, so two placements shared one GPU.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'Two inference workloads landed on the same GPU because the draft wrote the placement and decremented capacity as separate steps, and a node that had been dead for a week still received schedules. Review it, fix it, and prove allocation is atomic and dead nodes are unschedulable.',
+    signals: ['Operate', 'Specify', 'Verify'],
+    aiNote:
+      'The draft decrements node capacity after committing the placement record, leaving a window where two schedules read the same free count, and its lack of heartbeat expiry keeps dead nodes in the scheduling set, so work lands on machines that will never run it.',
+    testIdea:
+      'Fire two concurrent placements for the last GPU and assert one succeeds; expire a node heartbeat and assert no placement lands on it; crash between record and decrement and assert the counters reconcile on restart.',
+    followUps: [
+      'What should happen to a running workload whose node dies?',
+      'How do you price a max bid against a shared cluster?',
+      'Why reconstruct utilization from events when counters exist?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
