@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'chat-memory-the-memory-that-grows-forever',
+    problemId: 'chat-memory',
+    stepId: 'endpoint',
+    title: 'The memory that grows forever',
+    blurb: 'The draft leaves the session buffer untrimmed, unexpired and shared across tenants.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A tenant reported latency that grows through long sessions, and two tenants with colliding session ids saw each other in the buffer. The model-generated draft pushes turns onto a Redis list with no trim and no TTL and builds keys from the session id alone. Review it, fix it, and prove the buffer is bounded, expiring and tenant-scoped.',
+    signals: ['Specify', 'Secure', 'Verify'],
+    aiNote:
+      'The draft pushes each turn onto an unbounded Redis list with no TTL and no trim, builds the key without the tenant prefix so colliding session ids share a buffer, and appends without an idempotency key so a client retry writes the same turn twice.',
+    testIdea:
+      'Append 60 turns and assert the list holds 50; replay one append with the same Idempotency-Key and assert a single turn; read two tenants with the same session id and assert their buffers are disjoint.',
+    followUps: [
+      'How would you summarize older turns without blocking the append path?',
+      'Should the summary live in Redis or in durable storage, and why?',
+      'What breaks if two instances append to one session while the buffer is trimmed?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
