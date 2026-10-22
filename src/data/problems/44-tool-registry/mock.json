@@ -1,0 +1,18 @@
+[
+  {
+    "stepId": "endpoint",
+    "title": "The tool that promoted itself",
+    "blurb": "The draft promoted a new tool version on a validation timeout.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 20,
+    "prompt": "An agent called a payment tool with a schema change that had never been validated, because the draft promoted it when the sandbox timed out and treated silence as success. The same draft let any service account register tools. Review it, fix it, and prove promotion requires a passing validation and registration requires the right role.",
+    "signals": ["Secure", "Specify", "Verify"],
+    "aiNote": "The draft treats a sandbox timeout as a pass and promotes the candidate version on it, and it allows any authenticated caller to register a tool, so an agent can mint a tool and then resolve it.",
+    "testIdea": "Stub the sandbox to time out and assert the previous version stays active with a recorded rejection; attempt registration as an unprivileged role and assert 403; pin an old catalog version and assert resolution still serves it.",
+    "followUps": [
+      "What makes a side-effect class meaningful if nothing enforces it at call time?",
+      "How would you review a schema diff between two tool versions?",
+      "What should happen to runs using a revoked tool version?"
+    ]
+  }
+]
