@@ -629,6 +629,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'quota-broker-the-gpu-that-was-promised-twice',
+    problemId: 'quota-broker',
+    stepId: 'endpoint',
+    title: 'The GPU that was promised twice',
+    blurb: 'The draft reserved without recording, so two teams got the same capacity.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'Two training jobs were scheduled onto the same four GPUs because the broker answered ok to both without recording either reservation, and a capacity-service timeout was treated as tacit approval. The model-generated draft does GET-then-INCRBY and fails open. Review it, fix it, and prove reservations are atomic and uncertainty denies.',
+    signals: ['Specify', 'Operate', 'Verify'],
+    aiNote:
+      'The draft reads and then increments the reservation counter in separate commands, so concurrent requests both observe available capacity that only one can be granted, and a capacity-service timeout is treated as approval, silently double-booking the resource.',
+    testIdea:
+      'Fire two concurrent reservations for the last unit and assert exactly one succeeds; time out the capacity service and assert a 503 with no ledger entry; release a reservation and assert the capacity is immediately reservable again.',
+    followUps: [
+      'Should a reservation expire on its own, and what evidence keeps it honest?',
+      'How would you handle preemption when a high-priority team arrives?',
+      'What stops a team from holding reservations without consuming them?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
