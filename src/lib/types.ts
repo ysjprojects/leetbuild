@@ -14,7 +14,29 @@
  * `LANGUAGES`; `cuda` only appears in the deep-learning track, whose problems fix their language
  * (`Problem.language`) — nobody switches a kernel to Scala.
  */
-import type {Architecture} from './architecture';
+import {type Architecture, architectureIds} from './architecture';
+import {type GpuFigure, gpuIds} from './gpuFigure';
+
+/** A model as a layer stack read bottom to top (lib/architecture.ts). */
+export interface ArchitectureFigure {
+  title: string;
+  architecture: Architecture;
+}
+
+/** A kernel as GPU references draw it: scopes, memory levels, data moving between them (lib/gpuFigure.ts). */
+export interface GpuFigureEntry {
+  title: string;
+  gpu: GpuFigure;
+}
+
+/** One of a deep-learning problem's figures; the pane shows one at a time, titled. */
+export type ProblemFigure = ArchitectureFigure | GpuFigureEntry;
+
+export const isArchitectureFigure = (f: ProblemFigure): f is ArchitectureFigure => 'architecture' in f;
+
+/** The ids a step's `focus` may name in one figure: blocks and ops, or boxes, arrays and threads. */
+export const figureIds = (f: ProblemFigure): Set<string> =>
+  isArchitectureFigure(f) ? architectureIds(f.architecture) : gpuIds(f.gpu);
 
 export type Language = 'python' | 'typescript' | 'go' | 'scala' | 'cpp' | 'cuda';
 
@@ -269,10 +291,11 @@ export interface Problem {
   /** The system's architecture: services, stores and the calls between them (systems and AI-era courses). */
   diagram?: Diagram;
   /**
-   * The model or kernel as a stack of layers read bottom to top (the deep-learning track), drawn in
-   * place of `diagram`; step `focus` names its block ids.
+   * The deep-learning track's figures, drawn in place of `diagram`: layer stacks for models, GPU
+   * figures for kernels, as many as the problem needs (each one titled). Step `focus` names ids from
+   * any of them, so ids are unique across a problem's figures.
    */
-  architecture?: Architecture;
+  figures?: ProblemFigure[];
   steps: Step[];
   /**
    * Modules every step of the course can import when it runs, per language: generated protobuf

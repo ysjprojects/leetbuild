@@ -63,8 +63,34 @@ the right:
 
 The matmuls in attention are not the bottleneck; the traffic around the score matrix is. A GPU's high-bandwidth
 memory (HBM) holds the tensors; the on-chip SRAM each streaming multiprocessor works from is a few hundred
-kilobytes. The naive version writes \`s\` to HBM, reads it back for the softmax, writes \`p\`, reads it back for
-the multiply by \`v\` — every pass over \`T²\` numbers.
+kilobytes. Written as three ops, attention is three kernels, and everything between them goes through HBM:
+
+:::gpu
+{
+  "align": "center",
+  "items": [
+    {"id": "n-hbm", "label": "HBM", "sub": "per (b, h)", "tone": "global", "layout": "column", "items": [
+      {"id": "n-s", "array": "s = q kᵀ / √hd", "sub": "[T, T] float32", "rows": 6, "cols": 6, "marks": [{"cols": [0, 5], "tone": "bad", "label": "T²"}], "detail": "Written by the first matmul, read back whole by the softmax. At T = 32k and 32 batch-heads this one tensor is 137 GB."},
+      {"id": "n-p", "array": "p = softmax(s)", "sub": "[T, T] float32", "rows": 6, "cols": 6, "marks": [{"cols": [0, 5], "tone": "bad", "label": "T²"}], "detail": "Written by the softmax, read back whole by the second matmul."}
+    ]},
+    {"id": "n-kernels", "label": "Three kernels", "sub": "one after another", "layout": "column", "items": [
+      {"id": "n-mm1", "label": "matmul q kᵀ", "sub": "reads q, k: T · hd", "tone": "compute"},
+      {"id": "n-soft", "label": "softmax", "sub": "row by row", "tone": "compute"},
+      {"id": "n-mm2", "label": "matmul p v", "sub": "writes out: T · hd", "tone": "compute"}
+    ]}
+  ],
+  "arrows": [
+    {"from": "n-mm1", "to": "n-s", "label": "write T²"},
+    {"from": "n-s", "to": "n-soft", "label": "read T²"},
+    {"from": "n-soft", "to": "n-p", "label": "write T²"},
+    {"from": "n-p", "to": "n-mm2", "label": "read T²"}
+  ]
+}
+:::
+
+Four full passes over \`T²\` numbers, against \`T · hd\` for the inputs and the output: at \`hd = 64\` and
+\`T = 4096\` the score traffic is 64 times the rest. The problem's figure **Tiles in on-chip memory** is the
+other side: the tiles of \`q\`, \`k\` and \`v\` cross to the chip, the scores never leave it.
 
 | T | B·H | scores in float32 | one 128 × 128 tile per head |
 | --- | --- | --- | --- |

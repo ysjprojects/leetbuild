@@ -12,25 +12,34 @@ runs it over every row of the attention scores \`QKᵀ / √d\`, over the vocabu
 the cross-entropy loss. On a GPU it is one kernel launch over a \`rows × cols\` matrix, and the whole design
 follows from one fact: the formula as written overflows, and the fix needs the row max before the first \`exp\`.
 
-One block per row, bottom to top:
+One block per row, three passes over the row's 1,000 floats. Each pass reads \`x[r]\` again; only the first
+read comes from DRAM, and the cells are tinted by where each read is served from:
 
-:::architecture
+:::gpu
 {
-  "input": "x · 4096 × 1000 fp32",
-  "output": "y · each row sums to 1",
+  "layout": "column",
   "items": [
-    {"id": "a-x", "label": "Global memory", "sub": "x[r] · 1000 floats · 4 KB", "kind": "memory", "detail": "Read from DRAM once per row; the 32 lanes of a warp read 32 consecutive floats per round."},
-    {"tone": "block", "repeat": "4096 ×", "label": "Block r · 256 threads", "items": [
-      {"id": "a-max", "label": "Pass 1 · block max", "sub": "m = max_c x[r][c]", "kind": "kernel", "detail": "Warp shuffles, then one shared slot per warp and warp 0. It must finish before any thread takes an exp."},
-      {"id": "a-sum", "label": "Pass 2 · block sum", "sub": "sum = Σ_c __expf(x − m)", "kind": "kernel", "side": {"label": "x[r] again", "sub": "from L1/L2"}, "detail": "The same block reduction with + and identity 0, over terms in (0, 1]."},
-      {"id": "a-write", "label": "Pass 3 · write", "sub": "y = __expf(x − m) / sum", "kind": "kernel", "side": {"label": "x[r] again", "sub": "from L1/L2"}, "detail": "Recomputes the exponent instead of storing it; zeros for a fully masked row."}
+    {"id": "a-block", "label": "Block r", "sub": "256 threads · one row", "count": "× 4,096", "layout": "column", "items": [
+      {"id": "a-max", "label": "Pass 1 · block max", "sub": "m = max_c x[r][c]", "stretch": true, "align": "end", "items": [
+        {"threads": 8, "continues": true, "label": "8 warps"},
+        {"id": "a-x1", "array": "x[r]", "sub": "from DRAM", "cols": 32, "tone": "global"}
+      ], "detail": "Warp shuffles, then one shared slot per warp and warp 0. It must finish before any thread takes an exp."},
+      {"id": "a-sum", "label": "Pass 2 · block sum", "sub": "sum = Σ_c __expf(x − m)", "stretch": true, "align": "end", "items": [
+        {"threads": 8, "continues": true, "label": "8 warps"},
+        {"id": "a-x2", "array": "x[r] again", "sub": "an L1/L2 hit", "cols": 32, "tone": "shared"}
+      ], "detail": "The same block reduction with + and identity 0, over terms in (0, 1]."},
+      {"id": "a-write", "label": "Pass 3 · write", "sub": "y = __expf(x − m) / sum", "stretch": true, "align": "end", "items": [
+        {"threads": 8, "continues": true, "label": "8 warps"},
+        {"id": "a-x3", "array": "x[r] again", "sub": "an L1/L2 hit", "cols": 32, "tone": "shared"}
+      ], "detail": "Recomputes the exponent instead of storing it; zeros for a fully masked row."}
     ]},
-    {"id": "a-y", "label": "Global memory", "sub": "y[r] · 4 KB written", "kind": "memory"}
+    {"id": "a-gmem", "label": "Global memory", "sub": "HBM · 16.4 MB per matrix", "tone": "global", "stretch": true, "items": [
+      {"id": "a-x", "array": "x · 4096 × 1000", "sub": "read once", "cols": 16, "rows": 4, "marks": [{"cols": [0, 15], "rows": [0, 0], "tone": "register", "label": "row r"}], "detail": "Read from DRAM once per row; the 32 lanes of a warp read 32 consecutive floats per round."},
+      {"id": "a-y", "array": "y · 4096 × 1000", "sub": "written once", "cols": 16, "rows": 4, "marks": [{"cols": [0, 15], "rows": [0, 0], "tone": "global", "label": "row r"}], "detail": "4 KB written per row: 8 bytes of DRAM traffic per element in all."}
+    ]}
   ],
-  "notes": [
-    {"at": "a-x", "text": "**16.4 MB** read from DRAM once"},
-    {"at": "a-max", "text": "The max comes first: no exp before **m**"},
-    {"at": "a-y", "text": "**16.4 MB** written: **8** bytes per element"}
+  "arrows": [
+    {"from": "a-write", "to": "a-y", "label": "y[r] · 4 KB"}
   ]
 }
 :::
@@ -108,31 +117,33 @@ A block reduction has two levels:
    lanes 8–31), warp-reduces again, thread 0 writes \`shared[0]\`, a second \`__syncthreads()\`, and every thread
    reads the result.
 
-The max, bottom to top:
+The max inside one block, from the warps' registers through shared memory and back to every thread:
 
-:::architecture
+:::gpu
 {
-  "input": "a local max per thread over c = t, t + 256, …",
-  "output": "m in every thread",
   "items": [
-    {"tone": "block", "repeat": "4096 ×", "label": "One block · 8 warps", "items": [
-      {"columns": [
-        [{"id": "b-w0", "label": "Warp 0 max", "sub": "__shfl_xor_sync 16 … 1", "kind": "kernel"}],
-        [{"id": "b-w1", "label": "Warp 1 max", "sub": "__shfl_xor_sync 16 … 1", "kind": "kernel"}],
-        [{"id": "b-w7", "label": "… warp 7 max", "sub": "__shfl_xor_sync 16 … 1", "kind": "kernel"}]
+    {"id": "b-block", "label": "One block", "sub": "256 threads · 8 warps", "count": "× 4,096", "layout": "column", "items": [
+      {"id": "b-warps", "label": "Every warp", "sub": "fmaxf + __shfl_xor_sync 16 … 1", "items": [
+        {"label": "Warp 0", "layout": "column", "items": [{"threads": 8, "continues": true, "label": "32 lanes"}]},
+        {"label": "Warp 1", "layout": "column", "items": [{"threads": 8, "continues": true, "label": "32 lanes"}]},
+        {"gap": "…"},
+        {"label": "Warp 7", "layout": "column", "items": [{"threads": 8, "continues": true, "label": "32 lanes"}]}
+      ], "detail": "Each thread starts from its local max over c = t, t + 256, …; five butterfly rounds leave the warp's max in every lane."},
+      {"id": "b-smem", "label": "Shared memory", "sub": "__shared__ float s_max[8]", "tone": "shared", "stretch": true, "layout": "column", "items": [
+        {"id": "b-slots", "array": "s_max", "sub": "one warp max per slot", "cols": 8, "tone": "shared", "cells": "index", "marks": [{"cols": [0, 0], "tone": "shared", "label": "later m"}], "detail": "Lane 0 of each warp writes its slot; barrier 1 makes all 8 visible. Thread 0 later overwrites slot 0 with m."}
       ]},
-      {"id": "b-slots", "label": "__shared__ s_max[8]", "sub": "lane 0 of each warp writes", "kind": "memory"},
-      {"id": "b-sync1", "label": "__syncthreads()", "sub": "all 8 slots written", "kind": "kernel"},
-      {"id": "b-warp0", "label": "Warp 0 reduces the slots", "sub": "lanes 8–31 load -INFINITY", "kind": "kernel", "detail": "A full 32-lane shuffle needs every lane; the lanes past the warp count contribute the identity."},
-      {"id": "b-pub", "label": "Thread 0 writes s_max[0]", "sub": "m published", "kind": "memory"},
-      {"id": "b-sync2", "label": "__syncthreads()", "sub": "nobody reads m early", "kind": "kernel"},
-      {"id": "b-read", "label": "Every thread reads m", "kind": "kernel"}
+      {"id": "b-warp0", "label": "Warp 0 reduces the slots", "sub": "lanes 8–31 load -INFINITY", "layout": "column", "items": [
+        {"threads": 32, "idle": 24, "label": "the identity: -inf for max, 0 for sum"}
+      ], "detail": "A full 32-lane shuffle needs every lane; the lanes past the warp count contribute the identity. Thread 0 then writes m to s_max[0]."},
+      {"id": "b-read", "label": "Every thread reads m", "sub": "s_max[0]", "layout": "column", "items": [
+        {"threads": 16, "continues": true, "label": "256 threads"}
+      ], "detail": "Only after barrier 2: a thread that read s_max[0] early would get warp 0's own partial, not the row max."}
     ]}
   ],
-  "notes": [
-    {"at": "b-sync1", "text": "Barrier **1** guards the 8 slots"},
-    {"at": "b-warp0", "text": "Identity: **-inf** for the max, **0** for the sum"},
-    {"at": "b-sync2", "text": "Barrier **2** guards **m**"}
+  "arrows": [
+    {"from": "b-warps", "to": "b-smem", "label": "lane 0 · barrier 1"},
+    {"from": "b-smem", "to": "b-warp0", "label": "8 slots"},
+    {"from": "b-warp0", "to": "b-read", "label": "m via s_max[0] · barrier 2"}
   ]
 }
 :::

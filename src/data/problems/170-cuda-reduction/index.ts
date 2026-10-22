@@ -72,127 +72,230 @@ Vectorised \`float4\` loads and several accumulators per thread, the determinist
 \`cooperative_groups::reduce\`, reductions over one dimension of a 2-D tensor (one block per row, the shape
 LayerNorm and softmax use), half-precision inputs with float accumulators, and the segmented and
 multi-GPU (all-reduce) forms.`,
-  architecture: {
-    input: 'in[n] · n = 2²⁴ floats in [0, 1)',
-    output: 'sum, checked against Kahan',
-    items: [
-      {
-        id: 'host',
-        label: 'Host · main()',
-        kind: 'host',
-        sub: 'cudaMemset(out, 0) · launch',
-        detail:
-          'Copies `N = 1 << 24` floats to the device, zeroes `*out` before **every** launch (atomics accumulate), launches 512 × 256 and 64 × 128 threads and times 20 launches with `cudaEvent`s.',
-      },
-      {
-        id: 'gmem-in',
-        label: 'Global memory',
-        sub: 'in[n] · 64 MiB',
-        kind: 'memory',
-        shape: 'float[2²⁴]',
-        detail:
-          'The input, read exactly once. On every grid-stride iteration the 32 lanes of a warp read 32 consecutive floats: one 128-byte transaction.',
-      },
-      {
-        tone: 'block',
-        repeat: '512 ×',
-        label: 'Thread block · 256 threads',
+  figures: [
+    {
+      title: 'The grid and one block',
+      gpu: {
+        align: 'end',
         items: [
           {
-            id: 'stride',
-            label: 'Grid-stride loop',
-            sub: 'v += in[i]; i += gridDim·blockDim',
-            kind: 'kernel',
-            shape: 'v: one float per thread',
-            detail:
-              'Thread `blockIdx.x * blockDim.x + threadIdx.x` folds every `gridDim.x * blockDim.x`-th element into one register: 128 elements per thread at 512 × 256, 2,048 at 64 × 128. Threads past `n` do zero iterations and hold 0.',
-          },
-          {
-            tone: 'dotted',
-            label: 'each of 8 warps',
+            id: 'gmem',
+            label: 'Global memory',
+            sub: 'cudaMalloc · HBM',
+            tone: 'global',
+            layout: 'column',
             items: [
               {
-                id: 'shfl',
-                label: 'Warp shuffle tree',
-                sub: '__shfl_down_sync 16, 8, 4, 2, 1',
-                kind: 'kernel',
-                shape: 'lane 0: warp sum',
+                id: 'in',
+                array: 'in[n] · 2²⁴ floats',
+                sub: 'row = pass · column = block',
+                cols: 16,
+                rows: 8,
+                continues: true,
+                cells: ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15'],
+                marks: [{cols: [0, 0], rows: [0, 7], tone: 'register'}],
                 detail:
-                  '`warp_reduce_sum`: `v += __shfl_down_sync(0xffffffff, v, offset)` five times. Registers move lane to lane; no shared memory, no barrier. The full mask, never `__activemask()`.',
+                  'A cell is 256 floats, one block’s slice; a row is one pass of the whole grid, 131,072 floats; 128 rows cover `n` (8 drawn). Thread `blockIdx.x * 256 + threadIdx.x` starts in row 0 and steps by `gridDim.x * blockDim.x`, so block 0 reads column 0 of every row (marked) into its threads’ registers. Each warp load is 32 consecutive floats, one 128-byte transaction, and every element is read once.',
+              },
+              {
+                id: 'out',
+                array: 'out',
+                sub: '1 float',
+                cols: 1,
+                detail:
+                  'The host `cudaMemset`s it to 0 before **every** launch, because atomics accumulate. 512 blocks finish in any order, so the last bits of the sum vary run to run.',
               },
             ],
           },
           {
-            id: 'smem',
-            label: 'Shared memory',
-            sub: 'warp_sums[32] · __syncthreads()',
-            kind: 'memory',
-            shape: 'blockDim.x / 32 floats',
-            detail:
-              'Lane 0 of warp `w` writes `warp_sums[w]`, then the whole block waits at one `__syncthreads()`. A 256-thread block fills 8 slots; the rest stay unwritten.',
-          },
-          {
-            tone: 'dotted',
-            label: 'warp 0',
+            id: 'grid',
+            label: 'Kernel grid',
+            sub: 'reduce_sum<<<512, 256>>>',
+            count: '512 blocks',
+            align: 'start',
             items: [
               {
-                id: 'warp0',
-                label: 'Warp 0 sums the slots',
-                sub: 'warp_sums[lane] or 0 → shuffle',
-                kind: 'kernel',
-                shape: 'lane 0: block sum',
+                id: 'block0',
+                label: 'Block 0',
+                sub: '256 threads · 8 warps',
+                layout: 'column',
+                items: [
+                  {
+                    id: 'warps',
+                    label: 'Every warp',
+                    sub: 'v = warp_reduce_sum(v)',
+                    items: [
+                      {
+                        label: 'Warp 0',
+                        layout: 'column',
+                        items: [{threads: 8, continues: true, label: '32 lanes'}],
+                      },
+                      {gap: '…'},
+                      {
+                        label: 'Warp 7',
+                        layout: 'column',
+                        items: [{threads: 8, continues: true, label: '32 lanes'}],
+                      },
+                    ],
+                    detail:
+                      'Each lane holds its grid-stride partial `v` in a register. `warp_reduce_sum` does `v += __shfl_down_sync(0xffffffff, v, offset)` for offsets 16, 8, 4, 2, 1 (the other figure): registers move lane to lane, no shared memory, no barrier. Lane 0 ends with the warp’s sum.',
+                  },
+                  {
+                    id: 'smem',
+                    label: 'Shared memory',
+                    sub: '__shared__ float warp_sums[32]',
+                    tone: 'shared',
+                    stretch: true,
+                    layout: 'column',
+                    items: [
+                      {
+                        id: 'warp-sums',
+                        array: 'warp_sums',
+                        sub: 'one slot per warp',
+                        cols: 16,
+                        tone: 'shared',
+                        cells: 'index',
+                        continues: true,
+                        marks: [
+                          {cols: [0, 7], tone: 'shared', label: 'warps 0–7'},
+                          {cols: [8, 15], tone: 'muted', label: 'never written'},
+                        ],
+                        detail:
+                          'Lane 0 (`threadIdx.x % 32 == 0`) of warp `w = threadIdx.x / 32` writes `warp_sums[w]`, then the whole block meets at one `__syncthreads()`. A 256-thread block fills 8 of the 32 slots; shared memory is not initialised, so the other 24 hold whatever was there.',
+                      },
+                    ],
+                  },
+                  {
+                    id: 'warp0',
+                    label: 'Warp 0 sums the slots',
+                    sub: 'lane < 8 ? warp_sums[lane] : 0',
+                    layout: 'column',
+                    items: [{threads: 16, idle: 8, continues: true, label: 'lanes 8–31 read 0'}],
+                    detail:
+                      'Lane `l` reads `l < blockDim.x / 32 ? warp_sums[l] : 0` and calls `warp_reduce_sum` again. At most 1,024 threads means at most 32 slots, so one warp finishes any block. Lane 0 then holds the block’s total and does the block’s only `atomicAdd`.',
+                  },
+                ],
                 detail:
-                  'Lane `l` reads `l < blockDim.x / 32 ? warp_sums[l] : 0` and calls `warp_reduce_sum` again. At most 1,024 threads means at most 32 slots, so one warp finishes any block.',
+                  'Three stages in one register `v`: the grid-stride loop, a shuffle reduction per warp into a shared slot, and warp 0 over the slots. Every thread reaches the `__syncthreads()`, including one whose loop ran zero times.',
+              },
+              {gap: '…'},
+              {
+                label: 'Block 511',
+                layout: 'column',
+                items: [{threads: 8, continues: true, label: '256 threads'}],
               },
             ],
+            detail:
+              '512 × 256 = 131,072 threads, a fixed grid: each thread folds 128 elements before any shuffle. The 64 × 128 launch folds 2,048 each and cannot keep enough loads in flight to saturate HBM.',
+          },
+        ],
+        arrows: [
+          {from: 'in', to: 'block0', label: 'grid-stride loads'},
+          {from: 'warps', to: 'smem', label: 'lane 0 of each warp'},
+          {from: 'smem', to: 'warp0', label: 'after __syncthreads()'},
+          {from: 'warp0', to: 'out', label: 'atomicAdd(out, v)'},
+        ],
+      },
+    },
+    {
+      title: 'One warp’s shuffle tree',
+      gpu: {
+        items: [
+          {
+            id: 'shfl',
+            label: 'One warp · warp_reduce_sum',
+            sub: 'v += __shfl_down_sync(0xffffffff, v, offset)',
+            count: '5 shuffles',
+            layout: 'column',
+            items: [
+              {
+                id: 'lanes',
+                threads: 32,
+                label: 'lanes 0–31 · one register v each',
+                detail:
+                  'All 32 lanes call `warp_reduce_sum`, and the full mask `0xffffffff` says so; `__activemask()` would name only the lanes converged at that instant.',
+              },
+              {
+                id: 'v-in',
+                array: 'v',
+                sub: 'one partial per lane · lane numbers',
+                cols: 32,
+                tone: 'register',
+                cells: 'index',
+                marks: [{cols: [0, 31], tone: 'register'}],
+              },
+              {
+                id: 'off16',
+                array: 'after offset 16',
+                sub: 'l adds l + 16 · cell: values summed',
+                cols: 32,
+                tone: 'register',
+                cells: Array<string>(16).fill('2'),
+                marks: [
+                  {cols: [0, 15], tone: 'register'},
+                  {cols: [16, 31], tone: 'muted', label: 'never read again'},
+                ],
+                detail:
+                  'Lanes 16–31 also add something (lane `l + 16` is past 31, so they get their own value back), but nobody reads them again. The warp issues once whatever the lanes do.',
+              },
+              {
+                id: 'off8',
+                array: 'after offset 8',
+                sub: 'l adds l + 8',
+                cols: 32,
+                tone: 'register',
+                cells: Array<string>(8).fill('4'),
+                marks: [
+                  {cols: [0, 7], tone: 'register'},
+                  {cols: [8, 31], tone: 'muted'},
+                ],
+              },
+              {
+                id: 'off4',
+                array: 'after offset 4',
+                sub: 'l adds l + 4',
+                cols: 32,
+                tone: 'register',
+                cells: Array<string>(4).fill('8'),
+                marks: [
+                  {cols: [0, 3], tone: 'register'},
+                  {cols: [4, 31], tone: 'muted'},
+                ],
+              },
+              {
+                id: 'off2',
+                array: 'after offset 2',
+                sub: 'l adds l + 2',
+                cols: 32,
+                tone: 'register',
+                cells: ['16', '16'],
+                marks: [
+                  {cols: [0, 1], tone: 'register'},
+                  {cols: [2, 31], tone: 'muted'},
+                ],
+              },
+              {
+                id: 'off1',
+                array: 'after offset 1',
+                sub: 'l adds l + 1 · lane 0 holds the sum',
+                cols: 32,
+                tone: 'register',
+                cells: ['32'],
+                marks: [
+                  {cols: [0, 0], tone: 'register'},
+                  {cols: [1, 31], tone: 'muted'},
+                ],
+                detail:
+                  'Five register moves replace five shared-memory levels and their barriers. Lane 0 writes this value to `warp_sums[warp]`; in warp 0’s second pass it is the block’s total.',
+              },
+            ],
+            detail:
+              'A shuffle reads another lane’s register directly: no shared memory, no `__syncthreads()`, no bank conflicts. Each step halves the lanes whose values still matter.',
           },
         ],
       },
-      {
-        id: 'atomic',
-        label: 'atomicAdd(out, block sum)',
-        sub: 'lane 0 of warp 0 · once per block',
-        kind: 'kernel',
-        detail:
-          'Blocks cannot wait for each other inside a launch, so their totals meet in global memory. Blocks finish in any order, so the last bits of the sum vary run to run.',
-      },
-      {
-        id: 'gmem-out',
-        label: 'Global memory',
-        sub: 'out · 4 bytes',
-        kind: 'memory',
-        detail: 'One float, zeroed by the host before each launch and copied back after it.',
-      },
-      {
-        id: 'check',
-        label: 'Host check',
-        kind: 'host',
-        sub: 'rel err ≤ 1e-5 vs Kahan (double)',
-        detail:
-          'The reference is a Kahan sum in double, so its own error is negligible; the tolerance is relative, `|sum − ref| / |ref|`. The host prints ms per launch, GB/s and `PASS`.',
-      },
-    ],
-    notes: [
-      {at: 'gmem-in', text: '**64 MiB** read once: **128** floats per thread', side: 'left'},
-      {at: 'shfl', text: '**5** shuffles, no shared memory, no barrier', side: 'left'},
-      {at: 'smem', text: '**1** __syncthreads() per block', side: 'left'},
-      {at: 'atomic', text: '**512** atomics against **16 M** loads'},
-    ],
-    insets: [
-      {
-        for: 'shfl',
-        title: 'Warp shuffle tree',
-        items: [
-          {id: 'off16', label: 'offset 16', sub: 'lanes 0–15 hold 2 values', kind: 'kernel'},
-          {id: 'off8', label: 'offset 8', sub: 'lanes 0–7 hold 4', kind: 'kernel'},
-          {id: 'off4', label: 'offset 4', sub: 'lanes 0–3 hold 8', kind: 'kernel'},
-          {id: 'off2', label: 'offset 2', sub: 'lanes 0–1 hold 16', kind: 'kernel'},
-          {id: 'off1', label: 'offset 1', sub: 'lane 0 holds all 32', kind: 'kernel'},
-        ],
-        note: '**5** register moves replace **5** shared-memory levels',
-      },
-    ],
-  },
+    },
+  ],
   steps: [reduceSumStep],
   learn,
 };

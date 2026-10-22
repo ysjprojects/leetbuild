@@ -54,141 +54,146 @@ Rotary or learned position embeddings (they belong to the block around this laye
 one-query-row decode step, grouped-query attention, the FlashAttention tiling that keeps the \`[T, T]\`
 scores out of memory, and \`torch.compile\`. This file materialises the full score matrix on purpose — that
 is the thing the fused kernels exist to avoid, and you should see it once.`,
-  architecture: {
-    input: 'from LayerNorm 1',
-    output: 'into the residual ⊕',
-    items: [
-      {
-        id: 'x',
-        label: 'Input embeddings',
-        kind: 'io',
-        sub: 'x · [B, T, 32]',
-        shape: '[B, T, 32]',
-        detail:
-          'The residual stream entering the layer. The self-test runs `B, T, D, H = 2, 8, 32, 4`, in float32, bfloat16 or float64.',
-      },
-      {
-        tone: 'model',
-        label: 'CausalSelfAttention',
+  figures: [
+    {
+      title: 'Causal self-attention',
+      architecture: {
+        input: 'from LayerNorm 1',
+        output: 'into the residual ⊕',
         items: [
           {
-            id: 'qkv',
-            label: 'Fused QKV projection',
-            sub: 'qkv · Linear(32, 96)',
-            shape: '[B, T, 96]',
+            id: 'x',
+            label: 'Input embeddings',
+            kind: 'io',
+            sub: 'x · [B, T, 32]',
+            shape: '[B, T, 32]',
             detail:
-              'One `nn.Linear(d_model, 3 * d_model)`: a single GEMM reads `x` once for all three projections. `split(d_model, dim=-1)` cuts its output into `q`, `k`, `v`.',
+              'The residual stream entering the layer. The self-test runs `B, T, D, H = 2, 8, 32, 4`, in float32, bfloat16 or float64.',
           },
           {
-            columns: [
-              [
-                {
-                  columns: [
-                    [
-                      {
-                        id: 'q',
-                        label: 'Queries',
-                        sub: '4 heads × 8',
-                        shape: '[B, 4, T, 8]',
+            tone: 'model',
+            label: 'CausalSelfAttention',
+            items: [
+              {
+                id: 'qkv',
+                label: 'Fused QKV projection',
+                sub: 'qkv · Linear(32, 96)',
+                shape: '[B, T, 96]',
+                detail:
+                  'One `nn.Linear(d_model, 3 * d_model)`: a single GEMM reads `x` once for all three projections. `split(d_model, dim=-1)` cuts its output into `q`, `k`, `v`.',
+              },
+              {
+                columns: [
+                  [
+                    {
+                      columns: [
+                        [
+                          {
+                            id: 'q',
+                            label: 'Queries',
+                            sub: '4 heads × 8',
+                            shape: '[B, 4, T, 8]',
+                            detail:
+                              '`view(B, T, n_heads, head_dim).transpose(1, 2)`: heads are a reshape of the embedding, not a loop.',
+                          },
+                        ],
+                        [
+                          {
+                            id: 'k',
+                            label: 'Keys',
+                            sub: '4 heads × 8',
+                            shape: '[B, 4, T, 8]',
+                            detail: 'The same view and transpose as the queries.',
+                          },
+                        ],
+                      ],
+                    },
+                    {
+                      id: 'scores',
+                      label: 'Scaled dot product',
+                      kind: 'attention',
+                      sub: 'q · kᵀ / √8',
+                      shape: '[B, 4, T, T]',
+                      detail:
+                        'One batched matmul over `B × H`: every query against every key, divided by `sqrt(head_dim)` so the scores stay at unit scale.',
+                    },
+                    {
+                      id: 'mask',
+                      label: 'Causal mask',
+                      kind: 'attention',
+                      sub: 'masked_fill(~mask, −inf)',
+                      shape: '[B, 4, T, T]',
+                      side: {
+                        label: 'causal_mask buffer',
+                        sub: 'tril · [1024, 1024] bool',
                         detail:
-                          '`view(B, T, n_heads, head_dim).transpose(1, 2)`: heads are a reshape of the embedding, not a loop.',
+                          '`register_buffer(..., persistent=False)`: moves with `.to(device)`, never trained, not saved. `forward` slices `[:T, :T]` and ANDs the padding mask `attn_mask[:, None, None, :]`.',
                       },
-                    ],
-                    [
-                      {
-                        id: 'k',
-                        label: 'Keys',
-                        sub: '4 heads × 8',
-                        shape: '[B, 4, T, 8]',
-                        detail: 'The same view and transpose as the queries.',
-                      },
-                    ],
+                      detail:
+                        'Keys after the query get `-inf` **before** the softmax, so `exp` makes their probability exactly 0 and the row normalises over `0..t` alone.',
+                    },
+                    {
+                      id: 'softmax',
+                      label: 'Softmax over keys',
+                      kind: 'attention',
+                      sub: 'float32, cast back to v.dtype',
+                      shape: '[B, 4, T, T]',
+                      detail:
+                        '`torch.softmax(..., dtype=torch.promote_types(scores.dtype, torch.float32))`: float32 for half inputs, float64 kept for `gradcheck`.',
+                    },
+                    {
+                      id: 'dropout',
+                      label: 'Attention dropout',
+                      detail: '`nn.Dropout(dropout)` on the probabilities; the identity in `eval()`.',
+                    },
                   ],
-                },
-                {
-                  id: 'scores',
-                  label: 'Scaled dot product',
-                  kind: 'attention',
-                  sub: 'q · kᵀ / √8',
-                  shape: '[B, 4, T, T]',
-                  detail:
-                    'One batched matmul over `B × H`: every query against every key, divided by `sqrt(head_dim)` so the scores stay at unit scale.',
-                },
-                {
-                  id: 'mask',
-                  label: 'Causal mask',
-                  kind: 'attention',
-                  sub: 'masked_fill(~mask, −inf)',
-                  shape: '[B, 4, T, T]',
-                  side: {
-                    label: 'causal_mask buffer',
-                    sub: 'tril · [1024, 1024] bool',
-                    detail:
-                      '`register_buffer(..., persistent=False)`: moves with `.to(device)`, never trained, not saved. `forward` slices `[:T, :T]` and ANDs the padding mask `attn_mask[:, None, None, :]`.',
-                  },
-                  detail:
-                    'Keys after the query get `-inf` **before** the softmax, so `exp` makes their probability exactly 0 and the row normalises over `0..t` alone.',
-                },
-                {
-                  id: 'softmax',
-                  label: 'Softmax over keys',
-                  kind: 'attention',
-                  sub: 'float32, cast back to v.dtype',
-                  shape: '[B, 4, T, T]',
-                  detail:
-                    '`torch.softmax(..., dtype=torch.promote_types(scores.dtype, torch.float32))`: float32 for half inputs, float64 kept for `gradcheck`.',
-                },
-                {
-                  id: 'dropout',
-                  label: 'Attention dropout',
-                  detail: '`nn.Dropout(dropout)` on the probabilities; the identity in `eval()`.',
-                },
-              ],
-              [
-                {
-                  id: 'v',
-                  label: 'Values',
-                  sub: '4 heads × 8',
-                  shape: '[B, 4, T, 8]',
-                  detail: 'The same view and transpose; values are what the weights average.',
-                },
-              ],
+                  [
+                    {
+                      id: 'v',
+                      label: 'Values',
+                      sub: '4 heads × 8',
+                      shape: '[B, 4, T, 8]',
+                      detail: 'The same view and transpose; values are what the weights average.',
+                    },
+                  ],
+                ],
+              },
+              {
+                id: 'wsum',
+                label: 'Weighted sum of values',
+                kind: 'attention',
+                sub: 'probs @ v',
+                shape: '[B, 4, T, 8]',
+                detail: 'Row `t` of the output is the probability-weighted average of the values at `0..t`.',
+              },
+              {
+                id: 'merge',
+                label: 'Merge heads',
+                sub: 'transpose · contiguous · view',
+                shape: '[B, T, 32]',
+                detail:
+                  '`transpose(1, 2).contiguous().view(B, T, d_model)`: the only copy in the layer puts the heads side by side again.',
+              },
+              {
+                id: 'proj',
+                label: 'Output projection',
+                sub: 'proj · Linear(32, 32)',
+                shape: '[B, T, 32]',
+                detail: '`nn.Linear(d_model, d_model)` mixes what the heads found.',
+              },
             ],
           },
-          {
-            id: 'wsum',
-            label: 'Weighted sum of values',
-            kind: 'attention',
-            sub: 'probs @ v',
-            shape: '[B, 4, T, 8]',
-            detail: 'Row `t` of the output is the probability-weighted average of the values at `0..t`.',
-          },
-          {
-            id: 'merge',
-            label: 'Merge heads',
-            sub: 'transpose · contiguous · view',
-            shape: '[B, T, 32]',
-            detail:
-              '`transpose(1, 2).contiguous().view(B, T, d_model)`: the only copy in the layer puts the heads side by side again.',
-          },
-          {
-            id: 'proj',
-            label: 'Output projection',
-            sub: 'proj · Linear(32, 32)',
-            shape: '[B, T, 32]',
-            detail: '`nn.Linear(d_model, d_model)` mixes what the heads found.',
-          },
+        ],
+        notes: [
+          {at: 'qkv', text: '**One** GEMM for q, k and v', side: 'left'},
+          {at: 'scores', text: 'The **[B, H, T, T]** matrix, materialised on purpose'},
+          {at: 'mask', text: '**−inf** before the softmax, never 0 after it'},
+          {at: 'softmax', text: 'Rows sum to **1** over keys **0..t**'},
+          {at: 'v', text: '**4** heads of **8** dimensions'},
         ],
       },
-    ],
-    notes: [
-      {at: 'qkv', text: '**One** GEMM for q, k and v', side: 'left'},
-      {at: 'scores', text: 'The **[B, H, T, T]** matrix, materialised on purpose'},
-      {at: 'mask', text: '**−inf** before the softmax, never 0 after it'},
-      {at: 'softmax', text: 'Rows sum to **1** over keys **0..t**'},
-      {at: 'v', text: '**4** heads of **8** dimensions'},
-    ],
-  },
+    },
+  ],
   steps: [causalAttentionStep],
   learn,
 };

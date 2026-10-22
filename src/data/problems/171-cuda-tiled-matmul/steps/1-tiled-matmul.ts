@@ -168,7 +168,7 @@ export const tiledMatmulStep: Step = {
   title: 'matmul_tiled: 32 × 32 shared tiles, two barriers per slab of K',
   concept: 'cuda',
   file: 'tiled_matmul',
-  focus: ['index', 'as', 'bs', 'sync1', 'fma', 'sync2', 'store'],
+  focus: ['mat-a', 'mat-b', 'as', 'bs', 'acc', 'mat-c', 'sync1', 'sync2'],
   task: `## Task
 
 Implement \`__global__ void matmul_tiled(const float* A, const float* B, float* C, int M, int N, int K)\`:

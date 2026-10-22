@@ -13,34 +13,48 @@ arithmetic, reordered so that each byte of \`K\` and \`V\` is read from global m
 queries and the softmax is finished one tile at a time. Every long-context model since 2022 trains and
 serves on a descendant of it; \`torch.nn.functional.scaled_dot_product_attention\` dispatches to one.
 
-:::architecture
+:::gpu
 {
-  "input": "Q, K, V · T × d float32",
-  "output": "O = softmax(Q Kᵀ / √d) V",
+  "layout": "column",
   "items": [
-    {"id": "host", "label": "Host", "sub": "cudaMemcpy Q K V · <<<⌈T/64⌉, 64>>>", "kind": "host", "detail": "Fills Q, K, V, launches the kernel non-causal and causal, compares O with a double-precision CPU reference."},
-    {"id": "hbm-in", "label": "Global memory (HBM)", "sub": "Q K V · T × d float each", "kind": "memory", "shape": "3 × [T, d]", "detail": "Row-major T × d arrays, 65,536 bytes each at T = 256, d = 64. No T × T buffer exists."},
-    {"tone": "block", "repeat": "⌈T/64⌉ ×", "label": "Thread block · BQ = 64 query rows", "items": [
-      {"id": "q-reg", "label": "Registers: query row", "sub": "q[k] = Q[row][k] · scale", "kind": "memory", "shape": "q: [64]", "detail": "One thread per query row. Registers also hold o[64] = 0, the running max m = −∞ and the running sum l = 0."},
-      {"tone": "block", "repeat": "⌈T/32⌉ ×", "label": "K/V tile loop · BK = 32", "items": [
-        {"id": "skip", "label": "Causal tile skip", "sub": "break if kv0 > q_last", "kind": "kernel", "detail": "Block-uniform: it depends on blockIdx only, so the whole block leaves the loop together."},
-        {"id": "smem", "label": "Shared memory: Ks, Vs", "sub": "2 × [32][64] float · __syncthreads", "kind": "memory", "shape": "Ks, Vs: [32, 64]", "detail": "Each K/V tile is read from HBM once and used by all 64 query rows of the block."},
-        {"id": "scores", "label": "Scores in registers", "sub": "s[j] = q · Ks[j], −∞ if masked", "kind": "kernel", "shape": "s: [32]", "detail": "One row of S = Q Kᵀ for this tile; padding and causal keys get −∞."},
-        {"id": "rescale", "label": "Online softmax rescale", "sub": "α = exp(m − m_new); o *= α", "kind": "kernel", "detail": "Re-expresses the accumulator and the sum under the new running max with one multiply."},
-        {"id": "accum", "label": "Accumulate O in registers", "sub": "o += p · Vs[j]; l = l·α + Σp", "kind": "kernel", "shape": "o: [64]", "detail": "p = exp(s[j] − m_new) ≤ 1 never overflows. A second __syncthreads() ends the tile."}
+    {"id": "block", "label": "Thread block 1", "sub": "flash_attn_fwd<<<⌈T/64⌉, 64>>> · rows 64 … 127", "count": "4 blocks", "align": "end", "items": [
+      {"id": "smem", "label": "Shared memory", "sub": "2 × 8 KB · tile 2, kv0 = 64", "tone": "shared", "layout": "column", "items": [
+        {"id": "ks", "array": "Ks[32][64]", "sub": "a cell = key row kv0 + j", "cols": 16, "rows": 2, "tone": "shared", "detail": "Each K tile is read from HBM once and used by all 64 query rows of the block. Every lane reads the same Ks[j][k]: a broadcast."},
+        {"id": "vs", "array": "Vs[32][64]", "sub": "a cell = value row kv0 + j", "cols": 16, "rows": 2, "tone": "shared", "detail": "Staged with Ks; a second __syncthreads() ends the tile before anyone overwrites it."}
       ]},
-      {"id": "normalise", "label": "Normalise once", "sub": "O[row][k] = o[k] / l", "kind": "kernel", "shape": "O[row]: [d]", "detail": "One division per row after the last tile, exact because every term carries the same exp(−m)."}
+      {"id": "thread", "label": "Thread 15", "sub": "query row 79", "count": "× 64", "layout": "column", "items": [
+        {"threads": 1, "detail": "One thread per query row: row = blockIdx.x · 64 + threadIdx.x."},
+        {"id": "regs", "label": "Registers", "sub": "about 160 floats per thread", "tone": "register", "layout": "grid", "columns": 2, "items": [
+          {"id": "s", "array": "s[32]", "sub": "q · Ks[j] · a cell = one key", "cols": 16, "rows": 2, "tone": "register", "marks": [{"rows": [0, 0], "cols": [0, 15], "tone": "register", "label": "keys 64 … 79"}, {"rows": [1, 1], "cols": [0, 15], "tone": "muted", "label": "−∞: key > row"}], "detail": "One row of S = Q Kᵀ for this tile. Tile 2 straddles the diagonal: row 79 masks keys 80 … 95 with −∞."},
+          {"id": "ml", "array": "m, l", "sub": "running max, running sum", "cols": 2, "cells": ["m", "l"], "tone": "register", "detail": "m = −∞ and l = 0 at the start; one fold per tile."},
+          {"id": "o", "array": "o[64]", "sub": "o *= α, then o += p · Vs[j]", "cols": 16, "tone": "register", "detail": "The output accumulator, rescaled whenever the running max rises, divided by l once after the last tile."},
+          {"id": "q", "array": "q[64]", "sub": "Q[79] · scale · a cell = 4 floats", "cols": 16, "tone": "register", "detail": "Loaded once, pre-scaled by 1/√d, reused by every score of the row."}
+        ]}
+      ]}
     ]},
-    {"id": "hbm-out", "label": "Global memory (HBM)", "sub": "O · T × d · written once", "kind": "memory", "shape": "[T, d]", "detail": "The only output. A backward pass would also want logsumexp = m + log l per row; the drill leaves it out."}
+    {"id": "hbm", "label": "Global memory", "sub": "HBM · 64 KB per array", "detail": "T = 256, d = 64: Q, K, V and O are 65,536 bytes each, and there is no T × T buffer.", "tone": "global", "stretch": true, "items": [
+      {"id": "g-k", "array": "K", "sub": "a row = one tile", "cols": 8, "rows": 8, "marks": [{"rows": [2, 2], "cols": [0, 7], "tone": "shared", "label": "tile 2"}, {"rows": [4, 7], "cols": [0, 7], "tone": "muted", "label": "causal: skipped"}], "detail": "Walked in tiles of 32 rows. Under the causal mask block 1 stops before tile 4: its last query is row 127."},
+      {"id": "g-v", "array": "V", "sub": "a row = one tile", "cols": 8, "rows": 8, "marks": [{"rows": [2, 2], "cols": [0, 7], "tone": "shared", "label": "tile 2"}, {"rows": [4, 7], "cols": [0, 7], "tone": "muted", "label": "causal: skipped"}]},
+      {"id": "g-s", "array": "S = Q Kᵀ", "sub": "T × T · 256 KB · never allocated", "cols": 8, "rows": 8, "marks": [{"rows": [0, 7], "cols": [0, 7], "tone": "muted", "label": "not in memory"}], "detail": "Standard attention writes this, reads it for the softmax and again for P V. Here each tile of it lives only in the s registers of 64 threads."},
+      {"id": "g-o", "array": "O", "sub": "a row = 32 tokens", "cols": 8, "rows": 8, "marks": [{"rows": [2, 3], "cols": [0, 7], "tone": "register", "label": "written once"}], "detail": "The only output, O[row][k] = o[k] / l."},
+      {"id": "g-q", "array": "Q", "sub": "a row = 32 tokens", "cols": 8, "rows": 8, "marks": [{"rows": [2, 3], "cols": [0, 7], "tone": "register", "label": "block 1"}]}
+    ]}
   ],
-  "notes": [
-    {"at": "q-reg", "text": "**64** threads per block, one query row each"},
-    {"at": "smem", "text": "**16 KB** of shared memory per block"},
-    {"at": "scores", "text": "The **T × T** scores never leave registers"},
-    {"at": "hbm-out", "text": "A 256 × 256 score matrix would be **256 KB**"}
+  "arrows": [
+    {"from": "g-q", "to": "q", "label": "Q[row] · scale"},
+    {"from": "g-k", "to": "smem", "label": "K tile 2"},
+    {"from": "g-v", "to": "smem", "label": "V tile 2"},
+    {"from": "ks", "to": "s", "label": "q · Ks[j]"},
+    {"from": "vs", "to": "o", "label": "p · Vs[j]"},
+    {"from": "o", "to": "g-o", "label": "o / l"}
   ]
 }
 :::
+
+Read it bottom to top. Block 1 owns query rows 64 … 127, one per thread, and copies each row into registers.
+It then walks \`K\` and \`V\` one 32-row tile at a time through shared memory; each thread turns a tile into 32
+scores and folds them into \`m\`, \`l\` and \`o\` without leaving registers. The \`T × T\` matrix \`S\` has no
+address anywhere, and \`O\` is written once.
 
 The contract the drill implements, in one file \`flash_attention.cu\`:
 
@@ -203,6 +217,34 @@ whole tiles can be dropped: with \`q_last = min(blockIdx.x × BQ + BQ, T) − 1\
 - Tiles straddling the diagonal keep the per-element test \`causal && key > row\` → \`-INFINITY\`.
 - Roughly half the tiles of a causal head are never loaded; the drill's causal timing reflects it.
 - Threads with \`row ≥ T\` skip the arithmetic but still load and reach every barrier, for the same reason.
+
+At the drill's \`T = 256\` the grid has four blocks, and the break leaves block 0 with two tiles and block 3
+with eight: 20 of the 32 tiles are loaded. The share skipped approaches half as \`T\` grows.
+
+:::gpu
+{
+  "items": [
+    {"id": "grid", "label": "Grid · causal", "sub": "flash_attn_fwd<<<4, 64>>> · T = 256", "count": "20 of 32 tiles", "detail": "The break depends on blockIdx only, so each block leaves its loop as a whole.", "items": [
+      {"id": "blk0", "label": "Block 0", "sub": "queries 0 … 63", "layout": "column", "items": [
+        {"threads": 8, "continues": true, "label": "64 threads, one query each"},
+        {"id": "tiles0", "array": "K/V tiles", "sub": "a cell = 32 keys", "cols": 8, "cells": "index", "tone": "shared", "marks": [{"cols": [0, 1], "tone": "register", "label": "diag"}, {"cols": [2, 7], "tone": "muted", "label": "skip"}], "detail": "q_last = 63: tile 2 starts at key 64 and breaks the loop."}
+      ]},
+      {"id": "blk1", "label": "Block 1", "sub": "queries 64 … 127", "layout": "column", "items": [
+        {"threads": 8, "continues": true, "label": "64 threads, one query each"},
+        {"id": "tiles1", "array": "K/V tiles", "sub": "a cell = 32 keys", "cols": 8, "cells": "index", "tone": "shared", "marks": [{"cols": [0, 1], "tone": "shared", "label": "full"}, {"cols": [2, 3], "tone": "register", "label": "diag"}, {"cols": [4, 7], "tone": "muted", "label": "skip"}], "detail": "Tiles 0 and 1 are below the diagonal for every row; tiles 2 and 3 straddle it and are masked per key."}
+      ]},
+      {"id": "blk2", "label": "Block 2", "sub": "queries 128 … 191", "layout": "column", "items": [
+        {"threads": 8, "continues": true, "label": "64 threads, one query each"},
+        {"id": "tiles2", "array": "K/V tiles", "sub": "a cell = 32 keys", "cols": 8, "cells": "index", "tone": "shared", "marks": [{"cols": [0, 3], "tone": "shared", "label": "full"}, {"cols": [4, 5], "tone": "register", "label": "diag"}, {"cols": [6, 7], "tone": "muted", "label": "skip"}]}
+      ]},
+      {"id": "blk3", "label": "Block 3", "sub": "queries 192 … 255", "layout": "column", "items": [
+        {"threads": 8, "continues": true, "label": "64 threads, one query each"},
+        {"id": "tiles3", "array": "K/V tiles", "sub": "a cell = 32 keys", "cols": 8, "cells": "index", "tone": "shared", "marks": [{"cols": [0, 5], "tone": "shared", "label": "full"}, {"cols": [6, 7], "tone": "register", "label": "diag"}], "detail": "The last block sees every key: all eight tiles, four times the work of block 0."}
+      ]}
+    ]}
+  ]
+}
+:::
 
 :::quiz
 Q: Why must the causal skip be decided per block rather than per thread?

@@ -63,126 +63,135 @@ The hand-written backward (autograd derives it; the fused kernels in \`F.layer_n
 the fused residual-add-plus-norm kernels inference engines use, QK-norm inside attention, Gemma's
 \`(1 + weight)\` parameterisation, and \`elementwise_affine=False\`. The two modules here are the shape
 every one of those starts from.`,
-  architecture: {
-    input: 'x · (B, T, D) · float32 or bfloat16',
-    output: 'x + sublayer(norm(x))',
-    items: [
-      {
-        id: 'stream',
-        label: 'Residual stream',
-        sub: 'x · one D-vector per token',
-        kind: 'io',
-        shape: '[B, T, D]',
-        detail:
-          'Every block reads from it and adds into it, so its rows grow with depth. The norm acts on each of the `B × T` rows on its own; the reduction is over `D` only.',
-      },
-      {
-        columns: [
-          [
-            {
-              tone: 'dotted',
-              label: 'LayerNorm · GPT-2, BERT',
-              items: [
+  figures: [
+    {
+      title: 'LayerNorm and RMSNorm',
+      architecture: {
+        input: 'x · (B, T, D) · float32 or bfloat16',
+        output: 'x + sublayer(norm(x))',
+        items: [
+          {
+            id: 'stream',
+            label: 'Residual stream',
+            sub: 'x · one D-vector per token',
+            kind: 'io',
+            shape: '[B, T, D]',
+            detail:
+              'Every block reads from it and adds into it, so its rows grow with depth. The norm acts on each of the `B × T` rows on its own; the reduction is over `D` only.',
+          },
+          {
+            columns: [
+              [
                 {
-                  id: 'ln-mean',
-                  label: 'Row mean',
-                  sub: 'μ = x.mean(-1, keepdim)',
-                  shape: '[B, T, 1]',
-                  detail: '`keepdim=True` keeps the reduced axis as size 1 so `x − μ` broadcasts back over the row.',
-                },
-                {
-                  id: 'ln-var',
-                  label: 'Biased variance',
-                  sub: 'σ² = x.var(unbiased=False)',
-                  shape: '[B, T, 1]',
-                  detail:
-                    'Divide by `D`, not `D − 1`: Bessel’s correction scales the whole output by `sqrt(D / (D − 1))`, 0.8% at `D = 64`.',
-                },
-                {
-                  id: 'ln-scale',
-                  label: 'Centre and scale',
-                  sub: '(x − μ) · rsqrt(σ² + 1e-5)',
-                  detail:
-                    '`eps` inside the root, so a constant row (σ² = 0) gives `0` rather than `0 / 0`; one `rsqrt` per row, then a multiply per element.',
-                },
-                {
-                  id: 'ln-affine',
-                  label: 'Affine map',
-                  sub: '· weight + bias · (D,) each',
-                  shape: '[B, T, D]',
-                  detail: '`weight` starts at ones and `bias` at zeros: the identity at initialisation, 2D parameters.',
-                },
-              ],
-            },
-          ],
-          [
-            {
-              tone: 'dotted',
-              label: 'RMSNorm · Llama, Mistral',
-              items: [
-                {
-                  id: 'rms-up',
-                  label: 'Upcast',
-                  sub: 'xf = x.float() if 16-bit',
-                  detail:
-                    'Only `float16`/`bfloat16` are upcast. A float64 input stays float64, which is what lets `gradcheck` see the real Jacobian.',
-                },
-                {
-                  id: 'rms-ms',
-                  label: 'Mean of squares',
-                  sub: 'mean(xf²) · no centring',
-                  shape: '[B, T, 1]',
-                  detail: '`mean(x²) = σ² + μ²`: one reduction instead of two, and the row is not moved to zero mean.',
-                },
-                {
-                  id: 'rms-scale',
-                  label: 'Scale',
-                  sub: 'xf · rsqrt(ms + 1e-6)',
-                  detail: 'The row now has unit root mean square, every value of order 1.',
-                },
-                {
-                  id: 'rms-cast',
-                  label: 'Cast back',
-                  sub: '.type_as(x)',
-                  detail:
-                    'Before the weight multiply, so the output keeps the input dtype and the next matmul runs in it.',
-                },
-                {
-                  id: 'rms-weight',
-                  label: 'Scale by weight',
-                  sub: '· weight (D,) · no bias',
-                  shape: '[B, T, D]',
-                  detail: 'One parameter of ones, D values per layer.',
+                  tone: 'dotted',
+                  label: 'LayerNorm · GPT-2, BERT',
+                  items: [
+                    {
+                      id: 'ln-mean',
+                      label: 'Row mean',
+                      sub: 'μ = x.mean(-1, keepdim)',
+                      shape: '[B, T, 1]',
+                      detail:
+                        '`keepdim=True` keeps the reduced axis as size 1 so `x − μ` broadcasts back over the row.',
+                    },
+                    {
+                      id: 'ln-var',
+                      label: 'Biased variance',
+                      sub: 'σ² = x.var(unbiased=False)',
+                      shape: '[B, T, 1]',
+                      detail:
+                        'Divide by `D`, not `D − 1`: Bessel’s correction scales the whole output by `sqrt(D / (D − 1))`, 0.8% at `D = 64`.',
+                    },
+                    {
+                      id: 'ln-scale',
+                      label: 'Centre and scale',
+                      sub: '(x − μ) · rsqrt(σ² + 1e-5)',
+                      detail:
+                        '`eps` inside the root, so a constant row (σ² = 0) gives `0` rather than `0 / 0`; one `rsqrt` per row, then a multiply per element.',
+                    },
+                    {
+                      id: 'ln-affine',
+                      label: 'Affine map',
+                      sub: '· weight + bias · (D,) each',
+                      shape: '[B, T, D]',
+                      detail:
+                        '`weight` starts at ones and `bias` at zeros: the identity at initialisation, 2D parameters.',
+                    },
+                  ],
                 },
               ],
-            },
-          ],
+              [
+                {
+                  tone: 'dotted',
+                  label: 'RMSNorm · Llama, Mistral',
+                  items: [
+                    {
+                      id: 'rms-up',
+                      label: 'Upcast',
+                      sub: 'xf = x.float() if 16-bit',
+                      detail:
+                        'Only `float16`/`bfloat16` are upcast. A float64 input stays float64, which is what lets `gradcheck` see the real Jacobian.',
+                    },
+                    {
+                      id: 'rms-ms',
+                      label: 'Mean of squares',
+                      sub: 'mean(xf²) · no centring',
+                      shape: '[B, T, 1]',
+                      detail:
+                        '`mean(x²) = σ² + μ²`: one reduction instead of two, and the row is not moved to zero mean.',
+                    },
+                    {
+                      id: 'rms-scale',
+                      label: 'Scale',
+                      sub: 'xf · rsqrt(ms + 1e-6)',
+                      detail: 'The row now has unit root mean square, every value of order 1.',
+                    },
+                    {
+                      id: 'rms-cast',
+                      label: 'Cast back',
+                      sub: '.type_as(x)',
+                      detail:
+                        'Before the weight multiply, so the output keeps the input dtype and the next matmul runs in it.',
+                    },
+                    {
+                      id: 'rms-weight',
+                      label: 'Scale by weight',
+                      sub: '· weight (D,) · no bias',
+                      shape: '[B, T, D]',
+                      detail: 'One parameter of ones, D values per layer.',
+                    },
+                  ],
+                },
+              ],
+            ],
+          },
+          {
+            id: 'sublayer',
+            label: 'Attention or MLP',
+            kind: 'attention',
+            sub: 'reads the normalised row',
+            shape: '[B, T, D]',
+            detail:
+              'Either norm feeds the sublayer: GPT-2 uses the left path, Llama the right. Same input magnitude at layer 1 and layer 80.',
+          },
+          {
+            id: 'add',
+            op: '+',
+            from: 'stream',
+            detail:
+              'Pre-norm: `x = x + sublayer(norm(x))`. The residual carries the un-normalised `x` around the norm.',
+          },
+        ],
+        notes: [
+          {at: 'ln-var', text: 'Divide by **D**, not D − 1', side: 'left'},
+          {at: 'ln-scale', text: 'eps **inside** the root: a flat row gives bias, not NaN', side: 'left'},
+          {at: 'rms-up', text: 'fp16 x² overflows at **|x| > 256**'},
+          {at: 'rms-ms', text: '**1** reduction instead of 2'},
+          {at: 'add', text: 'Pre-norm: the stream itself is never normalised'},
         ],
       },
-      {
-        id: 'sublayer',
-        label: 'Attention or MLP',
-        kind: 'attention',
-        sub: 'reads the normalised row',
-        shape: '[B, T, D]',
-        detail:
-          'Either norm feeds the sublayer: GPT-2 uses the left path, Llama the right. Same input magnitude at layer 1 and layer 80.',
-      },
-      {
-        id: 'add',
-        op: '+',
-        from: 'stream',
-        detail: 'Pre-norm: `x = x + sublayer(norm(x))`. The residual carries the un-normalised `x` around the norm.',
-      },
-    ],
-    notes: [
-      {at: 'ln-var', text: 'Divide by **D**, not D − 1', side: 'left'},
-      {at: 'ln-scale', text: 'eps **inside** the root: a flat row gives bias, not NaN', side: 'left'},
-      {at: 'rms-up', text: 'fp16 x² overflows at **|x| > 256**'},
-      {at: 'rms-ms', text: '**1** reduction instead of 2'},
-      {at: 'add', text: 'Pre-norm: the stream itself is never normalised'},
-    ],
-  },
+    },
+  ],
   steps: [normsStep],
   learn,
 };

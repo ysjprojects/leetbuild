@@ -8,17 +8,21 @@ import {
   type Company,
   type Language,
   type Problem,
+  type ProblemFigure,
   type Source,
   type Step,
   codeFor,
   CONCEPT_LABEL,
+  figureIds,
   fileName,
+  isArchitectureFigure,
   LANGUAGE_LABEL,
   stepKey,
 } from '@/lib/types';
 
 import ArchitectureDiagram from './ArchitectureDiagram';
 import {useDialog} from './Dialog';
+import GpuDiagram from './GpuDiagram';
 import Markdown from './Markdown';
 import {CompanyMark, ConceptChip, DifficultyChip, ghostButtonClass, linkClass, primaryButtonClass} from './paneShared';
 import SequenceDiagram from './SequenceDiagram';
@@ -27,6 +31,7 @@ import {LinkedInButton, POST_HINT} from './Social';
 import StepEditor from './StepEditor';
 import SystemDiagram from './SystemDiagram';
 import {renderWidget} from './widgets';
+import {tabClass} from './widgets/frame';
 
 export type PaneTab = 'problem' | 'step';
 
@@ -231,23 +236,69 @@ Solution.displayName = 'Solution';
 
 const NO_FOCUS: readonly string[] = [];
 
-/** A deep-learning problem's layer stack in the pane's column, with the full figure a click away. */
-const PaneArchitecture: FC<{problem: Problem; focus: readonly string[]}> = memo(({problem, focus}) => {
-  const [dialog, openDialog] = useDialog();
-  const spec = problem.architecture;
-  const onExpand = useCallback(() => {
-    if (spec === undefined) return;
-    void openDialog({title: problem.title, body: <ArchitectureDiagram spec={spec} />, figure: true});
-  }, [openDialog, problem.title, spec]);
-  if (spec === undefined) return null;
-  return (
-    <>
-      <ArchitectureDiagram compact focus={focus} onExpand={onExpand} spec={spec} />
-      {dialog}
-    </>
+/** One figure, compact or full; `focus` holds only ids of this figure. */
+const FigureView: FC<{figure: ProblemFigure; compact: boolean; focus?: readonly string[]; onExpand?: () => void}> =
+  memo(({figure, compact, focus, onExpand}) =>
+    isArchitectureFigure(figure) ? (
+      <ArchitectureDiagram compact={compact} focus={focus} onExpand={onExpand} spec={figure.architecture} />
+    ) : (
+      <GpuDiagram compact={compact} focus={focus} onExpand={onExpand} spec={figure.gpu} />
+    ),
   );
-});
-PaneArchitecture.displayName = 'PaneArchitecture';
+FigureView.displayName = 'FigureView';
+
+const FigureTab: FC<{index: number; title: string; active: boolean; onSelect: (index: number) => void}> = memo(
+  ({index, title, active, onSelect}) => {
+    const select = useCallback(() => onSelect(index), [index, onSelect]);
+    return (
+      <button aria-selected={active} className={tabClass(active)} onClick={select} role="tab" type="button">
+        {title}
+      </button>
+    );
+  },
+);
+FigureTab.displayName = 'FigureTab';
+
+/**
+ * A deep-learning problem's figures in the pane's column: one at a time, titled tabs when there are
+ * several, the figure holding the step's focus brought up when the step changes, and the full figure
+ * a click away.
+ */
+const PaneFigures: FC<{figures: ProblemFigure[]; title: string; focus: readonly string[]}> = memo(
+  ({figures, title, focus}) => {
+    const [dialog, openDialog] = useDialog();
+    const ids = useMemo(() => figures.map(figureIds), [figures]);
+    const focusIndex = useMemo(() => ids.findIndex(set => focus.some(id => set.has(id))), [ids, focus]);
+    const [active, setActive] = useState(Math.max(0, focusIndex));
+    useEffect(() => {
+      if (focusIndex >= 0) setActive(focusIndex);
+    }, [focusIndex]);
+    const index = Math.min(active, figures.length - 1);
+    const figure = figures[index];
+    const ownFocus = useMemo(() => focus.filter(id => ids[index]?.has(id) === true), [focus, ids, index]);
+    const onExpand = useCallback(() => {
+      void openDialog({
+        title: figures.length > 1 ? `${title} · ${figure.title}` : title,
+        body: <FigureView compact={false} figure={figure} />,
+        figure: true,
+      });
+    }, [figure, figures.length, openDialog, title]);
+    return (
+      <>
+        {figures.length > 1 ? (
+          <div aria-label="Figures" className="mb-2 flex flex-wrap gap-1.5" role="tablist">
+            {figures.map((f, i) => (
+              <FigureTab active={i === index} index={i} key={f.title} onSelect={setActive} title={f.title} />
+            ))}
+          </div>
+        ) : null}
+        <FigureView compact figure={figure} focus={ownFocus} onExpand={onExpand} />
+        {dialog}
+      </>
+    );
+  },
+);
+PaneFigures.displayName = 'PaneFigures';
 
 /** Company-tagged courses open with the company: whose writing this is, and where it appears. */
 /** A page with lines on it: the learning guide's mark. */
@@ -536,8 +587,12 @@ const ProblemPane: FC<{
           </button>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3" ref={scroller}>
-          {problem.architecture !== undefined ? (
-            <PaneArchitecture focus={tab === 'step' ? step.focus : NO_FOCUS} problem={problem} />
+          {problem.figures !== undefined && problem.figures.length > 0 ? (
+            <PaneFigures
+              figures={problem.figures}
+              focus={tab === 'step' ? step.focus : NO_FOCUS}
+              title={problem.title}
+            />
           ) : problem.diagram !== undefined ? (
             <SystemDiagram
               compact

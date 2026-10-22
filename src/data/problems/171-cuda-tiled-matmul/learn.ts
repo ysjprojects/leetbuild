@@ -15,31 +15,31 @@ and the ancestor of every cuBLAS and CUTLASS kernel. It keeps the naive mapping 
 element) and changes only where the operands come from: a block stages slabs of \`A\` and \`B\` in shared
 memory and reuses each float 32 times.
 
-Read the figure bottom to top: both kernels read the same global memory and write the same \`C\`; only the
-tiled one stages each slab of \`K\` in shared memory between two barriers.
+The figure puts the two kernels on either side of the same global memory. The naive one feeds its registers
+straight from \`A\` and \`B\`; the tiled one stages each slab of \`K\` in shared memory first, where 32 threads read
+every float it fetched. Both write \`C\` once per output.
 
-:::architecture
+:::gpu
 {
-  "input": "A[M×K] · B[K×N] float32",
-  "output": "C = A · B, timed in GFLOP/s",
   "items": [
-    {"id": "host", "label": "Host · main()", "kind": "host", "sub": "CPU reference · cudaEvent timing", "detail": "Copies A and B in, launches both kernels on the same grid, checks them on 97 × 75 × 131 and times them on 1024³."},
-    {"id": "gmem-in", "label": "Global memory", "kind": "memory", "sub": "A · B · off-chip, slow, large", "detail": "DRAM (HBM). Tens of TFLOP/s of arithmetic against 2 to 3 TB/s of bandwidth."},
-    {"columns": [
-      [{"id": "naive", "label": "matmul_naive", "kind": "kernel", "sub": "acc += A[row][k] · B[k][col]", "detail": "The baseline: one thread, one output, every operand straight from global memory."}],
-      [{"tone": "block", "repeat": "⌈K/32⌉ ×", "label": "matmul_tiled · per slab", "items": [
-        {"id": "smem", "label": "Shared memory", "kind": "memory", "sub": "As[32][32] · Bs[32][32] · 8 KB", "detail": "On-chip, per block. Each thread loads one float of A and one of B per slab, coalesced."},
-        {"id": "sync1", "label": "__syncthreads()", "kind": "kernel", "sub": "slab complete"},
-        {"id": "fma", "label": "32 FMAs per thread", "kind": "kernel", "sub": "acc += As[ty][k] · Bs[k][tx]", "detail": "Out of shared memory into a register accumulator."},
-        {"id": "sync2", "label": "__syncthreads()", "kind": "kernel", "sub": "everyone done with the slab"}
-      ]}]
+    {"id": "naive", "label": "matmul_naive", "sub": "block 32 × 32 · no shared memory", "layout": "column", "items": [
+      {"id": "n-acc", "label": "Registers", "sub": "acc, one per thread", "tone": "register", "stretch": true, "detail": "Every multiply-add brings two fresh floats from global memory into registers: 8 bytes for 2 FLOPs."},
+      {"threads": 12, "continues": true, "label": "1,024 threads · one output each"}
+    ], "detail": "The baseline: one thread, one output, every operand straight from global memory. Caches catch some repeats; it stays a memory benchmark."},
+    {"id": "gmem", "label": "Global memory", "sub": "HBM · off-chip, large, slow", "tone": "global", "layout": "column", "items": [
+      {"id": "g-ab", "array": "A, B", "sub": "float32 · read", "cols": 10, "continues": true, "detail": "DRAM: tens of TFLOP/s of arithmetic against 2 to 3 TB/s of bandwidth, so a kernel needs about 10 FLOPs per byte fetched to be compute-bound."},
+      {"id": "g-c", "array": "C", "sub": "written once", "cols": 10, "continues": true, "detail": "One guarded store per output from each kernel."}
     ]},
-    {"id": "gmem-out", "label": "Global memory", "kind": "memory", "sub": "C[M×N] · one store per output"}
+    {"id": "tiled", "label": "matmul_tiled", "sub": "block 32 × 32 · ⌈K/32⌉ slabs", "layout": "column", "items": [
+      {"id": "t-smem", "label": "Shared memory", "sub": "As[32][32] · Bs[32][32] · 8 KB", "tone": "shared", "stretch": true, "detail": "On-chip, per block. Each thread loads one float of A and one of B per slab, coalesced; two barriers fence the slab."},
+      {"id": "t-acc", "label": "Registers", "sub": "acc, one per thread", "tone": "register", "stretch": true, "detail": "32 FMAs per slab out of shared memory into a register accumulator."},
+      {"threads": 12, "continues": true, "label": "1,024 threads · one output each"}
+    ], "detail": "The same mapping, one thread per output; only the operands' source changes."}
   ],
-  "notes": [
-    {"at": "naive", "text": "**2K** global loads per output: **0.25** FLOP/byte", "side": "left"},
-    {"at": "smem", "text": "**2K / 32** global loads per output"},
-    {"at": "fma", "text": "Each staged float is reused **32** times"}
+  "arrows": [
+    {"from": "g-ab", "to": "n-acc", "label": "2K floats per output"},
+    {"from": "g-ab", "to": "t-smem", "label": "2K / 32 per output"},
+    {"from": "t-smem", "to": "t-acc", "label": "read 32 times"}
   ]
 }
 :::

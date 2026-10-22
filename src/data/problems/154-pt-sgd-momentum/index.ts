@@ -61,105 +61,111 @@ first \`AssertionError\` with the configuration that diverged.
 \`dampening\`, \`maximize\`, the \`foreach\` and \`fused\` multi-tensor paths, learning-rate schedulers,
 gradient clipping, \`add_param_group\` with per-group overrides (inherited and unused), and sharding the
 optimizer state across devices.`,
-  architecture: {
-    input: 'params, lr = 0.02, μ = 0.9',
-    items: [
-      {
-        tone: 'block',
-        repeat: 'for each step',
-        label: 'Training loop',
+  figures: [
+    {
+      title: 'One SGD step with momentum',
+      architecture: {
+        input: 'params, lr = 0.02, μ = 0.9',
         items: [
           {
-            id: 'backward',
-            label: 'loss.backward()',
-            sub: '0.5·‖A w + c − b‖² → p.grad',
-            kind: 'loss',
-            detail:
-              'The self-test’s quadratic. Autograd fills `p.grad` for every parameter the loss touched; a third parameter never gets one and stays `None`.',
-          },
-          {
-            tone: 'dotted',
-            label: 'SGD.step() · each p with a grad',
+            tone: 'block',
+            repeat: 'for each step',
+            label: 'Training loop',
             items: [
               {
-                id: 'grad',
-                label: 'Gradient g',
-                sub: 'g = p.grad · skip if None',
-                kind: 'io',
-                shape: 'same shape as p',
+                id: 'backward',
+                label: 'loss.backward()',
+                sub: '0.5·‖A w + c − b‖² → p.grad',
+                kind: 'loss',
                 detail:
-                  'Read from `p.grad` inside `for group in self.param_groups: for p in group["params"]`. A parameter whose `grad is None` is skipped: no decay, no buffer.',
+                  'The self-test’s quadratic. Autograd fills `p.grad` for every parameter the loss touched; a third parameter never gets one and stays `None`.',
               },
               {
-                id: 'buffer',
-                label: 'Momentum buffer',
-                sub: 'buf.mul_(μ).add_(g)',
-                kind: 'memory',
-                shape: 'same shape as p',
-                side: {
-                  label: 'state[p]',
-                  sub: 'clone(g) on step 1',
-                  detail:
-                    'Created lazily the first time `p` has a gradient, as `torch.clone(g).detach()`; absent when `momentum = 0`.',
-                },
-                detail:
-                  '`buf ← μ · buf + g`, in place in `self.state[p]["momentum_buffer"]`, so `state_dict()` saves it. A constant gradient drives it to `g / (1 − μ)`.',
-              },
-              {
-                columns: [
-                  [
-                    {
-                      id: 'classical',
-                      label: 'Classical momentum',
-                      sub: 'd = buf',
-                      detail: 'Heavy ball: step along the buffer. With `momentum = 0` there is no buffer and `d = g`.',
-                    },
-                  ],
-                  [
-                    {
-                      id: 'nesterov',
-                      label: 'Nesterov look-ahead',
-                      sub: 'd = g.add(buf, alpha=μ)',
+                tone: 'dotted',
+                label: 'SGD.step() · each p with a grad',
+                items: [
+                  {
+                    id: 'grad',
+                    label: 'Gradient g',
+                    sub: 'g = p.grad · skip if None',
+                    kind: 'io',
+                    shape: 'same shape as p',
+                    detail:
+                      'Read from `p.grad` inside `for group in self.param_groups: for p in group["params"]`. A parameter whose `grad is None` is skipped: no decay, no buffer.',
+                  },
+                  {
+                    id: 'buffer',
+                    label: 'Momentum buffer',
+                    sub: 'buf.mul_(μ).add_(g)',
+                    kind: 'memory',
+                    shape: 'same shape as p',
+                    side: {
+                      label: 'state[p]',
+                      sub: 'clone(g) on step 1',
                       detail:
-                        'With `nesterov=True`: `d = g + μ · buf`, one out-of-place `add`. The buffer is the classical one; only the direction changes.',
+                        'Created lazily the first time `p` has a gradient, as `torch.clone(g).detach()`; absent when `momentum = 0`.',
                     },
-                  ],
+                    detail:
+                      '`buf ← μ · buf + g`, in place in `self.state[p]["momentum_buffer"]`, so `state_dict()` saves it. A constant gradient drives it to `g / (1 − μ)`.',
+                  },
+                  {
+                    columns: [
+                      [
+                        {
+                          id: 'classical',
+                          label: 'Classical momentum',
+                          sub: 'd = buf',
+                          detail:
+                            'Heavy ball: step along the buffer. With `momentum = 0` there is no buffer and `d = g`.',
+                        },
+                      ],
+                      [
+                        {
+                          id: 'nesterov',
+                          label: 'Nesterov look-ahead',
+                          sub: 'd = g.add(buf, alpha=μ)',
+                          detail:
+                            'With `nesterov=True`: `d = g + μ · buf`, one out-of-place `add`. The buffer is the classical one; only the direction changes.',
+                        },
+                      ],
+                    ],
+                  },
+                  {
+                    id: 'decay',
+                    label: 'Decoupled weight decay',
+                    sub: 'p.mul_(1 − lr·wd)',
+                    detail:
+                      'Shrinks the weight itself, before the update and outside the buffer. Folded into the gradient instead (`g + wd · p`), the decay would be replayed by the buffer `1 / (1 − μ)` times.',
+                  },
+                  {
+                    id: 'update',
+                    label: 'In-place update',
+                    sub: 'p.add_(d, alpha=−lr)',
+                    detail:
+                      '`p ← p − lr · d` under `@torch.no_grad()`, writing into the leaf tensor the model holds. No `p = p − …`, no `.data`.',
+                  },
                 ],
-              },
-              {
-                id: 'decay',
-                label: 'Decoupled weight decay',
-                sub: 'p.mul_(1 − lr·wd)',
-                detail:
-                  'Shrinks the weight itself, before the update and outside the buffer. Folded into the gradient instead (`g + wd · p`), the decay would be replayed by the buffer `1 / (1 − μ)` times.',
-              },
-              {
-                id: 'update',
-                label: 'In-place update',
-                sub: 'p.add_(d, alpha=−lr)',
-                detail:
-                  '`p ← p − lr · d` under `@torch.no_grad()`, writing into the leaf tensor the model holds. No `p = p − …`, no `.data`.',
               },
             ],
           },
+          {
+            id: 'trained',
+            label: 'Trained parameters',
+            sub: 'p after 25 steps',
+            kind: 'io',
+            detail:
+              'The self-test compares every parameter after every step with `torch.optim.SGD` at `weight_decay=0` (`allclose`, `rtol=1e-5`), then checks one decayed step by hand.',
+          },
+        ],
+        notes: [
+          {at: 'buffer', text: 'μ = **0.9**: steady state **10 × g**'},
+          {at: 'nesterov', text: 'Newest gradient weighs **1 + μ**'},
+          {at: 'decay', text: '**wd · p** never enters the buffer'},
+          {at: 'trained', text: 'Same as torch.optim.SGD for **25** steps'},
         ],
       },
-      {
-        id: 'trained',
-        label: 'Trained parameters',
-        sub: 'p after 25 steps',
-        kind: 'io',
-        detail:
-          'The self-test compares every parameter after every step with `torch.optim.SGD` at `weight_decay=0` (`allclose`, `rtol=1e-5`), then checks one decayed step by hand.',
-      },
-    ],
-    notes: [
-      {at: 'buffer', text: 'μ = **0.9**: steady state **10 × g**'},
-      {at: 'nesterov', text: 'Newest gradient weighs **1 + μ**'},
-      {at: 'decay', text: '**wd · p** never enters the buffer'},
-      {at: 'trained', text: 'Same as torch.optim.SGD for **25** steps'},
-    ],
-  },
+    },
+  ],
   steps: [sgdMomentumStep],
   learn,
 };

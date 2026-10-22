@@ -83,141 +83,267 @@ does the last one.
 memory, \`ldmatrix\` and the PTX \`mma.sync\` instructions, Hopper's \`wgmma\` and TMA, bf16/tf32/fp8 inputs,
 split-K, fused epilogues (bias, activation, residual) and transposed operands. These are what cuBLAS and
 CUTLASS add on top of the warp-level contract written here.`,
-  architecture: {
-    input: 'A[M×K] · B[K×N] fp16',
-    output: 'C[M×N] fp32',
-    items: [
-      {
-        id: 'host',
-        label: 'Host · pad16 + upload',
-        kind: 'host',
-        sub: 'cudaMemcpy2D into zeroed buffers',
-        detail:
-          '`pad16(x) = (x + 15) / 16 * 16` rounds M, N, K up; the real rows are copied into zeroed `Mp × Kp` and `Kp × Np` buffers, so 250 × 375 × 500 runs as 256 × 384 × 512. The zeros add nothing to the products.',
-      },
-      {
-        id: 'gmem-in',
-        label: 'Global memory',
-        kind: 'memory',
-        sub: 'A[Mp×Kp] · B[Kp×Np] half',
-        shape: 'A[256×512] · B[512×384]',
-        detail:
-          'Row-major `half`, every dimension a multiple of 16, so every fragment pointer is 32-byte aligned and every `ldm` a multiple of 8 halves.',
-      },
-      {
-        tone: 'block',
-        repeat: '⌈Np/64⌉ · Mp/16 ×',
-        label: 'Thread block · 128 threads',
+  figures: [
+    {
+      title: 'Block tile, warp tiles, fragments',
+      gpu: {
         items: [
           {
-            tone: 'dotted',
-            label: 'each of 4 warps',
+            id: 'gmem',
+            label: 'Global memory',
+            sub: 'HBM · every dimension padded to ×16',
+            tone: 'global',
+            layout: 'column',
+            align: 'start',
             items: [
               {
-                id: 'acc0',
-                label: 'Zero the accumulator',
-                kind: 'kernel',
-                sub: 'fill_fragment(acc, 0.0f)',
+                id: 'mat-a',
+                array: 'A · 256 × 512 half',
+                sub: 'a cell = 64 × 32',
+                rows: 4,
+                cols: 16,
+                marks: [
+                  {cols: [0, 15], rows: [1, 1], tone: 'global'},
+                  {cols: [3, 3], rows: [1, 1], tone: 'shared', label: 'k0'},
+                ],
                 detail:
-                  '`warpId = threadIdx.x / warpSize`, `tileRow = blockIdx.y`, `tileCol = blockIdx.x * 4 + warpId`. A warp whose tile is past `N` returns as a whole.',
+                  'Row-major `half`. Block row `by = 1` walks its 64 × K strip in steps of `BK = 32`. `pad16` and `cudaMemcpy2D` put a 250 × 500 input into a zeroed 256 × 512 buffer, so every pointer is 32-byte aligned; the zeros add nothing.',
               },
               {
-                tone: 'dotted',
-                repeat: 'K/16 ×',
-                label: 'k += 16',
+                id: 'mat-b',
+                array: 'B · 512 × 384 half',
+                sub: 'a cell = 32 × 64',
+                rows: 16,
+                cols: 6,
+                marks: [
+                  {cols: [2, 2], rows: [0, 15], tone: 'global'},
+                  {cols: [2, 2], rows: [3, 3], tone: 'shared', label: 'k0'},
+                ],
+                detail:
+                  'Row-major `half`. Block column `bx = 2` needs the K × 64 strip of columns 128 … 191, the same `k0` rows as `A`.',
+              },
+              {
+                id: 'mat-c',
+                array: 'C · 256 × 384 float',
+                sub: 'a cell = 64 × 64',
+                rows: 4,
+                cols: 6,
+                marks: [{cols: [2, 2], rows: [1, 1], tone: 'register'}],
+                detail:
+                  'One block per 64 × 64 tile: a 6 × 4 grid. Each warp stores its four 16 × 16 accumulators with `ldm = N`; the host copies the real `M × N` corner back.',
+              },
+            ],
+          },
+          {
+            id: 'block',
+            label: 'Thread block (2, 1)',
+            sub: 'wmma_matmul_smem · 128 threads',
+            count: '24 blocks',
+            layout: 'column',
+            items: [
+              {
+                id: 'smem',
+                label: 'Shared memory',
+                sub: '__align__(32) half · 9.5 KB',
+                tone: 'shared',
+                layout: 'column',
+                align: 'start',
                 items: [
                   {
-                    columns: [
-                      [
-                        {
-                          id: 'frag-a',
-                          label: 'load_matrix_sync a',
-                          kind: 'kernel',
-                          sub: 'A + tileRow·16·K + k · ldm K',
-                          detail:
-                            '`fragment<matrix_a, 16, 16, 16, half, row_major>`: the warp’s share of a 16 × 16 fp16 tile of `A`, spread over the 32 lanes’ registers in an opaque layout.',
-                        },
-                      ],
-                      [
-                        {
-                          id: 'frag-b',
-                          label: 'load_matrix_sync b',
-                          kind: 'kernel',
-                          sub: 'B + k·N + tileCol·16 · ldm N',
-                          detail:
-                            '`fragment<matrix_b, 16, 16, 16, half, row_major>`: a 16 × 16 fp16 tile of `B`. `ldm` is the row length of the matrix it sits in, not the tile width.',
-                        },
-                      ],
+                    id: 'as',
+                    array: 'As[64][40]',
+                    sub: 'a cell = 16 × 8 halves',
+                    tone: 'shared',
+                    rows: 4,
+                    cols: 5,
+                    marks: [
+                      {cols: [4, 4], tone: 'muted', label: 'skew'},
+                      {cols: [0, 1], rows: [0, 1], tone: 'register', label: 'a'},
+                    ],
+                    detail:
+                      'The 64 × 32 slab of `A`, filled by all 128 threads, zero past `M` and `K`. Rows are 40 halves (80 bytes): the 8-half skew keeps `ldm = 40` legal and shifts consecutive rows across the banks. Warp 0 reads `a[0]`, `a[1]` from `&As[i·16][kk]`.',
+                  },
+                  {
+                    id: 'bs',
+                    array: 'Bs[32][72]',
+                    sub: 'a cell = 16 × 8 halves',
+                    tone: 'shared',
+                    rows: 2,
+                    cols: 9,
+                    marks: [
+                      {cols: [8, 8], tone: 'muted'},
+                      {cols: [0, 3], rows: [0, 0], tone: 'register', label: 'b'},
+                    ],
+                    detail:
+                      'The 32 × 64 slab of `B`, rows of 72 halves (144 bytes). Warp 0 reads `b[0]`, `b[1]` from `&Bs[kk][j·16]` with `ldm = 72`.',
+                  },
+                ],
+                detail:
+                  'Filled once per `k0` step and read by all four warps: 8 KiB of operands feed 262,144 FLOPs, 32 per byte against 8 for the direct kernel. A `__syncthreads()` after the fill and one after the `mma_sync` loop.',
+              },
+              {
+                id: 'warps',
+                label: '2 × 2 warps',
+                sub: '32 × 32 each · a cell = 16 × 16',
+                layout: 'grid',
+                columns: 2,
+                items: [
+                  {
+                    id: 'w0',
+                    label: 'Warp 0',
+                    sub: 'rows 0–31 · cols 0–31',
+                    align: 'start',
+                    items: [
+                      {
+                        id: 'w0-a',
+                        array: 'a[2]',
+                        tone: 'register',
+                        rows: 2,
+                        cols: 1,
+                        detail:
+                          '`fragment<matrix_a, 16, 16, 16, half, row_major>`, two of them: rows 0–15 and 16–31 of the warp tile, reloaded for each `kk`.',
+                      },
+                      {
+                        id: 'w0-b',
+                        array: 'b[2]',
+                        tone: 'register',
+                        cols: 2,
+                        detail:
+                          '`fragment<matrix_b, 16, 16, 16, half, row_major>`, two of them: columns 0–15 and 16–31 of the warp tile.',
+                      },
+                      {
+                        id: 'w0-acc',
+                        array: 'acc[2][2]',
+                        tone: 'register',
+                        rows: 2,
+                        cols: 2,
+                        detail:
+                          '`fragment<accumulator, 16, 16, 16, float>`, 2 × 2 of them, zeroed once with `fill_fragment` and kept in fp32 registers across all of K: `acc[i][j] += a[i] · b[j]`.',
+                      },
+                    ],
+                    detail:
+                      '`warpId = threadIdx.x / 32`, `warpRow = warpId / 2`, `warpCol = warpId % 2`: rows 0–31, columns 0–31 of the block tile. Each fragment is the warp’s share of a 16 × 16 tile spread over its 32 lanes’ registers; per 16 of `kk`, two `a`, two `b`, four `mma_sync`.',
+                  },
+                  {
+                    label: 'Warp 1',
+                    sub: 'rows 0–31 · cols 32–63',
+                    align: 'start',
+                    items: [
+                      {array: 'a[2]', tone: 'register', rows: 2, cols: 1},
+                      {array: 'b[2]', tone: 'register', cols: 2},
+                      {array: 'acc[2][2]', tone: 'register', rows: 2, cols: 2},
                     ],
                   },
                   {
-                    id: 'mma',
-                    label: 'mma_sync(acc, a, b, acc)',
-                    kind: 'kernel',
-                    sub: 'tensor cores · m16n16k16',
-                    detail:
-                      'Warp-collective: all 32 lanes issue it together. `acc = a · b + acc`, 16 · 16 · 16 = 4,096 multiply-adds per instruction; fp16 products are exact in fp32.',
+                    label: 'Warp 2',
+                    sub: 'rows 32–63 · cols 0–31',
+                    align: 'start',
+                    items: [
+                      {array: 'a[2]', tone: 'register', rows: 2, cols: 1},
+                      {array: 'b[2]', tone: 'register', cols: 2},
+                      {array: 'acc[2][2]', tone: 'register', rows: 2, cols: 2},
+                    ],
                   },
                   {
-                    id: 'acc',
-                    label: 'Accumulator fragment',
-                    kind: 'memory',
-                    sub: '16 × 16 float · registers',
-                    detail:
-                      '`fragment<accumulator, 16, 16, 16, float>`: the sum stays in fp32 registers across all K/16 steps, so the only error left is summation order.',
+                    label: 'Warp 3',
+                    sub: 'rows 32–63 · cols 32–63',
+                    align: 'start',
+                    items: [
+                      {array: 'a[2]', tone: 'register', rows: 2, cols: 1},
+                      {array: 'b[2]', tone: 'register', cols: 2},
+                      {array: 'acc[2][2]', tone: 'register', rows: 2, cols: 2},
+                    ],
                   },
                 ],
-              },
-              {
-                id: 'store',
-                label: 'store_matrix_sync',
-                kind: 'kernel',
-                sub: 'C + tileRow·16·N + tileCol·16',
                 detail:
-                  'Once per tile: `store_matrix_sync(…, acc, N, wmma::mem_row_major)`. The accumulator has no layout; the store names one.',
+                  'The 64 × 64 block tile split four ways. In the direct kernel `wmma_matmul` the block is instead 4 warps along a row of 16 × 16 tiles, each loading its fragments straight from global memory with `ldm = K` and `ldm = N`.',
               },
             ],
           },
         ],
+        arrows: [
+          {from: 'mat-a', to: 'as', label: 'fill · 128 threads'},
+          {from: 'mat-b', to: 'bs', label: 'fill · 128 threads'},
+          {from: 'smem', to: 'warps', label: 'load_matrix_sync'},
+          {from: 'w0', to: 'mat-c', label: 'store_matrix_sync'},
+        ],
       },
-      {
-        id: 'gmem-out',
-        label: 'Global memory',
-        kind: 'memory',
-        sub: 'C[Mp×Np] float · M × N corner back',
-        shape: 'C[250×375]',
-        detail:
-          '`cudaMemcpy2D` copies the real `M × N` corner back; the host checks `max |C − ref| ≤ 2e-5 × K` against an fp32 CPU reference over the same rounded inputs.',
-      },
-    ],
-    notes: [
-      {at: 'store', text: 'One warp owns one **16 × 16** tile of C', side: 'left'},
-      {at: 'mma', text: '**16 × 16 × 16**: **4,096** multiply-adds', side: 'left'},
-      {at: 'frag-a', text: 'fp16 tiles in, **fp32** accumulator', side: 'left'},
-      {at: 'gmem-in', text: 'Pointers **32-byte** aligned, ldm a multiple of **8**', side: 'left'},
-    ],
-    insets: [
-      {
-        for: 'frag-b',
-        title: 'wmma_matmul_smem: staged loads',
+    },
+    {
+      title: 'mma_sync on the tensor cores',
+      gpu: {
         items: [
           {
-            tone: 'dotted',
-            repeat: 'K/32 ×',
+            id: 'mma-warp',
+            label: 'Warp 0',
+            sub: 'mma_sync(acc[i][j], a[i], b[j], acc[i][j])',
+            layout: 'column',
             items: [
-              {id: 's-fill', label: 'Cooperative fill', kind: 'kernel', sub: '128 threads · zero past M, N, K'},
-              {id: 's-smem', label: 'Shared memory', kind: 'memory', sub: 'As[64][40] · Bs[32][72] half'},
-              {id: 's-sync1', label: '__syncthreads()', kind: 'kernel'},
-              {id: 's-load', label: 'load_matrix_sync', kind: 'kernel', sub: '2 a (ldm 40) · 2 b (ldm 72)'},
-              {id: 's-mma', label: '4 × mma_sync', kind: 'kernel', sub: '2 × 2 accumulators per warp'},
-              {id: 's-sync2', label: '__syncthreads()', kind: 'kernel'},
+              {threads: 32, label: 'all 32 lanes issue it together'},
+              {
+                id: 'tc',
+                label: 'Tensor cores',
+                sub: 'm16n16k16 · a cell = 2 × 2 elements',
+                tone: 'compute',
+                items: [
+                  {
+                    id: 'mma-d',
+                    array: 'acc · D',
+                    sub: 'float',
+                    tone: 'register',
+                    rows: 8,
+                    cols: 8,
+                    marks: [{cols: [5, 5], rows: [2, 2], tone: 'register'}],
+                    detail:
+                      'The result, back into the same fp32 accumulator fragment. Each element is a 16-long dot product of a row of `a` and a column of `b`, plus its old value.',
+                  },
+                  {gap: '='},
+                  {
+                    id: 'mma-a',
+                    array: 'a',
+                    sub: 'half',
+                    tone: 'register',
+                    rows: 8,
+                    cols: 8,
+                    marks: [{cols: [0, 7], rows: [2, 2], tone: 'register', label: 'row i'}],
+                    detail:
+                      'A 16 × 16 fp16 tile of `A` in registers. fp16 keeps 11 significant bits, so a product of two has at most 22: exact in fp32.',
+                  },
+                  {gap: '@'},
+                  {
+                    id: 'mma-b',
+                    array: 'b',
+                    sub: 'half',
+                    tone: 'register',
+                    rows: 8,
+                    cols: 8,
+                    marks: [{cols: [5, 5], rows: [0, 7], tone: 'register', label: 'col j'}],
+                    detail: 'A 16 × 16 fp16 tile of `B`, `row_major` because `B` is row-major in memory.',
+                  },
+                  {gap: '+'},
+                  {
+                    id: 'mma-c',
+                    array: 'acc · C',
+                    sub: 'float',
+                    tone: 'register',
+                    rows: 8,
+                    cols: 8,
+                    marks: [{cols: [5, 5], rows: [2, 2], tone: 'register'}],
+                    detail:
+                      'The running sum from the previous steps of K, zeroed once by `fill_fragment(acc, 0.0f)`. Accumulating in fp32 leaves summation order as the only error.',
+                  },
+                ],
+                detail:
+                  'One warp-collective instruction: 16 · 16 · 16 = 4,096 multiply-adds, against 32 for an fp32 FMA across a warp. A lane-dependent `if` around it is undefined behaviour.',
+              },
             ],
+            detail:
+              'The warp is the unit of work: every WMMA call is executed by all 32 lanes with the same arguments, and each fragment is spread over all 32 lanes’ registers.',
           },
         ],
-        note: '64 × 64 block tile, **32 × 32** per warp: **32** FLOP per byte',
       },
-    ],
-  },
+    },
+  ],
   steps: [wmmaMatmulStep],
   learn,
 };

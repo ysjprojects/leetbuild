@@ -92,149 +92,284 @@ memory so the backward reads \`x\` once, a warp-per-row layout for small \`cols\
 dropout into the same kernel, RMSNorm (the same kernel without the mean), and the PyTorch
 \`torch.autograd.Function\` / C++ extension that would wire these kernels into a model. Each one sits on the
 reduction written here.`,
-  architecture: {
-    input: 'x, dy · 256 × 1000 fp32 · γ, β',
-    output: 'y, dx, dγ, dβ vs a double reference',
-    items: [
-      {
-        id: 'host',
-        label: 'Host · main()',
-        kind: 'host',
-        sub: 'rows 0, 64, 128, 192 at 1000 ± 1',
-        detail:
-          'Fills `x`, `dy`, `gamma`, `beta`; four rows are `1000 + U(−1, 1)`, the rest `2 · U(−1, 1)`. Launches the three kernels and compares six outputs with a double-precision CPU reference, each `≤ 1e-3`.',
-      },
-      {
-        id: 'gmem-x',
-        label: 'Global memory',
-        sub: 'x[256, 1000] · 1 MB',
-        kind: 'memory',
-        shape: 'x[row]: 1000 floats',
-        detail: 'Row-major. Each block owns one row of 4 KB and reads it with warp-contiguous strided loads.',
-      },
-      {
-        tone: 'block',
-        repeat: '256 ×',
-        label: 'layernorm_fwd · one row',
+  figures: [
+    {
+      title: 'Forward: one block per row',
+      gpu: {
+        align: 'center',
         items: [
           {
-            id: 'welford',
-            label: 'Welford per thread',
-            sub: '(n, mean, M2) · c = t, t + 256, …',
-            kind: 'kernel',
-            shape: '256 states',
-            detail:
-              '`welford_update`: `count += 1`, `delta = v − mean`, `mean += delta / count`, `m2 += delta · (v − mean)`. Only products of small deviations, never squares of values near 1000.',
-          },
-          {
-            tone: 'dotted',
-            label: 'each of 8 warps',
+            id: 'gmem',
+            label: 'Global memory',
+            sub: 'row-major float',
+            tone: 'global',
+            layout: 'column',
             items: [
               {
-                id: 'warp-merge',
-                label: 'Chan merge via shuffles',
-                sub: '__shfl_down_sync 16, 8, 4, 2, 1',
-                kind: 'kernel',
-                shape: 'lane 0: warp state',
+                id: 'x',
+                array: 'x · 256 × 1000',
+                sub: 'cell = 100 floats',
+                cols: 10,
+                rows: 14,
+                marks: [{cols: [0, 9], rows: [0, 0], tone: 'register', label: '1000 ± 1'}],
                 detail:
-                  '`warp_welford`: shuffle `count`, `mean` and `m2` down, then `welford_merge`. Chan’s merge is exact, so any tree of merges gives the row’s statistics.',
+                  'Row `r` belongs to block `r`. Rows 0, 64, 128, 192 are `1000 + U(−1, 1)` (row 0 marked), where `E[x²] − E[x]²` falls apart; the rest `2 · U(−1, 1)`. Block `r` reads its row once, with warp-contiguous strided loads, into its threads’ Welford states.',
+              },
+              {
+                id: 'gb',
+                array: 'γ, β · [1000]',
+                sub: 'all blocks',
+                cols: 10,
+                rows: 2,
+                detail: 'Read by every block for its `y` pass, so they stay in L2 (and L1).',
+              },
+              {
+                id: 'saved',
+                array: 'mean, rstd · [256]',
+                sub: 'kept',
+                cols: 10,
+                rows: 2,
+                marks: [{cols: [0, 0], rows: [0, 1], tone: 'global'}],
+                detail:
+                  'Two floats per row (row 0’s marked), saved so the backward recomputes `x̂` elementwise instead of reducing the row again.',
+              },
+              {
+                id: 'y',
+                array: 'y · 256 × 1000',
+                cols: 10,
+                rows: 14,
+                marks: [{cols: [0, 9], rows: [0, 0], tone: 'global'}],
+                detail: 'Compared with a double-precision CPU reference: `|gpu − ref| / max(1, |ref|) ≤ 1e-3`.',
               },
             ],
           },
           {
-            id: 's-warp',
-            label: 'Shared s_warp[32]',
-            sub: 'one Welford per warp · barrier',
-            kind: 'memory',
-            shape: '8 states',
-            detail: 'Lane 0 of warp `w` writes `s_warp[w]`, then `__syncthreads()`.',
-          },
-          {
-            tone: 'dotted',
-            label: 'warp 0',
+            id: 'grid',
+            label: 'Kernel grid',
+            sub: 'layernorm_fwd<<<256, 256>>>',
+            count: '256 blocks',
             items: [
               {
-                id: 'warp0',
-                label: 'Warp 0 merges 8 states',
-                sub: 'rstd = rsqrtf(M2 / N + eps)',
-                kind: 'kernel',
-                shape: 'mean, rstd',
+                id: 'block0',
+                label: 'Block 0 · row 0',
+                sub: '256 threads · 8 warps',
+                layout: 'column',
+                items: [
+                  {
+                    id: 'welford',
+                    label: 'Welford per thread',
+                    sub: 'c = t, t + 256, … · 3 or 4 values',
+                    items: [
+                      {
+                        label: 'Thread 0',
+                        align: 'end',
+                        items: [{threads: 1}, {array: 's', cols: 3, tone: 'register', cells: ['n', 'μ', 'M2']}],
+                      },
+                      {
+                        label: 'Thread 1',
+                        align: 'end',
+                        items: [{threads: 1}, {array: 's', cols: 3, tone: 'register', cells: ['n', 'μ', 'M2']}],
+                      },
+                      {gap: '…'},
+                      {
+                        label: 'Thread 255',
+                        align: 'end',
+                        items: [{threads: 1}, {array: 's', cols: 3, tone: 'register', cells: ['n', 'μ', 'M2']}],
+                      },
+                    ],
+                    detail:
+                      '`welford_update`: `count += 1`, `delta = v − mean`, `mean += delta / count`, `m2 += delta · (v − mean)`. Three registers per thread, and only products of small deviations, never squares of values near 1000.',
+                  },
+                  {
+                    id: 'warp-merge',
+                    label: 'Chan merge per warp',
+                    sub: 'shfl n, μ, M2 down 16 … 1, merge',
+                    layout: 'column',
+                    items: [{threads: 16, continues: true, label: 'lane 0 ends with the warp’s state'}],
+                    detail:
+                      '`warp_welford`: `__shfl_down_sync(FULL_MASK, …)` of `count`, `mean` and `m2`, then `welford_merge`, `m2 = a.m2 + b.m2 + δ² · n_a · n_b / n`. Chan’s merge is exact, so any tree of merges gives the row’s statistics.',
+                  },
+                  {
+                    id: 's-warp',
+                    label: 'Shared memory',
+                    sub: '__shared__ Welford s_warp[32]',
+                    tone: 'shared',
+                    stretch: true,
+                    layout: 'column',
+                    items: [
+                      {
+                        id: 's-warp-slots',
+                        array: 's_warp',
+                        sub: 'one state per warp',
+                        cols: 16,
+                        continues: true,
+                        tone: 'shared',
+                        cells: 'index',
+                        marks: [
+                          {cols: [0, 7], tone: 'shared', label: 'warps 0–7'},
+                          {cols: [8, 15], tone: 'muted', label: 'unused'},
+                        ],
+                        detail:
+                          'Lane 0 of warp `w` writes `s_warp[w]`, then `__syncthreads()`. The block also keeps two shared floats, the row’s `mean` and `rstd`, published behind a second barrier.',
+                      },
+                    ],
+                  },
+                  {
+                    id: 'warp0',
+                    label: 'Warp 0 merges the 8 states',
+                    sub: 'rstd = rsqrtf(M2 / cols + eps)',
+                    layout: 'column',
+                    items: [{threads: 16, idle: 8, continues: true, label: 'lanes 8–31: count = 0'}],
+                    detail:
+                      'Lanes 8–31 load empty states (`count = 0`), which merge without `0 / 0`. Thread 0 computes the biased variance `m2 / cols` and `rsqrtf`, writes `mean[row]`, `rstd[row]` and the two shared floats; a second `__syncthreads()` publishes them.',
+                  },
+                  {
+                    id: 'norm',
+                    label: 'Every thread writes y',
+                    sub: 'y = (x − mean) · rstd · γ + β',
+                    layout: 'column',
+                    items: [{threads: 16, continues: true, label: 'its own columns again'}],
+                    detail:
+                      'An elementwise pass over the row, served from L1/L2; `gamma` and `beta` are shared by every block.',
+                  },
+                ],
+                detail: 'One block per row: rows are independent, so no block talks to another. Two barriers per row.',
+              },
+            ],
+            detail: 'One block per row, 256 rows: block 0 is drawn; the others run the same code on their own rows.',
+          },
+        ],
+        arrows: [
+          {from: 'x', to: 'welford', label: 'x[row], once'},
+          {from: 'warp-merge', to: 's-warp', label: 'lane 0 of each warp'},
+          {from: 's-warp', to: 'warp0', label: 'after __syncthreads()'},
+          {from: 'warp0', to: 'saved', label: 'mean, rstd'},
+          {from: 'norm', to: 'y', label: 'y[row]'},
+        ],
+      },
+    },
+    {
+      title: 'Backward: partial rows, then columns',
+      gpu: {
+        align: 'end',
+        items: [
+          {
+            id: 'bwd',
+            label: 'layernorm_bwd',
+            sub: '<<<64, 256>>> · rows b, b + 64, …',
+            count: '64 blocks',
+            items: [
+              {
+                id: 'bwd-block0',
+                label: 'Block 0',
+                sub: 'rows 0, 64, 128, 192',
+                layout: 'column',
+                items: [
+                  {
+                    id: 'bwd-load',
+                    label: 'Per row: x̂ and g',
+                    sub: 'x̂ = (x − mean)·rstd · g = dy·γ',
+                    layout: 'column',
+                    items: [{threads: 12, continues: true, label: 'sum_g, sum_gx in registers'}],
+                    detail:
+                      'Reads the saved `mean[row]` and `rstd[row]`: no second variance. Each thread accumulates `sum_g += g` and `sum_gx += g · x̂` over its columns.',
+                  },
+                  {
+                    id: 'sum2',
+                    label: 'block_reduce_sum2',
+                    sub: 'Σ g, Σ g·x̂ → every thread',
+                    tone: 'shared',
+                    stretch: true,
+                    detail:
+                      '`__shfl_xor_sync` within each warp, a `__shared__` slot per warp for each sum, warp 0 over the slots. It syncs before writing the slots, so the previous row’s readers are done.',
+                  },
+                  {
+                    id: 'dx',
+                    label: 'Write dx',
+                    sub: 'rstd·(g − (Σg + x̂·Σgx̂) / cols)',
+                    layout: 'column',
+                    items: [{threads: 12, continues: true, label: 'a second loop over the row'}],
+                    detail:
+                      'Every `dx_i` needs the row totals, which exist only after the block reduction and its barrier: writing `dx` in the first loop would use one thread’s partial sums.',
+                  },
+                  {
+                    id: 'acc',
+                    label: 'Add to partial row 0',
+                    sub: '+= dy·x̂ and += dy',
+                    layout: 'column',
+                    items: [{threads: 12, continues: true, label: 'thread t owns c ≡ t (mod 256)'}],
+                    detail:
+                      'Block `b` zeroes partial row `b` first; thread `t` alone touches its columns of that row, so `+=` needs no atomic.',
+                  },
+                ],
+              },
+              {gap: '…'},
+            ],
+          },
+          {
+            id: 'bwd-gmem',
+            label: 'Global memory',
+            tone: 'global',
+            layout: 'column',
+            items: [
+              {
+                id: 'dy-x',
+                array: 'dy, x · 256 × 1000',
+                sub: 'with saved mean, rstd',
+                cols: 16,
+                rows: 4,
+                marks: [{cols: [0, 15], rows: [0, 0], tone: 'register', label: 'row 0 → block 0'}],
                 detail:
-                  'Lanes 8–31 load empty states (`count = 0`), which merge without `0 / 0`. Thread 0 computes the biased variance `m2 / cols` and `rsqrtf`, writes `mean[row]`, `rstd[row]` and two shared floats; a second `__syncthreads()` publishes them.',
+                  'Block `b` takes rows `b, b + 64, …`: four rows each for 256 rows. It also reads `gamma` and the two saved statistics of each row.',
+              },
+              {
+                id: 'dx-out',
+                array: 'dx · 256 × 1000',
+                cols: 16,
+                rows: 4,
+              },
+              {
+                id: 'partials',
+                array: 'dγ, dβ partial · 64 × 1000',
+                sub: 'one row per block',
+                cols: 16,
+                rows: 4,
+                marks: [
+                  {cols: [0, 15], rows: [0, 0], tone: 'global', label: 'block 0'},
+                  {cols: [3, 3], rows: [0, 3], tone: 'register'},
+                ],
+                detail:
+                  'Two `[64, 1000]` arrays, 256 KB each. Row `b` belongs to block `b`; the marked column is what one thread of the reduce kernel sums.',
+              },
+              {
+                id: 'grads',
+                array: 'dγ, dβ · [1000]',
+                cols: 16,
+                marks: [{cols: [3, 3], tone: 'register', label: 'column c'}],
               },
             ],
           },
           {
-            id: 'norm',
-            label: 'Normalise with γ, β',
-            sub: 'y = (x − mean)·rstd·γ + β',
-            kind: 'kernel',
-            shape: 'y[row]: 1000 floats',
+            id: 'reduce',
+            label: 'layernorm_bwd_reduce',
+            sub: 'one thread per column',
+            count: '1,000 threads',
+            layout: 'column',
+            items: [{threads: 12, continues: true, label: 'thread c: Σ over 64 rows'}],
             detail:
-              'An elementwise pass over the row, served from L1/L2; `gamma` and `beta` are shared by every block.',
-            side: {label: 'γ, β', sub: '[1000] · from cache'},
+              'Thread `c` sums `partial[p, c]` over the 64 partial rows in a fixed order: the same bits every run, unlike float `atomicAdd`s in arrival order. Adjacent threads read adjacent columns, so the loads coalesce.',
           },
         ],
-      },
-      {
-        id: 'saved',
-        label: 'Saved statistics',
-        sub: 'mean[row], rstd[row] · y written',
-        kind: 'memory',
-        detail: 'Two floats per row, so the backward recomputes `x̂` elementwise instead of reducing the row again.',
-      },
-      {
-        id: 'bwd',
-        label: 'layernorm_bwd<<<64, 256>>>',
-        sub: 'Σ dy·γ, Σ dy·γ·x̂ per row → dx',
-        kind: 'kernel',
-        detail:
-          'Block `b` handles rows `b, b + 64, …`: two block reductions per row, then `dx`, and its own partial row of `dγ` and `dβ`.',
-        side: {label: 'dy', sub: '[256, 1000]'},
-      },
-      {
-        id: 'partials',
-        label: 'dγ, dβ partial rows',
-        sub: '[64, 1000] each · no atomics',
-        kind: 'memory',
-        detail:
-          'Block `b` zeroes row `b` first; thread `t` alone touches the columns `c ≡ t (mod 256)` of it, so `+=` needs no atomic.',
-      },
-      {
-        id: 'reduce',
-        label: 'layernorm_bwd_reduce',
-        sub: 'one thread per column · 64 rows',
-        kind: 'kernel',
-        detail: 'Thread `c` sums `partial[p, c]` over the 64 partial rows in a fixed order: the same bits every run.',
-      },
-      {
-        id: 'grads',
-        label: 'Global memory',
-        sub: 'dx · dγ[1000] · dβ[1000]',
-        kind: 'memory',
-      },
-    ],
-    notes: [
-      {at: 'gmem-x', text: 'Rows at **1000** ± 1: E[x²] − E[x]² fails here'},
-      {at: 'welford', text: 'Up to **4** columns per thread, one read of x'},
-      {at: 'warp-merge', text: 'Chan: M2 += **δ²·n_a·n_b / n**'},
-      {at: 'saved', text: '**2** floats per row: no second variance', side: 'left'},
-      {at: 'partials', text: '**64** partial rows, then a column sum', side: 'left'},
-    ],
-    insets: [
-      {
-        for: 'bwd',
-        title: 'layernorm_bwd, per row',
-        items: [
-          {id: 'bwd-load', label: 'Recompute x̂ and g', sub: 'x̂ = (x − mean)·rstd · g = dy·γ', kind: 'kernel'},
-          {id: 'sum2', label: 'block_reduce_sum2', sub: 'Σ g, Σ g·x̂ → every thread', kind: 'kernel'},
-          {id: 'dx', label: 'Write dx', sub: 'rstd·(g − (Σg + x̂·Σgx̂) / N)', kind: 'kernel'},
-          {id: 'acc', label: 'Add to partial row b', sub: '+= dy·x̂, dy · thread owns its c', kind: 'kernel'},
+        arrows: [
+          {from: 'dy-x', to: 'bwd-block0', label: 'dy, x[row]'},
+          {from: 'dx', to: 'dx-out', label: 'dx[row]'},
+          {from: 'acc', to: 'partials', label: 'partial row 0'},
+          {from: 'partials', to: 'reduce', label: 'column c'},
+          {from: 'reduce', to: 'grads', label: 'dγ[c], dβ[c]'},
         ],
-        note: 'A barrier between the **row totals** and dx',
       },
-    ],
-  },
+    },
+  ],
   steps: [layernormKernelsStep],
   learn,
 };

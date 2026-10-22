@@ -11,7 +11,7 @@ export const wmmaMatmulStep: Step = {
   title: 'wmma_matmul: one warp, one 16×16 tile, fragments, mma_sync',
   concept: 'cuda',
   file: 'wmma_matmul',
-  focus: ['host', 'acc0', 'frag-a', 'frag-b', 'mma', 'acc', 'store'],
+  focus: ['mat-a', 'mat-b', 'as', 'bs', 'w0', 'mat-c', 'tc'],
   task: `## Task
 
 Implement \`C = A · B\` on tensor cores with \`nvcuda::wmma\` (\`#include <mma.h>\`): \`A\` is \`M × K\` and \`B\` is

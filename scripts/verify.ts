@@ -14,7 +14,8 @@
  */
 import {resolve} from 'node:path';
 
-import {architectureIds, architectureProblems} from '../src/lib/architecture';
+import {architectureProblems} from '../src/lib/architecture';
+import {gpuProblems} from '../src/lib/gpuFigure';
 import {describePattern, judge, matches, stripComments} from '../src/lib/judge';
 import {malformedBlocksOf, widgetsOf} from '../src/lib/markdown';
 import {type NodeRuntime, createNodePythonRuntime, createNodeTypeScriptRuntime} from '../src/lib/runtime/node';
@@ -25,7 +26,9 @@ import {
   type Problem,
   type Step,
   codeFor,
+  figureIds,
   fileName,
+  isArchitectureFigure,
   problemLanguages,
   SYSTEMS_CONCEPTS,
 } from '../src/lib/types';
@@ -86,21 +89,19 @@ function judgeSelfTest(): string[] {
   return failures;
 }
 
-/** The ids a step's `focus` may name: the diagram's nodes, or the architecture's blocks and ops. */
-const figureIds = (problem: Problem): Set<string> =>
-  problem.architecture !== undefined
-    ? architectureIds(problem.architecture)
+/** The ids a step's `focus` may name: the diagram's nodes, or the ids of every figure. */
+const focusIds = (problem: Problem): Set<string> =>
+  problem.figures !== undefined
+    ? new Set(problem.figures.flatMap(f => [...figureIds(f)]))
     : new Set((problem.diagram?.nodes ?? []).map(n => n.id));
 
 function verifyStep(problem: Problem, step: Step, index: number): string[] {
   const errors: string[] = [];
   const tag = `${problem.id}/${step.id}`;
-  const nodeIds = figureIds(problem);
+  const nodeIds = focusIds(problem);
   if (!/^[a-z0-9-]+$/.test(step.id)) errors.push(`${tag}: step id must be kebab-case`);
   if (problem.track === 'dl' && step.sequence !== undefined)
-    errors.push(
-      `${tag}: a deep-learning step has no request/reply sequence (use an :::architecture figure or a widget)`,
-    );
+    errors.push(`${tag}: a deep-learning step has no request/reply sequence (use a figure or a widget)`);
   if (problem.track === 'dl')
     for (const [where, text] of [
       ['task', step.task],
@@ -194,10 +195,32 @@ function verifyProblem(problem: Problem): string[] {
     for (const what of malformedBlocksOf(problem.learn)) errors.push(`${problem.id}: learning guide: ${what}`);
   }
   for (const what of malformedBlocksOf(problem.statement)) errors.push(`${problem.id}: statement: ${what}`);
-  // One figure per problem: a system diagram, or for the deep-learning track a layer stack.
+  // The systems track draws one system diagram; the deep-learning track draws titled figures, layer
+  // stacks for PyTorch models and GPU figures for CUDA kernels, as many as the problem needs.
   if (problem.track === 'dl') {
-    if (problem.architecture === undefined) errors.push(`${problem.id}: a deep-learning problem draws an architecture`);
+    const figures = problem.figures ?? [];
+    const kernel = problem.language === 'cuda';
+    if (figures.length === 0) errors.push(`${problem.id}: a deep-learning problem draws at least one figure`);
+    else if (!figures.some(f => isArchitectureFigure(f) !== kernel))
+      errors.push(
+        `${problem.id}: ${
+          kernel ? 'a CUDA problem draws a GPU figure' : 'a PyTorch problem draws an architecture figure'
+        }`,
+      );
     if (problem.diagram !== undefined) errors.push(`${problem.id}: a deep-learning problem has no system diagram`);
+    const titles = new Set<string>();
+    const seen = new Set<string>();
+    for (const f of figures) {
+      if (f.title.trim() === '') errors.push(`${problem.id}: a figure has no title`);
+      else if (titles.has(f.title)) errors.push(`${problem.id}: two figures are titled '${f.title}'`);
+      titles.add(f.title);
+      for (const what of isArchitectureFigure(f) ? architectureProblems(f.architecture) : gpuProblems(f.gpu))
+        errors.push(`${problem.id}: figure '${f.title}': ${what}`);
+      for (const id of figureIds(f)) {
+        if (seen.has(id)) errors.push(`${problem.id}: id '${id}' is in two figures, so a step's focus is ambiguous`);
+        seen.add(id);
+      }
+    }
     for (const [where, text] of [
       ['statement', problem.statement],
       ['learning guide', problem.learn ?? ''],
@@ -207,14 +230,16 @@ function verifyProblem(problem: Problem): string[] {
           `${problem.id}: ${where} uses a systems figure (:::sequence / :::diagram) in the deep-learning track`,
         );
     if (problem.learn !== undefined) {
-      if (!/^:::architecture\b/m.test(problem.learn))
-        errors.push(`${problem.id}: the learning guide draws no :::architecture figure`);
+      const kind = kernel ? 'gpu' : 'architecture';
+      if (!new RegExp(`^:::${kind}\\b`, 'm').test(problem.learn))
+        errors.push(`${problem.id}: the learning guide draws no :::${kind} figure`);
       if (widgetsOf(problem.learn).length === 0)
         errors.push(`${problem.id}: the learning guide has no interactive widget`);
     }
-  } else if (problem.diagram === undefined) errors.push(`${problem.id}: draws no system diagram`);
-  if (problem.architecture !== undefined)
-    for (const what of architectureProblems(problem.architecture)) errors.push(`${problem.id}: architecture: ${what}`);
+  } else {
+    if (problem.diagram === undefined) errors.push(`${problem.id}: draws no system diagram`);
+    if (problem.figures !== undefined) errors.push(`${problem.id}: figures belong to the deep-learning track`);
+  }
   const nodeIds = new Set<string>();
   for (const node of problem.diagram?.nodes ?? []) {
     if (nodeIds.has(node.id)) errors.push(`${problem.id}: duplicate diagram node '${node.id}'`);

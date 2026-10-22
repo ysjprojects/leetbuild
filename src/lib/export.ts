@@ -8,6 +8,7 @@
 import {night} from '@/styles/palette';
 
 import {type Architecture, architectureToMermaid} from './architecture';
+import {type GpuFigure, gpuToMermaid} from './gpuFigure';
 import {
   type Diagram,
   type Language,
@@ -18,6 +19,7 @@ import {
   codeFor,
   CONCEPT_LABEL,
   fileName,
+  isArchitectureFigure,
   LANGUAGE_LABEL,
   LANGUAGE_STACK,
   stepPath,
@@ -115,11 +117,11 @@ export function widgetsToNotes(markdown: string, stepUrl?: string): string {
 /**
  * `:::quiz` blocks become the question, its options as a task list, and the answer with its
  * explanation behind a `<details>` spoiler; `:::details Title` blocks become `<details>` elements;
- * `:::sequence`, `:::diagram` and `:::architecture` blocks become Mermaid fences.
+ * `:::sequence`, `:::diagram`, `:::architecture` and `:::gpu` blocks become Mermaid fences.
  */
 export function blocksToMarkdown(markdown: string): string {
   return markdown.replace(
-    /^:::(quiz|details|sequence|diagram|architecture)([^\n]*)\n([\s\S]*?)^:::\s*$/gm,
+    /^:::(quiz|details|sequence|diagram|architecture|gpu)([^\n]*)\n([\s\S]*?)^:::\s*$/gm,
     (_, kind: string, rest: string, body: string) => {
       if (kind === 'details')
         return `<details>\n<summary>${rest.trim() || 'Details'}</summary>\n\n${body.trim()}\n\n</details>`;
@@ -127,6 +129,7 @@ export function blocksToMarkdown(markdown: string): string {
       if (kind === 'diagram') return `\`\`\`mermaid\n${diagramToMermaid(JSON.parse(body) as Diagram)}\n\`\`\``;
       if (kind === 'architecture')
         return `\`\`\`mermaid\n${architectureToMermaid(JSON.parse(body) as Architecture)}\n\`\`\``;
+      if (kind === 'gpu') return `\`\`\`mermaid\n${gpuToMermaid(JSON.parse(body) as GpuFigure)}\n\`\`\``;
       const prompt: string[] = [];
       const options: string[] = [];
       const explanation: string[] = [];
@@ -256,19 +259,28 @@ export function problemToMarkdown(problem: Problem, language: Language): string 
       parts.push(`- [${s.title}](${s.url})${s.by !== undefined ? ` — ${s.by}` : ''}, ${s.date}. ${s.takes}`);
     parts.push('');
   }
-  const figure =
-    problem.architecture !== undefined
-      ? architectureToMermaid(problem.architecture)
+  const figures: {title: string; mermaid: string}[] =
+    problem.figures !== undefined
+      ? problem.figures.map(f => ({
+          title: f.title,
+          mermaid: isArchitectureFigure(f) ? architectureToMermaid(f.architecture) : gpuToMermaid(f.gpu),
+        }))
       : problem.diagram !== undefined
-      ? diagramToMermaid(problem.diagram)
-      : null;
-  if (figure !== null) {
+      ? [{title: '', mermaid: diagramToMermaid(problem.diagram)}]
+      : [];
+  if (figures.length > 0) {
     parts.push('## Architecture');
     parts.push('');
-    parts.push('```mermaid');
-    parts.push(figure);
-    parts.push('```');
-    parts.push('');
+    for (const f of figures) {
+      if (figures.length > 1) {
+        parts.push(`### ${f.title}`);
+        parts.push('');
+      }
+      parts.push('```mermaid');
+      parts.push(f.mermaid);
+      parts.push('```');
+      parts.push('');
+    }
   }
   parts.push('## Steps');
   parts.push('');

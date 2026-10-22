@@ -20,7 +20,7 @@ export const rowSoftmaxStep: Step = {
   title: 'softmax_rows: one block per row, two block reductions, exp(x − max)',
   concept: 'cuda',
   file: 'row_softmax',
-  focus: ['max-local', 'max-warp', 's-max', 'guard', 'sum-local', 'sum-warp', 's-sum', 'write'],
+  focus: ['x', 'pass-max', 's-max', 'guard', 'pass-sum', 's-sum', 'write', 'inv', 'y'],
   task: `## Task
 
 Implement \`__global__ void softmax_rows(const float* x, float* y, int rows, int cols)\`: \`y[r][c] = exp(x[r][c] − m_r) / Σ_c exp(x[r][c] − m_r)\`

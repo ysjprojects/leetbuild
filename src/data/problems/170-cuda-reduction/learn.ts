@@ -11,30 +11,32 @@ each partial lives: a register per thread, registers passed between the 32 lanes
 kilobytes of shared memory per block, and global memory between blocks. A good reduction uses each level
 once, in that order, and moves as little as possible to the next.
 
-Bottom to top, how many partials are left at each level for the 512 × 256 launch:
+Where the partials live in the 512 × 256 launch, scope inside scope, and how many there are at each level:
 
-:::architecture
+:::gpu
 {
-  "input": "2²⁴ floats · 512 blocks × 256 threads",
-  "output": "one float",
   "items": [
-    {"id": "g-in", "label": "Global memory", "sub": "in[n] · 16,777,216 floats", "kind": "memory", "shape": "16.8 M values", "detail": "Read once, coalesced: 64 MiB for 16 M adds, so the kernel is as fast as it reads."},
-    {"tone": "block", "repeat": "512 ×", "label": "Thread block · 256 threads", "items": [
-      {"id": "g-reg", "label": "Register per thread", "sub": "grid-stride: 128 adds each", "kind": "kernel", "shape": "131,072 partials", "detail": "Each thread folds every 131,072nd element into one register before any tree starts."},
-      {"tone": "dotted", "label": "each of 8 warps", "items": [
-        {"id": "g-warp", "label": "Warp shuffles", "sub": "32 lanes → lane 0", "kind": "kernel", "shape": "4,096 warp sums", "detail": "Five \`__shfl_down_sync\` steps: registers move lane to lane, no shared memory, no barrier."}
+    {"id": "g-grid", "label": "Grid", "sub": "reduce_sum<<<512, 256>>>", "count": "512 blocks", "align": "end", "items": [
+      {"id": "g-gmem", "label": "Global memory", "tone": "global", "layout": "column", "items": [
+        {"id": "g-in", "array": "in[n]", "sub": "16.8 M floats, read once", "cols": 16, "continues": true, "detail": "Read once, coalesced: 64 MiB for 16 M adds, so the kernel is as fast as it reads."},
+        {"id": "g-out", "array": "out", "sub": "512 atomics", "cols": 1, "detail": "One float. Blocks cannot synchronise inside a launch; their totals meet here, one \`atomicAdd\` per block."}
       ]},
-      {"id": "g-smem", "label": "Shared memory", "sub": "warp_sums[8] per block", "kind": "memory", "shape": "8 slots per block", "detail": "Lane 0 of each warp writes its slot; one \`__syncthreads()\` makes them visible."},
-      {"id": "g-block", "label": "Warp 0 per block", "sub": "8 slots → lane 0", "kind": "kernel", "shape": "512 block sums", "detail": "Warp 0 reads the slots (0 past the warp count) and shuffles again."}
-    ]},
-    {"id": "g-atomic", "label": "atomicAdd into out", "sub": "one per block", "kind": "kernel", "shape": "1 float", "detail": "Blocks cannot synchronise inside a launch; their totals meet in global memory."},
-    {"id": "g-out", "label": "Global memory", "sub": "out · 4 bytes", "kind": "memory"}
+      {"id": "g-block", "label": "Block", "sub": "× 512", "count": "8 warps", "align": "end", "items": [
+        {"id": "g-warp", "label": "Warp", "sub": "× 4,096", "count": "32 lanes", "layout": "column", "items": [
+          {"threads": 8, "continues": true, "label": "a lane is a thread"},
+          {"id": "g-reg", "label": "Registers", "sub": "v · 131,072 partials", "tone": "register", "detail": "Each thread folds every 131,072nd element into one register before any tree starts: 128 adds each."}
+        ]},
+        {"id": "g-smem", "label": "Shared memory", "sub": "warp_sums · 4,096 sums", "tone": "shared", "detail": "Five \`__shfl_down_sync\` steps leave each warp's sum in lane 0, which writes its slot; one \`__syncthreads()\` makes the 8 slots visible."},
+        {"id": "g-w0", "label": "Warp 0", "sub": "512 block sums", "layout": "column", "items": [
+          {"threads": 8, "continues": true, "label": "lane 0 adds to out"}
+        ], "detail": "Warp 0 of each block reads the slots (0 past the warp count), shuffles again and does the block's one atomicAdd."}
+      ]}
+    ]}
   ],
-  "notes": [
-    {"at": "g-reg", "text": "**131,072** partials, one register each"},
-    {"at": "g-warp", "text": "**4,096** warp sums, no barrier"},
-    {"at": "g-block", "text": "**512** block sums after **1** barrier each"},
-    {"at": "g-atomic", "text": "**512** atomics into one address"}
+  "arrows": [
+    {"from": "g-in", "to": "g-reg", "label": "128 floats each"},
+    {"from": "g-reg", "to": "g-smem", "label": "lane 0"},
+    {"from": "g-smem", "to": "g-w0"}
   ]
 }
 :::
@@ -158,30 +160,38 @@ for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * bloc
   and shuffles again. With at most 1024 threads there are at most 32 warps, so one warp finishes any block.
 - The guard matters: a 128-thread block fills four slots and leaves 28 uninitialised.
 
-The hand-off inside one 256-thread block, bottom to top:
+The hand-off inside one block of the 64 × 128 launch, where the guard does its work: four warps, four
+slots written, 28 holding whatever shared memory held before.
 
-:::architecture
+:::gpu
 {
-  "input": "one grid-stride partial v per thread",
-  "output": "*out += block sum",
+  "align": "end",
   "items": [
-    {"tone": "block", "repeat": "512 ×", "label": "One block · 8 warps", "items": [
-      {"columns": [
-        [{"id": "h-w0", "label": "Warp 0 shuffles", "sub": "lane 0 → warp_sums[0]", "kind": "kernel"}],
-        [{"id": "h-w1", "label": "Warp 1 shuffles", "sub": "lane 0 → warp_sums[1]", "kind": "kernel"}],
-        [{"id": "h-w7", "label": "… warp 7", "sub": "lane 0 → warp_sums[7]", "kind": "kernel"}]
+    {"id": "h-block", "label": "One block", "sub": "128 threads · 4 warps", "count": "× 64", "layout": "column", "items": [
+      {"id": "h-warps", "label": "Every warp", "sub": "v = warp_reduce_sum(v)", "items": [
+        {"label": "Warp 0", "layout": "column", "items": [{"threads": 8, "continues": true, "label": "32 lanes"}]},
+        {"label": "Warp 1", "layout": "column", "items": [{"threads": 8, "continues": true, "label": "32 lanes"}]},
+        {"label": "Warp 2", "layout": "column", "items": [{"threads": 8, "continues": true, "label": "32 lanes"}]},
+        {"label": "Warp 3", "layout": "column", "items": [{"threads": 8, "continues": true, "label": "32 lanes"}]}
       ]},
-      {"id": "h-smem", "label": "__shared__ warp_sums[32]", "sub": "slots 0–7 written, 8–31 stale", "kind": "memory", "detail": "Shared memory is not initialised: only the slots of existing warps hold sums."},
-      {"id": "h-sync", "label": "__syncthreads()", "sub": "every slot visible to warp 0", "kind": "kernel", "detail": "The only barrier in the kernel. Every thread must reach it, including those whose loop did zero iterations."},
-      {"id": "h-read", "label": "Warp 0 reads the slots", "sub": "lane < 8 ? warp_sums[lane] : 0", "kind": "kernel", "detail": "Lanes past \`blockDim.x / 32\` contribute 0, the identity of the sum."},
-      {"id": "h-shfl", "label": "warp_reduce_sum again", "sub": "5 shuffles → lane 0", "kind": "kernel"},
-      {"id": "h-atomic", "label": "atomicAdd(out, v)", "sub": "lane 0 of warp 0 only", "kind": "kernel"}
+      {"id": "h-smem", "label": "Shared memory", "sub": "__shared__ float warp_sums[32]", "tone": "shared", "stretch": true, "layout": "column", "items": [
+        {"id": "h-slots", "array": "warp_sums", "sub": "not initialised", "cols": 32, "tone": "shared", "cells": "index", "marks": [
+          {"cols": [0, 3], "tone": "shared", "label": "warps 0–3"},
+          {"cols": [4, 31], "tone": "bad", "label": "stale: never written by this block"}
+        ], "detail": "Shared memory is not initialised: only the slots of existing warps hold sums. Reading slot 4 would add garbage from whatever ran on this SM before."}
+      ]},
+      {"id": "h-read", "label": "Warp 0 reads the slots", "sub": "lane < 4 ? warp_sums[lane] : 0", "layout": "column", "items": [
+        {"threads": 32, "idle": 28, "label": "lanes 4–31 contribute 0, the identity"}
+      ], "detail": "Lanes past \`blockDim.x / 32\` contribute 0, the identity of the sum; then \`warp_reduce_sum\` again, and lane 0 holds the block's total."}
     ]},
-    {"id": "h-out", "label": "Global memory", "sub": "out · 4 bytes", "kind": "memory"}
+    {"id": "h-gmem", "label": "Global memory", "tone": "global", "items": [
+      {"id": "h-out", "array": "out", "sub": "1 float", "cols": 1, "detail": "Zeroed by the host before every launch; 64 atomics land here."}
+    ]}
   ],
-  "notes": [
-    {"at": "h-smem", "text": "A 128-thread block: **4** slots written, **28** stale"},
-    {"at": "h-read", "text": "The guard reads **0** past blockDim.x / 32"}
+  "arrows": [
+    {"from": "h-warps", "to": "h-smem", "label": "lane 0 of each warp"},
+    {"from": "h-smem", "to": "h-read", "label": "after __syncthreads()"},
+    {"from": "h-read", "to": "h-out", "label": "atomicAdd(out, v)"}
   ]
 }
 :::

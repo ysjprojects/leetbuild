@@ -62,128 +62,133 @@ laptop CPU.
 The U-Net or DiT backbone, learned variances (Nichol & Dhariwal's \`L_hybrid\`), EMA weights, loss
 weighting (min-SNR) and v-prediction, conditioning and classifier-free guidance, latent diffusion's VAE,
 and higher-order ODE solvers (DPM-Solver, UniPC).`,
-  architecture: {
-    output: '2,000 samples on the two moons',
-    items: [
-      {
-        id: 'x0',
-        label: 'Clean data x₀',
-        kind: 'io',
-        sub: 'two_moons · (512, 2) batches',
-        shape: 'x₀ (512, 2)',
-        detail:
-          '`train_toy` draws 512 rows per step from 4,096 two-moons points, centred and scaled to about unit variance.',
-      },
-      {
-        tone: 'block',
-        repeat: '3,000 ×',
-        label: 'Training step · ddpm_loss',
+  figures: [
+    {
+      title: 'DDPM training and sampling',
+      architecture: {
+        output: '2,000 samples on the two moons',
         items: [
           {
-            id: 'draw',
-            label: 'Draw t and ε',
-            sub: 't ~ U{0 … 999} · ε ~ N(0, I)',
-            shape: 't (512,) · ε (512, 2)',
+            id: 'x0',
+            label: 'Clean data x₀',
+            kind: 'io',
+            sub: 'two_moons · (512, 2) batches',
+            shape: 'x₀ (512, 2)',
             detail:
-              'One timestep per sample, uniformly: a batch of 512 sees 512 noise levels, so the loss averages over `t` by construction.',
+              '`train_toy` draws 512 rows per step from 4,096 two-moons points, centred and scaled to about unit variance.',
           },
           {
-            id: 'q-sample',
-            label: 'Forward process q(x_t | x₀)',
-            kind: 'attention',
-            sub: '√ᾱ_t · x₀ + √(1 − ᾱ_t) · ε',
-            shape: 'x_t (512, 2)',
-            side: {
-              label: 'NoiseSchedule',
-              sub: '7 buffers · (T,) fp32',
-              detail:
-                '`betas`, `alphas`, `alphas_cumprod`, `alphas_cumprod_prev`, the two square roots and `posterior_variance`: computed once in float64, stored as float32 buffers that move with `.to(device)`.',
-            },
-            detail:
-              '`q_sample`: the marginal after `t` forward steps, drawn in one step. Gaussians compose, so the mean is `√ᾱ_t x₀` and the variance `1 − ᾱ_t`; the chain is never simulated.',
+            tone: 'block',
+            repeat: '3,000 ×',
+            label: 'Training step · ddpm_loss',
+            items: [
+              {
+                id: 'draw',
+                label: 'Draw t and ε',
+                sub: 't ~ U{0 … 999} · ε ~ N(0, I)',
+                shape: 't (512,) · ε (512, 2)',
+                detail:
+                  'One timestep per sample, uniformly: a batch of 512 sees 512 noise levels, so the loss averages over `t` by construction.',
+              },
+              {
+                id: 'q-sample',
+                label: 'Forward process q(x_t | x₀)',
+                kind: 'attention',
+                sub: '√ᾱ_t · x₀ + √(1 − ᾱ_t) · ε',
+                shape: 'x_t (512, 2)',
+                side: {
+                  label: 'NoiseSchedule',
+                  sub: '7 buffers · (T,) fp32',
+                  detail:
+                    '`betas`, `alphas`, `alphas_cumprod`, `alphas_cumprod_prev`, the two square roots and `posterior_variance`: computed once in float64, stored as float32 buffers that move with `.to(device)`.',
+                },
+                detail:
+                  '`q_sample`: the marginal after `t` forward steps, drawn in one step. Gaussians compose, so the mean is `√ᾱ_t x₀` and the variance `1 − ᾱ_t`; the chain is never simulated.',
+              },
+              {
+                id: 'eps-train',
+                label: 'Noise predictor ε_θ(x_t, t)',
+                kind: 'ffn',
+                sub: 'TinyDenoiser · 66 → 256 → 256 → 2',
+                shape: 'ε̂ (512, 2)',
+                side: {label: 'Timestep embedding', sub: 'sinusoidal · 64'},
+                detail:
+                  'An MLP over the point concatenated with a 64-dim sinusoidal embedding of `t`, SiLU between layers, 83,458 parameters. One network serves all 1,000 noise levels.',
+              },
+              {
+                id: 'loss',
+                label: 'MSE(ε̂, ε)',
+                kind: 'loss',
+                sub: 'L_simple · Adam lr 2e-3',
+                shape: 'trained ε_θ',
+                detail:
+                  '`F.mse_loss(model(x_t, t), noise)`: the unweighted ε loss of Algorithm 1. It falls from about 0.55 to about 0.25, not 0: at large `t` the noise is unpredictable from `x_t`.',
+              },
+            ],
           },
           {
-            id: 'eps-train',
-            label: 'Noise predictor ε_θ(x_t, t)',
-            kind: 'ffn',
-            sub: 'TinyDenoiser · 66 → 256 → 256 → 2',
-            shape: 'ε̂ (512, 2)',
-            side: {label: 'Timestep embedding', sub: 'sinusoidal · 64'},
-            detail:
-              'An MLP over the point concatenated with a 64-dim sinusoidal embedding of `t`, SiLU between layers, 83,458 parameters. One network serves all 1,000 noise levels.',
+            tone: 'block',
+            repeat: '1,000 ×',
+            label: 'Reverse step · p_sample',
+            items: [
+              {
+                id: 'eps-pred',
+                label: 'Trained ε_θ(x_t, t)',
+                kind: 'ffn',
+                sub: 't = 999, 998, … 0',
+                shape: 'ε̂ (2,000, 2)',
+                side: {
+                  label: 'Pure noise x_T',
+                  sub: 'randn · (2,000, 2)',
+                  detail:
+                    'Sampling starts from `N(0, I)`, the distribution the forward process ends in; it is `x_t` at the first step.',
+                },
+                detail:
+                  'The same network, called once per step under `torch.no_grad()` with `torch.full((B,), t)`. DDIM calls it 50 times on `range(0, 1000, 20)` instead.',
+              },
+              {
+                id: 'mean',
+                label: 'Posterior mean μ',
+                kind: 'attention',
+                sub: '(x_t − β_t/√(1 − ᾱ_t) · ε̂) / √α_t',
+                shape: 'μ (2,000, 2)',
+                detail:
+                  'The mean of `q(x_{t−1} | x_t, x₀)` with `x₀` replaced by its estimate from `ε̂`. Reads `betas[t]`, `sqrt_one_minus_alphas_cumprod[t]` and `alphas[t]`.',
+              },
+              {
+                id: 'noise-step',
+                label: 'Add posterior noise',
+                kind: 'attention',
+                sub: 'x_{t−1} = μ + σ_t · z',
+                shape: 'x_{t−1} (2,000, 2)',
+                side: {
+                  label: 'z ~ N(0, I)',
+                  sub: 'σ_t² from the buffers',
+                  detail: '`σ_t² = posterior_variance[t]`, the variance of `q(x_{t−1} | x_t, x₀)`.',
+                },
+                detail:
+                  'Fresh noise at every step makes this ancestral sampling. At `t = 0` the step returns `μ` alone: `posterior_variance[0]` is 0.',
+              },
+            ],
           },
           {
-            id: 'loss',
-            label: 'MSE(ε̂, ε)',
-            kind: 'loss',
-            sub: 'L_simple · Adam lr 2e-3',
-            shape: 'trained ε_θ',
+            id: 'samples',
+            label: 'Samples x₀',
+            kind: 'io',
+            sub: 'median distance < 0.05',
             detail:
-              '`F.mse_loss(model(x_t, t), noise)`: the unweighted ε loss of Algorithm 1. It falls from about 0.55 to about 0.25, not 0: at large `t` the noise is unpredictable from `x_t`.',
+              'The self-test checks that 2,000 samples from each sampler land within a median distance of 0.05 of the two moons.',
           },
         ],
-      },
-      {
-        tone: 'block',
-        repeat: '1,000 ×',
-        label: 'Reverse step · p_sample',
-        items: [
-          {
-            id: 'eps-pred',
-            label: 'Trained ε_θ(x_t, t)',
-            kind: 'ffn',
-            sub: 't = 999, 998, … 0',
-            shape: 'ε̂ (2,000, 2)',
-            side: {
-              label: 'Pure noise x_T',
-              sub: 'randn · (2,000, 2)',
-              detail:
-                'Sampling starts from `N(0, I)`, the distribution the forward process ends in; it is `x_t` at the first step.',
-            },
-            detail:
-              'The same network, called once per step under `torch.no_grad()` with `torch.full((B,), t)`. DDIM calls it 50 times on `range(0, 1000, 20)` instead.',
-          },
-          {
-            id: 'mean',
-            label: 'Posterior mean μ',
-            kind: 'attention',
-            sub: '(x_t − β_t/√(1 − ᾱ_t) · ε̂) / √α_t',
-            shape: 'μ (2,000, 2)',
-            detail:
-              'The mean of `q(x_{t−1} | x_t, x₀)` with `x₀` replaced by its estimate from `ε̂`. Reads `betas[t]`, `sqrt_one_minus_alphas_cumprod[t]` and `alphas[t]`.',
-          },
-          {
-            id: 'noise-step',
-            label: 'Add posterior noise',
-            kind: 'attention',
-            sub: 'x_{t−1} = μ + σ_t · z',
-            shape: 'x_{t−1} (2,000, 2)',
-            side: {
-              label: 'z ~ N(0, I)',
-              sub: 'σ_t² from the buffers',
-              detail: '`σ_t² = posterior_variance[t]`, the variance of `q(x_{t−1} | x_t, x₀)`.',
-            },
-            detail:
-              'Fresh noise at every step makes this ancestral sampling. At `t = 0` the step returns `μ` alone: `posterior_variance[0]` is 0.',
-          },
+        notes: [
+          {at: 'q-sample', text: 'Any t in **one** step: no chain in training'},
+          {at: 'loss', text: 'Loss settles near **0.25**, not 0'},
+          {at: 'eps-pred', text: '**1,000** network calls; DDIM needs **50**'},
+          {at: 'noise-step', text: 'No noise at **t = 0**'},
         ],
       },
-      {
-        id: 'samples',
-        label: 'Samples x₀',
-        kind: 'io',
-        sub: 'median distance < 0.05',
-        detail:
-          'The self-test checks that 2,000 samples from each sampler land within a median distance of 0.05 of the two moons.',
-      },
-    ],
-    notes: [
-      {at: 'q-sample', text: 'Any t in **one** step: no chain in training'},
-      {at: 'loss', text: 'Loss settles near **0.25**, not 0'},
-      {at: 'eps-pred', text: '**1,000** network calls; DDIM needs **50**'},
-      {at: 'noise-step', text: 'No noise at **t = 0**'},
-    ],
-  },
+    },
+  ],
   steps: [ddpmForwardStep, ddpmSampleStep],
   learn,
 };

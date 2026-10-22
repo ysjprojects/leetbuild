@@ -141,7 +141,7 @@ export const flashAttentionStep: Step = {
   title: 'flash_attn_fwd: tiled scores, online softmax, one write of O',
   concept: 'cuda',
   file: 'flash_attention',
-  focus: ['q-reg', 'skip', 'smem', 'scores', 'rescale', 'accum', 'normalise'],
+  focus: ['q', 'ks', 'vs', 's', 'ml', 'o', 'g-o'],
   task: `## Task
 
 Implement the kernel

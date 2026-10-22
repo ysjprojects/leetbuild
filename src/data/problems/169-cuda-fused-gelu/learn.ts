@@ -11,39 +11,31 @@ step — add the bias, apply the GELU — over an activation of \`tokens × 4·d
 4096 tokens that is 4096 × 3072 = 12,582,912 elements, 48 MiB. The step does almost no arithmetic per byte,
 so its speed is set by how many bytes it moves and how it asks for them.
 
-Bottom to top, one launch: the activation and the bias come in from global memory as 16-byte vectors, the
-bias add and the GELU happen in registers, and \`y\` goes out once. A scalar kernel picks up the last
-\`n % 4\` elements.
+One launch over the activation: a grid of 12,288 blocks of 256 threads, each thread one \`float4\` of \`x\`,
+three blocks to a row of 3072 floats. Every thread adds the bias lanes that sit over its four columns and
+applies the GELU in registers, so \`x\` is read once and \`y\` written once. A scalar kernel picks up the last
+\`n % 4\` elements when there are any.
 
-:::architecture
+:::gpu
 {
-  "input": "x: 4096 × 3072 float32 · bias: 3072",
-  "output": "y = gelu(x + bias)",
+  "layout": "column",
   "items": [
-    {"id": "gmem-in", "label": "Global memory x, bias", "kind": "memory", "sub": "x 48 MiB · bias 12 KiB", "shape": "float4[3,145,728] · float4[768]", "detail": "Reinterpreted as float4: n4 = n / 4 vectors of x, cols4 = 768 of the bias."},
-    {"columns": [
-      [{"tone": "block", "repeat": "12,288 ×", "label": "Thread block · 256 threads", "items": [
-        {"columns": [
-          [{"id": "ld-x", "label": "float4 load x[i]", "kind": "memory", "sub": "LDG.128 · 16 B", "detail": "Returns first when i >= n4. A warp asks for 512 contiguous bytes."}],
-          [{"id": "ld-b", "label": "float4 load bias[i % 768]", "kind": "memory", "sub": "LDG.128 · cache-resident", "detail": "The four lanes of x[i] are the four lanes of bias[i % cols4] when cols % 4 == 0."}]
-        ]},
-        {"tone": "dotted", "label": "Registers · four lanes", "items": [
-          {"id": "add", "op": "+", "detail": "v.x + b.x … v.w + b.w: the fused bias add."},
-          {"id": "gelu", "label": "gelu_tanh × 4 lanes", "kind": "kernel", "sub": "0.5v(1+tanh(√(2/π)(v+0.044715v³)))", "detail": "Single precision, tanhf, inlined: about 20 FLOPs per element."}
-        ]},
-        {"id": "st-y", "label": "float4 store y[i]", "kind": "kernel", "sub": "STG.128 · 16 B"}
-      ]}],
-      [{"tone": "dotted", "label": "Tail kernel · 1 block", "items": [
-        {"id": "tail", "label": "Scalar tail", "kind": "kernel", "sub": "y[i] = gelu(x[i] + bias[i % cols])", "detail": "Launched with n % 4 threads from 4 · n4, only when n % 4 > 0."}
-      ]}]
+    {"id": "grid", "label": "Kernel grid", "sub": "gelu_bias_kernel<<<12,288, 256>>>", "count": "12,288 blocks", "detail": "n4 = 4096 × 3072 / 4 = 3,145,728 threads, one per float4, in blocks of 256: three blocks per row of 3072 floats.", "items": [
+      {"id": "block0", "label": "Block 0", "layout": "column", "items": [{"threads": 8, "continues": true, "label": "256 float4s"}], "detail": "Threads 0 … 255 take floats 0 … 1023 of row 0, four each: a warp asks for 512 contiguous bytes per load."},
+      {"label": "Block 1", "layout": "column", "items": [{"threads": 8, "continues": true, "label": "256 float4s"}]},
+      {"label": "Block 2", "layout": "column", "items": [{"threads": 8, "continues": true, "label": "256 float4s"}]},
+      {"gap": "…"},
+      {"label": "Block 12,287", "layout": "column", "items": [{"threads": 8, "continues": true, "label": "256 float4s"}]}
     ]},
-    {"id": "gmem-y", "label": "Global memory y", "kind": "memory", "sub": "48 MiB · written once", "shape": "float[4096 × 3072]"}
-  ],
-  "notes": [
-    {"at": "ld-x", "text": "**16 B** per load: 512 B in flight per warp", "side": "left"},
-    {"at": "gelu", "text": "~**2.5 FLOP/B** against a ridge near 20: memory-bound"},
-    {"at": "tail", "text": "Only when **n % 4 > 0**"},
-    {"at": "gmem-y", "text": "**8 B** of HBM per element: one read, one write"}
+    {"id": "act-gmem", "label": "Global memory", "sub": "cudaMalloc · HBM", "tone": "global", "stretch": true, "items": [
+      {"id": "act-x", "array": "x · 4096 × 3072", "sub": "a cell = 256 floats", "rows": 4, "cols": 12, "continues": true, "marks": [
+        {"cols": [0, 3], "rows": [0, 0], "tone": "register", "label": "block 0"},
+        {"cols": [4, 7], "rows": [0, 0], "tone": "register", "label": "block 1"},
+        {"cols": [8, 11], "rows": [0, 0], "tone": "register", "label": "block 2"}
+      ], "detail": "A block covers 1024 floats, a third of a row; every element is read exactly once."},
+      {"id": "act-bias", "array": "bias · 3072", "sub": "every row", "cols": 12, "marks": [{"cols": [0, 11], "tone": "register", "label": "same lanes, every row"}], "detail": "All 4096 rows read the same 12 KiB; after the first row it comes from L2."},
+      {"id": "act-y", "array": "y · 4096 × 3072", "sub": "written once", "rows": 4, "cols": 12, "continues": true, "detail": "Thread i writes the float4 it read."}
+    ]}
   ]
 }
 :::
@@ -136,30 +128,46 @@ Q: You replace tanhf with a cheaper polynomial and halve the FLOPs per element. 
 
 Eager PyTorch runs \`x + b\` and \`F.gelu\` as two kernels. The intermediate \`x + b\` is a full activation
 that has to be written to HBM by the first and read back by the second. Side by side, from the same \`x\`
-to the same \`y\`:
+to the same \`y\`: above, every arrow is a 48 MiB pass over HBM; below, the sum lives in the four lanes of
+a \`float4\` register and only \`x\` and \`y\` cross the memory boundary.
 
-:::architecture
+:::gpu
 {
-  "input": "x, bias",
-  "output": "y = gelu(x + bias)",
+  "layout": "column",
   "items": [
-    {"id": "gmem-x", "label": "Global memory x", "kind": "memory", "sub": "48 MiB", "detail": "Read once by either version; the bias comes from cache."},
-    {"columns": [
-      [{"tone": "dotted", "label": "Eager · 2 kernels", "items": [
-        {"id": "e-add", "label": "add kernel", "kind": "kernel", "sub": "t = x + b"},
-        {"id": "e-t", "label": "Global memory t", "kind": "memory", "sub": "48 MiB written, then read back", "detail": "The intermediate makes a full round trip through HBM: the bytes just written are read straight back."},
-        {"id": "e-gelu", "label": "gelu kernel", "kind": "kernel", "sub": "F.gelu(t), tanh form"}
-      ]}],
-      [{"tone": "dotted", "label": "Fused · 1 kernel", "items": [
-        {"id": "f-add", "label": "Registers: v + b", "kind": "memory", "sub": "t never leaves the thread"},
-        {"id": "f-gelu", "label": "gelu_tanh × 4 lanes", "kind": "kernel", "sub": "in registers"}
-      ]}]
+    {"id": "eager", "label": "Eager PyTorch: two launches", "sub": "x + bias, then F.gelu(t)", "count": "192 MiB of HBM traffic", "items": [
+      {"id": "u-in", "label": "HBM", "tone": "global", "layout": "column", "items": [
+        {"id": "u-x", "array": "x", "sub": "48 MiB", "cols": 6, "continues": true},
+        {"id": "u-b", "array": "bias", "sub": "12 KiB", "cols": 3}
+      ]},
+      {"id": "u-add", "label": "add kernel", "sub": "t = x + bias", "tone": "compute"},
+      {"id": "u-mid", "label": "HBM", "tone": "global", "items": [
+        {"id": "u-t", "array": "t", "sub": "48 MiB", "cols": 6, "continues": true, "detail": "A full round trip through HBM for values that were in registers a moment earlier."}
+      ]},
+      {"id": "u-gelu", "label": "gelu kernel", "sub": "y = gelu(t)", "tone": "compute"},
+      {"id": "u-out", "label": "HBM", "tone": "global", "items": [{"id": "u-y", "array": "y", "sub": "48 MiB", "cols": 6, "continues": true}]}
     ]},
-    {"id": "gmem-y", "label": "Global memory y", "kind": "memory", "sub": "48 MiB"}
+    {"id": "fused", "label": "Fused: one launch", "sub": "gelu_bias_kernel<<<12,288, 256>>>", "count": "96 MiB of HBM traffic", "items": [
+      {"id": "f-in", "label": "HBM", "tone": "global", "layout": "column", "items": [
+        {"id": "x", "array": "x", "sub": "48 MiB", "cols": 6, "continues": true},
+        {"id": "bias", "array": "bias", "sub": "12 KiB · from L2", "cols": 3, "detail": "Read by every row, so it comes from L2 after the first."}
+      ]},
+      {"id": "thread", "label": "Thread i", "sub": "i = blockIdx.x · 256 + threadIdx.x", "count": "3,145,728 threads", "layout": "column", "items": [
+        {"id": "regs", "label": "Registers", "sub": "t never leaves them", "tone": "register", "layout": "column", "items": [
+          {"id": "v", "array": "v = x[i] + bias[i % 768]", "cols": 4, "cells": [".x", ".y", ".z", ".w"], "tone": "register", "detail": "The bias add, four FADDs, fused."},
+          {"id": "r", "array": "r = gelu_tanh(v)", "sub": "× 4 lanes", "cols": 4, "cells": [".x", ".y", ".z", ".w"], "tone": "register", "detail": "Inlined, single precision, about 20 FLOPs per element."}
+        ]}
+      ]},
+      {"id": "f-out", "label": "HBM", "tone": "global", "items": [{"id": "y", "array": "y", "sub": "48 MiB", "cols": 6, "continues": true}]}
+    ]}
   ],
-  "notes": [
-    {"at": "e-t", "text": "**192 MiB** moved, two launches", "side": "left"},
-    {"at": "f-gelu", "text": "**96 MiB** moved, one launch"}
+  "arrows": [
+    {"from": "u-in", "to": "u-add", "label": "read 48 MiB"},
+    {"from": "u-add", "to": "u-mid", "label": "write 48 MiB"},
+    {"from": "u-mid", "to": "u-gelu", "label": "read 48 MiB"},
+    {"from": "u-gelu", "to": "u-out", "label": "write 48 MiB"},
+    {"from": "f-in", "to": "regs", "label": "float4 reads · 48 MiB"},
+    {"from": "regs", "to": "f-out", "label": "float4 writes · 48 MiB"}
   ]
 }
 :::
@@ -197,29 +205,33 @@ The rules that make \`reinterpret_cast<const float4*>(x)\` legal:
   \`4·(i % cols4)\` … \`+3\` of one row — exactly the four lanes of \`bias[i % cols4]\`.
 - **The tail.** \`n / 4\` vectors cover \`4 · n4\` elements; the last \`n % 4\` need scalar code.
 
-For \`n = 1,000,003\` the split is two launches over two ranges of \`y\`; the notes mark what each missing
-piece costs:
+For \`n = 1,000,003\` the split is two launches over two ranges of \`y\`. The last block of the vector
+kernel has 112 threads past \`n4\` (dimmed): without the guard they would load past the end. The tail
+kernel's three threads write the floats no \`float4\` covers: without that launch they stay 0 and the
+self-test fails.
 
-:::architecture
+:::gpu
 {
-  "input": "n = 1,000,003 · n4 = 250,000",
-  "output": "all 1,000,003 elements of y",
+  "layout": "column",
   "items": [
-    {"id": "gmem-x", "label": "Global memory x, bias", "kind": "memory", "sub": "x: 1,000,003 floats"},
-    {"columns": [
-      [{"tone": "block", "repeat": "977 ×", "label": "Vector kernel · 256 threads", "items": [
-        {"id": "guard", "label": "Guard: i >= n4 returns", "kind": "kernel", "sub": "250,112 threads, 112 spare"},
-        {"id": "vec", "label": "float4 path", "kind": "kernel", "sub": "y[0 … 999,999]"}
-      ]}],
-      [{"tone": "dotted", "label": "Tail kernel · 3 threads", "items": [
-        {"id": "tk", "label": "Scalar tail", "kind": "kernel", "sub": "y[1,000,000 … 1,000,002]", "detail": "gelu_bias_tail_kernel with start = 4 · n4 = 1,000,000."}
-      ]}]
+    {"id": "launches", "label": "Two launches for n = 1,000,003", "sub": "n4 = 250,000 · n % 4 = 3", "align": "end", "items": [
+      {"id": "vec-grid", "label": "gelu_bias_kernel", "sub": "<<<977, 256>>>", "count": "250,112 threads", "detail": "977 blocks: 250,112 threads for 250,000 vectors; if (i >= n4) return; stops the extra 112.", "items": [
+        {"label": "Block 0", "layout": "column", "items": [{"threads": 9, "continues": true, "label": "256 work"}]},
+        {"gap": "…"},
+        {"id": "last-block", "label": "Block 976", "layout": "column", "items": [{"threads": 9, "idle": 4, "continues": true, "label": "144 work, 112 return"}]}
+      ]},
+      {"id": "tail", "label": "gelu_bias_tail_kernel", "sub": "<<<1, 3>>> · start = 1,000,000", "detail": "Launched only when n % 4 > 0, guarded by i >= n.", "items": [
+        {"id": "tail-threads", "threads": 3, "label": "3 scalar threads"}
+      ]}
     ]},
-    {"id": "gmem-y", "label": "Global memory y", "kind": "memory", "sub": "every element written once"}
+    {"id": "tail-gmem", "label": "Global memory", "sub": "y, 1,000,003 floats", "tone": "global", "stretch": true, "items": [
+      {"id": "y-vec", "array": "y as float4", "sub": "a cell = 4 floats", "cols": 16, "continues": true, "marks": [{"cols": [0, 15], "tone": "global", "label": "y[0 … 999,999] · 250,000 × 16 B"}]},
+      {"id": "y-tail", "array": "y tail", "sub": "3 floats", "cols": 3, "marks": [{"cols": [0, 2], "tone": "global", "label": "y[1,000,000 …]"}]}
+    ]}
   ],
-  "notes": [
-    {"at": "vec", "text": "No guard: **112** threads load past the end", "side": "left"},
-    {"at": "tk", "text": "No tail launch: the last **3** stay 0, FAIL"}
+  "arrows": [
+    {"from": "vec-grid", "to": "y-vec", "label": "STG.128"},
+    {"from": "tail", "to": "y-tail", "label": "STG.32"}
   ]
 }
 :::

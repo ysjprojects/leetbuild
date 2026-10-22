@@ -14,49 +14,42 @@ Overlapping them needs three things together: host memory the copy engine can re
 (**pinned**), work split into independent queues (**streams**), and markers that time the work and order
 one queue after another without stopping the host (**events**).
 
-Read it bottom to top: pinned host memory, four chunks side by side, each on its own stream, and the
-pinned output buffer. The notes name the engine each row runs on.
+The figure is the schedule the host enqueues: four chunks, each on its own stream, each stream a queue
+holding its chunk's copy in, two kernels and copy out. The only edges between streams are the dashed
+events: chunk \`c\`'s \`add_carry\` waits for \`computed[c − 1]\`, recorded after chunk \`c − 1\`'s \`add_carry\`.
 
-:::architecture
+:::gpu
 {
-  "input": "N = 4,194,304 float32 · 4 chunks of 4 MiB",
-  "output": "h_out · speedup over the baseline",
   "items": [
-    {"id": "h-in", "label": "Pinned host buffer h_in", "kind": "host", "sub": "cudaMallocHost · 16 MiB", "detail": "Page-locked: the copy engine reads it directly. The host enqueues every chunk, then waits once."},
-    {"columns": [
-      [
-        {"id": "h2d-0", "label": "H2D · chunk 0", "kind": "io", "sub": "cudaMemcpyAsync · s0"},
-        {"id": "heavy-0", "label": "heavy", "kind": "kernel", "sub": "<<<4096, 256, 0, s0>>>"},
-        {"id": "carry-0", "label": "add_carry", "kind": "kernel", "sub": "carry = null"},
-        {"id": "d2h-0", "label": "D2H · chunk 0", "kind": "io", "sub": "then record landed[0]"}
-      ],
-      [
-        {"id": "h2d-1", "label": "H2D · chunk 1", "kind": "io", "sub": "cudaMemcpyAsync · s1"},
-        {"id": "heavy-1", "label": "heavy", "kind": "kernel", "sub": "<<<4096, 256, 0, s1>>>"},
-        {"id": "carry-1", "label": "add_carry", "kind": "kernel", "sub": "after wait computed[0]"},
-        {"id": "d2h-1", "label": "D2H · chunk 1", "kind": "io", "sub": "then record landed[1]"}
-      ],
-      [
-        {"id": "h2d-2", "label": "H2D · chunk 2", "kind": "io", "sub": "cudaMemcpyAsync · s2"},
-        {"id": "heavy-2", "label": "heavy", "kind": "kernel", "sub": "<<<4096, 256, 0, s2>>>"},
-        {"id": "carry-2", "label": "add_carry", "kind": "kernel", "sub": "after wait computed[1]"},
-        {"id": "d2h-2", "label": "D2H · chunk 2", "kind": "io", "sub": "then record landed[2]"}
-      ],
-      [
-        {"id": "h2d-3", "label": "H2D · chunk 3", "kind": "io", "sub": "cudaMemcpyAsync · s3"},
-        {"id": "heavy-3", "label": "heavy", "kind": "kernel", "sub": "<<<4096, 256, 0, s3>>>"},
-        {"id": "carry-3", "label": "add_carry", "kind": "kernel", "sub": "after wait computed[2]"},
-        {"id": "d2h-3", "label": "D2H · chunk 3", "kind": "io", "sub": "then record landed[3]"}
-      ]
+    {"id": "stream-0", "label": "Stream 0", "sub": "chunk 0 · streams[0]", "layout": "column", "detail": "A FIFO: its operations run in issue order. Different streams have no order between them except the events they wait on.", "items": [
+      {"id": "h2d-0", "label": "H2D chunk 0", "sub": "cudaMemcpyAsync", "tone": "compute", "detail": "On the H2D copy engine; the call returns in microseconds."},
+      {"id": "heavy-0", "label": "heavy", "sub": "<<<4096, 256, 0, s0>>>", "tone": "compute", "detail": "On the SMs: 64 sinf iterations per element of chunk 0."},
+      {"id": "carry-0", "label": "add_carry", "sub": "carry = null", "tone": "compute", "detail": "No carry for chunk 0; cudaEventRecord(computed[0], s0) right after."},
+      {"id": "d2h-0", "label": "D2H chunk 0", "sub": "then record landed[0]", "tone": "compute", "detail": "On the D2H copy engine, then the landing-time event."}
     ]},
-    {"id": "h-out", "label": "Pinned host buffer h_out", "kind": "host", "sub": "sync streams · stop · ElapsedTime"}
+    {"id": "stream-1", "label": "Stream 1", "sub": "chunk 1 · streams[1]", "layout": "column", "items": [
+      {"id": "h2d-1", "label": "H2D chunk 1", "sub": "cudaMemcpyAsync", "tone": "compute"},
+      {"id": "heavy-1", "label": "heavy", "sub": "<<<4096, 256, 0, s1>>>", "tone": "compute", "detail": "Touches only chunk 1, so it waits for nothing but its own copy."},
+      {"id": "carry-1", "label": "add_carry", "sub": "after wait computed[0]", "tone": "compute", "detail": "cudaStreamWaitEvent(s1, computed[0], 0) first, then adds d_out[off − 1], the last output of chunk 0."},
+      {"id": "d2h-1", "label": "D2H chunk 1", "sub": "then record landed[1]", "tone": "compute"}
+    ]},
+    {"id": "stream-2", "label": "Stream 2", "sub": "chunk 2 · streams[2]", "layout": "column", "items": [
+      {"id": "h2d-2", "label": "H2D chunk 2", "sub": "cudaMemcpyAsync", "tone": "compute"},
+      {"id": "heavy-2", "label": "heavy", "sub": "<<<4096, 256, 0, s2>>>", "tone": "compute"},
+      {"id": "carry-2", "label": "add_carry", "sub": "after wait computed[1]", "tone": "compute"},
+      {"id": "d2h-2", "label": "D2H chunk 2", "sub": "then record landed[2]", "tone": "compute"}
+    ]},
+    {"id": "stream-3", "label": "Stream 3", "sub": "chunk 3 · streams[3]", "layout": "column", "items": [
+      {"id": "h2d-3", "label": "H2D chunk 3", "sub": "cudaMemcpyAsync", "tone": "compute"},
+      {"id": "heavy-3", "label": "heavy", "sub": "<<<4096, 256, 0, s3>>>", "tone": "compute"},
+      {"id": "carry-3", "label": "add_carry", "sub": "after wait computed[2]", "tone": "compute"},
+      {"id": "d2h-3", "label": "D2H chunk 3", "sub": "then record landed[3]", "tone": "compute"}
+    ]}
   ],
-  "notes": [
-    {"at": "h2d-3", "text": "H2D **copy engine**: chunk c + 1 during compute of c"},
-    {"at": "heavy-3", "text": "**SMs**: 64 sinf iterations per element, chunk c"},
-    {"at": "carry-3", "text": "**cudaStreamWaitEvent**: the one cross-stream edge"},
-    {"at": "d2h-3", "text": "D2H **copy engine**: chunk c − 1, the other direction"},
-    {"at": "h-out", "text": "**≈ 1.5×** faster than the one-stream baseline"}
+  "arrows": [
+    {"from": "carry-0", "to": "carry-1", "label": "computed[0]", "dashed": true},
+    {"from": "carry-1", "to": "carry-2", "label": "computed[1]", "dashed": true},
+    {"from": "carry-2", "to": "carry-3", "label": "computed[2]", "dashed": true}
   ]
 }
 :::
@@ -99,6 +92,45 @@ puts the consequence plainly: \`cudaMemcpyAsync\` needs pinned host memory to be
   only the timeline shows it, which is why the program times both versions.
 - Pinned pages cannot be swapped. Pinning gigabytes starves the OS, so allocate pinned buffers once, reuse
   them, and release them with \`cudaFreeHost\` — never \`free\`.
+
+With pinned buffers on both sides, one moment of the pipeline looks like this: the H2D engine moves chunk
+2 in, the SMs compute chunk 1, the D2H engine moves chunk 0 out, and the CPU is idle.
+
+:::gpu
+{
+  "items": [
+    {"id": "host", "label": "Host", "sub": "cudaMallocHost · pinned", "tone": "host", "layout": "column", "detail": "Page-locked, so a copy engine can DMA the pages directly.", "items": [
+      {"id": "h-in", "array": "h_in", "sub": "a cell = one 4 MiB chunk", "cols": 4, "cells": ["0", "1", "2", "3"], "tone": "host", "marks": [{"cols": [2, 2], "tone": "global", "label": "H2D now"}]},
+      {"id": "h-out", "array": "h_out", "sub": "chunks land in order", "cols": 4, "cells": ["0", "1", "2", "3"], "tone": "host"}
+    ]},
+    {"id": "gpu", "label": "GPU", "sub": "chunk 2 in, chunk 1 computing, chunk 0 out", "items": [
+      {"id": "copy-engines", "label": "Copy engines", "sub": "DMA over PCIe or NVLink", "layout": "column", "items": [
+        {"id": "h2d-engine", "label": "H2D copy engine", "sub": "host → device", "tone": "compute", "detail": "Moves chunk c + 1 in while the SMs compute chunk c."},
+        {"id": "d2h-engine", "label": "D2H copy engine", "sub": "device → host", "tone": "compute", "detail": "Moves chunk c − 1 out at the same time. With one copy engine both directions share it."}
+      ]},
+      {"id": "dev-gmem", "label": "Global memory", "sub": "cudaMalloc · 2 × 16 MiB", "tone": "global", "layout": "column", "items": [
+        {"id": "d-in", "array": "d_in", "cols": 4, "cells": ["0", "1", "2", "3"], "marks": [{"cols": [1, 1], "tone": "register", "label": "heavy now"}]},
+        {"id": "d-out", "array": "d_out", "cols": 4, "cells": ["0", "1", "2", "3"], "marks": [{"cols": [0, 0], "tone": "host", "label": "D2H now"}]}
+      ]},
+      {"id": "sms", "label": "SMs", "sub": "chunk 1, on stream 1", "tone": "compute", "layout": "column", "items": [
+        {"id": "sm-heavy", "label": "heavy", "sub": "64 sinf per element"},
+        {"id": "sm-carry", "label": "add_carry", "sub": "+ d_out[off − 1]"}
+      ]}
+    ]}
+  ],
+  "arrows": [
+    {"from": "h-in", "to": "h2d-engine", "label": "chunk 2"},
+    {"from": "h2d-engine", "to": "d-in"},
+    {"from": "d-in", "to": "sms", "label": "chunk 1"},
+    {"from": "sms", "to": "d-out", "label": "chunk 1"},
+    {"from": "d-out", "to": "d2h-engine", "label": "chunk 0"},
+    {"from": "d2h-engine", "to": "h-out"}
+  ]
+}
+:::
+
+From pageable memory the H2D arrow would run through the CPU first, and the host would not get back to
+enqueue the next chunk until it had.
 
 :::quiz
 Q: h_in comes from malloc and every call is cudaMemcpyAsync on its own stream. What does the timeline look like?
@@ -176,32 +208,34 @@ cudaEventElapsedTime(&chunk_ms[c], start, landed[c]);             // ms since st
 
 \`add_carry\` of chunk \`c\` reads \`d_out[off − 1]\`, which chunk \`c − 1\`'s stream writes. Without an order
 between the two streams the read races the write. The event is the order, and it holds back exactly
-one operation:
+one operation: the dashed edge runs from the record in stream 0 to the wait in stream 1, and \`heavy\` of
+chunk 1 sits above the wait, free to overlap chunk 0. Drop the wait and \`add_carry\` 1 may read a stale
+carry: max abs error far above \`1e-4\`, \`FAIL\`.
 
-:::architecture
+:::gpu
 {
-  "input": "chunks 0 and 1, enqueued back to back",
-  "output": "chunk 1 = heavy(in) + d_out[CHUNK − 1]",
+  "layout": "column",
   "items": [
-    {"columns": [
-      [{"tone": "dotted", "label": "Stream 0", "items": [
-        {"id": "heavy-0", "label": "heavy · chunk 0", "kind": "kernel", "sub": "<<<4096, 256, 0, s0>>>"},
-        {"id": "carry-0", "label": "add_carry · chunk 0", "kind": "kernel", "sub": "writes d_out[CHUNK − 1]"},
+    {"id": "two-streams", "label": "Chunks 0 and 1", "sub": "enqueued back to back", "align": "start", "items": [
+      {"id": "s0", "label": "Stream 0", "layout": "column", "items": [
+        {"id": "heavy-0", "label": "heavy · chunk 0", "sub": "<<<4096, 256, 0, s0>>>", "tone": "compute"},
+        {"id": "carry-0", "label": "add_carry · chunk 0", "sub": "writes d_out[CHUNK − 1]", "tone": "compute"},
         {"id": "rec-0", "label": "cudaEventRecord", "sub": "computed[0], s0", "detail": "Completes once everything issued to s0 before it, add_carry 0 included, has completed."}
-      ]}],
-      [{"tone": "dotted", "label": "Stream 1", "items": [
-        {"id": "heavy-1", "label": "heavy · chunk 1", "kind": "kernel", "sub": "<<<4096, 256, 0, s1>>>", "detail": "Touches only chunk 1, so it is not held back."},
+      ]},
+      {"id": "s1", "label": "Stream 1", "layout": "column", "items": [
+        {"id": "heavy-1", "label": "heavy · chunk 1", "sub": "<<<4096, 256, 0, s1>>>", "tone": "compute", "detail": "Touches only chunk 1, so it is not held back."},
         {"id": "wait-1", "label": "cudaStreamWaitEvent", "sub": "s1, computed[0]", "detail": "Stream 1 waits on the GPU; the host returns at once and keeps enqueueing."},
-        {"id": "carry-1", "label": "add_carry · chunk 1", "kind": "kernel", "sub": "reads d_out[CHUNK − 1]"}
-      ]}]
+        {"id": "carry-1", "label": "add_carry · chunk 1", "sub": "reads d_out[CHUNK − 1]", "tone": "compute"}
+      ]}
     ]},
-    {"id": "dout", "label": "Global memory d_out", "kind": "memory", "sub": "chunk 0 · chunk 1"}
+    {"id": "dout", "label": "Global memory", "sub": "d_out, chunks 0 and 1", "tone": "global", "stretch": true, "items": [
+      {"id": "dout-cells", "array": "d_out", "sub": "a cell = ¼ chunk, numbered by chunk", "cols": 8, "cells": ["0", "0", "0", "0", "1", "1", "1", "1"], "marks": [
+        {"cols": [3, 3], "tone": "register", "label": "carry"}
+      ], "detail": "The last element of chunk 0 is the one value stream 1 reads from stream 0's output."}
+    ]}
   ],
-  "notes": [
-    {"at": "rec-0", "text": "Fires once **add_carry 0** has finished", "side": "left"},
-    {"at": "heavy-1", "text": "Not held back: only the read of the carry waits"},
-    {"at": "wait-1", "text": "The GPU waits, the **host** moves on"},
-    {"at": "carry-1", "text": "No wait: stale carry, max abs err ≫ 1e-4, **FAIL**"}
+  "arrows": [
+    {"from": "rec-0", "to": "wait-1", "label": "computed[0]", "dashed": true}
   ]
 }
 :::

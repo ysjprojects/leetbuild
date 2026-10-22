@@ -75,158 +75,318 @@ The exact \`erf\` GELU, the backward pass, \`half\`/\`bfloat16\` inputs (\`__hal
 load), a grid-stride loop, unaligned pointers and \`cols % 4 != 0\`, inline-PTX \`tanh.approx.f32\`, and
 fusing the GELU into the GEMM epilogue itself. The kernel is the standalone fused elementwise op a compiler
 emits when it cannot reach into the matmul.`,
-  architecture: {
-    input: 'x: 4096 × 3072 float32 · bias: 3072',
-    output: 'y = gelu(x + bias) · max abs err < 1e-5',
-    items: [
-      {
-        id: 'host-in',
-        label: 'Host buffers x, bias',
-        kind: 'host',
-        sub: '48 MiB + 12 KiB',
-        detail:
-          '`main` fills the GPT-2 small MLP activation (4096 tokens × 3072 columns) and its bias, and computes the reference `0.5·v·(1 + tanh(…))` in double.',
-      },
-      {
-        id: 'h2d',
-        label: 'cudaMemcpy host → device',
-        kind: 'io',
-        sub: 'x, bias',
-        detail: 'Into `cudaMalloc` buffers, 256-byte aligned: every `float4` index is a legal 16-byte load.',
-      },
-      {
-        id: 'gmem-in',
-        label: 'Global memory x, bias',
-        kind: 'memory',
-        sub: 'x 48 MiB · bias 12 KiB',
-        shape: 'float4[3,145,728] · float4[768]',
-        detail:
-          '`gelu_bias` reinterprets both as `float4*`: `n4 = n / 4` vectors of `x`, `cols4 = cols / 4 = 768` of the bias. The bias is read by every row, so after the first it is served from L2/L1.',
-      },
-      {
-        columns: [
-          [
-            {
-              tone: 'block',
-              repeat: '12,288 ×',
-              label: 'Thread block · 256 threads',
-              items: [
-                {
-                  columns: [
-                    [
-                      {
-                        id: 'ld-x',
-                        label: 'float4 load x[i]',
-                        kind: 'memory',
-                        sub: 'LDG.128 · 16 B',
-                        detail:
-                          'Thread `i = blockIdx.x · 256 + threadIdx.x` returns when `i >= n4`; otherwise one 128-bit load of four consecutive elements. A warp asks for 512 contiguous bytes.',
-                      },
-                    ],
-                    [
-                      {
-                        id: 'ld-b',
-                        label: 'float4 load bias[i % 768]',
-                        kind: 'memory',
-                        sub: 'LDG.128 · cache-resident',
-                        detail:
-                          'With `cols % 4 == 0` the four lanes of `x[i]` are columns `4·(i % cols4) … + 3` of one row: exactly the lanes of `bias[i % cols4]`.',
-                      },
-                    ],
-                  ],
-                },
-                {
-                  tone: 'dotted',
-                  label: 'Registers · four lanes',
-                  items: [
-                    {
-                      id: 'add',
-                      op: '+',
-                      detail: '`v.x + b.x … v.w + b.w`: the bias add, fused. The sum `t` lives in registers only.',
-                    },
-                    {
-                      id: 'gelu',
-                      label: 'gelu_tanh × 4 lanes',
-                      kind: 'kernel',
-                      sub: '0.5v(1+tanh(√(2/π)(v+0.044715v³)))',
-                      detail:
-                        '`__forceinline__`, single precision, `tanhf` (not `tanh`, not `erff`): the tanh approximation GPT-2 was trained with. About 20 FLOPs per element.',
-                    },
-                  ],
-                },
-                {
-                  id: 'st-y',
-                  label: 'float4 store y[i]',
-                  kind: 'kernel',
-                  sub: 'STG.128 · 16 B',
-                  detail: 'The four results assembled into one `float4 r` and stored once.',
-                },
-              ],
-            },
-          ],
-          [
-            {
-              tone: 'dotted',
-              label: 'Tail kernel · 1 block',
-              items: [
-                {
-                  id: 'tail',
-                  label: 'Scalar tail',
-                  kind: 'kernel',
-                  sub: 'y[i] = gelu(x[i] + bias[i % cols])',
-                  detail:
-                    '`gelu_bias_tail_kernel<<<1, n % 4>>>` from `start = 4 · n4`, guarded by `i >= n`, launched only when `n % 4 > 0`. Plain 4-byte loads and stores.',
-                },
-              ],
-            },
-          ],
-        ],
-      },
-      {
-        id: 'gmem-y',
-        label: 'Global memory y',
-        kind: 'memory',
-        sub: '48 MiB · written once',
-        shape: 'float[4096 × 3072]',
-        detail:
-          'Twenty timed launches between two `cudaEvent`s; `8 × n` bytes (x read once, y written once) over the time is the GB/s line.',
-      },
-      {
-        id: 'd2h',
-        label: 'cudaMemcpy device → host',
-        kind: 'io',
-        sub: 'y · 48 MiB',
-      },
-      {
-        id: 'host-out',
-        label: 'Host buffer y',
-        kind: 'host',
-        sub: 'vs double reference → PASS',
-        detail:
-          'Max abs error against the double-precision CPU reference, below `1e-5`, for n = 4096 × 3072 and for n = 1,000,003.',
-      },
-    ],
-    notes: [
-      {at: 'ld-x', text: '**16 B** per load: 512 B in flight per warp', side: 'left'},
-      {at: 'add', text: 'Bias add in registers: **t** never reaches HBM', side: 'left'},
-      {at: 'gelu', text: '~**2.5 FLOP/B** against a ridge near 20: memory-bound', side: 'left'},
-      {at: 'gmem-y', text: '**96 MiB** per launch: one read of x, one write of y', side: 'left'},
-    ],
-    insets: [
-      {
-        for: 'gelu',
-        title: 'Unfused: two kernels',
+  figures: [
+    {
+      title: 'Unfused against fused',
+      gpu: {
+        layout: 'column',
         items: [
-          {id: 'u-x', label: 'Read x from HBM', kind: 'memory', sub: '48 MiB'},
-          {id: 'u-add', label: 'add kernel', kind: 'kernel', sub: 't = x + b'},
-          {id: 'u-t', label: 'Write t, read it back', kind: 'memory', sub: '2 × 48 MiB round trip'},
-          {id: 'u-gelu', label: 'gelu kernel', kind: 'kernel', sub: 'F.gelu(t, approximate="tanh")'},
-          {id: 'u-y', label: 'Write y to HBM', kind: 'memory', sub: '48 MiB'},
+          {
+            id: 'eager',
+            label: 'Eager PyTorch: two launches',
+            sub: 'x + bias, then F.gelu(t)',
+            count: '192 MiB of HBM traffic',
+            detail:
+              '`x + b` and `F.gelu(…, approximate="tanh")` are two kernels. The intermediate `t` is a full activation: written by the first, read straight back by the second.',
+            items: [
+              {
+                id: 'u-in',
+                label: 'HBM',
+                tone: 'global',
+                layout: 'column',
+                items: [
+                  {id: 'u-x', array: 'x', sub: '48 MiB', cols: 6, continues: true},
+                  {id: 'u-b', array: 'bias', sub: '12 KiB', cols: 3},
+                ],
+              },
+              {
+                id: 'u-add',
+                label: 'add kernel',
+                sub: 't = x + bias',
+                tone: 'compute',
+                detail: 'Reads `x` (and the cached bias), writes `t`: 8 bytes of HBM per element for one add.',
+              },
+              {
+                id: 'u-mid',
+                label: 'HBM',
+                tone: 'global',
+                items: [
+                  {
+                    id: 'u-t',
+                    array: 't',
+                    sub: '48 MiB',
+                    cols: 6,
+                    continues: true,
+                    detail:
+                      'The intermediate makes a full round trip through HBM: 96 MiB moved for values that existed in registers a moment earlier.',
+                  },
+                ],
+              },
+              {
+                id: 'u-gelu',
+                label: 'gelu kernel',
+                sub: 'y = gelu(t)',
+                tone: 'compute',
+                detail: 'Reads `t` back, writes `y`: another 8 bytes per element.',
+              },
+              {
+                id: 'u-out',
+                label: 'HBM',
+                tone: 'global',
+                items: [{id: 'u-y', array: 'y', sub: '48 MiB', cols: 6, continues: true}],
+              },
+            ],
+          },
+          {
+            id: 'fused',
+            label: 'Fused: one launch',
+            sub: 'gelu_bias_kernel<<<12,288, 256>>>',
+            count: '96 MiB of HBM traffic',
+            detail:
+              'One read of `x`, one write of `y`: 8 bytes per element instead of 16, so about twice as fast on a memory-bound step.',
+            items: [
+              {
+                id: 'f-in',
+                label: 'HBM',
+                tone: 'global',
+                layout: 'column',
+                items: [
+                  {
+                    id: 'x',
+                    array: 'x',
+                    sub: '48 MiB',
+                    cols: 6,
+                    continues: true,
+                    detail:
+                      'Reinterpreted as `float4*`: `n4 = n / 4` = 3,145,728 vectors. `cudaMalloc` aligns the base to 256 bytes, so every `x[i]` is a legal 16-byte load.',
+                  },
+                  {
+                    id: 'bias',
+                    array: 'bias',
+                    sub: '12 KiB · from L2',
+                    cols: 3,
+                    detail:
+                      '`cols4 = 768` vectors, read by every row: after the first row it comes from L2/L1, so the byte count leaves it out.',
+                  },
+                ],
+              },
+              {
+                id: 'thread',
+                label: 'Thread i',
+                sub: 'i = blockIdx.x · 256 + threadIdx.x',
+                count: '3,145,728 threads',
+                layout: 'column',
+                detail:
+                  'One thread per `float4`; it returns at once when `i >= n4`. `__restrict__` on all three pointers lets the compiler issue both 16-byte loads before any arithmetic.',
+                items: [
+                  {
+                    id: 'regs',
+                    label: 'Registers',
+                    sub: 't never leaves them',
+                    tone: 'register',
+                    layout: 'column',
+                    items: [
+                      {
+                        id: 'v',
+                        array: 'v = x[i] + bias[i % 768]',
+                        cols: 4,
+                        cells: ['.x', '.y', '.z', '.w'],
+                        tone: 'register',
+                        detail:
+                          'With `cols % 4 == 0` the four lanes of `x[i]` are columns `4·(i % 768) … + 3` of one row: exactly the lanes of `bias[i % 768]`. The bias add is four FADDs, fused.',
+                      },
+                      {
+                        id: 'r',
+                        array: 'r = gelu_tanh(v)',
+                        sub: '× 4 lanes',
+                        cols: 4,
+                        cells: ['.x', '.y', '.z', '.w'],
+                        tone: 'register',
+                        detail:
+                          '`0.5f·v·(1 + tanhf(0.79788456f·(v + 0.044715f·v³)))`, inlined, in single precision: about 20 FLOPs per element against 8 bytes, still memory-bound.',
+                      },
+                    ],
+                  },
+                ],
+              },
+              {
+                id: 'f-out',
+                label: 'HBM',
+                tone: 'global',
+                items: [
+                  {
+                    id: 'y',
+                    array: 'y',
+                    sub: '48 MiB',
+                    cols: 6,
+                    continues: true,
+                    detail: 'Written once, one 16-byte store per thread. `8 × n` bytes over the time is the GB/s line.',
+                  },
+                ],
+              },
+            ],
+          },
         ],
-        note: '**192 MiB** of HBM traffic against **96 MiB** fused',
+        arrows: [
+          {from: 'u-in', to: 'u-add', label: 'read 48 MiB'},
+          {from: 'u-add', to: 'u-mid', label: 'write 48 MiB'},
+          {from: 'u-mid', to: 'u-gelu', label: 'read 48 MiB'},
+          {from: 'u-gelu', to: 'u-out', label: 'write 48 MiB'},
+          {from: 'f-in', to: 'regs', label: 'float4 reads · 48 MiB'},
+          {from: 'regs', to: 'f-out', label: 'float4 writes · 48 MiB'},
+        ],
       },
-    ],
-  },
+    },
+    {
+      title: 'Threads over the activation',
+      gpu: {
+        layout: 'column',
+        items: [
+          {
+            id: 'grid',
+            label: 'Kernel grid',
+            sub: 'gelu_bias_kernel<<<12,288, 256>>>',
+            count: '12,288 blocks',
+            detail:
+              '`n4 = 4096 × 3072 / 4` = 3,145,728 threads, one per `float4`, in blocks of 256: `(n4 + 255) / 256` = 12,288 blocks, three per row of 3072 floats.',
+            items: [
+              {
+                id: 'block0',
+                label: 'Block 0',
+                layout: 'column',
+                items: [{threads: 8, continues: true, label: '256 float4s'}],
+                detail:
+                  'Threads 0 … 255 take floats 0 … 1023 of row 0, four each: a warp asks for 512 contiguous bytes per load.',
+              },
+              {label: 'Block 1', layout: 'column', items: [{threads: 8, continues: true, label: '256 float4s'}]},
+              {label: 'Block 2', layout: 'column', items: [{threads: 8, continues: true, label: '256 float4s'}]},
+              {gap: '…'},
+              {label: 'Block 12,287', layout: 'column', items: [{threads: 8, continues: true, label: '256 float4s'}]},
+            ],
+          },
+          {
+            id: 'act-gmem',
+            label: 'Global memory',
+            sub: 'cudaMalloc · HBM',
+            tone: 'global',
+            stretch: true,
+            layout: 'row',
+            items: [
+              {
+                id: 'act-x',
+                array: 'x · 4096 × 3072',
+                sub: 'a cell = 256 floats',
+                rows: 4,
+                cols: 12,
+                continues: true,
+                marks: [
+                  {cols: [0, 3], rows: [0, 0], tone: 'register', label: 'block 0'},
+                  {cols: [4, 7], rows: [0, 0], tone: 'register', label: 'block 1'},
+                  {cols: [8, 11], rows: [0, 0], tone: 'register', label: 'block 2'},
+                ],
+                detail:
+                  'A block covers 1024 floats, a third of a row; rows 1 … 4095 go to blocks 3 … 12,287 the same way. Every element is read exactly once.',
+              },
+              {
+                id: 'act-bias',
+                array: 'bias · 3072',
+                sub: 'every row',
+                cols: 12,
+                marks: [{cols: [0, 11], tone: 'register', label: 'same lanes, every row'}],
+                detail:
+                  'Column `c` of every row adds `bias[c]`, so all 4096 rows read the same 12 KiB. It stays in L2 after the first row: no HBM cost to speak of.',
+              },
+              {
+                id: 'act-y',
+                array: 'y · 4096 × 3072',
+                sub: 'written once',
+                rows: 4,
+                cols: 12,
+                continues: true,
+                detail: 'The same tiling as `x`: thread `i` writes the `float4` it read.',
+              },
+            ],
+          },
+        ],
+      },
+    },
+    {
+      title: 'float4 body and scalar tail',
+      gpu: {
+        layout: 'column',
+        items: [
+          {
+            id: 'launches',
+            label: 'Two launches for n = 1,000,003',
+            sub: 'n4 = 250,000 · n % 4 = 3',
+            align: 'end',
+            items: [
+              {
+                id: 'vec-grid',
+                label: 'gelu_bias_kernel',
+                sub: '<<<977, 256>>>',
+                count: '250,112 threads',
+                detail:
+                  '`(250,000 + 255) / 256` = 977 blocks: 250,112 threads for 250,000 vectors. The guard `if (i >= n4) return;` stops the extra 112 before they load past the end.',
+                items: [
+                  {label: 'Block 0', layout: 'column', items: [{threads: 9, continues: true, label: '256 work'}]},
+                  {gap: '…'},
+                  {
+                    id: 'last-block',
+                    label: 'Block 976',
+                    layout: 'column',
+                    items: [{threads: 9, idle: 4, continues: true, label: '144 work, 112 return'}],
+                    detail:
+                      'Threads 249,856 … 250,111: the first 144 have a vector, the last 112 find `i >= n4` and return.',
+                  },
+                ],
+              },
+              {
+                id: 'tail',
+                label: 'gelu_bias_tail_kernel',
+                sub: '<<<1, 3>>> · start = 1,000,000',
+                detail:
+                  'Launched only when `n % 4 > 0`, from `start = 4 · n4`, guarded by `i >= n`: plain 4-byte loads and stores for the last three elements.',
+                items: [{id: 'tail-threads', threads: 3, label: '3 scalar threads'}],
+              },
+            ],
+          },
+          {
+            id: 'tail-gmem',
+            label: 'Global memory',
+            sub: 'y, 1,000,003 floats',
+            tone: 'global',
+            stretch: true,
+            items: [
+              {
+                id: 'y-vec',
+                array: 'y as float4',
+                sub: 'a cell = 4 floats',
+                cols: 16,
+                continues: true,
+                marks: [{cols: [0, 15], tone: 'global', label: 'y[0 … 999,999] · 250,000 × 16 B'}],
+                detail:
+                  '`reinterpret_cast<float4*>(y)`: 250,000 vectors cover `4 · n4` = 1,000,000 floats, one 16-byte store each.',
+              },
+              {
+                id: 'y-tail',
+                array: 'y tail',
+                sub: '3 floats',
+                cols: 3,
+                marks: [{cols: [0, 2], tone: 'global', label: 'y[1,000,000 …]'}],
+                detail:
+                  'No `float4` covers them. Without the tail launch they keep the zeros they were filled with and the self-test fails.',
+              },
+            ],
+          },
+        ],
+        arrows: [
+          {from: 'vec-grid', to: 'y-vec', label: 'STG.128'},
+          {from: 'tail', to: 'y-tail', label: 'STG.32'},
+        ],
+      },
+    },
+  ],
   steps: [fusedGeluStep],
   learn,
 };

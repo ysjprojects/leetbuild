@@ -245,8 +245,16 @@ const ArchitectureDiagram: FC<{
         role="tooltip"
         style={{
           left: `${((hover.box.x + hover.box.w / 2 - layout.minX) / layout.width) * 100}%`,
-          top: `${((hover.box.y - layout.minY) / layout.height) * 100}%`,
-          transform: 'translate(-50%, calc(-100% - 8px))',
+          // Near the top a tooltip above the block would leave the figure: it opens below instead.
+          ...((hover.box.y - layout.minY) / layout.height < 0.3
+            ? {
+                top: `${((hover.box.y + hover.box.h - layout.minY) / layout.height) * 100}%`,
+                transform: 'translate(-50%, 8px)',
+              }
+            : {
+                top: `${((hover.box.y - layout.minY) / layout.height) * 100}%`,
+                transform: 'translate(-50%, calc(-100% - 8px))',
+              }),
         }}>
         <p className="text-ink-50 font-semibold">
           {hover.label}

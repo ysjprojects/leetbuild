@@ -160,31 +160,37 @@ m2    = a.m2 + b.m2 + delta * delta * a.count * b.count / count;   // the spread
 
 The last term is what a naive "add the two variances" misses: two halves with the same spread but
 different means have a larger combined variance. The merge is associative in real arithmetic, so any
-tree of merges gives the same answer — which is what lets a block reduce it like a sum:
+tree of merges gives the same answer, which is what lets a block reduce it like a sum. Inside one warp of
+the self-test's 1000-column row, each cell is the count \`n\` a lane's state covers after each shuffle and
+merge; lane 0 of every warp then hands its state to shared memory:
 
-:::architecture
+:::gpu
 {
-  "input": "x[row] · 1000 floats",
-  "output": "y[row]",
+  "align": "end",
   "items": [
-    {"tone": "block", "repeat": "256 ×", "label": "One block · one row", "items": [
-      {"id": "w-thr", "label": "welford_update per thread", "sub": "c = t, t + 256, t + 512, t + 768", "kind": "kernel", "shape": "256 states (n, mean, M2)"},
-      {"columns": [
-        [{"id": "w-w0", "label": "Warp 0 · warp_welford", "sub": "shfl n, mean, M2 → merge", "kind": "kernel"}],
-        [{"id": "w-w1", "label": "Warp 1 · warp_welford", "sub": "shfl n, mean, M2 → merge", "kind": "kernel"}],
-        [{"id": "w-w7", "label": "… warp 7", "sub": "shfl n, mean, M2 → merge", "kind": "kernel"}]
+    {"id": "w-block", "label": "One block · one row", "sub": "1000 columns · 256 threads", "count": "× 256", "align": "end", "items": [
+      {"id": "w-warp", "label": "Warp 0 · warp_welford", "sub": "shfl n, mean, M2 down, then merge", "count": "5 merges", "layout": "column", "items": [
+        {"threads": 32, "label": "lanes 0–31 · a Welford state (n, mean, M2) each"},
+        {"id": "w-n0", "array": "after welford_update", "sub": "4 columns each", "cols": 32, "tone": "register", "cells": ["4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4", "4"], "detail": "Thread t folds columns t, t + 256, t + 512, t + 768 with welford_update; threads 232–255 get only 3, since the row ends at 1000."},
+        {"id": "w-n16", "array": "offset 16", "sub": "lane l merges lane l + 16", "cols": 32, "tone": "register", "cells": ["8", "8", "8", "8", "8", "8", "8", "8", "8", "8", "8", "8", "8", "8", "8", "8"], "marks": [{"cols": [16, 31], "tone": "muted", "label": "never read again"}]},
+        {"id": "w-n8", "array": "offset 8", "cols": 32, "tone": "register", "cells": ["16", "16", "16", "16", "16", "16", "16", "16"], "marks": [{"cols": [8, 31], "tone": "muted"}]},
+        {"id": "w-n4", "array": "offset 4", "cols": 32, "tone": "register", "cells": ["32", "32", "32", "32"], "marks": [{"cols": [4, 31], "tone": "muted"}]},
+        {"id": "w-n2", "array": "offset 2", "cols": 32, "tone": "register", "cells": ["64", "64"], "marks": [{"cols": [2, 31], "tone": "muted"}]},
+        {"id": "w-n1", "array": "offset 1", "sub": "lane 0: the warp's 128 values", "cols": 32, "tone": "register", "cells": ["128"], "marks": [{"cols": [1, 31], "tone": "muted"}], "detail": "Chan's merge is exact, so lane 0 holds the count, mean and m2 of all 128 values the warp read."}
       ]},
-      {"id": "w-slots", "label": "__shared__ s_warp[32]", "sub": "lane 0 writes · __syncthreads()", "kind": "memory"},
-      {"id": "w-merge", "label": "Warp 0 merges 8 states", "sub": "lanes 8–31: count = 0", "kind": "kernel", "detail": "Lanes past the warp count load empty states, which merge to the other state, not to 0 / 0."},
-      {"id": "w-rstd", "label": "Thread 0: the statistics", "sub": "rstd = rsqrtf(M2 / 1000 + eps)", "kind": "kernel"},
-      {"id": "w-pub", "label": "s_mean, s_rstd · mean[row]", "sub": "shared and global · barrier", "kind": "memory"},
-      {"id": "w-y", "label": "Every thread writes y", "sub": "y = x̂ · γ + β", "kind": "kernel"}
+      {"id": "w-right", "label": "Across the warps", "sub": "2 barriers per row", "layout": "column", "items": [
+        {"id": "w-slots", "label": "Shared memory", "sub": "__shared__ Welford s_warp[32]", "tone": "shared", "layout": "column", "items": [
+          {"array": "s_warp", "sub": "n: 128 each, 104 in warp 7", "cols": 8, "tone": "shared", "cells": "index"}
+        ], "detail": "Lane 0 of warp w writes s_warp[w], then __syncthreads(). Warp 7's lanes 8–31 got 3 columns, so its state covers 104 values; the eight add up to 1000."},
+        {"id": "w-merge", "label": "Warp 0 merges 8 states", "sub": "rstd = rsqrtf(M2 / 1000 + eps)", "layout": "column", "items": [
+          {"threads": 16, "idle": 8, "continues": true, "label": "lanes 8–31: count = 0"}
+        ], "detail": "Lanes past the warp count load empty states, which merge to the other state, not to 0 / 0. Thread 0 writes mean[row], rstd[row] and two shared floats; after a second barrier every thread writes y."}
+      ]}
     ]}
   ],
-  "notes": [
-    {"at": "w-w7", "text": "**5** merges per warp, no shared memory"},
-    {"at": "w-merge", "text": "Empty states merge cleanly, never **0 / 0**"},
-    {"at": "w-pub", "text": "**2** barriers per row"}
+  "arrows": [
+    {"from": "w-warp", "to": "w-slots", "label": "lane 0 of each warp"},
+    {"from": "w-slots", "to": "w-merge"}
   ]
 }
 :::
@@ -226,29 +232,42 @@ variance (stretching the row changes \`rstd\`). So the backward has the forward'
 block reduction of two sums, then an elementwise pass; and across rows, a reduction per column for \`dγ\` and
 \`dβ\`.
 
-Bottom to top, one backward block and the column reduce after it:
+One backward block's row loop, the partial rows the 64 blocks leave in global memory, and the column
+reduce that sums them:
 
-:::architecture
+:::gpu
 {
-  "input": "dy, x · saved mean, rstd",
-  "output": "parameter gradients",
+  "layout": "column",
   "items": [
-    {"tone": "block", "repeat": "64 ×", "label": "layernorm_bwd · block b", "items": [
-      {"id": "k-zero", "label": "Zero partial row b", "sub": "dgamma_partial, dbeta_partial", "kind": "kernel"},
-      {"tone": "dotted", "label": "4 rows each", "items": [
-        {"id": "k-load", "label": "Load dy, x, mean, rstd", "sub": "x̂ = (x − mean)·rstd, g = dy·γ", "kind": "kernel"},
-        {"id": "k-sum", "label": "block_reduce_sum2", "sub": "sum_g = Σ g, sum_gx = Σ g·x̂", "kind": "kernel"},
-        {"id": "k-dx", "label": "Write dx", "sub": "rstd·(g − (sum_g + x̂·sum_gx)/N)", "kind": "kernel"},
-        {"id": "k-acc", "label": "Add to partial row b", "sub": "+= dy·x̂, dy · c ≡ t (mod 256)", "kind": "kernel"}
-      ]}
+    {"id": "k-grid", "label": "layernorm_bwd", "sub": "<<<64, 256>>>", "count": "64 blocks", "items": [
+      {"id": "k-block", "label": "Block 0", "sub": "rows 0, 64, 128, 192", "layout": "column", "items": [
+        {"id": "k-load", "label": "Per row: x̂ and g", "sub": "x̂ = (x − mean)·rstd · g = dy·γ", "layout": "column", "items": [
+          {"threads": 12, "continues": true, "label": "sum_g, sum_gx per thread"}
+        ], "detail": "Each thread reads dy and x for its columns plus the saved mean[row] and rstd[row], and accumulates sum_g += g and sum_gx += g · x̂ in registers."},
+        {"id": "k-sum", "label": "block_reduce_sum2", "sub": "barrier · totals to every thread", "tone": "shared", "stretch": true, "detail": "Shuffles within each warp, a shared slot per warp, warp 0 over the slots. dx needs the row totals, so this barrier separates the sums from their use."},
+        {"id": "k-dx", "label": "Then dx, and partial row 0", "sub": "a second loop over the columns", "layout": "column", "items": [
+          {"threads": 12, "continues": true, "label": "thread t owns c ≡ t (mod 256)"}
+        ], "detail": "dx = rstd · (g − (sum_g + x̂ · sum_gx) / N), then dy · x̂ and dy added to the block's own partial row, which only this thread touches at these columns."}
+      ]},
+      {"label": "Block 1", "sub": "rows 1, 65, …", "layout": "column", "items": [{"threads": 8, "continues": true}]},
+      {"gap": "…"},
+      {"label": "Block 63", "sub": "rows 63, 127, …", "layout": "column", "items": [{"threads": 8, "continues": true}]}
     ]},
-    {"id": "k-part", "label": "dγ, dβ partial rows", "sub": "[64, 1000] each", "kind": "memory"},
-    {"id": "k-red", "label": "layernorm_bwd_reduce", "sub": "dγ[c] = Σ_p partial[p, c]", "kind": "kernel"},
-    {"id": "k-out", "label": "dγ, dβ", "sub": "[1000] each", "kind": "memory"}
+    {"id": "k-gmem", "label": "Global memory", "tone": "global", "stretch": true, "align": "end", "items": [
+      {"id": "k-part", "array": "dγ, dβ partial · 64 × 1000", "sub": "a row per block", "cols": 16, "rows": 8, "marks": [
+        {"cols": [0, 15], "rows": [0, 0], "tone": "global", "label": "block 0"},
+        {"cols": [5, 5], "rows": [0, 7], "tone": "register"}
+      ], "detail": "Two [64, 1000] arrays, 256 KB each; 8 of the 64 rows drawn. No atomics: every cell has exactly one writer."},
+      {"id": "k-out", "array": "dγ, dβ · [1000]", "cols": 16, "marks": [{"cols": [5, 5], "tone": "register", "label": "c"}]}
+    ]},
+    {"id": "k-red", "label": "layernorm_bwd_reduce", "sub": "one thread per column", "count": "1,000 threads", "layout": "column", "items": [
+      {"threads": 12, "continues": true, "label": "thread c sums column c of the 64 rows"}
+    ], "detail": "64 partials per column in a fixed order: the same bits every run. Adjacent threads read adjacent columns, so each row's loads coalesce."}
   ],
-  "notes": [
-    {"at": "k-sum", "text": "dx needs the **row totals**: a barrier first"},
-    {"at": "k-red", "text": "**64** partials in a fixed order: deterministic"}
+  "arrows": [
+    {"from": "k-block", "to": "k-part", "label": "row 0"},
+    {"from": "k-part", "to": "k-red", "label": "column c"},
+    {"from": "k-red", "to": "k-out", "label": "dγ[c], dβ[c]"}
   ]
 }
 :::

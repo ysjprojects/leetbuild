@@ -3,6 +3,9 @@ import type {Problem} from '@/lib/types';
 import {learn} from './learn';
 import {blellochScanStep} from './steps/1-blelloch-scan';
 
+/** The 977 tiles of `n = 1,000,003`, a few drawn: the first ten and the last. */
+const TILE_CELLS = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '…', '976'];
+
 /**
  * Drill: a work-efficient (Blelloch) exclusive scan of any length — an up-sweep and a down-sweep
  * over a bank-conflict-free shared tile per block, the block totals scanned recursively and added
@@ -76,142 +79,208 @@ starter prints \`FAIL\`: \`d_out\` comes back as the zeros it was set to.
 Single-pass scan with decoupled look-back (what CUB's \`DeviceScan\` does), warp-shuffle scans in
 registers, several elements per thread, preallocated scratch instead of a \`cudaMalloc\` per level,
 segmented scans, operators other than \`+\`, 64-bit sums and \`n\` beyond \`int\`.`,
-  architecture: {
-    input: 'in[n] · n = 1,000,003 int',
-    output: 'exclusive and inclusive scans',
-    items: [
-      {
-        id: 'host',
-        label: 'Host: exclusive_scan',
-        sub: 'blocks = ⌈n/1024⌉ · LAUNCH_CHECK',
-        kind: 'host',
-        detail:
-          'One `scan_block` launch when `n ≤ 1024`; otherwise `scan_block` over the grid, `exclusive_scan` of the block sums by calling itself, then `add_block_offsets`. `main` checks `n = 1, 1023, 1024, 1000003` against a CPU loop.',
-      },
-      {
-        id: 'gmem-in',
-        label: 'Global memory',
-        sub: 'in[n] · 4 MB of int',
-        kind: 'memory',
-        shape: '[n] int32',
-        detail: 'The input, read once by `scan_block` and once more by `to_inclusive`.',
-      },
-      {
-        tone: 'block',
-        repeat: '⌈n/1024⌉ ×',
-        label: 'scan_block · 512 threads',
+  figures: [
+    {
+      title: 'One block’s padded tile',
+      gpu: {
+        layout: 'column',
         items: [
           {
-            id: 'smem',
-            label: 'Shared tile temp[]',
-            sub: '1,024 + 31 int · i + (i >> 5)',
-            kind: 'memory',
-            shape: 'temp: [1,055]',
-            detail:
-              'Two elements per thread (`tid` and `tid + 512`), zero past `n`. Every index goes through `CONFLICT_FREE_OFFSET(i) = i >> 5`: one wasted word every 32 spreads the tree’s power-of-two strides over all 32 banks.',
-          },
-          {
-            tone: 'dotted',
-            repeat: '10 ×',
-            label: 'offset 1 → 512',
+            id: 'block',
+            label: 'Thread block 2',
+            sub: 'scan_block<<<977, 512>>> · elements 2048 … 3071',
+            count: '977 blocks',
+            layout: 'column',
             items: [
               {
-                id: 'up',
-                label: 'Up-sweep level',
-                sub: '__syncthreads; temp[b] += temp[a]',
-                kind: 'kernel',
+                id: 'threads',
+                threads: 16,
+                continues: true,
+                label: '512 threads · elements tid and tid + 512',
                 detail:
-                  'Thread `tid < d` owns `a = offset·(2·tid + 1) − 1`, `b = offset·(2·tid + 2) − 1` (both padded). 512, 256, …, 1 active threads: a reduction tree built in place, `n − 1` adds.',
+                  'Two elements per thread: the busiest tree level combines 512 pairs, so 512 threads cover it. Loads and stores at `tid` and `tid + 512` stay coalesced.',
+              },
+              {
+                id: 'smem',
+                label: 'Shared memory',
+                sub: 'int temp[1024 + 31] · 4,220 bytes',
+                tone: 'shared',
+                items: [
+                  {
+                    id: 'temp',
+                    array: 'temp[]',
+                    sub: 'first 128 words · a column = one bank',
+                    cols: 32,
+                    rows: 4,
+                    tone: 'shared',
+                    marks: [
+                      {rows: [1, 1], cols: [0, 0], tone: 'muted'},
+                      {rows: [2, 2], cols: [1, 1], tone: 'muted'},
+                      {rows: [3, 3], cols: [2, 2], tone: 'muted'},
+                      {rows: [0, 0], cols: [15, 15], tone: 'register'},
+                      {rows: [1, 1], cols: [16, 16], tone: 'register'},
+                      {rows: [2, 2], cols: [17, 17], tone: 'register'},
+                      {rows: [3, 3], cols: [18, 18], tone: 'register'},
+                    ],
+                    detail:
+                      'Element `i` lives at `i + (i >> 5)`: one wasted word (grey) after every 32, so each row of 32 elements starts one bank later than the last. At offset 16, thread `t` reads `a = 32t + 15`, stored at `33t + 15` (highlighted): bank `(t + 15) mod 32`, 32 lanes in 32 banks instead of a 32-way conflict on bank 15. The up-sweep and the down-sweep run in place here, a `__syncthreads()` before every level.',
+                  },
+                ],
               },
             ],
           },
           {
-            id: 'root',
-            label: 'Save the root, clear it',
-            sub: 'block_sums[b] = root; root = 0',
-            kind: 'kernel',
+            id: 'hbm',
+            label: 'Global memory',
+            sub: 'HBM',
             detail:
-              'Thread 0: the root holds the block total, which the next level of the multi-block scan needs (skipped when `block_sums` is `nullptr`). Clearing it to 0 makes the result exclusive.',
-          },
-          {
-            tone: 'dotted',
-            repeat: '10 ×',
-            label: 'offset 512 → 1',
+              '`n = 1,000,003` ints. A cell of `in` and `out` is one 1,024-element tile; a cell of `block_sums` one int.',
+            tone: 'global',
+            stretch: true,
             items: [
               {
-                id: 'down',
-                label: 'Down-sweep level',
-                sub: '__syncthreads; a, b = b, a + b',
-                kind: 'kernel',
+                id: 'g-in',
+                array: 'in[n]',
+                cols: TILE_CELLS.length,
+                cells: TILE_CELLS,
+                marks: [
+                  {cols: [2, 2], tone: 'shared', label: 'tile 2'},
+                  {cols: [11, 11], tone: 'bad', label: '579'},
+                ],
                 detail:
-                  'The same pairs walked back down: each left child gets its parent’s value, each right child parent + left. 1, 2, …, 512 active threads, a `__syncthreads()` before every level and one before the guarded store.',
+                  'Block `b` loads elements `b · 1024 … b · 1024 + 1023`. The last tile holds only 579 elements; its block loads zeros past `n`, the identity of `+`, and guards its stores.',
+              },
+              {
+                id: 'g-out',
+                array: 'out[n]',
+                cols: TILE_CELLS.length,
+                cells: TILE_CELLS,
+                marks: [{cols: [2, 2], tone: 'shared', label: 'from 0'}],
+                detail:
+                  'After this launch every tile holds its own exclusive scan, as if it began the array: tile 2 is still missing the totals of tiles 0 and 1.',
+              },
+              {
+                id: 'g-sums',
+                array: 'block_sums[977]',
+                cols: TILE_CELLS.length,
+                cells: TILE_CELLS,
+                marks: [{cols: [2, 2], tone: 'shared', label: 'root'}],
+                detail:
+                  'Between the sweeps thread 0 copies the root, the tile’s total, to `block_sums[blockIdx.x]` (skipped when it is `nullptr`) and clears it to 0, which makes the scan exclusive.',
               },
             ],
           },
         ],
-      },
-      {
-        columns: [
-          [
-            {
-              id: 'out-part',
-              label: 'out[n]: per-block scans',
-              sub: 'each block as if it began at 0',
-              kind: 'memory',
-              shape: '[n] int32',
-            },
-          ],
-          [
-            {
-              id: 'sums',
-              label: 'block_sums[977]',
-              sub: 'one total per block',
-              kind: 'memory',
-              shape: '[977] int32',
-            },
-            {
-              id: 'scan-sums',
-              label: 'exclusive_scan(block_sums)',
-              sub: 'recursive · <<<1, 512>>>',
-              kind: 'kernel',
-              shape: 'offsets: [977]',
-              detail:
-                'The carry each block is missing is the exclusive scan of the block totals: `offsets[b]` = total of blocks `0 … b−1`. 977 sums fit one block, so the recursion bottoms out at once with `block_sums = nullptr`.',
-            },
-          ],
+        arrows: [
+          {from: 'g-in', to: 'temp', label: '2 ints per thread'},
+          {from: 'temp', to: 'g-out', label: 'guarded store'},
+          {from: 'temp', to: 'g-sums', label: 'thread 0: root'},
         ],
       },
-      {
-        id: 'add',
-        label: 'add_block_offsets',
-        sub: 'out[i] += offsets[blockIdx.x]',
-        kind: 'kernel',
-        detail:
-          'A separate launch over the same grid: kernel boundaries are the only ordering between blocks the scan relies on.',
+    },
+    {
+      title: 'Carry across blocks',
+      gpu: {
+        layout: 'column',
+        items: [
+          {
+            id: 'stream',
+            label: 'exclusive_scan(in, out, n)',
+            sub: 'three launches on one stream · LAUNCH_CHECK after each',
+            items: [
+              {
+                id: 'launch1',
+                label: '1 · scan_block',
+                sub: '<<<977, 512>>> · tiles from 0',
+                tone: 'compute',
+                detail:
+                  'Every block scans its own tile and writes its total. Blocks run in any order and never wait for each other.',
+              },
+              {
+                id: 'launch2',
+                label: '2 · exclusive_scan(sums)',
+                sub: 'scan_block<<<1, 512>>>',
+                tone: 'compute',
+                detail:
+                  'The carry is itself a scan: `exclusive_scan` calls itself on the 977 block sums. They fit one block, so the recursion bottoms out with `block_sums = nullptr`; a billion elements would take one more level.',
+              },
+              {
+                id: 'launch3',
+                label: '3 · add_block_offsets',
+                sub: '<<<977, 512>>> · out += offsets[b]',
+                tone: 'compute',
+                detail:
+                  'Adds `offsets[blockIdx.x]` to the block’s 1,024 elements, guarded by `n`. Then `to_inclusive` can add `in[i]` for the inclusive variant.',
+              },
+            ],
+            detail:
+              'Kernel boundaries on one stream are the only ordering between blocks the scan relies on: launch 2 starts after every block of launch 1 has written its sum.',
+          },
+          {
+            id: 'hbm2',
+            label: 'Global memory',
+            sub: 'HBM',
+            detail:
+              'A cell of `out` is one 1,024-element tile; a cell of `block_sums` and `offsets` is one int, one per tile.',
+            tone: 'global',
+            stretch: true,
+            items: [
+              {
+                id: 'out-part',
+                array: 'out[n]',
+                sub: 'after launch 1 · from 0',
+                cols: TILE_CELLS.length,
+                cells: TILE_CELLS,
+                detail: 'Each tile’s exclusive scan, starting from 0.',
+              },
+              {
+                id: 'sums',
+                array: 'block_sums[977]',
+                sub: 'one per tile',
+                cols: TILE_CELLS.length,
+                cells: TILE_CELLS,
+                marks: [
+                  {cols: [0, 0], tone: 'register', label: 's0'},
+                  {cols: [1, 1], tone: 'register', label: 's1'},
+                ],
+                detail: '`block_sums[b]`, written `s_b` here, is the total of tile `b`: the root of its up-sweep.',
+              },
+              {
+                id: 'offsets',
+                array: 'offsets[977]',
+                sub: 'scan of the sums',
+                cols: TILE_CELLS.length,
+                cells: TILE_CELLS,
+                marks: [{cols: [2, 2], tone: 'register', label: 's0 + s1'}],
+                detail:
+                  '`offsets[b] = s0 + … + s(b − 1)`: the total of every tile before `b`, the carry tile `b` is missing.',
+              },
+              {
+                id: 'out-final',
+                array: 'out[n]',
+                sub: 'after launch 3 · final',
+                cols: TILE_CELLS.length,
+                cells: TILE_CELLS,
+                marks: [{cols: [2, 2], tone: 'register', label: '+ (s0 + s1)'}],
+                detail:
+                  'The exclusive scan of the whole array. About `4n` ints of traffic in all: `scan_block` reads and writes `n`, `add_block_offsets` does it again.',
+              },
+            ],
+          },
+        ],
+        arrows: [
+          {from: 'launch1', to: 'launch2', dashed: true},
+          {from: 'launch2', to: 'launch3', dashed: true},
+          {from: 'launch1', to: 'out-part'},
+          {from: 'launch1', to: 'sums', label: 'roots'},
+          {from: 'sums', to: 'launch2'},
+          {from: 'launch2', to: 'offsets', label: 'scan'},
+          {from: 'offsets', to: 'launch3'},
+          {from: 'launch3', to: 'out-final'},
+        ],
       },
-      {
-        id: 'gmem-out',
-        label: 'Global memory',
-        sub: 'out[n] · exclusive scan',
-        kind: 'memory',
-        shape: '[n] int32',
-      },
-      {
-        id: 'incl',
-        label: 'to_inclusive',
-        sub: 'incl[i] = excl[i] + in[i]',
-        kind: 'kernel',
-        detail: 'The inclusive scan is the exclusive one shifted by one element; `inclusive_scan` runs it in place.',
-      },
-    ],
-    notes: [
-      {at: 'smem', text: '**31** pad words: a 32-way conflict becomes none'},
-      {at: 'up', text: '**2(n − 1)** adds: 2,046 per tile, not 9,217'},
-      {at: 'root', text: 'The root is the block total, taken before clearing'},
-      {at: 'scan-sums', text: '**977** block sums fit one block: 2 levels'},
-      {at: 'add', text: 'About **4n** ints of traffic; CUB needs 2n'},
-    ],
-  },
+    },
+  ],
   steps: [blellochScanStep],
   learn,
 };

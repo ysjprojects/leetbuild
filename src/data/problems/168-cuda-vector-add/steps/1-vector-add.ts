@@ -8,7 +8,7 @@ export const vectorAddStep: Step = {
   title: 'vector_add: grid-stride loop, checked launch, timed, compared',
   concept: 'cuda',
   file: 'vector_add',
-  focus: ['h2d', 'idx', 'ld-a', 'ld-b', 'add', 'st-c', 'd2h'],
+  focus: ['h-ab', 'grid', 'block0', 'd-ab', 'd-c', 'h-c', 'lanes', 'r-c'],
   task: `## Task
 
 Write \`vector_add.cu\`: a kernel \`__global__ void vector_add(const float* a, const float* b, float* c, int n)\`

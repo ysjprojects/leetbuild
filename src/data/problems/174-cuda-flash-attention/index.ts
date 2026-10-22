@@ -71,132 +71,308 @@ The backward pass and the \`logsumexp\` it needs, multiple heads and a batch dim
 axis), bf16/fp16 inputs and tensor-core matmuls (\`wmma\`, \`mma.sync\`), warp-level work partitioning
 and the register-tile sizes of FlashAttention-2, the asynchronous pipelining of FlashAttention-3,
 dropout, ALiBi/sliding-window masks, and the KV-cache layout of inference.`,
-  architecture: {
-    input: 'Q, K, V · T × d float32',
-    output: 'O = softmax(Q Kᵀ / √d) V',
-    items: [
-      {
-        id: 'host',
-        label: 'Host',
-        sub: 'cudaMemcpy Q K V · <<<⌈T/64⌉, 64>>>',
-        kind: 'host',
-        detail:
-          'Fills `Q`, `K`, `V` with deterministic values in `[−1, 1]`, copies them to the device, launches `flash_attn_fwd` with `scale = 1/√d` (non-causal, then causal) and compares `O` with a double-precision CPU reference.',
-      },
-      {
-        id: 'hbm-in',
-        label: 'Global memory (HBM)',
-        sub: 'Q K V · T × d float each',
-        kind: 'memory',
-        shape: '3 × [T, d]',
-        detail:
-          'Row-major `T × d` arrays: 65,536 bytes each at `T = 256`, `d = 64`. There is no `T × T` buffer anywhere on the device.',
-      },
-      {
-        tone: 'block',
-        repeat: '⌈T/64⌉ ×',
-        label: 'Thread block · BQ = 64 query rows',
+  figures: [
+    {
+      title: 'One block over Q, K and V',
+      gpu: {
+        layout: 'column',
         items: [
           {
-            id: 'q-reg',
-            label: 'Registers: query row',
-            sub: 'q[k] = Q[row][k] · scale',
-            kind: 'memory',
-            shape: 'q: [64]',
-            detail:
-              'Thread `threadIdx.x` owns `row = blockIdx.x · 64 + threadIdx.x`. It keeps `q[D_MAX]` (pre-scaled, zero past `d`), the accumulator `o[D_MAX] = 0`, the running max `m = −∞` and the running sum `l = 0`, all in registers.',
-          },
-          {
-            tone: 'block',
-            repeat: '⌈T/32⌉ ×',
-            label: 'K/V tile loop · BK = 32',
+            id: 'block',
+            label: 'Thread block 1',
+            sub: 'flash_attn_fwd<<<⌈T/64⌉, 64>>> · rows 64 … 127',
+            count: '4 blocks',
+            align: 'end',
             items: [
               {
-                id: 'skip',
-                label: 'Causal tile skip',
-                sub: 'break if kv0 > q_last',
-                kind: 'kernel',
-                detail:
-                  'A tile whose first key is past the block’s last query row is entirely above the diagonal. The test depends on `blockIdx` only, so the whole block leaves together and no barrier is half-reached.',
-              },
-              {
                 id: 'smem',
-                label: 'Shared memory: Ks, Vs',
-                sub: '2 × [32][64] float · __syncthreads',
-                kind: 'memory',
-                shape: 'Ks, Vs: [32, 64]',
-                detail:
-                  'Every thread loads a strided share of rows `kv0 … kv0 + 31` of `K` and `V` (zero past `T` and `d`), consecutive threads on consecutive floats, then `__syncthreads()` so no thread reads a half-filled tile.',
+                label: 'Shared memory',
+                sub: '2 × 8 KB · tile 2, kv0 = 64',
+                tone: 'shared',
+                layout: 'column',
+                items: [
+                  {
+                    id: 'ks',
+                    array: 'Ks[32][64]',
+                    sub: 'a cell = key row kv0 + j',
+                    cols: 16,
+                    rows: 2,
+                    tone: 'shared',
+                    detail:
+                      'Staged by the whole block, `idx` striding by 64 over `32 × 64` floats, zero past `T` and `d`, then `__syncthreads()`. In the score loop every lane reads the same `Ks[j][k]`: a broadcast, not a bank conflict.',
+                  },
+                  {
+                    id: 'vs',
+                    array: 'Vs[32][64]',
+                    sub: 'a cell = value row kv0 + j',
+                    cols: 16,
+                    rows: 2,
+                    tone: 'shared',
+                    detail:
+                      'Staged with `Ks`. A second `__syncthreads()` after the fold keeps a fast warp from overwriting the tile while a slow one still reads it.',
+                  },
+                ],
               },
               {
-                id: 'scores',
-                label: 'Scores in registers',
-                sub: 's[j] = q · Ks[j], −∞ if masked',
-                kind: 'kernel',
-                shape: 's: [32]',
-                detail:
-                  'One row of `S = Q Kᵀ` for this tile: 32 dot products of length `d`. Padding keys (`key ≥ T`) and causal keys (`key > row`) get `−∞`, so they contribute `exp(−∞) = 0`. Every lane reads the same `Ks[j][k]`: a broadcast, not a conflict.',
-              },
-              {
-                id: 'rescale',
-                label: 'Online softmax rescale',
-                sub: 'α = exp(m − m_new); o *= α',
-                kind: 'kernel',
-                detail:
-                  '`m_new = fmaxf(m, tile_max)`, `alpha = __expf(m − m_new)`: the past accumulator and sum are re-expressed under the new maximum by one multiply. On the first tile `m = −∞`, so `alpha = 0`.',
-              },
-              {
-                id: 'accum',
-                label: 'Accumulate O in registers',
-                sub: 'o += p · Vs[j]; l = l·α + Σp',
-                kind: 'kernel',
-                shape: 'o: [64]',
-                detail:
-                  '`p = __expf(s[j] − m_new) ≤ 1` for each key; `o[k] += p · Vs[j][k]`, `p_sum += p`; then `l = l · alpha + p_sum`, `m = m_new`. A second `__syncthreads()` ends the tile, so nobody overwrites `Ks`/`Vs` while a neighbour still reads them.',
+                id: 'thread',
+                label: 'Thread 15',
+                sub: 'query row 79',
+                count: '× 64',
+                layout: 'column',
+                items: [
+                  {
+                    threads: 1,
+                    detail:
+                      'One thread per query row: `row = blockIdx.x · 64 + threadIdx.x`. Every one of the block’s 64 threads holds the same set of registers for its own row.',
+                  },
+                  {
+                    id: 'regs',
+                    label: 'Registers',
+                    sub: 'about 160 floats per thread',
+                    tone: 'register',
+                    layout: 'grid',
+                    columns: 2,
+                    items: [
+                      {
+                        id: 's',
+                        array: 's[32]',
+                        sub: 'q · Ks[j] · a cell = one key',
+                        cols: 16,
+                        rows: 2,
+                        tone: 'register',
+                        marks: [
+                          {rows: [0, 0], cols: [0, 15], tone: 'register', label: 'keys 64 … 79'},
+                          {rows: [1, 1], cols: [0, 15], tone: 'muted', label: '−∞: key > row'},
+                        ],
+                        detail:
+                          'One row of `S = Q Kᵀ` for this tile: 32 dot products of length `d`. Tile 2 straddles the diagonal, so row 79 keeps keys 64 … 79 and writes `-INFINITY` for keys 80 … 95, which then weigh `exp(−∞) = 0`. The row never leaves registers.',
+                      },
+                      {
+                        id: 'ml',
+                        array: 'm, l',
+                        sub: 'running max, running sum',
+                        cols: 2,
+                        cells: ['m', 'l'],
+                        tone: 'register',
+                        detail:
+                          'Start at `m = −∞`, `l = 0`. Per tile: `m_new = fmaxf(m, tile_max)`, `alpha = __expf(m − m_new)`, then `l = l · alpha + Σ p` and `m = m_new`.',
+                      },
+                      {
+                        id: 'o',
+                        array: 'o[64]',
+                        sub: 'o *= α, then o += p · Vs[j]',
+                        cols: 16,
+                        tone: 'register',
+                        detail:
+                          'The output accumulator, rescaled by `alpha` when the running max rises, then `o[k] += p · Vs[j][k]` with `p = __expf(s[j] − m_new) ≤ 1`. Divided by `l` once, after the last tile.',
+                      },
+                      {
+                        id: 'q',
+                        array: 'q[64]',
+                        sub: 'Q[79] · scale · a cell = 4 floats',
+                        cols: 16,
+                        tone: 'register',
+                        detail:
+                          'Loaded once before the tile loop, already multiplied by `scale = 1/√d`, zero past `d`. Every score of the row reuses it.',
+                      },
+                    ],
+                  },
+                ],
               },
             ],
           },
           {
-            id: 'normalise',
-            label: 'Normalise once',
-            sub: 'O[row][k] = o[k] / l',
-            kind: 'kernel',
-            shape: 'O[row]: [d]',
+            id: 'hbm',
+            label: 'Global memory',
+            sub: 'HBM · 64 KB per array',
+            detail: '`T = 256`, `d = 64`: `Q`, `K`, `V`, `O` are 65,536 bytes each, and there is no `T × T` buffer.',
+            tone: 'global',
+            stretch: true,
+            items: [
+              {
+                id: 'g-k',
+                array: 'K',
+                sub: 'a row = one tile',
+                cols: 8,
+                rows: 8,
+                marks: [
+                  {rows: [2, 2], cols: [0, 7], tone: 'shared', label: 'tile 2'},
+                  {rows: [4, 7], cols: [0, 7], tone: 'muted', label: 'causal: skipped'},
+                ],
+                detail:
+                  'Walked in tiles of `BK = 32` rows. With `causal`, block 1’s last query is row 127, so `kv0 > 127` breaks the loop before tiles 4 … 7 are loaded. The test reads `blockIdx` only: the whole block leaves together.',
+              },
+              {
+                id: 'g-v',
+                array: 'V',
+                sub: 'a row = one tile',
+                cols: 8,
+                rows: 8,
+                marks: [
+                  {rows: [2, 2], cols: [0, 7], tone: 'shared', label: 'tile 2'},
+                  {rows: [4, 7], cols: [0, 7], tone: 'muted', label: 'causal: skipped'},
+                ],
+                detail: 'Staged tile by tile beside `K`, and skipped with it.',
+              },
+              {
+                id: 'g-s',
+                array: 'S = Q Kᵀ',
+                sub: 'T × T · 256 KB · never allocated',
+                cols: 8,
+                rows: 8,
+                marks: [{rows: [0, 7], cols: [0, 7], tone: 'muted', label: 'not in memory'}],
+                detail:
+                  'Where standard attention would write its `T × T` scores, read them for the softmax and read them again for `P V`. Here each 64 × 32 tile of `S` exists only as the `s[32]` registers of 64 threads, one tile at a time.',
+              },
+              {
+                id: 'g-o',
+                array: 'O',
+                sub: 'a row = 32 tokens',
+                cols: 8,
+                rows: 8,
+                marks: [{rows: [2, 3], cols: [0, 7], tone: 'register', label: 'written once'}],
+                detail:
+                  'The only output: after the last tile, `O[row · d + k] = o[k] / l` for `k < d`, only for `row < T`. Threads past `T` still reached every barrier.',
+              },
+              {
+                id: 'g-q',
+                array: 'Q',
+                sub: 'a row = 32 tokens',
+                cols: 8,
+                rows: 8,
+                marks: [{rows: [2, 3], cols: [0, 7], tone: 'register', label: 'block 1'}],
+                detail: 'Row-major `T × d`. Block 1’s 64 query rows are read once, one row per thread, into registers.',
+              },
+            ],
+          },
+        ],
+        arrows: [
+          {from: 'g-q', to: 'q', label: 'Q[row] · scale'},
+          {from: 'g-k', to: 'smem', label: 'K tile 2'},
+          {from: 'g-v', to: 'smem', label: 'V tile 2'},
+          {from: 'ks', to: 's', label: 'q · Ks[j]'},
+          {from: 'vs', to: 'o', label: 'p · Vs[j]'},
+          {from: 'o', to: 'g-o', label: 'o / l'},
+        ],
+      },
+    },
+    {
+      title: 'Causal tiles per block',
+      gpu: {
+        items: [
+          {
+            id: 'grid',
+            label: 'Grid · causal',
+            sub: 'flash_attn_fwd<<<4, 64>>> · T = 256',
+            count: '20 of 32 tiles',
+            items: [
+              {
+                id: 'blk0',
+                label: 'Block 0',
+                sub: 'queries 0 … 63',
+                layout: 'column',
+                items: [
+                  {
+                    threads: 8,
+                    continues: true,
+                    label: '64 threads, one query each',
+                    detail:
+                      'Every thread of the block walks the same tiles: the loop bound depends on `blockIdx` only, never on the thread’s own row.',
+                  },
+                  {
+                    id: 'tiles0',
+                    array: 'K/V tiles',
+                    sub: 'a cell = 32 keys',
+                    cols: 8,
+                    cells: 'index',
+                    tone: 'shared',
+                    marks: [
+                      {cols: [0, 1], tone: 'register', label: 'diag'},
+                      {cols: [2, 7], tone: 'muted', label: 'skip'},
+                    ],
+                    detail:
+                      '`q_last = 63`: tiles 0 and 1 hold the diagonal, tile 2 starts at key 64 > 63 and breaks the loop. Two tiles loaded.',
+                  },
+                ],
+              },
+              {
+                id: 'blk1',
+                label: 'Block 1',
+                sub: 'queries 64 … 127',
+                layout: 'column',
+                items: [
+                  {threads: 8, continues: true, label: '64 threads, one query each'},
+                  {
+                    id: 'tiles1',
+                    array: 'K/V tiles',
+                    sub: 'a cell = 32 keys',
+                    cols: 8,
+                    cells: 'index',
+                    tone: 'shared',
+                    marks: [
+                      {cols: [0, 1], tone: 'shared', label: 'full'},
+                      {cols: [2, 3], tone: 'register', label: 'diag'},
+                      {cols: [4, 7], tone: 'muted', label: 'skip'},
+                    ],
+                    detail:
+                      'Tiles 0 and 1 are below the diagonal for every row of the block: no score is masked. Tiles 2 and 3 straddle it, so each thread writes `-INFINITY` for the keys past its own row. Four tiles loaded.',
+                  },
+                ],
+              },
+              {
+                id: 'blk2',
+                label: 'Block 2',
+                sub: 'queries 128 … 191',
+                layout: 'column',
+                items: [
+                  {threads: 8, continues: true, label: '64 threads, one query each'},
+                  {
+                    id: 'tiles2',
+                    array: 'K/V tiles',
+                    sub: 'a cell = 32 keys',
+                    cols: 8,
+                    cells: 'index',
+                    tone: 'shared',
+                    marks: [
+                      {cols: [0, 3], tone: 'shared', label: 'full'},
+                      {cols: [4, 5], tone: 'register', label: 'diag'},
+                      {cols: [6, 7], tone: 'muted', label: 'skip'},
+                    ],
+                    detail: '`q_last = 191`: tile 6 starts at key 192 and breaks the loop. Six tiles loaded.',
+                  },
+                ],
+              },
+              {
+                id: 'blk3',
+                label: 'Block 3',
+                sub: 'queries 192 … 255',
+                layout: 'column',
+                items: [
+                  {threads: 8, continues: true, label: '64 threads, one query each'},
+                  {
+                    id: 'tiles3',
+                    array: 'K/V tiles',
+                    sub: 'a cell = 32 keys',
+                    cols: 8,
+                    cells: 'index',
+                    tone: 'shared',
+                    marks: [
+                      {cols: [0, 5], tone: 'shared', label: 'full'},
+                      {cols: [6, 7], tone: 'register', label: 'diag'},
+                    ],
+                    detail:
+                      'The last block sees every key up to 255: all eight tiles, the last two masked per key. It does four times the work of block 0.',
+                  },
+                ],
+              },
+            ],
             detail:
-              'One division per row after the last tile, exact because every term carries the same `exp(−m)`. Threads with `row ≥ T` skip the write but have reached every barrier.',
+              'The skip `if (causal && kv0 > q_last) break;` depends on `blockIdx` only, so each block leaves its loop as a whole and no `__syncthreads()` is reached by half a block. Across the grid 20 of 32 tiles are loaded, which is the causal speed-up in the timing line.',
           },
         ],
       },
-      {
-        id: 'hbm-out',
-        label: 'Global memory (HBM)',
-        sub: 'O · T × d · written once',
-        kind: 'memory',
-        shape: '[T, d]',
-        detail:
-          'The only output: `T × d` floats. The `logsumexp` per row (`m + log l`) that a backward pass would need is left out of this drill.',
-      },
-    ],
-    notes: [
-      {at: 'hbm-out', text: 'No **T × T** buffer: 256 × 256 would be **256 KB**'},
-      {at: 'smem', text: '**16 KB** of shared memory per block'},
-      {at: 'skip', text: 'Causal: about **half** the tiles never loaded'},
-      {at: 'q-reg', text: '**64** threads per block, one query row each'},
-    ],
-    insets: [
-      {
-        for: 'rescale',
-        title: 'Online softmax, one tile',
-        items: [
-          {id: 'fold-max', label: 'New running max', sub: 'm_new = max(m, max_j s[j])'},
-          {id: 'fold-alpha', label: 'Rescale the past', sub: 'α = exp(m − m_new); o, l *= α'},
-          {id: 'fold-p', label: 'Weights for this tile', sub: 'p_j = exp(s[j] − m_new) ≤ 1'},
-          {id: 'fold-add', label: 'Add the tile', sub: 'o += Σ p_j·Vs[j]; l += Σ p_j'},
-        ],
-        note: 'The past is rescaled by **exp(m_old − m_new)**',
-      },
-    ],
-  },
+    },
+  ],
   steps: [flashAttentionStep],
   learn,
 };

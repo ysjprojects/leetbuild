@@ -11,8 +11,9 @@
 import {type Palette, type Theme, PALETTE} from '@/styles/palette';
 
 import {type Architecture, type ArchKind, layoutArchitecture} from './architecture';
+import {type GpuFigure, type GpuTone, layoutGpu} from './gpuFigure';
 import {layoutDiagram} from './layout';
-import type {EdgeKind, NodeKind, Problem} from './types';
+import {type EdgeKind, type NodeKind, type Problem, isArchitectureFigure} from './types';
 
 export type Tool = 'select' | 'hand' | 'pen' | 'rect' | 'ellipse' | 'diamond' | 'arrow' | 'line' | 'text' | 'eraser';
 
@@ -748,8 +749,11 @@ const EDGE_HUE: Record<EdgeKind, Hue> = {http: 'http', grpc: 'grpc', kafka: 'kaf
  * anything else.
  */
 export function fromDiagram(problem: Problem): Shape[] {
-  if (problem.diagram === undefined)
-    return problem.architecture === undefined ? [] : fromArchitecture(problem.architecture);
+  if (problem.diagram === undefined) {
+    const first = problem.figures?.[0];
+    if (first === undefined) return [];
+    return isArchitectureFigure(first) ? fromArchitecture(first.architecture) : fromGpu(first.gpu);
+  }
   const layout = layoutDiagram(problem.diagram);
   const K = 1.5;
   const px = (x: number): number => x * K;
@@ -882,6 +886,98 @@ function fromArchitecture(arch: Architecture): Shape[] {
       h: b.box.h * K,
       fill: b.kind !== 'layer' && b.kind !== 'norm' && b.kind !== 'embed' && b.kind !== 'head',
       label: b.sub === undefined ? b.label : `${b.label}\n${b.sub}`,
+    });
+  return shapes;
+}
+
+const GPU_HUE: Record<GpuTone, Hue> = {
+  scope: 'ink',
+  compute: 'ink',
+  host: 'http',
+  global: 'success',
+  shared: 'warning',
+  register: 'iris',
+};
+
+/** A GPU figure as editable shapes: its scopes and units, each array and thread row as a labelled box, the arrows. */
+function fromGpu(fig: GpuFigure): Shape[] {
+  const layout = layoutGpu(fig);
+  const K = 1.4;
+  const px = (x: number): number => (x - layout.minX) * K;
+  const py = (y: number): number => (y - layout.minY) * K;
+  const shapes: Shape[] = [];
+  for (const b of layout.boxes) {
+    const head = [b.label, b.count].filter(Boolean).join(' ');
+    const text = b.sub === undefined ? head : `${head}\n${b.sub}`;
+    shapes.push({
+      id: uid(),
+      kind: 'rect',
+      hue: GPU_HUE[b.tone],
+      width: 2,
+      x: px(b.box.x),
+      y: py(b.box.y),
+      w: b.box.w * K,
+      h: b.box.h * K,
+      fill: b.leaf && b.tone !== 'scope',
+      // A container's title sits in its corner, as the figure has it; a centred one would land on its contents.
+      label: b.leaf ? text : '',
+    });
+    if (!b.leaf && text !== '') {
+      const size = textSize(2);
+      shapes.push({
+        id: uid(),
+        kind: 'text',
+        hue: GPU_HUE[b.tone],
+        width: 2,
+        x: px(b.box.x) + 10,
+        y: py(b.box.y) + 6,
+        text,
+        size,
+        ...measureText(text, size),
+      });
+    }
+  }
+  for (const a of layout.arrays)
+    shapes.push({
+      id: uid(),
+      kind: 'rect',
+      hue: GPU_HUE[a.tone],
+      width: 2,
+      x: px(a.origin.x),
+      y: py(a.origin.y),
+      w: a.cols * a.cell * K,
+      h: a.rows * a.cell * K,
+      fill: true,
+      label: a.sub === undefined ? a.label : `${a.label}\n${a.sub}`,
+    });
+  for (const t of layout.threads)
+    shapes.push({
+      id: uid(),
+      kind: 'rect',
+      hue: 'iris',
+      width: 2,
+      x: px(t.box.x),
+      y: py(t.box.y),
+      w: t.box.w * K,
+      h: t.box.h * K,
+      fill: false,
+      label: t.label ?? `${t.count} threads`,
+    });
+  for (const w of layout.arrows)
+    w.points.slice(1).forEach((p, i) => {
+      const a = w.points[i];
+      const last = i === w.points.length - 2;
+      shapes.push({
+        id: uid(),
+        kind: last ? 'arrow' : 'line',
+        hue: 'ink',
+        width: 2,
+        x1: px(a.x),
+        y1: py(a.y),
+        x2: px(p.x),
+        y2: py(p.y),
+        label: last ? w.label ?? '' : '',
+      });
     });
   return shapes;
 }

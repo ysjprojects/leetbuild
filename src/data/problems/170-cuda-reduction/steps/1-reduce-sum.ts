@@ -9,7 +9,7 @@ export const reduceSumStep: Step = {
   title: 'reduce_sum: grid-stride partials, warp shuffles, one slot per warp, one atomic per block',
   concept: 'cuda',
   file: 'reduce_sum',
-  focus: ['stride', 'shfl', 'smem', 'warp0', 'atomic'],
+  focus: ['in', 'warps', 'shfl', 'smem', 'warp0', 'out'],
   task: `## Task
 
 Implement \`__global__ void reduce_sum(const float* in, float* out, int n)\`: on entry \`*out\` is 0, on exit it

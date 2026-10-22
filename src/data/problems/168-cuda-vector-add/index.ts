@@ -1,7 +1,22 @@
+import type {GpuMark} from '@/lib/gpuFigure';
 import type {Problem} from '@/lib/types';
 
 import {learn} from './learn';
 import {vectorAddStep} from './steps/1-vector-add';
+
+/** A warp's 32 floats as the four 32-byte sectors the memory system serves them in. */
+const sectors: GpuMark[] = [0, 1, 2, 3].map(s => ({
+  cols: [8 * s, 8 * s + 7],
+  tone: 'global',
+  label: '32 B sector',
+}));
+
+/** The same 32 floats in registers: lanes 8s … 8s + 7 hold sector s. */
+const laneGroups: GpuMark[] = [0, 1, 2, 3].map(s => ({
+  cols: [8 * s, 8 * s + 7],
+  tone: 'register',
+  label: `lanes ${8 * s}–${8 * s + 7}`,
+}));
 
 /**
  * Drill: the smallest complete CUDA program — a grid-stride vector add, a launch helper that
@@ -71,133 +86,212 @@ Pinned host memory and \`cudaMemcpyAsync\` on streams, \`float4\` vectorised loa
 \`cudaOccupancyMaxActiveBlocksPerMultiprocessor\` and the SM count, unified memory, multiple devices, and the
 2-D and 3-D grids an image kernel uses. The runtime API as used here is the one every later kernel in this
 track builds on.`,
-  architecture: {
-    input: 'h_a, h_b · n = 4,194,341 float32',
-    output: 'h_c · max abs err 0 → PASS',
-    items: [
-      {
-        id: 'host-in',
-        label: 'Host buffers h_a, h_b',
-        kind: 'host',
-        sub: 'pageable · 2 × 16 MiB',
-        detail:
-          '`main` fills `h_a[i] = 0.001f · (i mod 1000)` and `h_b[i] = 1 − 0.0005f · (i mod 2000)` and computes the CPU reference `h_ref = h_a + h_b`. Host memory: the kernel cannot dereference it.',
-      },
-      {
-        id: 'h2d',
-        label: 'cudaMemcpy host → device',
-        kind: 'io',
-        sub: '2 × 16 MiB · blocking',
-        detail:
-          '`cudaMemcpy(d_a, h_a, bytes, cudaMemcpyHostToDevice)` and the same for `b`, after three `cudaMalloc`s. `bytes = size_t(n) * sizeof(float)`; every call goes through `CUDA_CHECK`.',
-      },
-      {
-        id: 'gmem-in',
-        label: 'Global memory d_a, d_b',
-        kind: 'memory',
-        sub: 'cudaMalloc · 2 × 16 MiB',
-        shape: 'float[4,194,341] × 2',
-        detail:
-          'Device (HBM) buffers from `cudaMalloc`, 256-byte aligned. Each launch reads both once: 8 bytes per element.',
-      },
-      {
-        tone: 'block',
-        repeat: '1,024 ×',
-        label: 'Thread block · 256 threads',
+  figures: [
+    {
+      title: 'Grid over the arrays',
+      gpu: {
+        align: 'end',
         items: [
           {
-            id: 'idx',
-            label: 'Global index',
-            kind: 'kernel',
-            sub: 'i = blockIdx.x·256 + threadIdx.x',
-            side: {
-              label: 'launch_vector_add',
-              sub: '<<<1024, 256>>>',
-              detail:
-                '`blocks = (n + 255) / 256` = 16,385, capped at `MAX_BLOCKS = 1024`; the launch, then `CUDA_CHECK(cudaGetLastError())` for a bad configuration.',
-            },
-            detail:
-              'Each of the 262,144 threads starts at its global index: 0 … 255 in block 0, 256 … 511 in block 1, and so on. Adjacent threads, adjacent elements.',
-          },
-          {
-            tone: 'dotted',
-            repeat: '16–17 ×',
-            label: 'Grid-stride loop',
+            id: 'host',
+            label: 'Host',
+            sub: 'pageable memory',
+            tone: 'host',
+            layout: 'column',
             items: [
               {
-                columns: [
-                  [
-                    {
-                      id: 'ld-a',
-                      label: 'Load a[i]',
-                      kind: 'memory',
-                      sub: 'into a register',
-                      detail:
-                        'One 4-byte load per thread; across a warp, 32 consecutive floats: 128 bytes, four 32-byte sectors, fully coalesced.',
-                    },
-                  ],
-                  [
-                    {
-                      id: 'ld-b',
-                      label: 'Load b[i]',
-                      kind: 'memory',
-                      sub: 'into a register',
-                      detail: 'The same coalesced pattern on `b`, at the same index.',
-                    },
-                  ],
-                ],
-              },
-              {
-                id: 'add',
-                op: '+',
-                detail: '`a[i] + b[i]`: one FADD in registers, the kernel’s only arithmetic.',
-              },
-              {
-                id: 'st-c',
-                label: 'Store c[i]',
-                kind: 'kernel',
-                sub: 'then i += gridDim.x · blockDim.x',
+                id: 'h-ab',
+                array: 'h_a, h_b',
+                sub: '2 × 16 MiB',
+                cols: 12,
+                tone: 'host',
+                continues: true,
                 detail:
-                  'One 4-byte store, then the index advances by the whole grid, 262,144. The loop condition `i < n` is the bounds test: nothing is written past `c[n − 1]`.',
+                  '`main` fills both and computes the CPU reference `h_ref = h_a + h_b`. The kernel cannot read host memory: it has to be copied.',
+              },
+              {
+                id: 'h-c',
+                array: 'h_c',
+                sub: 'max |h_c − h_ref| = 0',
+                cols: 12,
+                tone: 'host',
+                continues: true,
+                detail:
+                  'Copied back after `cudaDeviceSynchronize()` and compared over all `n`: a float add rounds the same on both sides.',
+              },
+            ],
+          },
+          {
+            id: 'gpu',
+            label: 'GPU',
+            layout: 'column',
+            items: [
+              {
+                id: 'grid',
+                label: 'Kernel grid',
+                sub: 'vector_add<<<1024, 256>>>',
+                count: '1,024 blocks',
+                items: [
+                  {
+                    id: 'block0',
+                    label: 'Block 0',
+                    layout: 'column',
+                    items: [{threads: 10, continues: true, label: '256 threads'}],
+                    detail:
+                      'Threads 0 … 255 start at elements 0 … 255: adjacent threads, adjacent floats, so a warp’s 32 loads are one coalesced 128-byte request.',
+                  },
+                  {
+                    label: 'Block 1',
+                    layout: 'column',
+                    items: [{threads: 10, continues: true, label: '256 threads'}],
+                  },
+                  {gap: '…'},
+                  {
+                    label: 'Block 1023',
+                    layout: 'column',
+                    items: [{threads: 10, continues: true, label: '256 threads'}],
+                  },
+                ],
+                detail:
+                  '`(n + 255) / 256` = 16,385 blocks would cover `n` in one pass; the launch caps the grid at 1,024 and lets each thread loop instead.',
+              },
+              {
+                id: 'gmem',
+                label: 'Global memory',
+                sub: 'cudaMalloc · HBM',
+                tone: 'global',
+                stretch: true,
+                layout: 'column',
+                items: [
+                  {
+                    id: 'd-ab',
+                    array: 'd_a, d_b',
+                    sub: 'a cell = one pass of 262,144 floats',
+                    cols: 17,
+                    cells: 'index',
+                    marks: [
+                      {cols: [0, 15], tone: 'global', label: '16 full passes'},
+                      {cols: [16, 16], tone: 'muted', label: '37'},
+                    ],
+                    detail:
+                      'Pass `p` covers elements `p · 262,144 + i`. The 17th pass has only 37 elements, so threads 37 … 262,143 find `i ≥ n` and leave the loop: the condition is the bounds test, nothing is read past the end.',
+                  },
+                  {
+                    id: 'd-c',
+                    array: 'd_c',
+                    sub: 'each element written once',
+                    cols: 17,
+                    detail:
+                      'One 4-byte store per element: 12 bytes of HBM traffic per add, which makes the kernel bandwidth-bound.',
+                  },
+                ],
               },
             ],
           },
         ],
+        arrows: [
+          {from: 'h-ab', to: 'd-ab', label: 'cudaMemcpy H2D'},
+          {from: 'd-c', to: 'h-c', label: 'cudaMemcpy D2H'},
+        ],
       },
-      {
-        id: 'gmem-out',
-        label: 'Global memory d_c',
-        kind: 'memory',
-        sub: '16 MiB · each element written once',
-        shape: 'float[4,194,341]',
-        detail:
-          'Written by the kernel, read by nobody on the device. Twenty timed launches between two `cudaEvent`s give ms per launch; `3 · n · 4` bytes over it is the GB/s line.',
+    },
+    {
+      title: 'One warp, one pass',
+      gpu: {
+        align: 'end',
+        items: [
+          {
+            id: 'warp-gmem',
+            label: 'Global memory',
+            sub: 'pass p: elements i … i + 31',
+            tone: 'global',
+            layout: 'column',
+            items: [
+              {
+                id: 'w-a',
+                array: 'a[i … i + 31]',
+                sub: '128 B',
+                cols: 32,
+                marks: sectors,
+                detail:
+                  'Lane `k` asks for `a[i + k]`: 32 consecutive floats, 128 contiguous bytes. The memory system serves them as four 32-byte sectors in one request; every fetched byte is used.',
+              },
+              {
+                id: 'w-b',
+                array: 'b[i … i + 31]',
+                sub: '128 B',
+                cols: 32,
+                marks: sectors,
+                detail: 'The same pattern on `b`, at the same indices: four more sectors, fully used.',
+              },
+              {
+                id: 'w-c',
+                array: 'c[i … i + 31]',
+                sub: '128 B',
+                cols: 32,
+                marks: sectors,
+                detail:
+                  'One 4-byte store per lane, four whole sectors written. Then `i += 262,144`: the next pass is 1 MiB further on, and still 32 adjacent floats per warp.',
+              },
+            ],
+          },
+          {
+            id: 'warp',
+            label: 'Warp 0 of block 0',
+            sub: 'threads 0 … 31',
+            count: '8 warps per block',
+            layout: 'column',
+            detail:
+              'A block of 256 threads runs as 8 warps of 32. The 32 lanes of a warp issue each instruction together, so their 32 addresses reach the memory system as one request.',
+            items: [
+              {
+                id: 'lanes',
+                threads: 32,
+                label: 'lane k handles element i + k',
+                detail:
+                  'Lane `k` of warp 0 is thread `k`: it starts at `i = k` and visits `k`, `k + 262,144`, `k + 524,288`, … while `i < n`, 16 or 17 times.',
+              },
+              {
+                id: 'warp-regs',
+                label: 'Registers',
+                sub: 'one float of each per lane',
+                tone: 'register',
+                stretch: true,
+                layout: 'column',
+                items: [
+                  {
+                    id: 'r-a',
+                    array: 'a',
+                    cols: 32,
+                    tone: 'register',
+                    marks: laneGroups,
+                    detail:
+                      '`a[i + k]` lands in a register of lane `k`: lanes 0 … 7 got their floats from the first sector.',
+                  },
+                  {id: 'r-b', array: 'b', cols: 32, tone: 'register', marks: laneGroups},
+                  {
+                    id: 'r-c',
+                    array: 'a + b',
+                    sub: 'one FADD per lane',
+                    cols: 32,
+                    tone: 'register',
+                    marks: laneGroups,
+                    detail:
+                      'The kernel’s only arithmetic: one add per 12 bytes moved, which is why it is bandwidth-bound.',
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+        arrows: [
+          {from: 'w-a', to: 'r-a', label: 'load · 128 B'},
+          {from: 'w-b', to: 'r-b', label: 'load · 128 B'},
+          {from: 'r-c', to: 'w-c', label: 'store · 128 B'},
+        ],
       },
-      {
-        id: 'd2h',
-        label: 'cudaMemcpy device → host',
-        kind: 'io',
-        sub: '16 MiB · after the synchronise',
-        detail:
-          '`CUDA_CHECK(cudaDeviceSynchronize())` first, where an illegal address inside the kernel surfaces, then `cudaMemcpy(h_c, d_c, bytes, cudaMemcpyDeviceToHost)` and three `cudaFree`s.',
-      },
-      {
-        id: 'host-out',
-        label: 'Host buffer h_c',
-        kind: 'host',
-        sub: 'max |h_c − h_ref| → PASS',
-        detail:
-          'Compared with the CPU reference over all `n`. A float add rounds the same on both sides, so the max abs error is exactly 0.',
-      },
-    ],
-    notes: [
-      {at: 'idx', text: '**1,024 × 256** = 262,144 threads: a capped grid'},
-      {at: 'st-c', text: '**16 or 17** passes per thread for n = 4,194,341'},
-      {at: 'gmem-in', text: '**12 B** of HBM per FLOP: bandwidth-bound', side: 'left'},
-      {at: 'h2d', text: 'Every runtime call wrapped in **CUDA_CHECK**', side: 'left'},
-      {at: 'd2h', text: '**cudaDeviceSynchronize** first: kernel faults surface there'},
-    ],
-  },
+    },
+  ],
   steps: [vectorAddStep],
   learn,
 };

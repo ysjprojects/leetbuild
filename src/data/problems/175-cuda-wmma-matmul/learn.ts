@@ -14,36 +14,38 @@ introduced with Volta in CUDA 9: a warp of 32 threads loads a 16 × 16 tile of A
 **fragments**, issues \`mma_sync\`, and stores a 16 × 16 tile of C. Every linear layer of a transformer
 ends up here — through cuBLAS, which is built from the same instructions.
 
-Read the figure bottom to top: the operands climb from global memory through an optional shared-memory
-block tile into each warp's fragments, the tensor cores accumulate into an fp32 fragment, and one store
-writes the tile of C.
+The figure follows the operands down the memory hierarchy: from global memory, either straight or through a
+shared-memory block tile, into each warp's fragments in registers, where the tensor cores compute
+\`acc = a @ b + acc\`; one store writes the warp's tile of C.
 
-:::architecture
+:::gpu
 {
-  "input": "A[M×K] · B[K×N] fp16",
-  "output": "C[M×N] fp32",
   "items": [
-    {"id": "host", "label": "Host · main()", "kind": "host", "sub": "fp16 inputs · pad16 · CPU reference", "detail": "Rounds every dimension up to a multiple of 16, copies the inputs into zeroed padded buffers with cudaMemcpy2D, checks against an fp32 CPU reference and prints TFLOP/s."},
-    {"id": "gmem-in", "label": "Global memory", "kind": "memory", "sub": "A, B half · padded to ×16"},
-    {"tone": "block", "repeat": "grid ×", "label": "Thread block · 4 warps", "items": [
-      {"id": "smem", "label": "Shared memory", "kind": "memory", "sub": "As, Bs block tile · staged kernel", "detail": "Only in wmma_matmul_smem: a 64 × 64 block tile filled once per K-step and read by all four warps. The direct kernel loads fragments straight from global memory."},
-      {"tone": "dotted", "label": "each warp · K/16 steps", "items": [
-        {"columns": [
-          [{"id": "frag-a", "label": "Fragment a", "kind": "memory", "sub": "matrix_a · 16 × 16 half", "detail": "Spread over the 32 lanes' registers in an opaque layout."}],
-          [{"id": "frag-b", "label": "Fragment b", "kind": "memory", "sub": "matrix_b · 16 × 16 half"}]
-        ]},
-        {"id": "tc", "label": "Tensor cores", "kind": "kernel", "sub": "mma_sync(acc, a, b, acc)", "detail": "One warp-collective instruction: D = A·B + C on the m16n16k16 shape."},
-        {"id": "acc", "label": "Accumulator fragment", "kind": "memory", "sub": "16 × 16 float · registers"}
-      ]},
-      {"id": "store", "label": "store_matrix_sync", "kind": "kernel", "sub": "ldm N · mem_row_major"}
+    {"id": "gmem", "label": "Global memory", "sub": "HBM · padded to multiples of 16", "tone": "global", "layout": "column", "align": "start", "items": [
+      {"id": "g-ab", "array": "A, B", "sub": "half · row-major", "cols": 10, "continues": true, "detail": "The host rounds M, N, K up to multiples of 16 and copies the inputs into zeroed buffers with cudaMemcpy2D, so every fragment pointer is 32-byte aligned and every ldm a multiple of 8 halves."},
+      {"id": "g-c", "array": "C", "sub": "float · M × N corner to host", "cols": 10, "continues": true, "detail": "Checked against an fp32 CPU reference over the same rounded inputs: max |C − ref| ≤ 2e-5 × K."}
     ]},
-    {"id": "gmem-out", "label": "Global memory", "kind": "memory", "sub": "C float · M × N corner to host"}
+    {"id": "block", "label": "Thread block", "sub": "128 threads", "count": "4 warps", "layout": "column", "items": [
+      {"id": "smem", "label": "Shared memory", "sub": "As, Bs block tile · staged kernel only", "tone": "shared", "stretch": true, "detail": "Only in wmma_matmul_smem: a 64 × 64 block tile filled once per K-step and read by all four warps. The direct kernel loads fragments straight from global memory."},
+      {"id": "warp", "label": "Warp", "sub": "one 16 × 16 tile of C per warp", "count": "× 4", "layout": "column", "items": [
+        {"threads": 16, "continues": true, "label": "32 lanes, every call together"},
+        {"id": "tc", "label": "Tensor cores", "sub": "mma_sync · m16n16k16 · K/16 times", "tone": "compute", "items": [
+          {"id": "f-d", "array": "acc", "sub": "float", "tone": "register", "rows": 4, "cols": 4, "detail": "fragment<accumulator, 16, 16, 16, float>: the sum stays in fp32 registers across all of K."},
+          {"gap": "="},
+          {"id": "f-a", "array": "a", "sub": "half", "tone": "register", "rows": 4, "cols": 4, "detail": "fragment<matrix_a, 16, 16, 16, half, row_major>: spread over the 32 lanes' registers in an opaque layout."},
+          {"gap": "@"},
+          {"id": "f-b", "array": "b", "sub": "half", "tone": "register", "rows": 4, "cols": 4, "detail": "fragment<matrix_b, 16, 16, 16, half, row_major>."},
+          {"gap": "+"},
+          {"id": "f-c", "array": "acc", "sub": "float", "tone": "register", "rows": 4, "cols": 4, "detail": "The same accumulator fragment, zeroed once by fill_fragment."}
+        ], "detail": "One warp-collective instruction: 16 · 16 · 16 = 4,096 multiply-adds."}
+      ]}
+    ]}
   ],
-  "notes": [
-    {"at": "smem", "text": "Staged: one tile reused by **4** warps"},
-    {"at": "tc", "text": "**16 × 16 × 16** = **4,096** multiply-adds"},
-    {"at": "acc", "text": "fp16 in, **fp32** accumulate", "side": "left"},
-    {"at": "gmem-in", "text": "Every dimension padded to a multiple of **16**"}
+  "arrows": [
+    {"from": "g-ab", "to": "smem", "label": "fill (staged)"},
+    {"from": "g-ab", "to": "warp", "label": "load_matrix_sync"},
+    {"from": "smem", "to": "warp"},
+    {"from": "warp", "to": "g-c", "label": "store_matrix_sync"}
   ]
 }
 :::
@@ -198,31 +200,33 @@ of output tiles instead of one.
 
 :::widget tiled-matmul
 
-The staged loop has two barriers, and each prevents a different race:
+The staged loop has two barriers, and each prevents a different race. Read the figure left to right, one
+K-step of the loop:
 
-:::architecture
+:::gpu
 {
-  "input": "A, B half in global memory",
-  "output": "C: one 64 × 64 fp32 tile per block",
   "items": [
-    {"tone": "block", "repeat": "K/32 ×", "label": "one K-step · k0 += 32", "items": [
-      {"columns": [
-        [{"id": "fill-a", "label": "Fill As[64][40]", "kind": "kernel", "sub": "64 × 32 halves · 0 past M, K", "detail": "The 128 threads copy the slab cooperatively; rows past M and columns past K are zero-filled."}],
-        [{"id": "fill-b", "label": "Fill Bs[32][72]", "kind": "kernel", "sub": "32 × 64 halves · 0 past K, N"}]
-      ]},
-      {"id": "sync1", "label": "__syncthreads()", "kind": "kernel", "sub": "no warp reads a half-written tile"},
-      {"tone": "dotted", "label": "each of 2 × 2 warps", "items": [
-        {"id": "ld", "label": "load_matrix_sync", "kind": "kernel", "sub": "2 a (ldm 40) · 2 b (ldm 72)", "detail": "For kk = 0 and 16: a fragments from &As[warpRow·32 + i·16][kk], b fragments from &Bs[kk][warpCol·32 + j·16]."},
-        {"id": "mma4", "label": "4 × mma_sync", "kind": "kernel", "sub": "acc[i][j] += a[i] · b[j]"}
-      ]},
-      {"id": "sync2", "label": "__syncthreads()", "kind": "kernel", "sub": "nobody refills while a warp reads"}
+    {"id": "kstep", "label": "for (k0 = 0; k0 < K; k0 += 32)", "sub": "8 KiB per step feeds 262,144 FLOP", "count": "K/32 steps", "items": [
+      {"id": "fill", "label": "Fill", "sub": "128 threads · 0 past M, N, K", "layout": "column", "items": [
+        {"threads": 12, "continues": true, "label": "16 halves of each tile per thread"},
+        {"label": "As[64][40] · Bs[32][72]", "sub": "being written", "tone": "shared", "stretch": true}
+      ], "detail": "The 128 threads copy the 64 × 32 slab of A and the 32 × 64 slab of B cooperatively; rows past M or K and columns past N are zero-filled."},
+      {"id": "sync1", "label": "__syncthreads()", "sub": "read after write", "detail": "No warp loads a fragment from a half-written tile."},
+      {"id": "mma4", "label": "Multiply", "sub": "kk = 0, 16", "layout": "column", "items": [
+        {"label": "As, Bs", "sub": "read only", "tone": "shared", "stretch": true},
+        {"label": "2 × 2 warps", "sub": "each: 2 a, 2 b, 4 mma_sync", "items": [
+          {"label": "Warp 0", "layout": "column", "items": [{"threads": 6, "continues": true, "label": "done"}]},
+          {"gap": "…"},
+          {"label": "Warp 3", "layout": "column", "items": [{"threads": 6, "continues": true, "label": "still loading"}]}
+        ]},
+        {"label": "acc[2][2]", "sub": "+= a[i] · b[j] · per warp", "tone": "register", "stretch": true}
+      ], "detail": "For kk = 0 and 16: a fragments from &As[warpRow·32 + i·16][kk] with ldm 40, b fragments from &Bs[kk][warpCol·32 + j·16] with ldm 72, four mma_sync into the 2 × 2 accumulators."},
+      {"id": "sync2", "label": "__syncthreads()", "sub": "write after read", "detail": "Nobody refills As and Bs for the next k0 while a slower warp still loads fragments from them."}
     ]},
-    {"id": "store", "label": "store_matrix_sync × 4", "kind": "kernel", "sub": "each tile inside M × N"}
-  ],
-  "notes": [
-    {"at": "fill-b", "text": "**8 KiB** per K-step feeds **262,144** FLOP"},
-    {"at": "ld", "text": "Warp tile **32 × 32** as 2 × 2 fragments"},
-    {"at": "sync2", "text": "The second barrier: write after read", "side": "left"}
+    {"id": "store", "label": "After the loop", "sub": "each tile inside M × N", "layout": "column", "items": [
+      {"label": "acc[2][2]", "sub": "per warp", "tone": "register", "stretch": true},
+      {"label": "C", "sub": "store_matrix_sync × 4", "tone": "global", "stretch": true}
+    ], "detail": "Four stores per warp with ldm = N and mem_row_major; M and N are multiples of 16, so a tile is wholly inside C or wholly outside."}
   ]
 }
 :::

@@ -5,7 +5,7 @@ export const gpt2GenerateStep: Step = {
   title: 'Generation: temperature, top-k, nucleus and a KV cache',
   concept: 'pytorch',
   file: 'gpt2_generate',
-  focus: ['tokens', 'wte', 'wpe', 'attn', 'head'],
+  focus: ['prefill', 'filter', 'sample', 'append', 'decode', 'generated'],
   task: `## Task
 
 Sample from the step-1 model (\`from gpt2_model import GPT, GPTConfig, CausalSelfAttention\`), first by
@@ -32,23 +32,6 @@ re-running the whole context for every token, then with a per-block KV cache tha
   \`block_size\` tokens, then feed only the sampled token \`forward_cached(model, idx_next, cache)\`; when
   \`cache.pos == block_size\` the learned positions are exhausted — reset \`pos\` to 0 and re-encode the last
   \`block_size\` tokens, exactly what the uncached crop computes.
-
-:::architecture
-{
-  "input": "prompt idx · (B, T)",
-  "output": "to the tokenizer's decode",
-  "items": [
-    {"id": "prefill", "label": "Prefill the prompt", "kind": "attention", "sub": "forward_cached · positions 0..T−1", "detail": "The prompt's last \`block_size\` tokens at once: every block writes its k and v rows into the cache; only the last position's logits come back."},
-    {"tone": "block", "repeat": "max_new_tokens ×", "label": "One decode step", "items": [
-      {"id": "filter", "label": "filter_logits", "sub": "÷ temperature · top-k · top-p"},
-      {"id": "sample", "label": "Sample", "sub": "softmax → multinomial → (B, 1)", "detail": "Exactly one \`torch.multinomial\` per new token, in both paths: that is what makes cached and uncached draws identical."},
-      {"id": "append", "label": "Append to idx", "kind": "io", "sub": "torch.cat((idx, idx_next), 1)"},
-      {"id": "decode", "label": "Decode one token", "kind": "attention", "sub": "forward_cached(idx_next) at pos", "side": {"label": "KV cache", "sub": "rows 0..pos", "detail": "\`(n_layer, B, n_head, block_size, hd)\` for k and for v; this step appends row \`pos\` and its one query attends over all \`pos + 1\` rows."}, "detail": "Skipped after the last token. When \`cache.pos == block_size\`, reset \`pos\` to 0 and re-encode the last \`block_size\` tokens."}
-    ]},
-    {"id": "out", "label": "Generated ids", "kind": "io", "sub": "(B, T + max_new_tokens)"}
-  ]
-}
-:::
 
 The self-test (float64, \`eval()\`, \`GPTConfig(32, 16, 2, 2, 16)\`) checks the filters on a known
 distribution, shapes and the crop past \`block_size\`, that \`top_k=1\` ignores the seed, that the cached

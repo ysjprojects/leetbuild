@@ -251,19 +251,24 @@ export const layernormKernelsStep: Step = {
   concept: 'cuda',
   file: 'layernorm_kernels',
   focus: [
+    'x',
     'welford',
     'warp-merge',
     's-warp',
     'warp0',
     'norm',
     'saved',
+    'y',
     'bwd',
+    'dy-x',
     'bwd-load',
     'sum2',
     'dx',
     'acc',
+    'dx-out',
     'partials',
     'reduce',
+    'grads',
   ],
   task: `## Task
 
@@ -282,20 +287,30 @@ and the self-test are given; the device code is yours.
   \`m2 = a.m2 + b.m2 + delta * delta * a.count * b.count / count\`. Two empty states (\`count == 0\`, threads
   past the end of a short row) merge to an empty state, not to \`0 / 0\`.
 
-The merge, bottom to top:
+One step of the warp tree: lane \`l\` receives lane \`l + offset\`'s state through three shuffles and merges it
+into its own, all in registers:
 
-:::architecture
+:::gpu
 {
-  "output": "the merged state",
+  "align": "start",
   "items": [
-    {"columns": [
-      [{"id": "ca", "label": "State a", "sub": "n_a, mean_a, M2_a", "kind": "memory"}],
-      [{"id": "cb", "label": "State b", "sub": "n_b, mean_b, M2_b", "kind": "memory"}]
+    {"id": "cm-lane", "label": "Lane l", "layout": "column", "items": [
+      {"threads": 1},
+      {"id": "cm-a", "array": "a", "sub": "its own state", "cols": 3, "tone": "register", "cells": ["n", "μ", "M2"]},
+      {"id": "cm-merge", "label": "welford_merge(a, b)", "tone": "register", "layout": "column", "items": [
+        {"label": "n", "sub": "n_a + n_b", "tone": "register", "stretch": true},
+        {"label": "δ", "sub": "mean_b − mean_a", "tone": "register", "stretch": true},
+        {"label": "mean", "sub": "mean_a + δ·n_b / n", "tone": "register", "stretch": true},
+        {"label": "M2", "sub": "M2_a + M2_b + δ²·n_a·n_b / n", "tone": "register", "stretch": true, "detail": "The last term is the spread between the two means, weighted by how many values sit on each side; it only adds, never subtracts."}
+      ], "detail": "If n_a + n_b is 0 (two empty lanes past the end of a short row), return a unchanged instead of dividing 0 by 0."}
     ]},
-    {"id": "cn", "label": "Count", "sub": "n = n_a + n_b", "kind": "kernel"},
-    {"id": "cd", "label": "Gap between the means", "sub": "δ = mean_b − mean_a", "kind": "kernel"},
-    {"id": "cm", "label": "Merged mean", "sub": "mean_a + δ·n_b / n", "kind": "kernel"},
-    {"id": "cm2", "label": "Merged M2", "sub": "M2_a + M2_b + δ²·n_a·n_b / n", "kind": "kernel"}
+    {"id": "cm-other", "label": "Lane l + offset", "layout": "column", "items": [
+      {"threads": 1},
+      {"id": "cm-b", "array": "b", "sub": "its state", "cols": 3, "tone": "register", "cells": ["n", "μ", "M2"]}
+    ]}
+  ],
+  "arrows": [
+    {"from": "cm-b", "to": "cm-a", "label": "__shfl_down_sync × 3"}
   ]
 }
 :::

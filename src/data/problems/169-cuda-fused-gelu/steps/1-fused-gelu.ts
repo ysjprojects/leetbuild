@@ -5,7 +5,7 @@ export const fusedGeluStep: Step = {
   title: 'gelu_bias_kernel: bias + GELU in one pass, sixteen bytes at a time',
   concept: 'cuda',
   file: 'fused_gelu',
-  focus: ['ld-x', 'ld-b', 'add', 'gelu', 'st-y', 'tail'],
+  focus: ['fused', 'x', 'bias', 'thread', 'v', 'r', 'y'],
   task: `## Task
 
 Implement \`y[i] = gelu(x[i] + bias[i % cols])\` for \`0 ≤ i < n\` as one fused, vectorised kernel plus a

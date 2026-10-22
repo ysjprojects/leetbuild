@@ -75,157 +75,163 @@ fuse a letter to a space on the wrong side), special tokens (\`<|endoftext|>\`),
 byte-to-unicode mapping GPT-2 uses to keep its merge file printable, and the incremental pair-count
 updates and multi-threading that make training on gigabytes tractable. The loop, the ranks and the
 byte fallback are the same.`,
-  architecture: {
-    input: 'low ×5 · lower ×2 · widest ×3 · newest ×6',
-    output: 'decode(encode(s)) == s',
-    items: [
-      {
-        id: 'text',
-        label: 'Text',
-        kind: 'io',
-        sub: 'str · any script',
-        detail:
-          'The self-test corpus is Sennrich’s: `low` ×5, `lower` ×2, `widest` ×3, `newest` ×6, joined by spaces (94 bytes).',
-      },
-      {
-        tone: 'dotted',
-        label: 'GPT-2 only · left out here',
+  figures: [
+    {
+      title: 'Byte-level BPE',
+      architecture: {
+        input: 'low ×5 · lower ×2 · widest ×3 · newest ×6',
+        output: 'decode(encode(s)) == s',
         items: [
           {
-            id: 'regex',
-            label: 'Pre-tokenizer regex',
-            sub: "'s|'t| ?\\p{L}+| ?\\p{N}+|…",
+            id: 'text',
+            label: 'Text',
+            kind: 'io',
+            sub: 'str · any script',
             detail:
-              'GPT-2’s `encoder.py` splits the string into chunks (contractions, letters with their leading space, digits, punctuation) and runs BPE inside each, so no merge crosses a word boundary. The drill merges across the whole corpus.',
+              'The self-test corpus is Sennrich’s: `low` ×5, `lower` ×2, `widest` ×3, `newest` ×6, joined by spaces (94 bytes).',
           },
-        ],
-      },
-      {
-        id: 'utf8',
-        label: 'UTF-8 bytes',
-        kind: 'embed',
-        sub: 'list(text.encode("utf-8"))',
-        shape: 'list[int] in 0..255',
-        detail:
-          'The base vocabulary: `vocab = {i: bytes([i]) for i in range(256)}`. `"é"` is two ids, `"日"` three, `"🙂"` four; nothing is ever out of vocabulary.',
-      },
-      {
-        tone: 'dotted',
-        label: 'GPT-2 only · left out here',
-        items: [
           {
-            id: 'byte-map',
-            label: 'byte → unicode map',
-            sub: 'bytes_to_unicode() · 256 chars',
-            detail:
-              'A fixed bijection from each byte to a printable character, so GPT-2’s merge file is plain text. It changes nothing about which merges happen; tiktoken drops it and stores byte strings.',
+            tone: 'dotted',
+            label: 'GPT-2 only · left out here',
+            items: [
+              {
+                id: 'regex',
+                label: 'Pre-tokenizer regex',
+                sub: "'s|'t| ?\\p{L}+| ?\\p{N}+|…",
+                detail:
+                  'GPT-2’s `encoder.py` splits the string into chunks (contractions, letters with their leading space, digits, punctuation) and runs BPE inside each, so no merge crosses a word boundary. The drill merges across the whole corpus.',
+              },
+            ],
           },
-        ],
-      },
-      {
-        columns: [
-          [
-            {
-              tone: 'block',
-              repeat: 'vocab_size − 256 ×',
-              label: 'train: one merge',
-              items: [
+          {
+            id: 'utf8',
+            label: 'UTF-8 bytes',
+            kind: 'embed',
+            sub: 'list(text.encode("utf-8"))',
+            shape: 'list[int] in 0..255',
+            detail:
+              'The base vocabulary: `vocab = {i: bytes([i]) for i in range(256)}`. `"é"` is two ids, `"日"` three, `"🙂"` four; nothing is ever out of vocabulary.',
+          },
+          {
+            tone: 'dotted',
+            label: 'GPT-2 only · left out here',
+            items: [
+              {
+                id: 'byte-map',
+                label: 'byte → unicode map',
+                sub: 'bytes_to_unicode() · 256 chars',
+                detail:
+                  'A fixed bijection from each byte to a printable character, so GPT-2’s merge file is plain text. It changes nothing about which merges happen; tiktoken drops it and stores byte strings.',
+              },
+            ],
+          },
+          {
+            columns: [
+              [
                 {
-                  id: 'count',
-                  label: 'Count adjacent pairs',
-                  sub: 'Counter(zip(ids, ids[1:]))',
-                  detail: 'Every adjacent pair across the whole corpus, in the order first seen.',
-                },
-                {
-                  id: 'pick',
-                  label: 'Most frequent pair',
-                  sub: 'max · ties to the first seen',
-                  detail:
-                    '`max(counts, key=counts.get)` returns the first maximum, so the same corpus always yields the same merge file. Training stops early when the best pair occurs fewer than twice.',
-                },
-                {
-                  id: 'record',
-                  label: 'Record the merge',
-                  sub: 'merges[r] · vocab[256 + r]',
-                  detail: '`vocab[256 + r] = vocab[a] + vocab[b]`: every learned token is the bytes of two older ones.',
-                },
-                {
-                  id: 'replace',
-                  label: 'Replace every occurrence',
-                  sub: '_merge(ids, pair, 256 + r)',
-                  detail: 'Left to right, non-overlapping: the corpus shrinks by the pair’s count.',
+                  tone: 'block',
+                  repeat: 'vocab_size − 256 ×',
+                  label: 'train: one merge',
+                  items: [
+                    {
+                      id: 'count',
+                      label: 'Count adjacent pairs',
+                      sub: 'Counter(zip(ids, ids[1:]))',
+                      detail: 'Every adjacent pair across the whole corpus, in the order first seen.',
+                    },
+                    {
+                      id: 'pick',
+                      label: 'Most frequent pair',
+                      sub: 'max · ties to the first seen',
+                      detail:
+                        '`max(counts, key=counts.get)` returns the first maximum, so the same corpus always yields the same merge file. Training stops early when the best pair occurs fewer than twice.',
+                    },
+                    {
+                      id: 'record',
+                      label: 'Record the merge',
+                      sub: 'merges[r] · vocab[256 + r]',
+                      detail:
+                        '`vocab[256 + r] = vocab[a] + vocab[b]`: every learned token is the bytes of two older ones.',
+                    },
+                    {
+                      id: 'replace',
+                      label: 'Replace every occurrence',
+                      sub: '_merge(ids, pair, 256 + r)',
+                      detail: 'Left to right, non-overlapping: the corpus shrinks by the pair’s count.',
+                    },
+                  ],
                 },
               ],
-            },
-          ],
-          [
-            {
-              tone: 'block',
-              repeat: 'until no rank ×',
-              label: 'encode: one merge',
-              items: [
+              [
                 {
-                  id: 'lowest',
-                  label: 'Lowest-ranked pair',
-                  sub: 'min(pairs, key=ranks.get)',
-                  detail:
-                    'Unranked pairs key to `float("inf")`; when the winner has no rank, encoding is done. Lowest rank first replays the training rounds in order.',
-                },
-                {
-                  id: 'apply',
-                  label: 'Merge it everywhere',
-                  sub: '_merge(ids, pair, 256 + rank)',
-                  detail: 'The same helper as training: on the corpus, `encode` ends at exactly `train`’s ids.',
+                  tone: 'block',
+                  repeat: 'until no rank ×',
+                  label: 'encode: one merge',
+                  items: [
+                    {
+                      id: 'lowest',
+                      label: 'Lowest-ranked pair',
+                      sub: 'min(pairs, key=ranks.get)',
+                      detail:
+                        'Unranked pairs key to `float("inf")`; when the winner has no rank, encoding is done. Lowest rank first replays the training rounds in order.',
+                    },
+                    {
+                      id: 'apply',
+                      label: 'Merge it everywhere',
+                      sub: '_merge(ids, pair, 256 + rank)',
+                      detail: 'The same helper as training: on the corpus, `encode` ends at exactly `train`’s ids.',
+                    },
+                  ],
                 },
               ],
-            },
-          ],
-        ],
-      },
-      {
-        id: 'ids',
-        label: 'Token ids',
-        kind: 'io',
-        sub: 'list[int] · each < vocab_size',
-        detail:
-          'What the model reads: one embedding row per id. `train` returns the corpus’s ids after its last merge; `encode(corpus)` must return the same list.',
-      },
-      {
-        tone: 'dotted',
-        label: 'decode(ids)',
-        items: [
-          {
-            id: 'lookup',
-            label: 'Join the tokens’ bytes',
-            sub: 'b"".join(vocab[i] for i in ids)',
-            detail: 'Exact: the bytes are preserved, so `decode(encode(s)) == s` for every string.',
+            ],
           },
           {
-            id: 'utf8-decode',
-            label: 'UTF-8 decode',
-            sub: '.decode("utf-8", errors="replace")',
+            id: 'ids',
+            label: 'Token ids',
+            kind: 'io',
+            sub: 'list[int] · each < vocab_size',
             detail:
-              'A token boundary can fall inside a multi-byte character; `errors="replace"` turns the orphaned bytes into U+FFFD instead of raising. `decode([0x80])` is `"\\ufffd"`.',
+              'What the model reads: one embedding row per id. `train` returns the corpus’s ids after its last merge; `encode(corpus)` must return the same list.',
+          },
+          {
+            tone: 'dotted',
+            label: 'decode(ids)',
+            items: [
+              {
+                id: 'lookup',
+                label: 'Join the tokens’ bytes',
+                sub: 'b"".join(vocab[i] for i in ids)',
+                detail: 'Exact: the bytes are preserved, so `decode(encode(s)) == s` for every string.',
+              },
+              {
+                id: 'utf8-decode',
+                label: 'UTF-8 decode',
+                sub: '.decode("utf-8", errors="replace")',
+                detail:
+                  'A token boundary can fall inside a multi-byte character; `errors="replace"` turns the orphaned bytes into U+FFFD instead of raising. `decode([0x80])` is `"\\ufffd"`.',
+              },
+            ],
+          },
+          {
+            id: 'text-out',
+            label: 'Text',
+            kind: 'io',
+            sub: 'str · U+FFFD for a split char',
+            detail:
+              'The original string whenever the ids came from `encode`; a replacement character where a token boundary cut a multi-byte character.',
           },
         ],
+        notes: [
+          {at: 'utf8', text: '**256** base tokens, nothing out of vocabulary'},
+          {at: 'pick', text: 'First merge **b"es"**, seen **9** times', side: 'left'},
+          {at: 'lowest', text: '**Lowest rank** first, as trained'},
+          {at: 'ids', text: 'Corpus: **94** bytes → **12** ids at 17 merges'},
+          {at: 'utf8-decode', text: 'A split character decodes to **U+FFFD**'},
+        ],
       },
-      {
-        id: 'text-out',
-        label: 'Text',
-        kind: 'io',
-        sub: 'str · U+FFFD for a split char',
-        detail:
-          'The original string whenever the ids came from `encode`; a replacement character where a token boundary cut a multi-byte character.',
-      },
-    ],
-    notes: [
-      {at: 'utf8', text: '**256** base tokens, nothing out of vocabulary'},
-      {at: 'pick', text: 'First merge **b"es"**, seen **9** times', side: 'left'},
-      {at: 'lowest', text: '**Lowest rank** first, as trained'},
-      {at: 'ids', text: 'Corpus: **94** bytes → **12** ids at 17 merges'},
-      {at: 'utf8-decode', text: 'A split character decodes to **U+FFFD**'},
-    ],
-  },
+    },
+  ],
   steps: [bpeStep],
   learn,
 };

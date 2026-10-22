@@ -30,9 +30,13 @@ const dangerClass = `${buttonClass} bg-danger-400 text-ink-950 hover:bg-danger-3
 
 const Dialog: FC<{spec: DialogSpec; onClose: (ok: boolean) => void}> = memo(({spec, onClose}) => {
   const ref = useRef<HTMLDialogElement>(null);
+  const dismiss = useRef<HTMLButtonElement>(null);
   useEffect(() => {
     const el = ref.current;
     if (el !== null && !el.open) el.showModal();
+    // showModal() focuses the first focusable element inside, which in a figure is a part that opens
+    // a tooltip: focus belongs on the dismissing button, as its autoFocus says.
+    dismiss.current?.focus();
   }, []);
   const cancel = useCallback(() => onClose(false), [onClose]);
   const confirm = useCallback(() => onClose(true), [onClose]);
@@ -70,12 +74,12 @@ const Dialog: FC<{spec: DialogSpec; onClose: (ok: boolean) => void}> = memo(({sp
         </div>
         <div className="mt-4 flex justify-end gap-2">
           {spec.confirm === undefined ? (
-            <button autoFocus className={cancelClass} onClick={cancel} type="button">
+            <button autoFocus className={cancelClass} onClick={cancel} ref={dismiss} type="button">
               Close
             </button>
           ) : (
             <>
-              <button autoFocus className={cancelClass} onClick={cancel} type="button">
+              <button autoFocus className={cancelClass} onClick={cancel} ref={dismiss} type="button">
                 {spec.cancel ?? 'Cancel'}
               </button>
               <button className={spec.danger === true ? dangerClass : confirmClass} onClick={confirm} type="button">

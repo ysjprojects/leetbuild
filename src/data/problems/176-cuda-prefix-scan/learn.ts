@@ -14,42 +14,36 @@ why a model stack runs it constantly: the token-to-expert offsets a mixture-of-e
 the \`cu_seqlens\` of a variable-length attention batch, the compaction of kept tokens in a sampler, radix
 sort, \`torch.cumsum\`.
 
-:::architecture
+:::gpu
 {
-  "input": "in[n] · n = 1,000,003 int",
-  "output": "exclusive and inclusive scans",
+  "layout": "column",
   "items": [
-    {"id": "host", "label": "Host: exclusive_scan", "sub": "blocks = ⌈n/1024⌉ · LAUNCH_CHECK", "kind": "host", "detail": "One scan_block launch when n ≤ 1024; otherwise scan the blocks, scan the block sums by calling itself, add them back."},
-    {"id": "gmem-in", "label": "Global memory", "sub": "in[n] · 4 MB of int", "kind": "memory", "shape": "[n] int32"},
-    {"tone": "block", "repeat": "⌈n/1024⌉ ×", "label": "scan_block · 512 threads", "items": [
-      {"id": "smem", "label": "Shared tile temp[]", "sub": "1,024 + 31 int · i + (i >> 5)", "kind": "memory", "shape": "temp: [1,055]", "detail": "Two elements per thread, zero past n, every index padded by i >> 5."},
-      {"tone": "dotted", "repeat": "10 ×", "label": "offset 1 → 512", "items": [
-        {"id": "up", "label": "Up-sweep level", "sub": "__syncthreads; temp[b] += temp[a]", "kind": "kernel", "detail": "512, 256, …, 1 active threads build the reduction tree in place."}
-      ]},
-      {"id": "root", "label": "Save the root, clear it", "sub": "block_sums[b] = root; root = 0", "kind": "kernel", "detail": "The root is the block total; clearing it makes the scan exclusive."},
-      {"tone": "dotted", "repeat": "10 ×", "label": "offset 512 → 1", "items": [
-        {"id": "down", "label": "Down-sweep level", "sub": "__syncthreads; a, b = b, a + b", "kind": "kernel", "detail": "Each left child gets its parent's value, each right child parent + left."}
+    {"id": "block", "label": "Thread block 2", "sub": "scan_block<<<977, 512>>> · elements 2048 … 3071", "count": "977 blocks", "layout": "column", "items": [
+      {"id": "threads", "threads": 16, "continues": true, "label": "512 threads · elements tid and tid + 512", "detail": "Two elements per thread: the busiest tree level combines 512 pairs."},
+      {"id": "smem", "label": "Shared memory", "sub": "int temp[1024 + 31] · 4,220 bytes", "tone": "shared", "items": [
+        {"id": "temp", "array": "temp[]", "sub": "first 128 words · a column = one bank", "cols": 32, "rows": 4, "tone": "shared", "marks": [
+          {"rows": [1, 1], "cols": [0, 0], "tone": "muted"}, {"rows": [2, 2], "cols": [1, 1], "tone": "muted"}, {"rows": [3, 3], "cols": [2, 2], "tone": "muted"},
+          {"rows": [0, 0], "cols": [15, 15], "tone": "register"}, {"rows": [1, 1], "cols": [16, 16], "tone": "register"}, {"rows": [2, 2], "cols": [17, 17], "tone": "register"}, {"rows": [3, 3], "cols": [18, 18], "tone": "register"}
+        ], "detail": "Element i lives at i + (i >> 5): one wasted word (grey) after every 32. At offset 16 the reads of threads 0 … 3 (highlighted) fall in four different banks."}
       ]}
     ]},
-    {"columns": [
-      [{"id": "out-part", "label": "out[n]: per-block scans", "sub": "each block as if it began at 0", "kind": "memory", "shape": "[n] int32"}],
-      [
-        {"id": "sums", "label": "block_sums[977]", "sub": "one total per block", "kind": "memory", "shape": "[977] int32"},
-        {"id": "scan-sums", "label": "exclusive_scan(block_sums)", "sub": "recursive · <<<1, 512>>>", "kind": "kernel", "shape": "offsets: [977]", "detail": "offsets[b] is the total of blocks 0 … b−1: the carry each block is missing."}
-      ]
-    ]},
-    {"id": "add", "label": "add_block_offsets", "sub": "out[i] += offsets[blockIdx.x]", "kind": "kernel", "detail": "A separate launch: kernel boundaries are the only ordering between blocks."},
-    {"id": "gmem-out", "label": "Global memory", "sub": "out[n] · exclusive scan", "kind": "memory", "shape": "[n] int32"},
-    {"id": "incl", "label": "to_inclusive", "sub": "incl[i] = excl[i] + in[i]", "kind": "kernel"}
+    {"id": "hbm", "label": "Global memory", "sub": "HBM", "detail": "n = 1,000,003 ints. A cell of in and out is one 1,024-element tile; a cell of block_sums one int.", "tone": "global", "stretch": true, "items": [
+      {"id": "g-in", "array": "in[n]", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"], "marks": [{"cols": [2, 2], "tone": "shared", "label": "tile 2"}, {"cols": [11, 11], "tone": "bad", "label": "579"}], "detail": "The last tile holds 579 elements; its block loads zeros past n."},
+      {"id": "g-out", "array": "out[n]", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"], "marks": [{"cols": [2, 2], "tone": "shared", "label": "from 0"}], "detail": "Each tile's scan as if it began the array, until the block sums are added back."},
+      {"id": "g-sums", "array": "block_sums[977]", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"], "marks": [{"cols": [2, 2], "tone": "shared", "label": "root"}], "detail": "The root of the up-sweep, the tile's total, saved before it is cleared."}
+    ]}
   ],
-  "notes": [
-    {"at": "smem", "text": "**31** pad words: a 32-way conflict becomes none"},
-    {"at": "up", "text": "**2(n − 1)** adds: 2,046 per tile, not 9,217"},
-    {"at": "scan-sums", "text": "**977** block sums fit one block: 2 levels"},
-    {"at": "add", "text": "About **4n** ints of traffic; CUB needs 2n"}
+  "arrows": [
+    {"from": "g-in", "to": "temp", "label": "2 ints per thread"},
+    {"from": "temp", "to": "g-out", "label": "guarded store"},
+    {"from": "temp", "to": "g-sums", "label": "thread 0: root"}
   ]
 }
 :::
+
+One block of 512 threads copies its 1,024-element tile of \`in\` into a padded shared array, scans it there
+with two trees, writes the scan to \`out\` and its total to \`block_sums\`. Each tile comes out as if it began
+the array; the totals are scanned in a second launch and added back in a third.
 
 The contract the drill implements, in one file \`prefix_scan.cu\`, with \`BLOCK_THREADS = 512\` and
 \`ELEMS_PER_BLOCK = 1024\`:
@@ -217,7 +211,9 @@ b += CONFLICT_FREE_OFFSET(b);
 At offset 16, thread \`t\` reads \`a = 32t + 15\`; padded it is \`33t + 15\`, bank \`(t + 15) mod 32\` — 32 lanes,
 32 banks. The same shift spreads every other level of a 1024-element tile, and the load and the store (where
 \`ai = tid\` is already contiguous) stay conflict-free because the pad only changes every 32 elements. The
-cost is 31 words of shared memory (124 bytes on 4,096) and one shift and add per index.
+cost is 31 words of shared memory (124 bytes on 4,096) and one shift and add per index. The figure at the top
+of this guide draws the first 128 words: the grey cells are pad words, the highlighted ones the offset-16
+reads of threads 0 … 3, each one bank further along.
 
 - Every index into \`temp\` must be padded — the load, both tree indices, the root, the store. Padding one
   and not another reads the wrong slot, which is a correctness bug, not a slowdown.
@@ -248,6 +244,38 @@ each ordered after the last by the stream:
 | 1 | \`scan_block<<<977, 512>>>(in, out, block_sums, n)\` | \`in\` | \`out\`: each block scanned as if it started at 0; \`block_sums[b]\`: the total of block \`b\` |
 | 2 | \`exclusive_scan(block_sums, offsets, 977)\`: \`scan_block<<<1, 512>>>\`, \`block_sums = nullptr\` | \`block_sums\` | \`offsets[b]\`: the total of blocks \`0 … b−1\` |
 | 3 | \`add_block_offsets<<<977, 512>>>(out, offsets, n)\` | \`out\`, \`offsets\` | \`out[i] += offsets[blockIdx.x]\` |
+
+The same three launches as a figure: the dashed arrows are the stream order, the solid ones what each launch
+reads and writes.
+
+:::gpu
+{
+  "layout": "column",
+  "items": [
+    {"id": "stream", "label": "exclusive_scan(in, out, n)", "sub": "three launches on one stream · LAUNCH_CHECK after each", "items": [
+      {"id": "launch1", "label": "1 · scan_block", "sub": "<<<977, 512>>> · tiles from 0", "tone": "compute", "detail": "Every block scans its own tile and writes its total."},
+      {"id": "launch2", "label": "2 · exclusive_scan(sums)", "sub": "scan_block<<<1, 512>>>", "tone": "compute", "detail": "exclusive_scan calls itself on the 977 block sums; they fit one block."},
+      {"id": "launch3", "label": "3 · add_block_offsets", "sub": "<<<977, 512>>> · out += offsets[b]", "tone": "compute", "detail": "Adds offsets[blockIdx.x] to the block's 1,024 elements, guarded by n."}
+    ]},
+    {"id": "hbm2", "label": "Global memory", "sub": "HBM", "detail": "A cell of out is one tile; a cell of block_sums and offsets is one int.", "tone": "global", "stretch": true, "items": [
+      {"id": "out-part", "array": "out[n]", "sub": "after launch 1 · from 0", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"]},
+      {"id": "sums", "array": "block_sums[977]", "sub": "one per tile", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"], "marks": [{"cols": [0, 0], "tone": "register", "label": "s0"}, {"cols": [1, 1], "tone": "register", "label": "s1"}]},
+      {"id": "offsets", "array": "offsets[977]", "sub": "scan of the sums", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"], "marks": [{"cols": [2, 2], "tone": "register", "label": "s0 + s1"}]},
+      {"id": "out-final", "array": "out[n]", "sub": "after launch 3 · final", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"], "marks": [{"cols": [2, 2], "tone": "register", "label": "+ (s0 + s1)"}]}
+    ]}
+  ],
+  "arrows": [
+    {"from": "launch1", "to": "launch2", "dashed": true},
+    {"from": "launch2", "to": "launch3", "dashed": true},
+    {"from": "launch1", "to": "out-part"},
+    {"from": "launch1", "to": "sums", "label": "roots"},
+    {"from": "sums", "to": "launch2"},
+    {"from": "launch2", "to": "offsets", "label": "scan"},
+    {"from": "offsets", "to": "launch3"},
+    {"from": "launch3", "to": "out-final"}
+  ]
+}
+:::
 
 - **Recursion depth.** Each level divides n by 1024: 977 block sums fit one block, so a million elements
   take two levels; a billion would take three. The recursion bottoms out at \`blocks == 1\` with
@@ -281,28 +309,27 @@ Production scans — CUB's \`DeviceScan\`, which \`thrust::exclusive_scan\` and 
 make one pass over the data. Merrill and Garland's
 [decoupled look-back](https://research.nvidia.com/publication/2016-03_single-pass-parallel-prefix-scan-decoupled-look-back)
 lets a tile learn its prefix from its predecessors *during* the launch, without the deadlock a naive
-spin-wait risks. Here is tile 6, bottom to top:
+spin-wait risks. Here is the block that drew tile 6, in the middle of its look-back:
 
-:::architecture
+:::gpu
 {
-  "input": "tile 6 of in[n]",
-  "output": "tile 6 of out[n]",
+  "layout": "column",
   "items": [
-    {"id": "claim", "label": "Claim a tile id", "sub": "id = atomicAdd(counter, 1)", "kind": "kernel", "detail": "Ids follow start order, so every predecessor is already running: no deadlock."},
-    {"id": "reduce", "label": "Reduce own tile", "sub": "aggregate of tile 6", "kind": "kernel"},
-    {"id": "publish-a", "label": "Publish {A, aggregate}", "sub": "status[6], global memory", "kind": "memory", "detail": "Successors can use the aggregate at once, before tile 6 knows its own prefix."},
-    {"columns": [
-      [{"id": "t5", "label": "Tile 5", "sub": "{A, 40}", "kind": "memory"}],
-      [{"id": "t4", "label": "Tile 4", "sub": "{A, 12}", "kind": "memory"}],
-      [{"id": "t3", "label": "Tile 3", "sub": "{P, 310}", "kind": "memory"}]
+    {"id": "lb-block", "label": "Thread block on tile 6", "sub": "tile = atomicAdd(&counter, 1)", "count": "one launch", "layout": "column", "detail": "Tile ids follow start order, so every predecessor the block waits on is already running: no deadlock.", "items": [
+      {"threads": 16, "continues": true, "label": "reduce, look back, then scan the tile"},
+      {"id": "lb-regs", "label": "Registers", "sub": "tile 6's aggregate · prefix = 40 + 12 + 310 = 362", "tone": "register", "detail": "The tile's own aggregate, published at once as {A, aggregate}; then the sum of predecessors read backwards until the first inclusive prefix, published as {P, 362 + aggregate}."}
     ]},
-    {"id": "lookback", "op": "+", "detail": "40 + 12 + 310 = 362: sum aggregates backwards, stop at the first inclusive prefix P."},
-    {"id": "publish-p", "label": "Publish {P, 362 + aggregate}", "sub": "status[6], global memory", "kind": "memory"},
-    {"id": "scan-tile", "label": "Scan the tile", "sub": "prefix 362 added · write out", "kind": "kernel"}
+    {"id": "lb-hbm", "label": "Global memory", "sub": "HBM", "tone": "global", "stretch": true, "items": [
+      {"id": "lb-in", "array": "in[n]", "cols": 12, "cells": "index", "marks": [{"cols": [6, 6], "tone": "register", "label": "tile 6"}], "detail": "A cell is one tile."},
+      {"id": "lb-status", "array": "status[tile]", "cols": 12, "cells": ["P", "P", "P", "P", "A", "A", "A", "X", "X", "X", "X", "X"], "marks": [{"cols": [3, 5], "tone": "register", "label": "look-back"}, {"cols": [7, 11], "tone": "muted", "label": "not yet"}], "detail": "One flag and one value per tile. X: nothing yet. A: the tile's aggregate, {A, 12} for tile 4 and {A, 40} for tile 5. P: its inclusive prefix, {P, 310} for tile 3, which ends the look-back."},
+      {"id": "lb-out", "array": "out[n]", "cols": 12, "cells": "index", "marks": [{"cols": [6, 6], "tone": "register", "label": "+ 362"}], "detail": "The tile's scan with the prefix 362 added: written once, about 2n words of traffic in all."}
+    ]}
   ],
-  "notes": [
-    {"at": "t3", "text": "Look-back stops at the first **P**"},
-    {"at": "publish-p", "text": "One pass: about **2n** words of traffic"}
+  "arrows": [
+    {"from": "lb-in", "to": "lb-regs", "label": "reduce"},
+    {"from": "lb-regs", "to": "lb-status", "label": "publish"},
+    {"from": "lb-status", "to": "lb-regs", "label": "look back"},
+    {"from": "lb-regs", "to": "lb-out", "label": "scan"}
   ]
 }
 :::

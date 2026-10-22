@@ -13,7 +13,7 @@ export const blellochScanStep: Step = {
   title: 'scan_block + add_block_offsets: a work-efficient exclusive scan of any length',
   concept: 'cuda',
   file: 'prefix_scan',
-  focus: ['host', 'smem', 'up', 'root', 'down', 'scan-sums', 'add', 'incl'],
+  focus: ['threads', 'temp', 'g-in', 'g-out', 'g-sums', 'launch2', 'launch3'],
   task: `## Task
 
 Implement an **exclusive prefix sum** of \`n\` \`int\`s on the device, for any \`n ≥ 1\`, as three kernels

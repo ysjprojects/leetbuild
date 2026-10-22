@@ -61,129 +61,138 @@ on \`log_softmax\` and \`cross_entropy\`. A passing run prints \`PASS\`; the sta
 Class weights, \`reduction="sum"\` / \`"none"\`, soft (probability) targets, the fused and chunked kernels
 that never materialise the \`(tokens, vocab)\` tensor, bf16 → float32 upcasting of the logits, and the
 online (tiled, running-max) softmax that FlashAttention uses inside attention.`,
-  architecture: {
-    input: 'logits x · (N, C) · one row near 1e4',
-    items: [
-      {
-        id: 'logits',
-        label: 'Logits',
-        sub: '(N, C) · float32 or float64',
-        kind: 'io',
-        shape: '[N, C]',
-        detail:
-          'One row per token, one column per class. The self-test puts its first row around `1e4` and one logit at `-1e4`: `exp` of either end is out of range in both dtypes.',
-      },
-      {
-        tone: 'dotted',
-        label: 'log_softmax(x, dim=-1)',
+  figures: [
+    {
+      title: 'Stable log-softmax and cross-entropy',
+      architecture: {
+        input: 'logits x · (N, C) · one row near 1e4',
         items: [
           {
-            id: 'shift',
-            label: 'Subtract the row max',
-            sub: 's = x − m ≤ 0',
+            id: 'logits',
+            label: 'Logits',
+            sub: '(N, C) · float32 or float64',
+            kind: 'io',
             shape: '[N, C]',
-            side: {
-              label: 'Row max m',
-              sub: 'x.amax(-1, keepdim)',
-              detail:
-                '`m` has shape `(N, 1)` and broadcasts back over the row. Its gradient cancels exactly (`-1 + Σ p = 0`), so `m.detach()` is safe.',
-            },
             detail:
-              'Softmax is a ratio of exponentials, unchanged when every term is multiplied by `exp(-m)`. After the shift the largest exponent is exactly `0`.',
+              'One row per token, one column per class. The self-test puts its first row around `1e4` and one logit at `-1e4`: `exp` of either end is out of range in both dtypes.',
           },
           {
-            id: 'exp',
-            label: 'Exponentiate',
-            sub: 'exp(s) ∈ (0, 1]',
-            detail:
-              'Every exponent is `≤ 0`, so nothing overflows. Terms far below the max underflow to `0`, which is the right probability.',
+            tone: 'dotted',
+            label: 'log_softmax(x, dim=-1)',
+            items: [
+              {
+                id: 'shift',
+                label: 'Subtract the row max',
+                sub: 's = x − m ≤ 0',
+                shape: '[N, C]',
+                side: {
+                  label: 'Row max m',
+                  sub: 'x.amax(-1, keepdim)',
+                  detail:
+                    '`m` has shape `(N, 1)` and broadcasts back over the row. Its gradient cancels exactly (`-1 + Σ p = 0`), so `m.detach()` is safe.',
+                },
+                detail:
+                  'Softmax is a ratio of exponentials, unchanged when every term is multiplied by `exp(-m)`. After the shift the largest exponent is exactly `0`.',
+              },
+              {
+                id: 'exp',
+                label: 'Exponentiate',
+                sub: 'exp(s) ∈ (0, 1]',
+                detail:
+                  'Every exponent is `≤ 0`, so nothing overflows. Terms far below the max underflow to `0`, which is the right probability.',
+              },
+              {
+                id: 'sum',
+                label: 'Sum over the row',
+                sub: 'Σ exp(s) ∈ [1, C]',
+                shape: '[N, 1]',
+                detail: 'The max term contributes exactly `1`, so the sum is never `0` and never above `C`.',
+              },
+              {
+                id: 'log',
+                label: 'Log, negated',
+                sub: '−log Σ exp(s) ∈ [−log C, 0]',
+                detail: 'Minus the log-sum-exp of the shifted row: a small finite number, `lse(x) − m`.',
+              },
+              {
+                id: 'logp',
+                op: '+',
+                from: 'exp',
+                detail:
+                  '`log p = s − log Σ exp(s)`: the shifted row comes around and the log-sum-exp is subtracted. `(N, C)`, finite, the one full-width tensor.',
+              },
+            ],
           },
           {
-            id: 'sum',
-            label: 'Sum over the row',
-            sub: 'Σ exp(s) ∈ [1, C]',
-            shape: '[N, 1]',
-            detail: 'The max term contributes exactly `1`, so the sum is never `0` and never above `C`.',
-          },
-          {
-            id: 'log',
-            label: 'Log, negated',
-            sub: '−log Σ exp(s) ∈ [−log C, 0]',
-            detail: 'Minus the log-sum-exp of the shifted row: a small finite number, `lse(x) − m`.',
-          },
-          {
-            id: 'logp',
-            op: '+',
-            from: 'exp',
-            detail:
-              '`log p = s − log Σ exp(s)`: the shifted row comes around and the log-sum-exp is subtracted. `(N, C)`, finite, the one full-width tensor.',
-          },
-        ],
-      },
-      {
-        columns: [
-          [
-            {
-              id: 'softmax',
-              label: 'softmax',
-              sub: 'p = exp(log p)',
-              kind: 'io',
-              shape: '[N, C]',
-              detail: 'Not a second formula: one more `exp` over the log-probabilities, which inherits the shift.',
-            },
-          ],
-          [
-            {
-              columns: [
-                [
-                  {
-                    id: 'gather',
-                    label: 'Gather the target',
-                    sub: '(1 − ε) · −logp[t]',
-                    shape: '[N]',
-                    detail:
-                      '`logp.gather(1, t.unsqueeze(1)).squeeze(1)`: one entry per row, no one-hot. Ignored rows gather a stand-in index `0`.',
-                  },
-                ],
-                [
-                  {
-                    id: 'smooth',
-                    label: 'Uniform term',
-                    sub: 'ε · −logp.mean(-1)',
-                    shape: '[N]',
-                    detail:
-                      'Label smoothing puts `ε / C` on every class; because cross-entropy is linear in the target this is `ε` times minus the row mean of `logp`.',
-                  },
-                ],
+            columns: [
+              [
+                {
+                  id: 'softmax',
+                  label: 'softmax',
+                  sub: 'p = exp(log p)',
+                  kind: 'io',
+                  shape: '[N, C]',
+                  detail: 'Not a second formula: one more `exp` over the log-probabilities, which inherits the shift.',
+                },
               ],
-            },
-            {id: 'mix', op: '+', detail: 'Per row: `(1 − ε) · nll + ε · smooth`. With `ε = 0` it is the plain NLL.'},
-            {
-              id: 'mask',
-              label: 'Mask ignored rows',
-              sub: 'loss = 0 where target is −100',
-              detail: '`masked_fill(~valid, 0)` after the mixture: an ignored row contributes neither term.',
-            },
-            {
-              id: 'loss',
-              label: 'cross_entropy',
-              sub: 'Σ loss / count of kept rows',
-              kind: 'loss',
-              shape: 'scalar',
-              detail:
-                '`loss.sum() / valid.sum().clamp(min=1)`: `reduction="mean"` with ignored targets divides by the kept rows, not `N`.',
-            },
-          ],
+              [
+                {
+                  columns: [
+                    [
+                      {
+                        id: 'gather',
+                        label: 'Gather the target',
+                        sub: '(1 − ε) · −logp[t]',
+                        shape: '[N]',
+                        detail:
+                          '`logp.gather(1, t.unsqueeze(1)).squeeze(1)`: one entry per row, no one-hot. Ignored rows gather a stand-in index `0`.',
+                      },
+                    ],
+                    [
+                      {
+                        id: 'smooth',
+                        label: 'Uniform term',
+                        sub: 'ε · −logp.mean(-1)',
+                        shape: '[N]',
+                        detail:
+                          'Label smoothing puts `ε / C` on every class; because cross-entropy is linear in the target this is `ε` times minus the row mean of `logp`.',
+                      },
+                    ],
+                  ],
+                },
+                {
+                  id: 'mix',
+                  op: '+',
+                  detail: 'Per row: `(1 − ε) · nll + ε · smooth`. With `ε = 0` it is the plain NLL.',
+                },
+                {
+                  id: 'mask',
+                  label: 'Mask ignored rows',
+                  sub: 'loss = 0 where target is −100',
+                  detail: '`masked_fill(~valid, 0)` after the mixture: an ignored row contributes neither term.',
+                },
+                {
+                  id: 'loss',
+                  label: 'cross_entropy',
+                  sub: 'Σ loss / count of kept rows',
+                  kind: 'loss',
+                  shape: 'scalar',
+                  detail:
+                    '`loss.sum() / valid.sum().clamp(min=1)`: `reduction="mean"` with ignored targets divides by the kept rows, not `N`.',
+                },
+              ],
+            ],
+          },
+        ],
+        notes: [
+          {at: 'shift', text: 'exp(1e4) is **inf**; exp(x − m) is at most **1**'},
+          {at: 'sum', text: 'Never **0**, so its log is finite'},
+          {at: 'logp', text: '**log p**: the one (N, C) tensor, no one-hot'},
+          {at: 'loss', text: 'Divide by **kept rows**, not N'},
         ],
       },
-    ],
-    notes: [
-      {at: 'shift', text: 'exp(1e4) is **inf**; exp(x − m) is at most **1**'},
-      {at: 'sum', text: 'Never **0**, so its log is finite'},
-      {at: 'logp', text: '**log p**: the one (N, C) tensor, no one-hot'},
-      {at: 'loss', text: 'Divide by **kept rows**, not N'},
-    ],
-  },
+    },
+  ],
   steps: [stableSoftmaxStep],
   learn,
 };

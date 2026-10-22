@@ -12,9 +12,11 @@
  *   :::details Title      collapsible section until the closing `:::`
  *   :::sequence / :::diagram  a JSON `Sequence` / `Diagram` (lib/types) up to the closing `:::`
  *   :::architecture       a JSON `Architecture` (lib/architecture): layers read bottom to top
+ *   :::gpu                a JSON `GpuFigure` (lib/gpuFigure): scopes, memory levels, data moving between them
  *   inline: **bold**, *em*, `code`, [text](url); code spans bind first and may sit inside the other three
  */
 import {type Architecture, architectureProblems} from './architecture';
+import {type GpuFigure, gpuProblems} from './gpuFigure';
 import type {Diagram, Sequence} from './types';
 
 export interface PopQuizSpec {
@@ -38,23 +40,25 @@ export type Block =
   | {kind: 'sequence'; sequence: Sequence}
   | {kind: 'diagram'; diagram: Diagram}
   | {kind: 'architecture'; architecture: Architecture}
+  | {kind: 'gpu'; gpu: GpuFigure}
   | {kind: 'malformed'; what: string};
 
-/** A `:::sequence` / `:::diagram` body: JSON with the arrays the drawing needs, or a malformed block. */
-/** A `:::architecture` body: the JSON spec, or a malformed block naming what is wrong with it. */
-const parseArchitecture = (body: string[]): Block => {
+/** A `:::architecture` or `:::gpu` body: the JSON spec, or a malformed block naming what is wrong with it. */
+const parseSpec = (name: 'architecture' | 'gpu', body: string[]): Block => {
   let value: unknown;
   try {
     value = JSON.parse(body.join('\n'));
   } catch {
-    return {kind: 'malformed', what: 'architecture block: not JSON'};
+    return {kind: 'malformed', what: `${name} block: not JSON`};
   }
-  const problems = architectureProblems(value);
-  return problems.length === 0
+  const problems = name === 'architecture' ? architectureProblems(value) : gpuProblems(value);
+  if (problems.length > 0) return {kind: 'malformed', what: `${name} block: ${problems.join('; ')}`};
+  return name === 'architecture'
     ? {kind: 'architecture', architecture: value as Architecture}
-    : {kind: 'malformed', what: `architecture block: ${problems.join('; ')}`};
+    : {kind: 'gpu', gpu: value as GpuFigure};
 };
 
+/** A `:::sequence` / `:::diagram` body: JSON with the arrays the drawing needs, or a malformed block. */
 const parseFigure = (name: 'sequence' | 'diagram', body: string[]): Block => {
   try {
     const value = JSON.parse(body.join('\n')) as Record<string, unknown>;
@@ -154,7 +158,7 @@ export const parseBlocks = (source: string): Block[] => {
       else if (name === 'details')
         blocks.push({kind: 'details', title: rest || 'Details', body: parseBlocks(body.join('\n'))});
       else if (name === 'sequence' || name === 'diagram') blocks.push(parseFigure(name, body));
-      else if (name === 'architecture') blocks.push(parseArchitecture(body));
+      else if (name === 'architecture' || name === 'gpu') blocks.push(parseSpec(name, body));
       else blocks.push({kind: 'paragraph', text: body.join(' ')});
       continue;
     }

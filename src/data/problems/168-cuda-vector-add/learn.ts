@@ -13,44 +13,37 @@ runs on the GPU as thousands of threads at once. Vector add is the smallest kern
 — \`c[i] = a[i] + b[i]\` — and the host code around it is the shape every custom kernel in a training
 stack sits inside: allocate, copy in, pick a grid, launch, check, synchronise, copy out, compare, free.
 
-Read the figure bottom to top: the data's path from host memory across the link, through one thread
-block's registers and back.
+The figure is the program's layout in memory and threads: the host arrays on the left, the copies across
+the link, and on the GPU a grid of 1,024 blocks of 256 threads over the device arrays. Each cell of
+\`d_a, d_b\` is one pass of the whole grid; hover a part marked with a dot for what it does.
 
-:::architecture
+:::gpu
 {
-  "input": "h_a, h_b · n = 4,194,341 float32",
-  "output": "h_c · max abs err 0 → PASS",
+  "align": "end",
   "items": [
-    {"id": "host-in", "label": "Host buffers h_a, h_b", "kind": "host", "sub": "pageable · 2 × 16 MiB", "detail": "Filled by main, which also computes the CPU reference. The kernel cannot dereference host memory."},
-    {"id": "h2d", "label": "cudaMemcpy host → device", "kind": "io", "sub": "2 × 16 MiB · blocking", "detail": "After three cudaMallocs; every call goes through CUDA_CHECK."},
-    {"id": "gmem-in", "label": "Global memory d_a, d_b", "kind": "memory", "sub": "cudaMalloc · 2 × 16 MiB", "shape": "float[4,194,341] × 2", "detail": "HBM, 256-byte aligned. Each launch reads both once."},
-    {"tone": "block", "repeat": "1,024 ×", "label": "Thread block · 256 threads", "items": [
-      {"id": "idx", "label": "Global index", "kind": "kernel", "sub": "i = blockIdx.x·256 + threadIdx.x", "side": {"label": "launch_vector_add", "sub": "<<<1024, 256>>>", "detail": "min(⌈n / 256⌉, 1024) blocks, then CUDA_CHECK(cudaGetLastError())."}, "detail": "Adjacent threads start at adjacent elements."},
-      {"tone": "dotted", "repeat": "16–17 ×", "label": "Grid-stride loop", "items": [
-        {"columns": [
-          [{"id": "ld-a", "label": "Load a[i]", "kind": "memory", "sub": "into a register", "detail": "A warp loads 32 consecutive floats: 128 bytes, fully coalesced."}],
-          [{"id": "ld-b", "label": "Load b[i]", "kind": "memory", "sub": "into a register"}]
-        ]},
-        {"id": "add", "op": "+", "detail": "One FADD in registers, the only arithmetic."},
-        {"id": "st-c", "label": "Store c[i]", "kind": "kernel", "sub": "then i += gridDim.x · blockDim.x", "detail": "The loop condition is the bounds test: nothing past c[n − 1]."}
-      ]}
+    {"id": "host", "label": "Host", "sub": "pageable memory", "tone": "host", "layout": "column", "items": [
+      {"id": "h-ab", "array": "h_a, h_b", "sub": "2 × 16 MiB", "cols": 12, "tone": "host", "continues": true, "detail": "Filled by main, which also computes the CPU reference. The kernel cannot read host memory: it has to be copied."},
+      {"id": "h-c", "array": "h_c", "sub": "max |h_c − h_ref| = 0", "cols": 12, "tone": "host", "continues": true, "detail": "Copied back after cudaDeviceSynchronize() and compared over all n."}
     ]},
-    {"id": "gmem-out", "label": "Global memory d_c", "kind": "memory", "sub": "16 MiB · each element written once", "shape": "float[4,194,341]"},
-    {"id": "d2h", "label": "cudaMemcpy device → host", "kind": "io", "sub": "16 MiB · after the synchronise", "detail": "CUDA_CHECK(cudaDeviceSynchronize()) first, then the copy and three cudaFrees."},
-    {"id": "host-out", "label": "Host buffer h_c", "kind": "host", "sub": "max |h_c − h_ref| → PASS"}
+    {"id": "gpu", "label": "GPU", "layout": "column", "items": [
+      {"id": "grid", "label": "Kernel grid", "sub": "vector_add<<<1024, 256>>>", "count": "1,024 blocks", "detail": "(n + 255) / 256 = 16,385 blocks would cover n in one pass; the launch caps the grid at 1,024 and lets each thread loop instead.", "items": [
+        {"id": "block0", "label": "Block 0", "layout": "column", "items": [{"threads": 10, "continues": true, "label": "256 threads"}], "detail": "Threads 0 … 255 start at elements 0 … 255: adjacent threads, adjacent floats."},
+        {"label": "Block 1", "layout": "column", "items": [{"threads": 10, "continues": true, "label": "256 threads"}]},
+        {"gap": "…"},
+        {"label": "Block 1023", "layout": "column", "items": [{"threads": 10, "continues": true, "label": "256 threads"}]}
+      ]},
+      {"id": "gmem", "label": "Global memory", "sub": "cudaMalloc · HBM", "tone": "global", "stretch": true, "layout": "column", "items": [
+        {"id": "d-ab", "array": "d_a, d_b", "sub": "a cell = one pass of 262,144 floats", "cols": 17, "cells": "index", "marks": [
+          {"cols": [0, 15], "tone": "global", "label": "16 full passes"},
+          {"cols": [16, 16], "tone": "muted", "label": "37"}
+        ], "detail": "Pass p covers elements p · 262,144 + i. The 17th pass has only 37 elements; every other thread finds i ≥ n and leaves the loop."},
+        {"id": "d-c", "array": "d_c", "sub": "each element written once", "cols": 17, "detail": "One 4-byte store per element: 12 bytes of HBM traffic per add."}
+      ]}
+    ]}
   ],
-  "notes": [
-    {"at": "idx", "text": "**1,024 × 256** = 262,144 threads: a capped grid"},
-    {"at": "st-c", "text": "**16 or 17** passes per thread for n = 4,194,341"},
-    {"at": "gmem-in", "text": "**12 B** of HBM per FLOP: bandwidth-bound"},
-    {"at": "h2d", "text": "Every runtime call wrapped in **CUDA_CHECK**"},
-    {"at": "d2h", "text": "**cudaDeviceSynchronize** first: kernel faults surface there"}
-  ],
-  "insets": [
-    {"for": "ld-b", "title": "One warp, one load", "items": [
-      {"id": "lanes", "label": "32 lanes, threads t … t + 31", "kind": "kernel", "sub": "addresses &b[i] … &b[i] + 124 B"},
-      {"id": "sectors", "label": "4 × 32-byte sectors", "kind": "memory", "sub": "one 128-byte request"}
-    ], "note": "**100 %** of the fetched bytes are used"}
+  "arrows": [
+    {"from": "h-ab", "to": "d-ab", "label": "cudaMemcpy H2D"},
+    {"from": "d-c", "to": "h-c", "label": "cudaMemcpy D2H"}
   ]
 }
 :::
@@ -147,6 +140,54 @@ Adjacent threads still touch adjacent addresses at every iteration — \`i\` dif
 the loop keeps the **coalesced** access pattern that makes the kernel run at memory bandwidth; a thread
 that instead walked its own contiguous chunk (\`i = t * 16 … t * 16 + 15\`) would scatter a warp's loads
 across 16 cache lines.
+
+One pass of warp 0, drawn at the level of bytes: the 32 lanes ask for 32 adjacent floats of \`a\`, the
+memory system serves the 128 bytes as four 32-byte sectors, and lanes 0 to 7 get the first sector, lanes 8
+to 15 the second, and so on. \`b\` the same; the sum is formed in registers and stored as four whole sectors.
+
+:::gpu
+{
+  "align": "end",
+  "items": [
+    {"id": "warp-gmem", "label": "Global memory", "sub": "pass p: elements i … i + 31", "tone": "global", "layout": "column", "items": [
+      {"id": "w-a", "array": "a[i … i + 31]", "sub": "128 B", "cols": 32, "marks": [
+        {"cols": [0, 7], "tone": "global", "label": "32 B sector"}, {"cols": [8, 15], "tone": "global", "label": "32 B sector"},
+        {"cols": [16, 23], "tone": "global", "label": "32 B sector"}, {"cols": [24, 31], "tone": "global", "label": "32 B sector"}
+      ], "detail": "32 consecutive floats, 128 contiguous bytes: four sectors in one request, every fetched byte used."},
+      {"id": "w-b", "array": "b[i … i + 31]", "sub": "128 B", "cols": 32, "marks": [
+        {"cols": [0, 7], "tone": "global", "label": "32 B sector"}, {"cols": [8, 15], "tone": "global", "label": "32 B sector"},
+        {"cols": [16, 23], "tone": "global", "label": "32 B sector"}, {"cols": [24, 31], "tone": "global", "label": "32 B sector"}
+      ]},
+      {"id": "w-c", "array": "c[i … i + 31]", "sub": "128 B", "cols": 32, "marks": [
+        {"cols": [0, 7], "tone": "global", "label": "32 B sector"}, {"cols": [8, 15], "tone": "global", "label": "32 B sector"},
+        {"cols": [16, 23], "tone": "global", "label": "32 B sector"}, {"cols": [24, 31], "tone": "global", "label": "32 B sector"}
+      ], "detail": "Four whole sectors written. Then i += 262,144: the next pass is 1 MiB further on, still 32 adjacent floats per warp."}
+    ]},
+    {"id": "warp", "label": "Warp 0 of block 0", "sub": "threads 0 … 31", "count": "8 warps per block", "layout": "column", "items": [
+      {"id": "lanes", "threads": 32, "label": "lane k handles element i + k", "detail": "The 32 lanes issue each load together, so their 32 addresses reach the memory system as one request."},
+      {"id": "warp-regs", "label": "Registers", "sub": "one float of each per lane", "tone": "register", "stretch": true, "layout": "column", "items": [
+        {"id": "r-a", "array": "a", "cols": 32, "tone": "register", "marks": [
+          {"cols": [0, 7], "tone": "register", "label": "lanes 0–7"}, {"cols": [8, 15], "tone": "register", "label": "lanes 8–15"},
+          {"cols": [16, 23], "tone": "register", "label": "lanes 16–23"}, {"cols": [24, 31], "tone": "register", "label": "lanes 24–31"}
+        ]},
+        {"id": "r-b", "array": "b", "cols": 32, "tone": "register", "marks": [
+          {"cols": [0, 7], "tone": "register", "label": "lanes 0–7"}, {"cols": [8, 15], "tone": "register", "label": "lanes 8–15"},
+          {"cols": [16, 23], "tone": "register", "label": "lanes 16–23"}, {"cols": [24, 31], "tone": "register", "label": "lanes 24–31"}
+        ]},
+        {"id": "r-c", "array": "a + b", "sub": "one FADD per lane", "cols": 32, "tone": "register", "marks": [
+          {"cols": [0, 7], "tone": "register", "label": "lanes 0–7"}, {"cols": [8, 15], "tone": "register", "label": "lanes 8–15"},
+          {"cols": [16, 23], "tone": "register", "label": "lanes 16–23"}, {"cols": [24, 31], "tone": "register", "label": "lanes 24–31"}
+        ], "detail": "One add per 12 bytes moved: the kernel is bandwidth-bound."}
+      ]}
+    ]}
+  ],
+  "arrows": [
+    {"from": "w-a", "to": "r-a", "label": "load · 128 B"},
+    {"from": "w-b", "to": "r-b", "label": "load · 128 B"},
+    {"from": "r-c", "to": "w-c", "label": "store · 128 B"}
+  ]
+}
+:::
 
 The same warp under other access patterns (strided, misaligned, \`float4\`), with the sectors each one
 touches:

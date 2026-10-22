@@ -70,10 +70,13 @@ course content, `AGENTS.md`, or the mock-interview feature unless the user names
   and matchers for that language only; it has no harness, and its reference solution is a complete
   program ending in a self-test the learner runs on their own machine. The catalogue maximum is the
   live sum over every problem (`STEP_POINTS` in `src/lib/scoring.ts`); adding content never re-balances it.
-- A deep-learning problem is drawn as a model or kernel, never as a system: `architecture` (a layer
-  stack read bottom to top, `src/lib/architecture.ts`) instead of `diagram`, step `focus` naming its
-  block ids, no step `sequence`, and no `:::diagram` / `:::sequence` anywhere in its Markdown. Its
-  guide carries at least one `:::architecture` figure and one widget. `yarn verify` enforces all of it.
+- A deep-learning problem is drawn as a model or kernel, never as a system: titled `figures` instead
+  of `diagram`, layer stacks (`architecture`, `src/lib/architecture.ts`) for PyTorch models and GPU
+  figures (`gpu`, `src/lib/gpuFigure.ts`, after Modal's GPU Glossary) for CUDA kernels, as many as
+  the problem needs and no two showing the same thing. Step `focus` names ids from any of them (ids
+  are unique across a problem's figures); no step `sequence`, no `:::diagram` / `:::sequence` in its
+  Markdown. Its guide carries a widget and at least one `:::architecture` (PyTorch) or `:::gpu`
+  (CUDA) figure. `yarn verify` enforces all of it.
 - The AI-era courses currently use static review checks only. The classic courses have Python and
   TypeScript harnesses that execute in the browser runtime. If you add AI-era harnesses, keep the
   checks outcome-based and update the README.
