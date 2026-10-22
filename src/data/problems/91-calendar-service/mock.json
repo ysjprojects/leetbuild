@@ -1,0 +1,16 @@
+{
+  "title": "The invite that would not stop",
+  "blurb": "Infinite recurrence and fresh idempotency tokens per retry.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "One badly formed RRULE consumed an entire calendar worker for an hour, and a timezone correction re-invited 400 attendees who all responded again because retries used fresh tokens. The model-generated draft ignores unknown rule parts. Review it, fix it, and prove expansion terminates and notifications are idempotent.",
+  "signals": ["Specify", "Operate", "Verify"],
+  "aiNote": "The draft accepts recurrence rules with no terminating condition and unknown parts silently dropped, so one tenant can create an expansion that never ends, and its notification retries mint new idempotency tokens, so a single update fans out into duplicate invites.",
+  "testIdea": "Submit FREQ=SECONDLY with no end and assert 422; retry a notification and assert one invite per attendee; change only the timezone and assert no full re-invite is sent.",
+  "followUps": [
+    "How do you bound recurrence expansion per request?",
+    "When is a minimal update better than a full invite?",
+    "How should instance exceptions survive an event reschedule?"
+  ],
+  "stepId": "endpoint"
+}

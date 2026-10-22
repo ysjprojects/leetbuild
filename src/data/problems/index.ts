@@ -91,6 +91,7 @@ import {replicatorProblem} from './87-replicator/index';
 import {cdnPurgeProblem} from './88-cdn-purge/index';
 import {serviceDiscoveryProblem} from './89-service-discovery/index';
 import {emailDeliveryProblem} from './90-email-delivery/index';
+import {calendarServiceProblem} from './91-calendar-service/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -173,6 +174,7 @@ export const problems: Problem[] = [
   cdnPurgeProblem,
   serviceDiscoveryProblem,
   emailDeliveryProblem,
+  calendarServiceProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
