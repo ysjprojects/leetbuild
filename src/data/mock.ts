@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'service-discovery-the-discovery-that-routed-to-ghosts',
+    problemId: 'service-discovery',
+    stepId: 'endpoint',
+    title: 'The discovery that routed to ghosts',
+    blurb: 'Expired instances stayed routable and deploy swaps collided.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'Traffic kept landing on dead instances for minutes after a crash, and a deploy briefly had two instances claiming the same identity with different metadata. The model-generated draft refreshes TTL without metadata and returns instances by registration rather than health. Review it, fix it, and prove membership is heartbeat- and health-true.',
+    signals: ['Operate', 'Specify', 'Verify'],
+    aiNote:
+      "The draft renews a heartbeat with a bare EXPIRE, so a replaced instance's stale metadata lives on as long as anything renews it, and it registers the replacement before deregistering the original, so two addresses occupy one identity during a deploy window.",
+    testIdea:
+      'Stop heartbeats and assert the instance leaves the routable set within the interval bound; register a replacement while the old one is live and assert one address per identity; probe-fail an instance and assert it is excluded and later readmitted.',
+    followUps: [
+      'How many missed heartbeats mean dead?',
+      'Should probes be centralized or per-caller?',
+      'What identity do rolling deploys need?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
