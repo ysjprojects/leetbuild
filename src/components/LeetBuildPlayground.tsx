@@ -481,7 +481,7 @@ const Explorer: FC<{
             <span aria-hidden className="w-3 text-center text-[9px]">
               ▼
             </span>
-            provided · read-only
+            provided
           </div>
           <ul>
             {provided.map(f => (
@@ -1605,9 +1605,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                       <span aria-hidden className="mt-1 shrink-0">
                         <LockGlyph />
                       </span>
-                      <span>
-                        <span className="text-ink-100 font-semibold">Provided · read-only.</span> {openProvided.note}
-                      </span>
+                      <span>{openProvided.note}</span>
                     </div>
                     <StepEditor
                       className="min-h-0 min-w-0 flex-1"
