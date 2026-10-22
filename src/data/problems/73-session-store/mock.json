@@ -1,0 +1,16 @@
+{
+  "title": "The login that kept the old session",
+  "blurb": "Elevation reused the session id and trusted the body's device label.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "A security review found that the session endpoint hands back the same session id it was given, so a pre-login id becomes authenticated after elevation. The same handler takes the device class from the request body and creates a session for a caller that never completed the auth flow. Review it, fix it, and prove the id changes on elevation.",
+  "signals": ["Secure", "Specify", "Verify"],
+  "aiNote": "The draft reuses the incoming X-Session-Id instead of minting a new one, so a planted pre-login id is authenticated after login; it stores the device_class from the request body rather than the validated claims; and it creates a session without checking that the auth assertion completed.",
+  "testIdea": "Post a request with a planted X-Session-Id and assert the response carries a different id and the old id no longer authenticates; send device_class in the body and assert the stored class is the one from the claims; post without an auth assertion and expect 401.",
+  "followUps": [
+    "What is the difference between a session id and an identity?",
+    "Where does the device class have to come from so a caller cannot forge it?",
+    "What should happen to a request that arrives with an old session id mid-flight?"
+  ],
+  "stepId": "endpoint"
+}
