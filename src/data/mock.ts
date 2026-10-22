@@ -1399,6 +1399,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'trace-collector-the-trace-that-lost-a-leg',
+    problemId: 'trace-collector',
+    stepId: 'endpoint',
+    title: 'The trace that lost a leg',
+    blurb: 'Storage timeouts dropped traces and late roots duplicated trees.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'Traces showed suspiciously fast checkout paths during a storage slowdown, because the draft deleted Redis state before the write confirmed and partial traces were rendered as complete. Late root spans also duplicated trees. Review it, fix it, and prove deletion follows confirmation and gaps are visible.',
+    signals: ['Operate', 'Verify', 'Specify'],
+    aiNote:
+      'The draft deletes assembly state before storage acknowledges the write, so a timeout erases the only copy, and its non-atomic root recomputation lets a late-arriving root span create a second tree while readers observe the first.',
+    testIdea:
+      'Time out storage and assert the trace survives for the next cycle; deliver a root span after children and assert one tree; read a trace with a missing child and assert the partial marker.',
+    followUps: [
+      'What TTL makes sense for partial traces and why?',
+      'How would you sample traces without biasing the slow paths?',
+      'When should a trace be quarantined instead of written?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
