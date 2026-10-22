@@ -57,6 +57,7 @@ import {modelRegistryProblem} from './53-model-registry/index';
 import {checkpointStoreProblem} from './54-checkpoint-store/index';
 import {featureStoreProblem} from './55-feature-store/index';
 import {driftMonitorProblem} from './56-drift-monitor/index';
+import {shadowEvalProblem} from './57-shadow-eval/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -105,6 +106,7 @@ export const problems: Problem[] = [
   checkpointStoreProblem,
   featureStoreProblem,
   driftMonitorProblem,
+  shadowEvalProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,

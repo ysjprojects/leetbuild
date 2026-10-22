@@ -981,6 +981,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'shadow-eval-the-shadow-that-slowed-production',
+    problemId: 'shadow-eval',
+    stepId: 'endpoint',
+    title: 'The shadow that slowed production',
+    blurb: 'The draft ran shadows inline with no deadline and no isolation.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'Production latency doubled during a semblance run because the draft called the candidate inline on the request thread with no deadline, and shadow traffic consumed tenants production rate limits. The same report declared a winner from twelve samples. Review it, fix it, and prove shadows cannot reach production in any way.',
+    signals: ['Operate', 'Evaluate', 'Verify'],
+    aiNote:
+      "The draft makes the candidate call synchronously inside the production handler with no deadline and shares the tenant's production rate-limit buckets and idempotency store, so an unhealthy candidate both slows and starves the real path.",
+    testIdea:
+      'Stub the candidate to hang and assert production p99 is unchanged; exhaust the shadow budget and assert production quota is untouched; feed 12 pairs and assert the report says inconclusive.',
+    followUps: [
+      'What metrics can a shadow observably improve before deployment?',
+      'How would you compare cost between candidate and production paths?',
+      'When is a 5 percent share too much?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
