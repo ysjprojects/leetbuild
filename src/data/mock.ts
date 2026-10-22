@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'secrets-rotation-the-deploy-that-broke-on-rotation-day',
+    problemId: 'secrets-rotation',
+    stepId: 'endpoint',
+    title: 'The deploy that broke on rotation day',
+    blurb: 'The old version was retired before consumers verified.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A rotation took down checkout for eleven minutes: the draft invalidated the old key the instant the new one activated, and a service that had cached the old material kept failing until it redeployed. An audit line also carried the new material in plaintext. Review it, fix it, and prove overlap and verification gate retirement.',
+    signals: ['Operate', 'Secure', 'Verify'],
+    aiNote:
+      'The draft invalidates the previous version at the same moment it activates the new one, leaving no overlap for consumers holding the old version, and its retirement path treats an unverified consumer as acceptable, so a fleet mid-deploy loses the ability to decrypt with no alert.',
+    testIdea:
+      'Activate a new version and assert the old one still decrypts until every registered consumer confirms the new one; simulate an unresponsive consumer and assert retirement is blocked with an alert; grep responses and logs for material.',
+    followUps: [
+      'How long should the overlap window be?',
+      'What makes a consumer verification meaningful versus a liveness check?',
+      'Where may material ever be stored outside the vault?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
