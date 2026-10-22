@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import {type FC, memo, useCallback, useMemo, useState} from 'react';
 
-import {applyListQuery, problemStatus} from '@/lib/catalog';
+import {applyListQuery, inTrack, problemStatus} from '@/lib/catalog';
 import {type Streak, activityByDay, badgeProgress, BADGES, stepOfTheDay} from '@/lib/gamify';
 import {useListQuery} from '@/lib/listQuery';
 import {type Profile, type StepAttempt, OPEN_ATTEMPT, problemScore, rankProgress} from '@/lib/scoring';
@@ -363,9 +363,9 @@ const StepSquares: FC<{problem: Problem; attempts: Record<string, StepAttempt>}>
 StepSquares.displayName = 'StepSquares';
 
 /**
- * What the AI-era track asks an interviewer to see. These are the behaviours the new courses are
- * built to expose: not "can you prompt", but can you specify, delegate, verify, evaluate, secure
- * and operate a system whose core is a model.
+ * What the AI-era track asks an interviewer to see, shown as a strip under the toolbar while that
+ * tab is selected: not "can you prompt", but can you specify, delegate, verify, evaluate, secure and
+ * operate a system whose core is a model.
  */
 const AI_SKILLS: readonly {title: string; body: string}[] = [
   {title: 'Specify', body: 'Turn an ambiguous ask into interfaces, budgets and acceptance criteria.'},
@@ -475,12 +475,12 @@ const ProblemList: FC<{
   const [query, update, reset] = useListQuery();
   const shown = useMemo(() => applyListQuery(problems, attempts, query), [problems, attempts, query]);
   const numbers = useMemo(() => new Map(problems.map((p, i) => [p.id, i])), [problems]);
+  // The tab's courses: what "n/total solved" counts, before any search or filter narrows the rows.
+  const inTab = useMemo(() => problems.filter(p => inTrack(p, query.track)), [problems, query.track]);
   const solvedCount = useMemo(
-    () => problems.filter(p => problemStatus(p, attempts) === 'solved').length,
-    [problems, attempts],
+    () => inTab.filter(p => problemStatus(p, attempts) === 'solved').length,
+    [inTab, attempts],
   );
-  const ai = useMemo(() => shown.filter(p => p.track === 'ai'), [shown]);
-  const systems = useMemo(() => shown.filter(p => p.track !== 'ai'), [shown]);
   const stats = useMemo(
     () => [
       `${problems.length} courses`,
@@ -511,10 +511,33 @@ const ProblemList: FC<{
               reset={reset}
               shown={shown.length}
               solved={solvedCount}
-              total={problems.length}
+              total={inTab.length}
               update={update}
             />
           </div>
+          {query.track === 'ai' ? (
+            <div className="border-iris-400/30 from-iris-400/[0.10] mb-4 flex flex-wrap items-center gap-x-4 gap-y-2 rounded-2xl border bg-gradient-to-r via-transparent to-transparent px-4 py-3">
+              <p className="text-ink-200 text-[12px]">
+                Every starter is a model-generated draft with a real flaw. Review it, fix it, prove it — the six signals
+                AI-era interviews probe:
+              </p>
+              <div className="flex flex-wrap gap-1.5">
+                {AI_SKILLS.map(skill => (
+                  <span
+                    className="border-iris-400/30 bg-iris-400/[0.08] text-iris-200 rounded-full border px-2.5 py-0.5 text-[11px] font-semibold"
+                    key={skill.title}
+                    title={skill.body}>
+                    {skill.title}
+                  </span>
+                ))}
+              </div>
+              <Link
+                className="text-iris-300 hover:text-iris-200 decoration-iris-400/40 text-[12px] font-semibold underline"
+                href="/mock-interview">
+                Start the timed mock ›
+              </Link>
+            </div>
+          ) : null}
           {shown.length === 0 ? (
             <p className="border-ink-700 text-ink-300 rounded-xl border border-dashed px-4 py-6 text-center text-[12px]">
               No course matches{query.q.trim() !== '' ? ` “${query.q.trim()}”` : ''} with these filters.{' '}
@@ -523,79 +546,17 @@ const ProblemList: FC<{
               </button>
             </p>
           ) : (
-            <>
-              {ai.length > 0 ? (
-                <section className="border-iris-400/30 from-iris-400/[0.10] mb-5 rounded-2xl border bg-gradient-to-br via-transparent to-transparent p-5">
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div>
-                      <p className="text-iris-300 text-[11px] font-bold uppercase tracking-wider">
-                        AI-era interview track
-                      </p>
-                      <h2 className="text-ink-50 mt-2 text-[20px] font-extrabold leading-tight">
-                        Use AI. Then prove it.
-                      </h2>
-                    </div>
-                    <span className="border-iris-400/40 bg-iris-400/10 text-iris-300 rounded-full border px-2.5 py-1 text-[11px] font-semibold">
-                      {ai.length} courses · {ai.reduce((n, p) => n + p.steps.length, 0)} steps
-                    </span>
-                  </div>
-                  <p className="text-ink-200 mt-3 max-w-3xl text-[13px] leading-6">
-                    {ai.length} courses, {ai.reduce((n, p) => n + p.steps.length, 0)} review-first steps, and the six
-                    signals AI-era interviews probe.
-                  </p>
-                  <div className="mt-3 flex flex-wrap gap-1.5">
-                    {AI_SKILLS.map(skill => (
-                      <span
-                        className="border-iris-400/30 bg-iris-400/[0.08] text-iris-200 rounded-full border px-2.5 py-1 text-[11px] font-semibold"
-                        key={skill.title}
-                        title={skill.body}>
-                        {skill.title}
-                      </span>
-                    ))}
-                  </div>
-                  <p className="text-ink-400 mt-3 text-[12px]">
-                    <Link
-                      className="text-iris-300 hover:text-iris-200 decoration-iris-400/40 font-semibold underline"
-                      href="/mock-interview">
-                      Start the timed mock
-                    </Link>{' '}
-                    or take a course below.
-                  </p>
-                  <ul className="mt-4 space-y-2.5">
-                    {ai.map(problem => (
-                      <ProblemRow
-                        attempts={attempts}
-                        best={bestSession(sessions, problem.id)}
-                        index={numbers.get(problem.id) ?? 0}
-                        key={problem.id}
-                        problem={problem}
-                      />
-                    ))}
-                  </ul>
-                </section>
-              ) : null}
-              {systems.length > 0 ? (
-                <section>
-                  <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
-                    <h2 className="text-ink-50 text-lg font-extrabold">
-                      {ai.length > 0 ? 'Systems track' : 'Problems'}
-                    </h2>
-                    <span className="text-ink-400 text-[12px]">{systems.length} courses</span>
-                  </div>
-                  <ul className="space-y-2.5">
-                    {systems.map(problem => (
-                      <ProblemRow
-                        attempts={attempts}
-                        best={bestSession(sessions, problem.id)}
-                        index={numbers.get(problem.id) ?? 0}
-                        key={problem.id}
-                        problem={problem}
-                      />
-                    ))}
-                  </ul>
-                </section>
-              ) : null}
-            </>
+            <ul className="space-y-2.5">
+              {shown.map(problem => (
+                <ProblemRow
+                  attempts={attempts}
+                  best={bestSession(sessions, problem.id)}
+                  index={numbers.get(problem.id) ?? 0}
+                  key={problem.id}
+                  problem={problem}
+                />
+              ))}
+            </ul>
           )}
         </section>
       </div>

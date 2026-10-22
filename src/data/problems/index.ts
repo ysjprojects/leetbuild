@@ -125,11 +125,28 @@ import {catalogEnrichmentProblem} from './126-catalog-enrichment/index';
 import {promptDefenceProblem} from './127-prompt-defence/index';
 
 /**
- * Problem order on the list page: the AI-era track first, then the classic systems track in its
- * catalogue order. Company-tagged courses (derived from engineering blogs, see `Problem.company`)
- * sit with the others of their difficulty.
+ * Problem order on the list page: the classic systems track first, in its catalogue order, then the
+ * AI-era track in the order its courses were added (the directory numbers). The list's track tabs
+ * show either on its own; "All topics" shows this order. Company-tagged courses (derived from
+ * engineering blogs, see `Problem.company`) sit with the others of their difficulty.
  */
 export const problems: Problem[] = [
+  dropboxGatesProblem,
+  urlShortenerProblem,
+  edgeGatewayProblem,
+  imageCacheProblem,
+  liveChatProblem,
+  notificationsProblem,
+  redditPlaceProblem,
+  netflixCountersProblem,
+  doordashSupportProblem,
+  matchEngineProblem,
+  merchantPaymentsProblem,
+  flashSaleProblem,
+  newsFeedProblem,
+  rideDispatchProblem,
+  discordMessagesProblem,
+  stripeLedgerProblem,
   aiGatewayProblem,
   ragServiceProblem,
   modelRouterProblem,
@@ -237,20 +254,4 @@ export const problems: Problem[] = [
   fairHousingGuardrailProblem,
   catalogEnrichmentProblem,
   promptDefenceProblem,
-  dropboxGatesProblem,
-  urlShortenerProblem,
-  edgeGatewayProblem,
-  imageCacheProblem,
-  liveChatProblem,
-  notificationsProblem,
-  redditPlaceProblem,
-  netflixCountersProblem,
-  doordashSupportProblem,
-  matchEngineProblem,
-  merchantPaymentsProblem,
-  flashSaleProblem,
-  newsFeedProblem,
-  rideDispatchProblem,
-  discordMessagesProblem,
-  stripeLedgerProblem,
 ];

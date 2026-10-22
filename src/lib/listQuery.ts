@@ -12,7 +12,7 @@ const write = (query: ListQuery): void => {
   void Router.replace({pathname: '/', query: serializeListQuery(query)}, undefined, {shallow: true, scroll: false});
 };
 
-/** `[query, update, reset]`: `update` merges a patch into the URL's query, `reset` clears every filter. */
+/** `[query, update, reset]`: `update` merges a patch into the URL's query, `reset` clears every filter (the track and sort stay). */
 export function useListQuery(): [ListQuery, (patch: Partial<ListQuery>) => void, () => void] {
   const router = useRouter();
   const query = useMemo(
@@ -23,7 +23,7 @@ export function useListQuery(): [ListQuery, (patch: Partial<ListQuery>) => void,
   const update = useCallback((patch: Partial<ListQuery>) => write({...parseListQuery(Router.query), ...patch}), []);
   const reset = useCallback(() => {
     const current = parseListQuery(Router.query);
-    write({...DEFAULT_LIST_QUERY, sort: current.sort, desc: current.desc});
+    write({...DEFAULT_LIST_QUERY, track: current.track, sort: current.sort, desc: current.desc});
   }, []);
   return [query, update, reset];
 }

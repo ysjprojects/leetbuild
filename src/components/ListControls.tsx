@@ -14,19 +14,22 @@ import {
   type ListQuery,
   type SortKey,
   type StatusFilter,
+  type TrackFilter,
   DEFAULT_LIST_QUERY,
   isDefaultQuery,
   SORTS,
   STATUS_LABEL,
+  TRACKS,
 } from '@/lib/catalog';
 import {type Difficulty, DIFFICULTIES} from '@/lib/types';
 
 /**
- * The row above the problem list, LeetCode-style: a search pill, a sort menu and a filter menu
- * behind two round buttons (a dot marks one that is in effect), and at the right how many courses
- * are solved — or, while filtering, how many rows match and the way out. Every control writes to
- * the URL through `update`; the search box keeps its own text so the caret never waits for the
- * router.
+ * The rows above the problem list, LeetCode-style: a row of track tabs (All topics · Systems · AI
+ * era, each with its icon; the active one is inverted), then a search pill, a sort menu and a
+ * filter menu behind two round buttons (a dot marks one that is in effect), and at the right how
+ * many courses of the track are solved — or, while filtering, how many rows match and the way out.
+ * Every control writes to the URL through `update`; the search box keeps its own text so the caret
+ * never waits for the router.
  */
 
 const DIFFICULTY_LABEL: Record<Difficulty, string> = {easy: 'Easy', medium: 'Medium', hard: 'Hard'};
@@ -63,6 +66,66 @@ const FilterIcon: FC = memo(() => (
   </svg>
 ));
 FilterIcon.displayName = 'FilterIcon';
+
+/** All topics: an archive box, as LeetCode draws it. */
+const AllTopicsIcon: FC = memo(() => (
+  <svg aria-hidden fill="none" height={15} stroke="currentColor" strokeWidth={1.6} viewBox="0 0 16 16" width={15}>
+    <rect height={3} rx={0.8} width={13} x={1.5} y={2.5} />
+    <path d="M2.75 5.5v7a1 1 0 0 0 1 1h8.5a1 1 0 0 0 1-1v-7M6.5 8.5h3" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+));
+AllTopicsIcon.displayName = 'AllTopicsIcon';
+
+/** Systems: a server rack. */
+const SystemsIcon: FC = memo(() => (
+  <svg aria-hidden fill="none" height={15} stroke="currentColor" strokeWidth={1.6} viewBox="0 0 16 16" width={15}>
+    <rect height={4} rx={1} width={12} x={2} y={2.5} />
+    <rect height={4} rx={1} width={12} x={2} y={9.5} />
+    <path d="M4.75 4.5h.01M4.75 11.5h.01" strokeLinecap="round" strokeWidth={2.2} />
+  </svg>
+));
+SystemsIcon.displayName = 'SystemsIcon';
+
+/** AI era: sparkles. */
+const AiEraIcon: FC = memo(() => (
+  <svg aria-hidden fill="none" height={15} stroke="currentColor" strokeWidth={1.5} viewBox="0 0 16 16" width={15}>
+    <path
+      d="M6.5 2.5c.4 2.6 1.4 3.6 4 4-2.6.4-3.6 1.4-4 4-.4-2.6-1.4-3.6-4-4 2.6-.4 3.6-1.4 4-4Z"
+      strokeLinejoin="round"
+    />
+    <path d="M12 9.5c.2 1.3.7 1.8 2 2-1.3.2-1.8.7-2 2-.2-1.3-.7-1.8-2-2 1.3-.2 1.8-.7 2-2Z" strokeLinejoin="round" />
+  </svg>
+));
+AiEraIcon.displayName = 'AiEraIcon';
+
+/** The icon and the colour it keeps while its tab is not selected (an inverted tab takes the text colour). */
+const TRACK_ICON: Record<TrackFilter, {icon: FC; tint: string}> = {
+  all: {icon: AllTopicsIcon, tint: 'text-ink-100'},
+  systems: {icon: SystemsIcon, tint: 'text-warning-300'},
+  ai: {icon: AiEraIcon, tint: 'text-iris-300'},
+};
+
+const TrackTab: FC<{value: TrackFilter; label: string; current: TrackFilter; update: (p: Partial<ListQuery>) => void}> =
+  memo(({value, label, current, update}) => {
+    const on = value === current;
+    const {icon: Icon, tint} = TRACK_ICON[value];
+    const onClick = useCallback(() => update({track: value}), [update, value]);
+    return (
+      <button
+        aria-pressed={on}
+        className={`flex h-9 items-center gap-2 rounded-full px-4 text-[13px] font-semibold transition ${
+          on ? 'bg-ink-50 text-ink-950' : 'bg-ink-800 text-ink-100 hover:bg-ink-700 hover:text-ink-50'
+        }`}
+        onClick={onClick}
+        type="button">
+        <span className={on ? '' : tint}>
+          <Icon />
+        </span>
+        {label}
+      </button>
+    );
+  });
+TrackTab.displayName = 'TrackTab';
 
 /** A small dot on a button whose setting is in effect. */
 const Dot: FC = memo(() => (
@@ -219,7 +282,7 @@ export const ListControls: FC<{
   query: ListQuery;
   update: (patch: Partial<ListQuery>) => void;
   reset: () => void;
-  /** Rows the query keeps, of all courses. */
+  /** Rows the query keeps, of the courses in the selected track. */
   shown: number;
   total: number;
   solved: number;
@@ -246,89 +309,99 @@ export const ListControls: FC<{
   const filtersSet = query.difficulty !== 'all' || query.status !== 'all' || query.company;
   const sortSet = query.sort !== DEFAULT_LIST_QUERY.sort || query.desc;
   return (
-    <div className="flex flex-wrap items-center gap-2">
-      <label className="bg-ink-800 text-ink-400 focus-within:bg-ink-700 flex h-10 w-full items-center gap-2 rounded-full px-4 transition sm:w-80">
-        <SearchIcon />
-        <input
-          aria-label="search courses"
-          className="text-ink-50 placeholder:text-ink-400 w-full border-0 bg-transparent p-0 text-[13px] focus:outline-none focus:ring-0 [&::-webkit-search-cancel-button]:hidden"
-          onChange={onSearch}
-          placeholder="Search courses"
-          type="search"
-          value={text}
-        />
-        {text !== '' ? (
-          <button
-            aria-label="clear search"
-            className="hover:text-ink-50 text-[13px] transition"
-            onClick={clearSearch}
-            type="button">
-            ×
-          </button>
-        ) : null}
-      </label>
-      <Menu active={sortSet} closeOn={sortPicked} icon="sort" label="sort">
-        {SORTS.map(s => (
-          <SortOption
-            blurb={s.blurb}
-            key={s.key}
-            label={s.label}
-            onPicked={onSortPicked}
-            query={query}
-            sortKey={s.key}
-            update={update}
-          />
+    <div className="space-y-3">
+      <div aria-label="track" className="flex flex-wrap items-center gap-2" role="group">
+        {TRACKS.map(t => (
+          <TrackTab current={query.track} key={t.key} label={t.label} update={update} value={t.key} />
         ))}
-      </Menu>
-      <Menu active={filtersSet} closeOn={0} icon="filter" label="filter">
-        <FilterRow label="Difficulty">
-          <DifficultyChipButton current={query.difficulty} update={update} value="all" />
-          {DIFFICULTIES.map(d => (
-            <DifficultyChipButton current={query.difficulty} key={d} update={update} value={d} />
-          ))}
-        </FilterRow>
-        <FilterRow label="Status">
-          {(Object.keys(STATUS_LABEL) as StatusFilter[]).map(s => (
-            <StatusChipButton current={query.status} key={s} update={update} value={s} />
-          ))}
-        </FilterRow>
-        <FilterRow label="Source">
-          <FilterChip label="All" on={!query.company} onClick={toggleCompany} />
-          <FilterChip label="Company-tagged" on={query.company} onClick={toggleCompany} />
-        </FilterRow>
-        {filtersSet ? (
-          <div className="border-ink-700 mt-1 border-t px-1 pt-2">
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <label className="bg-ink-800 text-ink-400 focus-within:bg-ink-700 flex h-10 w-full items-center gap-2 rounded-full px-4 transition sm:w-80">
+          <SearchIcon />
+          <input
+            aria-label="search courses"
+            className="text-ink-50 placeholder:text-ink-400 w-full border-0 bg-transparent p-0 text-[13px] focus:outline-none focus:ring-0 [&::-webkit-search-cancel-button]:hidden"
+            onChange={onSearch}
+            placeholder="Search courses"
+            type="search"
+            value={text}
+          />
+          {text !== '' ? (
             <button
-              className="text-iris-300 hover:text-iris-200 text-[11px] transition"
-              onClick={clearFilters}
+              aria-label="clear search"
+              className="hover:text-ink-50 text-[13px] transition"
+              onClick={clearSearch}
               type="button">
-              clear filters
+              ×
             </button>
-          </div>
-        ) : null}
-      </Menu>
-      <span className="ml-auto flex items-center gap-2 text-[13px]">
-        {filtering ? (
-          <>
-            <span className="text-ink-300">
-              <span className="font-code text-ink-100">{shown}</span> of {total}
+          ) : null}
+        </label>
+        <Menu active={sortSet} closeOn={sortPicked} icon="sort" label="sort">
+          {SORTS.map(s => (
+            <SortOption
+              blurb={s.blurb}
+              key={s.key}
+              label={s.label}
+              onPicked={onSortPicked}
+              query={query}
+              sortKey={s.key}
+              update={update}
+            />
+          ))}
+        </Menu>
+        <Menu active={filtersSet} closeOn={0} icon="filter" label="filter">
+          <FilterRow label="Difficulty">
+            <DifficultyChipButton current={query.difficulty} update={update} value="all" />
+            {DIFFICULTIES.map(d => (
+              <DifficultyChipButton current={query.difficulty} key={d} update={update} value={d} />
+            ))}
+          </FilterRow>
+          <FilterRow label="Status">
+            {(Object.keys(STATUS_LABEL) as StatusFilter[]).map(s => (
+              <StatusChipButton current={query.status} key={s} update={update} value={s} />
+            ))}
+          </FilterRow>
+          <FilterRow label="Source">
+            <FilterChip label="All" on={!query.company} onClick={toggleCompany} />
+            <FilterChip label="Company-tagged" on={query.company} onClick={toggleCompany} />
+          </FilterRow>
+          {filtersSet ? (
+            <div className="border-ink-700 mt-1 border-t px-1 pt-2">
+              <button
+                className="text-iris-300 hover:text-iris-200 text-[11px] transition"
+                onClick={clearFilters}
+                type="button">
+                clear filters
+              </button>
+            </div>
+          ) : null}
+        </Menu>
+        <span className="ml-auto flex items-center gap-2 text-[13px]">
+          {filtering ? (
+            <>
+              <span className="text-ink-300">
+                <span className="font-code text-ink-100">{shown}</span> of {total}
+              </span>
+              <button
+                className="text-iris-300 hover:text-iris-200 text-[12px] transition"
+                onClick={reset}
+                type="button">
+                clear
+              </button>
+            </>
+          ) : (
+            <span className="text-ink-300 flex items-center gap-1.5" title="courses with every step accepted">
+              <SolvedRing share={total === 0 ? 0 : solved / total} />
+              <span>
+                <span className="font-code text-ink-100">
+                  {solved}/{total}
+                </span>{' '}
+                solved
+              </span>
             </span>
-            <button className="text-iris-300 hover:text-iris-200 text-[12px] transition" onClick={reset} type="button">
-              clear
-            </button>
-          </>
-        ) : (
-          <span className="text-ink-300 flex items-center gap-1.5" title="courses with every step accepted">
-            <SolvedRing share={total === 0 ? 0 : solved / total} />
-            <span>
-              <span className="font-code text-ink-100">
-                {solved}/{total}
-              </span>{' '}
-              solved
-            </span>
-          </span>
-        )}
-      </span>
+          )}
+        </span>
+      </div>
     </div>
   );
 });

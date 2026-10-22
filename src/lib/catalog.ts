@@ -1,6 +1,6 @@
 /**
- * The problem list's search, filters and sort, as pure functions over a `ListQuery` — the same
- * shape the landing page keeps in its URL (`/?q=redis&difficulty=hard&status=started&sort=points`),
+ * The problem list's track tabs, search, filters and sort, as pure functions over a `ListQuery` —
+ * the same shape the landing page keeps in its URL (`/?track=ai&q=redis&difficulty=hard&sort=points`),
  * so a filtered view is a link. Rows keep their catalogue number whatever the order on screen.
  */
 import {type StepAttempt, problemScore, STEP_POINTS} from './scoring';
@@ -8,8 +8,12 @@ import {type Difficulty, type Problem, CONCEPT_LABEL, DIFFICULTIES} from './type
 
 export type StatusFilter = 'all' | 'open' | 'started' | 'solved';
 export type SortKey = 'order' | 'difficulty' | 'points' | 'minutes' | 'progress' | 'title';
+/** The tabs above the list, LeetCode-style: every course, the classic systems track, or the AI-era track. */
+export type TrackFilter = 'all' | 'systems' | 'ai';
 
 export interface ListQuery {
+  /** Which track the list shows; a view rather than a filter, so `reset` and "clear" leave it alone. */
+  track: TrackFilter;
   /** Free text; every word must appear somewhere in the course. */
   q: string;
   difficulty: Difficulty | 'all';
@@ -22,6 +26,7 @@ export interface ListQuery {
 }
 
 export const DEFAULT_LIST_QUERY: ListQuery = {
+  track: 'all',
   q: '',
   difficulty: 'all',
   status: 'all',
@@ -29,6 +34,15 @@ export const DEFAULT_LIST_QUERY: ListQuery = {
   sort: 'order',
   desc: false,
 };
+
+export const TRACKS: readonly {key: TrackFilter; label: string}[] = [
+  {key: 'all', label: 'All topics'},
+  {key: 'systems', label: 'Systems'},
+  {key: 'ai', label: 'AI era'},
+];
+
+export const inTrack = (problem: Problem, track: TrackFilter): boolean =>
+  track === 'all' || (track === 'ai') === (problem.track === 'ai');
 
 export const STATUS_LABEL: Record<StatusFilter, string> = {
   all: 'All',
@@ -94,6 +108,7 @@ export function applyListQuery(
   const order = new Map(problems.map((p, i) => [p.id, i]));
   const kept = problems.filter(
     p =>
+      inTrack(p, query.track) &&
       (query.difficulty === 'all' || p.difficulty === query.difficulty) &&
       (query.status === 'all' || problemStatus(p, attempts) === query.status) &&
       (!query.company || p.company !== undefined) &&
@@ -133,10 +148,12 @@ const one = (v: string | string[] | undefined): string | undefined => (Array.isA
 
 /** The query a URL carries; anything missing or malformed is the default. */
 export function parseListQuery(params: Record<string, string | string[] | undefined>): ListQuery {
+  const track = one(params.track);
   const difficulty = one(params.difficulty);
   const status = one(params.status);
   const sort = one(params.sort);
   return {
+    track: track === 'systems' || track === 'ai' ? track : 'all',
     q: one(params.q) ?? '',
     difficulty: (DIFFICULTIES as readonly string[]).includes(difficulty ?? '') ? (difficulty as Difficulty) : 'all',
     status: status !== undefined && status in STATUS_LABEL && status !== 'all' ? (status as StatusFilter) : 'all',
@@ -149,6 +166,7 @@ export function parseListQuery(params: Record<string, string | string[] | undefi
 /** Only what differs from the defaults, so the plain landing URL stays `/`. */
 export function serializeListQuery(query: ListQuery): Record<string, string> {
   const params: Record<string, string> = {};
+  if (query.track !== 'all') params.track = query.track;
   if (query.q.trim() !== '') params.q = query.q.trim();
   if (query.difficulty !== 'all') params.difficulty = query.difficulty;
   if (query.status !== 'all') params.status = query.status;
