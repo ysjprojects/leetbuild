@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'synthetic-data-the-synthetic-set-that-memorized-one-entity',
+    problemId: 'synthetic-data',
+    stepId: 'endpoint',
+    title: 'The synthetic set that memorized one entity',
+    blurb: 'Totals hid entity collapse and timeouts were admitted.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A synthetic dataset passed review on total counts while containing ten thousand variants of one seed entity, and judge timeouts were admitted as fine. The model-generated draft throttles no entity and admits unscored records. Review it, fix it, and prove diversity is measured and scoring is complete.',
+    signals: ['Evaluate', 'Specify', 'Verify'],
+    aiNote:
+      'The draft enforces only a global record cap with no per-entity throttle, so a recipe can collapse onto one prolific seed without any metric noticing, and it admits judge-timeout records as likely fine, converting infra flakiness into silent label noise.',
+    testIdea:
+      'Generate with a single dominant seed entity and assert per-entity limits throttle it; time out the judge and assert the record is parked and counted; trace a sampled admitted record back to its seed digest.',
+    followUps: [
+      'What diversity metric actually predicts utility?',
+      'How do license flags classify derivative synthetic data?',
+      'What review sample size makes a synthetic set shippable?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
