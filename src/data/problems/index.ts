@@ -111,6 +111,7 @@ import {secretsRotationProblem} from './107-secrets-rotation/index';
 import {identityServiceProblem} from './108-identity-service/index';
 import {permissionServiceProblem} from './109-permission-service/index';
 import {usageMeteringProblem} from './110-usage-metering/index';
+import {resumableUploadProblem} from './111-resumable-upload/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -213,6 +214,7 @@ export const problems: Problem[] = [
   identityServiceProblem,
   permissionServiceProblem,
   usageMeteringProblem,
+  resumableUploadProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
