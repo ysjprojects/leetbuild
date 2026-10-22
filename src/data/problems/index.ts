@@ -51,6 +51,7 @@ import {translationServiceProblem} from './47-translation-service/index';
 import {contentClassifierProblem} from './48-content-classifier/index';
 import {labelingServiceProblem} from './49-labeling-service/index';
 import {datasetRegistryProblem} from './50-dataset-registry/index';
+import {trainingSchedulerProblem} from './51-training-scheduler/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -93,6 +94,7 @@ export const problems: Problem[] = [
   contentClassifierProblem,
   labelingServiceProblem,
   datasetRegistryProblem,
+  trainingSchedulerProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
