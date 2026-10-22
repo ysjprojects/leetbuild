@@ -432,28 +432,6 @@ export const mockScenarios: readonly MockScenario[] = [
     defaultLanguage: 'python',
   },
   {
-    id: 'code-assistant-the-assistant-that-read-a-private-repo',
-    problemId: 'code-assistant',
-    stepId: 'endpoint',
-    title: 'The assistant that read a private repo',
-    blurb: 'The draft keyed context by path without checking repository access.',
-    role: 'AI platform engineer · 20 min',
-    minutes: 20,
-    prompt:
-      "An external audit found completions that quoted code from a repository the requesting user could not read, because the draft trusted file paths in the request. The same cache served a force-pushed repo's dead symbols. Review it, fix it, and prove repository access and index freshness are enforced.",
-    signals: ['Secure', 'Specify', 'Verify'],
-    aiNote:
-      'The draft treats a caller-supplied file path as sufficient authority to read repository content, so context from any repo can be completed on, and it caches the index by repo name alone, so a force-push keeps serving deleted symbols.',
-    testIdea:
-      'Request a completion whose path points into a repo the caller cannot read and assert 403; push a new commit and assert the next completion is a cache miss and the status reports the new sha; assert a completion on a repo more than ten commits behind is refused.',
-    followUps: [
-      'Should rejected completions be training signal, and with what privacy boundary?',
-      'How would you budget context when a file is larger than the token cap?',
-      'What makes a symbol index trustworthy after a rebase?',
-    ],
-    defaultLanguage: 'python',
-  },
-  {
     id: 'sql-copilot-the-copilot-that-offered-a-delete',
     problemId: 'sql-copilot',
     stepId: 'endpoint',
@@ -1000,28 +978,6 @@ export const mockScenarios: readonly MockScenario[] = [
       'What metrics can a shadow observably improve before deployment?',
       'How would you compare cost between candidate and production paths?',
       'When is a 5 percent share too much?',
-    ],
-    defaultLanguage: 'python',
-  },
-  {
-    id: 'prompt-firewall-the-firewall-that-allowed-on-error',
-    problemId: 'prompt-firewall',
-    stepId: 'endpoint',
-    title: 'The firewall that allowed on error',
-    blurb: 'An internal error returned allow, and the detector failure skipped the backstop.',
-    role: 'AI platform engineer · 20 min',
-    minutes: 20,
-    prompt:
-      'During a detector outage, injection attempts passed because the draft mapped every exception to allow and skipped the lexical backstop once the model call had failed. The same draft logged matched span text. Review it, fix it, and prove failures block and logs carry no prompt content.',
-    signals: ['Secure', 'Evaluate', 'Verify'],
-    aiNote:
-      'The draft catches every internal error and returns allow, so an outage opens the firewall completely, and when the detector fails it skips the lexical backstop instead of falling through to it.',
-    testIdea:
-      'Stub the detector to fail and assert a known injection pattern is still blocked or stripped by the backstop; trigger an internal error and assert block with no prompt in the body; inspect an event payload for span text.',
-    followUps: [
-      'Which patterns deserve block versus strip?',
-      'How do you tune rules without storing the prompts that matched?',
-      'What makes an injection rule durable against paraphrase?',
     ],
     defaultLanguage: 'python',
   },

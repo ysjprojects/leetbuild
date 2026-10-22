@@ -32,7 +32,6 @@ import {distillationPipelineProblem} from './28-distillation-pipeline/index';
 import {batchInferenceProblem} from './29-batch-inference/index';
 import {multimodalIngestProblem} from './30-multimodal-ingest/index';
 import {voiceAgentProblem} from './31-voice-agent/index';
-import {codeAssistantProblem} from './32-code-assistant/index';
 import {sqlCopilotProblem} from './33-sql-copilot/index';
 import {ticketTriageProblem} from './34-ticket-triage/index';
 import {recommendationRankingProblem} from './35-recommendation-ranking/index';
@@ -58,7 +57,6 @@ import {checkpointStoreProblem} from './54-checkpoint-store/index';
 import {featureStoreProblem} from './55-feature-store/index';
 import {driftMonitorProblem} from './56-drift-monitor/index';
 import {shadowEvalProblem} from './57-shadow-eval/index';
-import {promptFirewallProblem} from './58-prompt-firewall/index';
 import {citationStoreProblem} from './59-citation-store/index';
 import {rerankerServiceProblem} from './60-reranker-service/index';
 import {summarizerServiceProblem} from './61-summarizer-service/index';
@@ -141,7 +139,6 @@ export const problems: Problem[] = [
   batchInferenceProblem,
   multimodalIngestProblem,
   voiceAgentProblem,
-  codeAssistantProblem,
   sqlCopilotProblem,
   ticketTriageProblem,
   recommendationRankingProblem,
@@ -167,7 +164,6 @@ export const problems: Problem[] = [
   featureStoreProblem,
   driftMonitorProblem,
   shadowEvalProblem,
-  promptFirewallProblem,
   citationStoreProblem,
   rerankerServiceProblem,
   summarizerServiceProblem,
