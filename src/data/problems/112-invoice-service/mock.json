@@ -1,0 +1,16 @@
+{
+  "title": "The invoice that changed after it was paid",
+  "blurb": "Finalized invoices were editable and tax timeouts issued zeros.",
+  "role": "AI platform engineer · 20 min",
+  "minutes": 20,
+  "prompt": "An auditor found a paid invoice whose line items had been edited weeks later, and a batch of invoices had been issued with zero tax during a tax-service outage. Retried finalizes also minted duplicate invoices. Review it, fix it, and prove finals are immutable and tax gates. ",
+  "signals": ["Secure", "Verify", "Operate"],
+  "aiNote": "The draft treats finalize as a state label rather than a lock, so updates still land on issued invoices and invalidate every downstream reconciliation, and it substitutes tax zero on timeout instead of holding, quietly under-charging in a way nobody reconciles.",
+  "testIdea": "Attempt to update a finalized invoice and assert 409; time out the tax call and assert finalize holds with a marker; replay finalize and assert one invoice and one number.",
+  "followUps": [
+    "Who may ever adjust a finalized invoice, and how is it represented?",
+    "How do gapless numbers survive a crash?",
+    "What does a tax breakdown need for audit?"
+  ],
+  "stepId": "endpoint"
+}
