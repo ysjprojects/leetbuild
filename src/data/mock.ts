@@ -673,6 +673,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'prompt-cache-the-cache-that-served-another-tenant',
+    problemId: 'prompt-cache',
+    stepId: 'endpoint',
+    title: 'The cache that served another tenant',
+    blurb: 'A prefix-only key leaked completions across tenants.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A tenant noticed completions referencing a product they do not use; the cache key omitted the tenant, so the first tenant to warm a popular prefix served everyone. The same cache refreshed TTLs on hit so a deprecated version never expired. Review it, fix it, and prove keys are tenant- and version-scoped.',
+    signals: ['Secure', 'Specify', 'Verify'],
+    aiNote:
+      "The draft builds the cache key from the prefix hash alone and refreshes the value's TTL on every hit, so entries cross tenant boundaries and a hot deprecated version effectively never expires.",
+    testIdea:
+      'Warm a prefix as tenant A, request it as tenant B and assert a miss; bump the prompt version and assert the old namespace stops serving; assert a hot entry still reports the original TTL rather than an extended one.',
+    followUps: [
+      'When is a cached completion still safe to serve after a model update?',
+      'What should happen to the cache when a prompt version is rolled back?',
+      'How would you price the savings number so finance trusts it?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
