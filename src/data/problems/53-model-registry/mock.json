@@ -1,0 +1,18 @@
+[
+  {
+    "stepId": "endpoint",
+    "title": "The model that promoted on a timeout",
+    "blurb": "A serving probe timed out and the draft promoted anyway.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 20,
+    "prompt": "A model version with a mismatched artifact digest reached half the fleet, because the draft promoted when the probe timeout hit and checked digests only at registration. The same draft cached pointers per process so instances disagreed. Review it, fix it, and prove promotion is gated on a verified probe.",
+    "signals": ["Specify", "Evaluate", "Verify"],
+    "aiNote": "The draft treats a probe timeout as success and promotes without verifying the loaded artifact digest matches the registered one, and it keeps active pointers in process-local caches so a promotion is only visible to the instance that performed it.",
+    "testIdea": "Time out the probe and assert the previous version keeps 100 percent traffic; load a mismatched digest and assert promotion is refused; promote then read from a second instance and assert it resolves the new version.",
+    "followUps": [
+      "What must an eval record contain to open a promotion gate?",
+      "How would you roll back traffic without invalidating the version's history?",
+      "Why is a digest check at registration not enough?"
+    ]
+  }
+]
