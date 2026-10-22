@@ -53,6 +53,7 @@ import {labelingServiceProblem} from './49-labeling-service/index';
 import {datasetRegistryProblem} from './50-dataset-registry/index';
 import {trainingSchedulerProblem} from './51-training-scheduler/index';
 import {gpuSchedulerProblem} from './52-gpu-scheduler/index';
+import {modelRegistryProblem} from './53-model-registry/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -97,6 +98,7 @@ export const problems: Problem[] = [
   datasetRegistryProblem,
   trainingSchedulerProblem,
   gpuSchedulerProblem,
+  modelRegistryProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
