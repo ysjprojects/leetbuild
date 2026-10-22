@@ -109,6 +109,7 @@ import {autocompleteServiceProblem} from './105-autocomplete-service/index';
 import {dedupeServiceProblem} from './106-dedupe-service/index';
 import {secretsRotationProblem} from './107-secrets-rotation/index';
 import {identityServiceProblem} from './108-identity-service/index';
+import {permissionServiceProblem} from './109-permission-service/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -209,6 +210,7 @@ export const problems: Problem[] = [
   dedupeServiceProblem,
   secretsRotationProblem,
   identityServiceProblem,
+  permissionServiceProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
