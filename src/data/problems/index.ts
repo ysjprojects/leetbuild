@@ -88,6 +88,7 @@ import {productCatalogProblem} from './84-product-catalog/index';
 import {warehouseLoaderProblem} from './85-warehouse-loader/index';
 import {cdcStreamerProblem} from './86-cdc-streamer/index';
 import {replicatorProblem} from './87-replicator/index';
+import {cdnPurgeProblem} from './88-cdn-purge/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -167,6 +168,7 @@ export const problems: Problem[] = [
   warehouseLoaderProblem,
   cdcStreamerProblem,
   replicatorProblem,
+  cdnPurgeProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
