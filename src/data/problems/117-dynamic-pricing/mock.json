@@ -1,0 +1,19 @@
+[
+  {
+    "id": "price-spike",
+    "stepId": "endpoint",
+    "title": "The price that spiked 400 percent",
+    "blurb": "Concurrent updates each passed their own guardrail check.",
+    "role": "AI platform engineer \u00b7 20 min",
+    "minutes": 20,
+    "prompt": "A product's price jumped 400 percent in an hour because ten parallel updates each evaluated against the old price and all passed, and a model timeout froze an experimental price as production. Review it, fix it, and prove headroom is shared and sources are honest.",
+    "signals": ["Operate", "Verify", "Evaluate"],
+    "aiNote": "The draft evaluates each update against the on-disk price in isolation, so N concurrent updates each within the per-update limit compound far past the intended per-window cap, and on a model timeout it serves the last suggestion with a fresh timestamp as if it were newly computed.",
+    "testIdea": "Fire ten concurrent 15 percent updates and assert the cumulative move respects the 20 percent window bound; time out the model and assert the published price carries the stale marker and last approved value; inspect a storefront response for experiment prices.",
+    "followUps": [
+      "Who owns the guardrail recipe?",
+      "How do you roll back a bad price across storefronts?",
+      "What does a reason code need to be auditable?"
+    ]
+  }
+]
