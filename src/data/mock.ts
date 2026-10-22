@@ -167,6 +167,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'eval-harness-the-run-that-passed-too-early',
+    problemId: 'eval-harness',
+    stepId: 'endpoint',
+    title: 'The run that passed too early',
+    blurb: 'The draft calls a run green after a handful of samples and serves a stale report.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A release shipped on an eval run that was marked passed after 12 of 500 samples, and the report endpoint kept serving a cached copy from before the last batch. The model-generated draft gates on a caller-supplied threshold and never invalidates its cache. Review it, fix it, and prove the gate only opens on a complete, current record.',
+    signals: ['Specify', 'Evaluate', 'Verify'],
+    aiNote:
+      'The draft marks the run passed as soon as any sample scores above the threshold, accepts a threshold override from the query string, and serves a report cached at run start so late failures never appear.',
+    testIdea:
+      'Start a run over 500 samples and assert it stays pending at 12 and at 199 scored samples; pass a threshold override and assert 400; finish the run below threshold and assert the report flips to failed immediately.',
+    followUps: [
+      'How many samples make a pass meaningful, and how would you bound the error?',
+      'What do you do when the judge model itself regresses mid-run?',
+      'How would you compare two runs without letting dataset drift explain the difference?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
