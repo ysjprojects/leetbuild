@@ -7,7 +7,7 @@ import {WIDGETS} from '@/lib/widgets';
 
 import {BrandLockup} from './LoadingScreen';
 import Markdown, {type WidgetRenderer} from './Markdown';
-import {ConceptChip, DifficultyChip, ghostButtonClass, linkClass} from './paneShared';
+import {ghostButtonClass, linkClass} from './paneShared';
 import ThemeToggle from './ThemeToggle';
 import {renderWidget} from './widgets';
 
@@ -116,13 +116,6 @@ const LearnPage: FC<{guide: Guide}> = memo(({guide}) => {
         </Link>
         <h1 className="text-ink-50 mt-1 text-3xl font-extrabold leading-tight tracking-tight">{guide.title}</h1>
         <p className="text-ink-300 mt-2 max-w-3xl text-[14px] leading-6">{guide.tagline}</p>
-        <div className="text-ink-300 mt-3 flex flex-wrap items-center gap-2 text-[11px]">
-          <DifficultyChip difficulty={guide.difficulty} />
-          {guide.concepts.map(c => (
-            <ConceptChip concept={c} key={c} />
-          ))}
-          <span>{guide.steps} steps in the course</span>
-        </div>
         <div className="mt-4 flex flex-wrap items-center gap-2 print:hidden">
           <button className={ghostButtonClass} onClick={onDownload} title="The guide as Markdown" type="button">
             ⤓ Download .md

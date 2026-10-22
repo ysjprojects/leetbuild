@@ -286,7 +286,6 @@ export interface Guide {
   tagline: string;
   difficulty: Difficulty;
   concepts: Concept[];
-  steps: number;
   learn: string;
   sources: Source[];
 }
@@ -300,7 +299,6 @@ export const guideOf = (problem: Problem): Guide | null =>
         tagline: problem.tagline,
         difficulty: problem.difficulty,
         concepts: problem.concepts,
-        steps: problem.steps.length,
         learn: problem.learn,
         sources: problem.sources ?? [],
       };
