@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'autocomplete-service-the-search-box-that-suggested-a-person',
+    problemId: 'autocomplete-service',
+    stepId: 'endpoint',
+    title: 'The search box that suggested a person',
+    blurb: 'Raw prefixes got cached and one-off queries trended.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      "A private individual's name appeared in autocomplete after one search and then stayed cached, because the draft cached raw prefixes forever and promoted single-occurrence queries as trends. The same endpoint returned thousands of matches for long prefixes. Review it, fix it, and prove caches are capped and trends have floors.",
+    signals: ['Secure', 'Specify', 'Verify'],
+    aiNote:
+      'The draft caches every prefix with no TTL or cap, so a single sensitive query becomes a permanent suggestion, and the trending path has no occurrence floor or sensitive-category filter, turning one search into a global trend.',
+    testIdea:
+      'Walk ten thousand distinct prefixes and assert the cache cap evicts oldest while memory stays bounded; search a one-off term and assert it never trends without the floor; assert a cached prefix expires with its TTL.',
+    followUps: [
+      'What occurrence floor makes a trend defensible?',
+      'How do you keep typeahead useful under cache caps?',
+      'Which categories should never autocomplete?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
