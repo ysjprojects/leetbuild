@@ -245,7 +245,7 @@ const FileTab: FC<{
 });
 FileTab.displayName = 'FileTab';
 
-/** A provided file's tab: read-only, so it carries a lock instead of the task dot. */
+/** A provided file's tab: view-only, so it carries an eye instead of the task dot. */
 const ProvidedTab: FC<{path: string; active: boolean; onOpen: (id: string) => void; onClose: (id: string) => void}> =
   memo(({path, active, onOpen, onClose}) => {
     const id = providedId(path);
@@ -264,7 +264,7 @@ const ProvidedTab: FC<{path: string; active: boolean; onOpen: (id: string) => vo
           onClick={onClick}
           title="provided by the course — read-only"
           type="button">
-          <LockGlyph />
+          <EyeGlyph />
           <span className="whitespace-nowrap">{path}</span>
         </button>
         <button
@@ -331,15 +331,16 @@ const FileTabs: FC<{
 ));
 FileTabs.displayName = 'FileTabs';
 
-const LockGlyph: FC = memo(() => (
-  <svg aria-hidden fill="none" height={10} stroke="currentColor" strokeWidth={1.4} viewBox="0 0 10 10" width={10}>
-    <rect height={5} rx={1} width={7} x={1.5} y={4.5} />
-    <path d="M3 4.5V3a2 2 0 0 1 4 0v1.5" strokeLinecap="round" />
+/** View-only: an eye, so a provided file never reads as a locked step (the padlock means "not yet"). */
+const EyeGlyph: FC = memo(() => (
+  <svg aria-hidden fill="none" height={10} stroke="currentColor" strokeWidth={1.3} viewBox="0 0 12 10" width={12}>
+    <path d="M1 5c1.4-2.4 3.1-3.6 5-3.6S9.6 2.6 11 5c-1.4 2.4-3.1 3.6-5 3.6S2.4 7.4 1 5Z" strokeLinejoin="round" />
+    <circle cx={6} cy={5} r={1.6} />
   </svg>
 ));
-LockGlyph.displayName = 'LockGlyph';
+EyeGlyph.displayName = 'EyeGlyph';
 
-/** A provided file in the tree: muted, in italics, a lock for the glyph — readable, not editable. */
+/** A provided file in the tree: muted, in italics, an eye for the glyph — readable, not editable. */
 const ProvidedRow: FC<{file: ProvidedFile; active: boolean; onOpen: (id: string) => void}> = memo(
   ({file, active, onOpen}) => {
     const onClick = useCallback(() => onOpen(providedId(file.path)), [onOpen, file.path]);
@@ -353,7 +354,7 @@ const ProvidedRow: FC<{file: ProvidedFile; active: boolean; onOpen: (id: string)
           title={`${file.path} — provided by the course, read-only`}
           type="button">
           <span aria-hidden className="flex w-3 shrink-0 justify-center">
-            <LockGlyph />
+            <EyeGlyph />
           </span>
           <span className="font-code min-w-0 truncate italic">{file.path}</span>
         </button>
@@ -1589,7 +1590,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                   <>
                     <div className="border-ink-700 bg-ink-850/60 text-ink-300 flex shrink-0 items-start gap-2 border-b px-3 py-1.5 text-[11px] leading-5">
                       <span aria-hidden className="mt-1 shrink-0">
-                        <LockGlyph />
+                        <EyeGlyph />
                       </span>
                       <span>{openProvided.note}</span>
                     </div>
