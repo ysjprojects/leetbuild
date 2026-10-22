@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'reranker-service-the-reranker-that-scored-nothing',
+    problemId: 'reranker-service',
+    stepId: 'endpoint',
+    title: 'The reranker that scored nothing',
+    blurb: 'Failed batches got neutral scores instead of being marked unscored.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'Retrieval quality dropped without an alarm, because failed rerank batches were assigned neutral scores and low-value passages climbed. The same response truncated long passages silently and never reported it. Review it, fix it, and prove unscored is not a score.',
+    signals: ['Evaluate', 'Specify', 'Verify'],
+    aiNote:
+      'The draft maps failed rerank batches to a neutral score, so infrastructure failures are indistinguishable from genuine mid-tier relevance and silently reorder results, and it truncates passages without a marker so scores describe text the model never saw.',
+    testIdea:
+      'Fail one batch of 64 and assert those passages are marked unscored and keep their retrieval order; truncate a 6 KiB passage and assert the response reports truncation; bump the model version and assert old scores are not served.',
+    followUps: [
+      'When should reranking fail the whole request?',
+      'How would you validate reranking lift offline?',
+      'Why is a score histogram useful in production?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
