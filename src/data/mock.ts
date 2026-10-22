@@ -1245,6 +1245,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'booking-engine-the-slot-that-was-booked-twice',
+    problemId: 'booking-engine',
+    stepId: 'endpoint',
+    title: 'The slot that was booked twice',
+    blurb: 'Check-then-write holds let two bookings win one slot.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'Two team members booked the same room for the same hour, because the draft read the slot map, checked it in the handler, and wrote the hold in a separate step. The same draft never expired abandoned holds. Review it, fix it, and prove holds are atomic and expiry works.',
+    signals: ['Specify', 'Verify', 'Operate'],
+    aiNote:
+      'The draft checks slot availability with a read and writes the hold with a later command, so concurrent requests both observe the same free map, and its hold key has no TTL, so an abandoned checkout blocks the slot permanently.',
+    testIdea:
+      'Fire two concurrent bookings for one slot and assert exactly one succeeds; abandon a hold and assert it frees after its TTL; reschedule with a replayed key and assert one external calendar event.',
+    followUps: [
+      'How would you model recurring bookings without a slot explosion?',
+      'What should a reschedule do when the new slot is taken?',
+      'Which timezone bugs have you seen in booking systems?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
