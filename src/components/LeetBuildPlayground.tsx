@@ -1,10 +1,11 @@
 import type {EditorView} from '@codemirror/view';
 import Router from 'next/router';
-import {type CSSProperties, type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import {type CSSProperties, type FC, Fragment, memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 
 import {problems} from '@/data/problems';
 import {downloadCertificate} from '@/lib/certificate';
 import {downloadMarkdown, exportFileName, problemToMarkdown, problemUrl, siteUrl} from '@/lib/export';
+import {type TreeNode, buildTree} from '@/lib/fileTree';
 import {type Badge, badgeOf, dayKey, earnedBadges, streakOf} from '@/lib/gamify';
 import {type Verdict, exampleCheck, judge, narrow, withRuntime} from '@/lib/judge';
 import {type ProvidedFile, isProvidedId, providedFiles, providedId, providedPath} from '@/lib/provided';
@@ -262,10 +263,10 @@ const ProvidedTab: FC<{path: string; active: boolean; onOpen: (id: string) => vo
         <button
           className="font-code flex items-center gap-1.5 pl-3 pr-1 italic"
           onClick={onClick}
-          title="provided by the course — read-only"
+          title={`${path} — provided by the course, read-only`}
           type="button">
           <EyeGlyph />
-          <span className="whitespace-nowrap">{path}</span>
+          <span className="whitespace-nowrap">{path.slice(path.lastIndexOf('/') + 1)}</span>
         </button>
         <button
           aria-label={`close ${path}`}
@@ -340,28 +341,37 @@ const EyeGlyph: FC = memo(() => (
 ));
 EyeGlyph.displayName = 'EyeGlyph';
 
-/** A provided file in the tree: muted, in italics, an eye for the glyph — readable, not editable. */
-const ProvidedRow: FC<{file: ProvidedFile; active: boolean; onOpen: (id: string) => void}> = memo(
-  ({file, active, onOpen}) => {
-    const onClick = useCallback(() => onOpen(providedId(file.path)), [onOpen, file.path]);
-    return (
-      <li>
-        <button
-          className={`flex w-full items-center gap-1.5 py-0.5 pl-5 pr-2 text-left text-[11px] transition ${
-            active ? 'bg-ink-800 text-ink-300' : 'text-ink-500 hover:bg-ink-800/60 hover:text-ink-300'
-          }`}
-          onClick={onClick}
-          title={`${file.path} — provided by the course, read-only`}
-          type="button">
-          <span aria-hidden className="flex w-3 shrink-0 justify-center">
-            <EyeGlyph />
-          </span>
-          <span className="font-code min-w-0 truncate italic">{file.path}</span>
-        </button>
-      </li>
-    );
-  },
-);
+/** Indent per nesting level; depth 0 is a file directly under the course root. */
+const indent = (depth: number): CSSProperties => ({paddingLeft: 20 + depth * 12});
+
+/** A provided file in the tree: muted like a locked step, in italics, an eye for the glyph — readable, not editable. */
+const ProvidedRow: FC<{
+  file: ProvidedFile;
+  name: string;
+  depth: number;
+  active: boolean;
+  onOpen: (id: string) => void;
+}> = memo(({file, name, depth, active, onOpen}) => {
+  const onClick = useCallback(() => onOpen(providedId(file.path)), [onOpen, file.path]);
+  const style = useMemo(() => indent(depth), [depth]);
+  return (
+    <li>
+      <button
+        className={`flex w-full items-center gap-1.5 py-0.5 pr-2 text-left text-[11px] transition ${
+          active ? 'bg-ink-800 text-ink-300' : 'text-ink-500 hover:bg-ink-800/60 hover:text-ink-300'
+        }`}
+        onClick={onClick}
+        style={style}
+        title={`${file.path} — provided by the course, read-only`}
+        type="button">
+        <span aria-hidden className="flex w-3 shrink-0 justify-center">
+          <EyeGlyph />
+        </span>
+        <span className="font-code min-w-0 truncate italic">{name}</span>
+      </button>
+    </li>
+  );
+});
 ProvidedRow.displayName = 'ProvidedRow';
 
 const STATUS_GLYPH: Record<StepAttempt['status'], {glyph: string; className: string; word: string}> = {
@@ -373,19 +383,21 @@ const STATUS_GLYPH: Record<StepAttempt['status'], {glyph: string; className: str
 const ExplorerRow: FC<{
   step: Step;
   index: number;
-  language: Language;
+  name: string;
+  depth: number;
   status: StepAttempt['status'];
   locked: boolean;
   active: boolean;
   task: boolean;
   onOpen: (id: string) => void;
-}> = memo(({step, index, language, status, locked, active, task, onOpen}) => {
+}> = memo(({step, index, name, depth, status, locked, active, task, onOpen}) => {
   const onClick = useCallback(() => onOpen(step.id), [onOpen, step.id]);
+  const style = useMemo(() => indent(depth), [depth]);
   const mark = STATUS_GLYPH[status];
   return (
     <li>
       <button
-        className={`flex w-full items-center gap-1.5 py-0.5 pl-5 pr-2 text-left text-[11px] transition disabled:cursor-not-allowed ${
+        className={`flex w-full items-center gap-1.5 py-0.5 pr-2 text-left text-[11px] transition disabled:cursor-not-allowed ${
           active
             ? 'bg-ink-800 text-ink-50'
             : locked
@@ -394,6 +406,7 @@ const ExplorerRow: FC<{
         }`}
         disabled={locked}
         onClick={onClick}
+        style={style}
         title={
           locked
             ? `step ${index + 1}: ${step.title} — unlocks once step ${index} is done`
@@ -403,7 +416,7 @@ const ExplorerRow: FC<{
         <span aria-hidden className={`font-code w-3 shrink-0 text-center text-[10px] ${locked ? '' : mark.className}`}>
           {locked ? '🔒' : mark.glyph}
         </span>
-        <span className="font-code min-w-0 truncate">{fileName(step.file, language)}</span>
+        <span className="font-code min-w-0 truncate">{name}</span>
         {task ? <TaskDot /> : null}
       </button>
     </li>
@@ -411,12 +424,108 @@ const ExplorerRow: FC<{
 });
 ExplorerRow.displayName = 'ExplorerRow';
 
+/** A folder in the tree: a chevron that folds it, VS Code style. `depth` 0 is the course root itself. */
+const FolderRow: FC<{name: string; path: string; depth: number; open: boolean; onToggle: (path: string) => void}> =
+  memo(({name, path, depth, open, onToggle}) => {
+    const onClick = useCallback(() => onToggle(path), [onToggle, path]);
+    const style = useMemo(() => ({paddingLeft: 8 + depth * 12}), [depth]);
+    return (
+      <li>
+        <button
+          aria-expanded={open}
+          className={`hover:bg-ink-800/60 flex w-full items-center gap-1 py-0.5 pr-2 text-left text-[11px] transition ${
+            depth === 0 ? 'text-ink-100 font-semibold' : 'text-ink-200'
+          }`}
+          onClick={onClick}
+          style={style}
+          title={open ? `fold ${name}` : `unfold ${name}`}
+          type="button">
+          <span
+            aria-hidden
+            className={`text-ink-400 w-3 text-center text-[9px] transition ${open ? '' : '-rotate-90'}`}>
+            ▼
+          </span>
+          <span className="min-w-0 truncate">{name}</span>
+        </button>
+      </li>
+    );
+  });
+FolderRow.displayName = 'FolderRow';
+
+/** What a file row in the tree stands for: a step's own file, or something the course provides. */
+type Leaf = {kind: 'step'; step: Step; index: number} | {kind: 'provided'; file: ProvidedFile};
+
+const TreeNodes: FC<{
+  nodes: readonly TreeNode<Leaf>[];
+  depth: number;
+  folded: ReadonlySet<string>;
+  onToggle: (path: string) => void;
+  problem: Problem;
+  attempts: Record<string, StepAttempt>;
+  stepId: string;
+  openFile: string | null;
+  onOpen: (id: string) => void;
+}> = memo(({nodes, depth, folded, onToggle, problem, attempts, stepId, openFile, onOpen}) => (
+  <>
+    {nodes.map(node =>
+      node.kind === 'folder' ? (
+        <Fragment key={node.path}>
+          <FolderRow
+            depth={depth}
+            name={node.name}
+            onToggle={onToggle}
+            open={!folded.has(node.path)}
+            path={node.path}
+          />
+          {folded.has(node.path) ? null : (
+            <TreeNodes
+              attempts={attempts}
+              depth={depth + 1}
+              folded={folded}
+              nodes={node.children}
+              onOpen={onOpen}
+              onToggle={onToggle}
+              openFile={openFile}
+              problem={problem}
+              stepId={stepId}
+            />
+          )}
+        </Fragment>
+      ) : node.leaf.kind === 'step' ? (
+        <ExplorerRow
+          active={node.leaf.step.id === openFile}
+          depth={depth}
+          index={node.leaf.index}
+          key={node.path}
+          locked={!unlocked(problem, node.leaf.index, attempts)}
+          name={node.name}
+          onOpen={onOpen}
+          status={attempts[stepKey(problem.id, node.leaf.step.id)]?.status ?? 'open'}
+          step={node.leaf.step}
+          task={node.leaf.step.id === stepId}
+        />
+      ) : (
+        <ProvidedRow
+          active={providedId(node.leaf.file.path) === openFile}
+          depth={depth}
+          file={node.leaf.file}
+          key={node.path}
+          name={node.name}
+          onOpen={onOpen}
+        />
+      ),
+    )}
+  </>
+));
+TreeNodes.displayName = 'TreeNodes';
+
 /**
- * The problem's virtual filesystem — one file per step, in the current language — as a file tree.
- * Every file is listed so the shape of the system is visible from step 1; locked ones wait for
- * their step, every other one opens in a tab and is editable from any step. Under them, what the
- * course provides and no step builds (generated protobuf modules, helpers, the `.proto` behind a
- * generated package): readable in a tab, never editable.
+ * The problem's virtual filesystem in the current language as a VS Code-style tree: the course
+ * root, then folders (fold with their chevron) and files at the paths the step code refers to.
+ * Every step file is listed so the shape of the system is visible from step 1; locked ones wait
+ * for their step, every other one opens in a tab and is editable from any step. What the course
+ * provides and no step builds — generated protobuf modules, helpers, the `.proto` behind a
+ * generated package — is there too, readable in a tab, never editable.
  */
 const Explorer: FC<{
   problem: Problem;
@@ -428,58 +537,73 @@ const Explorer: FC<{
   onOpen: (id: string) => void;
   /** Fold the explorer into a strip beside the editor (`lg` and up), as the problem pane folds. */
   onCollapse: () => void;
-}> = memo(({problem, language, provided, attempts, stepId, openFile, onOpen, onCollapse}) => (
-  <nav aria-label="files" className="flex h-full min-h-0 flex-col">
-    <div className="text-ink-400 flex h-9 shrink-0 items-center justify-between pl-3 pr-1.5 text-[10px] font-bold uppercase tracking-wider">
-      Explorer
-      <button
-        aria-label="hide the file explorer"
-        className="text-ink-400 hover:text-ink-50 hidden h-6 w-6 items-center justify-center rounded-md transition lg:flex"
-        onClick={onCollapse}
-        title={`hide the file explorer (${mod('B')})`}
-        type="button">
-        <svg
-          aria-hidden
-          fill="none"
-          height={13}
-          stroke="currentColor"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-          strokeWidth={1.8}
-          viewBox="0 0 16 16"
-          width={13}>
-          <path d="M10 3 5 8l5 5" />
-        </svg>
-      </button>
-    </div>
-    <div className="min-h-0 flex-1 overflow-y-auto pb-2">
-      <div className="text-ink-100 flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold">
-        <span aria-hidden className="text-ink-400 w-3 text-center text-[9px]">
-          ▼
-        </span>
-        {problem.id}
+}> = memo(({problem, language, provided, attempts, stepId, openFile, onOpen, onCollapse}) => {
+  const tree = useMemo(
+    () =>
+      buildTree<Leaf>([
+        ...problem.steps.map((step, index) => ({
+          path: fileName(step.file, language),
+          leaf: {kind: 'step' as const, step, index},
+        })),
+        ...provided.map(file => ({path: file.path, leaf: {kind: 'provided' as const, file}})),
+      ]),
+    [problem, language, provided],
+  );
+  const [folded, setFolded] = useState<ReadonlySet<string>>(() => new Set());
+  const onToggle = useCallback((path: string) => {
+    setFolded(current => {
+      const next = new Set(current);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }, []);
+  const rootOpen = !folded.has('');
+  return (
+    <nav aria-label="files" className="flex h-full min-h-0 flex-col">
+      <div className="text-ink-400 flex h-9 shrink-0 items-center justify-between pl-3 pr-1.5 text-[10px] font-bold uppercase tracking-wider">
+        Explorer
+        <button
+          aria-label="hide the file explorer"
+          className="text-ink-400 hover:text-ink-50 hidden h-6 w-6 items-center justify-center rounded-md transition lg:flex"
+          onClick={onCollapse}
+          title={`hide the file explorer (${mod('B')})`}
+          type="button">
+          <svg
+            aria-hidden
+            fill="none"
+            height={13}
+            stroke="currentColor"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            strokeWidth={1.8}
+            viewBox="0 0 16 16"
+            width={13}>
+            <path d="M10 3 5 8l5 5" />
+          </svg>
+        </button>
       </div>
-      <ul>
-        {problem.steps.map((s, i) => (
-          <ExplorerRow
-            active={s.id === openFile}
-            index={i}
-            key={s.id}
-            language={language}
-            locked={!unlocked(problem, i, attempts)}
-            onOpen={onOpen}
-            status={attempts[stepKey(problem.id, s.id)]?.status ?? 'open'}
-            step={s}
-            task={s.id === stepId}
-          />
-        ))}
-        {provided.map(f => (
-          <ProvidedRow active={providedId(f.path) === openFile} file={f} key={f.path} onOpen={onOpen} />
-        ))}
-      </ul>
-    </div>
-  </nav>
-));
+      <div className="min-h-0 flex-1 overflow-y-auto pb-2">
+        <ul>
+          <FolderRow depth={0} name={problem.id} onToggle={onToggle} open={rootOpen} path="" />
+          {rootOpen ? (
+            <TreeNodes
+              attempts={attempts}
+              depth={1}
+              folded={folded}
+              nodes={tree}
+              onOpen={onOpen}
+              onToggle={onToggle}
+              openFile={openFile}
+              problem={problem}
+              stepId={stepId}
+            />
+          ) : null}
+        </ul>
+      </div>
+    </nav>
+  );
+});
 Explorer.displayName = 'Explorer';
 
 /** The problem pane folded into a strip (`lg` and up): the step title on its side, click to expand. */

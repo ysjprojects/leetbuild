@@ -1,16 +1,18 @@
 /**
- * The files a course provides beside the learner's own, per language: what a starter's local
- * import resolves to. In Python and TypeScript they are the course's support modules — the ones the
- * browser runtime mounts next to the step files (generated `*_pb2.py`, hand-written helpers, the
- * `.proto` sources proto-loader parses). Go, Scala and C++ import code that protoc generates and the
- * course does not ship, so for them the file is the `.proto` the generated package comes from, with
- * a note naming that package. Read-only in the explorer: context, not an exercise.
+ * The files a course provides beside the learner's own, per language, at the paths the step code
+ * reaches them by. In Python and TypeScript they are the course's support modules exactly as the
+ * browser runtime mounts them — generated `*_pb2.py`, hand-written helpers, the `.proto` sources
+ * proto-loader reads — so they sit flat, where `import chat_pb2` and `loadSync('chat.proto')` find
+ * them. Go, Scala and C++ import code that protoc generates and the course does not ship; for them
+ * the tree carries the `.proto` source and, at the generated files' paths, honest stubs: a comment
+ * saying who generates the file and what it declares, never fake generated code. Read-only in the
+ * explorer: context, not an exercise.
  */
 import type {Syntax} from './editor';
 import type {Language, Problem} from './types';
 
 export interface ProvidedFile {
-  /** Path as the explorer shows it and as the import refers to it. */
+  /** Path in the tree, relative to the course root, as the step code refers to it. */
   path: string;
   text: string;
   syntax: Syntax;
@@ -24,9 +26,45 @@ export const isProvidedId = (id: string): boolean => id.startsWith('provided:');
 export const providedPath = (id: string): string => id.slice('provided:'.length);
 
 const stem = (file: string): string => file.replace(/\.[^.]+$/, '');
+const pascal = (name: string): string => name.replace(/(^|_)(\w)/g, (_, __, c: string) => c.toUpperCase());
 
-/** `package chat;` → `chat`, for ScalaPB's `<package>.<file>` naming. */
-const protoPackage = (text: string): string | null => /^\s*package\s+([\w.]+)\s*;/m.exec(text)?.[1] ?? null;
+/** What a `.proto` declares, for the stubs: its package, messages (with oneofs) and services with their rpcs. */
+interface ProtoShape {
+  pkg: string | null;
+  messages: {name: string; oneofs: string[]}[];
+  services: {name: string; rpcs: string[]}[];
+}
+
+function parseProto(text: string): ProtoShape {
+  const pkg = /^\s*package\s+([\w.]+)\s*;/m.exec(text)?.[1] ?? null;
+  const messages = [...text.matchAll(/^\s*message\s+(\w+)\s*\{([^}]*)\}/gm)].map(m => ({
+    name: m[1],
+    oneofs: [...m[2].matchAll(/oneof\s+(\w+)/g)].map(o => o[1]),
+  }));
+  const services = [...text.matchAll(/^\s*service\s+(\w+)\s*\{([\s\S]*?)^\}/gm)].map(s => ({
+    name: s[1],
+    rpcs: [...s[2].matchAll(/rpc\s+(\w+)\s*\(([^)]*)\)\s*returns\s*\(([^)]*)\)/g)].map(
+      r => `rpc ${r[1]}(${r[2].trim()}) returns (${r[3].trim()})`,
+    ),
+  }));
+  return {pkg, messages, services};
+}
+
+const describe = (shape: ProtoShape, comment: string): string[] => [
+  `${comment} Messages: ${shape.messages
+    .map(m => (m.oneofs.length > 0 ? `${m.name} (oneof ${m.oneofs.join(', ')})` : m.name))
+    .join(', ')}`,
+  ...shape.services.flatMap(s => [`${comment} Service ${s.name}:`, ...s.rpcs.map(r => `${comment}   ${r}`)]),
+];
+
+/** The import path the Go starters use for the generated package (`pb "chat/gen/chat"`), if they spell one out. */
+const goImportPath = (problem: Problem, name: string): string | null => {
+  for (const step of problem.steps) {
+    const found = new RegExp(`"([\\w./-]+/gen/${name})"`).exec(step.code.go.starter);
+    if (found !== null) return found[1];
+  }
+  return null;
+};
 
 const pythonNote = (path: string): string => {
   const generated = /^(.*)_pb2(_grpc)?\.py$/.exec(path);
@@ -46,19 +84,154 @@ const typescriptNote = (path: string): string =>
         path,
       )}'\` works as written.`;
 
-const GENERATED_NOTE: Record<
-  Exclude<Language, 'python' | 'typescript'>,
-  (name: string, pkg: string | null) => string
-> = {
-  go: name =>
-    `protoc-gen-go and protoc-gen-go-grpc generate ${name}.pb.go and ${name}_grpc.pb.go from this file — the package the solutions import; the course does not ship the generated code.`,
-  scala: (name, pkg) =>
-    `ScalaPB generates the ${
-      pkg === null ? name : `${pkg}.${name}`
-    } package (messages and the service stub) from this file — what the solutions import; the course does not ship the generated code.`,
-  cpp: name =>
-    `protoc with grpc_cpp_plugin generates ${name}.pb.h and ${name}.grpc.pb.h from this file — the headers the solutions include; the course does not ship the generated code.`,
-};
+const STUB_NOTE =
+  'A stub in place of the generated file: the course does not ship generated code, so this lists what protoc would put here.';
+
+/** The `.proto` and the generated-file stubs for one proto source, in `language`. */
+function generated(problem: Problem, language: 'go' | 'scala' | 'cpp', file: string, text: string): ProvidedFile[] {
+  const name = stem(file);
+  const shape = parseProto(text);
+  const src = language === 'scala' ? `src/main/protobuf/${file}` : `proto/${file}`;
+  const source: ProvidedFile = {
+    path: src,
+    text,
+    syntax: 'proto',
+    note: `The source the generated files below come from; the course does not ship the generated code.`,
+  };
+  if (language === 'go') {
+    const importPath = goImportPath(problem, name);
+    const dir = `gen/${name}`;
+    const head = (tool: string): string[] => [
+      `// Code generated by ${tool} from ${src}. DO NOT EDIT.`,
+      `//`,
+      `// The course does not ship the generated file; this stub lists what it declares.`,
+      ...(importPath === null ? [] : [`// The step files import the package as "${importPath}".`]),
+      `//`,
+    ];
+    return [
+      source,
+      {
+        path: `${dir}/${name}.pb.go`,
+        syntax: 'go',
+        note: STUB_NOTE,
+        text: [
+          ...head('protoc-gen-go'),
+          ...describe({...shape, services: []}, '//'),
+          `//`,
+          `// Regenerate: protoc -I proto --go_out=gen --go_opt=paths=source_relative ${src}`,
+          ``,
+          `package ${shape.pkg ?? name}`,
+          ``,
+        ].join('\n'),
+      },
+      ...(shape.services.length === 0
+        ? []
+        : [
+            {
+              path: `${dir}/${name}_grpc.pb.go`,
+              syntax: 'go' as const,
+              note: STUB_NOTE,
+              text: [
+                ...head('protoc-gen-go-grpc'),
+                ...describe({...shape, messages: []}, '//').slice(1),
+                ...shape.services.map(
+                  s => `//   → ${s.name}Client, ${s.name}Server, Register${s.name}Server, Unimplemented${s.name}Server`,
+                ),
+                `//`,
+                `// Regenerate: protoc -I proto --go-grpc_out=gen --go-grpc_opt=paths=source_relative ${src}`,
+                ``,
+                `package ${shape.pkg ?? name}`,
+                ``,
+              ].join('\n'),
+            },
+          ]),
+    ];
+  }
+  if (language === 'scala') {
+    const pkg = `${shape.pkg ?? name}.${name}`;
+    const dir = `target/scala/src_managed/${pkg.replace(/\./g, '/')}`;
+    const head = (what: string): string[] => [
+      `// Generated by ScalaPB from ${src} (${what}). DO NOT EDIT.`,
+      `//`,
+      `// The course does not ship the generated file; this stub lists what it declares. The step files`,
+      `// import it as ${pkg}.{…}.`,
+      `//`,
+    ];
+    return [
+      source,
+      {
+        path: `${dir}/${pascal(name)}Proto.scala`,
+        syntax: 'scala',
+        note: STUB_NOTE,
+        text: [
+          ...head('messages'),
+          ...describe({...shape, services: []}, '//'),
+          `// Each message is a case class with a companion (parseFrom, toByteArray, …).`,
+          ``,
+          `package ${pkg}`,
+          ``,
+        ].join('\n'),
+      },
+      ...shape.services.map(s => ({
+        path: `${dir}/${s.name}Grpc.scala`,
+        syntax: 'scala' as const,
+        note: STUB_NOTE,
+        text: [
+          ...head('service'),
+          `// Service ${s.name}:`,
+          ...s.rpcs.map(r => `//   ${r}`),
+          `//   → ${s.name}Grpc.${s.name} (the trait to implement), ${s.name}Grpc.${s.name}Stub, ${s.name}Grpc.bindService`,
+          ``,
+          `package ${pkg}`,
+          ``,
+        ].join('\n'),
+      })),
+    ];
+  }
+  const ns = shape.pkg?.replace(/\./g, '::') ?? name;
+  const head = (what: string): string[] => [
+    `// Generated by protoc${what === 'service' ? ' with grpc_cpp_plugin' : ''} from ${src} (${what}). DO NOT EDIT.`,
+    `//`,
+    `// The course does not ship the generated file; this stub lists what it declares. The step files`,
+    `// include it as "${name}${what === 'service' ? '.grpc' : ''}.pb.h" (-Igen).`,
+    `//`,
+  ];
+  return [
+    source,
+    {
+      path: `gen/${name}.pb.h`,
+      syntax: 'cpp',
+      note: STUB_NOTE,
+      text: [
+        ...head('messages'),
+        ...describe({...shape, services: []}, '//'),
+        `// Each message is a class in namespace ${ns} with accessors, set_*(), SerializeToString(), ParseFromString().`,
+        ``,
+        `#pragma once`,
+        ``,
+      ].join('\n'),
+    },
+    ...(shape.services.length === 0
+      ? []
+      : [
+          {
+            path: `gen/${name}.grpc.pb.h`,
+            syntax: 'cpp' as const,
+            note: STUB_NOTE,
+            text: [
+              ...head('service'),
+              ...describe({...shape, messages: []}, '//').slice(1),
+              ...shape.services.map(
+                s => `//   → ${ns}::${s.name}::Service, ${ns}::${s.name}::Stub, ${ns}::${s.name}::NewStub`,
+              ),
+              ``,
+              `#pragma once`,
+              ``,
+            ].join('\n'),
+          },
+        ]),
+  ];
+}
 
 /** Every file `language`'s starters may import that no step builds, in the order the course lists them. */
 export function providedFiles(problem: Problem, language: Language): ProvidedFile[] {
@@ -74,10 +247,5 @@ export function providedFiles(problem: Problem, language: Language): ProvidedFil
   // The .proto sources travel with the TypeScript support (proto-loader reads them at run time).
   return Object.entries(problem.support?.typescript ?? {})
     .filter(([path]) => path.endsWith('.proto'))
-    .map(([path, text]) => ({
-      path: `proto/${path}`,
-      text,
-      syntax: 'proto',
-      note: GENERATED_NOTE[language](stem(path), protoPackage(text)),
-    }));
+    .flatMap(([file, text]) => generated(problem, language, file, text));
 }
