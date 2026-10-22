@@ -299,6 +299,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'cost-meter-the-meter-nobody-can-reconcile',
+    problemId: 'cost-meter',
+    stepId: 'endpoint',
+    title: 'The meter nobody can reconcile',
+    blurb: 'Counter updates were not atomic and replay billed twice.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'Finance found spend that did not match provider invoices, and a support engineer saw a tenant billed twice for one request after a retry. The model-generated draft increments per-model counters in separate commands and stores usage without any idempotency key. Review it, fix it, and prove counters, replay and reporting all agree.',
+    signals: ['Specify', 'Verify', 'Operate'],
+    aiNote:
+      "The draft increments each model's counter with a separate HINCRBY and sets no expiry, so concurrent writes can half-apply and the key never resets, and it stores usage without the Idempotency-Key so a retried report is recorded and billed twice.",
+    testIdea:
+      'Replay the same usage report and assert one stored row and one billed amount; increment two model counters concurrently and assert the hash updates atomically; wait out the window and assert the counter key is gone.',
+    followUps: [
+      'Should spend be reserved before a call or reconciled after it, and what does each choice cost?',
+      'How do you bill a request whose provider usage arrives after the response?',
+      'What makes a pricing version auditable months later?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
