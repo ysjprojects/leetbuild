@@ -34,15 +34,12 @@ export interface StepAttempt {
 export const OPEN_ATTEMPT: StepAttempt = {status: 'open', hints: 0, wrong: 0, language: null, solvedAt: null};
 
 /**
- * Points per step by difficulty, chosen so every course together adds up to exactly
- * `COURSE_POINTS` (19 easy + 33 medium + 46 hard steps: 133 + 330 + 874 = 1337). The verify script
- * enforces the total, so adding or removing a step — or a course — means re-balancing these; an
- * issued certificate keeps the maximum it was earned under (it travels in its URL).
+ * Points per step by difficulty. The live maximum is the sum over every course (`profile.max`),
+ * so adding content never requires re-balancing: the original eighteen-course catalogue happened
+ * to total 1337, and it keeps growing from there. An issued certificate carries the maximum it was
+ * earned under (it travels in its URL).
  */
 export const STEP_POINTS: Record<Difficulty, number> = {easy: 7, medium: 10, hard: 19};
-
-/** Every course together is worth exactly this many points — the number is the point. */
-export const COURSE_POINTS = 1337;
 
 /** Fraction of a step's points lost per hint revealed. */
 export const HINT_COST = 0.2;
