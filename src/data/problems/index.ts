@@ -21,8 +21,6 @@ import {ragServiceProblem} from './17-rag-service/index';
 import {modelRouterProblem} from './18-model-router/index';
 import {chatMemoryProblem} from './19-chat-memory/index';
 import {evalHarnessProblem} from './20-eval-harness/index';
-import {guardrailServiceProblem} from './21-guardrail-service/index';
-import {agentOrchestratorProblem} from './22-agent-orchestrator/index';
 import {embeddingServiceProblem} from './23-embedding-service/index';
 import {vectorSearchProblem} from './24-vector-search/index';
 import {promptRegistryProblem} from './25-prompt-registry/index';
@@ -32,8 +30,6 @@ import {distillationPipelineProblem} from './28-distillation-pipeline/index';
 import {batchInferenceProblem} from './29-batch-inference/index';
 import {multimodalIngestProblem} from './30-multimodal-ingest/index';
 import {voiceAgentProblem} from './31-voice-agent/index';
-import {codeAssistantProblem} from './32-code-assistant/index';
-import {sqlCopilotProblem} from './33-sql-copilot/index';
 import {ticketTriageProblem} from './34-ticket-triage/index';
 import {recommendationRankingProblem} from './35-recommendation-ranking/index';
 import {moderationServiceProblem} from './36-moderation-service/index';
@@ -58,7 +54,6 @@ import {checkpointStoreProblem} from './54-checkpoint-store/index';
 import {featureStoreProblem} from './55-feature-store/index';
 import {driftMonitorProblem} from './56-drift-monitor/index';
 import {shadowEvalProblem} from './57-shadow-eval/index';
-import {promptFirewallProblem} from './58-prompt-firewall/index';
 import {citationStoreProblem} from './59-citation-store/index';
 import {rerankerServiceProblem} from './60-reranker-service/index';
 import {summarizerServiceProblem} from './61-summarizer-service/index';
@@ -130,8 +125,6 @@ export const problems: Problem[] = [
   modelRouterProblem,
   chatMemoryProblem,
   evalHarnessProblem,
-  guardrailServiceProblem,
-  agentOrchestratorProblem,
   embeddingServiceProblem,
   vectorSearchProblem,
   promptRegistryProblem,
@@ -141,8 +134,6 @@ export const problems: Problem[] = [
   batchInferenceProblem,
   multimodalIngestProblem,
   voiceAgentProblem,
-  codeAssistantProblem,
-  sqlCopilotProblem,
   ticketTriageProblem,
   recommendationRankingProblem,
   moderationServiceProblem,
@@ -167,7 +158,6 @@ export const problems: Problem[] = [
   featureStoreProblem,
   driftMonitorProblem,
   shadowEvalProblem,
-  promptFirewallProblem,
   citationStoreProblem,
   rerankerServiceProblem,
   summarizerServiceProblem,

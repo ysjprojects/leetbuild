@@ -190,50 +190,6 @@ export const mockScenarios: readonly MockScenario[] = [
     defaultLanguage: 'python',
   },
   {
-    id: 'guardrail-service-the-guardrail-that-fails-open',
-    problemId: 'guardrail-service',
-    stepId: 'endpoint',
-    title: 'The guardrail that fails open',
-    blurb: 'The classifier timed out and the draft allowed the prompt through.',
-    role: 'AI platform engineer · 20 min',
-    minutes: 20,
-    prompt:
-      'During a classifier outage the guardrail allowed everything, and the review queue missed blocks because the violation events were fire-and-forget. The model-generated draft returns allow on any exception and publishes violations with no outbox. Review it, fix it, and prove the gate fails safe and loses no violation.',
-    signals: ['Secure', 'Operate', 'Verify'],
-    aiNote:
-      'The draft maps every classifier exception and timeout to allow, so an outage silently disables the gate instead of failing safe, and it publishes violation events without an outbox so a broker rejection loses the block record.',
-    testIdea:
-      'Kill the classifier stub and assert high-risk tenants get the conservative deny while low-risk tenants use their configured fallback; reject the produce and assert an outbox row exists; replay the queue and assert no duplicate review entries.',
-    followUps: [
-      'Which tenants should fail closed and which should fail open, and who decides?',
-      'How would you version a rule set so a rollback cannot resurrect a retracted rule?',
-      'What goes in the span offsets so reviewers can find the exact offending phrase?',
-    ],
-    defaultLanguage: 'python',
-  },
-  {
-    id: 'agent-orchestrator-the-agent-that-never-stops-paying',
-    problemId: 'agent-orchestrator',
-    stepId: 'endpoint',
-    title: 'The agent that never stops paying',
-    blurb: 'A timeout on a payment tool was retried, so the customer was charged twice.',
-    role: 'AI platform engineer · 20 min',
-    minutes: 20,
-    prompt:
-      'An agent run timed out during a payment tool call and the draft retried it, charging the customer twice; the same run also kept consuming budget while stalled behind a dead worker. The model-generated draft retries every tool and has no lease. Review it, fix it, and prove side-effecting tools are never replayed and stalled runs get recovered.',
-    signals: ['Specify', 'Operate', 'Secure'],
-    aiNote:
-      'The draft retries every tool call, including non-idempotent side effects, counts budget before acceptance so retries burn steps, and lets a second worker advance the same run because state transitions are plain SETs with no lease.',
-    testIdea:
-      'Force a timeout on a payment tool and assert exactly one call; claim a leased run from a second worker and assert rejection; kill the lease holder and assert recovery reopens the run without replaying completed side effects.',
-    followUps: [
-      'How would you make a payment tool idempotent so a retry is safe?',
-      'What should happen to a run when its budget hits zero mid-tool?',
-      'How do you distinguish a crashed worker from a slow one without a lease?',
-    ],
-    defaultLanguage: 'python',
-  },
-  {
     id: 'embedding-service-the-cache-that-forgot-the-model',
     problemId: 'embedding-service',
     stepId: 'endpoint',
@@ -428,50 +384,6 @@ export const mockScenarios: readonly MockScenario[] = [
       'What is the right behavior when ASR confidence is low for the whole turn?',
       "How would you cap a session's cost without cutting off a long legitimate answer?",
       'What redaction happens before a transcript is stored?',
-    ],
-    defaultLanguage: 'python',
-  },
-  {
-    id: 'code-assistant-the-assistant-that-read-a-private-repo',
-    problemId: 'code-assistant',
-    stepId: 'endpoint',
-    title: 'The assistant that read a private repo',
-    blurb: 'The draft keyed context by path without checking repository access.',
-    role: 'AI platform engineer · 20 min',
-    minutes: 20,
-    prompt:
-      "An external audit found completions that quoted code from a repository the requesting user could not read, because the draft trusted file paths in the request. The same cache served a force-pushed repo's dead symbols. Review it, fix it, and prove repository access and index freshness are enforced.",
-    signals: ['Secure', 'Specify', 'Verify'],
-    aiNote:
-      'The draft treats a caller-supplied file path as sufficient authority to read repository content, so context from any repo can be completed on, and it caches the index by repo name alone, so a force-push keeps serving deleted symbols.',
-    testIdea:
-      'Request a completion whose path points into a repo the caller cannot read and assert 403; push a new commit and assert the next completion is a cache miss and the status reports the new sha; assert a completion on a repo more than ten commits behind is refused.',
-    followUps: [
-      'Should rejected completions be training signal, and with what privacy boundary?',
-      'How would you budget context when a file is larger than the token cap?',
-      'What makes a symbol index trustworthy after a rebase?',
-    ],
-    defaultLanguage: 'python',
-  },
-  {
-    id: 'sql-copilot-the-copilot-that-offered-a-delete',
-    problemId: 'sql-copilot',
-    stepId: 'endpoint',
-    title: 'The copilot that offered a DELETE',
-    blurb: 'The draft skipped validation and a generated statement ran writes.',
-    role: 'AI platform engineer · 20 min',
-    minutes: 20,
-    prompt:
-      'A user asked the copilot to clean up stale rows and the generated DELETE was returned without a dry-run because the draft only validated short statements. The same endpoint executed caller-supplied SQL on the primary. Review it, fix it, and prove generated statements are read-only and every one is validated.',
-    signals: ['Specify', 'Secure', 'Verify'],
-    aiNote:
-      'The draft skips warehouse validation for statements over 100 characters and returns the SQL even when the dry-run errors, and the results endpoint executes whatever statement it receives on the primary connection.',
-    testIdea:
-      'Ask for a DELETE and assert it is either refused or clearly marked non-executable; throw a validation timeout and assert no SQL is returned; send a two-statement payload to the results endpoint and assert 400.',
-    followUps: [
-      'How would you tell a read-only statement from a write without a parser?',
-      'What cost estimate would you show before running a query and why?',
-      'Where should row-level permissions for the copilot live?',
     ],
     defaultLanguage: 'python',
   },
@@ -1000,28 +912,6 @@ export const mockScenarios: readonly MockScenario[] = [
       'What metrics can a shadow observably improve before deployment?',
       'How would you compare cost between candidate and production paths?',
       'When is a 5 percent share too much?',
-    ],
-    defaultLanguage: 'python',
-  },
-  {
-    id: 'prompt-firewall-the-firewall-that-allowed-on-error',
-    problemId: 'prompt-firewall',
-    stepId: 'endpoint',
-    title: 'The firewall that allowed on error',
-    blurb: 'An internal error returned allow, and the detector failure skipped the backstop.',
-    role: 'AI platform engineer · 20 min',
-    minutes: 20,
-    prompt:
-      'During a detector outage, injection attempts passed because the draft mapped every exception to allow and skipped the lexical backstop once the model call had failed. The same draft logged matched span text. Review it, fix it, and prove failures block and logs carry no prompt content.',
-    signals: ['Secure', 'Evaluate', 'Verify'],
-    aiNote:
-      'The draft catches every internal error and returns allow, so an outage opens the firewall completely, and when the detector fails it skips the lexical backstop instead of falling through to it.',
-    testIdea:
-      'Stub the detector to fail and assert a known injection pattern is still blocked or stripped by the backstop; trigger an internal error and assert block with no prompt in the body; inspect an event payload for span text.',
-    followUps: [
-      'Which patterns deserve block versus strip?',
-      'How do you tune rules without storing the prompts that matched?',
-      'What makes an injection rule durable against paraphrase?',
     ],
     defaultLanguage: 'python',
   },
