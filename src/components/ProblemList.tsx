@@ -13,7 +13,7 @@ import {useDialog} from './Dialog';
 import {ActivityHeatmap} from './Heatmap';
 import {ListControls} from './ListControls';
 import {LandingIntro} from './LoadingScreen';
-import {CompanyChip, CONCEPT_COLOR, ConceptChip, DifficultyChip} from './paneShared';
+import {CompanyChip, CONCEPT_COLOR, DifficultyChip} from './paneShared';
 import {Clock, SessionList} from './Timer';
 
 /**
@@ -416,9 +416,6 @@ const ProblemRow: FC<{
               </span>
             ) : null}
             {problem.company !== undefined ? <CompanyChip company={problem.company} /> : null}
-            {problem.concepts.map(c => (
-              <ConceptChip concept={c} key={c} />
-            ))}
           </span>
           <span className="text-ink-300 mt-1 block text-[13px] leading-5">{problem.tagline}</span>
           <span className="text-ink-300 mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px]">
