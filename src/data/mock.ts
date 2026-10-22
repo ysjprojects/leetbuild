@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'metrics-pipeline-the-metrics-that-counted-half-a-batch',
+    problemId: 'metrics-pipeline',
+    stepId: 'endpoint',
+    title: 'The metrics that counted half a batch',
+    blurb: 'Partial batches and full-shard retries corrupted rollups.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'Dashboards showed traffic dipping every night around deploys, because batch merges were per-sample and a crash applied half a batch, while retries re-sent windows to shards that already accepted them. The model-generated draft has no atomic merge and no window dedupe. Review it, fix it, and prove merges are whole and retries are per-shard.',
+    signals: ['Operate', 'Specify', 'Verify'],
+    aiNote:
+      'The draft merges each sample with its own INCRBY, so a crash leaves a silently partial batch, and when one shard fails it retries every shard, double-counting windows that already succeeded because nothing dedupes by window id.',
+    testIdea:
+      'Crash mid-batch and assert the window contains either all deltas or none; fail one shard and assert only it is retried with the same window id; query a 9-day range and assert 400.',
+    followUps: [
+      'How do you bound label cardinality without breaking useful dimensions?',
+      'What downsampling policy keeps dashboards honest?',
+      'How would you replay a rollup from the raw stream?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
