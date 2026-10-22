@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'job-queue-the-job-that-ran-at-the-same-time-as-itself',
+    problemId: 'job-queue',
+    stepId: 'endpoint',
+    title: 'The job that ran at the same time as itself',
+    blurb: 'Claims were split across commands and re-enqueues let two workers share a job.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      "A nightly billing job ran twice concurrently, because a slow worker's visibility timeout re-enqueued the job while the original was still running. A crash mid-claim also lost jobs with no trace. The model-generated draft claims non-atomically. Review it, fix it, and prove claims and returns are atomic.",
+    signals: ['Operate', 'Verify', 'Specify'],
+    aiNote:
+      'The draft moves a job out of the queue and marks it in-flight in separate writes, so a crash between them evaporates the job, and its timeout return is not atomic with the claim check, so a live slow worker and a fresh claimant can both hold the same job.',
+    testIdea:
+      'Kill a worker between claim steps and assert the job is still claimable; simulate a slow worker past its visibility timeout and assert the job cannot be double-claimed; feed a schema-invalid payload and assert it dead-letters on the first attempt.',
+    followUps: [
+      'What visibility timeout fits your slowest job, and how do you measure it?',
+      'Should the dead-letter queue be replayable, and with what protections?',
+      "How do you make a job's side effects idempotent?",
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
