@@ -173,6 +173,16 @@ import {cudaFlashAttentionProblem} from './174-cuda-flash-attention/index';
 import {cudaWmmaMatmulProblem} from './175-cuda-wmma-matmul/index';
 import {cudaPrefixScanProblem} from './176-cuda-prefix-scan/index';
 import {cudaStreamsOverlapProblem} from './177-cuda-streams-overlap/index';
+import {ptLlama3Problem} from './178-pt-llama3/index';
+import {ptSftPackingProblem} from './179-pt-sft-packing/index';
+import {ptDpoProblem} from './180-pt-dpo/index';
+import {ptGrpoProblem} from './181-pt-grpo/index';
+import {ptSpeculativeDecodingProblem} from './182-pt-speculative-decoding/index';
+import {ptMiniVllmProblem} from './183-pt-mini-vllm/index';
+import {ptGptqProblem} from './184-pt-gptq/index';
+import {ptZeroProblem} from './185-pt-zero/index';
+import {ptTensorParallelProblem} from './186-pt-tensor-parallel/index';
+import {cudaPagedAttentionProblem} from './187-cuda-paged-attention/index';
 
 /**
  * Problem order on the list page: the classic systems track first, in its catalogue order, then the
@@ -340,12 +350,21 @@ export const problems: Problem[] = [
   ptGpt2BlockProblem,
   ptLrScheduleClipProblem,
   ptBpeTokenizerProblem,
+  ptLlama3Problem,
+  ptSftPackingProblem,
+  ptDpoProblem,
   ptGpt2Problem,
   ptFlashAttentionTiledProblem,
   ptDdpmProblem,
   ptLoraProblem,
   ptMixedPrecisionProblem,
   ptMoeRouterProblem,
+  ptGrpoProblem,
+  ptSpeculativeDecodingProblem,
+  ptMiniVllmProblem,
+  ptGptqProblem,
+  ptZeroProblem,
+  ptTensorParallelProblem,
   cudaVectorAddProblem,
   cudaFusedGeluProblem,
   cudaReductionProblem,
@@ -356,4 +375,5 @@ export const problems: Problem[] = [
   cudaWmmaMatmulProblem,
   cudaPrefixScanProblem,
   cudaStreamsOverlapProblem,
+  cudaPagedAttentionProblem,
 ];

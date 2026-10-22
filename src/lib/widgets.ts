@@ -106,6 +106,14 @@ export const WIDGETS: Record<string, WidgetSpec> = {
       'Step-through: autoregressive decoding with and without a KV cache; the cache gains one key and one value row per token while the uncached path recomputes every row, with running counts of work and memory.',
     params: {},
   },
+  'paged-kv': {
+    about:
+      'Step-through: three requests sharing an 8-token system prompt grow token by token; their logical KV blocks map through block tables to physical blocks of a 96-slot pool (FIFO free list, finished sequences return their blocks). Bars compare the paged waste (the tail of each last block) with contiguous preallocation of max_len 32 per sequence; block-size tabs (2, 4, 8) and a shared-prefix toggle that maps the prefix blocks of every sequence to the same physical blocks with ref counts.',
+    params: {
+      blockSize: 'slots per block, 2, 4 or 8 (default 4)',
+      shared: 'start with the shared-prefix toggle on (default false)',
+    },
+  },
   'rope-rotation': {
     about:
       'Interactive: rotary position embeddings as 2-D vectors per pair of dimensions, each turning at its own frequency base^(−2i/d) as a position slider moves; a plot shows the rotated q·k depends only on the distance between positions.',
@@ -167,6 +175,77 @@ export const WIDGETS: Record<string, WidgetSpec> = {
     params: {
       experts: 'number of experts, 2–8 (default 4)',
       k: 'experts per token, 1–4 and at most `experts` (default 2)',
+    },
+  },
+  'dpo-loss': {
+    about:
+      'Interactive: the DPO loss −log σ(β·h) and IPO’s squared loss (h − 1/(2β))² against the policy’s log-ratio margin h, beside the gradient weight σ(−β·h) each pair receives; sliders for β, h and the label smoothing ε of conservative DPO, which turns the weight negative past h = ln((1 − ε)/ε)/β.',
+    params: {
+      beta: 'starting β, snapped to 0.01–1 (default 0.1)',
+      h: 'starting margin h, −30 to 30 (default 5)',
+      smoothing: 'starting label smoothing ε, 0–0.4 (default 0)',
+    },
+  },
+  'sequence-packing': {
+    about:
+      'Interactive: documents of varied length laid into rows of seq_len tokens, padded (one per row) against packed by first-fit decreasing, with the pad tokens and their share of the slots for both; the block-diagonal causal mask of a chosen row, with the causal pairs it blocks across segment boundaries; sliders for seq_len (32–64) and the row, and a resample button.',
+    params: {
+      docs: 'number of documents, 4–14 (default 10)',
+      seqLen: 'starting row length, 32–64 in steps of 8 (default 32)',
+    },
+  },
+  'int4-quant': {
+    about:
+      'Interactive: one group of weights on its quantization grid; the min and max set the scale and zero point, the 2^bits levels are drawn and each weight’s rounding error marked; sliders for bits (2–8) and group size (8–128), a toggle between round-to-nearest and GPTQ’s sequential error feedback on a small correlated example, with the weight error and the output error ‖(w − ŵ)X‖² of both, and a resample button.',
+    params: {
+      bits: 'starting bits per weight, 2–8 (default 4)',
+      group: 'starting group size: 8, 16, 32, 64 or 128 (default 32)',
+    },
+  },
+  'speculative-decoding': {
+    about:
+      'Interactive: sliders for the acceptance rate α (0–0.99), the draft length γ (1–10) and the draft cost ratio c (0–1) give the expected tokens per target call (1 − α^(γ+1))/(1 − α), the cost of a call γc + 1 and the speedup, with a bar per γ marking the best; a step-through of a seeded run under the i.i.d. model (draft i accepted iff u_i < α) shows each round’s accepts, the first rejection, the residual resample or the bonus token on a 40-token strip, with measured tokens per call against the formula, and a resample button.',
+    params: {
+      alpha: 'starting acceptance rate, 0–0.99 (default 0.8)',
+      gamma: 'starting draft length, 1–10 (default 4)',
+      cost: 'starting draft cost per forward relative to the target, 0–1 (default 0.1)',
+    },
+  },
+  'grpo-advantages': {
+    about:
+      'Interactive: a group of G seeded completions of "3 + 1 =" from a simulated policy of skill p (right first token with probability p, one digit then EOS with probability p), with their rewards (1 for the right first token, + 0.5 for one digit then EOS) and two advantage bars each, (r − mean)/(std + 1e-4) with the unbiased group std and r − mean (Dr. GRPO), zero for a group whose rewards are all equal; beside it the clipped objective min(ρA, clip(ρ, 1 − ε, 1 + ε)A) against the ratio ρ for the group’s best and worst advantage, the trust region shaded and the zero-gradient parts dashed. Sliders for p and ε, and a resample button.',
+    params: {
+      G: 'completions per group, 2–12 (default 8)',
+      p: 'starting skill: probability of a right answer and of a well-formed one, 0–1 (default 0.3)',
+      clip: 'starting clip ε, 0.05–0.4 (default 0.2)',
+    },
+  },
+  'gqa-heads': {
+    about:
+      'Interactive: the query heads drawn above the key/value heads they read, coloured by group, with MHA / GQA / MQA toggles and a slider over the divisors of `heads` for n_kv_heads; bars give the KV-cache bytes per token (2 · layers · n_kv_heads · headDim · 2 B in bf16) for MHA, the chosen grouping and MQA, and a context slider (512 to 131,072 tokens) gives the bytes per sequence. Llama 3 8B: 128 KiB per token, 1 GiB at 8,192 tokens.',
+    params: {
+      heads: 'query heads, 1–64 (default 32)',
+      kvHeads: 'starting key/value heads, snapped down to a divisor of `heads` (default 8)',
+      layers: 'layers, 1–200 (default 32)',
+      headDim: 'dimensions per head, 1–1024 (default 128)',
+      context: 'starting context length in tokens, rounded up to a power of two in 512–131,072 (default 8192)',
+    },
+  },
+  'zero-memory': {
+    about:
+      'Interactive: per-GPU memory of mixed-precision Adam as the ZeRO paper counts it (2Ψ fp16 parameters + 2Ψ fp16 gradients + 12Ψ fp32 optimizer states, before activations) under DDP, ZeRO-1 (P_os), ZeRO-2 (P_os+g) and ZeRO-3 (P_os+g+p), one stacked bar per stage against an 80 GB device line; sliders for Ψ (1.5B to 405B) and the GPU count N (1 to 1,024), stage toggles, and the traffic per GPU per step relative to DDP (2Ψ for DDP, ZeRO-1 and ZeRO-2; 3Ψ for ZeRO-3, times (N − 1)/N on a ring).',
+    params: {
+      psi: 'model size in billions of parameters, snapped to 1.5, 7, 7.5, 13, 70, 175 or 405 (default 7.5)',
+      gpus: 'data-parallel GPUs, snapped to a power of two from 1 to 1,024 (default 64)',
+      stage: "'ddp', 'zero1', 'zero2' or 'zero3' (default 'zero3')",
+    },
+  },
+  'tensor-parallel': {
+    about:
+      'Interactive: one Megatron sublayer (the MLP, or attention) at GPT-3 175B width (d = 12,288, 96 heads, bf16) split over 1 to 8 ranks; how A and B split into rank stripes by columns or by rows (W_qkv by head within q, k and v), where f and g sit, and a column → row / row → column toggle with the collectives each order needs forward and backward and the bytes one rank sends per token on a ring; non-divisible rank counts are flagged.',
+    params: {
+      layer: "'mlp' or 'attention' (default 'mlp')",
+      ranks: 'tensor-parallel ranks p, 1–8 (default 2)',
     },
   },
   'cuda-grid': {

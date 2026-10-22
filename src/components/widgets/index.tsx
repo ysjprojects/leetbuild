@@ -11,11 +11,15 @@ import CudaGrid from './CudaGrid';
 import DeadlineRetry from './DeadlineRetry';
 import DeliverySemantics from './DeliverySemantics';
 import DiffusionNoise from './DiffusionNoise';
+import DpoLoss from './DpoLoss';
 import FloatFormats from './FloatFormats';
+import GqaHeads from './GqaHeads';
 import GradClip from './GradClip';
 import GrpcStreams from './GrpcStreams';
+import GrpoAdvantages from './GrpoAdvantages';
 import HttpLifecycle from './HttpLifecycle';
 import Idempotency from './Idempotency';
+import Int4Quant from './Int4Quant';
 import KafkaPartitions from './KafkaPartitions';
 import KvCache from './KvCache';
 import LoraRank from './LoraRank';
@@ -27,18 +31,23 @@ import OnlineSoftmax from './OnlineSoftmax';
 import OptimizerPaths from './OptimizerPaths';
 import OrderBook from './OrderBook';
 import Outbox from './Outbox';
+import PagedKv from './PagedKv';
 import PercentRollout from './PercentRollout';
 import Roofline from './Roofline';
 import RopeRotation from './RopeRotation';
 import Sampling from './Sampling';
 import ScanSweep from './ScanSweep';
+import SequencePacking from './SequencePacking';
 import SoftmaxStability from './SoftmaxStability';
+import SpeculativeDecoding from './SpeculativeDecoding';
 import StatusCodes from './StatusCodes';
 import StreamTimeline from './StreamTimeline';
+import TensorParallel from './TensorParallel';
 import TiledMatmul from './TiledMatmul';
 import TokenBucket from './TokenBucket';
 import VarianceCancellation from './VarianceCancellation';
 import WarpReduce from './WarpReduce';
+import ZeroMemory from './ZeroMemory';
 
 /** Every widget receives the JSON object written after its name in `:::widget name {...}`. */
 export interface WidgetProps {
@@ -66,6 +75,7 @@ export const WIDGET_COMPONENTS: Record<string, FC<WidgetProps>> = {
   'attention-heatmap': AttentionHeatmap,
   'online-softmax': OnlineSoftmax,
   'kv-cache': KvCache,
+  'paged-kv': PagedKv,
   'rope-rotation': RopeRotation,
   'model-size': ModelSize,
   'optimizer-paths': OptimizerPaths,
@@ -78,6 +88,14 @@ export const WIDGET_COMPONENTS: Record<string, FC<WidgetProps>> = {
   'diffusion-noise': DiffusionNoise,
   'lora-rank': LoraRank,
   'moe-routing': MoeRouting,
+  'dpo-loss': DpoLoss,
+  'sequence-packing': SequencePacking,
+  'int4-quant': Int4Quant,
+  'speculative-decoding': SpeculativeDecoding,
+  'grpo-advantages': GrpoAdvantages,
+  'gqa-heads': GqaHeads,
+  'zero-memory': ZeroMemory,
+  'tensor-parallel': TensorParallel,
   'cuda-grid': CudaGrid,
   coalescing: Coalescing,
   roofline: Roofline,
