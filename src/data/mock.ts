@@ -387,6 +387,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'multimodal-ingest-the-ingest-that-indexed-a-placeholder',
+    problemId: 'multimodal-ingest',
+    stepId: 'endpoint',
+    title: 'The ingest that indexed a placeholder',
+    blurb: 'Vision failures were swallowed and the string an image entered the index.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'Search became useless for one tenant after a vision outage: every uncaptioned image was indexed as the literal text an image, and permanent URLs leaked in events. The model-generated draft swallows generation errors and publishes raw object URLs. Review it, fix it, and prove failures are visible and access stays signed.',
+    signals: ['Specify', 'Secure', 'Verify'],
+    aiNote:
+      'The draft catches every vision error and substitutes the literal string an image as the caption, so an outage converts into hundreds of poisoned retrievals, and its events carry permanent object URLs that bypass signed access.',
+    testIdea:
+      "Stub the vision model to fail and assert the asset falls back to text-only indexing with a visible degraded flag, never a placeholder caption; inspect a published event for any URL field; request another tenant's asset id and assert 404.",
+    followUps: [
+      'When should ingest block on captioning versus degrade to text-only?',
+      'How would you backfill captions once the vision service recovers?',
+      'What stops a proxy from following a leaked signed URL forever?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
