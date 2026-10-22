@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'browser-agent-the-agent-that-walked-into-the-intranet',
+    problemId: 'browser-agent',
+    stepId: 'endpoint',
+    title: 'The agent that walked into the intranet',
+    blurb: 'Redirects were not re-validated against the egress profile.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A compromised page redirected the agent to an internal address and the draft followed it, because only the initial URL was checked. The same draft retried clicks and double-submitted a form. Review it, fix it, and prove every navigation is re-validated and actions are idempotent.',
+    signals: ['Secure', 'Operate', 'Verify'],
+    aiNote:
+      "The draft validates only the session's start URL and then follows any redirect or subresource the page requests, so a hostile page can reach internal services, and it retries click actions blindly, turning a timeout into a duplicate submission.",
+    testIdea:
+      'Serve a redirect to an off-profile address and assert the navigation is blocked and recorded; time out a click and assert the agent checks page state before deciding to retry; inspect an event for typed values.',
+    followUps: [
+      'How would you let a session log in without storing credentials in the session state?',
+      'What page-state checks make a click safe to retry?',
+      'How do you budget steps for a long flow without losing resumability?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
