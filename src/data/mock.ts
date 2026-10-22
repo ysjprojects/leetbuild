@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'model-audit-the-audit-trail-that-verified-everything',
+    problemId: 'model-audit',
+    stepId: 'endpoint',
+    title: 'The audit trail that verified everything',
+    blurb: 'The verifier returned valid for any record that existed.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      "An auditor edited a record in the store and the verify endpoint still returned valid, because the draft never recomputed hashes. The same endpoint let any tenant verify against any other tenant's chain. Review it, fix it, and prove verification is real and tenant-scoped.",
+    signals: ['Secure', 'Verify', 'Evaluate'],
+    aiNote:
+      "The draft's verify path checks only that the record and head keys exist and returns valid, with no hash recomputation or position linking, so any tampering passes; it also resolves chains without a tenant check.",
+    testIdea:
+      'Tamper with one stored record and assert verification fails at that position; delete a middle record and assert the break is detected; verify a chain from another tenant and assert 404.',
+    followUps: [
+      'What must a receipt contain to be useful years later?',
+      'How would you rotate the signing key without breaking old verification?',
+      'What retention does an audit trail need, and why not a TTL?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */
