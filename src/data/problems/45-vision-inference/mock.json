@@ -1,0 +1,22 @@
+[
+  {
+    "title": "The vision model that answered unknown",
+    "blurb": "Timeouts returned a fake prediction instead of a downgrade.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 20,
+    "prompt": "A pipeline consumed thousands of unknown labels as real classifications after a model timeout, because the draft returned them with a 200 and no provenance. The same draft dereferenced caller-supplied object URLs. Review it, fix it, and prove degradation is explicit and references are scoped.",
+    "signals": [
+      "Specify",
+      "Secure",
+      "Verify"
+    ],
+    "aiNote": "The draft maps model timeouts to a successful prediction of unknown with no provenance marker, so downstream consumers train on fabricated labels, and it fetches whatever object URL a caller supplies rather than enforcing the tenant storage prefix.",
+    "testIdea": "Force a timeout and assert the response marks the downgrade or fails, never a default label as a normal prediction; submit a foreign URL and assert 403 before the fetch; assert a result names the exact model version.",
+    "followUps": [
+      "Which failures should downgrade and which should fail the request?",
+      "How would you expire results without losing auditability of decisions made from them?",
+      "What confidence signal would you surface for a downgraded result?"
+    ],
+    "stepId": "endpoint"
+  }
+]
