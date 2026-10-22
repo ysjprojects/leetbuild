@@ -1,6 +1,6 @@
 import {type FC, type MouseEvent, memo, useCallback, useEffect, useMemo, useRef} from 'react';
 
-import {type PlacedNode, EDGE_FONT, LABEL_FONT, layoutDiagram, SUB_FONT} from '@/lib/layout';
+import {type PlacedNode, arrowHead, EDGE_FONT, LABEL_FONT, layoutDiagram, SUB_FONT} from '@/lib/layout';
 import type {Diagram, EdgeKind, NodeKind} from '@/lib/types';
 import {concept, ink, node as KIND_COLOR} from '@/styles/palette';
 
@@ -216,18 +216,6 @@ const SystemDiagram: FC<{
         viewBox={`0 ${layout.originY} ${layout.width} ${layout.height}`}>
         <title>System architecture</title>
         <defs>
-          {(Object.keys(EDGE_COLOR) as EdgeKind[]).map(kind => (
-            <marker
-              id={`lb-arrow-${kind}`}
-              key={kind}
-              markerHeight={7}
-              markerWidth={8}
-              orient="auto"
-              refX={7}
-              refY={3.5}>
-              <path d="M0 0L8 3.5L0 7z" fill={EDGE_COLOR[kind]} />
-            </marker>
-          ))}
           <filter height="160%" id="lb-glow" width="160%" x="-30%" y="-30%">
             <feGaussianBlur result="blur" stdDeviation={5} />
             <feMerge>
@@ -236,7 +224,8 @@ const SystemDiagram: FC<{
             </feMerge>
           </filter>
         </defs>
-        {layout.edges.map(({edge, kind, d, label, labelW}, i) => {
+        {layout.edges.map((routed, i) => {
+          const {edge, kind, d, label, labelW} = routed;
           const color = EDGE_COLOR[kind];
           const lit = !dimming || (focused[edge.from] === true && focused[edge.to] === true);
           return (
@@ -244,11 +233,12 @@ const SystemDiagram: FC<{
               <path
                 d={d}
                 fill="none"
-                markerEnd={`url(#lb-arrow-${kind})`}
                 stroke={color}
                 strokeDasharray={kind === 'kafka' ? '6 4' : undefined}
                 strokeWidth={lit ? 1.8 : 1.2}
               />
+              {/* Drawn, not a marker: oriented along the visible approach rather than the end tangent. */}
+              <path d={arrowHead(routed)} fill={color} />
               {label !== null && edge.label !== undefined ? (
                 <g>
                   <rect

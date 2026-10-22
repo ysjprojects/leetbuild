@@ -172,6 +172,33 @@ const cubicAt = (p0: Point, p1: Point, p2: Point, p3: Point, t: number): Point =
   };
 };
 
+/**
+ * The arrowhead at the end of an edge, as SVG path data: a triangle whose axis follows the part of
+ * the line the eye sees entering it — the chord over the last stretch of the curve — not the curve's
+ * tangent at its very last point, which on a tight arc can point somewhere the visible line does not.
+ */
+export function arrowHead(edge: RoutedEdge, length = 8, halfWidth = 3.5): string {
+  const tip = edge.to;
+  let back: Point = edge.from;
+  if (edge.controls !== null) {
+    const [p1, p2] = edge.controls;
+    for (let t = 0.98; t >= 0; t -= 0.01) {
+      back = cubicAt(edge.from, p1, p2, tip, t);
+      if (Math.hypot(tip.x - back.x, tip.y - back.y) >= length * 1.75) break;
+    }
+  }
+  const dx = tip.x - back.x;
+  const dy = tip.y - back.y;
+  const norm = Math.hypot(dx, dy) || 1;
+  const ux = dx / norm;
+  const uy = dy / norm;
+  const bx = tip.x - ux * length;
+  const by = tip.y - uy * length;
+  return `M${tip.x} ${tip.y}L${bx - uy * halfWidth} ${by + ux * halfWidth}L${bx + uy * halfWidth} ${
+    by - ux * halfWidth
+  }Z`;
+}
+
 export function layoutDiagram(diagram: Diagram): Layout {
   const {nodes, edges} = diagram;
   if (nodes.length === 0) return {width: 10, height: 10, originY: 0, nodes: [], edges: []};
