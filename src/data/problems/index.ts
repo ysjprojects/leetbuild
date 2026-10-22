@@ -107,6 +107,7 @@ import {gameMatchmakingProblem} from './103-game-matchmaking/index';
 import {mediaTranscoderProblem} from './104-media-transcoder/index';
 import {autocompleteServiceProblem} from './105-autocomplete-service/index';
 import {dedupeServiceProblem} from './106-dedupe-service/index';
+import {secretsRotationProblem} from './107-secrets-rotation/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -205,6 +206,7 @@ export const problems: Problem[] = [
   mediaTranscoderProblem,
   autocompleteServiceProblem,
   dedupeServiceProblem,
+  secretsRotationProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
