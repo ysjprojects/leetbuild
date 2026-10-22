@@ -123,6 +123,28 @@ export const mockScenarios: readonly MockScenario[] = [
     ],
     defaultLanguage: 'python',
   },
+  {
+    id: 'realtime-bidding-the-bidder-that-was-always-late',
+    problemId: 'realtime-bidding',
+    stepId: 'endpoint',
+    title: 'The bidder that was always late',
+    blurb: 'No deadline propagation and unreleased cap claims.',
+    role: 'AI platform engineer · 20 min',
+    minutes: 20,
+    prompt:
+      'A bidder won almost nothing while looking healthy in dashboards, because bids arrived after auctions closed and losses were never counted; the same draft exhausted daily caps by never releasing claims on losses. Review it, fix it, and prove deadlines and claims are enforced.',
+    signals: ['Operate', 'Evaluate', 'Verify'],
+    aiNote:
+      "The draft runs every feature and model call to completion regardless of the auction's remaining budget, so bids systematically arrive after the close, and it claims spend at bid time without releasing on loss, silently burning the daily cap in minutes.",
+    testIdea:
+      'Set a 100 ms budget and a 200 ms feature stub and assert the response is a marked no-bid or degraded bid inside the budget; lose an auction and assert the cap claim returns; inspect stats for timeout and degradation shares.',
+    followUps: [
+      'Which features deserve which slice of a 100 ms budget?',
+      'How should a conservative degraded bid be priced?',
+      'What accounting makes spend reconciliable with wins?',
+    ],
+    defaultLanguage: 'python',
+  },
 ];
 
 /** The scenarios whose problem and step still exist, with their content resolved. */

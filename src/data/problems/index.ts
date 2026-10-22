@@ -18,6 +18,7 @@ import {dropboxGatesProblem} from './14-dropbox-gates/index';
 import {doordashSupportProblem} from './15-doordash-support/index';
 import {aiGatewayProblem} from './16-ai-gateway/index';
 import {ragServiceProblem} from './17-rag-service/index';
+import {realtimeBiddingProblem} from './116-realtime-bidding/index';
 
 /**
  * Problem order on the list page: the AI-era track first, then the classic systems track in its
@@ -27,6 +28,7 @@ import {ragServiceProblem} from './17-rag-service/index';
 export const problems: Problem[] = [
   aiGatewayProblem,
   ragServiceProblem,
+  realtimeBiddingProblem,
   dropboxGatesProblem,
   urlShortenerProblem,
   edgeGatewayProblem,
