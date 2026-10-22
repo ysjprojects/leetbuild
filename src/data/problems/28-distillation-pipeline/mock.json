@@ -1,0 +1,18 @@
+[
+  {
+    "stepId": "endpoint",
+    "title": "The distillation that learned from its own duplicates",
+    "blurb": "The draft drained budget on cache hits and double-counted nothing.",
+    "role": "AI platform engineer · 20 min",
+    "minutes": 20,
+    "prompt": "The student model regressed after a distillation run that fed it near-duplicate samples, and the job's dashboard showed more samples accepted than the budget could have paid for. The model-generated draft decrements budget before cache checks and never counts filtered duplicates. Review it, fix it, and prove the report reconciles and the filter holds.",
+    "signals": ["Specify", "Evaluate", "Verify"],
+    "aiNote": "The draft decrements the job budget before checking the dedupe cache, so repeated prompts drain the budget without new samples, and the report counts accepted as sampled minus hard failures, silently ignoring duplicates that the filter removed.",
+    "testIdea": "Run a job over a dataset with 40 percent duplicate prompts and assert duplicates are rejected once, budget spent matches unique calls, and accepted plus rejected equals sampled.",
+    "followUps": [
+      "What makes a teacher output safe to train on, and where would you put that check?",
+      "How much teacher data is too little to claim a distillation worked?",
+      "What would you log per sample to debug a student regression months later?"
+    ]
+  }
+]
