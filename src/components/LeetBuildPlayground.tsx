@@ -1216,7 +1216,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       // learner moved on, but its verdict is only shown for the step it belongs to.
       if (run.error === undefined) record(decided, src);
       if (submitSeq.current !== token) return;
-      setConsoleRun(c => (c === null ? c : finished(c, run)));
+      setConsoleRun(c => (c === null ? c : finished(c, run, step.checks)));
       setVerdict(decided);
       showVerdict();
     });
@@ -1242,7 +1242,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     void runner.run(job, onOutput).then(run => {
       setRunning(false);
       if (submitSeq.current !== token) return;
-      setConsoleRun(c => (c === null ? c : finished(c, run)));
+      setConsoleRun(c => (c === null ? c : finished(c, run, step.checks)));
       setVerdict({...withRuntime(result, run), trial: true});
       showVerdict();
     });

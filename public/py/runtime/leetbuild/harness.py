@@ -175,6 +175,9 @@ def reset_world() -> None:
 
 def _explain(exc: BaseException) -> str:
     """`NotImplementedError: … — thumb_cache.py:12 in get_thumb`: the error and where in the learner's code."""
+    if isinstance(exc, SyntaxError) and (exc.filename or "").startswith(WORK + "/"):
+        # Raised compiling the learner's file: no frame of theirs, the place is on the error itself.
+        return f"{type(exc).__name__}: {exc.msg} — {exc.filename[len(WORK) + 1:]}:{exc.lineno}"
     head = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
     frames = traceback.extract_tb(exc.__traceback__)
     learner = [f for f in frames if f.filename.startswith(WORK + "/")]

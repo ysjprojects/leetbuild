@@ -237,7 +237,10 @@ const PanelTabs: FC<{tab: BottomTab; onTab: (tab: BottomTab) => void; consoleRun
 );
 PanelTabs.displayName = 'PanelTabs';
 
-/** The last run's output, line by line as it was printed (stderr in red), and how the run ended. */
+/**
+ * The last run's output, line by line as it was printed (stderr in red), then, as a test runner
+ * would print them, the checks it ran with why each failed, and how the run ended.
+ */
 const ConsoleView: FC<{run: ConsoleRun | null; idle: string}> = memo(({run, idle}) => {
   const end = useRef<HTMLDivElement>(null);
   const count = run?.lines.length ?? 0;
@@ -248,6 +251,8 @@ const ConsoleView: FC<{run: ConsoleRun | null; idle: string}> = memo(({run, idle
   }, [count, running]);
   if (run === null) return <p className="text-ink-300 text-[12px]">{idle}</p>;
   const seconds = run.ms === undefined ? '' : ` · ${(run.ms / 1000).toFixed(1)} s`;
+  const checks = run.checks ?? [];
+  const failed = checks.filter(check => !check.passed).length;
   return (
     <div className="border-ink-700 bg-ink-950 font-code rounded-lg border px-3 py-2 text-[11px] leading-relaxed">
       <p className="text-ink-400">$ {run.label}</p>
@@ -261,19 +266,39 @@ const ConsoleView: FC<{run: ConsoleRun | null; idle: string}> = memo(({run, idle
           ))}
         </pre>
       ) : null}
+      {checks.map((check, i) => (
+        <div className={`mt-1 ${check.passed ? 'text-success-300' : 'text-danger-300'}`} key={i}>
+          <p>
+            {check.passed ? '✓' : '✗'} {check.title}
+          </p>
+          {!check.passed && check.message !== undefined ? (
+            <pre className="whitespace-pre-wrap break-words pl-3">{check.message}</pre>
+          ) : null}
+        </div>
+      ))}
       {running ? (
         <p className="text-iris-300 animate-pulse">▍</p>
       ) : run.error !== undefined ? (
         <p className="text-warning-300 mt-1">✗ {run.error}</p>
-      ) : run.exit === undefined ? (
-        <p className="text-ink-400 mt-1">
-          done{seconds}
-          {count === 0 ? ' · nothing printed' : ''}
-        </p>
-      ) : (
+      ) : run.exit !== undefined ? (
         <p className={`mt-1 ${run.exit === 0 ? 'text-success-300' : 'text-danger-300'}`}>
           {run.exit === 0 ? '✓' : '✗'} exited with status {run.exit}
           {seconds}
+        </p>
+      ) : checks.length > 0 ? (
+        <p className={`mt-1 ${failed === 0 ? 'text-success-300' : 'text-danger-300'}`}>
+          {failed === 0
+            ? '✓ passed'
+            : checks.length === 1
+            ? '✗ failed'
+            : `✗ ${failed} of ${checks.length} checks failed`}
+          {seconds}
+          {count === 0 ? ' · nothing printed' : ''}
+        </p>
+      ) : (
+        <p className="text-ink-400 mt-1">
+          done{seconds}
+          {count === 0 ? ' · nothing printed' : ''}
         </p>
       )}
       <div ref={end} />
