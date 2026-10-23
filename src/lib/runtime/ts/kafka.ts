@@ -392,7 +392,8 @@ export class Producer {
       const until = BROKER.stalledUntil(topic);
       if (until === null) return true;
       const next = Math.min(until === Infinity ? deadline : until, deadline);
-      if (next > CLOCK.now()) await CLOCK.sleep(next - CLOCK.now());
+      // Until the instant itself: sends waiting on one stall resume in the order they were made.
+      if (next > CLOCK.now()) await CLOCK.sleepUntil(next);
       else await new Promise<void>(resolve => queueMicrotask(resolve));
       if (BROKER.stalledUntil(topic) === null) return true;
       if (CLOCK.now() >= deadline) return false;

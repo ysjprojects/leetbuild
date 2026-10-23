@@ -134,6 +134,18 @@ export class Clock {
     return new Promise(resolve => this.setTimeout(resolve, ms));
   }
 
+  /**
+   * `await clock.sleepUntil(at)`: a virtual sleep to the instant `at`, so that sleepers for one
+   * instant wake in the order they slept. `sleep(at - now())` cannot promise it: the clock follows
+   * real time here and may tick between the two readings, setting one sleeper after the next.
+   */
+  sleepUntil(at: number): Promise<void> {
+    return new Promise(resolve => {
+      this.timers.push({id: this.nextTimer++, at, fn: resolve, interval: null});
+      this.schedulePump();
+    });
+  }
+
   // ---- the globals the learner's code sees -------------------------------------------------------
 
   /** Replace `Date.now`, `performance.now`, `setTimeout`/`setInterval` (and their clears) with virtual ones. */
