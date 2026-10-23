@@ -7,6 +7,8 @@
  */
 import type {PGlite} from '@electric-sql/pglite';
 
+import {CLOCK} from './ts/clock';
+
 export const PGLITE_VERSION = '0.5.10';
 export const PGVECTOR_VERSION = '0.0.11';
 export const PGLITE_URL = `https://cdn.jsdelivr.net/npm/@electric-sql/pglite@${PGLITE_VERSION}/dist/index.js`;
@@ -57,7 +59,12 @@ export function createDbBridge(open: () => Promise<PGlite>): DbBridge {
   /** Every type PGlite parses, left as text (PGlite spreads the map, so it must be a real object). */
   let raw: Record<string, (text: string) => string> | null = null;
   const ready = (): Promise<PGlite> => {
-    if (db === null) db = open();
+    db ??= open().then(pg => {
+      // Postgres arms timers of its own as it executes: they must not become the check's sleeps.
+      const execute = pg.execProtocolRawSync.bind(pg);
+      pg.execProtocolRawSync = (message: Uint8Array): Uint8Array => CLOCK.outside(() => execute(message));
+      return pg;
+    });
     return db;
   };
   return {

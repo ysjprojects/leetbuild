@@ -171,6 +171,32 @@ export class Clock {
     GLOBALS.setInterval = realSetInterval;
     GLOBALS.clearInterval = realClearInterval;
   }
+
+  /**
+   * Run `fn` (synchronous) with the real timer globals: for a library on the same thread whose
+   * timers are its own, not the learner's. PGlite's Postgres arms one as it executes (statistics
+   * flushed 10 s after a statement), which as a virtual sleep the pump would jump the check's clock
+   * to. Its callbacks run the same way, so a timer re-armed from one stays real. Time itself stays
+   * virtual: SQL `now()` keeps the check's clock.
+   */
+  outside<T>(fn: () => T): T {
+    if (!this.installed) return fn();
+    const virtual: TimerGlobals = {
+      setTimeout: GLOBALS.setTimeout,
+      clearTimeout: GLOBALS.clearTimeout,
+      setInterval: GLOBALS.setInterval,
+      clearInterval: GLOBALS.clearInterval,
+    };
+    GLOBALS.setTimeout = (cb: () => void, ms?: number): unknown => realSetTimeout(() => this.outside(cb), ms);
+    GLOBALS.clearTimeout = realClearTimeout;
+    GLOBALS.setInterval = (cb: () => void, ms?: number): unknown => realSetInterval(() => this.outside(cb), ms);
+    GLOBALS.clearInterval = realClearInterval;
+    try {
+      return fn();
+    } finally {
+      Object.assign(GLOBALS, virtual);
+    }
+  }
   private fire(): void {
     for (const fn of [...this.advanceListeners]) fn();
     // Timers fire in due order; a callback may schedule more.
