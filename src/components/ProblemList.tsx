@@ -44,16 +44,9 @@ const DIFFICULTY_RING: Record<Difficulty, string> = {
   hard: 'border-danger-400/50 text-danger-300',
 };
 
-/** A solved row inverts its ring: the difficulty colour fills the disc. */
-const DIFFICULTY_DISC: Record<Difficulty, string> = {
-  easy: 'text-success-400',
-  medium: 'text-warning-400',
-  hard: 'text-danger-400',
-};
-
 /**
- * The row's catalogue number in a ring of its difficulty colour. A solved problem keeps its number and
- * inverts the ring: the colour fills the disc and the digits are cut out of it, so the card shows through.
+ * The row's catalogue number in a ring of its difficulty colour. A solved problem keeps its number on an
+ * iris disc, the colour of its "solved" label: the digits are cut out of it, so the card shows through.
  */
 const RowNumber: FC<{n: number; difficulty: Difficulty; solved: boolean; started: boolean}> = memo(
   ({n, difficulty, solved, started}) => {
@@ -68,11 +61,7 @@ const RowNumber: FC<{n: number; difficulty: Difficulty; solved: boolean; started
         </span>
       );
     return (
-      <svg
-        aria-label={`${n}, solved`}
-        className={`h-7 w-7 shrink-0 ${DIFFICULTY_DISC[difficulty]}`}
-        role="img"
-        viewBox="0 0 28 28">
+      <svg aria-label={`${n}, solved`} className="text-iris-400 h-7 w-7 shrink-0" role="img" viewBox="0 0 28 28">
         <mask id={maskId}>
           <rect fill="white" height={28} width={28} />
           <text
