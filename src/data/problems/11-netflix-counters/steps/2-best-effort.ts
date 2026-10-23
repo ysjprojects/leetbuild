@@ -577,6 +577,99 @@ export async function check_get_clear(ctx) {
   await m.clearCount('views', 'never-existed'); // clearing an unknown counter is not an error
 }
 `,
+    go: `package main
+
+import (
+	"context"
+
+	"leetbuild/harness"
+)
+
+const beKey = "counter:views:trailer-7"
+
+var beBg = context.Background()
+
+func beAdd(ctx *harness.Ctx, name string, delta int64) int64 {
+	n, err := addCount(beBg, "views", name, delta)
+	ctx.NoError(err, "addCount(ctx, %q, %q, %d) returned an error", "views", name, delta)
+	return n
+}
+
+func beGet(ctx *harness.Ctx, name string) int64 {
+	n, err := getCount(beBg, "views", name)
+	ctx.NoError(err, "getCount(ctx, %q, %q) returned an error", "views", name)
+	return n
+}
+
+// beValue is the key's string value, or nil when it is missing.
+func beValue(ctx *harness.Ctx, key string) any {
+	if v, ok := ctx.Redis.Get(key); ok {
+		return v
+	}
+	return nil
+}
+
+func CheckKey(ctx *harness.Ctx) {
+	ctx.Equal(beAdd(ctx, "trailer-7", 3), 3, "the first add of 3 must return 3")
+	ctx.Assert(beValue(ctx, beKey) == "3", "the counter must live under %s, keys are %q", beKey, ctx.Redis.Keys("*"))
+	beAdd(ctx, "trailer-8", 1)
+	ctx.Assert(beValue(ctx, "counter:views:trailer-8") == "1" && beValue(ctx, beKey) == "3", "each counter has its own key")
+}
+
+func CheckIncrby(ctx *harness.Ctx) {
+	ctx.Equal(beAdd(ctx, "trailer-7", 3), 3, "the first add of 3")
+	ctx.Equal(beAdd(ctx, "trailer-7", 4), 7, "the second add returns the running count 7")
+	ctx.Equal(beAdd(ctx, "trailer-7", -2), 5, "a negative delta decrements: expected 5")
+	ctx.Equal(beValue(ctx, beKey), "5", "after +3 +4 -2 the key holds 5")
+}
+
+func CheckTtlOnCreate(ctx *harness.Ctx) {
+	beAdd(ctx, "trailer-7", 1)
+	ttl := ctx.Redis.TTL(beKey)
+	ctx.Assert(ttl > 0, "%s has no expiry (TTL %d): a best-effort counter must leave the cache on its own", beKey, ttl)
+	ctx.Assert(3600-5 <= ttl && ttl <= 3600, "%s expires in %d s, expected ttl (an hour, 3600 s)", beKey, ttl)
+	ctx.Clock.Advance(3601)
+	ctx.Equal(ctx.Redis.Exists(beKey), 0, "%s must be gone after ttl: EXISTS", beKey)
+	ctx.Equal(beGet(ctx, "trailer-7"), 0, "an expired counter reads as 0")
+	ctx.Equal(beAdd(ctx, "trailer-7", 2), 2, "an add after expiry starts a fresh counter at the delta")
+	fresh := ctx.Redis.TTL(beKey)
+	ctx.Assert(3600-5 <= fresh && fresh <= 3600, "the fresh counter gets a fresh TTL, got %d s", fresh)
+}
+
+func CheckPipelined(ctx *harness.Ctx) {
+	beAdd(ctx, "trailer-7", 1)
+	ctx.Clock.Advance(1200)
+	beAdd(ctx, "trailer-7", 1)
+	ttl := ctx.Redis.TTL(beKey)
+	ctx.Assert(ttl <= 3600-1200+5, "20 minutes after creation a second add left the TTL at %d s: the expiry was re-armed, so a busy counter would never expire", ttl)
+	ctx.Assert(ttl >= 3600-1200-5, "TTL is %d s, expected about %d", ttl, 3600-1200)
+	ctx.Equal(beValue(ctx, beKey), "2", "both adds must count")
+	ctx.Clock.Advance(2401)
+	ctx.Equal(ctx.Redis.Exists(beKey), 0, "the counter expires 3600 s after its creation, regardless of later adds: EXISTS")
+	// The counter's hour runs out in the middle of an add: only an add whose SET NX and INCRBY reach
+	// Redis as one unit (a MULTI/EXEC pipeline) cannot leave a counter behind without an expiry.
+	beAdd(ctx, "trailer-7", 1)
+	ctx.Clock.Advance(3599)
+	probe := ctx.Redis.After(beKey, func() any {
+		ctx.Clock.Advance(2)
+		return nil
+	})
+	beAdd(ctx, "trailer-7", 1)
+	ctx.Assert(probe.Fired, "addCount never touched %s", beKey)
+	ttl = ctx.Redis.TTL(beKey)
+	ctx.Assert(ttl != -1, "the counter's hour ran out between the SET NX and the INCRBY of one add, and the INCRBY recreated %s without any expiry (it now holds %v forever): send both in one MULTI/EXEC pipeline so nothing lands between them", beKey, beValue(ctx, beKey))
+}
+
+func CheckGetClear(ctx *harness.Ctx) {
+	ctx.Equal(beGet(ctx, "trailer-7"), 0, "a counter that was never added to reads as 0, not an error")
+	beAdd(ctx, "trailer-7", 5)
+	ctx.Equal(beGet(ctx, "trailer-7"), 5, "getCount returns the current count")
+	ctx.NoError(clearCount(beBg, "views", "trailer-7"), "clearCount returned an error")
+	ctx.Equal(ctx.Redis.Exists(beKey), 0, "clearCount must DEL %s: EXISTS", beKey)
+	ctx.Equal(beGet(ctx, "trailer-7"), 0, "a cleared counter reads as 0")
+	ctx.NoError(clearCount(beBg, "views", "never-existed"), "clearing an unknown counter is not an error")
+}
+`,
   },
   debrief: `A best-effort counter is the cheapest thing that can be called a counter: one key, one atomic INCRBY, no log and no reconciliation. The subtle part is the lifetime. Memcached's incr (what Netflix's EVCache sits on) never touches a key's expiry, and this step reproduces that deliberately: the TTL is a configuration of the namespace, not a side effect of traffic, so a counter nobody reads anymore disappears on schedule and a counter everybody hits does too — the next add simply starts it again. Pipelining the SET NX with the INCRBY keeps the add at one round trip. Real deployments replicate the cache across regions, accept that replicas may disagree briefly, and reach for the eventually consistent kind the moment a number has to be right.`,
 };

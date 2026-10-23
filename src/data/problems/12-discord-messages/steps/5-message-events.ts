@@ -1220,6 +1220,230 @@ export async function check_commit_after(ctx) {
   assert.equal(ctx.redis.hget(key, 'messages'), '1', \`only the well-formed event counts, \${key}.messages is \${JSON.stringify(ctx.redis.hget(key, 'messages'))}\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"log"
+	"strconv"
+	"sync"
+
+	"leetbuild/harness"
+)
+
+const (
+	evTopic   = "message-events"
+	evChannel = "1032000000000000001"
+	evOther   = "1032000000000000002"
+	evGroup   = "channel-state"
+)
+
+func evEvent(channel, mid, content string) string {
+	value, _ := json.Marshal(map[string]string{"type": "message.created", "channel_id": channel, "id": mid, "author_id": "7", "content": content})
+	return string(value)
+}
+
+// evSeed produces [channel, message id] events, in order.
+func evSeed(ctx *harness.Ctx, events ...[2]string) {
+	for _, e := range events {
+		ctx.Kafka.Seed(evTopic, e[0], evEvent(e[0], e[1], "hi"))
+	}
+}
+
+// evStored is what storeMessage (step 1) returns.
+func evStored(channel, mid, content string) message {
+	return message{ID: mid, ChannelID: channel, AuthorID: "7", Content: content}
+}
+
+// evLogs captures what the learner logs.
+type evLogs struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *evLogs) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, string(p))
+	return len(p), nil
+}
+
+func (l *evLogs) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.lines)
+}
+
+// evCapture tees the log output into an evLogs until restore is called.
+func evCapture() (*evLogs, func()) {
+	logs := &evLogs{}
+	previous := log.Writer()
+	log.SetOutput(io.MultiWriter(previous, logs))
+	return logs, func() { log.SetOutput(previous) }
+}
+
+func evRun(ctx *harness.Ctx) { ctx.Drain(func() { run(context.Background()) }) }
+
+// evCommit is one commit as the hook saw it: the group, the offsets, and messages per channel then.
+type evCommit struct {
+	group   string
+	offsets map[harness.KafkaTopicPartition]int64
+	counts  map[string]string
+}
+
+func evCopy(offsets harness.KafkaOffsets) map[harness.KafkaTopicPartition]int64 {
+	out := map[harness.KafkaTopicPartition]int64{}
+	for tp, offset := range offsets {
+		out[tp] = offset
+	}
+	return out
+}
+
+func CheckKeyedByChannel(ctx *harness.Ctx) {
+	publish(context.Background(), evStored(evChannel, "1561000000000000001", "hi"))
+	publish(context.Background(), evStored(evChannel, "1561000000000000002", "second"))
+	publish(context.Background(), evStored(evOther, "1561000000000000003", "hi"))
+	ctx.Settle()
+	produced := ctx.Kafka.Records(evTopic)
+	ctx.Equal(len(produced), 3, "three stored messages must be three records on message-events (topics: %v)", ctx.Kafka.Topics())
+	ctx.Equal(ctx.Kafka.Keys(evTopic), []string{evChannel, evChannel, evOther}, "records must be keyed by the channel id")
+	ctx.Assert(produced[0].Partition == produced[1].Partition, "two events of one channel must land on the same partition")
+	var got map[string]any
+	err := json.Unmarshal(produced[1].Value, &got)
+	ctx.NoError(err, "the record's value must be the JSON event, got %q", produced[1].Value)
+	for _, field := range [][2]string{{"type", "message.created"}, {"channel_id", evChannel}, {"id", "1561000000000000002"}, {"author_id", "7"}, {"content", "second"}} {
+		ctx.Equal(got[field[0]], field[1], "event.%s (%s)", field[0], produced[1].Value)
+	}
+}
+
+func CheckNonBlocking(ctx *harness.Ctx) {
+	logs, restore := evCapture()
+	defer restore()
+	publish(context.Background(), evStored(evChannel, "1561000000000000001", "hi"))
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(evTopic)), 1, "the event must be handed to the producer: records on message-events")
+	ctx.Kafka.Stall("") // the brokers stop acknowledging, as a partitioned or overloaded cluster does
+	started := ctx.Clock.Now()
+	publish(context.Background(), evStored(evChannel, "1561000000000000002", "hi"))
+	publish(context.Background(), evStored(evChannel, "1561000000000000003", "hi"))
+	waited := float64(ctx.Clock.Now()-started) / 1000
+	ctx.Assert(waited < 0.1, "with the broker not acknowledging, two publish calls took %.1f s: publish waits for the broker (a synchronous write on the request path), so every POST would hang with it", waited)
+	ctx.Kafka.Resume("")
+	ctx.Kafka.FailNext(evTopic, 1)
+	publish(context.Background(), evStored(evChannel, "1561000000000000004", "hi"))
+	publish(context.Background(), evStored(evChannel, "1561000000000000005", "hi"))
+	ctx.Settle()
+	ctx.Assert(logs.count() > 0, "the broker failed to deliver a record and nothing was logged: publish must report delivery failures (the writer's Completion)")
+}
+
+func CheckConsumerGroup(ctx *harness.Ctx) {
+	evSeed(ctx, [2]string{evChannel, "1561000000000000001"}, [2]string{evOther, "1561000000000000002"}, [2]string{evChannel, "1561000000000000003"})
+	records := ctx.Kafka.Records(evTopic)
+	var mu sync.Mutex
+	commits := []evCommit{}
+	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
+		counts := map[string]string{}
+		for _, c := range []string{evChannel, evOther} {
+			count, _ := ctx.Redis.HGet("channel:"+c, "messages")
+			counts[c] = count
+		}
+		mu.Lock()
+		commits = append(commits, evCommit{group, evCopy(offsets), counts})
+		mu.Unlock()
+	})
+	evRun(ctx)
+	mu.Lock()
+	seenCommits := append([]evCommit{}, commits...)
+	mu.Unlock()
+	ctx.Assert(len(seenCommits) > 0, "no offset was ever committed: the consumer must commit what it processed")
+	groups := map[string]bool{}
+	for _, c := range seenCommits {
+		groups[c.group] = true
+	}
+	ctx.Equal(groups, map[string]bool{evGroup: true}, "offsets must be committed for group channel-state only: groups")
+	seen := map[string]int{}
+	for _, record := range records {
+		channel := string(record.Key)
+		seen[channel]++
+		tp := harness.KafkaTopicPartition{Topic: evTopic, Partition: record.Partition}
+		var state map[string]string
+		for _, c := range seenCommits {
+			if offset, ok := c.offsets[tp]; ok && offset > record.Offset {
+				state = c.counts
+				break
+			}
+		}
+		ctx.Assert(state != nil, "the record at partition %d offset %d was processed but never committed by channel-state", record.Partition, record.Offset)
+		counted, _ := strconv.Atoi(state[channel])
+		ctx.Assert(counted >= seen[channel], "the record at partition %d offset %d was committed while channel:%s counted %d message(s), before its own event was written: commit after processing", record.Partition, record.Offset, channel, counted)
+	}
+	// A write that is slow and then fails: the record must stay uncommitted, to be redelivered.
+	broken := "1032000000000000009"
+	ctx.Redis.Set("channel:"+broken, "not a hash") // a corrupted key: HSET/HINCRBY fail with WRONGTYPE
+	ctx.Redis.After("channel:"+broken, func() any {
+		ctx.Clock.Advance(6)
+		return nil
+	})
+	evSeed(ctx, [2]string{broken, "1561000000000000009"})
+	all := ctx.Kafka.Records(evTopic)
+	record := all[len(all)-1]
+	evRun(ctx) // the worker fails on the write; a restart would redeliver the record
+	committed, ok := ctx.Kafka.Committed(evGroup, evTopic, record.Partition)
+	ctx.Assert(!ok || committed <= record.Offset, "the write for channel:%s took 6 s and then failed, yet its record (partition %d offset %d) was committed: offsets were committed while the record was still being processed (auto-commit on a timer), so the event is lost", broken, record.Partition, record.Offset)
+}
+
+func CheckChannelState(ctx *harness.Ctx) {
+	evSeed(ctx, [2]string{evChannel, "1561000000000000001"}, [2]string{evOther, "1561000000000000002"}, [2]string{evChannel, "1561000000000000003"}, [2]string{evChannel, "1561000000000000005"})
+	evRun(ctx)
+	key := "channel:" + evChannel
+	ctx.Equal(ctx.Redis.Type(key), "hash", "%s must be a hash (keys: %v)", key, ctx.Redis.Keys("*"))
+	state := ctx.Redis.HGetAll(key)
+	ctx.Equal(state["last_message_id"], "1561000000000000005", "%s.last_message_id must be the newest id", key)
+	ctx.Equal(state["messages"], "3", "%s.messages after three events", key)
+	other := ctx.Redis.HGetAll("channel:" + evOther)
+	ctx.Assert(other["last_message_id"] == "1561000000000000002" && other["messages"] == "1", "channel:%s must track its own single event, got %v", evOther, other)
+}
+
+func CheckCommitAfter(ctx *harness.Ctx) {
+	evSeed(ctx, [2]string{evChannel, "1561000000000000001"})
+	ctx.Kafka.Seed(evTopic, "bad", "not json")
+	ctx.Kafka.Seed(evTopic, "bad", \`{"type":"channel.renamed","channel_id":"\`+evOther+\`"}\`)
+	ctx.Kafka.Seed(evTopic, "bad", \`{"type":"message.created","content":"no ids"}\`)
+	record := ctx.Kafka.Records(evTopic)[0]
+	key := "channel:" + evChannel
+	var mu sync.Mutex
+	atCommit := []evCommit{}
+	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
+		count, ok := ctx.Redis.HGet(key, "messages")
+		if !ok {
+			count = "(nil)"
+		}
+		mu.Lock()
+		atCommit = append(atCommit, evCommit{group, evCopy(offsets), map[string]string{key: count}})
+		mu.Unlock()
+	})
+	evRun(ctx)
+	mu.Lock()
+	seenCommits := append([]evCommit{}, atCommit...)
+	mu.Unlock()
+	ctx.Assert(len(seenCommits) > 0, "no offset was ever committed")
+	tp := harness.KafkaTopicPartition{Topic: evTopic, Partition: record.Partition}
+	covering := []string{}
+	for _, c := range seenCommits {
+		if c.offsets[tp] > record.Offset {
+			covering = append(covering, c.counts[key])
+		}
+	}
+	ctx.Assert(len(covering) > 0, "the message.created record was never committed")
+	ctx.Equal(covering[0], "1", "the commit must come after HINCRBY: messages the channel counted when the record was committed")
+	ctx.Equal(ctx.Kafka.Lag(evGroup, evTopic), 0, "malformed records must be skipped and committed, not left to replay forever: lag")
+	ctx.Equal(ctx.Redis.Keys("channel:*"), []string{key}, "malformed records must not touch Redis")
+	messages, _ := ctx.Redis.HGet(key, "messages")
+	ctx.Equal(messages, "1", "only the well-formed event counts: %s.messages", key)
+}
+`,
   },
   debrief: `The topic decouples storing a message from everything that reacts to it: the API's job ends when the row is in and the record is in the producer's buffer, and search, push and counters each become a consumer group that can fall behind, catch up or be rebuilt without touching the write path. The key is a design decision disguised as a parameter: keyed by channel, a channel's events share a partition and arrive in order, which is exactly what makes "last message id" a safe thing to overwrite. Commit-after-write is the honest guarantee for a counter in Redis: a crash between the two replays one record and over-counts by one, which the hash can tolerate and a lost event could not. Real pipelines make the counter idempotent too, by remembering the last applied id per channel and skipping anything not newer, and they size the partition count for the hottest channel rather than the average, because one World Cup final channel is one partition's worth of writes.`,
 };

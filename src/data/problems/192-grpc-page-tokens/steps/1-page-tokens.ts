@@ -1127,6 +1127,247 @@ export async function check_malformed_token(ctx) {
   assert.deepEqual(page, ids(10), \`an empty page_token is the first page, b-0001 to b-0010, got \${JSON.stringify(page)}\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"slices"
+	"sort"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"leetbuild/harness"
+
+	pb "library/gen/library"
+)
+
+// bookIDs is b-0001, b-0002, … (or b-0010, b-0020, … with step 10).
+func bookIDs(n, step int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("b-%04d", (i+1)*step)
+	}
+	return out
+}
+
+func showBooks(list []string) string {
+	if len(list) <= 6 {
+		return fmt.Sprintf("%q", list)
+	}
+	return fmt.Sprintf("%d books %q … %q", len(list), list[:3], list[len(list)-2:])
+}
+
+func rawB64(text string) string { return base64.RawURLEncoding.EncodeToString([]byte(text)) }
+
+// setShelf puts a book on a shelf (or takes it off with an empty title), as the catalogue does.
+func setShelf(shelf, id, title string) {
+	mu.Lock()
+	defer mu.Unlock()
+	if title == "" {
+		delete(shelves[shelf], id)
+		return
+	}
+	shelves[shelf][id] = title
+}
+
+// startLibrary seeds shelves in place, runs the learner's server and returns a client on it.
+func startLibrary(ctx *harness.Ctx, seed map[string][]string) pb.LibraryClient {
+	mu.Lock()
+	for name := range shelves {
+		delete(shelves, name)
+	}
+	for name, list := range seed {
+		books := map[string]string{}
+		for _, id := range list {
+			books[id] = "Title " + id
+		}
+		shelves[name] = books
+	}
+	mu.Unlock()
+	ctx.Main(main)
+	return pb.NewLibraryClient(ctx.GRPC.Dial("library:9000"))
+}
+
+func listCall(client pb.LibraryClient, shelf string, pageSize int32, pageToken string) (*pb.ListBooksResponse, error) {
+	c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return client.ListBooks(c, &pb.ListBooksRequest{Shelf: shelf, PageSize: pageSize, PageToken: pageToken})
+}
+
+func listBooks(ctx *harness.Ctx, client pb.LibraryClient, shelf string, pageSize int32, pageToken string) *pb.ListBooksResponse {
+	reply, err := listCall(client, shelf, pageSize, pageToken)
+	if err != nil {
+		ctx.Fatalf("ListBooks(shelf=%q, page_size=%d, page_token=%q) failed with %v: %s", shelf, pageSize, pageToken, status.Code(err), status.Convert(err).Message())
+	}
+	return reply
+}
+
+func listCode(client pb.LibraryClient, shelf string, pageSize int32, pageToken string) codes.Code {
+	_, err := listCall(client, shelf, pageSize, pageToken)
+	return status.Code(err)
+}
+
+func idsOf(reply *pb.ListBooksResponse) []string {
+	out := []string{}
+	for _, b := range reply.GetBooks() {
+		out = append(out, b.GetId())
+	}
+	return out
+}
+
+// walkShelf is every page from pageToken to the one carrying NextPageToken "".
+func walkShelf(ctx *harness.Ctx, client pb.LibraryClient, shelf string, pageSize int32, pageToken string) [][]string {
+	var pages [][]string
+	for range 20 {
+		reply := listBooks(ctx, client, shelf, pageSize, pageToken)
+		pages = append(pages, idsOf(reply))
+		pageToken = reply.GetNextPageToken()
+		if pageToken == "" {
+			return pages
+		}
+	}
+	ctx.Fatalf("shelf %q at page_size %d: still a next_page_token after 20 pages, sizes %v", shelf, pageSize, pageSizes(pages))
+	return nil
+}
+
+func pageSizes(pages [][]string) []int {
+	sizes := make([]int, len(pages))
+	for i, p := range pages {
+		sizes[i] = len(p)
+	}
+	return sizes
+}
+
+func flattenPages(pages [][]string) []string {
+	out := []string{}
+	for _, p := range pages {
+		out = append(out, p...)
+	}
+	return out
+}
+
+func CheckPageSize(ctx *harness.Ctx) {
+	client := startLibrary(ctx, map[string][]string{"fiction": bookIDs(250, 1)})
+	every := bookIDs(250, 1)
+	for _, c := range [][2]int{{0, 50}, {7, 7}, {100, 100}, {101, 100}, {500, 100}} {
+		size, want := c[0], c[1]
+		reply := listBooks(ctx, client, "fiction", int32(size), "")
+		got := idsOf(reply)
+		ctx.Equal(len(got), want, "the books page_size %d returns on a shelf of 250", size)
+		ctx.Assert(slices.Equal(got, every[:want]), "page_size %d: the first page is the %d lowest ids in ascending order (%s to %s), got %s", size, want, every[0], every[want-1], showBooks(got))
+		ctx.Assert(reply.GetNextPageToken() != "", "page_size %d: %d books remain after the first page, so next_page_token must not be empty", size, 250-want)
+	}
+	books := listBooks(ctx, client, "fiction", 1, "").GetBooks()
+	ctx.Assert(len(books) > 0, "page_size 1 returned no book")
+	ctx.Equal(books[0].GetTitle(), "Title b-0001", "each Book carries its title from shelves")
+}
+
+func CheckRejectBadRequest(ctx *harness.Ctx) {
+	client := startLibrary(ctx, map[string][]string{"fiction": bookIDs(20, 1)})
+	for _, c := range []struct {
+		shelf string
+		size  int32
+	}{{"poetry", 0}, {"poetry", 10}, {"", 0}} {
+		ctx.Equal(listCode(client, c.shelf, c.size, ""), codes.NotFound, "shelf %q does not exist", c.shelf)
+	}
+	for _, size := range []int32{-1, -100} {
+		ctx.Equal(listCode(client, "fiction", size, ""), codes.InvalidArgument, "page_size %d", size)
+	}
+	token := listBooks(ctx, client, "fiction", 5, "").GetNextPageToken()
+	ctx.Assert(token != "", "5 of 20 books listed: next_page_token must not be empty")
+	ctx.Equal(listCode(client, "fiction", -1, token), codes.InvalidArgument, "page_size -1 with a valid page_token")
+}
+
+func CheckFullWalk(ctx *harness.Ctx) {
+	client := startLibrary(ctx, map[string][]string{"fiction": bookIDs(120, 1), "history": bookIDs(100, 1), "trilogy": bookIDs(3, 1), "empty": nil})
+	pages := walkShelf(ctx, client, "fiction", 0, "")
+	ctx.Equal(pageSizes(pages), []int{50, 50, 20}, "120 books at the default page size: the page sizes")
+	flat := flattenPages(pages)
+	ctx.Assert(slices.Equal(flat, bookIDs(120, 1)), "the walk must return every book once in ascending id order, got %s", showBooks(flat))
+	pages = walkShelf(ctx, client, "history", 50, "")
+	ctx.Equal(pageSizes(pages), []int{50, 50}, "100 books at page_size 50 are exactly two pages, the second with next_page_token %q because nothing follows it; the page sizes", "")
+	ctx.Assert(slices.Equal(flattenPages(pages), bookIDs(100, 1)), "the history walk must return b-0001 to b-0100 in order")
+	pages = walkShelf(ctx, client, "trilogy", 1, "")
+	ctx.Equal(pages, [][]string{{"b-0001"}, {"b-0002"}, {"b-0003"}}, "3 books at page_size 1 are three pages of one")
+	reply := listBooks(ctx, client, "empty", 0, "")
+	ctx.Assert(len(idsOf(reply)) == 0 && reply.GetNextPageToken() == "", "an empty shelf is one empty page with next_page_token %q, got %q and %q", "", idsOf(reply), reply.GetNextPageToken())
+}
+
+func CheckKeyset(ctx *harness.Ctx) {
+	client := startLibrary(ctx, map[string][]string{"fiction": bookIDs(20, 10)}) // b-0010 … b-0200
+	page := listBooks(ctx, client, "fiction", 5, "")
+	seen := idsOf(page)
+	ctx.Equal(seen, []string{"b-0010", "b-0020", "b-0030", "b-0040", "b-0050"}, "page 1 at page_size 5")
+	// Two books already listed are removed: an offset into the shorter list would skip b-0060 and b-0070.
+	setShelf("fiction", "b-0020", "")
+	setShelf("fiction", "b-0030", "")
+	page = listBooks(ctx, client, "fiction", 5, page.GetNextPageToken())
+	got := idsOf(page)
+	ctx.Equal(got, []string{"b-0060", "b-0070", "b-0080", "b-0090", "b-0100"}, "b-0020 and b-0030 (already listed) were removed: page 2 must continue after b-0050 (an offset skips survivors)")
+	seen = append(seen, got...)
+	// Three books added before the cursor, and the cursor's own book removed: an offset would repeat books.
+	for _, id := range []string{"b-0005", "b-0025", "b-0045"} {
+		setShelf("fiction", id, "Title "+id)
+	}
+	setShelf("fiction", "b-0100", "")
+	page = listBooks(ctx, client, "fiction", 5, page.GetNextPageToken())
+	got = idsOf(page)
+	ctx.Equal(got, []string{"b-0110", "b-0120", "b-0130", "b-0140", "b-0150"}, "three books were added before the cursor and the cursor's own book (b-0100) was removed: page 3 must continue strictly after b-0100")
+	seen = append(seen, got...)
+	// A book added ahead of the cursor is simply part of the rest of the walk.
+	setShelf("fiction", "b-0155", "Title b-0155")
+	rest := flattenPages(walkShelf(ctx, client, "fiction", 5, page.GetNextPageToken()))
+	ctx.Equal(rest, []string{"b-0155", "b-0160", "b-0170", "b-0180", "b-0190", "b-0200"}, "the rest of the walk is everything now after b-0150 (b-0155 was added ahead of the cursor)")
+	seen = append(seen, rest...)
+	twice := []string{}
+	for i, id := range seen {
+		if slices.Index(seen, id) != i && !slices.Contains(twice, id) {
+			twice = append(twice, id)
+		}
+	}
+	sort.Strings(twice)
+	ctx.Assert(len(twice) == 0, "no book may come back twice in one walk, but %q did", twice)
+	missing := []string{}
+	for _, id := range bookIDs(20, 10) {
+		if !slices.Contains([]string{"b-0020", "b-0030", "b-0100"}, id) && !slices.Contains(seen, id) {
+			missing = append(missing, id)
+		}
+	}
+	ctx.Assert(len(missing) == 0, "every book present for the whole walk must be listed, but %q never was", missing)
+	ctx.Assert(sort.StringsAreSorted(seen), "one walk lists books in ascending id order, got %s", showBooks(seen))
+}
+
+func CheckBoundToShelf(ctx *harness.Ctx) {
+	client := startLibrary(ctx, map[string][]string{"fiction": bookIDs(30, 1), "history": bookIDs(30, 1)})
+	token := listBooks(ctx, client, "fiction", 10, "").GetNextPageToken()
+	ctx.Assert(token != "", "10 of 30 fiction books listed: next_page_token must not be empty")
+	ctx.Assert(!slices.Contains([]string{"b-0010", "b-0011", "10"}, token), "the token must be opaque and carry the shelf, not the bare position %q", token)
+	ctx.Equal(listCode(client, "history", 10, token), codes.InvalidArgument, "a token issued for shelf %q sent with shelf %q", "fiction", "history")
+	page := idsOf(listBooks(ctx, client, "fiction", 10, token))
+	ctx.Equal(page, bookIDs(20, 1)[10:], "the fiction token still continues fiction with b-0011 to b-0020")
+	history := listBooks(ctx, client, "history", 10, "")
+	ctx.Equal(listCode(client, "fiction", 10, history.GetNextPageToken()), codes.InvalidArgument, "a token issued for shelf %q sent with shelf %q", "history", "fiction")
+	page = idsOf(listBooks(ctx, client, "history", 10, history.GetNextPageToken()))
+	ctx.Equal(page, bookIDs(20, 1)[10:], "the history token still continues history with b-0011 to b-0020")
+}
+
+func CheckMalformedToken(ctx *harness.Ctx) {
+	client := startLibrary(ctx, map[string][]string{"fiction": bookIDs(30, 1)})
+	for _, token := range []string{"not a token", "%%%", rawB64("not json"), rawB64("[1, 2]"), rawB64("42"), rawB64("{}"), rawB64(fmt.Sprintf("%q", "b-0010"))} {
+		got := listCode(client, "fiction", 10, token)
+		hint := ""
+		if got == codes.Unknown {
+			hint = " (a panic escaped the handler)"
+		}
+		ctx.Assert(got == codes.InvalidArgument, "page_token %q is not a token this server issued: expected InvalidArgument, got %v%s", token, got, hint)
+	}
+	page := idsOf(listBooks(ctx, client, "fiction", 10, ""))
+	ctx.Equal(page, bookIDs(10, 1), "an empty page_token is the first page, b-0001 to b-0010")
+}
+`,
   },
   debrief: `The token carries a key, not a count, because a count is only meaningful against the list it was computed on, and that list is gone by the next call: remove two books before the cursor and "skip 5" skips two survivors, add three and it repeats three. "Everything with \`id > b-0050\`" means the same thing whatever happened in between, including when \`b-0050\` itself was deleted, which is why the comparison is strict and the cursor is never looked up by position. The shelf travels inside the token so a token cannot be replayed against another collection, and decoding is total: garbage, a JSON list or a number is the client's mistake (\`INVALID_ARGUMENT\`), never an exception that surfaces as \`UNKNOWN\`. Counting what lies past the page, instead of checking that the page came out full, is what keeps the last page's token empty when the remaining books divide evenly. Real list methods run the same idea in the database (\`WHERE id > $1 ORDER BY id LIMIT $2 + 1\` on an index), use a composite key such as \`(created_at, id)\` when the sort column is not unique, bind every request parameter (\`filter\`, \`order_by\`) into the token, and serialize it as a versioned proto that is signed or encrypted, because AIP-158 says plain base64 is not opacity: clients that can read a token will come to depend on what is inside it.`,
 };

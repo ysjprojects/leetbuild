@@ -249,10 +249,11 @@ const (
 var ErrNotDurable = errors.New("counter event not acknowledged")
 
 var writer = &kafka.Writer{
-	Addr:     kafka.TCP("kafka:9092"),
-	Topic:    topic,
-	Balancer: &kafka.Hash{},
-	// TODO: RequiredAcks: every in-sync replica
+	Addr:         kafka.TCP("kafka:9092"),
+	Topic:        topic,
+	Balancer:     &kafka.Hash{},
+	BatchTimeout: 5 * time.Millisecond, // a sync write waits for its batch; the default lingers 1 s
+	// TODO: RequiredAcks: every in-sync replica (kafka-go has no idempotent producer: a retry after a lost ack is a copy carrying the same token)
 }
 
 type countEvent struct {
@@ -291,10 +292,13 @@ const (
 // ErrNotDurable: the broker did not acknowledge the event in time; the API answers 503 and the client retries with the same token.
 var ErrNotDurable = errors.New("counter event not acknowledged")
 
+// kafka-go has no idempotent producer: RequireAll is what it can promise, and a retry after a lost ack
+// is an identical copy carrying the same token, which the rollup drops.
 var writer = &kafka.Writer{
 	Addr:         kafka.TCP("kafka:9092"),
 	Topic:        topic,
 	Balancer:     &kafka.Hash{},
+	BatchTimeout: 5 * time.Millisecond, // a sync write waits for its batch; the default lingers 1 s
 	RequiredAcks: kafka.RequireAll,
 }
 
@@ -655,6 +659,114 @@ export async function check_not_durable_raises(ctx) {
   ctx.kafka.stall(TOPIC);
   const pending = await attempt(m, 'plays', 'stranger-things', 1, 't-9f4');
   assert(!pending.returned, 'the broker did not acknowledge the record within the flush (it is still pending) but appendEvent returned normally: the API would answer 202 for an event that may never be written');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"math"
+
+	"leetbuild/harness"
+)
+
+const (
+	ceTopic        = "counter-events"
+	ceFlushTimeout = 1.0 // seconds
+)
+
+var ceBg = context.Background()
+
+// ceAttempt is whether appendEvent returned nil, or the ErrNotDurable it returned; any other error fails the check.
+func ceAttempt(ctx *harness.Ctx, ns, name string, delta int64, token string) (bool, error) {
+	err := appendEvent(ceBg, ns, name, delta, token)
+	if err == nil {
+		return true, nil
+	}
+	ctx.Assert(errors.Is(err, ErrNotDurable), "appendEvent returned %v: a failed append must wrap ErrNotDurable", err)
+	return false, err
+}
+
+func ceAppend(ctx *harness.Ctx, ns, name string, delta int64, token string) {
+	ctx.NoError(appendEvent(ceBg, ns, name, delta, token), "appendEvent(ctx, %q, %q, %d, %q) returned an error", ns, name, delta, token)
+}
+
+func CheckTopicKey(ctx *harness.Ctx) {
+	ceAppend(ctx, "plays", "stranger-things", 1, "t-9f3")
+	ceAppend(ctx, "plays", "stranger-things", 2, "t-9f4")
+	ceAppend(ctx, "plays", "the-crown", 1, "t-9f5")
+	produced := ctx.Kafka.Records(ceTopic)
+	ctx.Assert(len(produced) == 3, "expected three records on %s, found %d (topics: %q)", ceTopic, len(produced), ctx.Kafka.Topics())
+	ctx.Equal(ctx.Kafka.Keys(ceTopic), []string{"plays:stranger-things", "plays:stranger-things", "plays:the-crown"}, "records must be keyed by ns:name")
+	ctx.Equal(produced[0].Partition, produced[1].Partition, "the same counter must land on the same partition")
+}
+
+func CheckEventShape(ctx *harness.Ctx) {
+	ceAppend(ctx, "plays", "stranger-things", -2, "t-9f3")
+	produced := ctx.Kafka.Values(ceTopic)
+	ctx.Equal(len(produced), 1, "the number of records on %s", ceTopic)
+	var event map[string]any
+	ctx.NoError(json.Unmarshal([]byte(produced[0]), &event), "the value must be JSON: %s", produced[0])
+	ctx.Assert(event["ns"] == "plays" && event["name"] == "stranger-things", "the value must carry ns and name: %s", produced[0])
+	ctx.Assert(event["delta"] == -2.0, "the value must carry the delta as an integer: %s", produced[0])
+	ctx.Equal(event["token"], "t-9f3", "the value must carry the client's token unchanged (the rollup dedupes on it): %s", produced[0])
+	ts, isNumber := event["ts"].(float64)
+	ctx.Assert(isNumber && math.Abs(ts-float64(ctx.Clock.Now())/1000) < 60, "the value must carry a current timestamp in seconds: %s", produced[0])
+}
+
+func CheckAcksAll(ctx *harness.Ctx) {
+	// The partition leader fails right after acknowledging: only an event every in-sync replica has survives.
+	ceAppend(ctx, "plays", "stranger-things", 1, "t-9f3")
+	ctx.Kafka.Failover(ceTopic)
+	held := len(ctx.Kafka.Records(ceTopic))
+	ctx.Assert(held == 1, "appendEvent returned (the API would answer 202), then the partition leader failed and %s holds %d record(s) instead of the event: it had been acknowledged by the leader alone. A durability promise needs RequiredAcks: kafka.RequireAll", ceTopic, held)
+	// The broker writes the next event but its acknowledgement is lost: the producer retries it.
+	ctx.Kafka.LoseAcks(ceTopic, 1)
+	ceAppend(ctx, "plays", "stranger-things", 2, "t-9f4")
+	// kafka-go has no idempotent producer (the step's Go code): at least once, identical copies.
+	copies := ctx.Kafka.Records(ceTopic)[1:]
+	ctx.Assert(len(copies) >= 1, "the broker wrote the second event and its acknowledgement was lost, yet %s does not hold it", ceTopic)
+	for _, c := range copies {
+		ctx.Assert(string(c.Key) == string(copies[0].Key) && string(c.Value) == string(copies[0].Value), "the producer's retry after a lost ack must be an identical copy (same key and value, the same token) so the rollup can drop it: got %s %s and %s %s", copies[0].Key, copies[0].Value, c.Key, c.Value)
+	}
+}
+
+func CheckBoundedFlush(ctx *harness.Ctx) {
+	// The broker is slow but answers within flushTimeout: the add waits for the ack and succeeds.
+	ctx.Kafka.StallFor(ceTopic, 0.8)
+	returned, err := ceAttempt(ctx, "plays", "stranger-things", 1, "t-9f3")
+	ctx.Assert(returned, "the broker acknowledged after 0.8 s, within flushTimeout (1 s), but appendEvent returned %v: it must wait for the acknowledgement up to the bound", err)
+	held := len(ctx.Kafka.Records(ceTopic))
+	ctx.Assert(held == 1, "appendEvent returned while the event was still unacknowledged (%s holds %d record(s)): it must not return (and the API must not answer 202) before the broker has the event, exactly once", ceTopic, held)
+	// The broker is down: the add gives up after flushTimeout instead of hanging the request.
+	ctx.Kafka.Stall(ceTopic)
+	start := ctx.Clock.Now()
+	returned, _ = ceAttempt(ctx, "plays", "stranger-things", 1, "t-9f4")
+	waited := float64(ctx.Clock.Now()-start) / 1000
+	ctx.Assert(waited <= ceFlushTimeout+0.05, "with the broker down appendEvent waited %.0f s before giving up (an unbounded send waits for the whole write timeout while the client's request hangs): bound it with context.WithTimeout(ctx, flushTimeout)", waited)
+	ctx.Assert(!returned, "with the broker down appendEvent returned nil after %.1f s without an acknowledgement: the API would answer 202 for an event that may never be written", waited)
+	held = len(ctx.Kafka.Records(ceTopic))
+	ctx.Assert(held == 1, "nothing can be written while the broker is down, yet %s holds %d record(s)", ceTopic, held)
+}
+
+func CheckNotDurableRaises(ctx *harness.Ctx) {
+	ctx.Kafka.FailNext(ceTopic, 1)
+	returned, _ := ceAttempt(ctx, "plays", "stranger-things", 1, "t-9f3")
+	ctx.Assert(!returned, "the broker refused the record (delivery error) but appendEvent returned nil: the API would answer 202 for an event that was lost")
+	ctx.Equal(len(ctx.Kafka.Records(ceTopic)), 0, "records on %s after the refused produce", ceTopic)
+	ceAppend(ctx, "plays", "stranger-things", 1, "t-9f3") // the client's retry, same token
+	tokens := []any{}
+	for _, v := range ctx.Kafka.Values(ceTopic) {
+		var event map[string]any
+		ctx.NoError(json.Unmarshal([]byte(v), &event), "the value must be JSON: %s", v)
+		tokens = append(tokens, event["token"])
+	}
+	ctx.Equal(tokens, []any{"t-9f3"}, "after the failure the retry must be produced normally, carrying the same token, which is what makes it safe: the tokens on %s", ceTopic)
+	ctx.Kafka.Stall(ceTopic)
+	returned, _ = ceAttempt(ctx, "plays", "stranger-things", 1, "t-9f4")
+	ctx.Assert(!returned, "the broker did not acknowledge the record within the flush (it is still pending) but appendEvent returned nil: the API would answer 202 for an event that may never be written")
 }
 `,
   },

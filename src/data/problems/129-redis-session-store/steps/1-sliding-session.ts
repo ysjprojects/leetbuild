@@ -882,6 +882,173 @@ export async function check_destroy_and_unknown(ctx) {
   assert.deepEqual(ctx.redis.keys('*'), [\`sess:\${b}\`], \`a miss must create no key — only sess:{b} may exist, found \${JSON.stringify(ctx.redis.keys('*'))}\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+const ssTTL = 1800
+
+var (
+	ssHex32  = regexp.MustCompile("^[0-9a-f]{32}$")
+	ssNobody = strings.Repeat("0", 32)
+	ssBg     = context.Background()
+)
+
+func ssCreate(ctx *harness.Ctx, userID string, data map[string]string) string {
+	sid, err := create(ssBg, userID, data)
+	ctx.NoError(err, "create(ctx, %q, %s) returned an error", userID, harness.Show(data))
+	return sid
+}
+
+func ssGet(ctx *harness.Ctx, sid string) map[string]string {
+	got, err := get(ssBg, sid)
+	ctx.NoError(err, "get(ctx, %q) returned an error", sid)
+	return got
+}
+
+func ssTouch(ctx *harness.Ctx, sid string) bool {
+	ok, err := touch(ssBg, sid)
+	ctx.NoError(err, "touch(ctx, %q) returned an error", sid)
+	return ok
+}
+
+func ssDestroy(ctx *harness.Ctx, sid string) {
+	ctx.NoError(destroy(ssBg, sid), "destroy(ctx, %q) returned an error", sid)
+}
+
+// ssFieldNames is the hash's field names, sorted.
+func ssFieldNames(fields map[string]string) []string {
+	names := make([]string, 0, len(fields))
+	for f := range fields {
+		names = append(names, f)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func CheckSessionId(ctx *harness.Ctx) {
+	sids := make([]string, 0, 50)
+	for i := range 50 {
+		sids = append(sids, ssCreate(ctx, fmt.Sprintf("u%d", i), map[string]string{"theme": "dark", "locale": "de"}))
+	}
+	for _, sid := range sids {
+		ctx.Assert(ssHex32.MatchString(sid), "a session id must be 32 lower-case hex chars (16 random bytes), got %q", sid)
+	}
+	distinct := map[string]bool{}
+	for _, sid := range sids {
+		distinct[sid] = true
+	}
+	ctx.Equal(len(distinct), 50, "fifty sessions must get fifty distinct ids (a secure random source, never a counter or a timestamp)")
+	sid := sids[0]
+	k := "sess:" + sid
+	ctx.Equal(ctx.Redis.Type(k), "hash", "the session must be the hash sess:{sid}; the type of %s", k)
+	fields := ctx.Redis.HGetAll(k)
+	ctx.Equal(fields["user_id"], "u0", "the hash must carry user_id = u0 (it holds %s)", harness.Show(fields))
+	createdAt, ok := fields["created_at"]
+	at, err := strconv.ParseInt(createdAt, 10, 64)
+	now := ctx.Clock.Now() / 1000
+	ctx.Assert(ok && err == nil && at-now <= 1 && now-at <= 1, "created_at must be the unix seconds at create, it is %q", createdAt)
+	ctx.Assert(fields["theme"] == "dark" && fields["locale"] == "de", "every entry of data must be a field of the hash; the hash holds %s", harness.Show(fields))
+	ctx.Equal(ssFieldNames(fields), []string{"created_at", "locale", "theme", "user_id"}, "the hash must hold exactly user_id, created_at and the data entries")
+	ctx.Equal(ssGet(ctx, sid), fields, "get must return the hash's fields as stored")
+	bare := ssCreate(ctx, "u99", map[string]string{})
+	ctx.Equal(ssFieldNames(ctx.Redis.HGetAll("sess:"+bare)), []string{"created_at", "user_id"}, "with empty data the hash holds only user_id and created_at")
+	keys := ctx.Redis.Keys("*")
+	want := make([]string, 0, len(sids)+1)
+	for _, s := range append(sids, bare) {
+		want = append(want, "sess:"+s)
+	}
+	sort.Strings(want)
+	shown := keys
+	if len(shown) > 5 {
+		shown = shown[:5]
+	}
+	ctx.Assert(reflect.DeepEqual(keys, want), "the only keys written are sess:{sid}, found %s", harness.Show(shown))
+}
+
+func CheckTtlOnCreate(ctx *harness.Ctx) {
+	sid := ssCreate(ctx, "ana", map[string]string{"theme": "dark"})
+	ctx.Equal(ctx.Redis.TTL("sess:"+sid), ssTTL, "right after create the TTL of sess:{sid} must be %d s (sessionTTL)", ssTTL)
+	ctx.Clock.Advance(100)
+	ctx.Equal(ctx.Redis.TTL("sess:"+sid), ssTTL-100, "the TTL counts down while nobody reads: 100 s later")
+	theme, _ := ctx.Redis.HGet("sess:"+sid, "theme")
+	ctx.Equal(theme, "dark", "the fields must survive the EXPIRE (EXPIRE sets a TTL, it does not rewrite the hash)")
+}
+
+func CheckSlidesOnGet(ctx *harness.Ctx) {
+	sid := ssCreate(ctx, "ana", map[string]string{"theme": "dark"})
+	k := "sess:" + sid
+	stored := ctx.Redis.HGetAll(k)
+	ctx.Clock.Advance(1000)
+	ctx.Equal(ctx.Redis.TTL(k), ssTTL-1000, "the TTL 1000 s after create")
+	got := ssGet(ctx, sid)
+	ctx.Assert(got != nil && got["user_id"] == "ana" && got["theme"] == "dark", "get on a live session must return its fields, got %s", harness.Show(got))
+	ctx.Equal(ctx.Redis.TTL(k), ssTTL, "a read must slide the TTL back to %d (EXPIRE after HGETALL)", ssTTL)
+	ctx.Equal(ctx.Redis.HGetAll(k), stored, "a read must not rewrite the hash (created_at and the data stay as they were)")
+	ctx.Clock.Advance(1500)
+	ctx.Equal(ctx.Redis.Exists(k), 1, "2500 s after create but only 1500 s after the last read the session must still be there")
+	ctx.Assert(ssGet(ctx, sid) != nil, "a session read every 1500 s must never expire")
+	ctx.Equal(ctx.Redis.TTL(k), ssTTL, "every read slides the TTL, not just the first")
+}
+
+func CheckTouch(ctx *harness.Ctx) {
+	sid := ssCreate(ctx, "ana", map[string]string{"theme": "dark"})
+	k := "sess:" + sid
+	stored := ctx.Redis.HGetAll(k)
+	ctx.Clock.Advance(1000)
+	ctx.Equal(ssTouch(ctx, sid), true, "touch on a live session must return true")
+	ctx.Equal(ctx.Redis.TTL(k), ssTTL, "touch must slide the TTL back to %d", ssTTL)
+	ctx.Equal(ctx.Redis.HGetAll(k), stored, "touch must leave the fields alone")
+	ctx.Equal(ssTouch(ctx, ssNobody), false, "touch on an unknown id must return false (EXPIRE answers 0 for a missing key)")
+	ctx.Equal(ctx.Redis.Exists("sess:"+ssNobody), 0, "touch on an unknown id must not create a key")
+	ctx.Equal(ctx.Redis.Keys("*"), []string{k}, "touch must write no other key")
+}
+
+func CheckExpires(ctx *harness.Ctx) {
+	sid := ssCreate(ctx, "ana", map[string]string{"theme": "dark"})
+	k := "sess:" + sid
+	ctx.Clock.Advance(1799)
+	ctx.Equal(ctx.Redis.Exists(k), 1, "1799 s without a read is still inside the idle window: the session must be there")
+	ctx.Clock.Advance(2)
+	ctx.Equal(ctx.Redis.Exists(k), 0, "1801 s without a read: Redis must have evicted sess:{sid} (the TTL set at create is the only thing keeping it alive)")
+	ctx.Assert(ssGet(ctx, sid) == nil, "get on an expired session must return nil")
+	ctx.Equal(ssTouch(ctx, sid), false, "touch on an expired session must return false")
+	keys := ctx.Redis.Keys("*")
+	ctx.Assert(len(keys) == 0, "get/touch on an expired session must not recreate anything, found %s", harness.Show(keys))
+	other := ssCreate(ctx, "bo", map[string]string{})
+	ctx.Clock.Advance(1000)
+	ctx.Assert(ssGet(ctx, other) != nil, "get on a live session must return its fields")
+	ctx.Clock.Advance(1799)
+	ctx.Equal(ctx.Redis.Exists("sess:"+other), 1, "a read at 1000 s buys a fresh 1800 s: 1799 s after it the session must still be there")
+	ctx.Clock.Advance(2)
+	ctx.Assert(ssGet(ctx, other) == nil, "a read buys 1800 s and no more: 1801 s after the last read the session must be gone")
+}
+
+func CheckDestroyAndUnknown(ctx *harness.Ctx) {
+	a := ssCreate(ctx, "ana", map[string]string{"theme": "dark"})
+	b := ssCreate(ctx, "bo", map[string]string{"theme": "light"})
+	ssDestroy(ctx, a)
+	ctx.Equal(ctx.Redis.Exists("sess:"+a), 0, "destroy must DEL sess:{sid}")
+	ctx.Assert(ssGet(ctx, a) == nil, "get after destroy must return nil")
+	ctx.Equal(ssTouch(ctx, a), false, "touch after destroy must return false")
+	got := ssGet(ctx, b)
+	ctx.Assert(got != nil && got["theme"] == "light", "destroying one session must not touch another")
+	ssDestroy(ctx, a) // idempotent
+	ctx.Assert(ssGet(ctx, ssNobody) == nil, "get on an id that was never created must return nil")
+	ctx.Equal(ssTouch(ctx, ssNobody), false, "touch on an id that was never created must return false")
+	ctx.Equal(ctx.Redis.Keys("*"), []string{"sess:" + b}, "a miss must create no key: only sess:{b} may exist")
+}
+`,
   },
   debrief: `The store is two commands and an ordering. \`HSET\` plus \`EXPIRE\` inside one \`MULTI\` means a crash between the write and the TTL can never leave an immortal session — the hash and its lifetime land together or not at all. \`HGETALL\` followed by \`EXPIRE\` is the slide: the TTL measures *idle time*, so an active user is never logged out mid-session and an abandoned tab is gone 30 minutes after its last request, with Redis doing the eviction and nobody running a sweeper. \`touch\` is that same \`EXPIRE\` alone, and its 0/1 reply doubles as "does this session exist" — the reason an unknown or expired id never creates a key is that neither \`HGETALL\` nor \`EXPIRE\` writes anything for a missing key. The id is 128 bits from a cryptographic source, which is what makes a cookie unguessable; a counter or a timestamp would let anyone enumerate live sessions. Real systems add an absolute lifetime next to the idle one (a second field compared at read time, or a shorter \`EXPIRE\` ceiling), rotate the id at login against session fixation, keep a per-user set of ids so "log out everywhere" is one \`SMEMBERS\` and a few \`DEL\`s, and sign the cookie so a tampered id is rejected before Redis is asked.`,
 };

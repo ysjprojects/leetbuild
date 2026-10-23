@@ -762,6 +762,152 @@ export async function check_commit_after_post(ctx) {
   assert.equal(ctx.kafka.lag('ledger', 'payments'), 0);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+
+	"github.com/segmentio/kafka-go"
+
+	"leetbuild/harness"
+
+	"payments/ledger"
+)
+
+var errLedgerDown = errors.New("ledger database down")
+
+func seedCaptured(ctx *harness.Ctx, eventIDs ...string) {
+	for _, id := range eventIDs {
+		event, _ := json.Marshal(map[string]any{"event_id": id, "type": "payment.captured", "merchant_id": "m-42", "order_id": "o-" + id, "amount_cents": 4999, "currency": "EUR"})
+		ctx.Kafka.Seed("payments", "m-42", event)
+	}
+}
+
+// consumeLedger runs the learner's loop until it waits for records that will not come, then stops it.
+func consumeLedger(ctx *harness.Ctx) error {
+	c, cancel := context.WithCancel(context.Background())
+	var err error
+	ctx.Drain(func() { err = run(c) })
+	cancel()
+	ctx.Settle()
+	return err
+}
+
+func mustConsume(ctx *harness.Ctx) {
+	err := consumeLedger(ctx)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		ctx.Fatalf("run returned an error: %v", err)
+	}
+}
+
+func postedIDs() []string {
+	ids := []string{}
+	for _, e := range ledger.Posted {
+		ids = append(ids, e.EventID)
+	}
+	return ids
+}
+
+func CheckGroupManualCommit(ctx *harness.Ctx) {
+	seedCaptured(ctx, "e1")
+	mustConsume(ctx)
+	subscriptions := ctx.Kafka.EventsOf("subscribe")
+	ctx.Assert(len(subscriptions) > 0, "the consumer must subscribe to a topic")
+	last := subscriptions[len(subscriptions)-1]
+	ctx.Equal(last.Group, "ledger", "GroupID")
+	subscribed := false
+	for _, t := range last.Topics {
+		subscribed = subscribed || t == "payments"
+	}
+	ctx.Assert(subscribed, "the consumer must subscribe to payments, got %v", last.Topics)
+	consumers := ctx.Kafka.Consumers()
+	ctx.Equal(consumers[len(consumers)-1].AutoCommit, false, "auto-commit is on: offsets would be acknowledged before the post; AutoCommit")
+	ctx.Equal(len(ctx.Kafka.EventsOf("auto-commit")), 0, "offsets were auto-committed: auto-commit events")
+	ctx.Assert(len(ctx.Kafka.EventsOf("manual-commit")) > 0, "no explicit commit happened")
+	ctx.Equal(ctx.Kafka.Lag("ledger", "payments"), 0, "every processed record must be committed: lag")
+}
+
+func CheckDedupeNx(ctx *harness.Ctx) {
+	ctx.Redis.Set("applied:e2", "1", "EX", 600000) // applied by an earlier run of the ledger
+	seedCaptured(ctx, "e1", "e2", "e3")
+	// Another ledger replica claims e3 right after the first command that touches its key.
+	claimedByReplica := false
+	ctx.Redis.After("applied:e3", func() any {
+		claimedByReplica = ctx.Redis.Set("applied:e3", "1", "EX", 604800, "NX")
+		return claimedByReplica
+	})
+	mustConsume(ctx)
+	ctx.Equal(ctx.Redis.Exists("applied:e1"), 1, "after posting e1 the claim applied:e1 must exist")
+	ttl := ctx.Redis.TTL("applied:e1")
+	ctx.Assert(604000 <= ttl && ttl <= 604800, "applied:e1 has TTL %d, expected 604800 s (7 days)", ttl)
+	var withoutE3 []string
+	for _, id := range postedIDs() {
+		if id != "e3" {
+			withoutE3 = append(withoutE3, id)
+		}
+	}
+	ctx.Equal(withoutE3, []string{"e1"}, "e2 was already applied and must be skipped, e1 must be posted once; the ledger posted %v", postedIDs())
+	ctx.Assert(ctx.Redis.TTL("applied:e2") <= 600000, "the claim of an already applied event must not be overwritten (SetNX, not Set)")
+	if claimedByReplica {
+		for _, id := range postedIDs() {
+			ctx.Assert(id != "e3", "another replica claimed applied:e3 between your read and your write and both posted e3: the claim must be one atomic SetNX")
+		}
+	} else {
+		posted := postedIDs()
+		ctx.Assert(len(posted) > 0, "the ledger posted nothing")
+		ctx.Equal(posted[1:], []string{"e3"}, "the replica that won the SetNX must post e3; the ledger posted after e1")
+	}
+}
+
+func CheckDedupeBeforePost(ctx *harness.Ctx) {
+	seedCaptured(ctx, "e1")
+	var claimedAtPost []int64
+	realPost := ledger.Post
+	ledger.Post = func(c context.Context, event ledger.Event) error {
+		claimedAtPost = append(claimedAtPost, ctx.Redis.Exists("applied:"+event.EventID))
+		return realPost(c, event)
+	}
+	mustConsume(ctx)
+	ctx.Assert(len(claimedAtPost) > 0, "ledger.Post never ran for e1")
+	ctx.Equal(claimedAtPost, []int64{1}, "when ledger.Post ran, applied:e1 must already be claimed (SetNX before the post): Exists at each post")
+}
+
+func CheckSkipStillCommits(ctx *harness.Ctx) {
+	seedCaptured(ctx, "e1", "e2", "e1") // the relay replayed e1: a duplicate with a new offset
+	mustConsume(ctx)
+	ctx.Equal(postedIDs(), []string{"e1", "e2"}, "each event exactly once, the replayed e1 skipped; the ledger posted")
+	ctx.Equal(ctx.Kafka.Lag("ledger", "payments"), 0, "the skipped duplicate's offset must be committed too, or it is redelivered forever: records not committed")
+}
+
+func CheckCommitAfterPost(ctx *harness.Ctx) {
+	seedCaptured(ctx, "e1")
+	var atCommit []int
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, len(ledger.Posted)) })
+	mustConsume(ctx)
+	ctx.Assert(len(atCommit) > 0, "the offset of e1 was never committed")
+	ctx.Equal(atCommit[0], 1, "the commit must come after ledger.Post: posts at commit time")
+	seedCaptured(ctx, "e2")
+	realPost := ledger.Post
+	ledger.Post = func(context.Context, ledger.Event) error { return errLedgerDown }
+	if err := consumeLedger(ctx); err != nil && !errors.Is(err, errLedgerDown) && !errors.Is(err, context.Canceled) {
+		ctx.Fatalf("run returned an error: %v", err)
+	}
+	_, claimed := ctx.Redis.Get("applied:e2")
+	ctx.Assert(!claimed, "when the post fails the claim applied:e2 must be released (Del), or no retry will ever post it")
+	ctx.Equal(ctx.Kafka.Lag("ledger", "payments"), 1, "a record whose post failed must not be committed (it has to come back): records not committed")
+	// restart the consumer (a fresh replica; the ledger is back): e1 is deduped by its claim, e2 is redelivered and posted this time
+	ledger.Post = realPost
+	before := len(ledger.Posted)
+	config := reader.Config()
+	_ = reader.Close()
+	reader = kafka.NewReader(config)
+	mustConsume(ctx)
+	ctx.Equal(postedIDs()[before:], []string{"e2"}, "after a restart only the retried e2 must be posted; the ledger posted")
+	ctx.Equal(ctx.Kafka.Lag("ledger", "payments"), 0, "records not committed after the restart")
+}
+`,
   },
   debrief: `The consumer owns its delivery guarantee: at-least-once from the broker (commit after the work) plus a claim keyed by the event's own id turns duplicates into no-ops. The claim is in Redis for speed, but notice its weak spot — a crash between the SET and the post leaves a claimed, unposted event until the TTL. Real ledgers close that gap by making the post itself idempotent (a unique index on \`event_id\` in the journal, insert-or-ignore) so the Redis claim is only a fast path, and they commit offsets in batches once the whole poll was applied.`,
 };

@@ -1513,6 +1513,264 @@ export async function check_complete(ctx) {
   await stop(ctx, world);
 }
 `,
+    go: `package main
+
+import (
+	"fmt"
+	"sort"
+	"sync"
+
+	"leetbuild/harness"
+)
+
+// ackGates is the harness's handler: every record waits on its own gate, so the harness decides the
+// completion order. Each handler runs on its own goroutine, so records start in any order.
+type ackGates struct {
+	mu        sync.Mutex
+	gates     map[string]chan struct{}
+	opened    map[string]bool
+	started   []string
+	completed []string
+}
+
+func newAckGates() *ackGates {
+	return &ackGates{gates: map[string]chan struct{}{}, opened: map[string]bool{}}
+}
+
+func (g *ackGates) gate(value string) chan struct{} {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.gates[value] == nil {
+		g.gates[value] = make(chan struct{})
+	}
+	return g.gates[value]
+}
+
+func (g *ackGates) handler(value string) error {
+	g.mu.Lock()
+	g.started = append(g.started, value)
+	g.mu.Unlock()
+	<-g.gate(value)
+	g.mu.Lock()
+	g.completed = append(g.completed, value)
+	g.mu.Unlock()
+	return nil
+}
+
+func (g *ackGates) open(values ...string) {
+	for _, value := range values {
+		gate := g.gate(value)
+		g.mu.Lock()
+		if !g.opened[value] {
+			g.opened[value] = true
+			close(gate)
+		}
+		g.mu.Unlock()
+	}
+}
+
+// snapshot is what started and completed so far, each sorted.
+func (g *ackGates) snapshot() (started, completed []string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	started = append([]string{}, g.started...)
+	completed = append([]string{}, g.completed...)
+	sort.Strings(started)
+	sort.Strings(completed)
+	return started, completed
+}
+
+func (g *ackGates) running() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.started) - len(g.completed)
+}
+
+func seedRequests(ctx *harness.Ctx, n, partition int, prefix string) []string {
+	var values []string
+	for i := range n {
+		value := fmt.Sprintf("%s%d", prefix, i)
+		values = append(values, value)
+		ctx.Kafka.SeedPartition("requests", partition, nil, value)
+	}
+	return values
+}
+
+func sortedCopy(values []string) []string {
+	out := append([]string{}, values...)
+	sort.Strings(out)
+	return out
+}
+
+// startConsumer runs the learner's loop and lets it settle with the clock held; the channel closes when run returns.
+func startConsumer(ctx *harness.Ctx, g *ackGates) chan struct{} {
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		run(g.handler)
+	}()
+	ctx.Tick()
+	return runDone
+}
+
+func stopConsumer(ctx *harness.Ctx, runDone chan struct{}) {
+	ctx.Drain(func() { shutdown() })
+	ctx.Tick()
+	ctx.Drain(func() { <-runDone })
+	ctx.Assert(len(ctx.Kafka.EventsOf("close")) > 0, "shutdown() must close the consumer")
+}
+
+func CheckConcurrency(ctx *harness.Ctx) {
+	values := seedRequests(ctx, 20, 0, "r")
+	g := newAckGates()
+	runDone := startConsumer(ctx, g)
+	started, _ := g.snapshot()
+	ctx.Equal(started, sortedCopy(values[:8]), "with every handler still running exactly concurrency = 8 records may be started")
+	running, _ := stats()
+	ctx.Equal(running, 8, "stats() must count 8 in flight while 8 handlers run")
+	g.open("r0")
+	ctx.Tick()
+	started, _ = g.snapshot()
+	ctx.Equal(started, sortedCopy(values[:9]), "one completion frees exactly one slot: the 9th record starts, no more")
+	ctx.Equal(g.running(), 8, "handlers running after one finished and one started")
+	g.open(values...)
+	ctx.Tick()
+	_, completed := g.snapshot()
+	ctx.Assert(g.running() == 0 && len(completed) == 20, "every record must be handled once the gates open: %d of 20 completed, %d running", len(completed), g.running())
+	stopConsumer(ctx, runDone)
+	ctx.Equal(ctx.Kafka.CommittedOffset(group, "requests", 0), 20, "with everything finished the committed offset")
+	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "auto-commit is on: offsets were committed on a timer, not by the tracker")
+}
+
+func CheckFrontier(ctx *harness.Ctx) {
+	values := seedRequests(ctx, 12, 0, "r")
+	g := newAckGates()
+	lowestUnfinished := func() int64 {
+		_, completed := g.snapshot()
+		done := map[string]bool{}
+		for _, value := range completed {
+			done[value] = true
+		}
+		for i := range 12 {
+			if !done[fmt.Sprintf("r%d", i)] {
+				return int64(i)
+			}
+		}
+		return 12
+	}
+	var violations [][2]int64
+	ctx.Kafka.OnCommit(func(_ string, offsets harness.KafkaOffsets) {
+		offset, ok := offsets[harness.KafkaTopicPartition{Topic: "requests", Partition: 0}]
+		if lowest := lowestUnfinished(); ok && offset > lowest {
+			violations = append(violations, [2]int64{offset, lowest})
+		}
+	})
+	runDone := startConsumer(ctx, g)
+	for _, value := range []string{"r3", "r1", "r0", "r6", "r5", "r2", "r4", "r9", "r7", "r11", "r8", "r10"} {
+		g.open(value)
+		ctx.Tick()
+		if len(violations) > 0 {
+			ctx.Fatalf("offset %d was committed while offset %d was still running: the commit passed an unfinished record", violations[0][0], violations[0][1])
+		}
+		committedNow := ctx.Kafka.CommittedOffset(group, "requests", 0)
+		ctx.Assert(max(committedNow, 0) <= lowestUnfinished(), "committed %d but offset %d is still running", committedNow, lowestUnfinished())
+	}
+	ctx.Equal(ctx.Kafka.CommittedOffset(group, "requests", 0), 12, "once every record has finished the committed offset must reach 12")
+	stopConsumer(ctx, runDone)
+	_, completed := g.snapshot()
+	ctx.Equal(completed, sortedCopy(values), "each record must be handled exactly once")
+}
+
+func CheckGap(ctx *harness.Ctx) {
+	seedRequests(ctx, 5, 0, "a")
+	seedRequests(ctx, 3, 1, "b")
+	g := newAckGates()
+	runDone := startConsumer(ctx, g)
+	g.open("a1", "a2", "a3", "a4", "b0", "b1", "b2")
+	ctx.Tick()
+	ctx.Equal(ctx.Kafka.CommittedOffset(group, "requests", 1), 3, "partition 1 is fully done: it must be committed to 3 while partition 0 waits")
+	p0 := ctx.Kafka.CommittedOffset(group, "requests", 0)
+	ctx.Assert(p0 == -1 || p0 == 0, "a0 is still running: partition 0 must not be committed past 0, got %d", p0)
+	running, _ := stats()
+	ctx.Equal(running, 1, "only a0 should be running: stats() in flight")
+	g.open("a0")
+	ctx.Tick()
+	ctx.Equal(ctx.Kafka.CommittedOffset(group, "requests", 0), 5, "a1..a4 were already done when a0 finished: partition 0 must jump to 5")
+	var onP0 []int64
+	for _, commit := range ctx.Kafka.Commits(group) {
+		if offset, ok := commit[harness.KafkaTopicPartition{Topic: "requests", Partition: 0}]; ok {
+			onP0 = append(onP0, offset)
+		}
+	}
+	ctx.Equal(onP0, []int64{5}, "partition 0 must be committed exactly once, straight to 5 — never 1, 2, 3 or 4 while a0 ran: its commits")
+	_, committedNow := stats()
+	ctx.Equal(committedNow, map[int32]int64{0: 5, 1: 3}, "stats() committed")
+	stopConsumer(ctx, runDone)
+}
+
+func CheckShutdown(ctx *harness.Ctx) {
+	seedRequests(ctx, 6, 0, "r")
+	g := newAckGates()
+	runDone := startConsumer(ctx, g)
+	g.open("r0", "r1", "r3", "r4", "r5")
+	ctx.Tick()
+	ctx.Equal(ctx.Kafka.CommittedOffset(group, "requests", 0), 2, "r2 still runs: the frontier")
+	shutDone := make(chan struct{})
+	go func() {
+		defer close(shutDone)
+		shutdown()
+	}()
+	ctx.Tick()
+	select {
+	case <-shutDone:
+		ctx.Fatalf("shutdown() must wait for the handler still running (r2), not return under it")
+	default:
+	}
+	ctx.Assert(len(ctx.Kafka.EventsOf("close")) == 0, "the consumer was closed while a handler was still running")
+	ctx.Equal(ctx.Kafka.CommittedOffset(group, "requests", 0), 2, "shutdown() must not commit past the frontier while r2 runs")
+	g.open("r2")
+	ctx.Tick()
+	returned := ctx.Drain(func() { <-shutDone })
+	ctx.Assert(returned, "shutdown() must return once the last in-flight handler has finished")
+	ctx.Equal(ctx.Kafka.CommittedOffset(group, "requests", 0), 6, "after shutdown the committed offset must equal the contiguous frontier")
+	ctx.Assert(len(ctx.Kafka.EventsOf("close")) > 0, "shutdown() must close the consumer")
+	running, _ := stats()
+	ctx.Equal(running, 0, "nothing may be in flight after shutdown: stats() in flight")
+	ctx.Drain(func() { <-runDone })
+}
+
+func CheckComplete(ctx *harness.Ctx) {
+	var values []string
+	for i := range 30 {
+		value := fmt.Sprintf("req-%d", i)
+		values = append(values, value)
+		ctx.Kafka.Seed("requests", value, value)
+	}
+	g := newAckGates()
+	runDone := startConsumer(ctx, g)
+	for i := len(values) - 1; i >= 0; i-- {
+		g.open(values[i])
+	}
+	ctx.Tick()
+	started, completed := g.snapshot()
+	ctx.Equal(started, sortedCopy(values), "each record must reach the handler exactly once")
+	ctx.Equal(completed, sortedCopy(values), "each record must finish exactly once")
+	ends := map[int32]int64{}
+	for p := range 3 {
+		if end := ctx.Kafka.EndOffset("requests", p); end > 0 {
+			ends[int32(p)] = end
+		}
+	}
+	for p, end := range ends {
+		ctx.Equal(ctx.Kafka.CommittedOffset(group, "requests", int(p)), end, "partition %d must be committed to its end %d", p, end)
+	}
+	ctx.Equal(ctx.Kafka.Lag(group, "requests"), 0, "nothing may be left uncommitted: lag")
+	running, committedNow := stats()
+	ctx.Equal(committedNow, ends, "stats() committed")
+	ctx.Equal(running, 0, "stats() in flight")
+	stopConsumer(ctx, runDone)
+}
+`,
   },
   debrief: `Kafka has no per-record acknowledgement: a partition's committed offset is one number that promises "everything below this is done". Serial consumers keep that promise by construction; the moment handlers overlap, completion order and delivery order part ways, and a consumer that commits \`offset + 1\` whenever something finishes will, sooner or later, commit past a record that is still running — a crash then replays nothing and the record is gone. The tracker turns a set of completions back into that one number: the frontier only moves across finished offsets, so a slow record pins it and the finished offsets above it wait in the set until it clears, then the commit jumps in one step. The bound on in-flight handlers is what keeps that set small and the replay-after-crash window bounded; the shutdown waits so that work already done is committed rather than redone. Real systems add what this drill leaves out: Confluent's Parallel Consumer encodes the finished-above-the-frontier set into the commit metadata so a restart skips what was already done, orders work by key inside a partition, and keeps heartbeating (or pauses partitions) while the loop waits at the limit so the group coordinator does not evict a consumer that is merely busy.`,
 };

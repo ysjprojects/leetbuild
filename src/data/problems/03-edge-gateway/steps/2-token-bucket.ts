@@ -793,6 +793,135 @@ export async function check_deny_429(ctx) {
   assert.equal(r.headers['x-ratelimit-remaining'], '0', \`X-RateLimit-Remaining on a 429 is \${JSON.stringify(r.headers['x-ratelimit-remaining'])}, expected 0\`);
 }
 `,
+    go: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+
+	"leetbuild/harness"
+)
+
+// bucketGateway is rateLimit wrapped around a route the harness registers, counting what got through.
+type bucketGateway struct {
+	served []string
+	http   *harness.HTTP
+}
+
+func newBucketGateway(ctx *harness.Ctx) *bucketGateway {
+	g := &bucketGateway{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /items/{id}", func(rw http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		g.served = append(g.served, id)
+		rw.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(rw).Encode(map[string]string{"id": id})
+	})
+	g.http = ctx.HTTP(rateLimit(mux))
+	return g
+}
+
+func (g *bucketGateway) burst(n int, header ...string) []int {
+	if len(header) == 0 {
+		header = []string{"X-API-Key", "k1"}
+	}
+	statuses := make([]int, 0, n)
+	for range n {
+		statuses = append(statuses, g.http.Get("/items/42", header...).Status)
+	}
+	return statuses
+}
+
+// bucketStatuses is n copies of status, then the tail.
+func bucketStatuses(n, status int, tail ...int) []int {
+	out := make([]int, 0, n+len(tail))
+	for range n {
+		out = append(out, status)
+	}
+	return append(out, tail...)
+}
+
+func CheckKey(ctx *harness.Ctx) {
+	g := newBucketGateway(ctx)
+	g.http.Get("/items/42", "X-API-Key", "k1")
+	g.http.Get("/items/42", "X-API-Key", "k2")
+	g.http.Get("/items/42")
+	for _, key := range []string{"bucket:k1", "bucket:k2", "bucket:anonymous"} {
+		kind := ctx.Redis.Type(key)
+		ctx.Assert(kind == "hash", "%s is %q after a request (keys: %q), expected a hash with tokens and ts", key, kind, ctx.Redis.Keys("*"))
+		fields := ctx.Redis.HGetAll(key)
+		_, hasTokens := fields["tokens"]
+		_, hasTS := fields["ts"]
+		ctx.Assert(hasTokens && hasTS, "%s has fields %v, expected tokens and ts", key, fields)
+	}
+	tokens, _ := ctx.Redis.HGet("bucket:k1", "tokens")
+	n, _ := strconv.ParseFloat(tokens, 64)
+	ctx.Assert(n == 9, "bucket:k1 holds %q tokens after one request, expected burst - 1 = 9", tokens)
+}
+
+func CheckAtomicLua(ctx *harness.Ctx) {
+	g := newBucketGateway(ctx)
+	// Another gateway replica lands right after the first command that touches the bucket — between a
+	// client-side read and its write-back — and spends the whole bucket.
+	ctx.Redis.After("bucket:k1", func() any {
+		ts, ok := ctx.Redis.HGet("bucket:k1", "ts")
+		if !ok {
+			ts = fmt.Sprint(float64(ctx.Clock.Now()) / 1000)
+		}
+		return ctx.Redis.Do("HSET", "bucket:k1", "tokens", 0, "ts", ts)
+	})
+	first := g.http.Get("/items/42", "X-API-Key", "k1")
+	ctx.Equal(first.Status, 200, "the first request on a fresh key (%s)", first.Text())
+	ctx.Equal(ctx.Redis.Type("bucket:k1"), "hash", "the request wrote no bucket:k1 hash; its type")
+	tokens, _ := ctx.Redis.HGet("bucket:k1", "tokens")
+	n, _ := strconv.ParseFloat(tokens, 64)
+	ctx.Assert(n == 0, "bucket:k1 holds %q tokens after another replica emptied it between your read and your write: the replica's update was lost. Refill and take must run inside one EVAL/EVALSHA script, not as HMGET … HSET from the client", tokens)
+	second := g.http.Get("/items/42", "X-API-Key", "k1")
+	ctx.Equal(second.Status, 429, "with the bucket emptied by another replica the next request (two gateways saw the same last token)")
+}
+
+func CheckRefillCapped(ctx *harness.Ctx) {
+	g := newBucketGateway(ctx)
+	ctx.Equal(g.burst(11), bucketStatuses(10, 200, 429), "a fresh key gets a full burst of 10, then 429")
+	ctx.Clock.Advance(1.0)
+	ctx.Equal(g.burst(6), bucketStatuses(5, 200, 429), "one second at rate 5 refills 5 tokens, so 5 allowed then 429")
+	ctx.Clock.Advance(100.0)
+	ctx.Equal(g.burst(11), bucketStatuses(10, 200, 429), "after 100 idle seconds the bucket is capped at burst (10), not 500")
+}
+
+func CheckTakeOne(ctx *harness.Ctx) {
+	g := newBucketGateway(ctx)
+	var remaining []string
+	for range 3 {
+		remaining = append(remaining, g.http.Get("/items/42", "X-API-Key", "k1").Header.Get("X-RateLimit-Remaining"))
+	}
+	ctx.Equal(remaining, []string{"9", "8", "7"}, "X-RateLimit-Remaining over three requests (one token each)")
+	g.burst(7)
+	ctx.Equal(g.burst(5), bucketStatuses(5, 429), "with the bucket empty every request is denied")
+	tokens, _ := ctx.Redis.HGet("bucket:k1", "tokens")
+	n, err := strconv.ParseFloat(tokens, 64)
+	ctx.Assert(err == nil && n >= 0, "bucket:k1 holds %q tokens after denied requests: a denial must not take a token", tokens)
+	ctx.Clock.Advance(0.4)
+	ctx.Equal(g.burst(3), []int{200, 200, 429}, "0.4 s at rate 5 is exactly 2 tokens (a bucket pushed negative by denials would refill less)")
+}
+
+func CheckDeny429(ctx *harness.Ctx) {
+	g := newBucketGateway(ctx)
+	for range 10 {
+		r := g.http.Get("/items/42", "X-API-Key", "k1")
+		ctx.Equal(r.Status, 200, "a request within the burst")
+	}
+	before := len(g.served)
+	r := g.http.Get("/items/42", "X-API-Key", "k1")
+	other := g.http.Get("/items/42", "X-API-Key", "k2")
+	ctx.Equal(r.Status, 429, "the 11th request on an empty bucket")
+	ctx.Assert(len(g.served) == before+1 && other.Status == 200, "a denied request must not reach the route, and other keys must be unaffected")
+	ctx.Equal(r.Header.Get("Retry-After"), "1", "Retry-After (ceil(1 / rate) seconds until one token refills)")
+	ctx.Equal(r.Header.Get("X-RateLimit-Remaining"), "0", "X-RateLimit-Remaining on a 429")
+}
+`,
   },
   debrief: `A token bucket is two numbers and a clock, which is why it fits in a Redis hash and a dozen lines of Lua. Putting the refill and the take in the script is the whole point: Redis runs scripts one at a time, so every replica of the gateway shares one correct counter without a lock. The \`EXPIRE\` keeps idle keys from living forever, and \`Retry-After\` turns a rejection into advice. Real gateways add a per-route and a global bucket, fail open when Redis is unreachable, and pass \`now\` from the client (as here) rather than calling \`TIME\` inside the script so it stays deterministic under replication.`,
 };

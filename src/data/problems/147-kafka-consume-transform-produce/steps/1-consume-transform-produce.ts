@@ -1247,6 +1247,297 @@ export async function check_replay_dedupable(ctx) {
   assert.equal([...bySource.values()].filter(c => c.length > 1).length, landed, 'the records that landed on the failed attempt must appear twice, with the same headers both times');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"sort"
+	"strings"
+
+	"github.com/segmentio/kafka-go"
+
+	"leetbuild/harness"
+)
+
+// cleanEvents are seven records over four keys: ana's three must stay in this order on one partition of clean.
+var cleanEvents = [][2]string{{"ana", " hello "}, {"bo", "x"}, {"ana", "world"}, {"cy", "ok"}, {"bo", "y"}, {"ana", "!"}, {"dee", "z"}}
+
+var decimalRe = regexp.MustCompile("^[0-9]+$")
+
+func cleanTransform(value string) string { return strings.ToUpper(strings.TrimSpace(value)) }
+
+func seedRaw(ctx *harness.Ctx) []harness.KafkaRecord {
+	var seeded []harness.KafkaRecord
+	for _, e := range cleanEvents {
+		seeded = append(seeded, ctx.Kafka.Seed(rawTopic, e[0], e[1]))
+	}
+	return seeded
+}
+
+// runCleaner runs the learner's loop until it waits for input, then stops it (cancels its context):
+// the open batch is finished before run returns.
+func runCleaner(ctx *harness.Ctx) error {
+	stop, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- run(stop, cleanTransform) }()
+	ctx.Settle()
+	cancel()
+	var err error
+	ctx.Drain(func() {
+		e := <-done
+		err = e
+	})
+	return err
+}
+
+// runFails: run must fail with ErrBatchFailed; anything else is a verdict.
+func runFails(ctx *harness.Ctx) {
+	err := runCleaner(ctx)
+	ctx.Assert(err != nil, "run returned nil although a record of the batch was never acknowledged: the batch must fail (ErrBatchFailed) and nothing of it be committed")
+	ctx.ErrorIs(err, ErrBatchFailed, "run failed with another error than ErrBatchFailed")
+}
+
+// cleanHome is the partition of clean the writer's Hash balancer puts key on.
+func cleanHome(ctx *harness.Ctx, key []byte) int {
+	partitions := make([]int, ctx.Kafka.Partitions(cleanTopic))
+	for i := range partitions {
+		partitions[i] = i
+	}
+	return (&kafka.Hash{}).Balance(kafka.Message{Key: key}, partitions...)
+}
+
+// sourceOf is "src_partition/src_offset" of a clean record; it asserts the headers are there.
+func sourceOf(ctx *harness.Ctx, r harness.KafkaRecord) string {
+	partition, hasPartition := r.Header("src_partition")
+	offset, hasOffset := r.Header("src_offset")
+	if !hasPartition || !hasOffset {
+		var names []string
+		for _, h := range r.Headers {
+			names = append(names, h.Key)
+		}
+		ctx.Fatalf("clean record %q has headers %q: every record needs src_partition and src_offset", r.Value, names)
+	}
+	ctx.Assert(decimalRe.Match(partition) && decimalRe.Match(offset), "src_partition/src_offset must be decimal strings, got %q/%q", partition, offset)
+	return string(partition) + "/" + string(offset)
+}
+
+func CheckTransformOrder(ctx *harness.Ctx) {
+	seeded := seedRaw(ctx)
+	ctx.NoError(runCleaner(ctx), "run(transform) returned an error")
+	clean := ctx.Kafka.Records(cleanTopic)
+	ctx.Assert(len(clean) == len(seeded), "clean holds %d records for %d raw ones: each raw record becomes exactly one clean record", len(clean), len(seeded))
+	for _, key := range []string{"ana", "bo", "cy", "dee"} {
+		var expected []string
+		for _, e := range cleanEvents {
+			if e[0] == key {
+				expected = append(expected, cleanTransform(e[1]))
+			}
+		}
+		var mine []harness.KafkaRecord
+		for _, r := range clean {
+			if string(r.Key) == key {
+				mine = append(mine, r)
+			}
+		}
+		sort.SliceStable(mine, func(i, j int) bool { return mine[i].Offset < mine[j].Offset })
+		var values []string
+		var partitions []int
+		for _, r := range mine {
+			values = append(values, string(r.Value))
+			if len(partitions) == 0 || partitions[len(partitions)-1] != r.Partition {
+				partitions = append(partitions, r.Partition)
+			}
+		}
+		ctx.Equal(values, expected, "clean records keyed %s (transform(value), in raw order)", key)
+		home := cleanHome(ctx, []byte(key))
+		ctx.Equal(partitions, []int{home}, "partitions of clean holding the records keyed %s: produce under the source key so a key stays on one partition", key)
+	}
+	lag := ctx.Kafka.Lag(group, rawTopic)
+	ctx.Assert(lag == 0, "%d raw record(s) were never committed: finish the open batch before run returns", lag)
+}
+
+func CheckSourceHeaders(ctx *harness.Ctx) {
+	seeded := seedRaw(ctx)
+	ctx.NoError(runCleaner(ctx), "run(transform) returned an error")
+	clean := ctx.Kafka.Records(cleanTopic)
+	ctx.Assert(len(clean) > 0, "nothing reached clean")
+	bySource := map[string]harness.KafkaRecord{}
+	var all []string
+	for _, r := range seeded {
+		src := fmt.Sprintf("%d/%d", r.Partition, r.Offset)
+		bySource[src] = r
+		all = append(all, src)
+	}
+	named := map[string]bool{}
+	for _, r := range clean {
+		source := sourceOf(ctx, r)
+		src, ok := bySource[source]
+		ctx.Assert(ok, "clean record %q points at raw[%s], which does not exist", r.Value, source)
+		ctx.Assert(string(r.Value) == cleanTransform(string(src.Value)) && string(r.Key) == string(src.Key), "clean record %q (key %s) points at raw[%s], whose transform is %q (key %s)", r.Value, r.Key, source, cleanTransform(string(src.Value)), src.Key)
+		named[source] = true
+	}
+	var names []string
+	for source := range named {
+		names = append(names, source)
+	}
+	sort.Strings(names)
+	sort.Strings(all)
+	ctx.Equal(names, all, "the headers of clean must name every raw record")
+}
+
+func CheckCommitAfterAcks(ctx *harness.Ctx) {
+	seeded := seedRaw(ctx)
+	ctx.Kafka.StallFor(cleanTopic, 1) // the broker acknowledges produces to clean one second from now
+	started := ctx.Clock.Now()
+	type commitSeen struct {
+		group string
+		short map[int]int
+		at    float64
+	}
+	var commits []commitSeen
+	ctx.Kafka.OnCommit(func(g string, offsets harness.KafkaOffsets) {
+		// The writer puts a key on the partition its Hash balancer picks: partition p of clean must
+		// already hold at least as many records as the commit covers of the raw records hashing to p.
+		need := map[int]int{}
+		for tp, upto := range offsets {
+			if tp.Topic != rawTopic {
+				continue
+			}
+			for _, r := range seeded {
+				if r.Partition == tp.Partition && r.Offset < upto {
+					need[cleanHome(ctx, r.Key)]++
+				}
+			}
+		}
+		have := map[int]int{}
+		for _, r := range ctx.Kafka.Records(cleanTopic) {
+			have[r.Partition]++
+		}
+		short := map[int]int{}
+		for p, n := range need {
+			if missing := n - have[p]; missing > 0 {
+				short[p] = missing
+			}
+		}
+		commits = append(commits, commitSeen{g, short, float64(ctx.Clock.Now()-started) / 1000})
+	})
+	ctx.NoError(runCleaner(ctx), "run(transform) returned an error")
+	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "auto-commit is on: offsets were committed on a timer, before the records were acknowledged")
+	ctx.Assert(len(commits) > 0, "no offset was ever committed")
+	for _, c := range commits {
+		ctx.Equal(c.group, group, "offsets were committed for the wrong group")
+		ctx.Assert(len(c.short) == 0, "at commit time clean was still missing %v record(s) (per partition) the commit covers: wait for every write before committing", c.short)
+		ctx.Assert(c.at >= 1, "committed %.1f s in, before the broker acknowledged anything (it answers after 1 s): the commit must wait for the acks", c.at)
+	}
+	ctx.Equal(len(ctx.Kafka.Records(cleanTopic)), len(seeded), "records on clean")
+	lag := ctx.Kafka.Lag(group, rawTopic)
+	ctx.Assert(lag == 0, "%d raw record(s) were never committed", lag)
+}
+
+func CheckIdempotent(ctx *harness.Ctx) {
+	seedRaw(ctx)
+	ctx.Kafka.LoseAcks(cleanTopic, 2) // two records are written but their acks never arrive: the producer retries
+	ctx.NoError(runCleaner(ctx), "run(transform) returned an error")
+	// kafka-go has no idempotent producer (the step's Go detail): at least once, identical copies.
+	landed := map[string]bool{}
+	for _, r := range ctx.Kafka.Records(cleanTopic) {
+		landed[string(r.Key)+"="+string(r.Value)] = true
+	}
+	var got, want []string
+	for pair := range landed {
+		got = append(got, pair)
+	}
+	for _, e := range cleanEvents {
+		want = append(want, e[0]+"="+cleanTransform(e[1]))
+	}
+	sort.Strings(got)
+	sort.Strings(want)
+	ctx.Equal(got, want, "distinct key=value records on clean after two lost acks: a retried write must neither lose a record nor change it")
+	lag := ctx.Kafka.Lag(group, rawTopic)
+	ctx.Assert(lag == 0, "%d raw record(s) were never committed", lag)
+}
+
+func CheckFlushTimeout(ctx *harness.Ctx) {
+	seeded := seedRaw(ctx)
+	ctx.Kafka.Stall(cleanTopic) // the broker never acknowledges produces to clean
+	started := ctx.Clock.Now()
+	runFails(ctx)
+	waited := float64(ctx.Clock.Now()-started) / 1000
+	ctx.Assert(waited <= 2.5, "run gave up after %.1f s: a write waits at most flushTimeout (2 s)", waited)
+	commits := ctx.Kafka.Commits(group)
+	ctx.Assert(len(commits) == 0, "offsets were committed (%v) although no record of the batch was acknowledged: the batch would be lost", commits)
+	ctx.Equal(ctx.Kafka.Lag(group, rawTopic), len(seeded), "raw records not committed")
+	ctx.Equal(len(ctx.Kafka.Records(cleanTopic)), 0, "records on clean")
+	ctx.Kafka.Resume(cleanTopic)
+	restart()
+	ctx.NoError(runCleaner(ctx), "run(transform) after restart() returned an error")
+	// kafka-go's Writer keeps the batch the failed run stopped waiting for and delivers it once the
+	// broker answers again, so a record may land twice: count distinct values.
+	distinct := map[string]bool{}
+	for _, value := range ctx.Kafka.Values(cleanTopic) {
+		distinct[value] = true
+	}
+	var got []string
+	for value := range distinct {
+		got = append(got, value)
+	}
+	sort.Strings(got)
+	var want []string
+	for _, e := range cleanEvents {
+		want = append(want, cleanTransform(e[1]))
+	}
+	sort.Strings(want)
+	ctx.Equal(got, want, "after restart() the failed batch must be re-read from the committed offsets and land: values on clean")
+	lag := ctx.Kafka.Lag(group, rawTopic)
+	ctx.Assert(lag == 0, "%d raw record(s) were never committed after the restart", lag)
+}
+
+func CheckReplayDedupable(ctx *harness.Ctx) {
+	seeded := seedRaw(ctx)
+	ctx.Kafka.FailNext(cleanTopic, 1) // the first write fails with a retriable error; the others land
+	runFails(ctx)
+	landed := len(ctx.Kafka.Records(cleanTopic))
+	commits := ctx.Kafka.Commits(group)
+	ctx.Assert(len(commits) == 0, "offsets were committed (%v) although a record of the batch failed: it would be lost", commits)
+	ctx.Assert(landed == len(seeded)-1, "%d records reached clean on the failed attempt, expected the %d whose write did not fail", landed, len(seeded)-1)
+	restart()
+	ctx.NoError(runCleaner(ctx), "run(transform) after restart() returned an error")
+	clean := ctx.Kafka.Records(cleanTopic)
+	lag := ctx.Kafka.Lag(group, rawTopic)
+	ctx.Assert(lag == 0, "%d raw record(s) were never committed after the restart", lag)
+	ctx.Assert(len(clean) == landed+len(seeded), "clean holds %d records after the replay, expected %d from the failed attempt plus %d re-read", len(clean), landed, len(seeded))
+	var sources []string
+	for _, r := range seeded {
+		sources = append(sources, fmt.Sprintf("%d/%d", r.Partition, r.Offset))
+	}
+	sort.Strings(sources)
+	bySource := map[string][]harness.KafkaRecord{}
+	for _, r := range clean {
+		source := sourceOf(ctx, r)
+		bySource[source] = append(bySource[source], r)
+	}
+	var named []string
+	for source := range bySource {
+		named = append(named, source)
+	}
+	sort.Strings(named)
+	ctx.Equal(named, sources, "deduplicated by src_partition/src_offset, clean must name exactly the raw records")
+	twice := 0
+	for source, copies := range bySource {
+		distinct := map[string]bool{}
+		for _, r := range copies {
+			distinct[string(r.Key)+"="+string(r.Value)] = true
+		}
+		ctx.Assert(len(distinct) == 1, "the copies of raw[%s] on clean differ: %v — a replay must produce the same key and value", source, distinct)
+		if len(copies) > 1 {
+			twice++
+		}
+	}
+	ctx.Equal(twice, landed, "the records that landed on the failed attempt must appear twice, with the same headers both times")
+}
+`,
   },
   debrief: `The guarantee is an ordering, not a feature: produce, **flush**, then **commit**. Committing before the acks is at-most-once — a crash between the two loses the batch; committing after is at-least-once — a crash replays it. The two additions make the replay harmless. The **idempotent producer** (\`enable.idempotence\`, which requires \`acks=all\`) gives every record a producer id and a sequence number, so when a produce is written and its acknowledgement is lost, the broker recognises the retry and keeps one copy — the producer's own duplicates never exist. The **source headers** cover the duplicates the producer cannot see: a replay after a crash is a *new* produce of the same source record, and only \`src_partition\`/\`src_offset\` tell a downstream consumer so. Bounding the flush matters as much as ordering it: an unbounded flush on a dead broker holds the partition forever, while a bounded one fails the batch and lets a restart (or a rebalance to another member) try again. Real systems add Kafka transactions when the output and the offsets must move together (\`sendOffsetsToTransaction\`, \`read_committed\` readers), a deduplicating state store downstream keyed by the source headers, rebalance listeners that finish the open batch on revocation, and a dead-letter topic for records the transform rejects — a poison record must not fail the batch forever.`,
 };

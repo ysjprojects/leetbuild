@@ -1,10 +1,11 @@
 /**
  * Main-thread handle on a runtime worker — one per executing language: `prewarm()` when a step
- * that will run opens, `run()` on submit. The workers are `public/py/worker.js` (Python, Pyodide)
- * and `public/ts/worker.js` (TypeScript, esbuild-wasm), ES-module bundles built by
- * `yarn build:runtime` (Pyodide only runs in module workers, which webpack cannot emit here). A run
- * that overshoots its budget (a learner's infinite loop cannot be interrupted from outside the
- * worker) terminates the worker; the next run boots a fresh one.
+ * that will run opens, `run()` on submit. The workers are `public/py/worker.js` (Python, Pyodide),
+ * `public/ts/worker.js` (TypeScript, esbuild-wasm) and `public/go/worker.js` (Go, the yaegi
+ * interpreter in WebAssembly), ES-module bundles built by `yarn build:runtime` (Pyodide only runs in
+ * module workers, which webpack cannot emit here). A run that overshoots its budget (a learner's
+ * infinite loop cannot be interrupted from outside the worker) terminates the worker; the next run
+ * boots a fresh one.
  */
 import type {Language} from '../types';
 import type {Phase, RunJob, RunResult, WorkerIn, WorkerOut} from './types';
@@ -22,12 +23,14 @@ export const RUN_TIMEOUT_MS = 20_000;
 export const RUNTIMES: Partial<Record<Language, {workerUrl: string; firstPhase: Phase}>> = {
   python: {workerUrl: '/py/worker.js', firstPhase: 'pyodide'},
   typescript: {workerUrl: '/ts/worker.js', firstPhase: 'esbuild'},
+  go: {workerUrl: '/go/worker.js', firstPhase: 'go'},
 };
 
 export const STATUS_TEXT: Record<Phase, string> = {
   pyodide: 'starting Python (downloading the runtime, ~10 MB the first time)',
   packages: 'loading FastAPI, Redis, protobuf…',
   esbuild: 'starting TypeScript (downloading the compiler, ~14 MB the first time)',
+  go: 'starting Go (downloading the interpreter, ~9 MB the first time)',
   runtime: 'installing the LeetBuild runtime',
 };
 

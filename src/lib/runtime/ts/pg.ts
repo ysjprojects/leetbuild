@@ -45,6 +45,36 @@ const strip = (e: unknown): string => {
   return text.startsWith('Error: ') ? text.slice(7) : text;
 };
 
+/** The fields of a server error the Go driver turns into a *pq.Error (pg-protocol's DatabaseError, as PGlite throws it). */
+const ERROR_FIELDS = [
+  'severity',
+  'code',
+  'detail',
+  'hint',
+  'position',
+  'internalPosition',
+  'internalQuery',
+  'where',
+  'schema',
+  'table',
+  'column',
+  'dataType',
+  'constraint',
+  'file',
+  'line',
+  'routine',
+] as const;
+
+const errorFields = (e: unknown): Record<string, string> => {
+  const out: Record<string, string> = {message: strip(e)};
+  if (e !== null && typeof e === 'object')
+    for (const key of ERROR_FIELDS) {
+      const value = (e as Record<string, unknown>)[key];
+      if (typeof value === 'string' || typeof value === 'number') out[key] = String(value);
+    }
+  return out;
+};
+
 export class Db {
   bridge: DbBridge | null = null;
   /** BEGIN / COMMIT / ROLLBACK, in order. */
@@ -104,6 +134,37 @@ export class Db {
     } finally {
       release();
     }
+  }
+
+  /** The Go driver's connection hold: the single connection until `release()` (a transaction's BEGIN…COMMIT). */
+  hold(): Promise<() => void> {
+    return new Promise(held => {
+      void this.withConnection(() => new Promise<void>(release => held(release)));
+    });
+  }
+
+  /**
+   * @internal — the Go driver's statement path (goruntime/models/pq/backend.go): the lock and the
+   * learner's statement count as `run`; the reply is DbBridge.queryText's JSON, or the server's
+   * error fields as `{error: {…}}`. The Go side keeps its own query log, events and probes.
+   */
+  async runText(sql: string, args: (string | Uint8Array | null)[], held: boolean, counted: boolean): Promise<string> {
+    if (!held) return this.withConnection(() => this.runText(sql, args, true, counted));
+    if (counted) this.learnerStatements += 1;
+    try {
+      if (args.length === 0 && /;\s*\S/.test(sql.trim().replace(/;\s*$/, ''))) {
+        await this.ready().exec(sql);
+        return JSON.stringify({fields: [], rows: [], affected: 0});
+      }
+      return await this.ready().queryText(sql, args);
+    } catch (e) {
+      return JSON.stringify({error: errorFields(e)});
+    }
+  }
+
+  /** Drop everything and apply `schema`, outside the lock and the logs (the Go harness's DB.Reset). */
+  async resetSchema(schema = ''): Promise<void> {
+    await this.ready().exec('DROP SCHEMA public CASCADE; CREATE SCHEMA public;' + schema);
   }
 
   /** @internal — the statement path every client goes through; `counted: false` is the harness's own statement. */

@@ -384,10 +384,33 @@ import (
 	"time"
 
 	"github.com/segmentio/kafka-go"
+
+	"notify/db"
 )
 
-// Provided by the previous steps (same package): allowed(ctx, userID, id) (bool, error) · getPrefs(ctx, userID) (Prefs, error)
-// · Quiet(prefs, hour) bool · sendPush(ctx, n Notification) error, which wraps ErrRetryable when the gateway asks for a retry.
+// Built in the previous steps: they stand in for those steps' files here.
+
+// allowed reports whether the notification fits the user's hourly budget (step 3).
+var allowed = func(ctx context.Context, userID, notificationID string) (bool, error) { panic("not implemented") }
+
+// getPrefs reads the user's preferences through the Redis cache (step 4).
+var getPrefs = func(ctx context.Context, userID string) (Prefs, error) { panic("not implemented") }
+
+// sendPush delivers n through the push gateway (step 5); the error wraps ErrRetryable when the gateway asks for a retry.
+var sendPush = func(ctx context.Context, n Notification) error { panic("not implemented") }
+
+// ErrRetryable: the push gateway asked for a retry (step 5).
+var ErrRetryable = errors.New("push gateway: retry later")
+
+type Prefs = db.Prefs
+
+// Quiet reports whether hour falls in the user's quiet window (step 4).
+func Quiet(p Prefs, hour int) bool {
+	if p.QuietStart <= p.QuietEnd {
+		return hour >= p.QuietStart && hour < p.QuietEnd
+	}
+	return hour >= p.QuietStart || hour < p.QuietEnd
+}
 
 const (
 	topic       = "notifications"
@@ -452,10 +475,33 @@ import (
 	"time"
 
 	"github.com/segmentio/kafka-go"
+
+	"notify/db"
 )
 
-// Provided by the previous steps (same package): allowed(ctx, userID, id) (bool, error) · getPrefs(ctx, userID) (Prefs, error)
-// · Quiet(prefs, hour) bool · sendPush(ctx, n Notification) error, which wraps ErrRetryable when the gateway asks for a retry.
+// Built in the previous steps: they stand in for those steps' files here.
+
+// allowed reports whether the notification fits the user's hourly budget (step 3).
+var allowed = func(ctx context.Context, userID, notificationID string) (bool, error) { panic("not implemented") }
+
+// getPrefs reads the user's preferences through the Redis cache (step 4).
+var getPrefs = func(ctx context.Context, userID string) (Prefs, error) { panic("not implemented") }
+
+// sendPush delivers n through the push gateway (step 5); the error wraps ErrRetryable when the gateway asks for a retry.
+var sendPush = func(ctx context.Context, n Notification) error { panic("not implemented") }
+
+// ErrRetryable: the push gateway asked for a retry (step 5).
+var ErrRetryable = errors.New("push gateway: retry later")
+
+type Prefs = db.Prefs
+
+// Quiet reports whether hour falls in the user's quiet window (step 4).
+func Quiet(p Prefs, hour int) bool {
+	if p.QuietStart <= p.QuietEnd {
+		return hour >= p.QuietStart && hour < p.QuietEnd
+	}
+	return hour >= p.QuietStart || hour < p.QuietEnd
+}
 
 const (
 	topic       = "notifications"
@@ -1075,6 +1121,313 @@ export async function check_commit_after(ctx) {
   assert(second.length > 0, \`the re-queued record on notifications-retry was never committed, commits were \${JSON.stringify(atCommit)}\`);
   assert.deepEqual(second[0].sent, ['n1'], 'the commit of the retried record came before sendPush delivered it');
   assert(ctx.kafka.lag('delivery', 'notifications') === 0 && ctx.kafka.lag('delivery', 'notifications-retry') === 0, 'every record must end up committed');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"slices"
+	"sort"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+
+	"leetbuild/harness"
+
+	"notify/db"
+	"notify/devices"
+	pb "notify/gen/push"
+)
+
+// seedDelivery puts a notification on topic from another producer, with an attempt header unless attempt < 0; it returns the value.
+func seedDelivery(ctx *harness.Ctx, nid, userID, priority, topic string, attempt int) string {
+	value, _ := json.Marshal(map[string]string{"id": nid, "user_id": userID, "channel": "push", "title": "Shipped", "body": "On its way", "priority": priority})
+	var headers []harness.KafkaHeader
+	if attempt >= 0 {
+		headers = append(headers, harness.KafkaHeader{Key: "attempt", Value: []byte(strconv.Itoa(attempt))})
+	}
+	ctx.Kafka.Seed(topic, userID, value, headers...)
+	return string(value)
+}
+
+// deliveryWorld is what the push gateway saw: the notification ids it delivered, and the
+// DEADLINE_EXCEEDED answers it still owes each notification id.
+type deliveryWorld struct {
+	mu       sync.Mutex
+	sent     []string
+	failures map[string]int
+	hour     int
+	awake    db.Prefs
+}
+
+func (w *deliveryWorld) delivered() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.sent...)
+}
+
+// deliveryGateway delivers (recording the notification id) or answers DEADLINE_EXCEEDED while a notification has failures left.
+type deliveryGateway struct {
+	pb.UnimplementedPushGatewayServer
+	w *deliveryWorld
+}
+
+func (g *deliveryGateway) Send(ctx context.Context, req *pb.SendRequest) (*pb.SendReply, error) {
+	g.w.mu.Lock()
+	defer g.w.mu.Unlock()
+	id := req.GetCollapseKey()
+	for _, v := range []string{req.GetCollapseKey(), req.GetTitle(), req.GetBody(), req.GetDeviceToken()} {
+		if _, ok := g.w.failures[v]; ok {
+			id = v
+			break
+		}
+	}
+	if g.w.failures[id] > 0 {
+		g.w.failures[id]--
+		return nil, status.Error(codes.DeadlineExceeded, "deadline exceeded")
+	}
+	g.w.sent = append(g.w.sent, id)
+	return &pb.SendReply{MessageId: fmt.Sprintf("m-%d", len(g.w.sent))}, nil
+}
+
+var (
+	deliveryRedis   = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+	deliveryConn, _ = grpc.NewClient("push-gateway:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+)
+
+// startDelivery is the worker with the real rate limit, preferences and push client of the previous
+// steps behind it; preferences rows are seeded so no user is in quiet hours unless a check says so.
+func startDelivery(ctx *harness.Ctx) *deliveryWorld {
+	w := &deliveryWorld{failures: map[string]int{}}
+	pb.RegisterPushGatewayServer(ctx.GRPC.Server(""), &deliveryGateway{w: w})
+	w.hour = time.Now().Hour()
+	w.awake = db.Prefs{Push: true, QuietStart: (w.hour + 2) % 24, QuietEnd: (w.hour + 3) % 24} // never quiet right now
+	for _, user := range []string{"u1", "u2", "u-ok", "u-limited", "u-off"} {
+		db.Rows[user] = w.awake
+	}
+	// Step 3: a sliding window of 20 an hour in rl:{user}.
+	allowed = func(c context.Context, userID, notificationID string) (bool, error) {
+		nowMs := time.Now().UnixMilli()
+		key := "rl:" + userID
+		pipe := deliveryRedis.TxPipeline()
+		pipe.ZAdd(c, key, redis.Z{Score: float64(nowMs), Member: notificationID})
+		pipe.ZRemRangeByScore(c, key, "-inf", strconv.FormatInt(nowMs-3_600_000, 10))
+		count := pipe.ZCard(c, key)
+		pipe.Expire(c, key, time.Hour)
+		if _, err := pipe.Exec(c); err != nil {
+			return false, err
+		}
+		if count.Val() > 20 {
+			deliveryRedis.Incr(c, "dropped:"+userID)
+			return false, nil
+		}
+		return true, nil
+	}
+	// Step 4: cache-aside in prefs:{user} over the provided database.
+	getPrefs = func(c context.Context, userID string) (Prefs, error) {
+		key := "prefs:" + userID
+		var p Prefs
+		cached, err := deliveryRedis.Get(c, key).Bytes()
+		if err == nil && json.Unmarshal(cached, &p) == nil {
+			return p, nil
+		}
+		if err != nil && !errors.Is(err, redis.Nil) {
+			return Prefs{}, err
+		}
+		p, err = db.LoadPrefs(c, userID)
+		if err != nil {
+			return Prefs{}, err
+		}
+		encoded, _ := json.Marshal(p)
+		deliveryRedis.Set(c, key, encoded, 10*time.Minute)
+		return p, nil
+	}
+	// Step 5: one device per user (the token is the user id, the collapse key the notification id),
+	// a 3 s deadline, three attempts with jittered backoff.
+	sendPush = func(c context.Context, n Notification) error {
+		client := pb.NewPushGatewayClient(deliveryConn)
+		req := &pb.SendRequest{DeviceToken: n.UserID, Title: n.Title, Body: n.Body, CollapseKey: n.ID}
+		var lastErr error
+		for attempt := range 3 {
+			callCtx, cancel := context.WithTimeout(c, 3*time.Second)
+			_, err := client.Send(callCtx, req)
+			cancel()
+			if err == nil {
+				return nil
+			}
+			switch status.Code(err) {
+			case codes.InvalidArgument, codes.NotFound:
+				devices.Disable(c, n.UserID)
+				return nil
+			case codes.DeadlineExceeded:
+				return fmt.Errorf("%w: %v", ErrRetryable, err)
+			case codes.Unavailable, codes.ResourceExhausted:
+				lastErr = err
+				time.Sleep(200*time.Millisecond<<attempt + time.Duration(rand.Int64N(int64(200*time.Millisecond))))
+			default:
+				return err
+			}
+		}
+		return fmt.Errorf("%w: 3 attempts: %v", ErrRetryable, lastErr)
+	}
+	return w
+}
+
+func drainDelivery(ctx *harness.Ctx) {
+	ctx.Drain(func() { _ = run(context.Background()) })
+}
+
+func deliveryHeader(r harness.KafkaRecord, name string) any {
+	if v, ok := r.Header(name); ok {
+		return string(v)
+	}
+	return nil
+}
+
+func CheckGroupTopics(ctx *harness.Ctx) {
+	seedDelivery(ctx, "n1", "u1", "normal", "notifications", -1)
+	seedDelivery(ctx, "n2", "u1", "normal", "notifications-retry", 1)
+	w := startDelivery(ctx)
+	drainDelivery(ctx)
+	subscriptions := ctx.Kafka.EventsOf("subscribe")
+	ctx.Assert(len(subscriptions) > 0, "the consumer must subscribe to its topics")
+	last := subscriptions[len(subscriptions)-1]
+	ctx.Equal(last.Group, "delivery", "GroupID must be delivery")
+	ctx.Assert(slices.Contains(last.Topics, "notifications") && slices.Contains(last.Topics, "notifications-retry"), "the consumer must subscribe to notifications and notifications-retry, got %v", last.Topics)
+	sent := w.delivered()
+	sort.Strings(sent)
+	ctx.Equal(sent, []string{"n1", "n2"}, "records from both topics must be delivered: sent")
+}
+
+func CheckManualCommit(ctx *harness.Ctx) {
+	seedDelivery(ctx, "n1", "u1", "normal", "notifications", -1)
+	seedDelivery(ctx, "n2", "u2", "normal", "notifications", -1)
+	startDelivery(ctx)
+	drainDelivery(ctx)
+	consumers := ctx.Kafka.Consumers()
+	ctx.Assert(len(consumers) > 0 && !consumers[len(consumers)-1].AutoCommit, "the reader commits on its own (ReadMessage, or a CommitInterval): offsets would be committed before the outcome, not after it")
+	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "auto-commit is on: offsets were committed on their own, before the outcome")
+	ctx.Assert(len(ctx.Kafka.EventsOf("manual-commit")) > 0, "no explicit commit happened")
+	ctx.Equal(ctx.Kafka.Lag("delivery", "notifications"), 0, "every processed record must be committed: lag of notifications")
+}
+
+func CheckGate(ctx *harness.Ctx) {
+	seedDelivery(ctx, "n-ok", "u-ok", "normal", "notifications", -1)
+	seedDelivery(ctx, "n-limited", "u-limited", "normal", "notifications", -1)
+	seedDelivery(ctx, "n-off", "u-off", "normal", "notifications", -1)
+	seedDelivery(ctx, "n-quiet", "u-quiet", "normal", "notifications", -1)
+	seedDelivery(ctx, "n-urgent", "u-quiet", "high", "notifications", -1)
+	w := startDelivery(ctx)
+	for i := range 20 {
+		ctx.Redis.Do("ZADD", "rl:u-limited", ctx.Clock.Now(), fmt.Sprintf("earlier-%d", i)) // the hourly budget is spent
+	}
+	off := w.awake
+	off.Push = false
+	db.Rows["u-off"] = off
+	db.Rows["u-quiet"] = db.Prefs{Push: true, QuietStart: w.hour, QuietEnd: w.hour + 1} // quiet hours right now
+	drainDelivery(ctx)
+	_, scored := ctx.Redis.ZScore("rl:u-ok", "n-ok")
+	ctx.Assert(scored, "allowed(ctx, userID, id) must be consulted for every record: rl:u-ok holds %v, expected n-ok", ctx.Redis.ZRangeWithScores("rl:u-ok", 0, -1))
+	_, cached := ctx.Redis.Get("prefs:u-ok")
+	ctx.Assert(cached, "getPrefs(ctx, userID) must be consulted: prefs:u-ok was never cached, keys are %v", ctx.Redis.Keys("prefs:*"))
+	sent := w.delivered()
+	ctx.Assert(slices.Contains(sent, "n-ok"), "an allowed notification with push on outside quiet hours must be sent, sent %v", sent)
+	ctx.Assert(!slices.Contains(sent, "n-limited"), "a rate-limited notification must not be sent")
+	ctx.Assert(!slices.Contains(sent, "n-off"), "a user with push off must not get a notification")
+	ctx.Assert(!slices.Contains(sent, "n-quiet"), "a normal notification in quiet hours must not be sent: u-quiet's quiet window is the current hour (%d), pass Quiet(prefs, hour) the current hour (0-23)", w.hour)
+	ctx.Assert(slices.Contains(sent, "n-urgent"), "a high-priority notification ignores quiet hours, sent %v", sent)
+	ctx.Equal(ctx.Kafka.Lag("delivery", "notifications"), 0, "skipped notifications are an outcome too (they must be committed): lag of notifications")
+}
+
+func CheckRetryTopic(ctx *harness.Ctx) {
+	original := seedDelivery(ctx, "n1", "u1", "normal", "notifications", -1)
+	seedDelivery(ctx, "n2", "u2", "normal", "notifications-retry", 4)
+	w := startDelivery(ctx)
+	w.failures["n1"] = 1
+	w.failures["n2"] = 1
+	drainDelivery(ctx)
+	retried := ctx.Kafka.Records("notifications-retry")
+	keys := ctx.Kafka.Keys("notifications-retry")
+	var requeued []harness.KafkaRecord
+	for i, r := range retried {
+		if keys[i] == "u1" {
+			requeued = append(requeued, r)
+		}
+	}
+	ctx.Assert(len(requeued) > 0, "n1 failed once: it must be re-queued on notifications-retry, found keys %v", keys)
+	ctx.Equal(len(requeued), 1, "n1 failed once: times it was re-queued")
+	ctx.Equal(string(requeued[0].Value), original, "the re-queued value must be the original record")
+	ctx.Equal(deliveryHeader(requeued[0], "attempt"), "1", "the re-queued record must carry attempt=1")
+	sent := w.delivered()
+	n1Deliveries := 0
+	for _, id := range sent {
+		if id == "n1" {
+			n1Deliveries++
+		}
+	}
+	ctx.Equal(n1Deliveries, 1, "the re-queued n1 must be delivered when it comes back (sent %v): deliveries of n1", sent)
+	dead := ctx.Kafka.Records("notifications-dlq")
+	deadKeys := ctx.Kafka.Keys("notifications-dlq")
+	ctx.Assert(len(dead) == 1 && deadKeys[0] == "u2", "n2 failing on attempt 4 must land on notifications-dlq, found keys %v", deadKeys)
+	ctx.Equal(deliveryHeader(dead[0], "attempt"), "5", "the dead-lettered record must carry attempt=5")
+	u2Retries := 0
+	for _, k := range keys {
+		if k == "u2" {
+			u2Retries++
+		}
+	}
+	ctx.Equal(u2Retries, 1, "a record on its fifth attempt goes to the DLQ, not back to the retry topic: u2 records on notifications-retry")
+	ctx.Assert(!slices.Contains(sent, "n2"), "a dead-lettered notification is not delivered")
+}
+
+// deliveryCommit is the world at one commit: the topics committed, the records on the retry topic, the deliveries.
+type deliveryCommit struct {
+	topics  []string
+	retried int
+	sent    []string
+}
+
+func CheckCommitAfter(ctx *harness.Ctx) {
+	seedDelivery(ctx, "n1", "u1", "normal", "notifications", -1)
+	w := startDelivery(ctx)
+	w.failures["n1"] = 1
+	ctx.Kafka.StallFor("notifications-retry", 1) // the retry topic's leader acknowledges after 1 s
+	var atCommit []deliveryCommit
+	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
+		var topics []string
+		for tp := range offsets {
+			topics = append(topics, tp.Topic)
+		}
+		sort.Strings(topics)
+		atCommit = append(atCommit, deliveryCommit{topics: topics, retried: len(ctx.Kafka.Records("notifications-retry")), sent: w.delivered()})
+	})
+	drainDelivery(ctx)
+	ctx.Assert(len(atCommit) > 0, "the offset was never committed")
+	var first, second []deliveryCommit
+	for _, c := range atCommit {
+		if slices.Contains(c.topics, "notifications") {
+			first = append(first, c)
+		}
+		if slices.Contains(c.topics, "notifications-retry") {
+			second = append(second, c)
+		}
+	}
+	ctx.Assert(len(first) > 0, "the record on notifications was never committed, commits were %+v", atCommit)
+	ctx.Equal(first[0].retried, 1, "the commit of the failed record came before its re-queue was acknowledged (at commit time nothing was on notifications-retry): wait for the writer before you commit. Records on notifications-retry")
+	ctx.Assert(len(second) > 0, "the re-queued record on notifications-retry was never committed, commits were %+v", atCommit)
+	ctx.Equal(second[0].sent, []string{"n1"}, "the commit of the retried record came before sendPush delivered it: sent at that commit")
+	ctx.Assert(ctx.Kafka.Lag("delivery", "notifications") == 0 && ctx.Kafka.Lag("delivery", "notifications-retry") == 0, "every record must end up committed")
 }
 `,
   },

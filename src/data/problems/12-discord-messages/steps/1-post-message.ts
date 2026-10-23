@@ -1133,6 +1133,131 @@ export async function check_insert_created(ctx) {
   assert.equal((await rows(ctx)).length, 2, 'every accepted message is one row');
 }
 `,
+    go: `package main
+
+import (
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"discord/db"
+	"leetbuild/harness"
+)
+
+const (
+	sfEpoch     int64 = 1420070400000
+	sfBucketMs  int64 = 10 * 24 * 3600 * 1000
+	postChannel int64 = ((400*sfBucketMs + 123456) << 22) | (1 << 17) // a channel created in bucket 400
+)
+
+var (
+	postPath   = "/channels/" + strconv.FormatInt(postChannel, 10) + "/messages"
+	digitsOnly = regexp.MustCompile("^[0-9]+$")
+)
+
+// postAPI empties the messages table and starts the learner's server.
+func postAPI(ctx *harness.Ctx) *harness.HTTP {
+	ctx.DB.Reset(db.Schema)
+	return ctx.Main(main).HTTP()
+}
+
+func postedRows(ctx *harness.Ctx) []harness.Row {
+	return ctx.DB.Query("SELECT channel_id, bucket, message_id, author_id, content FROM messages ORDER BY message_id")
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := postAPI(ctx)
+	r := c.Post(postPath, map[string]any{"author_id": 42, "content": "hello"})
+	ctx.Assert(r.Status != 404 && r.Status != 405, "POST /channels/{id}/messages answered %d: no handler is registered for it", r.Status)
+	ctx.Equal(r.Status, 201, "a valid message")
+}
+
+func CheckValidateContent(ctx *harness.Ctx) {
+	c := postAPI(ctx)
+	for _, bad := range []string{"", "   ", "\\n\\t", strings.Repeat("a", 2001)} {
+		r := c.Post(postPath, map[string]any{"author_id": 42, "content": bad})
+		shown := bad
+		if len(shown) > 12 {
+			shown = shown[:12]
+		}
+		ctx.Equal(r.Status, 400, "content %q (%d chars) is not 1..2000 characters", shown, len(bad))
+	}
+	ctx.Equal(len(postedRows(ctx)), 0, "a rejected message must not reach the table: rows in messages")
+	r := c.Post(postPath, map[string]any{"author_id": 42, "content": strings.Repeat("a", 2000)})
+	ctx.Equal(r.Status, 201, "exactly 2000 characters is allowed")
+	r = c.Post(postPath, map[string]any{"author_id": 42, "content": "x"})
+	ctx.Equal(r.Status, 201, "one character is allowed")
+}
+
+func CheckSnowflake(ctx *harness.Ctx) {
+	ms := sfEpoch + 430*sfBucketMs + 5000
+	first := nextID(ms)
+	ctx.Equal((first>>22)+sfEpoch, ms, "the high bits must be nowMs - discordEpochMs: %d decodes to", first)
+	ctx.Equal((first>>17)&0x1F, workerID, "bits 17..21 must carry workerID")
+	ctx.Equal(first&0xFFF, 0, "the first id of a millisecond has sequence 0")
+	second := nextID(ms)
+	ctx.Assert(second>>22 == first>>22 && second&0xFFF == 1, "a second id in the same millisecond keeps the timestamp and takes sequence 1: %d then %d", first, second)
+	later := nextID(ms + 7)
+	ctx.Assert((later>>22)+sfEpoch == ms+7 && later&0xFFF == 0, "a later millisecond restarts the sequence at 0")
+	steppedBack := nextID(ms + 3)
+	ctx.Assert(steppedBack > later, "the clock stepped back (ms + 3 after ms + 7) and nextID issued a lower id: %d <= %d", steppedBack, later)
+	burstMs := ms + 1000
+	ids := make([]int64, 4097)
+	for i := range ids {
+		ids[i] = nextID(burstMs)
+	}
+	increasing := true
+	for i := 1; i < len(ids); i++ {
+		increasing = increasing && ids[i] > ids[i-1]
+	}
+	ctx.Assert(increasing, "ids minted within one millisecond must strictly increase")
+	ctx.Assert((ids[4095]>>22)+sfEpoch == burstMs && ids[4095]&0xFFF == 4095, "the 4096th id of a millisecond has sequence 4095")
+	ctx.Assert((ids[4096]>>22)+sfEpoch == burstMs+1 && ids[4096]&0xFFF == 0, "the 4097th id in one millisecond must move to the next millisecond with sequence 0, got ms %+d seq %d", (ids[4096]>>22)+sfEpoch-burstMs, ids[4096]&0xFFF)
+}
+
+func CheckBucket(ctx *harness.Ctx) {
+	cases := [][2]int64{{426 * sfBucketMs, 426}, {426*sfBucketMs + 9*24*3600*1000, 426}, {427 * sfBucketMs, 427}, {0, 0}}
+	for _, tc := range cases {
+		snowflake := (tc[0] << 22) | (1 << 17) | 7
+		ctx.Equal(bucketOf(snowflake), tc[1], "bucketOf(%d): (id >> 22) / bucketMs counts 10-day windows from the Discord epoch", snowflake)
+	}
+	ctx.Equal(bucketOf(postChannel), 400, "a channel id is a snowflake too: bucketOf(channelID) is the window the channel was created in")
+	ctx.Equal(bucketMs, 864000000, "bucketMs must be 10 days in milliseconds")
+}
+
+func CheckInsertCreated(ctx *harness.Ctx) {
+	c := postAPI(ctx)
+	r := c.Post(postPath, map[string]any{"author_id": 42, "content": "hello"})
+	ctx.Equal(r.Status, 201, "a valid message must be 201 Created")
+	var body map[string]any
+	r.Decode(&body)
+	idText, isText := body["id"].(string)
+	ctx.Assert(isText && digitsOnly.MatchString(idText), "the id must be a string of digits (64 bits do not fit a JSON number), got %s", harness.Show(body["id"]))
+	messageID, _ := strconv.ParseInt(idText, 10, 64)
+	ctx.Assert(messageID > 1<<53, "the id %d is too small for a snowflake minted now: the timestamp must sit above bit 22", messageID)
+	drift := (messageID>>22)+sfEpoch - time.Now().UnixMilli()
+	ctx.Assert(-60000 < drift && drift < 60000, "the id's timestamp must be the current time in milliseconds")
+	ctx.Equal(body["bucket"], bucketOf(messageID), "the body must carry the bucket of the id")
+	ctx.Assert(body["content"] == "hello" && fmt.Sprint(body["author_id"]) == "42", "the body must echo author_id and content: %s", r.Text())
+	stored := postedRows(ctx)
+	ctx.Equal(len(stored), 1, "expected one row in messages")
+	row := stored[0]
+	ctx.Equal(fmt.Sprint(row["channel_id"]), strconv.FormatInt(postChannel, 10), "channel_id must be the path parameter")
+	ctx.Equal(fmt.Sprint(row["message_id"]), idText, "message_id must be the minted id")
+	ctx.Equal(row["bucket"], bucketOf(messageID), "bucket must be bucketOf(messageID)")
+	ctx.Assert(fmt.Sprint(row["author_id"]) == "42" && row["content"] == "hello", "author_id and content must be stored as sent, got %v", row)
+	r2 := c.Post(postPath, map[string]any{"author_id": 7, "content": "second"})
+	var second struct {
+		ID string \`json:"id"\`
+	}
+	r2.Decode(&second)
+	secondID, _ := strconv.ParseInt(second.ID, 10, 64)
+	ctx.Assert(secondID > messageID, "ids must increase from one message to the next")
+	ctx.Equal(len(postedRows(ctx)), 2, "every accepted message is one row")
+}
+`,
   },
   debrief: `A snowflake is an id and a clock in one 64-bit word: the timestamp in the high bits makes ids sort by time, the worker and sequence bits make them unique without a central counter, and the 12-bit sequence lets one process mint 4,096 ids per millisecond before it has to borrow the next one. Discord's 2017 schema leaned on exactly that: the primary key became (channel_id, bucket, message_id), with the bucket derived from the id, so every message of a channel from one 10-day window lands in one partition and a page of recent history is one contiguous range scan. The epoch is chosen so the timestamp fits in 42 bits for 139 years, and ids go out as strings because the languages reading the JSON cannot hold 64 bits in a number. Real services allocate worker ids from a registry so two instances can never agree on one, and refuse to mint when the clock steps back by more than a few milliseconds instead of silently reusing the last one.`,
 };

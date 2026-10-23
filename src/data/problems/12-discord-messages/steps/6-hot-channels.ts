@@ -368,15 +368,15 @@ type message struct {
 	Bucket    int32  \`json:"bucket"\`
 }
 
-func validContent(content string) bool                                      { panic("not implemented") }
-func storeMessage(ctx context.Context, channelID, authorID int64, content string) (message, error) {
+var validContent = func(content string) bool { panic("not implemented") }
+var storeMessage = func(ctx context.Context, channelID, authorID int64, content string) (message, error) {
 	panic("not implemented")
 }
-func latestSnowflake() int64                                                 { panic("not implemented") }
-func fetchMessages(ctx context.Context, channelID, before int64, limit int) ([]*pb.Message, error) {
+var latestSnowflake = func() int64 { panic("not implemented") }
+var fetchMessages = func(ctx context.Context, channelID, before int64, limit int) ([]*pb.Message, error) {
 	panic("not implemented")
 }
-func publish(ctx context.Context, msg message) { panic("not implemented") }
+var publish = func(ctx context.Context, msg message) { panic("not implemented") }
 
 type entry struct {
 	ID       string \`json:"id"\`
@@ -465,15 +465,15 @@ type message struct {
 	Bucket    int32  \`json:"bucket"\`
 }
 
-func validContent(content string) bool                                      { panic("not implemented") }
-func storeMessage(ctx context.Context, channelID, authorID int64, content string) (message, error) {
+var validContent = func(content string) bool { panic("not implemented") }
+var storeMessage = func(ctx context.Context, channelID, authorID int64, content string) (message, error) {
 	panic("not implemented")
 }
-func latestSnowflake() int64                                                 { panic("not implemented") }
-func fetchMessages(ctx context.Context, channelID, before int64, limit int) ([]*pb.Message, error) {
+var latestSnowflake = func() int64 { panic("not implemented") }
+var fetchMessages = func(ctx context.Context, channelID, before int64, limit int) ([]*pb.Message, error) {
 	panic("not implemented")
 }
-func publish(ctx context.Context, msg message) { panic("not implemented") }
+var publish = func(ctx context.Context, msg message) { panic("not implemented") }
 
 type entry struct {
 	ID       string \`json:"id"\`
@@ -1172,6 +1172,366 @@ export async function check_ttl(ctx) {
   const {page, reads} = await get(m, ctx, {limit: 50});
   assert.equal(reads.calls().length, 1, \`once the list expired the newest page comes from the data service again, it was called \${reads.calls().length} time(s)\`);
   assert.deepEqual(page.map(x => x.content), ['again', 'hello'], \`the page after expiry is read from Postgres: again, hello — got \${JSON.stringify(page.map(x => x.content))}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+
+	"discord/db"
+	pb "discord/gen/messages"
+	"leetbuild/harness"
+)
+
+const (
+	hcEpoch    int64 = 1420070400000
+	hcBucketMs int64 = 10 * 24 * 3600 * 1000
+	hcInsert         = "INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES ($1, $2, $3, $4, $5)"
+)
+
+var hcInstances = []string{"data-1:9000", "data-2:9000", "data-3:9000"}
+
+func hcSnowflake(bucket, offsetMs int64) int64 {
+	return ((bucket*hcBucketMs + offsetMs) << 22) | (1 << 17)
+}
+
+// hcPeer is step 3's data service: the page walk over Postgres behind MessageData.GetMessages.
+type hcPeer struct {
+	pb.UnimplementedMessageDataServer
+}
+
+func (p *hcPeer) GetMessages(ctx context.Context, req *pb.GetMessagesRequest) (*pb.GetMessagesReply, error) {
+	channel, before, limit := int64(req.GetChannelId()), int64(req.GetBefore()), int(req.GetLimit())
+	reply := &pb.GetMessagesReply{}
+	for bucket := (before >> 22) / hcBucketMs; len(reply.Messages) < limit && bucket >= (channel>>22)/hcBucketMs; bucket-- {
+		rows, err := db.Query(ctx, "SELECT message_id, author_id, content FROM messages"+
+			" WHERE channel_id = $1 AND bucket = $2 AND message_id < $3 ORDER BY message_id DESC LIMIT $4",
+			channel, bucket, before, limit-len(reply.Messages))
+		if err != nil {
+			return nil, status.Error(codes.Unavailable, "messages store: "+err.Error())
+		}
+		for rows.Next() {
+			var id, author int64
+			var content string
+			rows.Scan(&id, &author, &content)
+			reply.Messages = append(reply.Messages, &pb.Message{Id: uint64(id), AuthorId: uint64(author), Content: content})
+		}
+		rows.Close()
+	}
+	return reply, nil
+}
+
+// hcWorld is the API over the real stack: Postgres, step 3's data service at every instance, the
+// neighbours of steps 1, 2, 4 and 5 as they were built there.
+type hcWorld struct {
+	ctx     *harness.Ctx
+	nowB    int64
+	channel int64 // created last bucket
+	key     string
+	entries []entry // the stored messages, newest first
+	http    *harness.HTTP
+	stub    pb.MessageDataClient
+	lastMs  int64
+	seq     int64
+}
+
+// newHotWorld stores stored messages of the channel (db0 the oldest), leaves the newest cached of
+// them in recent:{channel} as POST would have, and starts the API.
+func newHotWorld(ctx *harness.Ctx, stored, cached int) *hcWorld {
+	nowB := (time.Now().UnixMilli() - hcEpoch) / hcBucketMs
+	w := &hcWorld{ctx: ctx, nowB: nowB, channel: hcSnowflake(nowB-1, 5000)}
+	w.key = "recent:" + strconv.FormatInt(w.channel, 10)
+	ctx.DB.Reset(db.Schema)
+	for i := range stored {
+		mid := hcSnowflake(nowB-1, int64(10000+1000*i))
+		content := fmt.Sprintf("db%d", i)
+		ctx.DB.Exec(hcInsert, w.channel, nowB-1, mid, 7, content)
+		w.entries = append([]entry{{ID: strconv.FormatInt(mid, 10), AuthorID: "7", Content: content}}, w.entries...)
+	}
+	if cached > 0 {
+		args := []any{"RPUSH", w.key}
+		for _, e := range w.entries[:cached] {
+			args = append(args, hcJSON(e))
+		}
+		ctx.Redis.Do(args...)
+	}
+	for _, node := range hcInstances {
+		pb.RegisterMessageDataServer(ctx.GRPC.Server(node), &hcPeer{})
+	}
+	conn, err := grpc.NewClient(hcInstances[0], grpc.WithTransportCredentials(insecure.NewCredentials()))
+	ctx.NoError(err, "dialing the data service")
+	w.stub = pb.NewMessageDataClient(conn)
+	validContent = func(content string) bool {
+		return strings.TrimSpace(content) != "" && utf8.RuneCountInString(content) <= 2000
+	}
+	storeMessage = w.store
+	latestSnowflake = func() int64 { return (time.Now().UnixMilli() + 1 - hcEpoch) << 22 }
+	fetchMessages = w.fetch
+	publish = w.publish
+	w.http = ctx.Main(main).HTTP()
+	return w
+}
+
+func hcJSON(e entry) string {
+	b, _ := json.Marshal(e)
+	return string(b)
+}
+
+// store is step 1's storeMessage: a snowflake minted now, its bucket, one row.
+func (w *hcWorld) store(ctx context.Context, channelID, authorID int64, content string) (message, error) {
+	nowMs := time.Now().UnixMilli()
+	if nowMs <= w.lastMs {
+		nowMs = w.lastMs
+		w.seq = (w.seq + 1) & 0xFFF
+		if w.seq == 0 {
+			nowMs++
+		}
+	} else {
+		w.seq = 0
+	}
+	w.lastMs = nowMs
+	id := (nowMs-hcEpoch)<<22 | 1<<17 | w.seq
+	bucket := int32((id >> 22) / hcBucketMs)
+	if err := db.Exec(ctx, hcInsert, channelID, bucket, id, authorID, content); err != nil {
+		return message{}, err
+	}
+	return message{ID: strconv.FormatInt(id, 10), ChannelID: strconv.FormatInt(channelID, 10), AuthorID: strconv.FormatInt(authorID, 10),
+		Content: content, Bucket: bucket}, nil
+}
+
+// fetch is step 4's fetchMessages: GetMessages on the data service under a 300 ms deadline.
+func (w *hcWorld) fetch(ctx context.Context, channelID, before int64, limit int) ([]*pb.Message, error) {
+	callCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+	reply, err := w.stub.GetMessages(callCtx, &pb.GetMessagesRequest{ChannelId: uint64(channelID), Before: uint64(before), Limit: uint32(limit)})
+	if err != nil {
+		return nil, err
+	}
+	return reply.GetMessages(), nil
+}
+
+// publish is step 5's: one message.created record keyed by the channel.
+func (w *hcWorld) publish(_ context.Context, msg message) {
+	value, _ := json.Marshal(map[string]string{"type": "message.created", "channel_id": msg.ChannelID, "id": msg.ID,
+		"author_id": msg.AuthorID, "content": msg.Content})
+	w.ctx.Kafka.Seed("message-events", msg.ChannelID, string(value))
+}
+
+// maps is entries as the JSON the API answers.
+func hcMaps(entries []entry) []map[string]any {
+	out := []map[string]any{}
+	for _, e := range entries {
+		out = append(out, map[string]any{"id": e.ID, "author_id": e.AuthorID, "content": e.Content})
+	}
+	return out
+}
+
+// hcReads is what reached the data path since it was made: GetMessages calls and Postgres SELECTs.
+type hcReads struct {
+	ctx         *harness.Ctx
+	callsFrom   int
+	queriesFrom int
+}
+
+func (rd *hcReads) calls() []harness.Call { return rd.ctx.GRPC.CallsTo("GetMessages", "")[rd.callsFrom:] }
+
+func (rd *hcReads) selects() int {
+	n := 0
+	for _, q := range rd.ctx.DB.Queries()[rd.queriesFrom:] {
+		if strings.HasPrefix(strings.ToLower(strings.Join(strings.Fields(q.SQL), " ")), "select") {
+			n++
+		}
+	}
+	return n
+}
+
+func (rd *hcReads) none() bool { return len(rd.calls()) == 0 && rd.selects() == 0 }
+
+func (rd *hcReads) String() string {
+	return fmt.Sprintf("%d GetMessages call(s) and %d SELECT(s) on Postgres", len(rd.calls()), rd.selects())
+}
+
+func hcRequest(call harness.Call) *pb.GetMessagesRequest {
+	req, _ := call.Request.(*pb.GetMessagesRequest)
+	if req == nil {
+		req = &pb.GetMessagesRequest{}
+	}
+	return req
+}
+
+func (w *hcWorld) path(params url.Values) string {
+	path := "/channels/" + strconv.FormatInt(w.channel, 10) + "/messages"
+	if len(params) > 0 {
+		path += "?" + params.Encode()
+	}
+	return path
+}
+
+// get is one GET that must answer 200: its page and what it cost the data path.
+func (w *hcWorld) get(params url.Values) ([]map[string]any, *hcReads) {
+	reads := &hcReads{ctx: w.ctx, callsFrom: len(w.ctx.GRPC.CallsTo("GetMessages", "")), queriesFrom: len(w.ctx.DB.Queries())}
+	r := w.http.Get(w.path(params))
+	text := strings.TrimSpace(r.Text())
+	if len(text) > 120 {
+		text = text[:120]
+	}
+	w.ctx.Equal(r.Status, 200, "GET answered %s", text)
+	var page []map[string]any
+	r.Decode(&page)
+	return page, reads
+}
+
+func (w *hcWorld) post(content string) *harness.Response {
+	return w.http.Post(w.path(nil), map[string]any{"author_id": 7, "content": content})
+}
+
+func hcLimit(limit int, pairs ...string) url.Values {
+	q := url.Values{"limit": {strconv.Itoa(limit)}}
+	for i := 0; i+1 < len(pairs); i += 2 {
+		q.Set(pairs[i], pairs[i+1])
+	}
+	return q
+}
+
+func hcContents(page []map[string]any) []any {
+	out := []any{}
+	for _, m := range page {
+		out = append(out, m["content"])
+	}
+	return out
+}
+
+func CheckCacheRead(ctx *harness.Ctx) {
+	w := newHotWorld(ctx, 60, 60)
+	page, reads := w.get(hcLimit(50))
+	ctx.Equal(page, hcMaps(w.entries[:50]), "with 60 cached entries limit=50 must be the first 50 of the list, newest first")
+	ctx.Assert(reads.none(), "the page was in the list, yet the read cost %s: a cache hit touches neither the data service nor the database", reads.String())
+	page, reads = w.get(nil)
+	ctx.Assert(len(page) == 50 && reads.none(), "without ?limit the default page of 50 comes from the list too; got %d entries for %s", len(page), reads.String())
+	page, reads = w.get(hcLimit(60))
+	ctx.Assert(fmt.Sprint(page) == fmt.Sprint(hcMaps(w.entries)) && reads.none(), "limit=60 is covered by 60 entries: the whole list, no data path; got %d entries for %s", len(page), reads.String())
+	for _, bad := range []int{0, 101} {
+		r := w.http.Get(w.path(hcLimit(bad)))
+		ctx.Equal(r.Status, 400, "limit=%d is outside 1..100", bad)
+	}
+}
+
+func CheckFullPageOnly(ctx *harness.Ctx) {
+	w := newHotWorld(ctx, 12, 10)
+	page, reads := w.get(hcLimit(50))
+	calls := reads.calls()
+	ctx.Equal(len(calls), 1, "10 cached entries cannot answer a page of 50: the data service must be asked once; times asked")
+	req := hcRequest(calls[0])
+	ctx.Assert(req.GetChannelId() == uint64(w.channel) && req.GetLimit() == 50, "the fallback must ask for this channel and limit, asked %v", calls[0].Request)
+	ctx.Equal(page, hcMaps(w.entries), "the list holds only 10 of the channel's 12 messages: the page must be all 12 from the data service")
+	cachedJSON := []string{}
+	for _, e := range w.entries[:10] {
+		cachedJSON = append(cachedJSON, hcJSON(e))
+	}
+	ctx.Equal(ctx.Redis.LRange(w.key, 0, -1), cachedJSON, "reads never write the list: after the fallback it must hold exactly the 10 entries POST left there")
+	page, reads = w.get(hcLimit(10))
+	ctx.Assert(reads.none(), "10 cached entries do answer a page of 10, yet the read cost %s", reads.String())
+	ctx.Equal(page, hcMaps(w.entries[:10]), "limit=10 must be served from the list")
+	page, reads = w.get(hcLimit(5, "before", w.entries[7].ID))
+	calls = reads.calls()
+	ctx.Equal(len(calls), 1, "a request with ?before is never the newest page: it must go to the data service even though the list holds enough entries; calls")
+	ctx.Equal(strconv.FormatUint(hcRequest(calls[0]).GetBefore(), 10), w.entries[7].ID, "the before cursor must be passed through to the data service")
+	ctx.Equal(page, hcMaps(w.entries[8:]), "the page older than db4 is db3..db0 from the data service")
+}
+
+func CheckFallback(ctx *harness.Ctx) {
+	w := newHotWorld(ctx, 3, 0)
+	page, reads := w.get(hcLimit(50))
+	calls := reads.calls()
+	ctx.Equal(len(calls), 1, "an empty list must fall back to the data service once; calls")
+	newest, _ := strconv.ParseUint(w.entries[0].ID, 10, 64)
+	ctx.Assert(hcRequest(calls[0]).GetBefore() > newest, "without ?before the fallback must pass latestSnowflake(), an id newer than anything stored; it passed %d", hcRequest(calls[0]).GetBefore())
+	ctx.Assert(reads.selects() > 0, "the fallback page must come from Postgres through the data service, no query reached it")
+	ctx.Equal(page, hcMaps(w.entries), "the data service's messages must be answered as {id, author_id, content} with string ids, newest first")
+	ctx.Equal(ctx.Redis.Exists(w.key), 0, "reads never fill the list: it is written only by POST, otherwise an old page could shadow a newer message")
+	page, reads = w.get(hcLimit(50))
+	ctx.Equal(len(reads.calls()), 1, "a second miss is a second data-service call (nothing was cached by the read); calls")
+	ctx.Assert(fmt.Sprint(page) == fmt.Sprint(hcMaps(w.entries)) && ctx.Redis.Exists(w.key) == 0, "the second miss answers the same page and still leaves the list alone")
+}
+
+func CheckWriteThrough(ctx *harness.Ctx) {
+	w := newHotWorld(ctx, 99, 99)
+	r := w.post("")
+	ctx.Equal(r.Status, 400, "empty content must be a 400")
+	ctx.Equal(ctx.Redis.LLen(w.key), 99, "a rejected message must not touch the list")
+	ids := []string{}
+	for _, content := range []string{"first", "second", "third"} {
+		r = w.post(content)
+		ctx.Equal(r.Status, 201, "POST %q", content)
+		var created struct {
+			ID string \`json:"id"\`
+		}
+		r.Decode(&created)
+		ids = append(ids, created.ID)
+	}
+	rows := ctx.DB.Query("SELECT message_id, content FROM messages ORDER BY message_id DESC LIMIT 3")
+	newest := []any{}
+	contents := []any{}
+	for _, row := range rows {
+		newest = append(newest, fmt.Sprint(row["message_id"]))
+		contents = append(contents, row["content"])
+	}
+	ctx.Equal(newest, []any{ids[2], ids[1], ids[0]}, "every message must be stored (storeMessage), the newest rows are %v", contents)
+	produced := ctx.Kafka.Records("message-events")
+	keyed := len(produced) == 3
+	for _, rec := range produced {
+		keyed = keyed && string(rec.Key) == strconv.FormatInt(w.channel, 10)
+	}
+	ctx.Assert(keyed, "every stored message must be published once, keyed by the channel; produced keys %v", ctx.Kafka.Keys("message-events"))
+	ctx.Equal(ctx.Redis.LLen(w.key), 100, "99 cached + 3 pushed must be trimmed to 100 (LTRIM 0 99): list length")
+	head := []map[string]any{}
+	for _, item := range ctx.Redis.LRange(w.key, 0, 2) {
+		var m map[string]any
+		json.Unmarshal([]byte(item), &m)
+		head = append(head, m)
+	}
+	want := hcMaps([]entry{{ids[2], "7", "third"}, {ids[1], "7", "second"}, {ids[0], "7", "first"}})
+	ctx.Equal(head, want, "the three posts must sit at the head of the list, newest first, as {id, author_id, content}")
+	tail := []map[string]any{}
+	for _, item := range ctx.Redis.LRange(w.key, -1, -1) {
+		var m map[string]any
+		json.Unmarshal([]byte(item), &m)
+		tail = append(tail, m)
+	}
+	ctx.Equal(tail, hcMaps(w.entries[96:97]), "the two oldest cached entries must have been trimmed away")
+	page, reads := w.get(hcLimit(50))
+	ctx.Assert(reads.none(), "the newest page is in the list now, yet the read cost %s", reads.String())
+	ctx.Assert(len(page) == 50 && fmt.Sprint(page[:3]) == fmt.Sprint(head) && fmt.Sprint(page[3:]) == fmt.Sprint(hcMaps(w.entries[:47])), "the newest page comes from the list and starts with the messages just posted")
+}
+
+func CheckTtl(ctx *harness.Ctx) {
+	w := newHotWorld(ctx, 0, 0)
+	r := w.post("hello")
+	ctx.Equal(r.Status, 201, "POST")
+	ttl := ctx.Redis.TTL(w.key)
+	ctx.Assert(ttl > 0, "%s has no expiry (TTL %d): quiet channels would stay in memory forever", w.key, ttl)
+	ctx.Assert(290 <= ttl && ttl <= 300, "%s expires in %d s, expected 300", w.key, ttl)
+	ctx.Clock.Advance(200)
+	w.post("again")
+	ctx.Assert(ctx.Redis.TTL(w.key) > 250, "a new message must re-arm the expiry, 200 s later the TTL is %d s", ctx.Redis.TTL(w.key))
+	ctx.Clock.Advance(301)
+	ctx.Equal(ctx.Redis.Exists(w.key), 0, "%s must be gone 300 s after the last message", w.key)
+	page, reads := w.get(hcLimit(50))
+	ctx.Equal(len(reads.calls()), 1, "once the list expired the newest page comes from the data service again; calls")
+	ctx.Equal(hcContents(page), []any{"again", "hello"}, "the page after expiry is read from Postgres: again, hello")
 }
 `,
   },

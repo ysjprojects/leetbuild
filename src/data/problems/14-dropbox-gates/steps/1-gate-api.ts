@@ -1758,6 +1758,381 @@ export async function check_published(ctx) {
   assert.equal(loader.getVariant('button_color', {user_id: 'ana', locale: 'en'}), 'BLUE_BUTTON', 'the stored populations must reach the loader: an English user lands in the catch-all (BLUE_BUTTON 100%)');
 }
 `,
+    go: `package main
+
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+func shareOf(variant string, pct any) map[string]any { return map[string]any{"variant": variant, "pct": pct} }
+
+var (
+	threeWayMix = []any{shareOf("RED_BUTTON", 33), shareOf("BLUE_BUTTON", 33), shareOf("CONTROL", 34)}
+	gateFixture = map[string]any{"populations": []any{
+		map[string]any{"match": map[string]any{"locale": "de"}, "mix": threeWayMix},
+		map[string]any{"match": map[string]any{}, "mix": []any{shareOf("BLUE_BUTTON", 100)}},
+	}}
+	onFixture       = map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": []any{shareOf("ON", 100)}}}}
+	notFoundFixture = map[string]any{"error": "not_found"}
+)
+
+// mixOf is RED_BUTTON, BLUE_BUTTON, CONTROL with the given shares, in that order.
+func mixOf(pcts ...any) []any {
+	var mix []any
+	for i, pct := range pcts {
+		mix = append(mix, shareOf([]string{"RED_BUTTON", "BLUE_BUTTON", "CONTROL"}[i], pct))
+	}
+	return mix
+}
+
+// gatePut is PUT /gates/{name}; an empty editor or ifMatch leaves that header out.
+func gatePut(c *harness.HTTP, name string, body any, editor, ifMatch string) *harness.Response {
+	var header []string
+	if editor != "" {
+		header = append(header, "X-Editor", editor)
+	}
+	if ifMatch != "" {
+		header = append(header, "If-Match", ifMatch)
+	}
+	return c.Put("/gates/"+name, body, header...)
+}
+
+// jsonValue is v as JSON sees it (maps, []any, float64), nil when it is not JSON.
+func jsonValue(v any) any {
+	var raw []byte
+	switch b := v.(type) {
+	case string:
+		raw = []byte(b)
+	case []byte:
+		raw = b
+	default:
+		raw, _ = json.Marshal(v)
+	}
+	var out any
+	if json.Unmarshal(raw, &out) != nil {
+		return nil
+	}
+	return out
+}
+
+// gateObject is the response body as a JSON object (nil when it is not one).
+func gateObject(r *harness.Response) map[string]any {
+	obj, _ := jsonValue(r.Body).(map[string]any)
+	return obj
+}
+
+// publishedGate is the gate stored in the hash gates, parsed (nil when there is none).
+func publishedGate(ctx *harness.Ctx, name string) map[string]any {
+	raw, ok := ctx.Redis.HGet("gates", name)
+	if !ok {
+		return nil
+	}
+	obj, _ := jsonValue(raw).(map[string]any)
+	return obj
+}
+
+func gateHistory(ctx *harness.Ctx, name string) []any {
+	entries := []any{}
+	for _, raw := range ctx.Redis.LRange("gate:"+name+":history", 0, -1) {
+		entries = append(entries, jsonValue(raw))
+	}
+	return entries
+}
+
+func assertUntouched(ctx *harness.Ctx, what string) {
+	keys := ctx.Redis.Keys("*")
+	ctx.Assert(len(keys) == 0, "%s must write nothing, but Redis now holds %q", what, keys)
+}
+
+func wholeSeconds(v any) (float64, bool) {
+	f, ok := v.(float64)
+	return f, ok && f == math.Trunc(f)
+}
+
+func CheckValidate(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	bad := []struct {
+		what, name string
+		body       any
+	}{
+		{"shares adding up to 99", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": mixOf(33, 33, 33)}}}},
+		{"shares adding up to 101", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": mixOf(34, 33, 34)}}}},
+		{"a negative share (-10 + 110)", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": mixOf(-10, 110)}}}},
+		{"a fractional share (33.5 + 66.5)", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": mixOf(33.5, 66.5)}}}},
+		{"a share without a pct", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": []any{map[string]any{"variant": "ON"}}}}}},
+		{"the lowercase variant 'red_button'", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": []any{shareOf("red_button", 100)}}}}},
+		{"the lowercase default 'off'", "button_color", map[string]any{"default": "off", "populations": onFixture["populations"]}},
+		{"an empty mix", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": []any{}}}}},
+		{"an empty populations list", "button_color", map[string]any{"populations": []any{}}},
+		{"no populations at all", "button_color", map[string]any{"seed": "button_color"}},
+		{"a population without a match", "button_color", map[string]any{"populations": []any{map[string]any{"mix": mixOf(50, 50)}}}},
+		{"a match value that is not a string", "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{"locale": 7}, "mix": mixOf(50, 50)}}}},
+		{"the name 'Button_Color' (upper case)", "Button_Color", onFixture},
+		{"the name 'ab' (too short)", "ab", onFixture},
+		{"the name '1st_gate' (starts with a digit)", "1st_gate", onFixture},
+		{"a 65-character name", strings.Repeat("a", 65), onFixture},
+	}
+	for _, b := range bad {
+		r := gatePut(c, b.name, b.body, "tomm", "")
+		ctx.Equal(r.Status, 400, "PUT /gates/%s with %s", b.name, b.what)
+		data := gateObject(r)
+		ctx.Equal(data["error"], "invalid_gate", "the error of PUT /gates/%s with %s (body %s)", b.name, b.what, r.Text())
+		reason, ok := data["reason"].(string)
+		ctx.Assert(ok && reason != "", "the 400 for %s must carry a reason string, got %s", b.what, r.Text())
+	}
+	assertUntouched(ctx, "a rejected gate")
+	r := gatePut(c, "button_color", map[string]any{"populations": []any{}}, "", "")
+	ctx.Assert(r.Status == 400 && gateObject(r)["error"] == "invalid_gate", "the shape is checked before the editor: a malformed gate without X-Editor answered %d %s, expected 400 invalid_gate", r.Status, r.Text())
+	assertUntouched(ctx, "a rejected gate")
+	r = gatePut(c, "button_color", gateFixture, "tomm", "")
+	ctx.Equal(r.Status, 201, "a valid gate (answered %s)", r.Text())
+	r = gatePut(c, strings.Repeat("a", 64), onFixture, "tomm", "")
+	ctx.Equal(r.Status, 201, "a 64-character name is within ^[a-z][a-z0-9_]{2,63}$")
+	ctx.Assert(publishedGate(ctx, "button_color") != nil, "the accepted gate must be stored in the hash gates")
+}
+
+func CheckCreatedUpdated(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	now := float64(ctx.Clock.Now() / 1000)
+	r := gatePut(c, "dark_mode", onFixture, "ana", "")
+	ctx.Equal(r.Status, 201, "the first PUT of dark_mode must answer 201 Created")
+	gate := gateObject(r)
+	ctx.Equal(gate["version"], 1, "a new gate must be version 1")
+	ctx.Equal(r.Header.Get("ETag"), \`"1"\`, "the 201 must carry the header ETag: %q (the version, quoted)", \`"1"\`)
+	overrides, isList := gate["overrides"].([]any)
+	ctx.Assert(gate["name"] == "dark_mode" && gate["seed"] == "dark_mode" && gate["default"] == "OFF" && isList && len(overrides) == 0, "seed defaults to the name, default to OFF, overrides to []; the answer was %s", r.Text())
+	ctx.Equal(gate["updated_by"], "ana", "updated_by must be the X-Editor (ana)")
+	updatedAt, whole := wholeSeconds(gate["updated_at"])
+	ctx.Assert(whole && math.Abs(updatedAt-now) <= 5, "updated_at must be the time of the write in seconds, got %v", gate["updated_at"])
+	storedRaw, _ := ctx.Redis.HGet("gates", "dark_mode")
+	ctx.Equal(jsonValue(r.Body), publishedGate(ctx, "dark_mode"), "the answer must be the stored gate (answered %s, stored %s)", r.Text(), storedRaw)
+	r = gatePut(c, "dark_mode", map[string]any{"seed": "dark_mode_v2", "default": "ON", "populations": onFixture["populations"]}, "bo", "")
+	ctx.Equal(r.Status, 200, "updating an existing gate must answer 200")
+	gate = gateObject(r)
+	ctx.Assert(gate["version"] == 2.0 && r.Header.Get("ETag") == \`"2"\`, "the update must bump the version to 2 and answer ETag %q: got version %v, ETag %q", \`"2"\`, gate["version"], r.Header.Get("ETag"))
+	ctx.Assert(gate["seed"] == "dark_mode_v2" && gate["default"] == "ON" && gate["updated_by"] == "bo", "the update must replace the gate's fields (seed, default, updated_by): %s", r.Text())
+	r = gatePut(c, "dark_mode", onFixture, "bo", "")
+	ctx.Assert(r.Status == 200 && gateObject(r)["version"] == 3.0, "a third PUT must be version 3, got %d %s", r.Status, r.Text())
+	r = gatePut(c, "other_gate", onFixture, "tomm", "")
+	ctx.Assert(r.Status == 201 && gateObject(r)["version"] == 1.0, "every gate counts its own versions: a new gate is version 1 even after three edits elsewhere (gates:version is the global counter, not the gate's); got %d %s", r.Status, r.Text())
+	r = c.Get("/gates/dark_mode")
+	ctx.Equal(r.Status, 200, "GET /gates/dark_mode")
+	storedRaw, _ = ctx.Redis.HGet("gates", "dark_mode")
+	ctx.Equal(jsonValue(r.Body), publishedGate(ctx, "dark_mode"), "GET must answer the stored gate (got %s, stored %s)", r.Text(), storedRaw)
+	ctx.Equal(r.Header.Get("ETag"), \`"3"\`, "GET must carry the ETag of the stored version")
+	r = c.Get("/gates/ghost")
+	ctx.Equal(r.Status, 404, "GET of an unknown gate")
+	ctx.Equal(jsonValue(r.Body), jsonValue(notFoundFixture), "the 404 body (%s)", r.Text())
+}
+
+func CheckIfMatch(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	for range 2 {
+		gatePut(c, "other", onFixture, "tomm", "") // gates:version is 2 before button_color exists
+	}
+	gatePut(c, "button_color", gateFixture, "tomm", "")
+	gatePut(c, "button_color", gateFixture, "tomm", "") // button_color is version 2, gates:version 4
+	before := publishedGate(ctx, "button_color")
+	r := gatePut(c, "button_color", map[string]any{"populations": []any{map[string]any{"match": map[string]any{}, "mix": []any{shareOf("CONTROL", 100)}}}}, "tomm", \`"1"\`)
+	ctx.Equal(r.Status, 412, "If-Match: %s against version 2", \`"1"\`)
+	ctx.Equal(jsonValue(r.Body), jsonValue(map[string]any{"error": "version_conflict", "current": 2}), "the 412 body (%s)", r.Text())
+	ctx.Equal(publishedGate(ctx, "button_color"), before, "a 412 must write nothing, but the stored gate changed")
+	version, _ := ctx.Redis.Get("gates:version")
+	ctx.Equal(version, "4", "a 412 must not bump gates:version")
+	ctx.Equal(len(gateHistory(ctx, "button_color")), 2, "a 412 must not add a history entry; entries in the history")
+	r = gatePut(c, "button_color", gateFixture, "tomm", \`"2"\`)
+	ctx.Assert(r.Status == 200 && gateObject(r)["version"] == 3.0, "If-Match: %s against version 2 must be accepted (200, version 3), got %d %s: compare with the gate's own version, not gates:version", \`"2"\`, r.Status, r.Text())
+	r = gatePut(c, "button_color", gateFixture, "tomm", "3")
+	ctx.Assert(r.Status == 200 && gateObject(r)["version"] == 4.0, "an unquoted If-Match: 3 against version 3 must be accepted too, got %d %s", r.Status, r.Text())
+	r = gatePut(c, "button_color", gateFixture, "tomm", \`"9"\`)
+	ctx.Assert(r.Status == 412 && gateObject(r)["current"] == 4.0, "If-Match: %s against version 4 must answer 412 with current 4, got %d %s", \`"9"\`, r.Status, r.Text())
+	r = gatePut(c, "button_color", gateFixture, "tomm", "")
+	ctx.Assert(r.Status == 200 && gateObject(r)["version"] == 5.0, "a PUT without If-Match is accepted (last writer wins is the caller's choice), got %d %s", r.Status, r.Text())
+}
+
+func CheckHistory(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	r := gatePut(c, "button_color", gateFixture, "", "")
+	ctx.Equal(r.Status, 400, "a PUT without X-Editor")
+	ctx.Equal(jsonValue(r.Body), jsonValue(map[string]any{"error": "editor_required"}), "the 400 body (%s)", r.Text())
+	assertUntouched(ctx, "a PUT without X-Editor")
+	now := float64(ctx.Clock.Now() / 1000)
+	gatePut(c, "button_color", gateFixture, "ana", "")
+	ctx.Clock.Advance(60)
+	gatePut(c, "button_color", gateFixture, "bo", "")
+	ctx.Equal(publishedGate(ctx, "button_color")["updated_by"], "bo", "the stored gate's updated_by must be the X-Editor of the last accepted PUT (bo)")
+	entries := gateHistory(ctx, "button_color")
+	ctx.Equal(len(entries), 2, "two accepted PUTs must leave two entries in gate:button_color:history")
+	var got []string
+	var at []float64
+	allWhole := true
+	for _, e := range entries {
+		entry, _ := e.(map[string]any)
+		got = append(got, fmt.Sprintf("%v %v %v", entry["version"], entry["by"], entry["change"]))
+		seconds, whole := wholeSeconds(entry["at"])
+		allWhole = allWhole && whole
+		at = append(at, seconds)
+	}
+	ctx.Equal(got, []string{"2 bo updated", "1 ana created"}, "history is newest first: version 2 by bo (updated), then version 1 by ana (created)")
+	ctx.Assert(allWhole && at[1] >= now-5 && at[0]-at[1] >= 59, "each entry's at is the time of its write in seconds (the second came a minute later): %v", entries)
+	r = c.Get("/gates/button_color/history")
+	ctx.Equal(r.Status, 200, "GET /gates/button_color/history")
+	ctx.Equal(jsonValue(r.Body), map[string]any{"entries": entries}, "GET /gates/button_color/history must answer the stored entries newest first (answered %s)", r.Text())
+	r = c.Get("/gates/ghost/history")
+	notFound, _ := json.Marshal(notFoundFixture)
+	ctx.Assert(r.Status == 404 && fmt.Sprint(jsonValue(r.Body)) == fmt.Sprint(jsonValue(notFoundFixture)), "the history of an unknown gate answered %d %s, expected 404 %s", r.Status, r.Text(), notFound)
+	gatePut(c, "button_color", gateFixture, "tomm", \`"1"\`)
+	gatePut(c, "button_color", map[string]any{"populations": []any{}}, "tomm", "")
+	gatePut(c, "button_color", gateFixture, "", "")
+	ctx.Equal(len(gateHistory(ctx, "button_color")), 2, "rejected requests (412, invalid gate, missing editor) must not add history entries; entries in the history")
+	for i := range 103 {
+		gatePut(c, "button_color", gateFixture, fmt.Sprintf("bot%d", i), "")
+	}
+	entries = gateHistory(ctx, "button_color")
+	ctx.Equal(len(entries), 100, "the history is capped at the last 100 entries (LTRIM 0 99); entries in the history")
+	first, _ := entries[0].(map[string]any)
+	last, _ := entries[99].(map[string]any)
+	ctx.Assert(first["version"] == 105.0 && last["version"] == 6.0, "the cap keeps the newest 100: versions 105 down to 6, found %v down to %v", first["version"], last["version"])
+}
+
+// loaderGate is a gate as step 2's loader parses it from the hash (its Gate's JSON fields).
+type loaderGate struct {
+	Seed        string \`json:"seed"\`
+	Default     string \`json:"default"\`
+	Populations []struct {
+		Match map[string]string \`json:"match"\`
+		Mix   []struct {
+			Variant string \`json:"variant"\`
+			Pct     int    \`json:"pct"\`
+		} \`json:"mix"\`
+	} \`json:"populations"\`
+	Overrides []struct {
+		UserID    string \`json:"user_id"\`
+		Variant   string \`json:"variant"\`
+		ExpiresAt int64  \`json:"expires_at"\`
+	} \`json:"overrides"\`
+}
+
+// loaderView is step 2's loader over what this step published. Go judges one step's file at a time, so the
+// harness reads the hash the way step 2's refresh does and decides the way its getVariant does.
+type loaderView struct {
+	ctx     *harness.Ctx
+	version int
+	gates   map[string]loaderGate
+}
+
+// refresh loads gates:version and the hash gates; it reports whether the version moved from the empty snapshot's 0.
+func (l *loaderView) refresh() bool {
+	raw, _ := l.ctx.Redis.Get("gates:version")
+	version, _ := strconv.Atoi(raw)
+	if version == l.version {
+		return false
+	}
+	gates := map[string]loaderGate{}
+	for name, body := range l.ctx.Redis.HGetAll("gates") {
+		var gate loaderGate
+		l.ctx.NoError(json.Unmarshal([]byte(body), &gate), "step 2's loader cannot parse the stored gate %s (%s)", name, body)
+		gates[name] = gate
+	}
+	l.version, l.gates = version, gates
+	return true
+}
+
+func (l *loaderView) getVariant(name string, attrs map[string]string) string {
+	gate, ok := l.gates[name]
+	if !ok {
+		return "OFF"
+	}
+	now := l.ctx.Clock.Now() / 1000
+	for _, o := range gate.Overrides {
+		if o.UserID == attrs["user_id"] && o.ExpiresAt > now {
+			return o.Variant
+		}
+	}
+	for _, p := range gate.Populations {
+		matched := true
+		for key, value := range p.Match {
+			matched = matched && attrs[key] == value
+		}
+		if !matched || len(p.Mix) == 0 {
+			continue
+		}
+		sum := sha256.Sum256([]byte(gate.Seed + ":" + attrs["user_id"]))
+		b := int(binary.BigEndian.Uint32(sum[:4]) % 10000)
+		edge := 0
+		for _, share := range p.Mix {
+			edge += share.Pct * 100
+			if b < edge {
+				return share.Variant
+			}
+		}
+		return p.Mix[len(p.Mix)-1].Variant
+	}
+	return gate.Default
+}
+
+func CheckPublished(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	probe := ctx.Redis.After("gates:version", func() any {
+		return []any{publishedGate(ctx, "button_color") != nil, ctx.Redis.LLen("gate:button_color:history")}
+	})
+	r := gatePut(c, "button_color", gateFixture, "tomm", "")
+	ctx.Equal(r.Status, 201, "PUT /gates/button_color (answered %q)", strings.TrimSpace(r.Text()))
+	ctx.Assert(probe.Fired, "an accepted PUT must INCR gates:version — the signal step 2's loader polls")
+	ctx.NoError(probe.Err, "reading Redis when gates:version moved")
+	seen, _ := probe.Result.([]any)
+	ctx.Assert(len(seen) == 2, "reading Redis when gates:version moved returned %v", probe.Result)
+	inHash, _ := seen[0].(bool)
+	entries, _ := seen[1].(int64)
+	state := "not yet"
+	if inHash {
+		state = "already"
+	}
+	ctx.Assert(inHash && entries == 1, "at the instant gates:version moved, the gate was %s in the hash and the history held %d entries: HSET, INCR, LPUSH and LTRIM belong to one MULTI/EXEC so a loader never sees one without the others", state, entries)
+	gatePut(c, "dark_mode", onFixture, "ana", "")
+	overrides := []any{map[string]any{"user_id": "tomm", "variant": "RED_BUTTON", "expires_at": ctx.Clock.Now()/1000 + 3600}}
+	gatePut(c, "button_color", map[string]any{"populations": gateFixture["populations"], "overrides": overrides}, "tomm", "")
+	version, _ := ctx.Redis.Get("gates:version")
+	ctx.Equal(version, "3", "three accepted writes must leave gates:version at 3: INCR exactly once per accepted write")
+	var fields []string
+	for name := range ctx.Redis.HGetAll("gates") {
+		fields = append(fields, name)
+	}
+	sort.Strings(fields)
+	ctx.Equal(fields, []string{"button_color", "dark_mode"}, "the hash gates must hold one field per gate")
+	gate := publishedGate(ctx, "button_color")
+	ctx.Assert(gate != nil, "button_color must be stored in the hash gates")
+	var lacking []string
+	for _, f := range []string{"name", "seed", "default", "populations", "overrides", "version", "updated_at", "updated_by"} {
+		if _, ok := gate[f]; !ok {
+			lacking = append(lacking, f)
+		}
+	}
+	ctx.Assert(len(lacking) == 0, "the stored JSON must carry every field (name, seed, default, populations, overrides, version, updated_at, updated_by), it lacks %q", lacking)
+	ctx.Equal(gate["populations"], jsonValue(gateFixture["populations"]), "populations must be stored as sent — an ordered list of {match, mix}, mix an ordered list of {variant, pct}")
+	storedGate, _ := json.Marshal(gate)
+	ctx.Assert(fmt.Sprint(gate["overrides"]) == fmt.Sprint(jsonValue(overrides)) && gate["version"] == 2.0 && gate["name"] == "button_color" && gate["seed"] == "button_color" && gate["default"] == "OFF", "the stored button_color must be version 2 with its overrides and defaults, stored %s", storedGate)
+	gatePut(c, "button_color", gateFixture, "tomm", \`"1"\`)
+	gatePut(c, "button_color", map[string]any{"populations": []any{}}, "tomm", "")
+	version, _ = ctx.Redis.Get("gates:version")
+	ctx.Equal(version, "3", "rejected writes must not move gates:version")
+	loader := &loaderView{ctx: ctx}
+	ctx.Equal(loader.refresh(), true, "step 2's loader must see a new gates:version and load the hash")
+	ctx.Equal(loader.version, 3, "the version step 2's loader read from gates:version")
+	ctx.Equal(loader.getVariant("dark_mode", map[string]string{"user_id": "ana"}), "ON", "step 2's loader must find dark_mode in the hash and serve its ON population: the stored JSON is not what the loader expects")
+	ctx.Equal(loader.getVariant("button_color", map[string]string{"user_id": "tomm", "locale": "en"}), "RED_BUTTON", "the stored overrides must reach the loader: tomm's override answers RED_BUTTON")
+	ctx.Equal(loader.getVariant("button_color", map[string]string{"user_id": "ana", "locale": "en"}), "BLUE_BUTTON", "the stored populations must reach the loader: an English user lands in the catch-all (BLUE_BUTTON 100%%)")
+}
+`,
   },
   debrief: `An admin API for configuration is where most "easy" services go wrong, because the hard part is not the write but the *semantics around it*: validation that refuses half-valid shapes (a mix adding up to 99 silently assigns nobody to the last variant), optimistic concurrency so two editors cannot overwrite each other (If-Match / 412 is the HTTP-native way; a version in the body is the common substitute), attribution and history because this state lives outside version control and changes at 3 a.m., and a single version counter the readers can poll cheaply. Stormcrow's post lists exactly these — audit history, overrides, a config pushed on every edit — as what made the system operable rather than merely functional.`,
 };

@@ -35,7 +35,7 @@ const GLOBALS: TimerGlobals = globalThis;
 const FIRST_TIMER_ID = 1 << 30;
 
 /** A real macrotask without `setTimeout(0)`'s clamping: a message to ourselves, or the real timer where there is no channel. */
-const nextMacrotask: (fn: () => void) => void = (() => {
+export const nextMacrotask: (fn: () => void) => void = (() => {
   if (typeof MessageChannel === 'undefined') return (fn: () => void): void => void realSetTimeout(fn, 0);
   const channel = new MessageChannel();
   const queue: (() => void)[] = [];
@@ -67,9 +67,13 @@ export class Clock {
   private readonly interruptListeners: (() => void)[] = [];
   private installed = false;
   private pumpScheduled = false;
+  /** Real time the clock stopped following (`freeze`), null while it flows with real time. */
+  private frozenAt: number | null = null;
+  /** Holds on the pump (`hold`): while any is held, idle turns do not jump to pending sleeps. */
+  private holds = 0;
 
   now(): number {
-    return realNow() + this.offset;
+    return (this.frozenAt ?? realNow()) + this.offset;
   }
 
   reset(sleepLimit: number | null = null): void {
@@ -79,6 +83,27 @@ export class Clock {
     this.sleepLimit = sleepLimit;
     this.interrupted = false;
     this.timers = [];
+    this.frozenAt = null;
+    this.holds = 0;
+  }
+
+  /**
+   * Stop following real time until the next reset: the clock moves only when advanced or when it
+   * jumps to a sleep. The Go runtime's checks run this way, its interpreted code being slow enough
+   * for real time to show (a rate limiter would refill between two requests).
+   */
+  freeze(): void {
+    this.frozenAt ??= realNow();
+  }
+
+  /** Keep idle turns from jumping to pending sleeps until `release` (the Go harness's tick). */
+  hold(): void {
+    this.holds += 1;
+  }
+
+  release(): void {
+    this.holds = Math.max(0, this.holds - 1);
+    if (this.holds === 0 && this.hasPendingSleeps()) this.schedulePump();
   }
 
   /** Move the clock forward: keys expire, windows roll over, deadlines pass, timers and background jobs fire. */
@@ -95,6 +120,11 @@ export class Clock {
   /** Run `fn()` when the sleep limit is hit: the harness's `drain` resolves and the loop stays suspended. */
   onInterrupt(fn: () => void): void {
     this.interruptListeners.push(fn);
+  }
+
+  /** Whether a sleep is pending: on an idle turn the pump will jump the clock to it. */
+  hasPendingSleeps(): boolean {
+    return this.timers.some(t => t.interval === null);
   }
 
   /** `await clock.sleep(ms)`: a virtual sleep like any `setTimeout` of the learner's. */
@@ -163,7 +193,8 @@ export class Clock {
     this.pumpScheduled = true;
     nextMacrotask(() => {
       this.pumpScheduled = false;
-      if (!this.installed) return;
+      // Held (a tick in progress): release schedules the turn again.
+      if (!this.installed || this.holds > 0) return;
       const sleeps = this.timers.filter(t => t.interval === null).sort((a, b) => a.at - b.at);
       if (sleeps.length === 0) return;
       if (this.sleepLimit !== null && this.sleeps >= this.sleepLimit) {

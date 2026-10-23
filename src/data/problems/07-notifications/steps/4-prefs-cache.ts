@@ -725,6 +725,102 @@ export async function check_invalidate(ctx) {
   assert.equal(loads(db).length, before + 1, 'the read after the PUT must reload from the database');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+
+	"leetbuild/harness"
+
+	"notify/db"
+)
+
+var prefsRow = db.Prefs{Push: true, QuietStart: 22, QuietEnd: 7}
+
+// seedPrefs puts u42's row in the provided database the learner's code imported.
+func seedPrefs() { db.Rows["u42"] = prefsRow }
+
+func readPrefs(ctx *harness.Ctx, userID string) db.Prefs {
+	p, err := getPrefs(context.Background(), userID)
+	ctx.NoError(err, "getPrefs(%q) returned an error", userID)
+	return p
+}
+
+// prefsLoads are the users db.LoadPrefs was called for, in call order.
+func prefsLoads() []string {
+	var users []string
+	for _, c := range db.Calls {
+		if c.Op == "load" {
+			users = append(users, c.UserID)
+		}
+	}
+	return users
+}
+
+func cachedPrefs(ctx *harness.Ctx, key string) any {
+	if v, ok := ctx.Redis.Get(key); ok {
+		return v
+	}
+	return nil
+}
+
+func CheckKey(ctx *harness.Ctx) {
+	seedPrefs()
+	ctx.Equal(readPrefs(ctx, "u42"), prefsRow, "getPrefs must return the database row")
+	cached, ok := ctx.Redis.Get("prefs:u42")
+	ctx.Assert(ok, "the row must be cached under prefs:u42, keys are %v", ctx.Redis.Keys("*"))
+	var doc map[string]any
+	ctx.NoError(json.Unmarshal([]byte(cached), &doc), "prefs:u42 must hold the row as JSON, got %q", cached)
+	ctx.Equal(doc, map[string]any{"push": true, "quiet_start": 22.0, "quiet_end": 7.0}, "prefs:u42 must hold the row as JSON (%s)", cached)
+}
+
+func CheckReadFirst(ctx *harness.Ctx) {
+	seedPrefs()
+	stale := prefsRow
+	stale.Push = false
+	encoded, _ := json.Marshal(stale)
+	ctx.Redis.Set("prefs:u42", string(encoded))
+	ctx.Equal(readPrefs(ctx, "u42"), stale, "a cached entry must be returned as is, without consulting the database")
+	ctx.Equal(prefsLoads(), []string(nil), "the cache held prefs:u42, yet db.LoadPrefs was called (calls %v): loads", db.Calls)
+	ctx.Equal(readPrefs(ctx, "u7"), db.DefaultPrefs, "a miss must load the row from the database")
+	ctx.Equal(prefsLoads(), []string{"u7"}, "expected one load for u7 (calls %v): loads", db.Calls)
+	readPrefs(ctx, "u7")
+	ctx.Equal(len(prefsLoads()), 1, "the second read of u7 must hit the cache, not the database: loads")
+}
+
+func CheckTtl(ctx *harness.Ctx) {
+	seedPrefs()
+	readPrefs(ctx, "u42")
+	ttl := ctx.Redis.TTL("prefs:u42")
+	ctx.Assert(540 <= ttl && ttl <= 600, "prefs:u42 must expire after 600 s, TTL is %d", ttl)
+	ctx.Clock.Advance(601)
+	ctx.Equal(cachedPrefs(ctx, "prefs:u42"), nil, "the cached entry must be gone after 600 s")
+	readPrefs(ctx, "u42")
+	ctx.Equal(len(prefsLoads()), 2, "after the entry expired the next read must reload from the database: loads")
+}
+
+func CheckInvalidate(ctx *harness.Ctx) {
+	seedPrefs()
+	readPrefs(ctx, "u42")
+	ctx.Assert(ctx.Redis.Exists("prefs:u42") == 1, "warm the cache first")
+	var cacheAtSave []int64
+	savePrefs := db.SavePrefs
+	db.SavePrefs = func(c context.Context, userID string, p db.Prefs) error {
+		cacheAtSave = append(cacheAtSave, ctx.Redis.Exists("prefs:u42"))
+		return savePrefs(c, userID, p)
+	}
+	next := db.Prefs{Push: false, QuietStart: 23, QuietEnd: 8}
+	r := ctx.Main(main).HTTP().Put("/users/u42/preferences", map[string]any{"push": false, "quiet_start": 23, "quiet_end": 8})
+	ctx.Assert(r.Status == 200 || r.Status == 204, "PUT answered %d, expected 204 (or 200)", r.Status)
+	ctx.Equal(db.Rows["u42"], next, "the database must hold the new preferences")
+	ctx.Equal(cacheAtSave, []int64{1}, "db.SavePrefs must run before the Del: the cache entry was already gone when the database was written")
+	ctx.Equal(ctx.Redis.Exists("prefs:u42"), 0, "PUT must delete prefs:u42, it holds %v (invalidate, never Set)", cachedPrefs(ctx, "prefs:u42"))
+	before := len(prefsLoads())
+	ctx.Equal(readPrefs(ctx, "u42"), next, "the next read must see the new preferences")
+	ctx.Equal(len(prefsLoads()), before+1, "the read after the PUT must reload from the database: loads")
+}
+`,
   },
   debrief: `Cache-aside on the read path and invalidate-on-write is the pairing that survives concurrency: readers refill from the source of truth, writers only ever remove, and the TTL bounds how long a missed invalidation can hurt. Updating the cache in place looks faster and is the classic source of "my setting reverted ten minutes later" bugs. Real systems add a short negative entry for users with no row, version the document so an old refill cannot overwrite a newer one, and fan the DEL out to every region's cache.`,
 };

@@ -651,6 +651,107 @@ export async function check_raises(ctx) {
   await failsToPublish(ctx, m, PublishFailed, order('o-3'), 'an acknowledgement that never arrives within ACK_TIMEOUT_S');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+
+	"leetbuild/harness"
+)
+
+// Order is the gateway's order (order_gateway.go, step 1), which this file uses.
+type Order struct {
+	OrderID       string  \`json:"order_id"\`
+	Symbol        string  \`json:"symbol"\`
+	Side          string  \`json:"side"\`
+	Price         float64 \`json:"price"\`
+	Qty           int64   \`json:"qty"\`
+	ClientOrderID string  \`json:"client_order_id"\`
+}
+
+func orderFor(orderID, symbol string) Order {
+	return Order{OrderID: orderID, Symbol: symbol, Side: "BUY", Price: 10.05, Qty: 100, ClientOrderID: "c-1"}
+}
+
+func mustPublish(ctx *harness.Ctx, o Order) {
+	ctx.NoError(publishOrder(context.Background(), o), "publishOrder(%s) returned an error", o.OrderID)
+}
+
+// failsToPublish: publishOrder must return an error (the gateway's 503).
+func failsToPublish(ctx *harness.Ctx, o Order, what string) {
+	err := publishOrder(context.Background(), o)
+	ctx.Assert(err != nil, "%s must make publishOrder return an error, it returned nil", what)
+}
+
+func CheckKeyedBySymbol(ctx *harness.Ctx) {
+	mustPublish(ctx, orderFor("o-1", "ACME"))
+	mustPublish(ctx, orderFor("o-2", "ACME"))
+	mustPublish(ctx, orderFor("o-3", "BETA"))
+	produced := ctx.Kafka.Records("orders")
+	ctx.Equal(len(produced), 3, "expected three records on orders")
+	ctx.Equal(ctx.Kafka.Keys("orders"), []string{"ACME", "ACME", "BETA"}, "records must be keyed by the symbol")
+	ctx.Equal(produced[0].Partition, produced[1].Partition, "two ACME orders must land on the same partition")
+	var value map[string]any
+	err := json.Unmarshal(produced[0].Value, &value)
+	ctx.Assert(err == nil && value["order_id"] == "o-1" && value["symbol"] == "ACME" && value["qty"] == 100.0, "the value must be the JSON of the order, got %s", produced[0].Value)
+}
+
+func CheckAcksAll(ctx *harness.Ctx) {
+	mustPublish(ctx, orderFor("o-1", "ACME"))
+	// The partition leader fails right after it answered: a record acknowledged by the leader alone is gone.
+	ctx.Kafka.Failover("orders")
+	held := len(ctx.Kafka.Records("orders"))
+	ctx.Equal(held, 1, "publishOrder returned (the gateway would answer 202), then the partition leader failed and orders lost the order: it had been acknowledged by the leader alone. The 202 is a durability promise and needs RequiredAcks: kafka.RequireAll; records on orders")
+}
+
+func CheckIdempotent(ctx *harness.Ctx) {
+	// The broker writes the order but its acknowledgement is lost on the way back: the producer retries.
+	ctx.Kafka.LoseAcks("orders", 1)
+	mustPublish(ctx, orderFor("o-1", "ACME"))
+	// kafka-go has no idempotent producer (the step's Go text): at least once, identical copies that
+	// carry the order_id header so the engine can deduplicate them.
+	records := ctx.Kafka.Records("orders")
+	ctx.Assert(len(records) > 0, "after a lost acknowledgement the order must still be on orders, it holds nothing")
+	first := records[0]
+	for _, r := range records {
+		var value map[string]any
+		_ = json.Unmarshal(r.Value, &value)
+		ctx.Equal(value["order_id"], "o-1", "after a lost acknowledgement orders must hold only the order o-1; order_id of a record")
+		ctx.Assert(string(r.Key) == string(first.Key) && string(r.Value) == string(first.Value), "a retried write must be an identical copy of the order (key %q, value %s), got key %q, value %s", first.Key, first.Value, r.Key, r.Value)
+		id, _ := r.Header("order_id")
+		ctx.Equal(string(id), "o-1", "every copy must carry the order_id header so a retried write can be deduplicated")
+	}
+}
+
+func CheckWaitsForAck(ctx *harness.Ctx) {
+	// The broker is slow but answers within ackTimeout: the call waits for the ack and returns.
+	ctx.Kafka.StallFor("orders", 0.5)
+	start := ctx.Clock.Now()
+	mustPublish(ctx, orderFor("o-1", "ACME"))
+	waited := ctx.Clock.Now() - start
+	ctx.Equal(len(ctx.Kafka.Records("orders")), 1, "the order must be on the topic once publishOrder returned")
+	ctx.Assert(waited >= 500, "publishOrder returned after %d ms while the broker only answered after 500 ms: it returned without waiting for the acknowledgement", waited)
+	// The broker never answers: the wait is bounded by ackTimeout, not kafka-go's 10 s default.
+	ctx.Kafka.Stall("orders")
+	start = ctx.Clock.Now()
+	failsToPublish(ctx, orderFor("o-2", "ACME"), "an acknowledgement that never arrives")
+	gaveUp := ctx.Clock.Now() - start
+	limit := ackTimeout.Milliseconds()
+	ctx.Assert(gaveUp >= limit-1 && gaveUp <= limit+1000, "publishOrder gave up after %d ms, expected ackTimeout (%d ms)", gaveUp, limit)
+}
+
+func CheckRaises(ctx *harness.Ctx) {
+	ctx.Kafka.FailNext("orders", 1)
+	failsToPublish(ctx, orderFor("o-1", "ACME"), "a delivery error")
+	ctx.Equal(len(ctx.Kafka.Records("orders")), 0, "the failed order must not be on the topic; records on orders")
+	mustPublish(ctx, orderFor("o-2", "ACME")) // the producer is still usable afterwards
+	ctx.Equal(len(ctx.Kafka.Records("orders")), 1, "the next order must be published normally; records on orders")
+	// The broker never answers: the write times out with the record still pending.
+	ctx.Kafka.Stall("orders")
+	failsToPublish(ctx, orderFor("o-3", "ACME"), "an acknowledgement that never arrives within ackTimeout")
+}
+`,
   },
   debrief: `Same producer API as an analytics event, opposite trade-off: here latency is spent to buy durability, because the 202 already left the building as a promise. \`acks=all\` moves the failure from "lost silently" to "reported", idempotence keeps the broker's own retries from turning one order into two, and the symbol key is what lets the next step keep one book per partition with no locks at all. Real exchanges skip Kafka on the hot path — a sequencer assigns a global sequence number and replicates the input log to standbys synchronously — but the shape is identical: nothing is acknowledged to the client before it is on more than one machine, and everything downstream is a deterministic function of the sequenced log.`,
 };

@@ -321,7 +321,7 @@ return 0
 var releaseScript = redis.NewScript(releaseLua)
 
 // nextCandidate is provided (dispatcher.go): offers the ride to the next driver on its candidate list.
-func nextCandidate(ctx context.Context, rideID string) { panic("not implemented") }
+var nextCandidate = func(ctx context.Context, rideID string) { panic("not implemented") }
 
 // offer returns true when the offer went out, false when the driver already has an open offer.
 func offer(ctx context.Context, rideID, driverID string) (bool, error) {
@@ -368,7 +368,7 @@ return 0
 var releaseScript = redis.NewScript(releaseLua)
 
 // nextCandidate is provided (dispatcher.go): offers the ride to the next driver on its candidate list.
-func nextCandidate(ctx context.Context, rideID string) { panic("not implemented") }
+var nextCandidate = func(ctx context.Context, rideID string) { panic("not implemented") }
 
 // offer returns true when the offer went out, false when the driver already has an open offer.
 func offer(ctx context.Context, rideID, driverID string) (bool, error) {
@@ -744,6 +744,120 @@ export async function check_decline_guarded(ctx) {
   await m.decline('r-60', 'd-9');
   assert.equal(ctx.redis.get('offer:driver:d-9'), 'r-61', 'the offer changed to r-61 between the GET and the DEL and decline deleted it anyway: compare and delete atomically');
   assert.equal(movedOn[movedOn.length - 1], 'r-60', 'decline must call nextCandidate with the declined ride');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+
+	"leetbuild/harness"
+)
+
+var offerCtx = context.Background()
+
+// standInDispatcher replaces the provided dispatcher.go: it records every ride handed to nextCandidate.
+func standInDispatcher() *[]string {
+	movedOn := &[]string{}
+	nextCandidate = func(_ context.Context, rideID string) { *movedOn = append(*movedOn, rideID) }
+	return movedOn
+}
+
+func offerTo(ctx *harness.Ctx, rideID, driverID string) bool {
+	ok, err := offer(offerCtx, rideID, driverID)
+	ctx.NoError(err, "offer(%q, %q) returned an error", rideID, driverID)
+	return ok
+}
+
+func acceptOffer(ctx *harness.Ctx, rideID, driverID string) bool {
+	ok, err := accept(offerCtx, rideID, driverID)
+	ctx.NoError(err, "accept(%q, %q) returned an error", rideID, driverID)
+	return ok
+}
+
+func declineOffer(ctx *harness.Ctx, rideID, driverID string) {
+	ctx.NoError(decline(offerCtx, rideID, driverID), "decline(%q, %q) returned an error", rideID, driverID)
+}
+
+// keyValue is the string at key, nil when absent.
+func keyValue(ctx *harness.Ctx, key string) any {
+	if v, ok := ctx.Redis.Get(key); ok {
+		return v
+	}
+	return nil
+}
+
+// The race: right after the first command that reads the offer key, the offer is replaced by a newer
+// ride. A GET-then-DEL from the client has the swap land between its two steps and deletes the newer
+// offer; an atomic compare-and-delete finishes before the swap, so the newer offer survives it.
+func offerRace(ctx *harness.Ctx, key, newer string) {
+	ctx.Redis.After(key, func() any { return ctx.Redis.Set(key, newer, "EX", 15) })
+}
+
+func CheckOfferNx(ctx *harness.Ctx) {
+	standInDispatcher()
+	ctx.Equal(offerTo(ctx, "r-42", "d-7"), true, "the first offer to a free driver must return true")
+	ctx.Equal(keyValue(ctx, "offer:driver:d-7"), "r-42", "offer:driver:d-7 must hold the ride id")
+	ttl := ctx.Redis.TTL("offer:driver:d-7")
+	ctx.Assert(0 < ttl && ttl <= 15, "offer:driver:d-7 has TTL %d, expected offerTTL (15 s)", ttl)
+	ctx.Equal(offerTo(ctx, "r-43", "d-7"), false, "a driver with an open offer must be skipped: the second offer must return false")
+	ctx.Equal(keyValue(ctx, "offer:driver:d-7"), "r-42", "the second offer must not overwrite the first: the SET must be NX")
+	ctx.Equal(offerTo(ctx, "r-43", "d-8"), true, "another driver is free and must get the offer")
+	ctx.Clock.Advance(16)
+	ctx.Equal(offerTo(ctx, "r-44", "d-7"), true, "after the 15 s window the driver is free again")
+	ctx.Equal(keyValue(ctx, "offer:driver:d-7"), "r-44", "offer:driver:d-7 after the new offer")
+}
+
+func CheckCompareAndDelete(ctx *harness.Ctx) {
+	standInDispatcher()
+	offerTo(ctx, "r-42", "d-7")
+	ctx.Equal(acceptOffer(ctx, "r-99", "d-7"), false, "accepting a ride that is not the one on offer must return false")
+	ctx.Equal(keyValue(ctx, "offer:driver:d-7"), "r-42", "a mismatched accept must leave the offer in place")
+	ctx.Equal(acceptOffer(ctx, "r-42", "d-7"), true, "accepting the ride on offer must return true")
+	ctx.Equal(keyValue(ctx, "offer:driver:d-7"), nil, "a successful accept must release the offer key")
+	ctx.Equal(acceptOffer(ctx, "r-42", "d-7"), false, "the offer is gone: a second accept must return false")
+	offerTo(ctx, "r-50", "d-8")
+	ctx.Clock.Advance(16)       // the offer expired unanswered ...
+	offerTo(ctx, "r-51", "d-8") // ... and a newer ride landed under the key
+	ctx.Equal(acceptOffer(ctx, "r-50", "d-8"), false, "a stale accept after the offer expired must return false")
+	ctx.Equal(keyValue(ctx, "offer:driver:d-8"), "r-51", "the stale accept must not delete the newer offer r-51: compare and delete must be one atomic step")
+	// The race itself: a GET-then-DEL from the client lets the key change in between.
+	offerTo(ctx, "r-60", "d-9")
+	offerRace(ctx, "offer:driver:d-9", "r-61")
+	ctx.Equal(acceptOffer(ctx, "r-60", "d-9"), true, "accept of the ride on offer must succeed")
+	ctx.Equal(keyValue(ctx, "offer:driver:d-9"), "r-61", "the offer changed to r-61 between the GET and the DEL, so the stale accept must not delete it: the compare and the delete must run atomically (a Lua script or WATCH/MULTI)")
+}
+
+func CheckAssignAfterAccept(ctx *harness.Ctx) {
+	standInDispatcher()
+	offerTo(ctx, "r-42", "d-7")
+	ctx.Equal(acceptOffer(ctx, "r-42", "d-7"), true, "accepting the ride on offer")
+	ctx.Equal(keyValue(ctx, "ride:r-42:driver"), "d-7", "after a successful accept ride:r-42:driver")
+	offerTo(ctx, "r-50", "d-8")
+	ctx.Equal(acceptOffer(ctx, "r-51", "d-8"), false, "accepting a ride that is not on offer")
+	ctx.Equal(keyValue(ctx, "ride:r-51:driver"), nil, "the guarded delete returned 0, so ride:r-51:driver must not be written: assign only after the release succeeded")
+	ctx.Equal(keyValue(ctx, "offer:driver:d-8"), "r-50", "a failed accept must not touch the offer")
+	ctx.Equal(acceptOffer(ctx, "r-42", "d-9"), false, "d-9 holds no offer: accept must return false")
+	ctx.Equal(keyValue(ctx, "ride:r-42:driver"), "d-7", "a failed accept must not reassign the ride")
+}
+
+func CheckDeclineGuarded(ctx *harness.Ctx) {
+	movedOn := standInDispatcher()
+	offerTo(ctx, "r-42", "d-7")
+	declineOffer(ctx, "r-42", "d-7")
+	ctx.Equal(keyValue(ctx, "offer:driver:d-7"), nil, "declining the ride on offer must release the key")
+	ctx.Equal(*movedOn, []string{"r-42"}, "decline must hand the ride to nextCandidate: the rides it saw")
+	offerTo(ctx, "r-50", "d-8")
+	ctx.Clock.Advance(16)
+	offerTo(ctx, "r-51", "d-8")
+	declineOffer(ctx, "r-50", "d-8")
+	ctx.Equal(keyValue(ctx, "offer:driver:d-8"), "r-51", "a late decline of r-50 must not delete the newer offer r-51: the release must be the guarded delete, never a blind DEL")
+	ctx.Equal(*movedOn, []string{"r-42", "r-50"}, "a late decline still moves the ride on: the rides nextCandidate saw")
+	offerTo(ctx, "r-60", "d-9")
+	offerRace(ctx, "offer:driver:d-9", "r-61")
+	declineOffer(ctx, "r-60", "d-9")
+	ctx.Equal(keyValue(ctx, "offer:driver:d-9"), "r-61", "the offer changed to r-61 between the GET and the DEL, so decline must not delete it: compare and delete atomically")
+	ctx.Equal((*movedOn)[len(*movedOn)-1], "r-60", "decline must call nextCandidate with the declined ride")
 }
 `,
   },

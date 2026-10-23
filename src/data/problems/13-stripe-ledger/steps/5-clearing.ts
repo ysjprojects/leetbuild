@@ -979,6 +979,228 @@ export async function check_stuck_endpoint(ctx) {
   assert.equal(Object.keys(open(ctx)).length, 3, 'reading the report must not change clearing:open');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"database/sql"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	ledgerdb "ledger/db"
+	"leetbuild/harness"
+)
+
+const clrSchema = \`
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL REFERENCES transactions (id),
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL,
+    posted_at bigint NOT NULL
+);
+\`
+
+const clrH = 3600 * 1000
+
+var (
+	clrCapture  = []Entry{{Account: "cash:acquirer", Currency: "EUR", Amount: 4999}, {Account: "clearing:payments", Currency: "EUR", Amount: -4999}}
+	clrPayout   = []Entry{{Account: "clearing:payments", Currency: "EUR", Amount: 4999}, {Account: "clearing:payouts", Currency: "EUR", Amount: -4999}}
+	clrCashOnly = []Entry{{Account: "cash:bank", Currency: "EUR", Amount: 100}, {Account: "cash:acquirer", Currency: "EUR", Amount: -100}}
+)
+
+// clrWorld is an empty ledger behind the real journal writer (step 4), which calls the learner's
+// track after every commit.
+func clrWorld(ctx *harness.Ctx) {
+	ctx.DB.Reset(clrSchema)
+}
+
+// clrWrite is a real transaction through the journal, posted at its own time ("" settles nothing):
+// one database transaction, then track. It returns the transaction id.
+func clrWrite(ctx *harness.Ctx, entries []Entry, postedAt int64, settles string) string {
+	var settled *string
+	if settles != "" {
+		settled = &settles
+	}
+	bg := context.Background()
+	transactionID := uuid.NewString()
+	err := ledgerdb.Transaction(bg, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(bg,
+			"INSERT INTO transactions (id, event_id, description, settles, posted_at) VALUES ($1, NULL, 'flow', $2, $3)",
+			transactionID, settled, postedAt); err != nil {
+			return err
+		}
+		for _, e := range entries {
+			if _, err := tx.ExecContext(bg,
+				"INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES ($1, $2, $3, $4, $5)",
+				transactionID, e.Account, e.Currency, e.Amount, postedAt); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	ctx.NoError(err, "the journal writer failed")
+	track(bg, transactionID, postedAt, entries, settled)
+	return transactionID
+}
+
+func clrOpen(ctx *harness.Ctx) map[string]float64 {
+	out := map[string]float64{}
+	for _, z := range ctx.Redis.ZRangeWithScores("clearing:open", 0, -1) {
+		out[z.Member] = z.Score
+	}
+	return out
+}
+
+// clrNames maps transaction ids to the names they were written under (unknown ids stay as they are).
+func clrNames(transactionIDs []string, names map[string]string) []string {
+	out := []string{}
+	for _, id := range transactionIDs {
+		if name, ok := names[id]; ok {
+			id = name
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
+func clrStuckIDs(items []StuckItem) []string {
+	out := []string{}
+	for _, item := range items {
+		out = append(out, item.TransactionID)
+	}
+	return out
+}
+
+func clrAbs(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func CheckOpensItem(ctx *harness.Ctx) {
+	clrWorld(ctx)
+	t0 := time.Now().UnixMilli() - 3*clrH
+	a := clrWrite(ctx, clrCapture, t0, "")
+	ctx.Equal(ctx.Redis.Type("clearing:open"), "zset", "clearing:open must be a sorted set")
+	s, ok := ctx.Redis.ZScore("clearing:open", a)
+	ctx.Assert(ok, "a transaction crediting clearing:payments must be added to clearing:open under its transaction id")
+	ctx.Equal(s, t0, "the score must be the transaction's own posted_at: a late event must already be overdue")
+	b := clrWrite(ctx, clrCashOnly, time.Now().UnixMilli(), "")
+	_, ok = ctx.Redis.ZScore("clearing:open", b)
+	ctx.Assert(!ok, "a transaction between cash accounts touches no clearing account and must not be tracked")
+	c := clrWrite(ctx, clrPayout, t0+1, "")
+	ctx.Equal(clrOpen(ctx), map[string]float64{a: float64(t0), c: float64(t0 + 1)}, "clearing:open should hold the capture and the payout")
+}
+
+func CheckSettlesCloses(ctx *harness.Ctx) {
+	clrWorld(ctx)
+	t0 := time.Now().UnixMilli() - 3*clrH
+	a := clrWrite(ctx, clrCapture, t0, "")
+	b := clrWrite(ctx, clrPayout, t0+2*clrH, a)
+	_, ok := ctx.Redis.ZScore("clearing:open", a)
+	ctx.Assert(!ok, "the transaction that settles the capture must ZRem it from clearing:open")
+	_, ok = ctx.Redis.ZScore("clearing:open", b)
+	ctx.Assert(!ok, "the settling transaction is the closing side of the flow: it must not open an item of its own")
+	func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				ctx.Fatalf("settling an id that is not open must be a no-op, but the write failed in track with %v", rec)
+			}
+		}()
+		clrWrite(ctx, clrPayout, t0, "tx-unknown")
+	}()
+	ctx.Equal(clrOpen(ctx), map[string]float64{}, "clearing:open should be empty")
+	c := clrWrite(ctx, clrCapture, t0, "")
+	d := clrWrite(ctx, clrCapture, t0+1, "")
+	clrWrite(ctx, clrPayout, t0+2, c)
+	ctx.Equal(clrOpen(ctx), map[string]float64{d: float64(t0 + 1)}, "only the first of two captures was settled: clearing:open should hold the second")
+}
+
+func CheckStuckWindow(ctx *harness.Ctx) {
+	clrWorld(ctx)
+	now := time.Now().UnixMilli()
+	ids := map[string]string{}
+	for _, w := range []struct {
+		name  string
+		hours int64
+	}{{"48h", 48}, {"23h", 23}, {"25h", 25}, {"1h", 1}} {
+		ids[clrWrite(ctx, clrCapture, now-w.hours*clrH, "")] = w.name
+	}
+	items, err := stuck(context.Background(), nowMs())
+	ctx.Assert(err == nil, "stuck must return the list of stuck items, it failed: %v", err)
+	ctx.Equal(len(clrOpen(ctx)), 4, "stuck reports; it must not remove anything from clearing:open: items there")
+	got := clrNames(clrStuckIDs(items), ids)
+	ctx.Equal(got, []string{"48h", "25h"}, "of transactions posted 48 h, 23 h, 25 h and 1 h ago, the ones older than 24 h, oldest first")
+	for _, item := range items {
+		s, _ := ctx.Redis.ZScore("clearing:open", item.TransactionID)
+		ctx.Equal(item.OpenedAt, s, "OpenedAt must be the item's score (item %+v)", item)
+	}
+	ages := map[string]int64{}
+	for _, item := range items {
+		ages[ids[item.TransactionID]] = item.AgeS
+	}
+	ctx.Assert(clrAbs(ages["48h"]-48*3600) <= 2 && clrAbs(ages["25h"]-25*3600) <= 2, "AgeS must be the age in seconds, got %v", ages)
+	ctx.Clock.Advance(2 * 3600)
+	items, err = stuck(context.Background(), nowMs())
+	ctx.Assert(err == nil, "stuck must return the list of stuck items, it failed: %v", err)
+	got = clrNames(clrStuckIDs(items), ids)
+	ctx.Equal(got, []string{"48h", "25h", "23h"}, "two hours later the 23 h one has crossed 24 h and must be reported")
+	// A late event: posted 30 h ago, journaled just now — stuck immediately, because the score is its own time.
+	late := clrWrite(ctx, clrCapture, time.Now().UnixMilli()-30*clrH, "")
+	items, _ = stuck(context.Background(), nowMs())
+	found := false
+	for _, item := range items {
+		found = found || item.TransactionID == late
+	}
+	ctx.Assert(found, "a transaction posted 30 h ago that reaches the journal now is already stuck")
+}
+
+func CheckStuckEndpoint(ctx *harness.Ctx) {
+	clrWorld(ctx)
+	now := time.Now().UnixMilli()
+	ids := map[string]string{}
+	for _, w := range []struct {
+		name  string
+		hours int64
+	}{{"27h", 27}, {"2h", 2}, {"30h", 30}} {
+		ids[clrWrite(ctx, clrCapture, now-w.hours*clrH, "")] = w.name
+	}
+	r := ctx.Main(main).HTTP().Get("/clearing/stuck")
+	ctx.Equal(r.Status, 200, "GET /clearing/stuck")
+	contentType := r.Header.Get("Content-Type")
+	ctx.Assert(strings.HasPrefix(contentType, "application/json"), "the report must be JSON, got Content-Type %q", contentType)
+	body, ok := r.JSON().([]any)
+	ctx.Assert(ok, "the report is a JSON list, got %s", r.Text())
+	transactionIDs := []string{}
+	for _, raw := range body {
+		item, _ := raw.(map[string]any)
+		id, _ := item["transaction_id"].(string)
+		transactionIDs = append(transactionIDs, id)
+	}
+	ctx.Equal(clrNames(transactionIDs, ids), []string{"30h", "27h"}, "expected the two transactions older than 24 h, oldest first")
+	for _, raw := range body {
+		item, _ := raw.(map[string]any)
+		_, hasID := item["transaction_id"]
+		_, hasOpened := item["opened_at"]
+		_, hasAge := item["age_s"]
+		ctx.Assert(hasID && hasOpened && hasAge, "every item carries transaction_id, opened_at and age_s, got %v", item)
+	}
+	age, _ := body[0].(map[string]any)["age_s"].(float64)
+	ctx.Assert(age-30*3600 <= 2 && 30*3600-age <= 2, "the 30 h one's age_s should be about %d, got %v", 30*3600, age)
+	ctx.Equal(len(clrOpen(ctx)), 3, "reading the report must not change clearing:open: items there")
+}
+`,
   },
   debrief: `A sorted set keyed by the transaction's own time turns "which money has been in transit too long" into one range query, and the 24-hour cutoff is the timeliness window from Stripe's post expressed as a score. The rule that a settling transaction closes rather than opens is what makes the set converge: every flow adds exactly one item on its way in and removes it on its way out. The report is deliberately read-only — someone has to decide whether a stuck item is a missing event, a mislabelled one or a real operational problem, and Stripe's post describes tooling that attributes each one to a team and generates the investigation query. Real systems track clearing per account and per currency with the open *balance* as well as the open items, alert on the aged balance rather than on the count, and let an item be re-opened when a correction reverses the transaction that settled it.`,
 };

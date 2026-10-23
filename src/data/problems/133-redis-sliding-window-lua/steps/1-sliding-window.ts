@@ -823,6 +823,182 @@ export async function check_unique_members(ctx) {
   assert.deepEqual(await m.allow('burst', 5000), [false, 1000], 'the 11th call in that millisecond is denied with the full window to wait');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"sort"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+// swVerdict is what allow returned, so a call compares and prints as one value.
+type swVerdict struct {
+	Allowed      bool
+	RetryAfterMs int64
+}
+
+var (
+	swBg    = context.Background()
+	swAdmit = swVerdict{true, 0}
+)
+
+func swAllow(ctx *harness.Ctx, clientID string, nowMs int64) swVerdict {
+	ok, retry, err := allow(swBg, clientID, nowMs)
+	ctx.NoError(err, "allow(%q, %d) returned an error", clientID, nowMs)
+	return swVerdict{ok, retry}
+}
+
+// swAdmits is n admitted verdicts.
+func swAdmits(n int) []swVerdict {
+	out := make([]swVerdict, n)
+	for i := range out {
+		out[i] = swAdmit
+	}
+	return out
+}
+
+func CheckOneScript(ctx *harness.Ctx) {
+	ctx.Equal(swAllow(ctx, "c1", 0), swAdmit, "the first call of a fresh client is admitted with retryAfterMs 0")
+	before := len(ctx.Redis.RoundTrips())
+	for i := int64(1); i < 12; i++ {
+		swAllow(ctx, "c1", i)
+	}
+	trips := ctx.Redis.RoundTrips()[before:]
+	ctx.Assert(len(trips) == 11, "11 calls after the script is loaded took %d round trips, expected exactly 11: one EVALSHA/EVAL each", len(trips))
+	seen := map[string]bool{}
+	outside := []string{}
+	for _, trip := range trips {
+		for _, name := range trip {
+			if name != "EVAL" && name != "EVALSHA" && !seen[name] {
+				seen[name] = true
+				outside = append(outside, name)
+			}
+		}
+	}
+	sort.Strings(outside)
+	ctx.Assert(len(outside) == 0, "the client sent %s besides EVAL/EVALSHA: trim, count and admit must run inside the script", harness.Show(outside))
+	ctx.Equal(ctx.Redis.Type("sw:c1"), "zset", "sw:c1 must be a sorted set: its type")
+}
+
+func CheckLimit(ctx *harness.Ctx) {
+	first := []swVerdict{}
+	for range limit {
+		first = append(first, swAllow(ctx, "alice", 0))
+	}
+	ctx.Equal(first, swAdmits(limit), "10 calls at nowMs 0 must all be admitted with retry 0")
+	ctx.Equal(ctx.Redis.ZCard("sw:alice"), limit, "the members of sw:alice after 10 admits")
+	ctx.Equal(swAllow(ctx, "alice", 0), swVerdict{false, 1000}, "the 11th call at 0 is denied with retryAfterMs 1000 (oldest at 0 leaves at 1000)")
+	ctx.Equal(swAllow(ctx, "alice", 400), swVerdict{false, 600}, "at 400 the oldest member (scored 0) leaves in 600 ms")
+	ctx.Equal(swAllow(ctx, "alice", 999), swVerdict{false, 1}, "at 999 the oldest member leaves in 1 ms")
+	ctx.Equal(ctx.Redis.ZCard("sw:alice"), limit, "a denied call must not add a member: the members of sw:alice")
+	ctx.Equal(swAllow(ctx, "bob", 400), swAdmit, "clients are independent: bob's first call is admitted while alice is full")
+	ctx.Equal(swAllow(ctx, "alice", 1000), swAdmit, "at 1000 the member scored 0 is out of the window (<= now - window) and one call is admitted")
+}
+
+func CheckSliding(ctx *harness.Ctx) {
+	for range 4 {
+		ctx.Equal(swAllow(ctx, "c", 0), swAdmit, "the first 4 calls at 0 are admitted")
+	}
+	for range 6 {
+		ctx.Equal(swAllow(ctx, "c", 300), swAdmit, "the next 6 calls at 300 are admitted")
+	}
+	ctx.Equal(swAllow(ctx, "c", 300), swVerdict{false, 700}, "full at 300: denied, the oldest (scored 0) leaves at 1000, 700 ms away")
+	at1000 := []swVerdict{}
+	for range 5 {
+		at1000 = append(at1000, swAllow(ctx, "c", 1000))
+	}
+	ctx.Equal(at1000, append(swAdmits(4), swVerdict{false, 300}), "at 1000 exactly the 4 members scored 0 have left: 4 admits then a denial pointing at the member scored 300 (retry 300)")
+	ctx.Equal(ctx.Redis.ZCard("sw:c"), limit, "the members of sw:c: the 4 expired ones trimmed, 4 new ones added")
+	ctx.Equal(swAllow(ctx, "c", 1299), swVerdict{false, 1}, "at 1299 the member scored 300 leaves in 1 ms")
+	at1300 := []swVerdict{}
+	for range 7 {
+		at1300 = append(at1300, swAllow(ctx, "c", 1300))
+	}
+	ctx.Equal(at1300, append(swAdmits(6), swVerdict{false, 700}), "at 1300 the 6 members scored 300 have left: 6 admits, then a denial pointing at the member scored 1000 (retry 700)")
+}
+
+func CheckTtl(ctx *harness.Ctx) {
+	ctx.Equal(swAllow(ctx, "idle", ctx.Clock.Now()), swAdmit, "the first call of a fresh client is admitted")
+	pttl := ctx.Redis.PTTL("sw:idle")
+	ctx.Assert(950 <= pttl && pttl <= 1000, "PTTL sw:idle is %d right after an admit, expected windowMs (1000)", pttl)
+	ctx.Clock.Advance(0.3)
+	pttl = ctx.Redis.PTTL("sw:idle")
+	ctx.Assert(650 <= pttl && pttl <= 700, "PTTL sw:idle is %d 300 ms later, expected about 700: the TTL is set once per admit, not refreshed by the clock", pttl)
+	ctx.Equal(swAllow(ctx, "idle", ctx.Clock.Now()), swAdmit, "the second call is admitted")
+	pttl = ctx.Redis.PTTL("sw:idle")
+	ctx.Assert(950 <= pttl && pttl <= 1000, "PTTL sw:idle is %d after a second admit, expected 1000 again: every admit re-arms PEXPIRE", pttl)
+	ctx.Clock.Advance(1.1)
+	ctx.Equal(ctx.Redis.Exists("sw:idle"), 0, "a client idle for a whole window must leave no key behind")
+	ctx.Equal(swAllow(ctx, "idle", ctx.Clock.Now()), swAdmit, "after the key expired the client starts a fresh window")
+}
+
+func CheckAtomic(ctx *harness.Ctx) {
+	mine := []swVerdict{}
+	for range 7 {
+		mine = append(mine, swAllow(ctx, "racer", 0))
+	}
+	ctx.Equal(mine, swAdmits(7), "the first 7 calls are admitted")
+	// A second instance's two calls land right after each command of the first instance's that touches
+	// sw:racer, re-armed for its next one, until 40 have landed.
+	var theirs []swVerdict
+	var theirErr error
+	var land func() any
+	land = func() any {
+		for range 2 {
+			ok, retry, err := allow(swBg, "racer", 0)
+			if err != nil && theirErr == nil {
+				theirErr = err
+			}
+			theirs = append(theirs, swVerdict{ok, retry})
+		}
+		if len(theirs) < 40 {
+			ctx.Redis.After("sw:racer", land)
+		}
+		return nil
+	}
+	probe := ctx.Redis.After("sw:racer", land)
+	for range 5 {
+		mine = append(mine, swAllow(ctx, "racer", 0))
+	}
+	ctx.Assert(probe.Fired, "the first instance never touched sw:racer")
+	ctx.Assert(probe.Err == nil, "the second instance's allow failed while landing between commands: %v", probe.Err)
+	ctx.NoError(theirErr, "the second instance's allow returned an error while landing between commands")
+	admitted := 0
+	for _, v := range append(mine, theirs...) {
+		if v.Allowed {
+			admitted++
+		}
+	}
+	ctx.Assert(admitted <= limit, "two instances admitted %d calls for one client in one window: the second instance landed between the first's commands and both counted the same slot, so the decision must be one script", admitted)
+	ctx.Equal(admitted, limit, "the calls two instances together admitted")
+	ctx.Equal(ctx.Redis.ZCard("sw:racer"), limit, "the members of sw:racer")
+	ctx.Equal(swAllow(ctx, "racer", 0), swVerdict{false, 1000}, "both instances deny once the window is full")
+	ctx.Equal(swAllow(ctx, "racer", 0), swVerdict{false, 1000}, "both instances deny once the window is full")
+}
+
+func CheckUniqueMembers(ctx *harness.Ctx) {
+	same := []swVerdict{}
+	for range 9 {
+		same = append(same, swAllow(ctx, "burst", 5000))
+	}
+	ctx.Equal(same, swAdmits(9), "9 calls in the same millisecond must all be admitted")
+	ctx.Equal(ctx.Redis.ZCard("sw:burst"), 9, "the members after 9 calls at nowMs 5000: each call must be its own member, not one member rewritten")
+	ctx.Equal(swAllow(ctx, "burst", 5000), swAdmit, "a second instance's call in the same millisecond is the 10th member")
+	members := ctx.Redis.ZRangeWithScores("sw:burst", 0, -1)
+	names := map[string]bool{}
+	for _, z := range members {
+		names[z.Member] = true
+	}
+	ctx.Assert(len(members) == limit && len(names) == limit, "expected 10 distinct members, got %v", members)
+	for _, z := range members {
+		ctx.Assert(z.Score == 5000, "every member is scored by its nowMs (5000), got %v", members)
+		ctx.Assert(strings.HasPrefix(z.Member, "5000-"), "members are %q, got %v", "{nowMs}-{nonce}", members)
+	}
+	ctx.Equal(swAllow(ctx, "burst", 5000), swVerdict{false, 1000}, "the 11th call in that millisecond is denied with the full window to wait")
+}
+`,
   },
   debrief: `The limiter is correct for one reason: nothing between the trim and the \`ZADD\` happens outside Redis. A client that trims, counts and then adds gives every other instance three places to land, and the race only shows at the edge — count nine, both add — which is exactly where a limiter matters. The script runs alone, so the count it reads is the count it adds to, and because the caller passes \`now_ms\` the script is deterministic and replicates safely. The sorted set is the natural log: scores are time, \`ZREMRANGEBYSCORE\` is the slide, \`ZRANGE 0 0\` is the oldest member and therefore an exact \`retry_after_ms\`, and \`PEXPIRE\` makes an idle client cost nothing. The member must be unique per call because a sorted set is a set — reusing \`now_ms\` silently merges a burst into one entry. Real systems add a second, coarser limit per client, a cheaper approximation (two fixed windows weighted by overlap) when the log would hold thousands of members per client, hash tags so the key and the script stay on one cluster slot, and fail-open behaviour when Redis is unreachable.`,
 };

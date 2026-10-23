@@ -127,3 +127,77 @@ export function subscribers(room: string): number {
 }
 `,
 };
+
+/**
+ * The same subscription table for Go, as the package `chat/subscriptions`: one channel per open
+ * stream. The chat stream (step 2) binds `subscribe` / `unsubscribe` to it, the room bus (step 3)
+ * binds `localDeliver`.
+ */
+export const supportModulesGo: Record<string, string> = {
+  'chat/subscriptions/subscriptions.go': `// Package subscriptions is the subscription table of one chat-server instance. Every open stream
+// that joined a room owns one channel; the room bus hands every delivered message to all of them.
+package subscriptions
+
+import (
+	"sync"
+
+	pb "chat/gen/chat"
+)
+
+// inboxSize is how far a stream may fall behind its room. LocalDeliver never blocks the room on one
+// slow stream: a stream that has inboxSize messages waiting misses the next ones.
+const inboxSize = 64
+
+var (
+	mu    sync.Mutex
+	rooms = map[string][]chan *pb.ServerMsg{}
+)
+
+// Subscribe returns a fresh channel that receives every message delivered to room on this instance.
+func Subscribe(room string) <-chan *pb.ServerMsg {
+	mu.Lock()
+	defer mu.Unlock()
+	sub := make(chan *pb.ServerMsg, inboxSize)
+	rooms[room] = append(rooms[room], sub)
+	return sub
+}
+
+// Unsubscribe drops sub from room: it receives nothing more.
+func Unsubscribe(room string, sub <-chan *pb.ServerMsg) {
+	mu.Lock()
+	defer mu.Unlock()
+	subs := rooms[room]
+	for i := range subs {
+		if (<-chan *pb.ServerMsg)(subs[i]) == sub {
+			subs = append(subs[:i:i], subs[i+1:]...)
+			break
+		}
+	}
+	if len(subs) == 0 {
+		delete(rooms, room)
+	} else {
+		rooms[room] = subs
+	}
+}
+
+// LocalDeliver hands msg to every stream on this instance subscribed to room.
+func LocalDeliver(room string, msg *pb.ServerMsg) {
+	mu.Lock()
+	defer mu.Unlock()
+	subs := rooms[room]
+	for i := range subs {
+		select {
+		case subs[i] <- msg:
+		default: // this stream is inboxSize messages behind: it misses this one
+		}
+	}
+}
+
+// Subscribers is how many streams on this instance are subscribed to room.
+func Subscribers(room string) int {
+	mu.Lock()
+	defer mu.Unlock()
+	return len(rooms[room])
+}
+`,
+};

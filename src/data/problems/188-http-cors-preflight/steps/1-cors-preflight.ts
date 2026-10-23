@@ -1281,5 +1281,193 @@ export async function check_no_origin(ctx) {
   assert.deepEqual(bare.json(), [{id: 1, text: 'from evil'}], 'GET without Origin returned ' + show(bare.text) + ': the body is the same for every caller');
 }
 `,
+    go: `package main
+
+import (
+	"net/http"
+	"sort"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+const (
+	corsApp   = "https://app.example.com"
+	corsAdmin = "https://admin.example.com"
+	corsEvil  = "https://evil.example.com"
+)
+
+// corsGranted lists the Access-Control-* headers a response carries, lowercased and sorted.
+func corsGranted(r *harness.Response) []string {
+	var names []string
+	for name := range r.Header {
+		if lower := strings.ToLower(name); strings.HasPrefix(lower, "access-control-") {
+			names = append(names, lower)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// corsVary is the set of Vary tokens, lowercased.
+func corsVary(r *harness.Response) map[string]bool {
+	tokens := map[string]bool{}
+	for _, t := range strings.Split(strings.Join(r.Header.Values("Vary"), ","), ",") {
+		if t = strings.ToLower(strings.TrimSpace(t)); t != "" {
+			tokens[t] = true
+		}
+	}
+	return tokens
+}
+
+// corsHas reports whether the response carries the header at all.
+func corsHas(r *harness.Response, name string) bool {
+	_, ok := r.Header[http.CanonicalHeaderKey(name)]
+	return ok
+}
+
+// corsShow quotes a header's value, or says nil when it is absent.
+func corsShow(r *harness.Response, name string) string {
+	if !corsHas(r, name) {
+		return "nil"
+	}
+	return harness.Show(r.Header.Get(name))
+}
+
+func corsPreflight(c *harness.HTTP, path, origin, method string, headers ...string) *harness.Response {
+	h := []string{"Origin", origin, "Access-Control-Request-Method", method}
+	if len(headers) > 0 {
+		h = append(h, "Access-Control-Request-Headers", headers[0])
+	}
+	return c.Options(path, h...)
+}
+
+func CheckPreflight(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	for _, tc := range [][3]string{
+		{corsApp, "/api/notes", "POST"},
+		{corsAdmin, "/api/notes/7", "DELETE"},
+		{corsApp, "/api/notes", "GET"},
+	} {
+		origin, path, method := tc[0], tc[1], tc[2]
+		r := corsPreflight(c, path, origin, method)
+		where := "OPTIONS " + path + " from " + origin + " for " + method
+		ctx.Equal(r.Status, 204, "%s: the status (answer the preflight in cors, before routing)", where)
+		ctx.Equal(r.Text(), "", "%s: a 204 carries no body", where)
+		ctx.Equal(r.Header.Get("Access-Control-Allow-Origin"), origin, "%s: Access-Control-Allow-Origin must be the origin itself", where)
+		ctx.Equal(r.Header.Get("Access-Control-Allow-Methods"), "GET, POST, DELETE", "%s: Access-Control-Allow-Methods", where)
+		ctx.Equal(r.Header.Get("Access-Control-Allow-Credentials"), "true", "%s: Access-Control-Allow-Credentials", where)
+		ctx.Equal(r.Header.Get("Access-Control-Max-Age"), "600", "%s: Access-Control-Max-Age", where)
+		ctx.Assert(!corsHas(r, "Access-Control-Allow-Headers"), "%s: no headers were requested, so Access-Control-Allow-Headers must be omitted (got %s)", where, corsShow(r, "Access-Control-Allow-Headers"))
+	}
+}
+
+func CheckAllowHeaders(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	for _, tc := range [][2]string{
+		{"Content-Type, Authorization", "content-type, authorization"},
+		{" authorization ,CONTENT-TYPE", "authorization, content-type"},
+		{"content-type", "content-type"},
+	} {
+		sent, expected := tc[0], tc[1]
+		r := corsPreflight(c, "/api/notes", corsApp, "POST", sent)
+		ctx.Equal(r.Status, 204, "Access-Control-Request-Headers %q names only allowed headers, so the preflight's status", sent)
+		ctx.Equal(r.Header.Get("Access-Control-Allow-Headers"), expected, "Access-Control-Request-Headers %q: Access-Control-Allow-Headers (trimmed, lowercased, in the order sent)", sent)
+	}
+	for _, sent := range []string{"Content-Type, X-Debug", "x-api-key"} {
+		r := corsPreflight(c, "/api/notes", corsApp, "POST", sent)
+		ctx.Equal(r.Status, 403, "Access-Control-Request-Headers %q names a header outside allowedHeaders, so the preflight's status", sent)
+		ctx.Equal(corsGranted(r), []string(nil), "the rejected preflight for %q still sent Access-Control-* headers", sent)
+	}
+}
+
+func CheckRejected(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	for _, tc := range [][3]string{
+		{corsEvil, "POST", "an origin outside the allowlist"},
+		{"https://app.example.com.evil.net", "GET", "a look-alike with the allowed origin as a prefix"},
+		{"http://app.example.com", "GET", "the allowed host over http (a different origin)"},
+		{"null", "GET", "the opaque origin 'null'"},
+		{corsApp, "PUT", "a method outside GET, POST, DELETE"},
+		{corsApp, "PATCH", "a method outside GET, POST, DELETE"},
+	} {
+		origin, method, why := tc[0], tc[1], tc[2]
+		r := corsPreflight(c, "/api/notes", origin, method)
+		where := "preflight from " + origin + " for " + method + " (" + why + ")"
+		ctx.Equal(r.Status, 403, "%s: the status", where)
+		ctx.Equal(corsGranted(r), []string(nil), "%s was refused but still sent Access-Control-* headers: a refusal grants nothing", where)
+	}
+}
+
+func CheckEchoOrigin(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	created := c.Post("/api/notes", map[string]any{"text": "hi"}, "Origin", corsAdmin, "Authorization", "Bearer t")
+	listed := c.Get("/api/notes", "Origin", corsApp)
+	deleted := c.Delete("/api/notes/1", "Origin", corsApp)
+	for _, tc := range []struct {
+		name   string
+		r      *harness.Response
+		status int
+		origin string
+	}{
+		{"POST /api/notes", created, 201, corsAdmin},
+		{"GET /api/notes", listed, 200, corsApp},
+		{"DELETE /api/notes/1", deleted, 204, corsApp},
+	} {
+		ctx.Equal(tc.r.Status, tc.status, "%s from %s: the status", tc.name, tc.origin)
+		acao := tc.r.Header.Get("Access-Control-Allow-Origin")
+		ctx.Assert(acao != "*", "%s: Access-Control-Allow-Origin is '*', which browsers refuse with credentials: echo the origin", tc.name)
+		ctx.Equal(acao, tc.origin, "%s from %s: Access-Control-Allow-Origin", tc.name, tc.origin)
+		ctx.Equal(tc.r.Header.Get("Access-Control-Allow-Credentials"), "true", "%s from %s: Access-Control-Allow-Credentials", tc.name, tc.origin)
+	}
+	ctx.Equal(listed.JSON(), []any{map[string]any{"id": float64(1), "text": "hi"}}, "GET /api/notes body: CORS must not change the response")
+}
+
+func CheckVary(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	pre := corsPreflight(c, "/api/notes", corsApp, "POST", "content-type")
+	actual := []struct {
+		name string
+		r    *harness.Response
+	}{
+		{"GET from an allowed origin", c.Get("/api/notes", "Origin", corsApp)},
+		{"GET from a disallowed origin", c.Get("/api/notes", "Origin", corsEvil)},
+		{"GET without Origin", c.Get("/api/notes")},
+		{"DELETE without Origin", c.Delete("/api/notes/3")},
+	}
+	tokens := corsVary(pre)
+	for _, want := range []string{"origin", "access-control-request-method", "access-control-request-headers"} {
+		ctx.Assert(tokens[want], "the allowed preflight has Vary %s, expected 'Origin, Access-Control-Request-Method, Access-Control-Request-Headers'", corsShow(pre, "Vary"))
+	}
+	for _, a := range actual {
+		ctx.Assert(corsVary(a.r)["origin"], "%s has Vary %s: every /api response depends on Origin, so a cache must key on it even when no Origin was sent", a.name, corsShow(a.r, "Vary"))
+	}
+}
+
+func CheckNoOrigin(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	control := c.Get("/api/notes", "Origin", corsApp)
+	ctx.Equal(control.Header.Get("Access-Control-Allow-Origin"), corsApp, "control: GET /api/notes from %s must be granted, Access-Control-Allow-Origin", corsApp)
+	created := c.Post("/api/notes", map[string]any{"text": "from evil"}, "Origin", corsEvil)
+	bare := c.Get("/api/notes")
+	cases := []struct {
+		name   string
+		r      *harness.Response
+		status int
+	}{
+		{"POST from a disallowed origin", created, 201},
+		{"GET without Origin", bare, 200},
+		{"GET from a disallowed origin", c.Get("/api/notes", "Origin", corsEvil), 200},
+		{"GET from a look-alike origin", c.Get("/api/notes", "Origin", "https://app.example.com.evil.net"), 200},
+		{"DELETE from http://app.example.com", c.Delete("/api/notes/9", "Origin", "http://app.example.com"), 204},
+	}
+	for _, tc := range cases {
+		ctx.Equal(tc.r.Status, tc.status, "%s: the status (the server answers normally, the browser enforces CORS)", tc.name)
+		ctx.Assert(!corsHas(tc.r, "Access-Control-Allow-Origin"), "%s got Access-Control-Allow-Origin %s: only an origin in allowedOrigins is granted", tc.name, corsShow(tc.r, "Access-Control-Allow-Origin"))
+		ctx.Assert(!corsHas(tc.r, "Access-Control-Allow-Credentials"), "%s got Access-Control-Allow-Credentials: grant nothing to an origin outside the allowlist", tc.name)
+	}
+	ctx.Equal(bare.JSON(), []any{map[string]any{"id": float64(1), "text": "from evil"}}, "GET without Origin: the body is the same for every caller")
+}
+`,
   },
 };

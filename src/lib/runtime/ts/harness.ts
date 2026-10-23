@@ -37,9 +37,9 @@ export interface CheckResult {
 }
 
 /** Virtual sleeps one check may take before its loops are stopped. */
-const SLEEP_LIMIT = 500;
+export const SLEEP_LIMIT = 500;
 /** Real time one check may take; a check still running past it fails and the next one starts. */
-const CHECK_BUDGET_MS = 10_000;
+export const CHECK_BUDGET_MS = 10_000;
 
 export interface HttpResponse {
   json<T = unknown>(): T;
@@ -241,18 +241,23 @@ const explain = (error: unknown, modules: ModuleSystem): string => {
   return head;
 };
 
-const resetWorld = (modules: ModuleSystem): void => {
+/** The JavaScript resources every runtime shares, emptied before each check: the clock at zero with its sleep budget. */
+export const resetResources = (): void => {
   CLOCK.reset(SLEEP_LIMIT);
   SERVER.reset();
   BROKER.reset();
   grpc.REGISTRY.reset();
   DB.clear();
   PROCESS.reset();
+};
+
+const resetWorld = (modules: ModuleSystem): void => {
+  resetResources();
   modules.purge();
 };
 
 /** What the learner's code did in the check so far, read off the resources (they are reset per check). */
-const snapshotMetrics = (): RunMetrics => {
+export const snapshotMetrics = (): RunMetrics => {
   const events = BROKER.events;
   const count = (kind: string): number => events.reduce((n, e) => (e[0] === kind ? n + 1 : n), 0);
   return {

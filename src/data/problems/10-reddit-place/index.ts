@@ -108,6 +108,10 @@ whiteboard or map.`,
     ],
   },
   steps: [boardEndpointStep, cooldownStep, placementEventsStep, tileStreamStep, leaderboardStep],
-  support: {python: {...protoModules, ...supportModules}, typescript: {...protoFiles, ...supportModulesTs}},
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles},
+  },
   learn,
 };

@@ -682,6 +682,112 @@ export async function check_fail_loud(ctx) {
   assert(timedOut instanceof m.BusUnavailable, \`no acknowledgement within the timeout must throw BusUnavailable, got \${timedOut}\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+
+	"leetbuild/harness"
+)
+
+// busEnqueue enqueues a notification the way the API does.
+func busEnqueue(id, userID, priority string) error {
+	return enqueue(context.Background(), Notification{ID: id, UserID: userID, Channel: "push", Title: "Shipped", Body: "On its way", Priority: priority})
+}
+
+func busHeader(r harness.KafkaRecord, name string) any {
+	if v, ok := r.Header(name); ok {
+		return string(v)
+	}
+	return nil
+}
+
+func busHeaderKeys(r harness.KafkaRecord) []string {
+	var keys []string
+	for _, h := range r.Headers {
+		keys = append(keys, h.Key)
+	}
+	return keys
+}
+
+// busIDs are the ids of the records on notifications; copies of one record (same key and value) count once.
+func busIDs(ctx *harness.Ctx) []string {
+	seen := map[[2]string]bool{}
+	var ids []string
+	for _, r := range ctx.Kafka.Records("notifications") {
+		copyOf := [2]string{string(r.Key), string(r.Value)}
+		if seen[copyOf] {
+			continue
+		}
+		seen[copyOf] = true
+		var n struct{ ID string }
+		ctx.NoError(json.Unmarshal(r.Value, &n), "a record on notifications is not a notification as JSON: %q", r.Value)
+		ids = append(ids, n.ID)
+	}
+	return ids
+}
+
+func CheckDurableProducer(ctx *harness.Ctx) {
+	ctx.NoError(busEnqueue("n1", "u42", "normal"), "enqueue(n1) returned an error")
+	ctx.Kafka.Failover("notifications")
+	ctx.Equal(len(busIDs(ctx)), 1, "enqueue returned (the API answered 202), then the partition leader failed and notifications lost the record: it had been acknowledged by the leader alone. The writer must wait for every in-sync replica (RequiredAcks: kafka.RequireAll)")
+	ctx.Kafka.LoseAcks("notifications", 1)
+	ctx.NoError(busEnqueue("n2", "u42", "normal"), "enqueue(n2) returned an error")
+	// kafka-go has no idempotent producer (the step's Go detail): at least once, identical copies.
+	ctx.Equal(busIDs(ctx), []string{"n1", "n2"}, "the acknowledgement of n2 was lost and the writer retried: notifications must hold n1 and n2, every copy identical to the original")
+}
+
+func CheckKeyed(ctx *harness.Ctx) {
+	ctx.NoError(busEnqueue("n1", "u42", "normal"), "enqueue(n1) returned an error")
+	ctx.NoError(busEnqueue("n2", "u42", "normal"), "enqueue(n2) returned an error")
+	ctx.NoError(busEnqueue("n3", "u7", "normal"), "enqueue(n3) returned an error")
+	produced := ctx.Kafka.Records("notifications")
+	ctx.Equal(len(produced), 3, "records on notifications")
+	ctx.Equal(ctx.Kafka.Keys("notifications"), []string{"u42", "u42", "u7"}, "records must be keyed by the user id")
+	ctx.Equal(produced[0].Partition, produced[1].Partition, "one user's notifications must share a partition")
+	var first struct{ ID string }
+	ctx.NoError(json.Unmarshal(produced[0].Value, &first), "the value must be the notification as JSON, got %q", produced[0].Value)
+	ctx.Equal(first.ID, "n1", "the value must be the notification as JSON (%s): its id", produced[0].Value)
+}
+
+func CheckPriorityHeader(ctx *harness.Ctx) {
+	ctx.NoError(busEnqueue("n1", "u42", "high"), "enqueue(n1) returned an error")
+	ctx.NoError(busEnqueue("n2", "u42", "normal"), "enqueue(n2) returned an error")
+	produced := ctx.Kafka.Records("notifications")
+	ctx.Equal(len(produced), 2, "records on notifications")
+	ctx.Equal(busHeader(produced[0], "priority"), "high", "the first record must carry a priority=high header, headers were %v", busHeaderKeys(produced[0]))
+	ctx.Equal(busHeader(produced[1], "priority"), "normal", "the second record must carry a priority=normal header, headers were %v", busHeaderKeys(produced[1]))
+}
+
+func CheckWaitAck(ctx *harness.Ctx) {
+	ctx.NoError(busEnqueue("n1", "u42", "normal"), "enqueue(n1) returned an error")
+	ctx.Equal(len(ctx.Kafka.Records("notifications")), 1, "the record must be in Kafka when enqueue returns: records on notifications")
+	ctx.Kafka.StallFor("notifications", 1) // the broker is slow but answers within the timeout
+	ctx.NoError(busEnqueue("n2", "u42", "normal"), "the broker acknowledged after 1 s, within the 2 s wait, yet enqueue returned an error")
+	ctx.Equal(len(ctx.Kafka.Records("notifications")), 2, "the record must be in Kafka when enqueue returns: records on notifications")
+	ctx.Kafka.Stall("notifications") // the broker is down for good
+	started := ctx.Clock.Now()
+	down := busEnqueue("n3", "u42", "normal")
+	waited := float64(ctx.Clock.Now()-started) / 1000
+	ctx.Assert(down != nil, "the broker never acknowledged, yet enqueue returned nil: the 202 was promised before the record was in Kafka")
+	ctx.Assert(1 <= waited && waited <= 2.5, "the acknowledgement wait must be bounded by about 2 s, enqueue gave up after %v s", waited)
+}
+
+func CheckFailLoud(ctx *harness.Ctx) {
+	ctx.Kafka.FailNext("notifications", 1)
+	failed := busEnqueue("n1", "u42", "normal")
+	ctx.Assert(failed != nil, "a delivery error must return an error wrapping ErrBusUnavailable, enqueue returned nil")
+	ctx.ErrorIs(failed, ErrBusUnavailable, "a delivery error must return an error wrapping ErrBusUnavailable")
+	ctx.Equal(len(ctx.Kafka.Records("notifications")), 0, "the failed record must not be in the topic: records on notifications")
+	ctx.NoError(busEnqueue("n2", "u42", "normal"), "after the failure a new enqueue must work")
+	ctx.Equal(len(ctx.Kafka.Records("notifications")), 1, "after the failure a new enqueue must work: records on notifications")
+	ctx.Kafka.Stall("notifications") // no acknowledgement arrives before the timeout
+	timedOut := busEnqueue("n3", "u42", "normal")
+	ctx.Assert(timedOut != nil, "no acknowledgement within the timeout must return an error wrapping ErrBusUnavailable, enqueue returned nil")
+	ctx.ErrorIs(timedOut, ErrBusUnavailable, "no acknowledgement within the timeout must return an error wrapping ErrBusUnavailable")
+}
+`,
   },
   debrief: `Same key → same partition → same order is the only ordering Kafka gives you, and keying by user is exactly the order a user notices. \`acks=all\` plus the idempotent producer make the acknowledged record durable *and* unique across the client's own retries; waiting for that ack is what gives the 202 its meaning. Real producers keep one future per record instead of flushing the whole buffer (so one slow partition does not stall unrelated requests), and set \`delivery.timeout.ms\` so the client's retries and the caller's deadline agree.`,
 };

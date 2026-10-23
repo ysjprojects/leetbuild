@@ -384,7 +384,7 @@ type Order struct {
 
 // publishOrder hands the order to the engine (built in the next step); it returns an error when Kafka
 // does not acknowledge the order.
-func publishOrder(ctx context.Context, order Order) error {
+var publishOrder = func(ctx context.Context, order Order) error {
 	panic("not implemented")
 }
 
@@ -431,7 +431,7 @@ type Order struct {
 
 // publishOrder hands the order to the engine (built in the next step); it returns an error when Kafka
 // does not acknowledge the order.
-func publishOrder(ctx context.Context, order Order) error {
+var publishOrder = func(ctx context.Context, order Order) error {
 	panic("not implemented")
 }
 
@@ -861,6 +861,112 @@ export async function check_unavailable(ctx) {
   const {m} = gateway(ctx, true);
   const r = await ctx.client(m.app).post('/orders', {json: ORDER, headers: HEADERS});
   assert.equal(r.status, 503, \`PublishFailed answered \${r.status}, expected 503\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"errors"
+
+	"leetbuild/harness"
+)
+
+var gatewayHeaders = []string{"X-Api-Key", "k-1f9c", "Idempotency-Key", "idem-1"}
+
+func gatewayOrder() map[string]any {
+	return map[string]any{"symbol": "ACME", "side": "BUY", "price": 10.05, "qty": 100, "client_order_id": "c-1"}
+}
+
+// gatewayUnderTest runs the learner's server with publishOrder replaced by a recorder (the real one is
+// built in step 2); fail makes it return the error Kafka's missing acknowledgement would.
+func gatewayUnderTest(ctx *harness.Ctx, fail bool) (*harness.HTTP, *[]Order) {
+	published := &[]Order{}
+	publishOrder = func(_ context.Context, order Order) error {
+		if fail {
+			return errors.New("broker did not acknowledge")
+		}
+		*published = append(*published, order)
+		return nil
+	}
+	return ctx.Main(main).HTTP(), published
+}
+
+func CheckAuth(ctx *harness.Ctx) {
+	c, published := gatewayUnderTest(ctx, false)
+	r := c.Post("/orders", gatewayOrder(), "Idempotency-Key", "idem-1")
+	ctx.Equal(r.Status, 401, "no X-Api-Key")
+	r = c.Post("/orders", gatewayOrder(), "X-Api-Key", "nope", "Idempotency-Key", "idem-1")
+	ctx.Equal(r.Status, 401, "an unknown X-Api-Key")
+	r = c.Post("/orders", "not json", "Content-Type", "application/json")
+	ctx.Equal(r.Status, 401, "a request without a key and with a broken body: the key must be checked before the body is read")
+	ctx.Equal(len(*published), 0, "rejected requests must not reach publishOrder; calls")
+	r = c.Post("/orders", gatewayOrder(), gatewayHeaders...)
+	ctx.Assert(r.Status != 401, "a known X-Api-Key must be accepted, got 401")
+}
+
+func CheckIdempotencyKey(ctx *harness.Ctx) {
+	c, published := gatewayUnderTest(ctx, false)
+	r := c.Post("/orders", gatewayOrder(), "X-Api-Key", "k-1f9c")
+	ctx.Equal(r.Status, 400, "a request without Idempotency-Key")
+	ctx.Equal(len(*published), 0, "a request without Idempotency-Key must not be published; calls")
+	r = c.Post("/orders", gatewayOrder(), gatewayHeaders...)
+	ctx.Assert(r.Status != 400, "a request with Idempotency-Key and a valid body answered 400")
+}
+
+func CheckValidate(ctx *harness.Ctx) {
+	c, published := gatewayUnderTest(ctx, false)
+	with := func(key string, value any) map[string]any {
+		body := gatewayOrder()
+		body[key] = value
+		return body
+	}
+	without := func(key string) map[string]any {
+		body := gatewayOrder()
+		delete(body, key)
+		return body
+	}
+	bad := []struct {
+		label string
+		body  map[string]any
+	}{
+		{"side", with("side", "HOLD")},
+		{"price 0", with("price", 0)},
+		{"negative price", with("price", -1)},
+		{"qty 0", with("qty", 0)},
+		{"missing symbol", without("symbol")},
+		{"missing client_order_id", without("client_order_id")},
+	}
+	for _, b := range bad {
+		r := c.Post("/orders", b.body, gatewayHeaders...)
+		ctx.Equal(r.Status, 400, "an order with a bad %s", b.label)
+	}
+	ctx.Equal(len(*published), 0, "invalid orders must never reach publishOrder; calls")
+	r := c.Post("/orders", gatewayOrder(), gatewayHeaders...)
+	ctx.Assert(r.Status != 400, "a valid order (side BUY, price 10.05, qty 100) was rejected with 400")
+	ctx.Equal(len(*published), 1, "the valid order must reach publishOrder; calls")
+}
+
+func CheckAccepted(ctx *harness.Ctx) {
+	c, published := gatewayUnderTest(ctx, false)
+	r := c.Post("/orders", gatewayOrder(), gatewayHeaders...)
+	ctx.Equal(r.Status, 202, "a valid order")
+	var body map[string]any
+	r.Decode(&body)
+	ctx.Equal(body["status"], "accepted", "the 202 body must say status accepted, body %v; status", body)
+	ctx.Equal(len(*published), 1, "publishOrder must be called exactly once; calls")
+	order := (*published)[0]
+	ctx.Equal([]any{order.Symbol, order.Side, order.Price, order.Qty, order.ClientOrderID}, []any{"ACME", "BUY", 10.05, int64(100), "c-1"}, "the published Order does not carry the request's fields")
+	ctx.Assert(order.OrderID != "" && body["order_id"] == order.OrderID, "the 202 must return the published OrderID %q, got %v", order.OrderID, body["order_id"])
+	var second map[string]any
+	c.Post("/orders", gatewayOrder(), gatewayHeaders...).Decode(&second)
+	ctx.Assert(second["order_id"] != body["order_id"], "every order needs a fresh OrderID")
+}
+
+func CheckUnavailable(ctx *harness.Ctx) {
+	c, _ := gatewayUnderTest(ctx, true)
+	r := c.Post("/orders", gatewayOrder(), gatewayHeaders...)
+	ctx.Equal(r.Status, 503, "publishOrder returned an error")
 }
 `,
   },

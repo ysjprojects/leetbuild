@@ -1191,6 +1191,218 @@ export async function check_sweep_stale(ctx) {
   assert(await m.sweep(100) === 6 && ctx.redis.zcard('drivers') === 0, 'the next sweep clears the rest');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"sort"
+	"strconv"
+
+	"leetbuild/harness"
+)
+
+var gpBg = context.Background()
+
+const (
+	gpPickupLat, gpPickupLon = 48.85, 2.35
+	gpEarthKm                = 6372.797560856 // the radius Redis's GEO commands use
+)
+
+// gpKm is the great-circle distance the way GEOSEARCH WITHDIST computes it, independently of the learner.
+func gpKm(lat1, lon1, lat2, lon2 float64) float64 {
+	rad := func(d float64) float64 { return d * math.Pi / 180 }
+	a := math.Pow(math.Sin(rad(lat2-lat1)/2), 2) + math.Cos(rad(lat1))*math.Cos(rad(lat2))*math.Pow(math.Sin(rad(lon2-lon1)/2), 2)
+	return 2 * gpEarthKm * math.Asin(math.Sqrt(a))
+}
+
+type gpDriver struct {
+	id       string
+	lat, lon float64
+}
+
+// gpSeed writes the GEO member and, when seen, a 30 s presence key: what a heartbeat leaves behind.
+func gpSeed(ctx *harness.Ctx, drivers []gpDriver, seen bool) {
+	for _, d := range drivers {
+		ctx.Redis.Do("GEOADD", "drivers", d.lon, d.lat, d.id)
+		if seen {
+			ctx.Redis.Set("seen:"+d.id, "1", "EX", 30)
+		}
+	}
+}
+
+func gpIDs(found []Near) []string {
+	ids := []string{}
+	for _, n := range found {
+		ids = append(ids, n.DriverID)
+	}
+	return ids
+}
+
+// gpPos is the driver's GEOPOS as (lon, lat), or nil when it is not in drivers.
+func gpPos(ctx *harness.Ctx, driverID string) []float64 {
+	reply, _ := ctx.Redis.Do("GEOPOS", "drivers", driverID).([]any)
+	if len(reply) == 0 {
+		return nil
+	}
+	pair, _ := reply[0].([]any)
+	if len(pair) != 2 {
+		return nil
+	}
+	lon, _ := strconv.ParseFloat(fmt.Sprint(pair[0]), 64)
+	lat, _ := strconv.ParseFloat(fmt.Sprint(pair[1]), 64)
+	return []float64{lon, lat}
+}
+
+func gpNearest(ctx *harness.Ctx, lat, lon, radiusKm float64, k int) []Near {
+	found, err := nearest(gpBg, lat, lon, radiusKm, k)
+	ctx.NoError(err, "nearest(%v, %v, %v, %d) returned an error", lat, lon, radiusKm, k)
+	return found
+}
+
+func gpSweep(ctx *harness.Ctx, limit int) int {
+	n, err := sweep(gpBg, limit)
+	ctx.NoError(err, "sweep(%d) returned an error", limit)
+	return n
+}
+
+func gpMembers(ctx *harness.Ctx) []string {
+	ids := []string{}
+	for _, z := range ctx.Redis.ZRangeWithScores("drivers", 0, -1) {
+		ids = append(ids, z.Member)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func CheckHeartbeatPipeline(ctx *harness.Ctx) {
+	before := len(ctx.Redis.RoundTrips())
+	ctx.NoError(heartbeat(gpBg, "d-a", 48.852, 2.352), "heartbeat returned an error")
+	trips := ctx.Redis.RoundTrips()[before:]
+	p := gpPos(ctx, "d-a")
+	ctx.Assert(p != nil, "heartbeat must GEOADD the driver to the GEO set drivers")
+	ctx.Assert(math.Abs(p[0]-2.352) < 1e-4 && math.Abs(p[1]-48.852) < 1e-4, "d-a is at lat 48.852, lon 2.352 but GEOPOS says (lon %v, lat %v): GEOADD takes longitude before latitude", p[0], p[1])
+	ctx.Equal(ctx.Redis.Exists("seen:d-a"), 1, "heartbeat must SET seen:d-a")
+	ttl := ctx.Redis.TTL("seen:d-a")
+	ctx.Assert(28 <= ttl && ttl <= 30, "seen:d-a must expire after 30 s (EX 30), its TTL is %d", ttl)
+	ctx.Assert(len(trips) == 1, "heartbeat made %d round trip(s) (%v): queue GEOADD and SET on one pipeline and exec once", len(trips), trips)
+	ctx.Clock.Advance(20)
+	ctx.Assert(ctx.Redis.TTL("seen:d-a") <= 10, "the presence key must count down on its own")
+	ctx.NoError(heartbeat(gpBg, "d-a", 48.853, 2.353), "heartbeat returned an error")
+	ttl = ctx.Redis.TTL("seen:d-a")
+	ctx.Assert(28 <= ttl && ttl <= 30, "a new heartbeat must reset the presence key to a full 30 s, its TTL is %d", ttl)
+	p = gpPos(ctx, "d-a")
+	ctx.Assert(p != nil && math.Abs(p[0]-2.353) < 1e-4 && math.Abs(p[1]-48.853) < 1e-4, "a new heartbeat must move the driver: GEOPOS says %v, expected (2.353, 48.853)", p)
+	ctx.Equal(ctx.Redis.ZCard("drivers"), 1, "a driver that heartbeats twice is one GEO member, not two: ZCARD drivers")
+	ctx.Clock.Advance(31)
+	ctx.Equal(ctx.Redis.Exists("seen:d-a"), 0, "30 s after the last heartbeat the presence key must be gone on its own (EX 30): EXISTS seen:d-a")
+	ctx.Equal(ctx.Redis.ZCard("drivers"), 1, "expiry removes only the presence key, the GEO set still holds the driver: ZCARD drivers")
+}
+
+func CheckRadiusOrder(ctx *harness.Ctx) {
+	drivers := []gpDriver{{"d-a", 48.852, 2.352}, {"d-b", 48.857, 2.35}, {"d-c", 48.86, 2.37}, {"d-far", 48.9, 2.35}}
+	// inserted farthest first: the order must come from the distance
+	gpSeed(ctx, []gpDriver{drivers[3], drivers[2], drivers[1], drivers[0]}, true)
+	found := gpNearest(ctx, gpPickupLat, gpPickupLon, 3, 10)
+	ctx.Equal(gpIDs(found), []string{"d-a", "d-b", "d-c"}, "nearest(radius 3 km): nearest first, lon before lat in the search, d-far (5.6 km) outside the radius")
+	byID := map[string]float64{}
+	for _, n := range found {
+		byID[n.DriverID] = n.Dist
+	}
+	for _, d := range drivers[:3] {
+		dist, ok := byID[d.id]
+		want := gpKm(gpPickupLat, gpPickupLon, d.lat, d.lon)
+		ctx.Assert(ok, "the distance of %s must be a number in km, got none", d.id)
+		ctx.Assert(math.Abs(dist-want) < 0.01, "%s is %.3f km away (WITHDIST, km), nearest says %v", d.id, want, dist)
+		ctx.Equal(dist, math.Round(dist*1000)/1000, "distances are rounded to 3 decimals: %s's distance", d.id)
+	}
+	found = gpNearest(ctx, gpPickupLat, gpPickupLon, 1, 10)
+	ctx.Equal(gpIDs(found), []string{"d-a", "d-b"}, "nearest(radius 1 km): d-c is 1.8 km away")
+	found = gpNearest(ctx, gpPickupLat, gpPickupLon, 0.1, 10)
+	ctx.Assert(len(found) == 0, "nobody within 100 m: nearest must return no drivers, got %+v", found)
+	found = gpNearest(ctx, 45.76, 4.84, 3, 10)
+	ctx.Assert(len(found) == 0, "a search 400 km away finds nobody, got %+v", found)
+}
+
+func CheckStaleExcluded(ctx *harness.Ctx) {
+	gpSeed(ctx, []gpDriver{{"d-a", 48.852, 2.352}, {"d-c", 48.86, 2.37}}, true)
+	ctx.Clock.Advance(10)
+	gpSeed(ctx, []gpDriver{{"d-b", 48.857, 2.35}}, true)
+	ctx.Clock.Advance(21) // d-a and d-c heartbeat 31 s ago, d-b 21 s ago
+	before := len(ctx.Redis.RoundTrips())
+	found := gpNearest(ctx, gpPickupLat, gpPickupLon, 3, 10)
+	trips := ctx.Redis.RoundTrips()[before:]
+	ctx.Equal(gpIDs(found), []string{"d-b"}, "nearest: d-a and d-c last heartbeat 31 s ago, their seen: keys expired")
+	_, kept := ctx.Redis.ZScore("drivers", "d-a")
+	ctx.Assert(kept, "nothing removed d-a from the GEO set — nearest must filter on the seen: keys, not trust GEOSEARCH")
+	ctx.Assert(len(trips) <= 2, "nearest made %d round trips (%v): one GEOSEARCH, then one MGET over every candidate's seen: key — never a GET or EXISTS per driver", len(trips), trips)
+	ctx.NoError(heartbeat(gpBg, "d-a", 48.852, 2.352), "heartbeat returned an error")
+	found = gpNearest(ctx, gpPickupLat, gpPickupLon, 3, 10)
+	ctx.Equal(gpIDs(found), []string{"d-a", "d-b"}, "after a fresh heartbeat d-a is back: nearest")
+	ctx.Clock.Advance(10) // d-b is now 31 s old
+	found = gpNearest(ctx, gpPickupLat, gpPickupLon, 3, 10)
+	ctx.Equal(gpIDs(found), []string{"d-a"}, "d-b went silent 31 s ago: nearest")
+	before = len(ctx.Redis.RoundTrips())
+	found = gpNearest(ctx, 0, 0, 1, 5)
+	ctx.Assert(len(found) == 0, "no candidates at all: nearest must return no drivers, got %+v", found)
+	trips = ctx.Redis.RoundTrips()[before:]
+	ctx.Assert(len(trips) <= 2, "an empty search still costs at most two round trips, this one made %d", len(trips))
+}
+
+func CheckOverfetchK(ctx *harness.Ctx) {
+	// 0.11 .. 0.56 km: GEO members with no presence key; then three live drivers at 0.78, 0.89, 1.00 km.
+	silent, live := []gpDriver{}, []gpDriver{}
+	for i := range 5 {
+		silent = append(silent, gpDriver{fmt.Sprintf("s-%d", i+1), 48.85 + float64(i+1)/1000, 2.35})
+	}
+	for i := range 3 {
+		live = append(live, gpDriver{fmt.Sprintf("l-%d", i+1), 48.85 + float64(7+i)/1000, 2.35})
+	}
+	gpSeed(ctx, silent, false)
+	gpSeed(ctx, live, true)
+	found := gpNearest(ctx, gpPickupLat, gpPickupLon, 3, 2)
+	ctx.Equal(gpIDs(found), []string{"l-1", "l-2"}, "nearest(k=2): the five nearest members are silent and the live ones come after them — ask Redis for COUNT 4k = 8 candidates, drop the silent, then cut to k")
+	ctx.Equal(len(found), 2, "k=2: the number of drivers nearest returned")
+	found = gpNearest(ctx, gpPickupLat, gpPickupLon, 3, 5)
+	ctx.Equal(gpIDs(found), []string{"l-1", "l-2", "l-3"}, "k=5 with three live drivers in range returns all three")
+	gpSeed(ctx, []gpDriver{{"s-6", 48.8575, 2.35}}, false) // between l-1 and l-2: the 8 candidates are s-1..s-5, l-1, s-6, l-2
+	found = gpNearest(ctx, gpPickupLat, gpPickupLon, 3, 2)
+	ctx.Equal(gpIDs(found), []string{"l-1", "l-2"}, "with a silent driver between the two live ones nearest(k=2)")
+}
+
+func CheckRemoveBoth(ctx *harness.Ctx) {
+	gpSeed(ctx, []gpDriver{{"d-a", 48.852, 2.352}, {"d-b", 48.857, 2.35}}, true)
+	ctx.NoError(remove(gpBg, "d-a"), "remove(%q) returned an error", "d-a")
+	_, inGeo := ctx.Redis.ZScore("drivers", "d-a")
+	ctx.Assert(!inGeo, "remove must ZREM the driver from drivers")
+	ctx.Equal(ctx.Redis.Exists("seen:d-a"), 0, "remove must DEL seen:d-a")
+	_, otherInGeo := ctx.Redis.ZScore("drivers", "d-b")
+	ctx.Assert(otherInGeo && ctx.Redis.Exists("seen:d-b") == 1, "remove touches only the driver it was given")
+	ctx.Equal(gpIDs(gpNearest(ctx, gpPickupLat, gpPickupLon, 3, 10)), []string{"d-b"}, "a removed driver is gone from nearest at once")
+	ctx.NoError(remove(gpBg, "ghost"), "removing an unknown driver must not fail")
+	ctx.Assert(ctx.Redis.ZCard("drivers") == 1 && ctx.Redis.Exists("seen:d-b") == 1, "removing an unknown driver changes nothing")
+}
+
+func CheckSweepStale(ctx *harness.Ctx) {
+	gpSeed(ctx, []gpDriver{{"s-1", 48.851, 2.35}, {"s-2", 48.852, 2.35}, {"s-3", 48.853, 2.35}}, true)
+	ctx.Clock.Advance(31) // their presence keys expired
+	gpSeed(ctx, []gpDriver{{"l-1", 48.857, 2.35}, {"l-2", 48.858, 2.35}}, true)
+	ctx.Redis.Do("GEOADD", "drivers", 2.36, 48.84, "orphan") // a GEO member that never had a presence key
+	ctx.Equal(gpSweep(ctx, 100), 4, "sweep must return how many stale members it removed (s-1, s-2, s-3, orphan = 4)")
+	ctx.Equal(gpMembers(ctx), []string{"l-1", "l-2"}, "after the sweep the GEO set must hold exactly the live drivers")
+	ctx.Assert(ctx.Redis.TTL("seen:l-1") > 0 && ctx.Redis.TTL("seen:l-2") > 0, "sweep must not touch presence keys")
+	ctx.Equal(gpSweep(ctx, 100), 0, "nothing stale left: sweep returns 0")
+	ctx.Equal(gpMembers(ctx), []string{"l-1", "l-2"}, "a sweep with nothing to do removes nothing")
+	ctx.Redis.Del("drivers", "seen:l-1", "seen:l-2")
+	for i := range 10 {
+		ctx.Redis.Do("GEOADD", "drivers", 2.3+float64(i)/100, 48.8, fmt.Sprintf("x-%d", i))
+	}
+	ctx.Equal(gpSweep(ctx, 4), 4, "sweep(4) inspects the first 4 members (ZRANGE drivers 0 3) and removes the stale among them")
+	ctx.Equal(ctx.Redis.ZCard("drivers"), 6, "sweep(4) must leave the other 6 members for the next pass: ZCARD drivers")
+	ctx.Assert(gpSweep(ctx, 100) == 6 && ctx.Redis.ZCard("drivers") == 0, "the next sweep clears the rest")
+}
+`,
   },
   debrief: `Two facts, two shapes. Position goes into the GEO set because that is the structure that can answer a radius query sorted by distance in one command; it is a sorted set underneath, which is why \`ZREM\` and \`ZRANGE\` work on it and why nothing in it ever expires by itself. Liveness goes into a plain key with a TTL because expiry is exactly the semantics a heartbeat needs: refresh it or lose it, no sweeper on the hot path. The query joins them client-side in two round trips, and over-fetches because a filter can only shrink a list — ask for \`k\` and one silent driver among the nearest hands the rider \`k − 1\`. \`sweep\` exists only to keep the GEO set from growing with every driver who ever logged in; it is bounded by \`limit\` so it can run from a cron without stalling Redis. Real systems shard the set per city, use \`COUNT … ANY\` when any \`k\` live drivers will do, fold driver status into the same \`MGET\` (a hash per driver instead of a flag), and replace straight-line distance with an ETA from the routing service once the candidate list is short.`,
 };

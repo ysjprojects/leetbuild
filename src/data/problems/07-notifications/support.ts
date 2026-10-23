@@ -79,3 +79,67 @@ export const devices = {
 };
 `,
 };
+
+/**
+ * The same two modules for the Go starters (`"notify/db"`, `"notify/devices"`). Their state lives in
+ * package variables, and the database's two calls are function variables, so a harness can seed rows,
+ * read the call log and wrap a call through the package the learner's code imported.
+ */
+export const supportModulesGo: Record<string, string> = {
+  'notify/db/db.go': `// Package db is the preferences database: one row per user, provided.
+package db
+
+import "context"
+
+// Prefs is a user's preferences row.
+type Prefs struct {
+	Push       bool \`json:"push"\`
+	QuietStart int  \`json:"quiet_start"\`
+	QuietEnd   int  \`json:"quiet_end"\`
+}
+
+// Call is one database call: Op is "load" or "save"; Prefs is the row a save wrote.
+type Call struct {
+	Op     string
+	UserID string
+	Prefs  Prefs
+}
+
+// DefaultPrefs is the row of a user who never saved one.
+var DefaultPrefs = Prefs{Push: true, QuietStart: 22, QuietEnd: 7}
+
+var (
+	Rows  = map[string]Prefs{} // the table, by user id
+	Calls []Call               // every LoadPrefs and SavePrefs, in call order
+)
+
+// LoadPrefs returns the user's preferences row (DefaultPrefs for users who never saved one).
+var LoadPrefs = func(ctx context.Context, userID string) (Prefs, error) {
+	Calls = append(Calls, Call{Op: "load", UserID: userID})
+	if p, ok := Rows[userID]; ok {
+		return p, nil
+	}
+	return DefaultPrefs, nil
+}
+
+// SavePrefs writes the user's preferences row.
+var SavePrefs = func(ctx context.Context, userID string, p Prefs) error {
+	Calls = append(Calls, Call{Op: "save", UserID: userID, Prefs: p})
+	Rows[userID] = p
+	return nil
+}
+`,
+  'notify/devices/devices.go': `// Package devices is the device registry: it marks tokens the push gateway rejected as stale, provided.
+package devices
+
+import "context"
+
+// Disabled lists the disabled tokens, in the order they were disabled.
+var Disabled []string
+
+// Disable stops further sends to this token.
+func Disable(ctx context.Context, token string) {
+	Disabled = append(Disabled, token)
+}
+`,
+};

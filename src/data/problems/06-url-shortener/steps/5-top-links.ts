@@ -993,6 +993,154 @@ export async function check_top_endpoint(ctx) {
   assert.deepEqual(r.json().map(row => row.code), ['today2', 'today1'], \`without ?day the endpoint reads today's set (\${today}), got \${r.text}\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"leetbuild/harness"
+)
+
+const clickDay = "2026-10-05"
+
+var (
+	clickTs     = float64(time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC).Unix())
+	nextClickTs = clickTs + 86400
+	dayZKey     = "top:" + clickDay
+)
+
+// seedClicks puts one click per code on clicks, on clickDay; seedClickAt picks the timestamp.
+func seedClicks(ctx *harness.Ctx, codes ...string) {
+	for _, code := range codes {
+		seedClickAt(ctx, code, clickTs)
+	}
+}
+
+func seedClickAt(ctx *harness.Ctx, code string, ts float64) {
+	ctx.Kafka.Seed("clicks", code, map[string]any{"code": code, "ts": ts, "referrer": nil, "ua": nil})
+}
+
+func drainWorker(ctx *harness.Ctx) {
+	ctx.Drain(func() { run(context.Background()) })
+}
+
+func CheckConsumer(ctx *harness.Ctx) {
+	seedClicks(ctx, "g9Xc")
+	drainWorker(ctx)
+	subscriptions := ctx.Kafka.EventsOf("subscribe")
+	ctx.Assert(len(subscriptions) > 0, "the consumer must subscribe to a topic")
+	last := subscriptions[len(subscriptions)-1]
+	ctx.Equal(last.Group, "top-links", "GroupID must be top-links")
+	subscribed := false
+	for _, t := range last.Topics {
+		subscribed = subscribed || t == "clicks"
+	}
+	ctx.Assert(subscribed, "the consumer must subscribe to clicks, got %q", last.Topics)
+	consumers := ctx.Kafka.Consumers()
+	ctx.Equal(consumers[len(consumers)-1].AutoCommit, false, "auto-commit is on: offsets would be acknowledged on a timer, before the click is counted")
+	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "offsets were auto-committed")
+	ctx.Assert(len(ctx.Kafka.EventsOf("manual-commit")) > 0, "no explicit commit happened after processing")
+	ctx.Equal(ctx.Kafka.Lag("top-links", "clicks"), 0, "every processed record must be committed; lag")
+}
+
+func CheckZincrby(ctx *harness.Ctx) {
+	seedClicks(ctx, "g9Xc", "zz12", "g9Xc")
+	seedClickAt(ctx, "g9Xc", nextClickTs)
+	seedClicks(ctx, "g9Xc")
+	drainWorker(ctx)
+	ctx.Equal(ctx.Redis.Type(dayZKey), "zset", "the type of %s (keys: %q)", dayZKey, ctx.Redis.Keys("*"))
+	score, _ := ctx.Redis.ZScore(dayZKey, "g9Xc")
+	ctx.Equal(score, 3, "the score of g9Xc in %s", dayZKey)
+	score, _ = ctx.Redis.ZScore(dayZKey, "zz12")
+	ctx.Equal(score, 1, "the score of zz12 in %s", dayZKey)
+	nextKey := dayKey(nextClickTs)
+	score, _ = ctx.Redis.ZScore(nextKey, "g9Xc")
+	ctx.Equal(score, 1, "a click on the next day counts in %s: the score of g9Xc", nextKey)
+}
+
+func CheckExpire(ctx *harness.Ctx) {
+	seedClicks(ctx, "g9Xc")
+	drainWorker(ctx)
+	ttl := ctx.Redis.TTL(dayZKey)
+	ctx.Assert(ttl > 0, "%s has no expiry (TTL %d): day leaderboards would accumulate forever", dayZKey, ttl)
+	ctx.Assert(604800-60 <= ttl && ttl <= 604800, "%s expires in %d s, expected 7 days (604800)", dayZKey, ttl)
+	ctx.Clock.Advance(604801)
+	ctx.Equal(ctx.Redis.Exists(dayZKey), 0, "%s must be gone after 7 days", dayZKey)
+}
+
+func CheckCommitAfter(ctx *harness.Ctx) {
+	seedClicks(ctx, "g9Xc")
+	ctx.Kafka.Seed("clicks", "bad", "not json")
+	ctx.Kafka.Seed("clicks", "bad", \`{"referrer":null}\`)
+	click := ctx.Kafka.Records("clicks")[0]
+	type commitSnapshot struct {
+		offsets harness.KafkaOffsets
+		score   float64 // 0 while g9Xc is not in the set
+	}
+	var atCommit []commitSnapshot
+	ctx.Kafka.OnCommit(func(_ string, offsets harness.KafkaOffsets) {
+		snap := commitSnapshot{offsets: harness.KafkaOffsets{}}
+		for tp, offset := range offsets {
+			snap.offsets[tp] = offset
+		}
+		snap.score, _ = ctx.Redis.ZScore(dayZKey, "g9Xc")
+		atCommit = append(atCommit, snap)
+	})
+	drainWorker(ctx)
+	ctx.Assert(len(atCommit) > 0, "no offset was ever committed")
+	var covering []float64
+	for _, snap := range atCommit {
+		if snap.offsets[harness.KafkaTopicPartition{Topic: "clicks", Partition: click.Partition}] > click.Offset {
+			covering = append(covering, snap.score)
+		}
+	}
+	ctx.Assert(len(covering) > 0, "the g9Xc click was never committed")
+	ctx.Equal(covering[0], 1, "the commit must come after ZINCRBY: the score of g9Xc when its click was committed")
+	ctx.Equal(ctx.Kafka.Lag("top-links", "clicks"), 0, "malformed records must be skipped and committed, not left to replay forever; lag")
+	ctx.Equal(ctx.Redis.ZCard(dayZKey), 1, "malformed records must not be counted (%v); members of %s", ctx.Redis.ZRangeWithScores(dayZKey, 0, -1), dayZKey)
+}
+
+func CheckTopEndpoint(ctx *harness.Ctx) {
+	var codes []string
+	for i := range 12 {
+		code := fmt.Sprintf("code%02d", i)
+		codes = append(codes, code)
+		ctx.Redis.Do("ZADD", dayZKey, 100-i, code)
+	}
+	c := ctx.Main(main).HTTP()
+	r := c.Get("/top?day=" + clickDay)
+	ctx.Equal(r.Status, 200, "GET /top?day=%s", clickDay)
+	var rows []struct {
+		Code   string  \`json:"code"\`
+		Clicks float64 \`json:"clicks"\`
+	}
+	r.Decode(&rows)
+	ctx.Assert(len(rows) == 10, "expected the 10 top codes, got %s", r.Text())
+	var gotCodes []string
+	var gotClicks, wantClicks []float64
+	for i, row := range rows {
+		gotCodes = append(gotCodes, row.Code)
+		gotClicks = append(gotClicks, row.Clicks)
+		wantClicks = append(wantClicks, float64(100-i))
+	}
+	ctx.Equal(gotCodes, codes[:10], "rows must be in descending score order")
+	ctx.Equal(gotClicks, wantClicks, "each row carries the click count (%s)", r.Text())
+	today := "top:" + ctx.Clock.Time().UTC().Format("2006-01-02")
+	ctx.Redis.Do("ZADD", today, 2, "today1", 5, "today2")
+	r = c.Get("/top")
+	var todayRows []struct {
+		Code string \`json:"code"\`
+	}
+	r.Decode(&todayRows)
+	var todayCodes []string
+	for _, row := range todayRows {
+		todayCodes = append(todayCodes, row.Code)
+	}
+	ctx.Equal(todayCodes, []string{"today2", "today1"}, "without ?day the endpoint reads today's set (%s)", today)
+}
+`,
   },
   debrief: `A sorted set is the leaderboard data structure: ZINCRBY keeps it ordered on every write, and the top 10 is one O(log n + 10) read — no scan, no sort at query time. Keying by day gives a natural partition and a natural expiry; a 7-day TTL bounds memory without any cleanup job. Where the commit sits relative to the increment decides the guarantee: process-then-commit is at-least-once, and a leaderboard can afford a rare duplicate. Real analytics pipelines also keep a hourly set, merge days with ZUNIONSTORE for "this week", and write the raw clicks to a warehouse for the questions a sorted set cannot answer (clicks by country, by referrer).`,
 };

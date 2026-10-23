@@ -506,8 +506,13 @@ type Snapshot struct {
 	Gates   map[string]Gate
 }
 
-// snapshot is replaced whole: readers never see a half-loaded map.
-var snapshot atomic.Pointer[Snapshot]
+// snapshotBox holds the live snapshot; Store replaces it whole, so readers never see a half-loaded map.
+type snapshotBox struct{ v atomic.Value }
+
+func (b *snapshotBox) Load() *Snapshot   { return b.v.Load().(*Snapshot) }
+func (b *snapshotBox) Store(s *Snapshot) { b.v.Store(s) }
+
+var snapshot snapshotBox
 
 func init() { snapshot.Store(&Snapshot{Gates: map[string]Gate{}}) }
 
@@ -620,8 +625,13 @@ type Snapshot struct {
 	Gates   map[string]Gate
 }
 
-// snapshot is replaced whole: readers never see a half-loaded map.
-var snapshot atomic.Pointer[Snapshot]
+// snapshotBox holds the live snapshot; Store replaces it whole, so readers never see a half-loaded map.
+type snapshotBox struct{ v atomic.Value }
+
+func (b *snapshotBox) Load() *Snapshot   { return b.v.Load().(*Snapshot) }
+func (b *snapshotBox) Store(s *Snapshot) { b.v.Store(s) }
+
+var snapshot snapshotBox
 
 func init() { snapshot.Store(&Snapshot{Gates: map[string]Gate{}}) }
 
@@ -1462,6 +1472,237 @@ export async function check_overrides(ctx) {
   assert.equal(m.getVariant('button_color', {user_id: 'old', locale: 'de'}), 'CONTROL', 'an expired override must be ignored');
   ctx.clock.advance(3601);
   assert.equal(m.getVariant('button_color', {user_id: 'tomm', locale: 'de'}), 'CONTROL', 'once its expires_at has passed, the override stops applying without any reload');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strconv"
+
+	"leetbuild/harness"
+)
+
+type fixtureShare struct {
+	Variant string \`json:"variant"\`
+	Pct     int    \`json:"pct"\`
+}
+
+type fixturePopulation struct {
+	Match map[string]string \`json:"match"\`
+	Mix   []fixtureShare    \`json:"mix"\`
+}
+
+// fixtureGate is a gate as step 1 publishes it.
+type fixtureGate struct {
+	Name        string              \`json:"name"\`
+	Seed        string              \`json:"seed"\`
+	Default     string              \`json:"default"\`
+	Populations []fixturePopulation \`json:"populations"\`
+	Overrides   []map[string]any    \`json:"overrides"\`
+	Version     int                 \`json:"version"\`
+}
+
+var threeWayMix = []fixtureShare{{"RED_BUTTON", 33}, {"BLUE_BUTTON", 33}, {"CONTROL", 34}}
+
+// newFixtureGate has the defaults step 1 fills in: seed = name, default OFF, no overrides, version 1.
+func newFixtureGate(name string, populations []fixturePopulation) fixtureGate {
+	return fixtureGate{Name: name, Seed: name, Default: "OFF", Populations: populations, Overrides: []map[string]any{}, Version: 1}
+}
+
+func everyone(mix []fixtureShare) []fixturePopulation {
+	return []fixturePopulation{{Match: map[string]string{}, Mix: mix}}
+}
+
+// publishGates leaves what step 1 leaves behind: one field per gate in the hash, and the global version.
+func publishGates(ctx *harness.Ctx, version int, gates ...fixtureGate) {
+	for _, g := range gates {
+		encoded, _ := json.Marshal(g)
+		ctx.Redis.Do("HSET", "gates", g.Name, string(encoded))
+	}
+	ctx.Redis.Set("gates:version", version)
+}
+
+// expectedVariant is the spec, computed independently of the learner: sha256(seed:user)[:8 hex] % 10000, cumulative edges.
+func expectedVariant(seed, userID string, mix []fixtureShare) string {
+	sum := sha256.Sum256([]byte(seed + ":" + userID))
+	n, _ := strconv.ParseUint(fmt.Sprintf("%x", sum[:4]), 16, 64)
+	b := int(n % 10000)
+	edge := 0
+	for _, share := range mix {
+		edge += share.Pct * 100
+		if b < edge {
+			return share.Variant
+		}
+	}
+	return mix[len(mix)-1].Variant
+}
+
+func userIDs(n int, prefix string) []string {
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("%s%d", prefix, i)
+	}
+	return ids
+}
+
+// refreshOK is refresh(ctx); an error fails the check.
+func refreshOK(ctx *harness.Ctx) bool {
+	changed, err := refresh(context.Background())
+	ctx.NoError(err, "refresh")
+	return changed
+}
+
+func variantsOf(gate string, ids []string) []string {
+	out := make([]string, len(ids))
+	for i, u := range ids {
+		out[i] = getVariant(gate, map[string]string{"user_id": u})
+	}
+	return out
+}
+
+// commandsSince flattens the learner's Redis round trips after the first 'before'.
+func commandsSince(ctx *harness.Ctx, before int) []string {
+	sent := []string{}
+	for _, trip := range ctx.Redis.RoundTrips()[before:] {
+		sent = append(sent, trip...)
+	}
+	return sent
+}
+
+func CheckStatelessHash(ctx *harness.Ctx) {
+	copyGate := newFixtureGate("button_copy", everyone(threeWayMix))
+	copyGate.Seed = "button_color"
+	otherGate := newFixtureGate("other", everyone(threeWayMix))
+	otherGate.Seed = "s2"
+	publishGates(ctx, 1, newFixtureGate("button_color", everyone(threeWayMix)), copyGate, otherGate)
+	refreshOK(ctx)
+	ids := userIDs(40, "u")
+	var want []string
+	for _, u := range ids {
+		expected := expectedVariant("button_color", u, threeWayMix)
+		want = append(want, expected)
+		got := getVariant("button_color", map[string]string{"user_id": u})
+		ctx.Assert(got == expected, "getVariant(%q, %s) is %q, expected %q: bucket = first 4 bytes of sha256(%q) as a big-endian integer %% 10000, then cumulative edges 3300 / 6600 / 10000", "button_color", u, got, expected, "button_color:"+u)
+	}
+	again := variantsOf("button_color", ids)
+	ctx.Equal(again, want, "the same user must get the same variant on every call: the assignment is a hash, not a coin toss")
+	ctx.Equal(variantsOf("button_copy", ids), again, "two gates with the same seed must assign every user the same way (that is what a shared seed is for)")
+	ctx.Assert(fmt.Sprint(variantsOf("other", ids)) != fmt.Sprint(again), "a different seed must shuffle the assignment; %q (seed s2) assigned every user exactly like button_color", "other")
+	snapshot.Store(&Snapshot{Gates: map[string]Gate{}}) // a second server: the snapshot starts empty
+	refreshOK(ctx)
+	ctx.Equal(variantsOf("button_color", ids), again, "a second server loading the same snapshot must assign identically: nothing may be stored per user")
+}
+
+func CheckFallThrough(ctx *harness.Ctx) {
+	populations := []fixturePopulation{
+		{Match: map[string]string{"locale": "de"}, Mix: []fixtureShare{{"RED_BUTTON", 100}}},
+		{Match: map[string]string{"plan": "pro"}, Mix: []fixtureShare{{"BLUE_BUTTON", 100}}},
+		{Match: map[string]string{}, Mix: []fixtureShare{{"CONTROL", 100}}},
+	}
+	narrow := newFixtureGate("narrow", populations[:2])
+	narrow.Default = "FALLBACK"
+	publishGates(ctx, 1, newFixtureGate("button_color", populations), narrow)
+	refreshOK(ctx)
+	ctx.Equal(getVariant("button_color", map[string]string{"user_id": "ana", "locale": "de", "plan": "pro"}), "RED_BUTTON", "a German pro user matches the first population (locale de) — the first match decides, not the most specific or the last")
+	ctx.Equal(getVariant("button_color", map[string]string{"user_id": "bo", "locale": "en", "plan": "pro"}), "BLUE_BUTTON", "an English pro user falls through to the second population (plan pro)")
+	ctx.Equal(getVariant("button_color", map[string]string{"user_id": "cy", "locale": "en", "plan": "free"}), "CONTROL", "a user matching nothing specific lands in the catch-all population ({} matches everyone)")
+	ctx.Equal(getVariant("button_color", map[string]string{"user_id": "dee"}), "CONTROL", "a missing attribute does not match a rule on it; the user still reaches the catch-all")
+	ctx.Equal(getVariant("narrow", map[string]string{"user_id": "cy", "locale": "en", "plan": "free"}), "FALLBACK", "when no population matches, the gate's own default is the answer")
+	ctx.Equal(getVariant("ghost", map[string]string{"user_id": "cy"}), "OFF", "a gate the snapshot does not know answers OFF — a client on a newer build must not crash the server")
+}
+
+func CheckMonotoneRollout(ctx *harness.Ctx) {
+	ids := userIDs(2000, "user-")
+	rollout := func(on, version int) fixtureGate {
+		g := newFixtureGate("new_sidebar", everyone([]fixtureShare{{"ON", on}, {"OFF", 100 - on}}))
+		g.Version = version
+		return g
+	}
+	holdersOfOn := func() map[string]bool {
+		set := map[string]bool{}
+		for _, u := range ids {
+			if getVariant("new_sidebar", map[string]string{"user_id": u}) == "ON" {
+				set[u] = true
+			}
+		}
+		return set
+	}
+	publishGates(ctx, 1, rollout(10, 1))
+	refreshOK(ctx)
+	first := holdersOfOn()
+	ctx.Assert(140 <= len(first) && len(first) <= 260, "a 10%% share should hold about 200 of 2000 users, it holds %d", len(first))
+	publishGates(ctx, 2, rollout(20, 2))
+	ctx.Equal(refreshOK(ctx), true, "a bumped gates:version must make refresh() load the new config")
+	second := holdersOfOn()
+	var lost []string
+	for _, u := range ids {
+		if first[u] && !second[u] {
+			lost = append(lost, u)
+		}
+	}
+	ctx.Assert(len(lost) == 0, "raising ON from 10%% to 20%% must keep everyone who already had it, but %d users (e.g. %q) fell back to OFF: shares are cumulative edges in mix order, not independent draws", len(lost), lost[:min(3, len(lost))])
+	ctx.Assert(320 <= len(second) && len(second) <= 480, "a 20%% share should hold about 400 of 2000 users, it holds %d", len(second))
+	publishGates(ctx, 3, rollout(10, 3))
+	refreshOK(ctx)
+	third := holdersOfOn()
+	sortedKeys := func(set map[string]bool) []string {
+		keys := []string{}
+		for u := range set {
+			keys = append(keys, u)
+		}
+		sort.Strings(keys)
+		return keys
+	}
+	ctx.Equal(sortedKeys(third), sortedKeys(first), "rolling back to 10%% must return exactly the original set of users")
+}
+
+func CheckSnapshot(ctx *harness.Ctx) {
+	ctx.Equal(getVariant("button_color", map[string]string{"user_id": "ana"}), "OFF", "before the first refresh the snapshot is empty and every gate is OFF")
+	publishGates(ctx, 7, newFixtureGate("button_color", everyone(threeWayMix)))
+	before := len(ctx.Redis.RoundTrips())
+	ctx.Equal(refreshOK(ctx), true, "the first refresh after a publish must report a change")
+	sent := commandsSince(ctx, before)
+	hasHGetAll := false
+	for _, cmd := range sent {
+		hasHGetAll = hasHGetAll || cmd == "HGETALL"
+	}
+	ctx.Assert(hasHGetAll, "a changed version must be followed by HGETALL gates; the refresh sent %q", sent)
+	ctx.Equal(snapshot.Load().Version, 7, "the snapshot must carry the version it loaded")
+	before = len(ctx.Redis.RoundTrips())
+	ctx.Equal(refreshOK(ctx), false, "an unchanged version must report no change")
+	ctx.Equal(commandsSince(ctx, before), []string{"GET"}, "an unchanged version costs exactly one GET gates:version; the commands the refresh sent")
+	before = len(ctx.Redis.RoundTrips())
+	for i := range 500 {
+		getVariant("button_color", map[string]string{"user_id": fmt.Sprintf("u%d", i)})
+	}
+	sent = commandsSince(ctx, before)
+	ctx.Assert(len(sent) == 0, "getVariant must not touch Redis: 500 decisions sent %d commands (%q); evaluate the in-memory snapshot", len(sent), sent)
+	publishGates(ctx, 8, newFixtureGate("button_color", everyone(threeWayMix)), newFixtureGate("dark_mode", everyone([]fixtureShare{{"ON", 100}})))
+	ctx.Equal(getVariant("dark_mode", map[string]string{"user_id": "ana"}), "OFF", "a gate published after the last refresh is not visible yet: the snapshot only moves when the loader runs")
+	ctx.Equal(refreshOK(ctx), true, "refresh after gates:version moved to 8")
+	ctx.Equal(getVariant("dark_mode", map[string]string{"user_id": "ana"}), "ON", "after the refresh the new gate is live")
+	ctx.Equal(snapshot.Load().Version, 8, "the snapshot's version after the second load")
+}
+
+func CheckOverrides(ctx *harness.Ctx) {
+	now := ctx.Clock.Now() / 1000
+	g := newFixtureGate("button_color", []fixturePopulation{{Match: map[string]string{"locale": "de"}, Mix: []fixtureShare{{"CONTROL", 100}}}})
+	g.Overrides = []map[string]any{
+		{"user_id": "tomm", "variant": "RED_BUTTON", "expires_at": now + 3600},
+		{"user_id": "old", "variant": "RED_BUTTON", "expires_at": now - 1},
+	}
+	publishGates(ctx, 1, g)
+	refreshOK(ctx)
+	ctx.Equal(getVariant("button_color", map[string]string{"user_id": "tomm", "locale": "de"}), "RED_BUTTON", "an unexpired override must win over the population the user matches")
+	ctx.Equal(getVariant("button_color", map[string]string{"user_id": "tomm", "locale": "en"}), "RED_BUTTON", "an override applies even when the user matches no population at all — that is how a Dropboxer tests a gate aimed at someone else")
+	ctx.Equal(getVariant("button_color", map[string]string{"user_id": "old", "locale": "de"}), "CONTROL", "an expired override must be ignored")
+	ctx.Clock.Advance(3601)
+	ctx.Equal(getVariant("button_color", map[string]string{"user_id": "tomm", "locale": "de"}), "CONTROL", "once its expires_at has passed, the override stops applying without any reload")
 }
 `,
   },

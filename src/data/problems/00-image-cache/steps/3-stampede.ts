@@ -257,12 +257,12 @@ const (
 )
 
 // render is built in step 4; nil, nil when the origin has no such image.
-func render(ctx context.Context, id string, width int) ([]byte, error) {
+var render = func(ctx context.Context, id string, width int) ([]byte, error) {
 	panic("not implemented")
 }
 
 // store writes the value with the right TTL (sentinel when data is nil) — from step 2.
-func store(ctx context.Context, key string, data []byte) {
+var store = func(ctx context.Context, key string, data []byte) {
 	panic("not implemented")
 }
 
@@ -295,12 +295,12 @@ const (
 )
 
 // render is built in step 4; nil, nil when the origin has no such image.
-func render(ctx context.Context, id string, width int) ([]byte, error) {
+var render = func(ctx context.Context, id string, width int) ([]byte, error) {
 	panic("not implemented")
 }
 
 // store writes the value with the right TTL (sentinel when data is nil) — from step 2.
-func store(ctx context.Context, key string, data []byte) {
+var store = func(ctx context.Context, key string, data []byte) {
 	panic("not implemented")
 }
 
@@ -643,6 +643,131 @@ export async function check_bounded_wait(ctx) {
   assert.equal(String(result), 'MINE', 'once the lock TTL passes the follower must render itself');
   assert.deepEqual(calls, ['cat']);
   assert(50 <= ctx.clock.sleeps && ctx.clock.sleeps <= 200, \`waited through \${ctx.clock.sleeps} polls; a 50 ms poll over a 5 s lock TTL is about 100\`);
+}
+`,
+    go: `package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/hex"
+	"errors"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+const spMissing = "__missing__"
+
+var spBg = context.Background()
+
+// spJPEG is fake JPEG bytes: the real SOI marker (FF D8 FF, not valid UTF-8) and a label.
+func spJPEG(label string) []byte { return append([]byte{0xff, 0xd8, 0xff}, label...) }
+
+// spHex shows bytes as hex, nil as nil.
+func spHex(b []byte) string {
+	if b == nil {
+		return "nil"
+	}
+	return hex.EncodeToString(b)
+}
+
+// spStandIns stands in for the resizer's render (step 4), answering JPEG bytes, and the cache's
+// store (step 2), writing the value (the sentinel for nil) with a day's TTL.
+func spStandIns(ctx *harness.Ctx) {
+	render = func(context.Context, string, int) ([]byte, error) { return spJPEG("JPEG"), nil }
+	store = func(_ context.Context, key string, data []byte) {
+		var value any = data
+		if data == nil {
+			value = spMissing
+		}
+		ctx.Redis.Set(key, value, "EX", 86400)
+	}
+}
+
+// spRecorder stands in for render with one that records the image ids it is asked for and answers reply.
+func spRecorder(reply string) *[]string {
+	calls := &[]string{}
+	render = func(_ context.Context, id string, _ int) ([]byte, error) {
+		*calls = append(*calls, id)
+		return []byte(reply), nil
+	}
+	return calls
+}
+
+func spFill(ctx *harness.Ctx, key, id string, width int) []byte {
+	data, err := fill(spBg, key, id, width)
+	ctx.NoError(err, "fill(ctx, %q, %q, %d) returned an error", key, id, width)
+	return data
+}
+
+// spStored is the bytes at key, nil when there is no such key.
+func spStored(ctx *harness.Ctx, key string) []byte {
+	if v, ok := ctx.Redis.Get(key); ok {
+		return []byte(v)
+	}
+	return nil
+}
+
+func CheckLockNx(ctx *harness.Ctx) {
+	spStandIns(ctx)
+	var held, ttl int64
+	render = func(context.Context, string, int) ([]byte, error) {
+		held = ctx.Redis.Exists("lock:thumb:cat:256")
+		ttl = ctx.Redis.TTL("lock:thumb:cat:256")
+		return spJPEG("JPEG"), nil
+	}
+	won := spFill(ctx, "thumb:cat:256", "cat", 256)
+	ctx.Assert(won != nil && bytes.Equal(won, spJPEG("JPEG")), "the winner returns the rendered bytes: got %s", spHex(won))
+	ctx.Equal(held, 1, "lock:thumb:cat:256 must be held while the winner renders")
+	ctx.Assert(0 < ttl && ttl <= 5, "the lock must expire within 5 s (TTL %d)", ttl)
+	// Someone else holds the lock: NX must fail and this caller must not render.
+	ctx.Redis.Set("lock:thumb:dog:256", "1", "EX", 5)
+	ctx.Redis.Set("thumb:dog:256", spJPEG("LEADER"))
+	calls := spRecorder("X")
+	followed := spFill(ctx, "thumb:dog:256", "dog", 256)
+	ctx.Assert(followed != nil && bytes.Equal(followed, spJPEG("LEADER")), "a caller that did not win the lock returns the leader's value verbatim: got %s, expected %s", spHex(followed), spHex(spJPEG("LEADER")))
+	ctx.Equal(len(*calls), 0, "a caller that did not win the lock must not render")
+}
+
+func CheckRelease(ctx *harness.Ctx) {
+	spStandIns(ctx)
+	won := spFill(ctx, "thumb:cat:256", "cat", 256)
+	ctx.Assert(won != nil && bytes.Equal(won, spJPEG("JPEG")), "the winner returns the rendered bytes: got %s", spHex(won))
+	stored := spStored(ctx, "thumb:cat:256")
+	ctx.Assert(bytes.Equal(stored, spJPEG("JPEG")), "the winner must store() the rendered value: stored %s", spHex(stored))
+	ctx.Equal(ctx.Redis.Exists("lock:thumb:cat:256"), 0, "the lock must be released once the value is stored")
+	render = func(context.Context, string, int) ([]byte, error) { return nil, errors.New("origin down") }
+	_, err := fill(spBg, "thumb:bad:256", "bad", 256)
+	ctx.Assert(err != nil && strings.Contains(err.Error(), "origin down"), "a failing render must propagate: fill returned the error %v", err)
+	ctx.Equal(ctx.Redis.Exists("lock:thumb:bad:256"), 0, "the lock must be released even when render fails")
+}
+
+func CheckWaitRecheck(ctx *harness.Ctx) {
+	spStandIns(ctx)
+	ctx.Redis.Set("lock:thumb:cat:256", "1", "EX", 5)
+	// The leader finishes right after the follower's first read of the key.
+	ctx.Redis.After("thumb:cat:256", func() any { return ctx.Redis.Set("thumb:cat:256", spJPEG("LEADER")) })
+	calls := spRecorder("X")
+	followed := spFill(ctx, "thumb:cat:256", "cat", 256)
+	ctx.Assert(followed != nil && bytes.Equal(followed, spJPEG("LEADER")), "the follower must return the value the leader stored, verbatim: got %s, expected %s", spHex(followed), spHex(spJPEG("LEADER")))
+	ctx.Equal(len(*calls), 0, "the follower must not render while the lock is held")
+	ctx.Assert(ctx.Clock.Sleeps() >= 1, "poll by sleeping briefly between reads, not in a tight loop")
+}
+
+func CheckBoundedWait(ctx *harness.Ctx) {
+	spStandIns(ctx)
+	ctx.Redis.Set("lock:thumb:cat:256", "1", "EX", 5) // the leader died holding the lock
+	calls := spRecorder("MINE")
+	var result []byte
+	var err error
+	returned := ctx.Drain(func() { result, err = fill(spBg, "thumb:cat:256", "cat", 256) })
+	ctx.Assert(returned, "waited through %d polls and never rendered: once the lock TTL passes the follower must render itself", ctx.Clock.Sleeps())
+	ctx.NoError(err, "fill(ctx, %q, %q, %d) returned an error", "thumb:cat:256", "cat", 256)
+	ctx.Equal(string(result), "MINE", "once the lock TTL passes the follower must render itself")
+	ctx.Equal(*calls, []string{"cat"}, "render calls once the lock TTL passed")
+	sleeps := ctx.Clock.Sleeps()
+	ctx.Assert(50 <= sleeps && sleeps <= 200, "waited through %d polls; a 50 ms poll over a 5 s lock TTL is about 100", sleeps)
 }
 `,
   },

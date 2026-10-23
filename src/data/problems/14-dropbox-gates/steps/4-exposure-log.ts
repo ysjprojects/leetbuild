@@ -367,7 +367,10 @@ func pump() {
 	drain:
 		for len(batch) < cap(batch) {
 			select {
-			case m := <-queue:
+			case m, ok := <-queue:
+				if !ok {
+					break drain // closed by shutdown: write what is in hand
+				}
 				batch = append(batch, m)
 			default:
 				break drain
@@ -453,7 +456,10 @@ func pump() {
 	drain:
 		for len(batch) < cap(batch) {
 			select {
-			case m := <-queue:
+			case m, ok := <-queue:
+				if !ok {
+					break drain // closed by shutdown: write what is in hand
+				}
 				batch = append(batch, m)
 			default:
 				break drain
@@ -472,13 +478,14 @@ func shutdown() {
 	close(queue)
 	select {
 	case <-pumped:
+		_ = exposuresWriter.Close() // everything was written: nothing left to wait for
 	case <-ctx.Done():
+		// a dead broker: Close would wait out the writer's retries, so the write in hand is abandoned instead
 		left := int64(len(queue))
 		dropped.Add(left)
 		log.Printf("shutdown: %d exposures still unacknowledged after %s", left, flushTimeout)
 	}
 	stopPump()
-	_ = exposuresWriter.Close()
 }
 
 func init() { go pump() }
@@ -1031,6 +1038,355 @@ export async function check_flush(ctx) {
   took = (ctx.clock.now() - before) / 1000;
   assert(took <= 6, \`with the broker down, shutdown() took \${took.toFixed(0)} s: flush with a 5 s bound so a stop is not held for the producer's whole message timeout\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 3, 'nothing can reach the topic while the broker is down');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+	"github.com/segmentio/kafka-go"
+	"leetbuild/harness"
+)
+
+// Step 2's gates.go, which this file builds on. Go judges one step's file at a time, so the harness
+// supplies it as step 2's reference has it: the snapshot, its refresh and getVariant.
+
+var gatesRdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+type Share struct {
+	Variant string \`json:"variant"\`
+	Pct     int    \`json:"pct"\`
+}
+
+type Population struct {
+	Match map[string]string \`json:"match"\`
+	Mix   []Share           \`json:"mix"\`
+}
+
+type Override struct {
+	UserID    string \`json:"user_id"\`
+	Variant   string \`json:"variant"\`
+	ExpiresAt int64  \`json:"expires_at"\`
+}
+
+type Gate struct {
+	Name        string       \`json:"name"\`
+	Seed        string       \`json:"seed"\`
+	Default     string       \`json:"default"\`
+	Populations []Population \`json:"populations"\`
+	Overrides   []Override   \`json:"overrides"\`
+	Version     int          \`json:"version"\`
+}
+
+type Snapshot struct {
+	Version int
+	Gates   map[string]Gate
+}
+
+type snapshotBox struct{ v atomic.Value }
+
+func (b *snapshotBox) Load() *Snapshot   { return b.v.Load().(*Snapshot) }
+func (b *snapshotBox) Store(s *Snapshot) { b.v.Store(s) }
+
+var snapshot snapshotBox
+
+func init() { snapshot.Store(&Snapshot{Gates: map[string]Gate{}}) }
+
+func getVariant(name string, attrs map[string]string) string {
+	gate, ok := snapshot.Load().Gates[name]
+	if !ok {
+		return "OFF"
+	}
+	now := time.Now().Unix()
+	for _, override := range gate.Overrides {
+		if override.UserID == attrs["user_id"] && override.ExpiresAt > now {
+			return override.Variant
+		}
+	}
+	for _, population := range gate.Populations {
+		matched := true
+		for key, value := range population.Match {
+			matched = matched && attrs[key] == value
+		}
+		if !matched {
+			continue
+		}
+		sum := sha256.Sum256([]byte(gate.Seed + ":" + attrs["user_id"]))
+		b := int(binary.BigEndian.Uint32(sum[:4]) % 10_000)
+		edge := 0
+		for _, share := range population.Mix {
+			edge += share.Pct * 100
+			if b < edge {
+				return share.Variant
+			}
+		}
+		return population.Mix[len(population.Mix)-1].Variant
+	}
+	return gate.Default
+}
+
+func refresh(ctx context.Context) (bool, error) {
+	raw, err := gatesRdb.Get(ctx, "gates:version").Result()
+	if err != nil && err != redis.Nil {
+		return false, err
+	}
+	version, _ := strconv.Atoi(raw)
+	if version == snapshot.Load().Version {
+		return false, nil
+	}
+	fields, err := gatesRdb.HGetAll(ctx, "gates").Result()
+	if err != nil {
+		return false, err
+	}
+	gates := make(map[string]Gate, len(fields))
+	for name, body := range fields {
+		var gate Gate
+		if err := json.Unmarshal([]byte(body), &gate); err != nil {
+			return false, fmt.Errorf("gate %s: %w", name, err)
+		}
+		gates[name] = gate
+	}
+	snapshot.Store(&Snapshot{Version: version, Gates: gates})
+	return true, nil
+}
+
+// The checks.
+
+const exposureTopic = "gate-exposures"
+
+// publishExposureGates leaves what step 1 leaves behind: button_color and dark_mode in the hash, and the global version.
+func publishExposureGates(ctx *harness.Ctx, version int) {
+	share := func(variant string, pct int) map[string]any { return map[string]any{"variant": variant, "pct": pct} }
+	gates := []map[string]any{
+		{"name": "button_color", "seed": "button_color", "default": "OFF", "overrides": []any{}, "version": 1, "populations": []any{
+			map[string]any{"match": map[string]any{"locale": "de"}, "mix": []any{share("RED_BUTTON", 33), share("BLUE_BUTTON", 33), share("CONTROL", 34)}},
+			map[string]any{"match": map[string]any{}, "mix": []any{share("BLUE_BUTTON", 100)}},
+		}},
+		{"name": "dark_mode", "seed": "dark_mode", "default": "OFF", "overrides": []any{}, "version": 1, "populations": []any{
+			map[string]any{"match": map[string]any{}, "mix": []any{share("ON", 100)}},
+		}},
+	}
+	for _, g := range gates {
+		encoded, _ := json.Marshal(g)
+		ctx.Redis.Do("HSET", "gates", g["name"], string(encoded))
+	}
+	ctx.Redis.Set("gates:version", version)
+}
+
+// exposureLog collects the lines the learner logs, still passing them on to the original output.
+type exposureLog struct {
+	guard sync.Mutex
+	lines []string
+}
+
+func (w *exposureLog) Write(p []byte) (int, error) {
+	w.guard.Lock()
+	defer w.guard.Unlock()
+	w.lines = append(w.lines, string(p))
+	return len(p), nil
+}
+
+func (w *exposureLog) count() int {
+	w.guard.Lock()
+	defer w.guard.Unlock()
+	return len(w.lines)
+}
+
+// loadExposures publishes the gates, loads step 2's snapshot, and collects every line the learner logs.
+func loadExposures(ctx *harness.Ctx, version int) *exposureLog {
+	publishExposureGates(ctx, version)
+	_, err := refresh(context.Background())
+	ctx.NoError(err, "step 2's refresh")
+	logged := &exposureLog{}
+	log.SetOutput(io.MultiWriter(log.Writer(), logged))
+	return logged
+}
+
+func deAttrs(i int) map[string]string {
+	return map[string]string{"user_id": fmt.Sprintf("u%d", i), "locale": "de"}
+}
+
+func exposureUsers(ctx *harness.Ctx) []string {
+	users := []string{}
+	for _, raw := range ctx.Kafka.Values(exposureTopic) {
+		var event struct {
+			UserID string \`json:"user_id"\`
+		}
+		json.Unmarshal([]byte(raw), &event)
+		users = append(users, event.UserID)
+	}
+	return users
+}
+
+func secondsSince(ctx *harness.Ctx, before int64) float64 {
+	return float64(ctx.Clock.Now()-before) / 1000
+}
+
+func CheckTopicKeyed(ctx *harness.Ctx) {
+	loadExposures(ctx, 7)
+	calls := []struct {
+		name  string
+		attrs map[string]string
+	}{
+		{"button_color", deAttrs(1)},
+		{"button_color", map[string]string{"user_id": "bo", "locale": "en"}},
+		{"dark_mode", map[string]string{"user_id": "cy"}},
+		{"button_color", deAttrs(2)},
+	}
+	for _, call := range calls {
+		want := getVariant(call.name, call.attrs)
+		got := getExposedVariant(call.name, call.attrs)
+		ctx.Assert(got == want, "getExposedVariant(%q, %s) answered %q but step 2's getVariant says %q: the decision is getVariant's, the exposure is a side effect", call.name, call.attrs["user_id"], got, want)
+	}
+	ctx.Settle()
+	records := ctx.Kafka.Records(exposureTopic)
+	ctx.Equal(len(records), 4, "four decisions must produce four records on %s: every decision is one exposure; records", exposureTopic)
+	// kafka-go writes a batch partition by partition, so records of different gates need not follow the calls:
+	// each record is matched to its call by user_id (one per call); one gate's records must keep the call order.
+	inCallOrder := make([]harness.KafkaRecord, len(calls))
+	position := make([]int, len(calls))
+	for i, call := range calls {
+		position[i] = -1
+		for j, r := range records {
+			var event struct {
+				UserID string \`json:"user_id"\`
+			}
+			json.Unmarshal(r.Value, &event)
+			if event.UserID == call.attrs["user_id"] {
+				inCallOrder[i], position[i] = r, j
+			}
+		}
+		ctx.Assert(position[i] >= 0, "no exposure on %s carries user_id %q: every decision is one exposure for its user", exposureTopic, call.attrs["user_id"])
+	}
+	var keys []string
+	for _, r := range inCallOrder {
+		keys = append(keys, string(r.Key))
+	}
+	ctx.Equal(keys, []string{"button_color", "button_color", "dark_mode", "button_color"}, "records must be keyed by the gate name")
+	ctx.Assert(inCallOrder[0].Partition == inCallOrder[1].Partition && inCallOrder[1].Partition == inCallOrder[3].Partition && position[0] < position[1] && position[1] < position[3], "the same gate must land on the same partition so its exposures stay in order")
+	now := float64(ctx.Clock.Now()) / 1000
+	for i, call := range calls {
+		raw := inCallOrder[i].Value
+		var event map[string]any
+		ctx.NoError(json.Unmarshal(raw, &event), "the value must be JSON with feature, variant, version, user_id, ts: %s", raw)
+		ctx.Equal(event["feature"], call.name, "the feature of the exposure for a %q decision (%s)", call.name, raw)
+		ctx.Equal(event["variant"], getVariant(call.name, call.attrs), "the variant of the exposure for %s: the decision's", call.attrs["user_id"])
+		ctx.Equal(event["version"], 7, "the exposure must carry the snapshot version that made the assignment")
+		ctx.Equal(event["user_id"], call.attrs["user_id"], "the exposure must carry the user it was made for")
+		ts, isNumber := event["ts"].(float64)
+		ctx.Assert(isNumber && math.Abs(ts-now) < 5, "ts must be the current time in seconds, got %v", event["ts"])
+	}
+	publishExposureGates(ctx, 8)
+	_, err := refresh(context.Background())
+	ctx.NoError(err, "step 2's refresh")
+	getExposedVariant("button_color", deAttrs(3))
+	ctx.Settle()
+	values := ctx.Kafka.Values(exposureTopic)
+	var last map[string]any
+	json.Unmarshal([]byte(values[len(values)-1]), &last)
+	ctx.Equal(last["version"], 8, "after the snapshot moved to version 8 the next exposure must say so (the graphs are annotated per edit)")
+}
+
+func CheckNonBlocking(ctx *harness.Ctx) {
+	loadExposures(ctx, 7)
+	ctx.Kafka.StallFor(exposureTopic, 2) // the broker answers 2 s later
+	before := ctx.Clock.Now()
+	got := getExposedVariant("button_color", deAttrs(1))
+	waited := secondsSince(ctx, before)
+	ctx.Assert(waited < 0.5, "getExposedVariant waited %.1f s for a stalled broker's acknowledgement: hand the record to the producer and return, the request path never waits for Kafka", waited)
+	ctx.Equal(got, getVariant("button_color", deAttrs(1)), "with the broker stalled the decision must still be getVariant's")
+	ctx.Equal(len(ctx.Kafka.Records(exposureTopic)), 0, "getExposedVariant returned only after the broker acknowledged the record: hand it to the producer and return; records")
+	for i := 2; i < 4; i++ {
+		getExposedVariant("button_color", deAttrs(i))
+	}
+	total := secondsSince(ctx, before)
+	ctx.Assert(total < 0.5, "three decisions on a stalled broker took %.1f s of virtual time: none of them may wait", total)
+	ctx.Clock.Advance(2000) // the broker is back
+	ctx.Settle()
+	getExposedVariant("button_color", deAttrs(4))
+	ctx.Settle()
+	ctx.Equal(exposureUsers(ctx), []string{"u1", "u2", "u3", "u4"}, "the exposures handed to the producer while the broker was away must arrive once it answers: the users on %s", exposureTopic)
+}
+
+func CheckBounded(ctx *harness.Ctx) {
+	logged := loadExposures(ctx, 7)
+	ctx.Kafka.Stall(exposureTopic) // the broker stops acknowledging: nothing handed to the producer leaves the queue
+	before := ctx.Clock.Now()
+	sameDecisions := true
+	for i := range 1200 {
+		sameDecisions = getExposedVariant("button_color", deAttrs(i)) == getVariant("button_color", deAttrs(i)) && sameDecisions
+	}
+	ctx.Assert(sameDecisions, "a dropped exposure must not change the decision: every call still answers getVariant's variant")
+	ctx.Assert(dropped.Load() > 0, "1200 decisions on a stalled broker and nothing was dropped: the queue is unbounded, a broker that is not answering grows it until the server runs out of memory")
+	// Unlike TS's in-flight set, the Go step bounds the channel: the batch the pump is writing sits on top of it.
+	stalledDrops := int(dropped.Load())
+	inHand := 1200 - stalledDrops - len(queue)
+	ctx.Assert(1 <= inHand && inHand <= 100, "pending = queued + the batch being written: %d exposures were accepted beyond the %d queued, expected the pump's one batch (1 to 100)", inHand, len(queue))
+	ctx.Equal(stalledDrops+maxPending+inHand, 1200, "pending = queued + the batch being written: dropped + maxPending (1000) + the %d being written must account for the 1200 exposures", inHand)
+	ctx.Assert(logged.count() >= 1, "dropping exposures must be logged: a rising dropped counter is the alarm")
+	took := secondsSince(ctx, before)
+	ctx.Assert(took < 0.5, "1200 decisions on a stalled broker took %.1f s of virtual time: dropping must not wait either", took)
+	ctx.Equal(len(ctx.Kafka.Records(exposureTopic)), 0, "nothing can reach the topic while the broker is stalled; records")
+	ctx.Kafka.Resume(exposureTopic)
+	ctx.Clock.Advance(31_000) // the broker is back: the pending exposures are delivered
+	ctx.Settle()
+	getExposedVariant("button_color", deAttrs(1200))
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(exposureTopic)), maxPending+inHand+1, "once the broker answers again the pending exposures (1000 queued + %d being written) must be delivered; records on the topic", inHand)
+	ctx.Equal(dropped.Load(), stalledDrops, "dropped after the pending exposures were delivered must stay")
+	for i := range 1000 {
+		getExposedVariant("button_color", deAttrs(i))
+	}
+	ctx.Settle()
+	ctx.Assert(int(dropped.Load()) == stalledDrops, "after the pending exposures were delivered their slots must be free again, yet %d of the next 1000 decisions were dropped: the queue must drain", int(dropped.Load())-stalledDrops)
+	ctx.Equal(len(ctx.Kafka.Records(exposureTopic)), maxPending+inHand+1+1000, "with the broker back every decision is one exposure again; records on the topic")
+}
+
+func CheckFlush(ctx *harness.Ctx) {
+	loadExposures(ctx, 7)
+	// shutdown closes the queue and the writer: it ends the process's exposures for good. The second stop below
+	// runs on a restarted process, re-initialised the way the program starts, with the queue the learner sized.
+	restart := struct {
+		capacity int
+		writer   kafka.Writer
+	}{cap(queue), *exposuresWriter}
+	ctx.Kafka.StallFor(exposureTopic, 2) // the broker is slow to answer at the moment of the stop
+	for i := range 3 {
+		getExposedVariant("button_color", deAttrs(i))
+	}
+	before := ctx.Clock.Now()
+	shutdown()
+	took := secondsSince(ctx, before)
+	ctx.Equal(exposureUsers(ctx), []string{"u0", "u1", "u2"}, "shutdown() returned with exposures still queued (the broker answered after 2 s): flush so a clean stop loses nothing; the users on %s", exposureTopic)
+	ctx.Assert(took <= 5.5, "the broker answered after 2 s yet shutdown() took %.0f s: wait for the pending deliveries, not for the whole timeout", took)
+	ctx.Kafka.Stall(exposureTopic) // now the broker is down for good
+	writer := restart.writer
+	exposuresWriter = &writer
+	queue = make(chan kafka.Message, restart.capacity)
+	pumped = make(chan struct{})
+	pumpCtx, stopPump = context.WithCancel(context.Background())
+	go pump()
+	for i := 3; i < 6; i++ {
+		getExposedVariant("button_color", deAttrs(i))
+	}
+	before = ctx.Clock.Now()
+	shutdown()
+	took = secondsSince(ctx, before)
+	ctx.Assert(took <= 6, "with the broker down, shutdown() took %.0f s: flush with a 5 s bound so a stop is not held for the producer's whole write timeout", took)
+	ctx.Equal(len(ctx.Kafka.Records(exposureTopic)), 3, "nothing can reach the topic while the broker is down; records")
 }
 `,
   },

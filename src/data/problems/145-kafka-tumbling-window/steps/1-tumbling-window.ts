@@ -1043,6 +1043,129 @@ export async function check_commit_after_emit(ctx) {
   assert.equal(ctx.kafka.lag('windows', 'clicks'), 0, 'after the emit every consumed record must be committed');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sort"
+
+	"leetbuild/harness"
+)
+
+// seedClicks puts clicks on partition 0 of clicks, delivered in this order (event time is in the
+// value, not the log).
+func seedClicks(ctx *harness.Ctx, events ...click) {
+	for _, e := range events {
+		ctx.Kafka.SeedPartition("clicks", 0, e.Page, fmt.Sprintf(\`{"page":%q,"ts":%d}\`, e.Page, e.Ts))
+	}
+}
+
+// emittedCounts is page-counts as "page window_start count", sorted by page then window start.
+func emittedCounts(ctx *harness.Ctx) []string {
+	var got []pageCount
+	for _, r := range ctx.Kafka.Records("page-counts") {
+		var v pageCount
+		ctx.NoError(json.Unmarshal(r.Value, &v), "the page-counts value %q is not JSON", r.Value)
+		got = append(got, v)
+	}
+	sort.Slice(got, func(i, j int) bool {
+		if got[i].Page != got[j].Page {
+			return got[i].Page < got[j].Page
+		}
+		return got[i].WindowStart < got[j].WindowStart
+	})
+	var out []string
+	for _, v := range got {
+		out = append(out, fmt.Sprintf("%s %d %d", v.Page, v.WindowStart, v.Count))
+	}
+	return out
+}
+
+// drainWindows runs the aggregator until it waits for clicks that will not come.
+func drainWindows(ctx *harness.Ctx) { ctx.Drain(func() { run(context.Background()) }) }
+
+func CheckWindows(ctx *harness.Ctx) {
+	seedClicks(ctx, click{"home", 1000}, click{"home", 2000}, click{"about", 3000}, click{"home", 61000}, click{"about", 62000}, click{"home", 125000})
+	drainWindows(ctx)
+	expected := []string{"about 0 1", "about 60000 1", "home 0 2", "home 60000 1"}
+	ctx.Equal(emittedCounts(ctx), expected, "after ts 125000 (watermark 120000) windows 0 and 60000 must be emitted as page window_start count")
+	ctx.Equal(stats().Open, 1, "the window starting at 120000 must stay open: stats().Open (stats() is %+v)", stats())
+	shutdown()
+	ctx.Settle()
+	ctx.Equal(emittedCounts(ctx), expected, "shutdown() must not emit open windows")
+}
+
+func CheckBoundary(ctx *harness.Ctx) {
+	seedClicks(ctx, click{"home", 59999}, click{"home", 60000}, click{"home", 60001}, click{"home", 126000})
+	drainWindows(ctx)
+	ctx.Equal(emittedCounts(ctx), []string{"home 0 1", "home 60000 2"}, "ts 59999 belongs to window 0, ts 60000 and 60001 to window 60000")
+}
+
+func CheckLate(ctx *harness.Ctx) {
+	seedClicks(ctx, click{"home", 1000}, click{"home", 70000}, click{"home", 50000}, click{"home", 130000})
+	drainWindows(ctx)
+	ctx.Equal(emittedCounts(ctx), []string{"home 0 1", "home 60000 1"}, "ts 50000 arrives behind the watermark 65000: it must neither reopen window 0 nor count")
+	ctx.Equal(stats().Late, 1, "one late event must be counted: stats().Late (stats() is %+v)", stats())
+}
+
+func CheckWithinLateness(ctx *harness.Ctx) {
+	seedClicks(ctx, click{"home", 61000}, click{"home", 124000}, click{"home", 119500}, click{"home", 118000}, click{"home", 126000})
+	drainWindows(ctx)
+	ctx.Equal(emittedCounts(ctx), []string{"home 60000 2"}, "ts 119500 is 4500 ms behind 124000, inside the lateness: it counts in window 60000")
+	ctx.Equal(stats().Late, 1, "ts 118000 is 6000 ms behind, late: stats().Late (stats() is %+v)", stats())
+	ctx.Equal(stats().Open, 1, "the window starting at 120000 must stay open: stats().Open (stats() is %+v)", stats())
+}
+
+func CheckKeyed(ctx *harness.Ctx) {
+	seedClicks(ctx, click{"home", 1000}, click{"about", 2000}, click{"home", 3000}, click{"pricing", 4000}, click{"home", 70000})
+	drainWindows(ctx)
+	records := ctx.Kafka.Records("page-counts")
+	ctx.Equal(len(records), 3, "window 0 has three pages: records on page-counts")
+	for _, r := range records {
+		var v map[string]any
+		ctx.NoError(json.Unmarshal(r.Value, &v), "the page-counts value %q is not JSON", r.Value)
+		var fields []string
+		for k := range v {
+			fields = append(fields, k)
+		}
+		sort.Strings(fields)
+		ctx.Equal(fields, []string{"count", "page", "window_start"}, "the value %s must have exactly page, window_start, count", r.Value)
+		var key any
+		if r.Key != nil {
+			key = string(r.Key)
+		}
+		ctx.Equal(key, v["page"], "the key must be the page (value %s)", r.Value)
+	}
+	keys := ctx.Kafka.Keys("page-counts")
+	sort.Strings(keys)
+	ctx.Equal(keys, []string{"about", "home", "pricing"}, "the keys of page-counts")
+}
+
+func CheckCommitAfterEmit(ctx *harness.Ctx) {
+	seedClicks(ctx, click{"home", 1000}, click{"home", 70000})
+	ctx.Kafka.StallFor("page-counts", 2) // the broker acknowledges page-counts 2 s later
+	started := ctx.Clock.Now()
+	type commitSeen struct {
+		group  string
+		waited int64
+		held   []string
+	}
+	var seen []commitSeen
+	ctx.Kafka.OnCommit(func(group string, _ harness.KafkaOffsets) {
+		seen = append(seen, commitSeen{group, ctx.Clock.Now() - started, emittedCounts(ctx)})
+	})
+	drainWindows(ctx)
+	ctx.Assert(len(seen) > 0, "closing window 0 must commit the input offsets")
+	first := seen[0]
+	ctx.Equal(first.group, "windows", "the consumer must commit as group windows")
+	ctx.Equal(first.held, []string{"home 0 1"}, "at commit time page-counts must already hold window 0")
+	ctx.Assert(first.waited >= 2000, "committed %d ms in: the output topic was stalled, the commit must wait for the ack (a synchronous WriteMessages) first", first.waited)
+	ctx.Equal(len(ctx.Kafka.EventsOf("auto-commit")), 0, "offsets were committed on a timer: auto-commits")
+	ctx.Equal(ctx.Kafka.Lag("windows", "clicks"), 0, "after the emit every consumed record must be committed: lag")
+}
+`,
   },
   debrief: `The watermark turns an unbounded, out-of-order stream into finite, publishable windows: it is a promise — "nothing older than this will count" — derived from the data (\`max_ts - lateness\`), not from the wall clock, so a replay of yesterday's topic closes yesterday's windows the same way. Everything else follows from it: an event behind it is dropped (the count has already been published), an event ahead of it counts even into an older window, and a window closes exactly when its end falls at or before it. The commit sits last because the emitted counts are the side effect: commit first and a crash between the two loses a window; emit, wait for the ack, then commit and a crash replays it (a duplicate count, which downstream can dedupe by \`(page, window_start)\`). Real stream processors (Kafka Streams, Flink) add what this drill leaves out: open windows are checkpointed in a state store or changelog topic so a restart does not recount from the committed offset, watermarks are tracked per partition and merged, late events can update an already-emitted window instead of being dropped, and the emit-and-commit pair becomes a Kafka transaction so the output and the offsets land atomically.`,
 };

@@ -612,3 +612,496 @@ CREATE TABLE quality_scores (
 \`;
 `,
 };
+
+const articlesGo = ARTICLES.map(
+  a => `	{ID: ${JSON.stringify(a.id)}, Title: ${JSON.stringify(a.title)}, Body: ${JSON.stringify(a.body)}},`,
+).join('\n');
+
+/** The Go twins: the same `assistant` packages, computing the same numbers from the same text. */
+export const supportModulesGo: Record<string, string> = {
+  'assistant/config/config.go': `// Package config holds the addresses, topics and limits every step of the assistant agrees on.
+package config
+
+// The stand-in model server (served by the harness) at two addresses, and the LLM judge.
+const (
+	LLMLarge = "llm-large:50051"
+	LLMSmall = "llm-small:50051"
+	Judge    = "judge:50051"
+)
+
+// Kafka: one record per answered turn, keyed by session; the offline judge's consumer group.
+const (
+	Topic = "support-conversations"
+	Group = "quality-judge"
+)
+
+// Redis. The TTLs are in seconds.
+const (
+	HistoryTTL         = 86400
+	CacheTTL           = 3600
+	RateLimitPerMinute = 20
+)
+
+// Retrieval and generation.
+const (
+	TopK          = 4
+	MaxTokens     = 120
+	DeadlineS     = 2.0
+	MinSimilarity = 0.3
+	HandoffText   = "I've passed this to a support agent, who will follow up with you shortly."
+)
+`,
+  'assistant/embed/embed.go': `// Package embed computes deterministic text embeddings for the course: a TF-IDF vector over the
+// knowledge base's vocabulary (each word a dimension, weighted by how rare it is across the KB's
+// chunks; words the KB never saw share a hashed band at the end), L2-normalised, 512 dimensions. Not
+// a language model — a stand-in with the properties retrieval relies on: the same text always gives
+// the same vector, texts sharing rare words land close together (Cosine), and function words count
+// for nothing. ToPgvector writes a vector the way pgvector reads it: "[0.1,0.2,...]". The same
+// numbers as the Python and TypeScript modules.
+package embed
+
+import (
+	"math"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+
+	"assistant/chunk"
+	"assistant/kb"
+)
+
+// Dim is the length of every vector.
+const Dim = 512
+
+// StopWords carry no topic; without them a question's vector points at its subject, as a real embedding's would.
+var StopWords = map[string]bool{}
+
+var word = regexp.MustCompile(\`[a-z0-9]+\`)
+
+// Vocab is every word of the KB's chunks, sorted: the first len(Vocab) dimensions.
+var Vocab []string
+
+var (
+	df    = map[string]int{}
+	index = map[string]int{}
+	n     int
+)
+
+// The vocabulary and document frequencies come from the KB's chunks, so every process computes the same vector.
+func init() {
+	for _, w := range strings.Fields("a an and are as at be been but by can could did do does for from get got had has have he her his how i if in is it its me my no not of on or our she so that the their them they this to up us was we were what when where which who will with would you your") {
+		StopWords[w] = true
+	}
+	for _, a := range kb.Articles {
+		for _, text := range chunk.Chunk(a.Body) {
+			n++
+			seen := map[string]bool{}
+			for _, w := range Tokenize(text) {
+				if !seen[w] {
+					seen[w] = true
+					df[w]++
+				}
+			}
+		}
+	}
+	for w := range df {
+		Vocab = append(Vocab, w)
+	}
+	sort.Strings(Vocab)
+	for i, w := range Vocab {
+		index[w] = i
+	}
+}
+
+// Tokenize is the text's lower-cased words, stop words left out.
+func Tokenize(text string) []string {
+	var out []string
+	for _, w := range word.FindAllString(strings.ToLower(text), -1) {
+		if !StopWords[w] {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// CountTokens is len(Tokenize(text)).
+func CountTokens(text string) int { return len(Tokenize(text)) }
+
+// IDF is log(1 + N/df): a word in every chunk weighs little, a word in one weighs most; an unseen word most of all.
+func IDF(w string) float64 {
+	d := 0.5
+	if c, ok := df[w]; ok {
+		d = float64(c)
+	}
+	return math.Log(1 + float64(n)/d)
+}
+
+func fnv1a(s string) uint32 {
+	h := uint32(0x811c9dc5)
+	for _, b := range []byte(s) {
+		h ^= uint32(b)
+		h *= 0x01000193
+	}
+	return h
+}
+
+func slot(w string) int {
+	if i, ok := index[w]; ok {
+		return i
+	}
+	return len(Vocab) + int(fnv1a(w)%uint32(Dim-len(Vocab)))
+}
+
+// Embed is the text's unit vector, each component rounded to 6 decimals (all zeros for a text of stop words).
+func Embed(text string) []float64 {
+	v := make([]float64, Dim)
+	for _, tok := range Tokenize(text) {
+		v[slot(tok)] += IDF(tok)
+	}
+	norm := 0.0
+	for _, x := range v {
+		norm += x * x
+	}
+	norm = math.Sqrt(norm)
+	if norm == 0 {
+		return v
+	}
+	for i, x := range v {
+		v[i] = math.Round(x/norm*1e6) / 1e6
+	}
+	return v
+}
+
+// Cosine is the cosine similarity of a and b, 0 when either is all zeros.
+func Cosine(a, b []float64) float64 {
+	dot, na, nb := 0.0, 0.0, 0.0
+	for i := 0; i < len(a) && i < len(b); i++ {
+		dot += a[i] * b[i]
+		na += a[i] * a[i]
+		nb += b[i] * b[i]
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}
+
+// ToPgvector writes v as pgvector's text form, "[0.100000,0.200000,...]"; cast it with ::vector.
+func ToPgvector(v []float64) string {
+	parts := make([]string, len(v))
+	for i, x := range v {
+		parts[i] = strconv.FormatFloat(x, 'f', 6, 64)
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
+// FromPgvector reads pgvector's text form back.
+func FromPgvector(s string) []float64 {
+	var out []float64
+	for _, x := range strings.Split(strings.Trim(s, "[]"), ",") {
+		if x == "" {
+			continue
+		}
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil {
+			return nil
+		}
+		out = append(out, f)
+	}
+	return out
+}
+`,
+  'assistant/chunk/chunk.go': `// Package chunk cuts text into fixed-size word windows with overlap: the chunking every step and the harness agree on.
+package chunk
+
+import "strings"
+
+// A chunk is ChunkWords words; consecutive chunks share OverlapWords of them.
+const (
+	ChunkWords   = 48
+	OverlapWords = 12
+)
+
+// Chunk is text's windows of ChunkWords words, each starting ChunkWords-OverlapWords after the previous; none for an empty text.
+func Chunk(text string) []string {
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return nil
+	}
+	var out []string
+	for start := 0; ; start += ChunkWords - OverlapWords {
+		end := start + ChunkWords
+		if end > len(words) {
+			end = len(words)
+		}
+		out = append(out, strings.Join(words[start:end], " "))
+		if start+ChunkWords >= len(words) {
+			return out
+		}
+	}
+}
+`,
+  'assistant/kb/kb.go': `// Package kb is the support knowledge base: ten short articles. Chunk ids are "<article>-<position>".
+package kb
+
+// Article is one page of the knowledge base.
+type Article struct {
+	ID    string
+	Title string
+	Body  string
+}
+
+// Articles is the whole knowledge base.
+var Articles = []Article{
+${articlesGo}
+}
+
+// Find is the article with this id, and whether there is one.
+func Find(id string) (Article, bool) {
+	for _, a := range Articles {
+		if a.ID == id {
+			return a, true
+		}
+	}
+	return Article{}, false
+}
+`,
+  'assistant/prompt/prompt.go': `// Package prompt is the one prompt format: instructions, the retrieved chunks as "[kb:<id>] <text>"
+// lines, the conversation so far, then the question. The stand-in model reads chunk ids from these
+// lines, which is what lets a check tell a grounded answer from an invented one.
+package prompt
+
+import (
+	"regexp"
+	"strings"
+)
+
+// Chunk is a retrieved piece of the knowledge base: its id, its text and how close it was to the question.
+type Chunk struct {
+	ID    string  \`json:"id"\`
+	Text  string  \`json:"text"\`
+	Score float64 \`json:"score,omitempty"\`
+}
+
+// Turn is one message of a conversation; Role is "dasher" or "assistant".
+type Turn struct {
+	Role string \`json:"role"\`
+	Text string \`json:"text"\`
+}
+
+// Instructions open every prompt.
+const Instructions = "You are a Dasher support assistant. Answer only from the context below and cite the chunks you " +
+	"use as [kb:<id>]. If the context does not answer the question, say so."
+
+// Build is the prompt for question, grounded in chunks, after history.
+func Build(question string, chunks []Chunk, history []Turn) string {
+	lines := []string{Instructions, "", "Context:"}
+	for _, c := range chunks {
+		lines = append(lines, "[kb:"+c.ID+"] "+c.Text)
+	}
+	lines = append(lines, "", "History:")
+	for _, t := range history {
+		lines = append(lines, t.Role+": "+t.Text)
+	}
+	lines = append(lines, "", "Question: "+question, "Answer:")
+	return strings.Join(lines, "\\n")
+}
+
+var cite = regexp.MustCompile(\`\\[kb:([^\\]]+)\\]\`)
+
+// CitedIds is the chunk ids an answer cites, in order, without duplicates.
+func CitedIds(answer string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, m := range cite.FindAllStringSubmatch(answer, -1) {
+		if !seen[m[1]] {
+			seen[m[1]] = true
+			out = append(out, m[1])
+		}
+	}
+	return out
+}
+`,
+  'assistant/model/model.go': `// Package model is the stand-in for the model server and the LLM judge. The harness serves these over
+// gRPC (Llm at llm-large:50051 / llm-small:50051, Judge at judge:50051); the learner's code never
+// calls them directly. Deterministic on purpose: the course grades what the system around a model
+// does — grounds it, bounds it, times it out, judges it, escalates — never the prose.
+//
+// Complete(prompt, maxTokens, mode):
+//
+//	"faithful"     cites the first two context chunks and answers with the first sentence of the top one
+//	"hallucinate"  invents a policy and cites a chunk that was never retrieved ([kb:policy-404])
+//	"verbose"      the faithful answer followed by filler, so maxTokens has to cut it
+//
+// With no context chunks in the prompt the model says the documentation does not cover it (no citation).
+package model
+
+import (
+	"math"
+	"regexp"
+	"strings"
+)
+
+// NoContextText is the answer to a prompt without context chunks.
+const NoContextText = "The documentation available to me does not cover this; a support agent can help."
+
+var (
+	chunkLine = regexp.MustCompile(\`(?m)^\\[kb:([^\\]]+)\\]\\s*(.*)$\`)
+	cite      = regexp.MustCompile(\`\\[kb:([^\\]]+)\\]\`)
+	risky     = regexp.MustCompile(\`(?i)guarantee|promise|lawsuit|legal action\`)
+	sentence  = regexp.MustCompile(\`[^.!?]*[.!?]\`)
+)
+
+func firstSentence(text string) string {
+	if m := sentence.FindString(text); m != "" {
+		return strings.TrimSpace(m)
+	}
+	return strings.TrimSpace(text)
+}
+
+// Tokens is the text as the model streams it: words, each but the last carrying its trailing space.
+func Tokens(text string) []string {
+	words := strings.Fields(text)
+	out := make([]string, len(words))
+	for i, w := range words {
+		if i < len(words)-1 {
+			w += " "
+		}
+		out[i] = w
+	}
+	return out
+}
+
+// Truncate keeps the first maxTokens words of text.
+func Truncate(text string, maxTokens int) string {
+	if maxTokens <= 0 {
+		return ""
+	}
+	words := strings.Fields(text)
+	if maxTokens < len(words) {
+		words = words[:maxTokens]
+	}
+	return strings.Join(words, " ")
+}
+
+// Complete is the model's answer to prompt, at most maxTokens words.
+func Complete(prompt string, maxTokens int, mode string) string {
+	chunks := chunkLine.FindAllStringSubmatch(prompt, -1)
+	var text string
+	switch {
+	case mode == "hallucinate":
+		text = "Your issue will be resolved within 7 days, guaranteed [kb:policy-404]."
+	case len(chunks) == 0:
+		text = NoContextText
+	default:
+		cites := ""
+		for i, c := range chunks {
+			if i < 2 {
+				cites += "[kb:" + c[1] + "]"
+			}
+		}
+		text = "Based on " + cites + ": " + firstSentence(chunks[0][2])
+		if mode == "verbose" {
+			filler := make([]string, 40)
+			for i := range filler {
+				filler[i] = "Additionally, please note that this may vary by market and over time."
+			}
+			text += " " + strings.Join(filler, " ")
+		}
+	}
+	return Truncate(text, maxTokens)
+}
+
+// Scores is the judge's verdict.
+type Scores struct {
+	Groundedness float64
+	Coherence    float64
+	Compliance   float64
+	Pass         bool
+}
+
+// Evaluate is the judge's rubric: groundedness (citations within the context), coherence (length), compliance (no promises).
+func Evaluate(question, answer string, contextIDs []string) Scores {
+	allowed := map[string]bool{}
+	for _, id := range contextIDs {
+		allowed[id] = true
+	}
+	cited := cite.FindAllStringSubmatch(answer, -1)
+	groundedness := 0.0
+	if len(cited) > 0 {
+		in := 0
+		for _, c := range cited {
+			if allowed[c[1]] {
+				in++
+			}
+		}
+		groundedness = math.Round(float64(in)/float64(len(cited))*1000) / 1000
+	}
+	coherence := 0.4
+	if words := len(strings.Fields(answer)); words >= 3 && words <= 160 {
+		coherence = 1
+	}
+	compliance := 1.0
+	if risky.MatchString(answer) {
+		compliance = 0
+	}
+	return Scores{
+		Groundedness: groundedness,
+		Coherence:    coherence,
+		Compliance:   compliance,
+		Pass:         groundedness >= 0.8 && coherence >= 0.8 && compliance >= 0.8,
+	}
+}
+`,
+  'assistant/db/db.go': `// Package db is the assistant's Postgres (with pgvector), through database/sql and lib/pq: Pool.ExecContext
+// runs one statement (autocommit), Pool.QueryContext returns rows, Pool.BeginTx checks a connection out
+// for a transaction (tx.Commit(), or tx.Rollback()). Statements use $1…$n placeholders. Schema is what
+// the harness applies before a check.
+//
+// Tables:
+//
+//	kb_chunks      (id text primary key, article text, position int, text text, embedding vector(512))
+//	quality_scores (session_id text, turn int, groundedness real, coherence real, compliance real, pass boolean,
+//	                primary key (session_id, turn))
+package db
+
+import (
+	"database/sql"
+
+	_ "github.com/lib/pq"
+)
+
+// Pool is the assistant's connection pool.
+var Pool = open()
+
+func open() *sql.DB {
+	pool, err := sql.Open("postgres", "postgres://assistant@db/assistant?sslmode=disable")
+	if err != nil {
+		panic(err)
+	}
+	return pool
+}
+
+// Schema creates the assistant's tables.
+const Schema = \`
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE TABLE kb_chunks (
+  id text PRIMARY KEY,
+  article text NOT NULL,
+  position int NOT NULL,
+  text text NOT NULL,
+  embedding vector(512) NOT NULL
+);
+CREATE TABLE quality_scores (
+  session_id text NOT NULL,
+  turn int NOT NULL,
+  groundedness real NOT NULL,
+  coherence real NOT NULL,
+  compliance real NOT NULL,
+  pass boolean NOT NULL,
+  PRIMARY KEY (session_id, turn)
+);
+\`
+`,
+};

@@ -624,6 +624,143 @@ export async function check_chronological(ctx) {
   assert.deepEqual(got, want, \`after 60 messages recent('room-7') must be m11 .. m60 oldest first, got \${JSON.stringify(got.slice(0, 3))} .. \${JSON.stringify(got.slice(-3))} (\${got.length} entries)\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"slices"
+
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	"leetbuild/harness"
+
+	pb "chat/gen/chat"
+)
+
+const recentKey = "recent:room-7"
+
+var recentBg = context.Background()
+
+func recentMsg(i int, room string) *pb.ServerMsg {
+	user := "bo"
+	if i%2 == 1 {
+		user = "ana"
+	}
+	return &pb.ServerMsg{Room: room, User: user, Text: fmt.Sprintf("m%d", i), Ts: 1700000000000 + int64(i)}
+}
+
+func rememberMsg(ctx *harness.Ctx, room string, msg *pb.ServerMsg) {
+	ctx.NoError(remember(recentBg, room, msg), "remember(ctx, %q, %v) returned an error", room, msg)
+}
+
+func recentOf(ctx *harness.Ctx, room string) []*pb.ServerMsg {
+	got, err := recent(recentBg, room)
+	ctx.NoError(err, "recent(ctx, %q) returned an error", room)
+	return got
+}
+
+// storedRecent is the list as Redis holds it, head first, parsed back into ServerMsgs.
+func storedRecent(ctx *harness.Ctx, key string) []*pb.ServerMsg {
+	var out []*pb.ServerMsg
+	for _, v := range ctx.Redis.LRange(key, 0, -1) {
+		msg := &pb.ServerMsg{}
+		ctx.NoError(protojson.Unmarshal([]byte(v), msg), "%s holds %q, which is not a JSON ServerMsg", key, v)
+		out = append(out, msg)
+	}
+	return out
+}
+
+func recentTexts(msgs []*pb.ServerMsg) []string {
+	texts := make([]string, len(msgs))
+	for i, msg := range msgs {
+		texts[i] = msg.GetText()
+	}
+	return texts
+}
+
+func CheckLpush(ctx *harness.Ctx) {
+	rememberMsg(ctx, "room-7", recentMsg(1, "room-7"))
+	rememberMsg(ctx, "room-7", recentMsg(2, "room-7"))
+	rememberMsg(ctx, "room-8", recentMsg(3, "room-8"))
+	ctx.Equal(ctx.Redis.Type(recentKey), "list", "the type of recent:room-7 (keys: %s)", harness.Show(ctx.Redis.Keys("*")))
+	list := storedRecent(ctx, recentKey)
+	ctx.Equal(recentTexts(list), []string{"m2", "m1"}, "recent:room-7 head first: LPUSH puts the newest at the head")
+	ctx.Assert(proto.Equal(list[1], recentMsg(1, "room-7")), "the stored JSON parses back to %v, expected %v", list[1], recentMsg(1, "room-7"))
+	other := recentTexts(storedRecent(ctx, "recent:room-8"))
+	ctx.Equal(other, []string{"m3"}, "recent:room-8: one list per room")
+}
+
+func CheckTrim(ctx *harness.Ctx) {
+	for i := 1; i <= 55; i++ {
+		rememberMsg(ctx, "room-7", recentMsg(i, "room-7"))
+	}
+	n := ctx.Redis.LLen(recentKey)
+	ctx.Equal(n, 50, "after 55 messages the entries in recent:room-7 (LTRIM 0 49 after every push)")
+	list := storedRecent(ctx, recentKey)
+	first, last := list[0].GetText(), list[len(list)-1].GetText()
+	ctx.Assert(first == "m55" && last == "m6", "the list runs %s .. %s, expected m55 .. m6: trimming must drop the oldest, not the newest", first, last)
+}
+
+func CheckExpire(ctx *harness.Ctx) {
+	rememberMsg(ctx, "room-7", recentMsg(1, "room-7"))
+	ttl := ctx.Redis.TTL(recentKey)
+	ctx.Assert(3500 <= ttl && ttl <= 3600, "recent:room-7 has TTL %d, expected 3600 s", ttl)
+	ctx.Clock.Advance(1800)
+	rememberMsg(ctx, "room-7", recentMsg(2, "room-7"))
+	ttl = ctx.Redis.TTL(recentKey)
+	ctx.Assert(3500 <= ttl && ttl <= 3600, "a new message must restart the hour: TTL is %d after the second remember, expected 3600", ttl)
+	ctx.Clock.Advance(3601)
+	ctx.Equal(ctx.Redis.Exists(recentKey), 0, "a room quiet for an hour must drop out of Redis: recent:room-7 exists")
+}
+
+func CheckPipelined(ctx *harness.Ctx) {
+	before := len(ctx.Redis.RoundTrips())
+	rememberMsg(ctx, "room-7", recentMsg(1, "room-7"))
+	trips := ctx.Redis.RoundTrips()[before:]
+	var direct []string
+	for _, trip := range trips {
+		if len(trip) == 1 {
+			direct = append(direct, trip...)
+		}
+	}
+	ctx.Assert(len(direct) == 0, "remember sent %s outside a pipeline: queue LPush, LTrim and Expire in one TxPipelined and execute once", harness.Show(direct))
+	ctx.Equal(len(trips), 1, "remember's round trips (%v)", trips)
+	trip := trips[0]
+	var commands []string
+	for _, c := range trip {
+		if c != "MULTI" && c != "EXEC" {
+			commands = append(commands, c)
+		}
+	}
+	ctx.Equal(commands, []string{"LPUSH", "LTRIM", "EXPIRE"}, "the commands the pipeline queued, in order")
+	ctx.Assert(trip[0] == "MULTI", "the pipeline must be a MULTI (rdb.TxPipelined) so no reader ever sees the list at 51")
+	list := storedRecent(ctx, recentKey)
+	ttl := ctx.Redis.TTL(recentKey)
+	ctx.Assert(len(list) == 1 && list[0].GetText() == "m1" && 3500 <= ttl && ttl <= 3600, "after exec the list must hold the message with its TTL set")
+}
+
+func CheckChronological(ctx *harness.Ctx) {
+	got := recentOf(ctx, "room-7")
+	ctx.Assert(len(got) == 0, "a quiet room must give an empty list, got %v", got)
+	for i := 1; i <= 3; i++ {
+		rememberMsg(ctx, "room-7", recentMsg(i, "room-7"))
+	}
+	got = recentOf(ctx, "room-7")
+	ctx.Assert(!slices.Contains(got, nil), "recent must return ServerMsg objects, got %v", got)
+	ctx.Equal(recentTexts(got), []string{"m1", "m2", "m3"}, "recent(ctx, %q) oldest first", "room-7")
+	ctx.Assert(proto.Equal(got[0], recentMsg(1, "room-7")), "recent()[0] is %v, expected %v", got[0], recentMsg(1, "room-7"))
+	for i := 4; i <= 60; i++ {
+		rememberMsg(ctx, "room-7", recentMsg(i, "room-7"))
+	}
+	texts := recentTexts(recentOf(ctx, "room-7"))
+	want := make([]string, 50)
+	for i := range want {
+		want[i] = fmt.Sprintf("m%d", i+11)
+	}
+	ctx.Equal(texts, want, "after 60 messages recent(ctx, %q) must be m11 .. m60 oldest first", "room-7")
+}
+`,
   },
   debrief: `LPUSH + LTRIM + EXPIRE is the Redis idiom for a bounded, self-cleaning recent-items list, and wrapping the three in MULTI/EXEC is what makes it one round trip *and* one atomic unit — a plain pipeline saves the round trips but another client's LRANGE can still slip in between the push and the trim. The list is maintained by the writer, so a miss is not a signal to load anything; it just means the client uses the history endpoint. Real systems store a sequence number with each entry so a reconnecting client can ask for "everything after N", and keep the list per shard when a single room is hot enough to make one Redis key a bottleneck.`,
 };

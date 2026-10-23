@@ -293,7 +293,7 @@ over a server-streaming call, each token a \`ChatEvent{token}\` and the last a
     {"from": "Dasher app", "to": "Chat", "label": "Chat.Stream(session s-7, \\"My red card was declined…\\")", "kind": "sync"},
     {"from": "Chat", "to": "Redis · Postgres", "label": "LRANGE conv:s-7 · nearest 4 chunks", "kind": "sync"},
     {"from": "Chat", "to": "llm-large", "label": "Llm.Stream(large, prompt, max_tokens 120) · deadline 2 s", "kind": "sync"},
-    {"from": "llm-large", "to": "Chat", "label": "Token \\"Based \\" · Token \\"on \\" · … (one every ~100 ms)", "kind": "reply"},
+    {"from": "llm-large", "to": "Chat", "label": "Token \\"Based \\" · Token \\"on \\" · … (one every ~40 ms)", "kind": "reply"},
     {"from": "Chat", "to": "Dasher app", "label": "ChatEvent{token} as each arrives · tier 1 every 8 tokens", "kind": "reply"},
     {"from": "llm-large", "to": "Chat", "label": "end of stream (32 tokens)", "kind": "reply"},
     {"from": "Chat", "to": "judge", "label": "Evaluate(…) — the full check", "kind": "sync"},
@@ -303,10 +303,12 @@ over a server-streaming call, each token a \`ChatEvent{token}\` and the last a
 }
 :::
 
-Everything from the unary path moves, and changes shape on the way:
+Everything from the unary path comes along, and changes shape on the way:
 
-- **The deadline is the budget for the first token.** A relay that collects the whole answer before
-  writing anything sends the same bytes and is still wrong: it is a unary call with extra steps.
+- **The deadline covers the whole stream.** gRPC bounds the call, not its first message, so the answer
+  streams inside the 2 s and a model slow to start spends the answer's time. Within it, a relay that
+  collects the whole answer before writing anything sends the same bytes and is still wrong: it is a
+  unary call with extra steps.
 - **The fallback narrows.** \`UNAVAILABLE\` *before the first token* → the same prompt to \`llm-small\`.
   A model silent past the deadline, or one that dies mid-answer, has already shown the Dasher half a
   sentence: the honest outcome is a status the app can act on, and nothing is appended to memory.
@@ -403,8 +405,8 @@ Q: The consumer commits the offset before writing the row, and crashes between t
   model beats an error page; a person is for failed answers, not slow models.
 - **Guard cheap first, fail closed.** Strings before RPCs; no verdict is a failed verdict; one more
   generation, then a hand-off; the rejected text reaches nobody — and never the cache.
-- **Streaming moves the deadline, the fallback and the guard** — the guard to a trailing window of
-  complete sentences, where it loses "never shown" and gains the cancel.
+- **Streaming moves the fallback and the guard** — the fallback to before the first token, the guard to
+  a trailing window of complete sentences, where it loses "never shown" and gains the cancel.
 - **Observe off the request path, commit last.** One record per turn, never awaited; judge, write,
   commit; an upsert turns at-least-once into one row.
 

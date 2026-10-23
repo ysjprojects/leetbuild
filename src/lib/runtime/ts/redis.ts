@@ -8,6 +8,7 @@
  */
 import {Buffer} from './buffer';
 import {CLOCK} from './clock';
+import {sha1} from './node';
 
 export type Reply = string | number | null | Reply[];
 
@@ -113,6 +114,10 @@ const STATUS_REPLIES = new Set([
   'select',
 ]);
 
+/** A script's SHA-1 as Redis names it (lower-case hex of its bytes). */
+const scriptSha = (source: string): string =>
+  Array.from(sha1(byteStringToBytes(source)), b => b.toString(16).padStart(2, '0')).join('');
+
 const tag = (reply: Reply, status: boolean): Tagged => {
   if (reply === null) return {t: 'nil'};
   if (typeof reply === 'number') return {t: 'int', v: reply};
@@ -148,6 +153,8 @@ export class RedisServer {
   private expires = new Map<string, number>();
   private readonly subscribers = new Map<string, Set<Subscriber>>();
   private readonly patternSubscribers = new Map<string, Set<PatternSubscriber>>();
+  /** Scripts by SHA-1 (hex): EVAL and SCRIPT LOAD cache them, EVALSHA runs them. */
+  private readonly scripts = new Map<string, string>();
 
   flushall(): void {
     this.data.clear();
@@ -160,6 +167,7 @@ export class RedisServer {
     this.trips.length = 0;
     this.subscribers.clear();
     this.patternSubscribers.clear();
+    this.scripts.clear();
   }
 
   // ---- pub/sub: a connection's subscriptions, delivered asynchronously as replies would arrive ----------
@@ -214,6 +222,20 @@ export class RedisServer {
     return [...this.data.keys()].filter(k => re.test(k)).sort();
   }
 
+  /** A stable rendering of the key's value and expiry ('' when absent): WATCH compares it at EXEC. */
+  fingerprint(key: string): string {
+    this.sweep();
+    const v = this.data.get(key);
+    if (v === undefined) return '';
+    const body =
+      v.kind === 'string' || v.kind === 'list'
+        ? v.value
+        : v.kind === 'set'
+        ? [...v.value].sort()
+        : [...v.value.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    return JSON.stringify([v.kind, body, this.expires.get(key) ?? null]);
+  }
+
   // ---- dispatch ----------------------------------------------------------------------------------
 
   /**
@@ -261,7 +283,8 @@ export class RedisServer {
   private fireProbes(args: string[]): void {
     if (this.probes.length === 0) return;
     const touched = new Set(args);
-    for (const probe of this.probes) {
+    // A snapshot: a probe armed by a probe's fn waits for the next command touching its key.
+    for (const probe of [...this.probes]) {
       if (probe.fired || !touched.has(probe.key)) continue;
       probe.fired = true;
       try {
@@ -663,13 +686,20 @@ export class RedisServer {
       case 'eval':
       case 'evalsha': {
         if (this.lua === null) throw new ReplyError('ERR Lua scripting is not available in this runtime');
+        // EVAL caches its script under its SHA-1, as Redis does; EVALSHA runs only a cached one.
+        let source = a[0];
+        if (name === 'evalsha') {
+          const cached = this.scripts.get(a[0].toLowerCase());
+          if (cached === undefined) throw new ReplyError('NOSCRIPT No matching script. Please use EVAL.');
+          source = cached;
+        } else this.scripts.set(scriptSha(source), source);
         const numkeys = int(a[1]);
         const keys = a.slice(2, 2 + numkeys);
         const argv = a.slice(2 + numkeys);
         const statusCommand = (cmd: string): boolean => STATUS_REPLIES.has(cmd);
         let out: string;
         try {
-          out = this.lua(a[0], JSON.stringify(keys), JSON.stringify(argv), argsJson => {
+          out = this.lua(source, JSON.stringify(keys), JSON.stringify(argv), argsJson => {
             const args = (JSON.parse(argsJson) as (string | number)[]).map(String);
             const cmd = args[0].toLowerCase();
             try {
@@ -682,6 +712,20 @@ export class RedisServer {
           throw new ReplyError(e instanceof Error ? e.message : String(e));
         }
         return untag(JSON.parse(out) as Tagged);
+      }
+      case 'script': {
+        const sub = a[0]?.toLowerCase();
+        if (sub === 'load') {
+          const sha = scriptSha(a[1]);
+          this.scripts.set(sha, a[1]);
+          return sha;
+        }
+        if (sub === 'exists') return a.slice(1).map(sha => (this.scripts.has(sha.toLowerCase()) ? 1 : 0));
+        if (sub === 'flush') {
+          this.scripts.clear();
+          return 'OK';
+        }
+        throw new ReplyError(`ERR unknown subcommand '${a[0]}'`);
       }
       default:
         if (GEO_COMMANDS.has(name)) return this.geo(name, a);

@@ -545,6 +545,91 @@ export async function check_bounded(ctx) {
   assert.equal(attempts, 2, \`made \${attempts} attempts against a down resizer; retries must stop after the second\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"leetbuild/harness"
+
+	pb "thumbs/gen/resizer"
+)
+
+var rzBg = context.Background()
+
+// resizerPeer is the resizer: it knows every image but ghost and counts its calls.
+type resizerPeer struct {
+	pb.UnimplementedResizerServer
+	calls int
+}
+
+func (p *resizerPeer) Resize(_ context.Context, req *pb.ResizeRequest) (*pb.ResizeReply, error) {
+	p.calls++
+	if req.GetImageId() == "ghost" {
+		return nil, status.Error(codes.NotFound, "no such image")
+	}
+	return &pb.ResizeReply{Jpeg: []byte(fmt.Sprintf("JPEG-%s-%d", req.GetImageId(), req.GetWidth()))}, nil
+}
+
+func servePeer(ctx *harness.Ctx) *resizerPeer {
+	peer := &resizerPeer{}
+	pb.RegisterResizerServer(ctx.GRPC.Server(""), peer)
+	return peer
+}
+
+func resizeCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Resize", "")) }
+
+func CheckDeadline(ctx *harness.Ctx) {
+	servePeer(ctx)
+	got, err := render(rzBg, "cat", 256)
+	ctx.NoError(err, "render(ctx, %q, 256) returned an error", "cat")
+	ctx.Equal(string(got), "JPEG-cat-256", "render must return the resizer's bytes")
+	calls := ctx.GRPC.CallsTo("Resize", "")
+	ctx.Assert(len(calls) > 0, "render never called Resize")
+	call := calls[len(calls)-1]
+	ctx.Assert(call.HasDeadline(), "the RPC carries no deadline")
+	ctx.Assert(0.5 <= call.Timeout.Seconds() && call.Timeout.Seconds() <= 1.0, "the deadline must be about 800 ms, got %v", call.Timeout)
+	ctx.GRPC.SetLatency("Resize", 3.0, "")
+	_, err = render(rzBg, "cat", 128)
+	ctx.Assert(err != nil, "a resizer slower than the deadline must surface DEADLINE_EXCEEDED")
+	ctx.Equal(status.Code(err), codes.DeadlineExceeded, "the status a slow resizer surfaces")
+	ctx.Equal(resizeCalls(ctx), 2, "DEADLINE_EXCEEDED must not be retried: Resize calls")
+}
+
+func CheckNotFound(ctx *harness.Ctx) {
+	peer := servePeer(ctx)
+	got, err := render(rzBg, "ghost", 256)
+	ctx.NoError(err, "NOT_FOUND means the origin has no such image: render must return nil, nil")
+	ctx.Assert(got == nil, "NOT_FOUND means the origin has no such image: return nil, got %q", got)
+	ctx.Equal(peer.calls, 1, "NOT_FOUND must not be retried: Resize calls")
+}
+
+func CheckRetryUnavailable(ctx *harness.Ctx) {
+	servePeer(ctx)
+	ctx.GRPC.Fail("Resize", codes.Unavailable, "", 1, "")
+	got, err := render(rzBg, "cat", 256)
+	ctx.NoError(err, "one UNAVAILABLE must be retried and succeed")
+	ctx.Equal(string(got), "JPEG-cat-256", "one UNAVAILABLE must be retried and succeed")
+	ctx.Equal(resizeCalls(ctx), 2, "exactly one retry after UNAVAILABLE: Resize calls")
+	ctx.GRPC.Fail("Resize", codes.InvalidArgument, "width", 1, "")
+	_, err = render(rzBg, "cat", 256)
+	ctx.Assert(err != nil, "INVALID_ARGUMENT must propagate, not be retried or swallowed")
+	ctx.Equal(status.Code(err), codes.InvalidArgument, "INVALID_ARGUMENT must propagate as is")
+	ctx.Equal(resizeCalls(ctx), 3, "INVALID_ARGUMENT must not be retried: Resize calls")
+}
+
+func CheckBounded(ctx *harness.Ctx) {
+	servePeer(ctx)
+	ctx.GRPC.Fail("Resize", codes.Unavailable, "", 50, "")
+	_, err := render(rzBg, "cat", 256)
+	ctx.Assert(err != nil, "a resizer that stays UNAVAILABLE must make render return an error")
+	ctx.Equal(status.Code(err), codes.Unavailable, "a resizer that stays down must surface UNAVAILABLE")
+	ctx.Equal(resizeCalls(ctx), 2, "attempts against a down resizer: retries must stop after the second")
+}
+`,
   },
   debrief: `Deadlines are the single most important thing a client sets: without one, a slow dependency turns into a slow *you*. Retrying only \`UNAVAILABLE\` — and only a bounded number of times — is what keeps a retry from becoming a retry storm. Production clients add jittered backoff between attempts, honour the server's retry policy, and propagate the caller's deadline instead of picking their own (\`ctx\` in Go, \`grpc-timeout\` on the wire).`,
 };

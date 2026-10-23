@@ -835,6 +835,298 @@ export async function check_snapshot_served(ctx) {
   assert.deepEqual(reply.variants, want, \`after the refresh the reply must come from the new snapshot: expected \${JSON.stringify(want)}, got \${JSON.stringify(reply.variants)}\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"leetbuild/harness"
+
+	pb "gates/gen/gates"
+)
+
+// Step 2's gates.go, which this file builds on. Go judges one step's file at a time, so the harness
+// supplies it as step 2's reference has it: the snapshot, the loader and getVariant.
+
+var gatesRdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+const pollInterval = 10 * time.Second
+
+type Share struct {
+	Variant string \`json:"variant"\`
+	Pct     int    \`json:"pct"\`
+}
+
+type Population struct {
+	Match map[string]string \`json:"match"\`
+	Mix   []Share           \`json:"mix"\`
+}
+
+type Override struct {
+	UserID    string \`json:"user_id"\`
+	Variant   string \`json:"variant"\`
+	ExpiresAt int64  \`json:"expires_at"\`
+}
+
+type Gate struct {
+	Name        string       \`json:"name"\`
+	Seed        string       \`json:"seed"\`
+	Default     string       \`json:"default"\`
+	Populations []Population \`json:"populations"\`
+	Overrides   []Override   \`json:"overrides"\`
+	Version     int          \`json:"version"\`
+}
+
+type Snapshot struct {
+	Version int
+	Gates   map[string]Gate
+}
+
+type snapshotBox struct{ v atomic.Value }
+
+func (b *snapshotBox) Load() *Snapshot   { return b.v.Load().(*Snapshot) }
+func (b *snapshotBox) Store(s *Snapshot) { b.v.Store(s) }
+
+var snapshot snapshotBox
+
+func init() { snapshot.Store(&Snapshot{Gates: map[string]Gate{}}) }
+
+func getVariant(name string, attrs map[string]string) string {
+	gate, ok := snapshot.Load().Gates[name]
+	if !ok {
+		return "OFF"
+	}
+	now := time.Now().Unix()
+	for _, override := range gate.Overrides {
+		if override.UserID == attrs["user_id"] && override.ExpiresAt > now {
+			return override.Variant
+		}
+	}
+	for _, population := range gate.Populations {
+		matched := true
+		for key, value := range population.Match {
+			matched = matched && attrs[key] == value
+		}
+		if !matched {
+			continue
+		}
+		sum := sha256.Sum256([]byte(gate.Seed + ":" + attrs["user_id"]))
+		b := int(binary.BigEndian.Uint32(sum[:4]) % 10_000)
+		edge := 0
+		for _, share := range population.Mix {
+			edge += share.Pct * 100
+			if b < edge {
+				return share.Variant
+			}
+		}
+		return population.Mix[len(population.Mix)-1].Variant
+	}
+	return gate.Default
+}
+
+func refresh(ctx context.Context) (bool, error) {
+	raw, err := gatesRdb.Get(ctx, "gates:version").Result()
+	if err != nil && err != redis.Nil {
+		return false, err
+	}
+	version, _ := strconv.Atoi(raw)
+	if version == snapshot.Load().Version {
+		return false, nil
+	}
+	fields, err := gatesRdb.HGetAll(ctx, "gates").Result()
+	if err != nil {
+		return false, err
+	}
+	gates := make(map[string]Gate, len(fields))
+	for name, body := range fields {
+		var gate Gate
+		if err := json.Unmarshal([]byte(body), &gate); err != nil {
+			return false, fmt.Errorf("gate %s: %w", name, err)
+		}
+		gates[name] = gate
+	}
+	snapshot.Store(&Snapshot{Version: version, Gates: gates})
+	return true, nil
+}
+
+// startLoader is the loader's first poll; the checks call refresh where its later polls would come.
+func startLoader(ctx context.Context, interval time.Duration) error {
+	_, err := refresh(ctx)
+	return err
+}
+
+// The checks.
+
+type fixtureShare struct {
+	Variant string \`json:"variant"\`
+	Pct     int    \`json:"pct"\`
+}
+
+type fixturePopulation struct {
+	Match map[string]string \`json:"match"\`
+	Mix   []fixtureShare    \`json:"mix"\`
+}
+
+// fixtureGate is a gate as step 1 publishes it.
+type fixtureGate struct {
+	Name        string              \`json:"name"\`
+	Seed        string              \`json:"seed"\`
+	Default     string              \`json:"default"\`
+	Populations []fixturePopulation \`json:"populations"\`
+	Overrides   []map[string]any    \`json:"overrides"\`
+	Version     int                 \`json:"version"\`
+}
+
+var (
+	threeWayMix = []fixtureShare{{"RED_BUTTON", 33}, {"BLUE_BUTTON", 33}, {"CONTROL", 34}}
+	halfMix     = []fixtureShare{{"ON", 50}, {"OFF", 50}}
+)
+
+func newFixtureGate(name string, populations ...fixturePopulation) fixtureGate {
+	return fixtureGate{Name: name, Seed: name, Default: "OFF", Populations: populations, Overrides: []map[string]any{}, Version: 1}
+}
+
+func fixturePop(match map[string]string, mix ...fixtureShare) fixturePopulation {
+	return fixturePopulation{Match: match, Mix: mix}
+}
+
+// publishGates leaves what step 1 leaves behind: one field per gate in the hash, and the global version.
+func publishGates(ctx *harness.Ctx, version int, gates ...fixtureGate) {
+	for _, g := range gates {
+		encoded, _ := json.Marshal(g)
+		ctx.Redis.Do("HSET", "gates", g.Name, string(encoded))
+	}
+	ctx.Redis.Set("gates:version", version)
+}
+
+// expectedVariant is the spec, computed independently of the learner: sha256(seed:user)[:8 hex] % 10000, cumulative edges.
+func expectedVariant(seed, userID string, mix []fixtureShare) string {
+	sum := sha256.Sum256([]byte(seed + ":" + userID))
+	n, _ := strconv.ParseUint(fmt.Sprintf("%x", sum[:4]), 16, 64)
+	b := int(n % 10000)
+	edge := 0
+	for _, share := range mix {
+		edge += share.Pct * 100
+		if b < edge {
+			return share.Variant
+		}
+	}
+	return mix[len(mix)-1].Variant
+}
+
+// startGates publishes the gates and runs the learner's main: its loader's first poll, then the server on :9000.
+func startGates(ctx *harness.Ctx, version int, gates ...fixtureGate) pb.GatesClient {
+	publishGates(ctx, version, gates...)
+	ctx.Main(main)
+	return pb.NewGatesClient(ctx.GRPC.Dial("localhost:9000"))
+}
+
+func askGates(ctx *harness.Ctx, stub pb.GatesClient, userID string, attrs map[string]string, features ...string) *pb.GetVariantsReply {
+	reply, err := stub.GetVariants(context.Background(), &pb.GetVariantsRequest{UserId: userID, Attrs: attrs, Features: features})
+	ctx.NoError(err, "GetVariants(%s, %v, %q)", userID, attrs, features)
+	return reply
+}
+
+func variantNames(reply *pb.GetVariantsReply) []string {
+	names := []string{}
+	for name := range reply.GetVariants() {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func CheckBatch(ctx *harness.Ctx) {
+	stub := startGates(ctx, 3,
+		newFixtureGate("button_color", fixturePop(map[string]string{"locale": "de"}, threeWayMix...), fixturePop(map[string]string{}, fixtureShare{"BLUE_BUTTON", 100})),
+		newFixtureGate("dark_mode", fixturePop(map[string]string{"platform": "mac"}, fixtureShare{"ON", 100})),
+		newFixtureGate("new_sidebar", fixturePop(map[string]string{}, halfMix...)),
+	)
+	reply := askGates(ctx, stub, "ana", map[string]string{"locale": "de", "platform": "mac"}, "button_color", "dark_mode")
+	ctx.Equal(reply.GetVariants(), map[string]string{"button_color": expectedVariant("button_color", "ana", threeWayMix), "dark_mode": "ON"}, "GetVariants(ana, locale de + platform mac, [button_color, dark_mode]): one entry per requested feature, each getVariant(feature, attrs + user_id)")
+	reply = askGates(ctx, stub, "ana", map[string]string{"locale": "en", "platform": "windows"}, "button_color", "dark_mode")
+	ctx.Equal(reply.GetVariants(), map[string]string{"button_color": "BLUE_BUTTON", "dark_mode": "OFF"}, "the attrs the client sent decide the population: an English Windows user gets BLUE_BUTTON (the catch-all) and dark_mode OFF (no population matches, so the default)")
+	for i := range 30 {
+		u := fmt.Sprintf("u%d", i)
+		reply = askGates(ctx, stub, u, map[string]string{"locale": "de"}, "button_color", "new_sidebar")
+		want := map[string]string{"button_color": expectedVariant("button_color", u, threeWayMix), "new_sidebar": expectedVariant("new_sidebar", u, halfMix)}
+		ctx.Equal(reply.GetVariants(), want, "the variants of user %s: user_id must reach getVariant as attrs[%q] — it is what the hash is over", u, "user_id")
+	}
+}
+
+func CheckUnknownOff(ctx *harness.Ctx) {
+	stub := startGates(ctx, 1, newFixtureGate("button_color", fixturePop(map[string]string{}, threeWayMix...)))
+	reply, err := stub.GetVariants(context.Background(), &pb.GetVariantsRequest{UserId: "ana", Attrs: map[string]string{}, Features: []string{"button_color", "new_sidebar"}})
+	if err != nil {
+		st := status.Convert(err)
+		ctx.Fatalf("asking about new_sidebar, a gate the snapshot does not know, failed with %v (%s): an unknown gate answers OFF and the call succeeds — the build must still start", st.Code(), st.Message())
+	}
+	ctx.Equal(reply.GetVariants()["new_sidebar"], "OFF", "new_sidebar is not published: it must appear in variants as OFF (the reply was %v)", reply.GetVariants())
+	ctx.Equal(reply.GetVariants()["button_color"], expectedVariant("button_color", "ana", threeWayMix), "the known gate in the same request must still be evaluated (the reply was %v)", reply.GetVariants())
+	reply = askGates(ctx, stub, "ana", map[string]string{}, "ghost_a", "ghost_b")
+	ctx.Equal(reply.GetVariants(), map[string]string{"ghost_a": "OFF", "ghost_b": "OFF"}, "a build asking only about gates that are not published yet gets OFF for each")
+}
+
+func CheckInvalidArgument(ctx *harness.Ctx) {
+	stub := startGates(ctx, 1, newFixtureGate("button_color", fixturePop(map[string]string{}, threeWayMix...)))
+	for _, features := range [][]string{{"button_color"}, {}} {
+		reply, err := stub.GetVariants(context.Background(), &pb.GetVariantsRequest{UserId: "", Attrs: map[string]string{"locale": "de"}, Features: features})
+		if err != nil {
+			st := status.Convert(err)
+			ctx.Equal(st.Code(), codes.InvalidArgument, "an empty user_id must fail with INVALID_ARGUMENT")
+			ctx.Assert(strings.Contains(st.Message(), "user_id"), "the status message should name the field, it says %q", st.Message())
+		}
+		ctx.Assert(err != nil, "a request without user_id (features=%q) was answered %v instead of failing with INVALID_ARGUMENT: there is nothing to hash", features, reply.GetVariants())
+	}
+	reply := askGates(ctx, stub, "ana", map[string]string{}, "button_color")
+	ctx.Equal(reply.GetVariants(), map[string]string{"button_color": expectedVariant("button_color", "ana", threeWayMix)}, "a valid request after the rejected one must be answered as usual")
+}
+
+func CheckSnapshotServed(ctx *harness.Ctx) {
+	stub := startGates(ctx, 7,
+		newFixtureGate("button_color", fixturePop(map[string]string{}, threeWayMix...)),
+		newFixtureGate("dark_mode", fixturePop(map[string]string{}, fixtureShare{"ON", 100})),
+	)
+	before := len(ctx.Redis.RoundTrips())
+	var reply *pb.GetVariantsReply
+	for i := range 50 {
+		reply = askGates(ctx, stub, fmt.Sprintf("u%d", i), map[string]string{"locale": "de"}, "button_color", "dark_mode")
+		ctx.Equal(reply.GetVersion(), 7, "version must be the snapshot's")
+	}
+	sent := []string{}
+	for _, trip := range ctx.Redis.RoundTrips()[before:] {
+		sent = append(sent, trip...)
+	}
+	ctx.Assert(len(sent) == 0, "50 GetVariants calls must not touch Redis: they sent %d commands (%q); the handler is a batch of pure decisions over the snapshot", len(sent), sent)
+	reply = askGates(ctx, stub, "ana", map[string]string{})
+	ctx.Equal(variantNames(reply), []string{"button_color", "dark_mode"}, "an empty features list asks for every gate in the snapshot")
+	ctx.Equal(reply.GetVariants()["dark_mode"], "ON", "dark_mode is ON for everyone in this snapshot")
+	darkOff := newFixtureGate("dark_mode", fixturePop(map[string]string{}, fixtureShare{"OFF", 100}))
+	darkOff.Version = 2
+	publishGates(ctx, 8, darkOff, newFixtureGate("new_sidebar", fixturePop(map[string]string{}, fixtureShare{"ON", 100})))
+	reply = askGates(ctx, stub, "ana", map[string]string{})
+	_, sawNew := reply.GetVariants()["new_sidebar"]
+	ctx.Assert(reply.GetVersion() == 7 && !sawNew, "a publish the loader has not picked up is not visible yet: the handler serves the snapshot it has and never reloads per call, but the reply was version %d with %q", reply.GetVersion(), variantNames(reply))
+	changed, err := refresh(context.Background())
+	ctx.NoError(err, "step 2's refresh")
+	ctx.Equal(changed, true, "step 2's refresh after gates:version moved to 8")
+	reply = askGates(ctx, stub, "ana", map[string]string{})
+	ctx.Equal(reply.GetVersion(), 8, "after the loader refreshed, the reply must carry the new version")
+	ctx.Equal(reply.GetVariants(), map[string]string{"button_color": expectedVariant("button_color", "ana", threeWayMix), "dark_mode": "OFF", "new_sidebar": "ON"}, "after the refresh the reply must come from the new snapshot")
+}
+`,
   },
   debrief: `The batch endpoint is the client-side twin of the snapshot: the web servers hold all gates in memory, the clients hold all *variants* in memory, and both pay for configuration once per load rather than once per decision. Two details carry most of the value. Answering OFF for an unknown gate decouples client releases from gate publishing — the app ships with the check already in the code, and the gate is created later. Returning the snapshot version lets a client (and a support engineer reading its logs) say which edit produced the behaviour it shows, the same reason the exposure events of step 4 carry it.`,
 };

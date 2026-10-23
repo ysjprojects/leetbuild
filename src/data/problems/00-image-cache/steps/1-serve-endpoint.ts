@@ -239,7 +239,7 @@ const (
 )
 
 // getThumb returns the resized JPEG, or nil when the image does not exist (built in the next steps).
-func getThumb(id string, w int) []byte {
+var getThumb = func(id string, w int) []byte {
 	panic("not implemented")
 }
 
@@ -282,7 +282,7 @@ const (
 )
 
 // getThumb returns the resized JPEG, or nil when the image does not exist (built in the next steps).
-func getThumb(id string, w int) []byte {
+var getThumb = func(id string, w int) []byte {
 	panic("not implemented")
 }
 
@@ -629,6 +629,90 @@ export async function check_not_modified(ctx) {
   assert.equal(same.text, '', 'a 304 must carry no body');
   assert.equal(same.headers['etag'], etag, 'the 304 repeats the ETag so the client keeps its copy');
   assert.equal(other.status, 200, 'a stale If-None-Match must get the full 200');
+}
+`,
+    go: `package main
+
+import (
+	"fmt"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+// thumbCall is one getThumb call the stand-in saw.
+type thumbCall struct {
+	id string
+	w  int
+}
+
+// thumbServer runs the learner's server with getThumb stood in for by the thumbnail cache (built in
+// the next steps): it knows cat and records every call.
+func thumbServer(ctx *harness.Ctx) (*harness.HTTP, *[]thumbCall) {
+	calls := &[]thumbCall{}
+	getThumb = func(id string, w int) []byte {
+		*calls = append(*calls, thumbCall{id, w})
+		if id != "cat" {
+			return nil
+		}
+		return []byte(fmt.Sprintf("JPEG-%s-%d", id, w))
+	}
+	return ctx.Main(main).HTTP(), calls
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c, calls := thumbServer(ctx)
+	r := c.Get("/img/cat?w=256")
+	ctx.Equal(r.Status, 200, "GET /img/cat?w=256")
+	ctx.Equal(r.Text(), "JPEG-cat-256", "the body must be exactly the bytes getThumb returned")
+	ctx.Assert(strings.HasPrefix(r.Header.Get("Content-Type"), "image/jpeg"), "Content-Type was %q, not image/jpeg", r.Header.Get("Content-Type"))
+	ctx.Equal(*calls, []thumbCall{{"cat", 256}}, "getThumb must be called once with (%q, 256)", "cat")
+}
+
+func CheckValidate(ctx *harness.Ctx) {
+	c, calls := thumbServer(ctx)
+	ctx.Equal(c.Get("/img/cat?w=8").Status, 400, "w=8 is below 16")
+	ctx.Equal(c.Get("/img/cat?w=4096").Status, 400, "w=4096 is above 2048")
+	ctx.Equal(len(*calls), 0, "a rejected width must not reach getThumb")
+	ctx.Equal(c.Get("/img/cat?w=16").Status, 200, "w=16 is the lower bound and valid")
+	ctx.Equal(c.Get("/img/cat").Status, 200, "without w the default width (256) applies")
+	defaulted := false
+	for _, call := range *calls {
+		defaulted = defaulted || call == thumbCall{"cat", 256}
+	}
+	ctx.Assert(defaulted, "the default width is 256: getThumb was called with %v", *calls)
+}
+
+func CheckNotFound(ctx *harness.Ctx) {
+	c, _ := thumbServer(ctx)
+	r := c.Get("/img/ghost?w=256")
+	ctx.Equal(r.Status, 404, "an image getThumb does not know")
+}
+
+func CheckCacheHeaders(ctx *harness.Ctx) {
+	c, _ := thumbServer(ctx)
+	r1 := c.Get("/img/cat?w=256")
+	r2 := c.Get("/img/cat?w=256")
+	r3 := c.Get("/img/cat?w=128")
+	cacheControl := r1.Header.Get("Cache-Control")
+	ctx.Assert(strings.Contains(cacheControl, "public") && strings.Contains(cacheControl, "max-age=86400"), "Cache-Control was %q", cacheControl)
+	etag := r1.Header.Get("ETag")
+	ctx.Assert(etag != "", "the 200 response carries no ETag")
+	ctx.Equal(r2.Header.Get("ETag"), etag, "the same bytes must get the same ETag")
+	ctx.Assert(r3.Header.Get("ETag") != etag, "different bytes must get a different ETag, both got %q", etag)
+}
+
+func CheckNotModified(ctx *harness.Ctx) {
+	c, _ := thumbServer(ctx)
+	first := c.Get("/img/cat?w=256")
+	etag := first.Header.Get("ETag")
+	ctx.Assert(etag != "", "no ETag to revalidate against")
+	same := c.Get("/img/cat?w=256", "If-None-Match", etag)
+	other := c.Get("/img/cat?w=256", "If-None-Match", \`"stale"\`)
+	ctx.Equal(same.Status, 304, "If-None-Match with the current ETag")
+	ctx.Equal(same.Text(), "", "a 304 must carry no body")
+	ctx.Equal(same.Header.Get("ETag"), etag, "the 304 repeats the ETag so the client keeps its copy")
+	ctx.Equal(other.Status, 200, "a stale If-None-Match must get the full 200")
 }
 `,
   },

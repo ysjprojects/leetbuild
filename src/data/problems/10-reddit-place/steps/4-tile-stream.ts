@@ -298,8 +298,8 @@ type tile struct {
 }
 
 // Provided (tile_bus.go): one buffered channel per open stream; publish sends to all of them.
-func subscribe() <-chan tile      { panic("not implemented") }
-func unsubscribe(sub <-chan tile) { panic("not implemented") }
+var subscribe = func() <-chan tile { panic("not implemented") }
+var unsubscribe = func(sub <-chan tile) { panic("not implemented") }
 
 type placeServer struct {
 	pb.UnimplementedPlaceServer
@@ -344,8 +344,8 @@ type tile struct {
 }
 
 // Provided (tile_bus.go): one buffered channel per open stream; publish sends to all of them.
-func subscribe() <-chan tile      { panic("not implemented") }
-func unsubscribe(sub <-chan tile) { panic("not implemented") }
+var subscribe = func() <-chan tile { panic("not implemented") }
+var unsubscribe = func(sub <-chan tile) { panic("not implemented") }
 
 type placeServer struct {
 	pb.UnimplementedPlaceServer
@@ -778,6 +778,247 @@ export async function check_slow_client(ctx) {
   assert.equal(call.status.code, grpc.status.RESOURCE_EXHAUSTED, \`a client more than MAX_LAG tiles behind was ended with \${name(call.status.code)}, expected RESOURCE_EXHAUSTED\`);
   await settle();
   assert.equal(place.bus.subscribers(), 0, \`a dropped client must be unsubscribed, the bus still has \${place.bus.subscribers()} subscription(s)\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sync"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"leetbuild/harness"
+
+	pb "place/gen/place"
+)
+
+// stEvent is a placements event, and the five fields of a Tile.
+type stEvent struct {
+	User  string \`json:"user"\`
+	X     int    \`json:"x"\`
+	Y     int    \`json:"y"\`
+	Color int    \`json:"color"\`
+	Ts    int64  \`json:"ts"\`
+}
+
+// stPlace is one tile-stream instance as deployed: the learner's server, its bus fed from
+// placements, and step 3's producer upstream.
+type stPlace struct {
+	ctx       *harness.Ctx
+	mu        sync.Mutex
+	subs      []chan tile
+	published int // records of placements already pumped onto the bus
+	client    pb.PlaceClient
+}
+
+func stStart(ctx *harness.Ctx) *stPlace {
+	p := &stPlace{ctx: ctx}
+	subscribe = func() <-chan tile {
+		sub := make(chan tile, 4096)
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.subs = append(p.subs, sub)
+		return sub
+	}
+	unsubscribe = func(sub <-chan tile) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		for i, s := range p.subs {
+			if (<-chan tile)(s) == sub {
+				p.subs = append(p.subs[:i], p.subs[i+1:]...)
+				return
+			}
+		}
+	}
+	ctx.Main(main)
+	p.client = pb.NewPlaceClient(ctx.GRPC.Dial("tile-stream:9000"))
+	return p
+}
+
+// publish hands a placement to every open stream on this instance.
+func (p *stPlace) publish(t tile) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, sub := range p.subs {
+		sub <- t
+	}
+}
+
+func (p *stPlace) subscribers() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.subs)
+}
+
+// recordPlacement is step 3's producer: one JSON record on placements, keyed by the tile.
+func (p *stPlace) recordPlacement(user string, x, y, color int) {
+	value, _ := json.Marshal(stEvent{User: user, X: x, Y: y, Color: color, Ts: p.ctx.Clock.Now()})
+	p.ctx.Kafka.Seed("placements", fmt.Sprintf("%d:%d", x, y), value)
+}
+
+// placed is every event on placements.
+func (p *stPlace) placed() []stEvent {
+	out := []stEvent{}
+	for _, v := range p.ctx.Kafka.Values("placements") {
+		var e stEvent
+		p.ctx.NoError(json.Unmarshal([]byte(v), &e), "a placements record is not JSON: %q", v)
+		out = append(out, e)
+	}
+	return out
+}
+
+// pump: the instance consumes what is new on placements, publishes it on its bus, and the streams forward it.
+func (p *stPlace) pump() {
+	events := p.placed()
+	for _, e := range events[p.published:] {
+		p.publish(tile{User: e.User, X: e.X, Y: e.Y, Color: e.Color, Ts: e.Ts})
+	}
+	p.published = len(events)
+	p.ctx.Settle()
+}
+
+// stCall is an open StreamTiles call: what it received so far and how it ended.
+type stCall struct {
+	mu     sync.Mutex
+	got    []stEvent
+	ended  bool
+	err    error
+	cancel context.CancelFunc
+}
+
+func (c *stCall) received() []stEvent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]stEvent{}, c.got...)
+}
+
+// end is whether the call ended, and its status code.
+func (c *stCall) end() (bool, codes.Code) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ended, status.Code(c.err)
+}
+
+func (p *stPlace) open(client string) *stCall {
+	callCtx, cancel := context.WithCancel(context.Background())
+	call := &stCall{cancel: cancel}
+	stream, err := p.client.StreamTiles(callCtx, &pb.Subscribe{Client: client})
+	if err != nil {
+		call.ended, call.err = true, err
+	} else {
+		go func() {
+			for {
+				t, err := stream.Recv()
+				call.mu.Lock()
+				if err != nil {
+					call.ended, call.err = true, err
+					call.mu.Unlock()
+					return
+				}
+				call.got = append(call.got, stEvent{User: t.GetUser(), X: int(t.GetX()), Y: int(t.GetY()), Color: int(t.GetColor()), Ts: t.GetTs()})
+				call.mu.Unlock()
+			}
+		}()
+	}
+	p.ctx.Settle()
+	ended, code := call.end()
+	p.ctx.Assert(!ended || code != codes.Unavailable, "main serves no StreamTiles handler on :9000")
+	return call
+}
+
+func CheckServeStream(ctx *harness.Ctx) {
+	place := stStart(ctx)
+	call := place.open("web")
+	ended, code := call.end()
+	ctx.Assert(!ended, "a fresh StreamTiles call must stay open waiting for tiles, but it ended with %v", code)
+	place.recordPlacement("ana", 3, 7, 12)
+	place.pump()
+	want := place.placed()[0]
+	got := call.received()
+	ctx.Equal(len(got), 1, "the client must receive the one placement published: the Tiles received")
+	ctx.Equal(got[0], stEvent{User: "ana", X: 3, Y: 7, Color: 12, Ts: want.Ts}, "the Tile")
+}
+
+func CheckForwardOrder(ctx *harness.Ctx) {
+	place := stStart(ctx)
+	call := place.open("web")
+	ctx.Equal(place.subscribers(), 1, "one open call must mean one subscription: the subscriptions")
+	other := place.open("mobile")
+	ctx.Equal(place.subscribers(), 2, "two open calls must mean two subscriptions: the subscriptions")
+	for i, user := range []string{"ana", "bo", "cy"} {
+		// three tiles on one pixel: one partition, one order
+		place.recordPlacement(user, 3, 7, i+1)
+		ctx.Clock.Advance(1)
+	}
+	place.pump()
+	want := place.placed()
+	for _, stream := range []struct {
+		call  *stCall
+		label string
+	}{{call, "web"}, {other, "mobile"}} {
+		got := stream.call.received()
+		users := []string{}
+		for _, t := range got {
+			users = append(users, t.User)
+		}
+		ctx.Equal(users, []string{"ana", "bo", "cy"}, "client %s must receive ana, bo, cy in publish order", stream.label)
+		ctx.Equal(got, want, "client %s: every field of every tile must be forwarded", stream.label)
+	}
+	ctx.Equal(place.subscribers(), 2, "after forwarding three tiles the bus must still have 2 subscriptions: subscribe once per call, not per tile")
+}
+
+func CheckCancelCleanup(ctx *harness.Ctx) {
+	place := stStart(ctx)
+	call := place.open("web")
+	ctx.Equal(place.subscribers(), 1, "after the call opened the bus must have 1 subscription (subscribe())")
+	call.cancel()
+	ctx.Settle()
+	n := place.subscribers()
+	ctx.Assert(n == 0, "the client hung up but the bus still has %d subscription(s): unsubscribe when the call's context is done", n)
+	place.recordPlacement("ana", 3, 7, 12)
+	place.pump() // must not reach anyone, must not fail
+	second := place.open("mobile")
+	ctx.Equal(place.subscribers(), 1, "a new call after a cancelled one subscribes afresh: the subscriptions")
+	place.recordPlacement("bo", 4, 7, 1)
+	place.pump()
+	got := second.received()
+	ctx.Equal(len(got), 1, "the new client must receive bo's tile: the Tiles received")
+	ctx.Equal(got[0].User, "bo", "the new client must only see tiles published after it subscribed: the user of its Tile")
+}
+
+func CheckSlowClient(ctx *harness.Ctx) {
+	place := stStart(ctx)
+	call := place.open("web")
+	lag := maxLag
+	// Tiles from the other place-api instances arrive in one burst while the stream server is busy.
+	for i := 0; i < lag; i++ {
+		place.publish(tile{User: "ana", X: 3, Y: 7, Color: i % 16, Ts: 1700000000000 + int64(i)})
+	}
+	ctx.Settle()
+	want := make([]int64, lag)
+	for i := range want {
+		want[i] = 1700000000000 + int64(i)
+	}
+	got := []int64{}
+	for _, t := range call.received() {
+		got = append(got, t.Ts)
+	}
+	ctx.Assert(fmt.Sprint(got) == fmt.Sprint(want), "a backlog of exactly maxLag tiles must still be delivered in order: received %d Tiles", len(got))
+	ended, code := call.end()
+	ctx.Assert(!ended, "a client that caught up stays connected, but the call ended with %v", code)
+	for i := 0; i < lag+2; i++ {
+		place.publish(tile{User: "ana", X: 3, Y: 7, Color: 12, Ts: 1800000000000 + int64(i)})
+	}
+	ctx.Settle()
+	ended, code = call.end()
+	ctx.Assert(ended, "a client more than maxLag tiles behind must be dropped with ResourceExhausted, but the stream stayed open")
+	ctx.Equal(code, codes.ResourceExhausted, "the status of a client more than maxLag tiles behind")
+	ctx.Settle()
+	n := place.subscribers()
+	ctx.Assert(n == 0, "a dropped client must be unsubscribed, the bus still has %d subscription(s)", n)
 }
 `,
   },

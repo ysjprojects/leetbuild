@@ -548,6 +548,76 @@ export async function check_commit_after(ctx) {
   assert.equal(ctx.kafka.lag('view-counter', 'image-views'), 0, 'a malformed record must be skipped and committed, not left to replay forever');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+
+	"leetbuild/harness"
+)
+
+// cvSeed puts view events on partition 0 of image-views, so they are delivered in this order.
+func cvSeed(ctx *harness.Ctx, ids ...string) {
+	for _, id := range ids {
+		value, _ := json.Marshal(map[string]any{"id": id, "w": 256, "hit": true})
+		ctx.Kafka.SeedPartition("image-views", 0, id, string(value))
+	}
+}
+
+// cvRun runs the learner's consumer until it waits for records that will not come.
+func cvRun(ctx *harness.Ctx) {
+	ctx.Drain(func() { _ = run(context.Background()) })
+}
+
+// cvViews is the counter at key, nil when it does not exist.
+func cvViews(ctx *harness.Ctx, key string) any {
+	if v, ok := ctx.Redis.Get(key); ok {
+		return v
+	}
+	return nil
+}
+
+func CheckGroup(ctx *harness.Ctx) {
+	cvSeed(ctx, "cat")
+	cvRun(ctx)
+	subscriptions := ctx.Kafka.EventsOf("subscribe")
+	ctx.Assert(len(subscriptions) > 0, "the consumer must subscribe to a topic")
+	last := subscriptions[len(subscriptions)-1]
+	ctx.Equal(last.Group, "view-counter", "GroupID must be view-counter")
+	subscribed := false
+	for _, topic := range last.Topics {
+		subscribed = subscribed || topic == "image-views"
+	}
+	ctx.Assert(subscribed, "the consumer must subscribe to image-views, got %s", harness.Show(last.Topics))
+}
+
+func CheckManualCommit(ctx *harness.Ctx) {
+	cvSeed(ctx, "cat", "dog")
+	cvRun(ctx)
+	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "auto-commit is on: offsets were committed on a timer, before processing")
+	ctx.Assert(len(ctx.Kafka.EventsOf("manual-commit")) > 0, "no explicit commit happened")
+	ctx.Equal(ctx.Kafka.Lag("view-counter", "image-views"), 0, "every processed record must be committed: the group's lag")
+}
+
+func CheckIncr(ctx *harness.Ctx) {
+	cvSeed(ctx, "cat", "cat", "dog", "cat")
+	cvRun(ctx)
+	ctx.Equal(cvViews(ctx, "views:cat"), "3", "views:cat")
+	ctx.Equal(cvViews(ctx, "views:dog"), "1", "views:dog")
+}
+
+func CheckCommitAfter(ctx *harness.Ctx) {
+	cvSeed(ctx, "cat")
+	ctx.Kafka.SeedPartition("image-views", 0, "bad", "not json")
+	var atCommit []any
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, cvViews(ctx, "views:cat")) })
+	cvRun(ctx)
+	ctx.Assert(len(atCommit) > 0, "the offset was never committed")
+	ctx.Equal(atCommit[0], "1", "the commit must come after INCR: views:cat at commit time")
+	ctx.Equal(ctx.Kafka.Lag("view-counter", "image-views"), 0, "a malformed record must be skipped and committed, not left to replay forever: the group's lag")
+}
+`,
   },
   debrief: `Where the commit sits relative to the side effect decides the delivery guarantee: commit-then-process is at-most-once (crash → lost), process-then-commit is at-least-once (crash → replayed). A counter tolerates a rare duplicate; a payment does not, which is why the merchant problem stores the record id to make its writes idempotent. Real consumers commit in batches for throughput, handle rebalances (\`on_revoke\` → commit what you have), and send poison records to a dead-letter topic instead of just logging them.`,
 };

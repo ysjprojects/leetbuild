@@ -729,6 +729,167 @@ export async function check_handler_fault(ctx) {
   assert.equal(ctx.kafka.lag(GROUP, TOPIC), 2, 'the failed record and the one behind it must remain for redelivery');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"leetbuild/harness"
+)
+
+const ledgerGroup, ledgerTopic = "ledger-writer", "payments"
+
+// ledgerSeen is where a record the handler received sits: its value says so.
+type ledgerSeen struct{ partition, offset int }
+
+// seedLedger puts n well-formed payments on one partition; each value says where it sits, so the
+// handler's view can be checked.
+func seedLedger(ctx *harness.Ctx, partition, n int) {
+	start := ctx.Kafka.EndOffset(ledgerTopic, partition)
+	for i := range n {
+		offset := start + int64(i)
+		value, _ := json.Marshal(map[string]any{"id": fmt.Sprintf("pay-%d-%d", partition, offset), "partition": partition, "offset": offset, "cents": 100 * (offset + 1)})
+		ctx.Kafka.SeedPartition(ledgerTopic, partition, fmt.Sprintf("acct-%d", partition), value)
+	}
+}
+
+// runLedger drains the learner's loop with handler.
+func runLedger(ctx *harness.Ctx, handler Handler) {
+	loop, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx.Drain(func() { _ = run(loop, handler) })
+}
+
+// ledgerPlace reads where an event sits from its value (-1 for a field that is missing).
+func ledgerPlace(event PaymentEvent) ledgerSeen {
+	at := func(field string) int {
+		if v, ok := event[field].(float64); ok {
+			return int(v)
+		}
+		return -1
+	}
+	return ledgerSeen{at("partition"), at("offset")}
+}
+
+func ledgerOffsets(seen []ledgerSeen, partition int) []int {
+	out := []int{}
+	for _, s := range seen {
+		if s.partition == partition {
+			out = append(out, s.offset)
+		}
+	}
+	return out
+}
+
+func CheckInOrder(ctx *harness.Ctx) {
+	seedLedger(ctx, 0, 3)
+	seedLedger(ctx, 1, 3)
+	seedLedger(ctx, 2, 2)
+	var events []PaymentEvent
+	runLedger(ctx, func(e PaymentEvent) error {
+		events = append(events, e)
+		return nil
+	})
+	var seen []ledgerSeen
+	for _, e := range events {
+		ctx.Assert(e != nil, "the handler must receive the parsed JSON object, not the raw value")
+		seen = append(seen, ledgerPlace(e))
+	}
+	ctx.Assert(len(seen) == 8, "the handler saw %d events, expected all 8", len(seen))
+	for _, pn := range [][2]int{{0, 3}, {1, 3}, {2, 2}} {
+		p, n := pn[0], pn[1]
+		expected := []int{}
+		for i := range n {
+			expected = append(expected, i)
+		}
+		ctx.Equal(ledgerOffsets(seen, p), expected, "partition %d reached the handler as offsets", p)
+	}
+}
+
+func CheckManualCommit(ctx *harness.Ctx) {
+	seedLedger(ctx, 0, 2)
+	seedLedger(ctx, 1, 1)
+	runLedger(ctx, func(PaymentEvent) error { return nil })
+	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "auto-commit is on: offsets were committed on a timer, before processing")
+	ctx.Assert(len(ctx.Kafka.EventsOf("manual-commit")) > 0, "no explicit commit happened")
+	commits := ctx.Kafka.Commits(ledgerGroup)
+	ctx.Assert(len(commits) == 3, "%d commits for 3 records: commit once per record, after it is processed", len(commits))
+	for _, c := range commits {
+		ctx.Assert(len(c) == 1, "each commit must name the processed record's partition alone")
+	}
+}
+
+func CheckCommittedOffset(ctx *harness.Ctx) {
+	seedLedger(ctx, 0, 3)
+	seedLedger(ctx, 1, 2)
+	runLedger(ctx, func(PaymentEvent) error { return nil })
+	for _, pn := range [][2]int{{0, 3}, {1, 2}} {
+		p, n := pn[0], pn[1]
+		committed := ctx.Kafka.CommittedOffset(ledgerGroup, ledgerTopic, p)
+		ctx.Assert(committed == int64(n), "partition %d: committed offset is %d, expected %d (the next offset to read)", p, committed, n)
+	}
+	ctx.Equal(ctx.Kafka.Lag(ledgerGroup, ledgerTopic), 0, "every processed record must be committed")
+}
+
+func CheckCommitAfter(ctx *harness.Ctx) {
+	seedLedger(ctx, 0, 2)
+	seedLedger(ctx, 1, 2)
+	processed := map[ledgerSeen]bool{}
+	var early []string
+	ctx.Kafka.OnCommit(func(_ string, offsets harness.KafkaOffsets) {
+		for tp, offset := range offsets {
+			if !processed[ledgerSeen{tp.Partition, int(offset - 1)}] {
+				early = append(early, fmt.Sprintf("%s[%d] committed to %d before the handler finished offset %d", tp.Topic, tp.Partition, offset, offset-1))
+			}
+		}
+	})
+	runLedger(ctx, func(e PaymentEvent) error {
+		processed[ledgerPlace(e)] = true
+		return nil
+	})
+	ctx.Equal(len(ctx.Kafka.Commits(ledgerGroup)), 4, "expected one commit per record")
+	if len(early) > 0 {
+		ctx.Fatalf("%s", early[0])
+	}
+}
+
+func CheckPoison(ctx *harness.Ctx) {
+	seedLedger(ctx, 0, 1)
+	ctx.Kafka.SeedPartition(ledgerTopic, 0, "acct-0", "not json")
+	seedLedger(ctx, 0, 1)
+	ctx.Kafka.SeedPartition(ledgerTopic, 1, "acct-1", \`{"id": "pay-1-0", "cents": \`)
+	var seen []ledgerSeen
+	runLedger(ctx, func(e PaymentEvent) error {
+		seen = append(seen, ledgerPlace(e))
+		return nil
+	})
+	ctx.Equal(ledgerOffsets(seen, 0), []int{0, 2}, "partition 0 reached the handler as offsets (skip the poison record, process the ones behind it)")
+	ctx.Equal(len(seen), 2, "the malformed records must not reach the handler")
+	ctx.Equal(ctx.Kafka.CommittedOffset(ledgerGroup, ledgerTopic, 0), 3, "partition 0 must be committed past the poison record")
+	ctx.Equal(ctx.Kafka.CommittedOffset(ledgerGroup, ledgerTopic, 1), 1, "partition 1 must be committed past the poison record")
+	ctx.Equal(ctx.Kafka.Lag(ledgerGroup, ledgerTopic), 0, "a malformed record must be skipped and committed, not left to replay forever")
+}
+
+func CheckHandlerFault(ctx *harness.Ctx) {
+	seedLedger(ctx, 0, 3)
+	var seen []ledgerSeen
+	runLedger(ctx, func(e PaymentEvent) error {
+		s := ledgerPlace(e)
+		seen = append(seen, s)
+		if s.offset == 1 {
+			return errors.New("ledger unavailable")
+		}
+		return nil
+	})
+	committed := ctx.Kafka.CommittedOffset(ledgerGroup, ledgerTopic, 0)
+	ctx.Assert(committed == 1, "committed offset is %d, expected 1: the record whose handler failed must stay uncommitted", committed)
+	ctx.Equal(ledgerOffsets(seen, 0), []int{0, 1}, "the handler saw offsets (a failing handler stops the loop)")
+	ctx.Equal(ctx.Kafka.Lag(ledgerGroup, ledgerTopic), 2, "the failed record and the one behind it must remain for redelivery")
+}
+`,
   },
   debrief: `The loop has one commit site and it sits last, so the only question is which records reach it. A poison record reaches it by skipping the handler: committing it is the right call because nothing a retry does will make it parse, and leaving it uncommitted stalls the partition behind it. A record whose handler raised never reaches it: the exception leaves the loop before the commit, the offset stays where it was, and the restart replays that record — at-least-once, which means the handler must tolerate seeing it twice. Auto-commit would have broken both properties at once: it commits what was fetched, on a timer, regardless of what the handler did with it. Real consumers keep this exact shape and add what the drill leaves out — a commit per poll batch instead of per record, \`on_revoke\` committing before a rebalance takes the partition away, a dead-letter topic for poison records, and bounded retries before giving up on a handler.`,
 };

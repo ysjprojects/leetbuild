@@ -458,7 +458,7 @@ import (
 
 	"assistant/chunk"  // chunk.Chunk(text) []string
 	"assistant/config" // config.CacheTTL (seconds), config.TopK
-	"assistant/db"     // db.Pool *pgxpool.Pool
+	"assistant/db"     // db.Pool *sql.DB (database/sql, lib/pq)
 	"assistant/embed"  // embed.Embed(text) []float64, embed.ToPgvector(v) string
 	"assistant/kb"     // kb.Articles []kb.Article{ID, Title, Body}
 )
@@ -480,7 +480,7 @@ type CachedAnswer struct {
 func indexArticles(ctx context.Context, articles []kb.Article) (int, error) {
 	// TODO: for each article, for position, text := range chunk.Chunk(body):
 	// TODO:   id "<article>-<position>", the vector as embed.ToPgvector(embed.Embed(text)) cast ::vector
-	// TODO:   one INSERT per chunk, idempotent on the id; sum tag.RowsAffected()
+	// TODO:   one INSERT per chunk in one transaction (db.Pool.BeginTx), idempotent on the id; sum each result's RowsAffected()
 	panic("not implemented")
 }
 
@@ -538,7 +538,7 @@ import (
 
 	"assistant/chunk"  // chunk.Chunk(text) []string
 	"assistant/config" // config.CacheTTL (seconds), config.TopK
-	"assistant/db"     // db.Pool *pgxpool.Pool
+	"assistant/db"     // db.Pool *sql.DB (database/sql, lib/pq)
 	"assistant/embed"  // embed.Embed(text) []float64, embed.ToPgvector(v) string
 	"assistant/kb"     // kb.Articles []kb.Article{ID, Title, Body}
 )
@@ -558,24 +558,28 @@ type CachedAnswer struct {
 
 // indexArticles chunks, embeds and stores every article; the number of chunks inserted. Safe to run again.
 func indexArticles(ctx context.Context, articles []kb.Article) (int, error) {
-	tx, err := db.Pool.Begin(ctx)
+	tx, err := db.Pool.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback()
 	inserted := 0
 	for _, a := range articles {
 		for position, text := range chunk.Chunk(a.Body) {
-			tag, err := tx.Exec(ctx,
+			res, err := tx.ExecContext(ctx,
 				"INSERT INTO kb_chunks (id, article, position, text, embedding) VALUES ($1, $2, $3, $4, $5::vector) ON CONFLICT (id) DO NOTHING",
 				fmt.Sprintf("%s-%d", a.ID, position), a.ID, position, text, embed.ToPgvector(embed.Embed(text)))
 			if err != nil {
 				return 0, err
 			}
-			inserted += int(tag.RowsAffected())
+			n, err := res.RowsAffected()
+			if err != nil {
+				return 0, err
+			}
+			inserted += int(n)
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
 	return inserted, nil
@@ -584,7 +588,7 @@ func indexArticles(ctx context.Context, articles []kb.Article) (int, error) {
 // search returns the k chunks nearest to the question, best first.
 func search(ctx context.Context, question string, k int) ([]Hit, error) {
 	q := embed.ToPgvector(embed.Embed(question))
-	rows, err := db.Pool.Query(ctx,
+	rows, err := db.Pool.QueryContext(ctx,
 		"SELECT id, text, embedding <=> $1::vector AS distance FROM kb_chunks ORDER BY embedding <=> $1::vector LIMIT $2",
 		q, k)
 	if err != nil {
@@ -1183,6 +1187,231 @@ export async function check_cache_round_trip(ctx) {
   assert.equal(await m.cachedAnswer('How do tips work?'), null, 'a different question must still miss');
   ctx.clock.advance(config.CACHE_TTL_S + 1);
   assert.equal(await m.cachedAnswer('When do I get paid?'), null, 'after CACHE_TTL_S the answer must be gone');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"math"
+	"regexp"
+	"sort"
+	"strings"
+
+	"assistant/chunk"
+	"assistant/config"
+	"assistant/db"
+	"assistant/embed"
+	"assistant/kb"
+
+	"leetbuild/harness"
+)
+
+const (
+	kbPayQ   = "Payout missing after five business days — bank details on file?"
+	kbLoginQ = "Forgot Password reset email, two-factor code, account locked"
+)
+
+// kbRow is one chunk the knowledge base cuts into, computed without the learner.
+type kbRow struct {
+	id, article string
+	position    int
+	text        string
+}
+
+func kbExpectedChunks() []kbRow {
+	var out []kbRow
+	for _, a := range kb.Articles {
+		for position, text := range chunk.Chunk(a.Body) {
+			out = append(out, kbRow{fmt.Sprintf("%s-%d", a.ID, position), a.ID, position, text})
+		}
+	}
+	return out
+}
+
+// kbRanked is a chunk id and its cosine with the question.
+type kbRanked struct {
+	score float64
+	id    string
+}
+
+// kbExpectedRanking is the spec, independently: cosine of the question against every chunk, best first.
+func kbExpectedRanking(question string, k int) []kbRanked {
+	q := embed.Embed(question)
+	var out []kbRanked
+	for _, c := range kbExpectedChunks() {
+		out = append(out, kbRanked{embed.Cosine(q, embed.Embed(c.text)), c.id})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].score > out[j].score })
+	return out[:k]
+}
+
+// kbIndexed is a fresh schema with the knowledge base indexed by the learner; the count indexArticles returned.
+func kbIndexed(ctx *harness.Ctx) int {
+	ctx.DB.Reset(db.Schema)
+	defer func() {
+		if r := recover(); r != nil {
+			ctx.Fatalf("indexArticles(kb.Articles) crashed: %v", r)
+		}
+	}()
+	n, err := indexArticles(context.Background(), kb.Articles)
+	if err != nil {
+		ctx.Fatalf("indexArticles(kb.Articles) crashed: %v", err)
+	}
+	return n
+}
+
+func CheckIndexChunks(ctx *harness.Ctx) {
+	n := kbIndexed(ctx)
+	want := kbExpectedChunks()
+	rows := ctx.DB.Query("SELECT id, article, position, text FROM kb_chunks ORDER BY article, position")
+	ctx.Assert(len(rows) == len(want), "the ten articles chunk into %d windows (chunk.Chunk, 48 words, overlap 12), kb_chunks holds %d row(s)", len(want), len(rows))
+	ctx.Assert(n == len(want), "indexArticles must return the number of chunks it inserted (%d), it returned %d", len(want), n)
+	var got, wanted, ids []string
+	for _, r := range rows {
+		got = append(got, fmt.Sprintf("%v|%v|%v|%v", r["id"], r["article"], r["position"], r["text"]))
+		ids = append(ids, fmt.Sprint(r["id"]))
+	}
+	for _, c := range want {
+		wanted = append(wanted, fmt.Sprintf("%s|%s|%d|%s", c.id, c.article, c.position, c.text))
+	}
+	sort.Strings(got)
+	sort.Strings(wanted)
+	sort.Strings(ids)
+	ctx.Assert(strings.Join(got, "\\n") == strings.Join(wanted, "\\n"), "kb_chunks must hold one row per chunk with id <article>-<position>; ids found: %q", ids)
+	// Each stored vector is compared with embed.Embed(text) in Postgres (vector_dims, <=>) rather than parsed here.
+	for _, r := range rows {
+		text, _ := r["text"].(string)
+		stored := ctx.DB.Query("SELECT vector_dims(embedding) AS dims, 1 - (embedding <=> $1::vector) AS cosine FROM kb_chunks WHERE id = $2", embed.ToPgvector(embed.Embed(text)), r["id"])[0]
+		ctx.Assert(fmt.Sprint(stored["dims"]) == "512", "chunk %v must carry a 512-dimensional embedding, found %v dimensions", r["id"], stored["dims"])
+		cos, _ := stored["cosine"].(float64)
+		ctx.Assert(cos > 0.999, "chunk %v's stored vector is not embed.Embed(text): cosine %.3f against the expected vector", r["id"], cos)
+	}
+	again, err := indexArticles(context.Background(), kb.Articles)
+	ctx.NoError(err, "indexArticles(kb.Articles) a second time")
+	count := ctx.DB.Query("SELECT count(*) AS n FROM kb_chunks")[0]["n"]
+	ctx.Assert(fmt.Sprint(count) == fmt.Sprint(len(want)), "indexing twice must leave the table unchanged (%d rows): ON CONFLICT (id) DO NOTHING — found %v", len(want), count)
+	ctx.Assert(again == 0, "a second indexArticles inserts nothing, so it returns 0, not %d", again)
+}
+
+func CheckNearestChunks(ctx *harness.Ctx) {
+	kbIndexed(ctx)
+	texts := map[string]string{}
+	for _, c := range kbExpectedChunks() {
+		texts[c.id] = c.text
+	}
+	for _, tc := range []struct {
+		question, article string
+		k                 int
+	}{{kbPayQ, "pay", 4}, {kbLoginQ, "login", 3}} {
+		hits, err := search(context.Background(), tc.question, tc.k)
+		ctx.NoError(err, "search(%q, %d)", tc.question, tc.k)
+		ctx.Assert(len(hits) == tc.k, "search(%q, %d) must return exactly %d chunks, got %d", tc.question, tc.k, tc.k, len(hits))
+		var got, scores []string
+		for _, h := range hits {
+			ctx.Assert(h.Score > 0 && h.Score <= 1+1e-6, "Score is 1 - cosine distance, in (0, 1]: chunk %s scored %v", h.ID, h.Score)
+			got = append(got, h.ID)
+		}
+		ctx.Assert(strings.HasPrefix(hits[0].ID, tc.article+"-"), "for %q the best chunk must come from the '%s' article, got %q", tc.question, tc.article, got)
+		for i, h := range hits {
+			scores = append(scores, fmt.Sprint(h.Score))
+			ctx.Assert(i == 0 || hits[i-1].Score >= h.Score, "hits must come best first, scores were %v", scores)
+		}
+		want := kbExpectedRanking(tc.question, tc.k)
+		var wantIDs []string
+		for _, r := range want {
+			wantIDs = append(wantIDs, r.id)
+		}
+		gotSorted := append([]string(nil), got...)
+		wantSorted := append([]string(nil), wantIDs...)
+		sort.Strings(gotSorted)
+		sort.Strings(wantSorted)
+		ctx.Assert(strings.Join(gotSorted, ",") == strings.Join(wantSorted, ","), "the %d nearest chunks to %q are %q, search returned %q", tc.k, tc.question, wantIDs, got)
+		for i, h := range hits {
+			ctx.Assert(math.Abs(h.Score-want[i].score) < 1e-3, "chunk %s must score 1 - distance = %.4f, got %v", h.ID, want[i].score, h.Score)
+		}
+		for _, h := range hits {
+			ctx.Equal(h.Text, texts[h.ID], "hit %s must carry the chunk's text", h.ID)
+		}
+	}
+	one, err := search(context.Background(), kbPayQ, 1)
+	ctx.NoError(err, "search(%q, 1)", kbPayQ)
+	ctx.Assert(len(one) == 1 && strings.HasPrefix(one[0].ID, "pay-"), "k=1 returns the single best chunk, got %+v", one)
+}
+
+func CheckRankedInDatabase(ctx *harness.Ctx) {
+	kbIndexed(ctx)
+	before := len(ctx.DB.Queries())
+	hits, err := search(context.Background(), kbPayQ, 4)
+	ctx.NoError(err, "search(%q, 4)", kbPayQ)
+	ctx.Equal(len(hits), 4, "search must return 4 chunks")
+	var during, selects []string
+	for _, q := range ctx.DB.Queries()[before:] {
+		during = append(during, q.SQL)
+		lower := strings.ToLower(q.SQL)
+		if strings.Contains(lower, "kb_chunks") && strings.HasPrefix(strings.TrimSpace(lower), "select") {
+			selects = append(selects, q.SQL)
+		}
+	}
+	ctx.Assert(len(selects) > 0, "search must query kb_chunks; the statements it ran were %q", during)
+	ranked := false
+	for _, sql := range selects {
+		ranked = ranked || strings.Contains(sql, "<=>")
+	}
+	ctx.Assert(ranked, "the nearest-neighbour ranking belongs to Postgres: use pgvector's <=> operator; the statements were %q", selects)
+	for _, sql := range selects {
+		ctx.Assert(strings.Contains(strings.ToLower(sql), "limit"), "a SELECT on kb_chunks without a LIMIT pulls every chunk into the process to sort it there; let the database rank and bound: %s", sql)
+	}
+	ctx.Assert(len(selects) == 1, "one query answers a search; %d SELECTs on kb_chunks ran: %q", len(selects), selects)
+}
+
+var kbSpaces = regexp.MustCompile(\`\\s+\`)
+
+func kbKeyOf(question string) string {
+	sum := sha256.Sum256([]byte(kbSpaces.ReplaceAllString(strings.TrimSpace(strings.ToLower(question)), " ")))
+	return "answer:" + hex.EncodeToString(sum[:])
+}
+
+func CheckCacheKey(ctx *harness.Ctx) {
+	key := cacheKey("How do I get paid?")
+	ctx.Equal(key, kbKeyOf("How do I get paid?"), "cacheKey must be \\"answer:\\" + sha256 hex of the normalised question")
+	for _, variant := range []string{"  how do i   get PAID? ", "HOW DO I GET PAID?", "how\\tdo i get paid?\\n"} {
+		ctx.Assert(cacheKey(variant) == key, "%q is the same question once lower-cased, whitespace-collapsed and trimmed, but it got the key %q instead of %q", variant, cacheKey(variant), key)
+	}
+	ctx.Assert(cacheKey("How do I get a tip?") != key, "a different question must have a different key")
+	ctx.NoError(rememberAnswer(context.Background(), "How do I get paid?", "Weekly, on Mondays [kb:pay-0].", []string{"pay-0"}), "rememberAnswer")
+	ctx.Equal(ctx.Redis.Keys("*"), []string{key}, "rememberAnswer must write exactly the key %s", key)
+}
+
+func CheckCacheRoundTrip(ctx *harness.Ctx) {
+	bg := context.Background()
+	miss, err := cachedAnswer(bg, "When do I get paid?")
+	ctx.NoError(err, "cachedAnswer")
+	ctx.Assert(miss == nil, "nothing has been remembered yet: cachedAnswer must be nil, got %+v", miss)
+	ctx.NoError(rememberAnswer(bg, "When do I get paid?", "Weekly, on Mondays [kb:pay-0].", []string{"pay-0", "pay-1"}), "rememberAnswer")
+	hit, err := cachedAnswer(bg, "  when DO i get   paid? ")
+	ctx.NoError(err, "cachedAnswer")
+	want := CachedAnswer{Answer: "Weekly, on Mondays [kb:pay-0].", Sources: []string{"pay-0", "pay-1"}}
+	ctx.Assert(hit != nil, "the same question written differently must hit with {answer, sources}, got nil")
+	ctx.Equal(*hit, want, "the same question written differently must hit with {answer, sources}")
+	key := kbKeyOf("When do I get paid?")
+	raw, ok := ctx.Redis.Get(key)
+	ctx.Assert(ok, "the answer must be stored under %s, Redis holds %q", key, ctx.Redis.Keys("*"))
+	var stored CachedAnswer
+	ctx.Assert(json.Unmarshal([]byte(raw), &stored) == nil && stored.Answer == hit.Answer && strings.Join(stored.Sources, ",") == strings.Join(hit.Sources, ","), "the stored value must be the JSON {answer, sources}, it is %q", raw)
+	ttl := ctx.Redis.TTL(key)
+	ctx.Assert(config.CacheTTL-5 <= ttl && ttl <= config.CacheTTL, "the cached answer must expire after config.CacheTTL = %d s, its TTL is %d", config.CacheTTL, ttl)
+	other, err := cachedAnswer(bg, "How do tips work?")
+	ctx.NoError(err, "cachedAnswer")
+	ctx.Assert(other == nil, "a different question must still miss")
+	ctx.Clock.Advance(config.CacheTTL + 1)
+	gone, err := cachedAnswer(bg, "When do I get paid?")
+	ctx.NoError(err, "cachedAnswer")
+	ctx.Assert(gone == nil, "after config.CacheTTL the answer must be gone")
 }
 `,
   },

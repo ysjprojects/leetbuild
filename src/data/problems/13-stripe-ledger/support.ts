@@ -33,3 +33,60 @@ import {Pool} from 'pg';
 export const pool = new Pool({connectionString: 'postgres://ledger@db/ledger'});
 `,
 };
+
+/**
+ * The same handle for Go: package `ledger/db`, database/sql with lib/pq on the runtime's Postgres.
+ * Step 4 runs its inserts in `db.Transaction`, step 6 reads a balance with `db.QueryRow`.
+ */
+export const supportModulesGo: Record<string, string> = {
+  'ledger/db/db.go': `// Package db is the ledger database: Postgres through database/sql and lib/pq.
+//
+// Tables:
+//
+//	transactions (id text primary key, event_id text unique, description text, settles text, posted_at bigint)
+//	entries      (transaction_id text, account text, currency text, amount bigint, posted_at bigint)
+package db
+
+import (
+	"context"
+	"database/sql"
+
+	_ "github.com/lib/pq"
+)
+
+var pool = open()
+
+func open() *sql.DB {
+	pool, err := sql.Open("postgres", "postgres://ledger@db/ledger?sslmode=disable")
+	if err != nil {
+		panic(err)
+	}
+	return pool
+}
+
+// Transaction begins a transaction, runs fn in it and commits. When fn returns an error (or
+// panics) it rolls back instead, and returns that error.
+func Transaction(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	tx, err := pool.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tx.Rollback()
+		}
+	}()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	committed = true
+	return tx.Commit()
+}
+
+// QueryRow runs one statement (autocommit) that returns at most one row; Scan reads it.
+func QueryRow(ctx context.Context, query string, args ...any) *sql.Row {
+	return pool.QueryRowContext(ctx, query, args...)
+}
+`,
+};

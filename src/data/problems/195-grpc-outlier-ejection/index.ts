@@ -59,7 +59,7 @@ concurrent calls.`,
     ],
     edges: [{from: 'client', to: 'grpc', kind: 'grpc', label: 'GetStock(sku) → Stock{count}'}],
   },
-  support: {python: protoModules, typescript: protoFiles},
+  support: {python: protoModules, typescript: protoFiles, go: protoFiles},
   steps: [outlierEjectionStep],
   learn,
 };

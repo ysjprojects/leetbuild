@@ -8,3 +8,4 @@ tsconfig.tsbuildinfo
 *.log
 public/py/worker.js
 public/ts/worker.js
+public/go/worker.js

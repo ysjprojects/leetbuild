@@ -900,6 +900,199 @@ export async function check_no_empty_flush(ctx) {
   assert.equal(rec.commits.length, 1, \`one batch, one commit: got \${rec.commits.length} commits\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"sort"
+	"time"
+
+	"github.com/segmentio/kafka-go"
+	"leetbuild/harness"
+)
+
+const rollupGroup, metricsTopic = "rollup", "metrics"
+
+func seedMetrics(ctx *harness.Ctx, n int, partition func(int) int) {
+	for i := range n {
+		host := fmt.Sprintf("host-%d", i)
+		ctx.Kafka.SeedPartition(metricsTopic, partition(i), host, fmt.Sprintf("{%q:%q,%q:%d}", "host", host, "cpu", i))
+	}
+}
+
+func roundRobin3(i int) int { return i % 3 }
+
+// metricPlace is a flushed record: its partition and offset.
+type metricPlace struct {
+	partition int
+	offset    int64
+}
+
+type rollupCommit struct {
+	group   string
+	offsets map[string]int64
+	at      int64
+}
+
+// rollupRecorder is what the learner's loop did: every flush as places, every commit with the clock
+// at that moment, and their order.
+type rollupRecorder struct {
+	flushes [][]metricPlace
+	commits []rollupCommit
+	log     []string
+}
+
+func (rec *rollupRecorder) flush(records []kafka.Message) error {
+	places := make([]metricPlace, 0, len(records))
+	for _, r := range records {
+		places = append(places, metricPlace{r.Partition, r.Offset})
+	}
+	rec.flushes = append(rec.flushes, places)
+	rec.log = append(rec.log, fmt.Sprintf("flush %d", len(records)))
+	return nil
+}
+
+func (rec *rollupRecorder) sizes() []int {
+	sizes := []int{}
+	for _, f := range rec.flushes {
+		sizes = append(sizes, len(f))
+	}
+	return sizes
+}
+
+func recordRollup(ctx *harness.Ctx) *rollupRecorder {
+	rec := &rollupRecorder{}
+	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
+		byKey := map[string]int64{}
+		for tp, o := range offsets {
+			byKey[tp.String()] = o
+		}
+		rec.commits = append(rec.commits, rollupCommit{group, byKey, ctx.Clock.Now()})
+		rec.log = append(rec.log, "commit")
+	})
+	return rec
+}
+
+// runRollup runs the learner's loop over everything seeded, then 2 s of silence: a window still
+// open closes on the way, and the operator stops the loop.
+func runRollup(ctx *harness.Ctx, rec *rollupRecorder) {
+	c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ctx.Drain(func() { _ = run(c, rec.flush) })
+}
+
+func expectedRollupCommit(flush []metricPlace) map[string]int64 {
+	last := map[string]int64{}
+	for _, p := range flush {
+		key := fmt.Sprintf("%s|%d", metricsTopic, p.partition)
+		last[key] = max(last[key], p.offset+1)
+	}
+	return last
+}
+
+func CheckGroup(ctx *harness.Ctx) {
+	seedMetrics(ctx, 50, roundRobin3)
+	rec := recordRollup(ctx)
+	runRollup(ctx, rec)
+	subscriptions := ctx.Kafka.EventsOf("subscribe")
+	ctx.Assert(len(subscriptions) > 0, "the consumer must subscribe to a topic")
+	last := subscriptions[len(subscriptions)-1]
+	ctx.Equal(last.Group, rollupGroup, "GroupID must be %s", rollupGroup)
+	ctx.Assert(slices.Contains(last.Topics, metricsTopic), "the consumer must read %s, got %q", metricsTopic, last.Topics)
+	consumers := ctx.Kafka.Consumers()
+	ctx.Assert(len(consumers) > 0 && !consumers[len(consumers)-1].AutoCommit, "auto-commit is on (ReadMessage or a CommitInterval): offsets would be committed as read, not once per flushed batch")
+	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "offsets were auto-committed")
+	ctx.Assert(len(ctx.Kafka.EventsOf("manual-commit")) > 0, "no explicit commit happened after the flush")
+	lag := ctx.Kafka.Lag(rollupGroup, metricsTopic)
+	ctx.Equal(lag, 0, "%d flushed record(s) are not committed", lag)
+}
+
+func CheckBatchSize(ctx *harness.Ctx) {
+	seedMetrics(ctx, 120, roundRobin3)
+	rec := recordRollup(ctx)
+	runRollup(ctx, rec)
+	ctx.Equal(rec.sizes(), []int{50, 50, 20}, "120 records must flush as [50, 50, 20]")
+	ctx.Equal(rec.log, []string{"flush 50", "commit", "flush 50", "commit", "flush 20", "commit"}, "expected flush, commit, flush, commit, flush, commit — one commit right after each flush")
+	seen := map[metricPlace]bool{}
+	total := 0
+	for _, f := range rec.flushes {
+		for _, p := range f {
+			seen[p] = true
+			total++
+		}
+	}
+	ctx.Equal(len(seen), total, "a record was flushed twice: the batch must start empty after a flush; distinct records flushed")
+	missing := 0
+	seeded := ctx.Kafka.Records(metricsTopic)
+	for _, r := range seeded {
+		if !seen[metricPlace{r.Partition, r.Offset}] {
+			missing++
+		}
+	}
+	ctx.Equal(len(seeded)-missing, len(seeded), "%d seeded record(s) never reached flush; seeded records flushed", missing)
+	for i, f := range rec.flushes {
+		partitions := []int{}
+		for _, p := range f {
+			if !slices.Contains(partitions, p.partition) {
+				partitions = append(partitions, p.partition)
+			}
+		}
+		for _, partition := range partitions {
+			offsets := []int64{}
+			for _, p := range f {
+				if p.partition == partition {
+					offsets = append(offsets, p.offset)
+				}
+			}
+			ctx.Assert(sort.SliceIsSorted(offsets, func(a, b int) bool { return offsets[a] < offsets[b] }), "flush %d holds partition %d out of order: %v — keep the records in delivery order", i+1, partition, offsets)
+		}
+	}
+}
+
+func CheckBatchWait(ctx *harness.Ctx) {
+	seedMetrics(ctx, 70, roundRobin3)
+	rec := recordRollup(ctx)
+	runRollup(ctx, rec)
+	ctx.Equal(rec.sizes(), []int{50, 20}, "70 records must flush as [50, 20] — the 20 once 500 ms pass with nothing new")
+	ctx.Equal(len(rec.commits), 2, "expected one commit per batch")
+	// Measured from the previous commit (the batch starts right after it); a few real ms of slack.
+	elapsed := rec.commits[1].at - rec.commits[0].at
+	ctx.Assert(elapsed >= 490 && elapsed < 750, "the trailing batch must flush and commit 500 ms after it started, not %d ms later", elapsed)
+}
+
+func CheckCommitOffsets(ctx *harness.Ctx) {
+	seedMetrics(ctx, 55, func(i int) int {
+		if i < 50 {
+			return 1
+		}
+		return 2
+	})
+	rec := recordRollup(ctx)
+	runRollup(ctx, rec)
+	ctx.Equal(len(rec.flushes), 2, "55 records on partitions 1 and 2 must flush as two batches, got sizes %v; batches", rec.sizes())
+	ctx.Equal(len(rec.commits), len(rec.flushes), "expected one commit per flush")
+	for i, flush := range rec.flushes {
+		commit := rec.commits[i]
+		ctx.Equal(commit.group, rollupGroup, "commit %d came from the wrong group", i+1)
+		ctx.Equal(commit.offsets, expectedRollupCommit(flush), "commit %d must be the batch's highest offset + 1 per partition it touched", i+1)
+	}
+	ctx.Assert(ctx.Kafka.CommittedOffset(rollupGroup, metricsTopic, 1) == 50 && ctx.Kafka.CommittedOffset(rollupGroup, metricsTopic, 2) == 5, "after both batches partition 1 must be committed at 50 and partition 2 at 5")
+	ctx.Equal(ctx.Kafka.CommittedOffset(rollupGroup, metricsTopic, 0), -1, "partition 0 had no records: it must not appear in any commit (-1: no committed offset)")
+}
+
+func CheckNoEmptyFlush(ctx *harness.Ctx) {
+	seedMetrics(ctx, 50, roundRobin3)
+	rec := recordRollup(ctx)
+	runRollup(ctx, rec)
+	for _, f := range rec.flushes {
+		ctx.Assert(len(f) > 0, "flush was called with an empty batch: flushes of sizes %v", rec.sizes())
+	}
+	ctx.Equal(len(rec.flushes), 1, "exactly 50 records then silence must flush once; flushes")
+	ctx.Equal(len(rec.commits), 1, "one batch, one commit; commits")
+}
+`,
   },
   debrief: `The batch is closed by whichever of two conditions comes first because each bounds a different thing: the count bounds how much one sink call carries (and how much is at risk between flush and commit), the clock bounds how stale the sink may be when the stream is quiet. The commit is built from the batch itself — one offset per partition the batch touched, the highest + 1 — so a partition the batch never saw is left alone and a crash after the flush replays at most one batch: at-least-once, batch-granular. \`consume(n, timeout)\` is that loop in one call in librdkafka; kafkajs's real client has \`eachBatch\`, but assembling the batch across \`eachMessage\` with a timer is what every "window by count or time" looks like inside a connector. Production versions add: commit what you hold when a partition is revoked (\`on_revoke\`), pause the partition when the sink is slow instead of blowing \`max.poll.interval.ms\`, retry or dead-letter a failed flush rather than crash-loop on it, and size the batch in bytes as well as records.`,
 };

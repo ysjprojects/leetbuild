@@ -731,6 +731,110 @@ export async function check_fallback_502(ctx) {
   assert.equal(ok.status, 200, \`after the failures a healthy catalog must answer 200, got \${ok.status}\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"net/http"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"leetbuild/harness"
+
+	pb "gateway/gen/catalog"
+)
+
+// catalogPeer is the internal catalog: knows every id but ghost (NOT_FOUND) and bad (INVALID_ARGUMENT).
+type catalogPeer struct {
+	pb.UnimplementedCatalogServer
+}
+
+func (catalogPeer) GetItem(_ context.Context, req *pb.GetItemRequest) (*pb.Item, error) {
+	switch req.GetId() {
+	case "ghost":
+		return nil, status.Error(codes.NotFound, "no item ghost")
+	case "bad":
+		return nil, status.Error(codes.InvalidArgument, "ids are numeric")
+	}
+	return &pb.Item{Id: req.GetId(), Name: "Kettle", PriceCents: 3499}, nil
+}
+
+func catalogProxy(ctx *harness.Ctx) *harness.HTTP {
+	pb.RegisterCatalogServer(ctx.GRPC.Server(""), &catalogPeer{})
+	mux := http.NewServeMux()
+	register(mux)
+	return ctx.HTTP(mux)
+}
+
+func CheckRouteCall(ctx *harness.Ctx) {
+	c := catalogProxy(ctx)
+	r := c.Get("/items/42")
+	ctx.Equal(r.Status, 200, "GET /items/42 (%s)", r.Text())
+	calls := ctx.GRPC.CallsTo("GetItem", "")
+	ctx.Equal(len(calls), 1, "GET /items/42 must make exactly one GetItem call; the calls made")
+	req, _ := calls[0].Request.(*pb.GetItemRequest)
+	ctx.Equal(req.GetId(), "42", "GetItem must be called with the path id")
+	ctype := r.Header.Get("Content-Type")
+	ctx.Assert(strings.HasPrefix(ctype, "application/json"), "the answer must be JSON, got Content-Type %q", ctype)
+	ctx.Equal(r.JSON(), map[string]any{"id": "42", "name": "Kettle", "price_cents": float64(3499)}, "GET /items/42 must answer the item as id, name, price_cents (price_cents is a number)")
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	c := catalogProxy(ctx)
+	r := c.Get("/items/42")
+	ctx.Equal(r.Status, 200, "GET /items/42 (%s)", r.Text())
+	calls := ctx.GRPC.CallsTo("GetItem", "")
+	call := calls[len(calls)-1]
+	ctx.Assert(call.HasDeadline(), "the GetItem call carries no deadline: a stalled catalog would hold the gateway open forever")
+	ctx.Assert(1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "the deadline must be about 2 s, got %v", call.Timeout)
+	ctx.GRPC.SetLatency("GetItem", 5.0, "")
+	slow := c.Get("/items/42")
+	ctx.Equal(slow.Status, 504, "a catalog slower than the deadline (DEADLINE_EXCEEDED)")
+	ctx.Equal(len(ctx.GRPC.CallsTo("GetItem", "")), 2, "a timed-out call must not be retried (the client decides); GetItem calls")
+}
+
+func CheckRequestId(ctx *harness.Ctx) {
+	c := catalogProxy(ctx)
+	r := c.Get("/items/42", "X-Request-Id", "r-9")
+	ctx.Equal(r.Status, 200, "GET /items/42 (%s)", r.Text())
+	calls := ctx.GRPC.CallsTo("GetItem", "")
+	md := calls[len(calls)-1].Metadata
+	ids := md.Get("x-request-id")
+	ctx.Assert(len(ids) > 0, "the GetItem call carried metadata %v, expected x-request-id: r-9 (metadata keys are lowercase on the wire)", md)
+	ctx.Equal(ids, []string{"r-9"}, "x-request-id metadata must be the incoming X-Request-Id")
+	plain := c.Get("/items/42")
+	ctx.Equal(plain.Status, 200, "a request without X-Request-Id")
+}
+
+func CheckStatusMap(ctx *harness.Ctx) {
+	c := catalogProxy(ctx)
+	r := c.Get("/items/ghost")
+	ctx.Equal(r.Status, 404, "NOT_FOUND from the catalog")
+	r = c.Get("/items/bad")
+	ctx.Equal(r.Status, 400, "INVALID_ARGUMENT from the catalog")
+	ctx.GRPC.Fail("GetItem", codes.Unavailable, "catalog restarting", 1, "")
+	r = c.Get("/items/42")
+	ctx.Equal(r.Status, 503, "UNAVAILABLE from the catalog")
+	ctx.GRPC.SetLatency("GetItem", 5.0, "")
+	r = c.Get("/items/42")
+	ctx.Equal(r.Status, 504, "DEADLINE_EXCEEDED")
+	ctx.Equal(len(ctx.GRPC.CallsTo("GetItem", "")), 4, "the four failing requests' GetItem calls (the gateway must not retry on the client's behalf)")
+}
+
+func CheckFallback502(ctx *harness.Ctx) {
+	c := catalogProxy(ctx)
+	for _, code := range []codes.Code{codes.Internal, codes.PermissionDenied, codes.Unknown} {
+		ctx.GRPC.Fail("GetItem", code, "upstream broke", 1, "")
+		r := c.Get("/items/42")
+		ctx.Equal(r.Status, 502, "%s from the catalog (502 Bad Gateway)", code)
+	}
+	ok := c.Get("/items/42")
+	ctx.Equal(ok.Status, 200, "after the failures a healthy catalog")
+}
+`,
   },
   debrief: `The proxy is a translation layer and nothing more: it turns a path into a request message, a header into metadata, and a status code into another status code. The deadline is what makes it safe to sit in front of a service you do not control, and the 502 default is what keeps upstream internals from leaking to clients. Real gateways generate this code from the proto (grpc-gateway, Envoy's gRPC-JSON transcoder), propagate the *caller's* remaining deadline instead of a fixed 2 s, and copy a whole allow-list of headers (trace context, tenant) into metadata.`,
 };

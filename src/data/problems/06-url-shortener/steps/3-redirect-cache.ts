@@ -738,6 +738,114 @@ export async function check_redirect(ctx) {
   assert(cacheControl.includes('private') && cacheControl.includes('max-age=0'), \`Cache-Control is \${JSON.stringify(cacheControl)}, expected 'private, max-age=0'\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+const longURL = "https://example.com/launch"
+
+// fakeLinks is the links table: knows g9Xc, records every lookup. Assigned to the learner's store.
+type fakeLinks struct {
+	urls    map[string]string
+	lookups []string
+}
+
+func (f *fakeLinks) Exists(_ context.Context, code string) (bool, error) {
+	_, ok := f.urls[code]
+	return ok, nil
+}
+
+func (f *fakeLinks) Save(_ context.Context, code, url string) error {
+	f.urls[code] = url
+	return nil
+}
+
+func (f *fakeLinks) Lookup(_ context.Context, code string) (string, error) {
+	f.lookups = append(f.lookups, code)
+	return f.urls[code], nil
+}
+
+func standInLinks() *fakeLinks {
+	f := &fakeLinks{urls: map[string]string{"g9Xc": longURL}}
+	store = f
+	return f
+}
+
+// resolveOK is resolve(code); an error fails the check.
+func resolveOK(ctx *harness.Ctx, code string) string {
+	target, err := resolve(context.Background(), code)
+	ctx.NoError(err, "resolve(ctx, %q)", code)
+	return target
+}
+
+func CheckKey(ctx *harness.Ctx) {
+	standInLinks()
+	ctx.Equal(resolveOK(ctx, "g9Xc"), longURL, "resolve must return the long url the store knows")
+	cached, _ := ctx.Redis.Get("url:g9Xc")
+	ctx.Equal(cached, longURL, "after a miss the url must be cached under url:g9Xc (keys are %q)", ctx.Redis.Keys("*"))
+	ctx.Redis.Set("url:abcd", "https://example.com/cached")
+	ctx.Equal(resolveOK(ctx, "abcd"), "https://example.com/cached", "a value cached under url:{code} must be returned as the long url")
+}
+
+func CheckReadFirst(ctx *harness.Ctx) {
+	links := standInLinks()
+	ctx.Redis.Set("url:g9Xc", longURL)
+	ctx.Equal(resolveOK(ctx, "g9Xc"), longURL, "resolve of a cached code")
+	ctx.Equal(links.lookups, []string(nil), "a cache hit is the whole request: the store was asked")
+	links.urls["zz12"] = "https://example.com/z"
+	ctx.Equal(resolveOK(ctx, "zz12"), "https://example.com/z", "a miss must fall through to the store")
+	ctx.Equal(links.lookups, []string{"zz12"}, "the store must be asked once on a miss")
+	ctx.Equal(resolveOK(ctx, "zz12"), "https://example.com/z", "resolve of a code cached by the previous miss")
+	ctx.Equal(links.lookups, []string{"zz12"}, "the second resolve must be served from the cache, not the store again")
+}
+
+func CheckTtl(ctx *harness.Ctx) {
+	links := standInLinks()
+	resolveOK(ctx, "g9Xc")
+	ttl := ctx.Redis.TTL("url:g9Xc")
+	ctx.Assert(ttl > 0, "url:g9Xc was cached without an expiry (TTL %d): the cache would only grow", ttl)
+	ctx.Assert(86000 <= ttl && ttl <= 86400, "url:g9Xc expires in %d s, expected 86400", ttl)
+	ctx.Clock.Advance(86401)
+	_, ok := ctx.Redis.Get("url:g9Xc")
+	ctx.Assert(!ok, "url:g9Xc must be gone once its TTL has passed")
+	ctx.Equal(resolveOK(ctx, "g9Xc"), longURL, "resolve after the entry expired")
+	ctx.Equal(links.lookups, []string{"g9Xc", "g9Xc"}, "once the entry has expired the next resolve goes back to the store")
+}
+
+func CheckNegative(ctx *harness.Ctx) {
+	links := standInLinks()
+	ctx.Equal(resolveOK(ctx, "ghost"), "", "an unknown code resolves to nothing")
+	ctx.Equal(links.lookups, []string{"ghost"}, "the store lookups")
+	sentinel, ok := ctx.Redis.Get("url:ghost")
+	ctx.Assert(ok, "an unknown code must be cached as the missing sentinel")
+	ctx.Equal(sentinel, missing, "url:ghost must hold the missing sentinel")
+	ttl := ctx.Redis.TTL("url:ghost")
+	ctx.Assert(1 <= ttl && ttl <= 60, "the sentinel expires in %d s, expected 60", ttl)
+	ctx.Equal(resolveOK(ctx, "ghost"), "", "an unknown code resolves to nothing")
+	ctx.Equal(links.lookups, []string{"ghost"}, "a hit on the sentinel must not touch the store")
+	r := ctx.Main(main).HTTP().Get("/ghost")
+	ctx.Equal(r.Status, 404, "GET /ghost")
+	ctx.Equal(links.lookups, []string{"ghost"}, "the 404 is answered from the sentinel, not from a store lookup")
+	ctx.Clock.Advance(61)
+	ctx.Equal(resolveOK(ctx, "ghost"), "", "an unknown code resolves to nothing")
+	ctx.Equal(links.lookups, []string{"ghost", "ghost"}, "after 60 s the sentinel is gone and the store is asked again")
+}
+
+func CheckRedirect(ctx *harness.Ctx) {
+	standInLinks()
+	r := ctx.Main(main).HTTP().Get("/g9Xc")
+	ctx.Assert(r.Status != 301 && r.Status != 308, "GET /g9Xc answered %d: a permanent redirect is cached by the browser and later clicks never come back", r.Status)
+	ctx.Assert(r.Status == 302 || r.Status == 307, "GET /g9Xc answered %d, expected 302", r.Status)
+	ctx.Equal(r.Header.Get("Location"), longURL, "Location must be the long url")
+	cacheControl := r.Header.Get("Cache-Control")
+	ctx.Assert(strings.Contains(cacheControl, "private") && strings.Contains(cacheControl, "max-age=0"), "Cache-Control is %q, expected %q", cacheControl, "private, max-age=0")
+}
+`,
   },
   debrief: `The redirect is the hot path of a shortener — reads outnumber writes by a hundred to one — so it is shaped to be one Redis round trip and nothing else. Negative caching matters more here than in most caches: unknown codes are *the* abuse pattern (scanners walking the key space), and each one would otherwise be a database query. The 302 is deliberate: a 301 would be cached by the browser forever and the next step would never see the click. Real shorteners add a local in-process cache in front of Redis for the top links, and jitter the TTL so a popular link's entry does not expire on every replica at once.`,
 };

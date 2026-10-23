@@ -91,3 +91,56 @@ export const db = {
 };
 `,
 };
+
+/**
+ * The Go twin: `discord/db`, the runtime's Postgres through database/sql and lib/pq, with the schema
+ * beside it. Snowflakes are int64 in Go; the numeric id columns scan into int64 as they are.
+ */
+export const supportModulesGo: Record<string, string> = {
+  'discord/db/db.go': `// Package db is the messages table (provided): the runtime's Postgres through database/sql and
+// lib/pq. $1…$n placeholders.
+//
+// Ids are 64-bit snowflakes: pass them as int64 and scan the numeric id columns into int64.
+package db
+
+import (
+	"context"
+	"database/sql"
+
+	_ "github.com/lib/pq"
+)
+
+// Schema is the messages table: one partition per (channel_id, bucket), rows in message_id order.
+const Schema = \`
+CREATE TABLE messages (
+    channel_id numeric(20, 0) NOT NULL,
+    bucket integer NOT NULL,
+    message_id numeric(20, 0) NOT NULL,
+    author_id numeric(20, 0) NOT NULL,
+    content text NOT NULL,
+    PRIMARY KEY (channel_id, bucket, message_id)
+);
+\`
+
+var pool = open()
+
+func open() *sql.DB {
+	pool, err := sql.Open("postgres", "postgres://app@db:5432/app?sslmode=disable")
+	if err != nil {
+		panic(err)
+	}
+	return pool
+}
+
+// Exec runs one statement.
+func Exec(ctx context.Context, query string, args ...any) error {
+	_, err := pool.ExecContext(ctx, query, args...)
+	return err
+}
+
+// Query runs one statement and returns its rows; close them when done.
+func Query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	return pool.QueryContext(ctx, query, args...)
+}
+`,
+};

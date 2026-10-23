@@ -834,6 +834,167 @@ export async function check_independent(ctx) {
   assert.equal(ctx.kafka.events.filter(e => e[0] === 'close').length, 2, 'each replay creates and closes its own consumer');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+const (
+	replayTopic = "order-events"
+	liveGroup   = "orders"
+)
+
+// seedAt appends keyless records to one partition of the topic.
+func seedAt(ctx *harness.Ctx, partition int, values ...string) {
+	for _, v := range values {
+		ctx.Kafka.SeedPartition(replayTopic, partition, nil, v)
+	}
+}
+
+// replayed runs replay until it returns (or waits for records that will not come); an error fails
+// the check.
+func replayed(ctx *harness.Ctx, from int64, handler func(ReplayRecord)) int {
+	var n int
+	var err error
+	ctx.Drain(func() {
+		n, err = replay(context.Background(), replayTopic, from, func(r ReplayRecord) error {
+			handler(r)
+			return nil
+		})
+	})
+	ctx.NoError(err, "replay(%q, %d) returned an error", replayTopic, from)
+	return n
+}
+
+// perPartition lists the handled records as "offset:value", per partition.
+func perPartition(records []ReplayRecord) map[int][]string {
+	out := map[int][]string{}
+	for _, r := range records {
+		out[r.Partition] = append(out[r.Partition], fmt.Sprintf("%d:%s", r.Offset, r.Value))
+	}
+	return out
+}
+
+func countEvents(ctx *harness.Ctx, kind string) int { return len(ctx.Kafka.EventsOf(kind)) }
+
+func CheckReplaysInOrder(ctx *harness.Ctx) {
+	seedAt(ctx, 0, "a0", "a1", "a2")
+	seedAt(ctx, 1, "b0")
+	seedAt(ctx, 2, "c0", "c1")
+	var seen []ReplayRecord
+	count := replayed(ctx, 0, func(r ReplayRecord) { seen = append(seen, r) })
+	ctx.Equal(count, 6, "replay's return value (the number of records handled)")
+	got := perPartition(seen)
+	ctx.Equal(got[0], []string{"0:a0", "1:a1", "2:a2"}, "partition 0 must be handled at offsets 0..2 in order")
+	ctx.Equal(got[1], []string{"0:b0"}, "partition 1")
+	ctx.Equal(got[2], []string{"0:c0", "1:c1"}, "partition 2 must be handled at offsets 0..1 in order")
+	for _, r := range seen {
+		ctx.Assert(r.Key == nil, "records seeded without a key must reach the handler with a nil Key, got %q", r.Key)
+	}
+}
+
+func CheckSnapshotEnd(ctx *harness.Ctx) {
+	seedAt(ctx, 0, "a0", "a1")
+	seedAt(ctx, 1, "b0")
+	seedAt(ctx, 2, "c0", "c1", "c2")
+	var seen []ReplayRecord
+	count := replayed(ctx, 0, func(r ReplayRecord) {
+		if len(seen) == 0 {
+			// Producers keep writing while the replay runs: one more record on every partition.
+			seedAt(ctx, 0, "a-late")
+			seedAt(ctx, 1, "b-late")
+			seedAt(ctx, 2, "c-late")
+		}
+		seen = append(seen, r)
+	})
+	ctx.Equal(ctx.Kafka.EndOffset(replayTopic, 0), 3, "the harness appended a record to partition 0 mid-replay: its end offset")
+	var late []string
+	for _, r := range seen {
+		if strings.HasSuffix(string(r.Value), "-late") {
+			late = append(late, string(r.Value))
+		}
+	}
+	ctx.Equal(late, []string(nil), "records appended after the replay started must not be handled: the end is a snapshot taken before the first fetch")
+	ctx.Equal(count, 6, "replay's return value (the records that existed when it started)")
+	ctx.Equal(len(seen), 6, "records handled")
+}
+
+func CheckNoCommits(ctx *harness.Ctx) {
+	seedAt(ctx, 0, "a0", "a1", "a2")
+	seedAt(ctx, 1, "b0", "b1")
+	seedAt(ctx, 2, "c0")
+	// The live group is half-way through the topic.
+	live := map[int]int64{0: 1, 1: 2, 2: 0}
+	offsets := harness.KafkaOffsets{}
+	for p, o := range live {
+		offsets[harness.KafkaTopicPartition{Topic: replayTopic, Partition: p}] = o
+	}
+	ctx.Kafka.Commit(liveGroup, offsets)
+	var seen []ReplayRecord
+	count := replayed(ctx, 0, func(r ReplayRecord) { seen = append(seen, r) })
+	ctx.Clock.Advance(30)
+	ctx.Equal(count, 6, "replay's return value")
+	for p := range 3 {
+		ctx.Equal(ctx.Kafka.CommittedOffset(liveGroup, replayTopic, p), live[p], "group orders' committed offset for partition %d must not move: the replay must not touch the live group", p)
+	}
+	ctx.Equal(len(ctx.Kafka.Commits("replay-tool")), 0, "commits by group replay-tool (a replay tool never commits)")
+	ctx.Equal(len(ctx.Kafka.Commits(""))-1, 0, "commits made during the replay")
+	ctx.Equal(countEvents(ctx, "auto-commit"), 0, "auto-commits (the replay consumer must not commit on a timer)")
+	// The step's Go readers are partition readers without a GroupID (nothing to commit), where the
+	// other languages use group replay-tool: no consumer may join any group.
+	groups := map[string]bool{}
+	for _, e := range ctx.Kafka.EventsOf("consumer") {
+		groups[e.Group] = true
+	}
+	ctx.Equal(groups, map[string]bool{"": true}, "groups the replay's consumers joined (partition readers join none)")
+}
+
+func CheckFromOffset(ctx *harness.Ctx) {
+	seedAt(ctx, 0, "a0", "a1", "a2", "a3")
+	seedAt(ctx, 1, "b0")
+	seedAt(ctx, 2, "c0", "c1", "c2")
+	var seen []ReplayRecord
+	count := replayed(ctx, 2, func(r ReplayRecord) { seen = append(seen, r) })
+	got := perPartition(seen)
+	ctx.Equal(got[0], []string{"2:a2", "3:a3"}, "partition 0 must be handled at offsets 2 and 3 only")
+	ctx.Equal(got[1], []string(nil), "partition 1 has one record (offset 0) and must contribute nothing from offset 2")
+	ctx.Equal(got[2], []string{"2:c2"}, "partition 2 must be handled at offset 2 only")
+	ctx.Equal(count, 3, "replay's return value")
+	var beyond []ReplayRecord
+	none := replayed(ctx, 10, func(r ReplayRecord) { beyond = append(beyond, r) })
+	ctx.Assert(none == 0 && len(beyond) == 0, "replay from beyond every end handled %d record(s) and returned %d; expected 0", len(beyond), none)
+}
+
+func CheckIndependent(ctx *harness.Ctx) {
+	seedAt(ctx, 0, "a0", "a1")
+	seedAt(ctx, 1, "b0")
+	var first []ReplayRecord
+	ctx.Equal(replayed(ctx, 1, func(r ReplayRecord) { first = append(first, r) }), 1, "the first replay from offset 1 should handle exactly a1")
+	ctx.Equal(perPartition(first), map[int][]string{0: {"1:a1"}}, "records handled by the first replay")
+	firstReaders := countEvents(ctx, "consumer")
+	seedAt(ctx, 0, "a2")
+	seedAt(ctx, 2, "c0")
+	var second []ReplayRecord
+	count := replayed(ctx, 0, func(r ReplayRecord) { second = append(second, r) })
+	ctx.Equal(count, 5, "the second replay from 0 starts over and sees the records appended since the first")
+	got := perPartition(second)
+	ctx.Equal(got[0], []string{"0:a0", "1:a1", "2:a2"}, "partition 0 in the second replay")
+	ctx.Equal(got[2], []string{"0:c0"}, "partition 2 in the second replay")
+	ctx.Equal(len(ctx.Kafka.Commits("")), 0, "neither replay may commit: commits")
+	// The step's Go replay opens one group-less reader per partition, not one consumer per call:
+	// each replay creates its own readers, and every reader is closed.
+	for _, e := range ctx.Kafka.EventsOf("close") {
+		ctx.Equal(e.Group, "", "a closed consumer's group (partition readers join none)")
+	}
+	ctx.Assert(firstReaders > 0 && countEvents(ctx, "consumer") > firstReaders, "each replay creates its own readers")
+	ctx.Equal(countEvents(ctx, "close"), countEvents(ctx, "consumer"), "each replay closes the readers it created: closes")
+}
+`,
   },
   debrief: `Three decisions make this a replay tool and not a second live consumer. It owns its **assignment** — \`assign\` in Python and the Java client, \`subscribe\` + \`seek\` in kafkajs — so it starts where it is told, not where a group's bookmark is; it **never commits** (auto-commit off, no commit call, nothing on close), so group \`orders\` resumes exactly where it was and no other tool ever inherits the replay's position; and it reads to a **snapshot of the end** taken before the first fetch, so the job is bounded by two offsets per partition no matter how fast producers write. The pause-when-done loop is the shape every bounded read takes: the broker keeps serving a partition past its snapshot, so the position check — not the fetch — decides what the handler sees. Real tools add \`offsets_for_times\` to pick \`from_offset\` by timestamp, read the partition count from metadata instead of a constant, write the handler's output through an idempotent sink (a replay is by definition a duplicate), and run one replay per partition in parallel with the same two fixed ends.`,
 };

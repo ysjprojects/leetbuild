@@ -320,7 +320,7 @@ const (
 )
 
 // processCheckout authorizes, captures and records the order (built in the next steps); returns the response document.
-func processCheckout(ctx context.Context, body map[string]any) (map[string]any, error) {
+var processCheckout = func(ctx context.Context, body map[string]any) (map[string]any, error) {
 	panic("not implemented")
 }
 
@@ -362,7 +362,7 @@ const (
 )
 
 // processCheckout authorizes, captures and records the order (built in the next steps); returns the response document.
-func processCheckout(ctx context.Context, body map[string]any) (map[string]any, error) {
+var processCheckout = func(ctx context.Context, body map[string]any) (map[string]any, error) {
 	panic("not implemented")
 }
 
@@ -781,6 +781,137 @@ export async function check_store_response(ctx) {
   r = await post(c, 'k3');
   assert(r.status >= 500, \`a failing processCheckout answered \${r.status}\`);
   assert.equal(ctx.redis.get('idem:k3'), null, 'when processCheckout fails the key must be released, or every retry gets 409 for a day');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"leetbuild/harness"
+)
+
+var checkoutReq = map[string]any{"merchant_id": "m-42", "amount_cents": float64(4999), "currency": "EUR", "card_token": "tok_visa"}
+
+// idemSeen is what idem:k1 held while processCheckout ran.
+type idemSeen struct {
+	value any
+	ttl   int64
+}
+
+// checkoutRecorder stands in for processCheckout: the bodies it saw, and what idem:k1 held while it ran.
+type checkoutRecorder struct {
+	calls []map[string]any
+	seen  []idemSeen
+	http  *harness.HTTP
+}
+
+func newCheckoutRecorder(ctx *harness.Ctx) *checkoutRecorder {
+	rec := &checkoutRecorder{}
+	processCheckout = func(_ context.Context, body map[string]any) (map[string]any, error) {
+		rec.calls = append(rec.calls, body)
+		var held any
+		if v, ok := ctx.Redis.Get("idem:k1"); ok {
+			held = v
+		}
+		rec.seen = append(rec.seen, idemSeen{held, ctx.Redis.TTL("idem:k1")})
+		return map[string]any{"order_id": fmt.Sprintf("o-%d", len(rec.calls)), "status": "captured"}, nil
+	}
+	rec.http = ctx.Main(main).HTTP()
+	return rec
+}
+
+func (rec *checkoutRecorder) post(key string) *harness.Response {
+	if key == "" {
+		return rec.http.Post("/checkout", checkoutReq)
+	}
+	return rec.http.Post("/checkout", checkoutReq, "Idempotency-Key", key)
+}
+
+func CheckHeaderRequired(ctx *harness.Ctx) {
+	rec := newCheckoutRecorder(ctx)
+	r := rec.post("")
+	ctx.Equal(r.Status, 400, "POST /checkout without Idempotency-Key")
+	ctx.Equal(len(rec.calls), 0, "a request without a key must not reach processCheckout")
+	r = rec.post("k1")
+	ctx.Equal(r.Status, 201, "POST /checkout with a fresh key")
+	ctx.Equal(rec.calls, []map[string]any{checkoutReq}, "processCheckout must run once with the request body")
+}
+
+func CheckReserveNx(ctx *harness.Ctx) {
+	rec := newCheckoutRecorder(ctx)
+	r := rec.post("k1")
+	ctx.Equal(r.Status, 201, "POST /checkout with a fresh key")
+	ctx.Assert(len(rec.seen) > 0, "processCheckout did not run")
+	seen := rec.seen[0]
+	ctx.Equal(seen.value, "processing", "while processCheckout ran idem:k1 must hold the processing reservation")
+	ctx.Assert(86000 <= seen.ttl && seen.ttl <= 86400, "the reservation TTL was %d, expected 86400 s", seen.ttl)
+	ctx.Redis.Set("idem:k2", "processing")
+	r = rec.post("k2")
+	ctx.Assert(r.Status != 201, "a key already reserved by another request was claimed again: the SET must be NX")
+	ctx.Equal(len(rec.calls), 1, "a key already reserved must not run processCheckout a second time")
+	// A concurrent retry with the same key lands right after the first command that touches idem:k3.
+	claimedByRetry := false
+	ctx.Redis.After("idem:k3", func() any {
+		claimedByRetry = ctx.Redis.Set("idem:k3", "processing", "NX")
+		return claimedByRetry
+	})
+	r = rec.post("k3")
+	if claimedByRetry {
+		ctx.Assert(r.Status != 201, "a retry claimed idem:k3 between your read and your write and both charged: the reservation must be one atomic SetNX")
+		ctx.Equal(len(rec.calls), 1, "a retry claimed idem:k3 between your read and your write and both ran processCheckout: the reservation must be one atomic SetNX")
+	} else {
+		ctx.Equal(r.Status, 201, "the request that won the SetNX")
+	}
+}
+
+func CheckInFlight(ctx *harness.Ctx) {
+	rec := newCheckoutRecorder(ctx)
+	ctx.Redis.Set("idem:k1", "processing", "EX", 86400)
+	r := rec.post("k1")
+	ctx.Equal(r.Status, 409, "a key whose first request is still processing")
+	ctx.Equal(len(rec.calls), 0, "the in-flight key must not run processCheckout again")
+	held, _ := ctx.Redis.Get("idem:k1")
+	ctx.Equal(held, "processing", "the 409 must leave the running request's reservation in place")
+}
+
+func CheckReplay(ctx *harness.Ctx) {
+	rec := newCheckoutRecorder(ctx)
+	first := rec.post("k1")
+	ctx.Equal(first.Status, 201, "the first request")
+	again := rec.post("k1")
+	other := rec.post("k2")
+	ctx.Equal(again.Status, 200, "the retry with the same key")
+	ctx.Equal(again.Text(), first.Text(), "the replay must return the same body")
+	var doc struct {
+		OrderID string \`json:"order_id"\`
+	}
+	again.Decode(&doc)
+	ctx.Equal(doc.OrderID, "o-1", "the replayed document must be the first response, not a fresh one")
+	ctx.Assert(len(rec.calls) == 2 && other.Status == 201, "the retry must not charge again; a different key is a new order")
+}
+
+func CheckStoreResponse(ctx *harness.Ctx) {
+	rec := newCheckoutRecorder(ctx)
+	r := rec.post("k1")
+	ctx.Equal(r.Status, 201, "POST /checkout with a fresh key")
+	stored, ok := ctx.Redis.Get("idem:k1")
+	ctx.Assert(ok && stored != "processing", "after the response idem:k1 holds %q, expected the JSON response", stored)
+	var storedDoc any
+	ctx.NoError(json.Unmarshal([]byte(stored), &storedDoc), "idem:k1 must hold the JSON response, it holds %q", stored)
+	ctx.Equal(storedDoc, r.JSON(), "the stored document must be the response body")
+	ttl := ctx.Redis.TTL("idem:k1")
+	ctx.Assert(86000 <= ttl && ttl <= 86400, "the stored response has TTL %d, expected 86400 s (same as the reservation)", ttl)
+	processCheckout = func(context.Context, map[string]any) (map[string]any, error) {
+		return nil, errors.New("provider down")
+	}
+	r = rec.post("k3")
+	ctx.Assert(r.Status >= 500, "a failing processCheckout answered %d", r.Status)
+	_, held := ctx.Redis.Get("idem:k3")
+	ctx.Assert(!held, "when processCheckout fails the key must be released, or every retry gets 409 for a day")
 }
 `,
   },

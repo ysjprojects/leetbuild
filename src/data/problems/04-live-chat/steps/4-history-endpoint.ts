@@ -897,6 +897,210 @@ export async function check_cache_control(ctx) {
   assert.deepEqual(directives, ['max-age=5', 'private'], \`Cache-Control is \${JSON.stringify(value)}, expected 'private, max-age=5'\`);
 }
 `,
+    go: `package main
+
+import (
+	"fmt"
+	"slices"
+	"sort"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+const historyHourMs = 3600 * 1000
+
+// historyCall is one call the store saw: op "exists" (room) or "list" (room, before, limit).
+type historyCall struct {
+	op     string
+	room   string
+	before int64
+	limit  int
+}
+
+// historyStore is the provided message store: newest first, Ts < before, at most limit; it
+// records every call.
+type historyStore struct {
+	rooms map[string][]Message
+	calls []historyCall
+}
+
+func (s *historyStore) Exists(room string) bool {
+	s.calls = append(s.calls, historyCall{op: "exists", room: room})
+	_, ok := s.rooms[room]
+	return ok
+}
+
+func (s *historyStore) List(room string, before int64, limit int) []Message {
+	s.calls = append(s.calls, historyCall{op: "list", room: room, before: before, limit: limit})
+	newestFirst := append([]Message(nil), s.rooms[room]...)
+	sort.Slice(newestFirst, func(i, j int) bool { return newestFirst[i].Ts > newestFirst[j].Ts })
+	var out []Message
+	for _, m := range newestFirst {
+		if m.Ts < before && len(out) < limit {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func (s *historyStore) listed() bool {
+	return slices.ContainsFunc(s.calls, func(c historyCall) bool { return c.op == "list" })
+}
+
+// historyApp is the learner's server; every request gets a fresh store holding 120 messages in
+// room-7 (ts = 1000 .. 120000) plus one dated an hour from now, and an empty room "quiet".
+type historyApp struct {
+	ctx    *harness.Ctx
+	client *harness.HTTP
+	store  *historyStore
+}
+
+func newHistoryApp(ctx *harness.Ctx) *historyApp {
+	a := &historyApp{ctx: ctx}
+	a.reset()
+	a.client = ctx.Main(main).HTTP()
+	return a
+}
+
+func (a *historyApp) reset() {
+	room7 := make([]Message, 0, 121)
+	for i := 1; i <= 120; i++ {
+		user := "bo"
+		if i%2 == 1 {
+			user = "ana"
+		}
+		room7 = append(room7, Message{User: user, Text: fmt.Sprintf("message %d", i), Ts: int64(i) * 1000})
+	}
+	room7 = append(room7, Message{User: "cy", Text: "from the future", Ts: a.ctx.Clock.Now() + historyHourMs})
+	a.store = &historyStore{rooms: map[string][]Message{"room-7": room7, "quiet": {}}}
+	store = a.store
+}
+
+// get sends GET path to a fresh store.
+func (a *historyApp) get(path string) *harness.Response {
+	a.reset()
+	return a.client.Get(path)
+}
+
+// historyBody is the JSON page: the whole object and its messages.
+func historyBody(ctx *harness.Ctx, r *harness.Response) (map[string]any, []map[string]any) {
+	body, ok := r.JSON().(map[string]any)
+	ctx.Assert(ok, "the body must be the JSON object {messages: [...], next_before: ...}, got %s", r.Text())
+	raw, ok := body["messages"].([]any)
+	ctx.Assert(ok, "messages must be a JSON array, got %s", r.Text())
+	messages := make([]map[string]any, 0, len(raw))
+	for _, m := range raw {
+		msg, isObject := m.(map[string]any)
+		ctx.Assert(isObject, "every message must be a JSON object, got %s", r.Text())
+		messages = append(messages, msg)
+	}
+	return body, messages
+}
+
+func historyTs(messages []map[string]any) []int64 {
+	ts := make([]int64, len(messages))
+	for i, m := range messages {
+		n, _ := m["ts"].(float64)
+		ts[i] = int64(n)
+	}
+	return ts
+}
+
+func historyTsDown(from int64) []int64 {
+	ts := make([]int64, 10)
+	for i := range ts {
+		ts[i] = (from - int64(i)) * 1000
+	}
+	return ts
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	r := newHistoryApp(ctx).get("/rooms/room-7/messages")
+	ctx.Equal(r.Status, 200, "GET /rooms/room-7/messages")
+	ctx.Assert(strings.HasPrefix(r.Header.Get("Content-Type"), "application/json"), "Content-Type is %q, expected JSON", r.Header.Get("Content-Type"))
+	body, ok := r.JSON().(map[string]any)
+	_, hasMessages := body["messages"]
+	_, hasNext := body["next_before"]
+	ctx.Assert(ok && hasMessages && hasNext, "the body must be {messages: [...], next_before: ...}, got %s", r.Text())
+	_, messages := historyBody(ctx, r)
+	ctx.Equal(len(messages), 50, "the messages on the default page (limit = 50)")
+	first := messages[0]
+	ctx.Equal(first, map[string]any{"user": "bo", "text": "message 120", "ts": float64(120000)}, "the first message of the page must be the newest one (ts 120000)")
+}
+
+func CheckLimitBounds(ctx *harness.Ctx) {
+	a := newHistoryApp(ctx)
+	for _, limit := range []int{0, 101, -5} {
+		r := a.get(fmt.Sprintf("/rooms/room-7/messages?limit=%d", limit))
+		ctx.Equal(r.Status, 400, "limit=%d", limit)
+		ctx.Assert(len(a.store.calls) == 0, "limit=%d must be rejected before touching the store, but the store saw %v", limit, a.store.calls)
+	}
+	for _, c := range [][2]int{{1, 1}, {100, 100}} {
+		limit, n := c[0], c[1]
+		r := a.get(fmt.Sprintf("/rooms/room-7/messages?limit=%d", limit))
+		ctx.Equal(r.Status, 200, "limit=%d is within 1-100", limit)
+		_, messages := historyBody(ctx, r)
+		ctx.Equal(len(messages), n, "the messages limit=%d returned", limit)
+	}
+}
+
+func CheckUnknownRoom(ctx *harness.Ctx) {
+	a := newHistoryApp(ctx)
+	r := a.get("/rooms/nowhere/messages")
+	ctx.Equal(r.Status, 404, "an unknown room")
+	ctx.Assert(slices.Contains(a.store.calls, historyCall{op: "exists", room: "nowhere"}), "the handler must ask store.Exists(%q); the store saw %v", "nowhere", a.store.calls)
+	ctx.Assert(!a.store.listed(), "an unknown room must not be listed, but the store saw %v", a.store.calls)
+	r = a.get("/rooms/nowhere/messages?limit=0")
+	ctx.Equal(r.Status, 400, "a bad limit on an unknown room (validate before the store lookup)")
+	ctx.Assert(len(a.store.calls) == 0, "a bad limit must be rejected before store.Exists, but the store saw %v", a.store.calls)
+	r = a.get("/rooms/quiet/messages")
+	ctx.Equal(r.Status, 200, "an existing but empty room")
+	ctx.Equal(r.JSON(), map[string]any{"messages": []any{}, "next_before": nil}, "an empty room must answer {messages: [], next_before: null}")
+}
+
+func CheckNextBefore(ctx *harness.Ctx) {
+	a := newHistoryApp(ctx)
+	r := a.client.Get("/rooms/room-7/messages?limit=10")
+	ctx.Equal(r.Status, 200, "GET ...?limit=10")
+	var lists []historyCall
+	for _, c := range a.store.calls {
+		if c.op == "list" {
+			lists = append(lists, c)
+		}
+	}
+	ctx.Assert(len(lists) == 1 && lists[0].room == "room-7" && lists[0].limit == 10, "expected one store.List(%q, <now>, 10), the store saw %v", "room-7", a.store.calls)
+	before := lists[0].before
+	now := ctx.Clock.Now()
+	ctx.Assert(before-now < 60000 && now-before < 60000, "without ?before the store was asked for ts < %d, expected about now (%d ms)", before, now)
+	body, messages := historyBody(ctx, r)
+	ctx.Equal(historyTs(messages), historyTsDown(120), "the ts on the first page (newest first, 'from the future' excluded because before defaults to now)")
+	ctx.Equal(body["next_before"], 111000, "next_before must be the ts of the last message on the page")
+	r = a.client.Get("/rooms/room-7/messages?before=111000&limit=10")
+	ctx.Equal(r.Status, 200, "GET ...?before=111000&limit=10")
+	ctx.Equal(a.store.calls[len(a.store.calls)-1], historyCall{op: "list", room: "room-7", before: 111000, limit: 10}, "the second page must list (room-7, 111000, 10)")
+	body, messages = historyBody(ctx, r)
+	ctx.Equal(historyTs(messages), historyTsDown(110), "the ts on the second page")
+	ctx.Equal(body["next_before"], 101000, "next_before of the second page")
+	r = a.client.Get("/rooms/room-7/messages?before=5000&limit=10")
+	body, messages = historyBody(ctx, r)
+	ctx.Equal(len(messages), 4, "before=5000 leaves 4 messages")
+	ctx.Equal(body["next_before"], nil, "a page shorter than limit is the last one: next_before must be null")
+}
+
+func CheckCacheControl(ctx *harness.Ctx) {
+	r := newHistoryApp(ctx).get("/rooms/room-7/messages?limit=5")
+	ctx.Equal(r.Status, 200, "GET /rooms/room-7/messages?limit=5")
+	value := r.Header.Get("Cache-Control")
+	ctx.Assert(value != "", "the response carries no Cache-Control header")
+	var directives []string
+	for _, d := range strings.Split(value, ",") {
+		directives = append(directives, strings.ToLower(strings.TrimSpace(d)))
+	}
+	slices.Sort(directives)
+	ctx.Equal(directives, []string{"max-age=5", "private"}, "the Cache-Control directives in %q", value)
+}
+`,
   },
   debrief: `The endpoint is a cursor-paginated read: validate, authorise the resource (404), fetch one page, hand back the cursor for the next. \`next_before\` being derived from the data rather than from arithmetic is what makes it stable while new messages arrive. \`Cache-Control: private\` is the header people forget: without it a CDN or corporate proxy could happily serve one person's private room to the next. Real APIs sign or opaque-encode the cursor, cap the total scroll depth, and add \`ETag\`s so a repeated page costs a 304.`,
 };

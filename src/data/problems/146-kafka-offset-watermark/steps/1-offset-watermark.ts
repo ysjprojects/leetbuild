@@ -903,6 +903,108 @@ export async function check_commit_after(ctx) {
     }
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"slices"
+
+	"leetbuild/harness"
+)
+
+// seedTransfers puts transfers on one partition, in this order: account, delta, account, delta…
+func seedTransfers(ctx *harness.Ctx, partition int, pairs ...any) {
+	for i := 0; i+1 < len(pairs); i += 2 {
+		account := pairs[i].(string)
+		ctx.Kafka.SeedPartition("transfers", partition, account, fmt.Sprintf(\`{"account":%q,"delta":%d}\`, account, pairs[i+1]))
+	}
+}
+
+// drainBalances runs the consumer until it waits for transfers that will not come.
+func drainBalances(ctx *harness.Ctx) { ctx.Drain(func() { run(context.Background()) }) }
+
+func CheckApplies(ctx *harness.Ctx) {
+	seedTransfers(ctx, 0, "a", 100, "a", -30)
+	seedTransfers(ctx, 1, "b", 50, "b", -50)
+	seedTransfers(ctx, 2, "c", 7)
+	drainBalances(ctx)
+	ctx.Equal(store().Applied, map[string]int64{"a": 70, "b": 0, "c": 7}, "the balances")
+}
+
+func CheckManualCommit(ctx *harness.Ctx) {
+	seedTransfers(ctx, 0, "a", 1, "b", 2)
+	drainBalances(ctx)
+	subscriptions := ctx.Kafka.EventsOf("subscribe")
+	ok := len(subscriptions) > 0
+	if ok {
+		last := subscriptions[len(subscriptions)-1]
+		ok = last.Group == "balances" && slices.Contains(last.Topics, "transfers")
+	}
+	ctx.Assert(ok, "the consumer must subscribe to transfers in group balances")
+	ctx.Equal(len(ctx.Kafka.EventsOf("auto-commit")), 0, "offsets were committed on a timer, before the apply: auto-commits")
+	ctx.Assert(len(ctx.Kafka.EventsOf("manual-commit")) > 0, "no explicit commit happened")
+	ctx.Equal(ctx.Kafka.CommittedOffset("balances", "transfers", 0), 2, "partition 0's committed offset")
+	ctx.Equal(ctx.Kafka.Lag("balances", "transfers"), 0, "every processed record must be committed: lag")
+}
+
+func CheckSkipsRedelivery(ctx *harness.Ctx) {
+	seedTransfers(ctx, 0, "a", 10, "a", 5, "b", 3)
+	seedTransfers(ctx, 1, "b", 4)
+	drainBalances(ctx)
+	before := store()
+	ctx.Equal(before.Applied, map[string]int64{"a": 15, "b": 7}, "the balances after the first run")
+	// The commits for offsets 1 and 2 of partition 0 never landed: the group resumes from 1.
+	ctx.Kafka.Commit("balances", harness.KafkaOffsets{harness.KafkaTopicPartition{Topic: "transfers", Partition: 0}: 1})
+	restart()
+	drainBalances(ctx)
+	after := store()
+	ctx.Equal(after.Applied, map[string]int64{"a": 15, "b": 7}, "redelivered records must not be applied again: the balances")
+	ctx.Equal(after.Watermark, before.Watermark, "the watermark must not move on a redelivery")
+	ctx.Equal(ctx.Kafka.CommittedOffset("balances", "transfers", 0), 3, "skipped records must still be committed, or they are redelivered forever: partition 0's committed offset")
+	ctx.Equal(ctx.Kafka.Lag("balances", "transfers"), 0, "every record must be committed after the restart: lag")
+}
+
+func CheckWatermark(ctx *harness.Ctx) {
+	seedTransfers(ctx, 0, "a", 1, "a", 1, "a", 1)
+	seedTransfers(ctx, 1, "b", 1, "b", 1)
+	drainBalances(ctx)
+	ctx.Equal(store().Watermark, map[int]int64{0: 2, 1: 1}, "the watermark (the last applied offset per partition, no entry for partition 2)")
+}
+
+func CheckFreshPartition(ctx *harness.Ctx) {
+	seedTransfers(ctx, 2, "z", 9)
+	drainBalances(ctx)
+	s := store()
+	ctx.Equal(s.Applied, map[string]int64{"z": 9}, "the first record of a partition (offset 0) must be applied: the balances")
+	ctx.Equal(s.Watermark, map[int]int64{2: 0}, "the watermark")
+}
+
+func CheckCommitAfter(ctx *harness.Ctx) {
+	seedTransfers(ctx, 0, "a", 5, "a", 6)
+	type commitSnapshot struct {
+		offsets harness.KafkaOffsets
+		store   Store
+	}
+	var atCommit []commitSnapshot
+	ctx.Kafka.OnCommit(func(_ string, offsets harness.KafkaOffsets) {
+		atCommit = append(atCommit, commitSnapshot{offsets, store()})
+	})
+	drainBalances(ctx)
+	ctx.Assert(len(atCommit) > 0, "the offsets were never committed")
+	expected := map[int64]int64{1: 5, 2: 11}
+	for _, c := range atCommit {
+		for tp, offset := range c.offsets {
+			var wm any
+			if w, ok := c.store.Watermark[tp.Partition]; ok {
+				wm = w
+			}
+			ctx.Equal(wm, offset-1, "committing %s → %d: the watermark must move before the commit; the watermark", tp, offset)
+			ctx.Equal(c.store.Applied["a"], expected[offset], "committing offset %d: the apply must come before the commit; a", offset)
+		}
+	}
+}
+`,
   },
   debrief: `The commit never became safer — it is still process-then-commit, still at-least-once — the *apply* became idempotent, and that is the only place idempotence can live, because only the consumer knows what it has done. A watermark works because offsets are a per-partition total order: one integer summarises every record applied before it, so the check is a comparison, not a lookup in a set of seen ids, and the store never grows with the traffic. Two details carry the drill: the default is \`-1\` because the first record of a partition is offset 0, and the watermark moves *before* the commit so that a crash anywhere leaves the store ahead of (or equal to) the broker, never behind. Real systems keep the balance and the watermark in one durable write — a database row updated in the same transaction, a Kafka Streams state store, a Flink checkpoint — because an in-memory watermark that dies with the process is exactly the crash this drill pretends did not happen; they also reset the watermark when a partition is reassigned to another instance, which is why the store is keyed by partition and not by consumer.`,
 };

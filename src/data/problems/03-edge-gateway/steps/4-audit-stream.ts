@@ -225,6 +225,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"math"
 	"sync/atomic"
 	"time"
 
@@ -233,7 +234,7 @@ import (
 
 const (
 	topic     = "gateway-audit"
-	queueSize = 10000
+	queueSize = 1000
 )
 
 var writer = &kafka.Writer{
@@ -259,7 +260,7 @@ type auditRecord struct {
 
 // audit is called after the response is written; it must never block the request.
 func audit(apiKey, path string, status int, latency time.Duration) {
-	value, _ := json.Marshal(auditRecord{APIKey: apiKey, Path: path, Status: status, LatencyMs: float64(latency.Microseconds()) / 1000, Ts: float64(time.Now().UnixMilli()) / 1000})
+	value, _ := json.Marshal(auditRecord{APIKey: apiKey, Path: path, Status: status, LatencyMs: math.Round(float64(latency.Microseconds())/100) / 10, Ts: float64(time.Now().UnixMilli()) / 1000})
 	// TODO: non-blocking send into queue keyed by apiKey; when full, dropped.Add(1) instead of waiting
 	_ = value
 }
@@ -290,6 +291,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"math"
 	"sync/atomic"
 	"time"
 
@@ -298,7 +300,7 @@ import (
 
 const (
 	topic     = "gateway-audit"
-	queueSize = 10000
+	queueSize = 1000
 )
 
 var writer = &kafka.Writer{
@@ -324,7 +326,7 @@ type auditRecord struct {
 
 // audit is called after the response is written; it must never block the request.
 func audit(apiKey, path string, status int, latency time.Duration) {
-	value, _ := json.Marshal(auditRecord{APIKey: apiKey, Path: path, Status: status, LatencyMs: float64(latency.Microseconds()) / 1000, Ts: float64(time.Now().UnixMilli()) / 1000})
+	value, _ := json.Marshal(auditRecord{APIKey: apiKey, Path: path, Status: status, LatencyMs: math.Round(float64(latency.Microseconds())/100) / 10, Ts: float64(time.Now().UnixMilli()) / 1000})
 	select {
 	case queue <- kafka.Message{Key: []byte(apiKey), Value: value}:
 	default:
@@ -661,6 +663,120 @@ export async function check_non_blocking(ctx) {
   }
   const waited = (ctx.clock.now() - before) / 1000;
   assert(waited < 1 && ctx.clock.sleeps === 0, \`audit() waited \${waited.toFixed(1)} s for a stalled broker's acknowledgement: the request thread never waits for a broker, hand the record to the producer and return\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"leetbuild/harness"
+)
+
+const auditTopic = "gateway-audit"
+
+// auditBoot starts the pump as the gateway does at boot, and lets it reach its first wait.
+func auditBoot(ctx *harness.Ctx) {
+	go pump(context.Background())
+	ctx.Settle()
+}
+
+// auditBound is the producer's bound: the queue's capacity.
+func auditBound(ctx *harness.Ctx) int {
+	max := cap(queue)
+	ctx.Assert(max > 0, "cap(queue) is %d, expected a positive bound on the records in flight", max)
+	ctx.Assert(max <= 5000, "cap(queue) is %d: a bound that large is no bound for a gateway, keep it at 1000 or below", max)
+	return max
+}
+
+// auditMustReturn calls audit and fails the check with why when it panics.
+func auditMustReturn(ctx *harness.Ctx, why, path string) {
+	defer func() {
+		if e := recover(); e != nil {
+			ctx.Fatalf("audit() failed the request %s: %v", why, e)
+		}
+	}()
+	audit("k1", path, 200, time.Millisecond)
+}
+
+func CheckTopicKey(ctx *harness.Ctx) {
+	auditBoot(ctx)
+	audit("k1", "/items/42", 200, 12340*time.Microsecond)
+	audit("k2", "/items/7", 404, 3*time.Millisecond)
+	audit("k1", "/items/9", 200, time.Millisecond)
+	ctx.Settle()
+	records := ctx.Kafka.Records(auditTopic)
+	ctx.Equal(len(records), 3, "three audit() calls must produce three records on gateway-audit; the records")
+	ctx.Equal(ctx.Kafka.Keys(auditTopic), []string{"k1", "k2", "k1"}, "records must be keyed by the API key")
+	ctx.Equal(records[0].Partition, records[2].Partition, "the same API key must land on the same partition so one caller's trail stays ordered; k1's partitions")
+	var first map[string]any
+	err := json.Unmarshal(records[0].Value, &first)
+	ctx.Assert(err == nil && first["api_key"] == "k1" && first["path"] == "/items/42" && fmt.Sprint(first["status"]) == "200", "the value must be JSON with api_key, path, status, latency_ms, ts: %s", records[0].Value)
+	ctx.Equal(first["latency_ms"], 12.3, "latency_ms")
+	_, hasTS := first["ts"]
+	ctx.Assert(hasTS, "the record carries no ts: %s", records[0].Value)
+}
+
+func CheckBoundedQueue(ctx *harness.Ctx) {
+	max := auditBound(ctx)
+	// the broker stops acknowledging and the pump is not running: nothing handed over leaves the queue
+	ctx.Kafka.Stall(auditTopic)
+	for i := range max {
+		audit("k1", fmt.Sprintf("/items/%d", i), 200, time.Millisecond)
+	}
+	ctx.Equal(dropped.Load(), 0, "records dropped before the queue reached its bound of %d", max)
+	for range 3 {
+		audit("k1", "/items/42", 200, time.Millisecond)
+	}
+	ctx.Assert(dropped.Load() > 0, "%d audit() calls on a stalled broker and nothing was dropped: the queue is unbounded, a slow broker grows it until the gateway runs out of memory", max+3)
+	ctx.Equal(dropped.Load(), 3, "dropped after %d records on a stalled broker with a bound of %d", max+3, max)
+	ctx.Equal(len(ctx.Kafka.Records(auditTopic)), 0, "nothing can reach the topic while the broker is stalled; the records")
+}
+
+func CheckDropOnFull(ctx *harness.Ctx) {
+	max := auditBound(ctx)
+	// the broker stops acknowledging and the pump is not running: nothing handed over leaves the queue
+	ctx.Kafka.Stall(auditTopic)
+	for i := range max {
+		audit("k1", fmt.Sprintf("/items/%d", i), 200, time.Millisecond) // the queue is now full
+	}
+	for range 3 {
+		auditMustReturn(ctx, "when the queue was full (drop the record and count it instead)", "/items/42") // must neither panic nor wait
+	}
+	ctx.Equal(len(ctx.Kafka.Records(auditTopic)), 0, "nothing can be produced while the queue is full; the records")
+	ctx.Equal(dropped.Load(), 3, "dropped after three refused records")
+	ctx.Equal(ctx.Clock.Sleeps(), 0, "a full queue must be handled by dropping, not by sleeping and retrying; the sleeps")
+	ctx.Kafka.Resume(auditTopic)
+	auditBoot(ctx)
+	ctx.Clock.Advance(31) // the broker is back: the queued records are acknowledged
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(auditTopic)), max, "once the broker answers again the %d queued records must be delivered; the records on the topic", max)
+	audit("k1", "/items/after", 200, time.Millisecond)
+	ctx.Settle()
+	values := ctx.Kafka.Values(auditTopic)
+	ctx.Assert(len(values) > 0 && strings.Contains(values[len(values)-1], "/items/after"), "once the queue has room, audit records flow again")
+	ctx.Equal(dropped.Load(), 3, "dropped after a successful produce must stay at 3")
+}
+
+func CheckNonBlocking(ctx *harness.Ctx) {
+	auditBoot(ctx)
+	for i := range 3 {
+		audit("k1", fmt.Sprintf("/items/%d", i), 200, time.Millisecond)
+	}
+	// the pump's writer may wait out its BatchTimeout once audit() returned: only audit()'s own sleeps count
+	sleeps := ctx.Clock.Sleeps()
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(auditTopic)), 3, "three audit() calls must produce three records; the records")
+	ctx.Equal(sleeps, 0, "audit() must not sleep or wait; the sleeps")
+	ctx.Kafka.Stall(auditTopic) // the broker stops answering: the request must not notice
+	before, sleeps := ctx.Clock.Now(), ctx.Clock.Sleeps()
+	auditMustReturn(ctx, "because the broker was slow (hand the record to the producer and return)", "/items/slow")
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited < 1 && ctx.Clock.Sleeps() == sleeps, "audit() waited %.1f s for a stalled broker's acknowledgement: the request thread never waits for a broker, hand the record to the producer and return", waited)
 }
 `,
   },

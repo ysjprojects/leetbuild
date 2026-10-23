@@ -1085,6 +1085,234 @@ export async function check_as_of(ctx) {
   assert.equal(String(ctx.redis.get(KEY)), '3499', 'a point-in-time balance must not overwrite the cached current balance');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"database/sql"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	ledgerdb "ledger/db"
+	pb "ledger/gen/ledger"
+	"leetbuild/harness"
+)
+
+const balSchema = \`
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL REFERENCES transactions (id),
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL CHECK (amount <> 0),
+    posted_at bigint NOT NULL
+);
+\`
+
+const (
+	balT0  = 1700000000000
+	balKey = "bal:cash:acquirer:EUR"
+)
+
+type balEntry struct {
+	account, currency string
+	amount            int64
+}
+
+func balPair(debit, credit, currency string, amount int64) []balEntry {
+	return []balEntry{{debit, currency, amount}, {credit, currency, -amount}}
+}
+
+// balJournal: a capture, a partial refund a second later, a USD capture.
+var balJournal = []struct {
+	eventID  string
+	entries  []balEntry
+	postedAt int64
+}{
+	{"evt-capture", balPair("cash:acquirer", "clearing:payments", "EUR", 4999), balT0},
+	{"evt-refund", balPair("clearing:payments", "cash:acquirer", "EUR", 1500), balT0 + 1000},
+	{"evt-usd", balPair("cash:acquirer", "clearing:payments", "USD", 700), balT0 + 2000},
+}
+
+// balWrite is the real journal writer (step 4): one database transaction, insert-or-skip on the
+// event id, then the learner's invalidate for every entry.
+func balWrite(ctx *harness.Ctx, entries []balEntry, description, eventID string, postedAt int64) {
+	bg := context.Background()
+	transactionID := uuid.NewString()
+	duplicate := false
+	err := ledgerdb.Transaction(bg, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(bg,
+			"INSERT INTO transactions (id, event_id, description, settles, posted_at) VALUES ($1, $2, $3, NULL, $4) ON CONFLICT (event_id) DO NOTHING",
+			transactionID, eventID, description, postedAt)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			duplicate = true
+			return nil
+		}
+		for _, e := range entries {
+			if _, err := tx.ExecContext(bg,
+				"INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES ($1, $2, $3, $4, $5)",
+				transactionID, e.account, e.currency, e.amount, postedAt); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	ctx.NoError(err, "the journal writer failed")
+	if duplicate {
+		return
+	}
+	for _, e := range entries {
+		invalidate(bg, e.account, e.currency)
+	}
+}
+
+// balStart fills the journal through the real writer (step 4), starts the learner's server and
+// returns a client on it.
+func balStart(ctx *harness.Ctx) pb.LedgerServiceClient {
+	ctx.DB.Reset(balSchema)
+	for _, j := range balJournal {
+		balWrite(ctx, j.entries, "seed", j.eventID, j.postedAt)
+	}
+	ctx.Main(main)
+	return pb.NewLedgerServiceClient(ctx.GRPC.Dial("ledger:9100"))
+}
+
+// balCorrectInSQL is a correction applied straight in SQL by an operator, outside the writer:
+// nothing invalidates the cache.
+func balCorrectInSQL(ctx *harness.Ctx, name, account string, amount, postedAt int64) {
+	ctx.DB.Exec("INSERT INTO transactions (id, description, posted_at) VALUES ($1, 'correction', $2)", name, postedAt)
+	ctx.DB.Exec("INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES ($1, $2, 'EUR', $3, $4)", name, account, amount, postedAt)
+	ctx.DB.Exec("INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES ($1, 'revenue:adjustments', 'EUR', $2, $3)", name, -amount, postedAt)
+}
+
+// balReads counts the reads of the entries table in the database's query log.
+func balReads(ctx *harness.Ctx) int {
+	n := 0
+	for _, q := range ctx.DB.Queries() {
+		text := strings.ToLower(strings.TrimSpace(q.SQL))
+		if strings.HasPrefix(text, "select") && strings.Contains(text, "entries") {
+			n++
+		}
+	}
+	return n
+}
+
+func balCall(client pb.LedgerServiceClient, account, currency string, asOf int64) (*pb.Balance, error) {
+	deadline, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return client.GetBalance(deadline, &pb.BalanceRequest{Account: account, Currency: currency, AsOf: asOf})
+}
+
+func balBalance(ctx *harness.Ctx, client pb.LedgerServiceClient, account, currency string, asOf int64) *pb.Balance {
+	reply, err := balCall(client, account, currency, asOf)
+	if err != nil {
+		ctx.Fatalf("GetBalance(%s, %s, as_of=%d) failed with %v: %s", account, currency, asOf, status.Code(err), status.Convert(err).Message())
+	}
+	ctx.Assert(reply != nil, "GetBalance(%s, %s, as_of=%d) must answer a Balance", account, currency, asOf)
+	return reply
+}
+
+func balCode(client pb.LedgerServiceClient, account, currency string, asOf int64) codes.Code {
+	_, err := balCall(client, account, currency, asOf)
+	return status.Code(err)
+}
+
+func CheckServesBalance(ctx *harness.Ctx) {
+	client := balStart(ctx)
+	reply := balBalance(ctx, client, "cash:acquirer", "EUR", 0)
+	ctx.Equal(reply.GetAmount(), 3499, "cash:acquirer EUR is 4999 - 1500")
+	ctx.Equal([]string{reply.GetAccount(), reply.GetCurrency()}, []string{"cash:acquirer", "EUR"}, "the reply must echo account and currency")
+	now := time.Now().UnixMilli()
+	ctx.Assert(reply.GetAsOf()-now < 5000 && now-reply.GetAsOf() < 5000, "for AsOf 0 the reply's AsOf is now (%d), got %d", now, reply.GetAsOf())
+	usd := balBalance(ctx, client, "cash:acquirer", "USD", 0)
+	ctx.Equal(usd.GetAmount(), 700, "cash:acquirer USD")
+	clearing := balBalance(ctx, client, "clearing:payments", "EUR", 0)
+	ctx.Equal(clearing.GetAmount(), -3499, "clearing:payments EUR is -4999 + 1500")
+}
+
+func CheckInvalidArgument(ctx *harness.Ctx) {
+	client := balStart(ctx)
+	before := balReads(ctx)
+	for _, c := range [][2]string{{"cash:acquirer", "eur"}, {"cash:acquirer", "EURO"}, {"cash:acquirer", ""}, {"", "EUR"}} {
+		ctx.Equal(balCode(client, c[0], c[1], 0), codes.InvalidArgument, "account %q currency %q", c[0], c[1])
+	}
+	ctx.Equal(balReads(ctx), before, "a request rejected as InvalidArgument must not query the database: reads of entries")
+	keys := ctx.Redis.Keys("bal:*")
+	ctx.Assert(len(keys) == 0, "a request rejected as InvalidArgument must not touch the cache, found %q", keys)
+}
+
+func CheckNotFound(ctx *harness.Ctx) {
+	client := balStart(ctx)
+	ctx.Equal(balCode(client, "cash:nowhere", "EUR", 0), codes.NotFound, "an account with no entries")
+	_, cached := ctx.Redis.Get("bal:cash:nowhere:EUR")
+	ctx.Assert(!cached, "a NotFound must not be cached as a balance")
+	gbp := balBalance(ctx, client, "cash:acquirer", "GBP", 0)
+	ctx.Equal(gbp.GetAmount(), 0, "a known account with no GBP entries has a GBP balance of 0 (not NotFound)")
+	ctx.Equal(balCode(client, "cash:nowhere", "EUR", balT0), codes.NotFound, "an unknown account is NotFound at any AsOf")
+}
+
+func CheckCache(ctx *harness.Ctx) {
+	client := balStart(ctx)
+	before := balReads(ctx)
+	first := balBalance(ctx, client, "cash:acquirer", "EUR", 0)
+	ctx.Equal(first.GetAmount(), 3499, "cash:acquirer EUR")
+	ctx.Equal(balReads(ctx)-before, 1, "the first current balance is a cache miss: queries")
+	cached, ok := ctx.Redis.Get(balKey)
+	ctx.Assert(ok, "after a miss the balance must be stored under %s", balKey)
+	ctx.Equal(cached, "3499", "%s holds", balKey)
+	ttl := ctx.Redis.TTL(balKey)
+	ctx.Assert(1 <= ttl && ttl <= 5, "%s has TTL %d, expected 5 s", balKey, ttl)
+	// An operator books +100 straight in SQL: no invalidation, so for up to 5 s the cache still answers.
+	balCorrectInSQL(ctx, "fix-1", "cash:acquirer", 100, balT0+3000)
+	second := balBalance(ctx, client, "cash:acquirer", "EUR", 0)
+	ctx.Equal(second.GetAmount(), 3499, "within 5 s the current balance must come from the cache (3499), not from the database")
+	ctx.Equal(balReads(ctx), before+1, "the second current balance within 5 s must come from Redis, but the database was queried: reads of entries")
+	ctx.Clock.Advance(6)
+	third := balBalance(ctx, client, "cash:acquirer", "EUR", 0)
+	ctx.Equal(third.GetAmount(), 3599, "after the 5 s TTL the cached balance must have expired and be recomputed")
+	// A write through the journal writer invalidates: the very next read sees it.
+	balWrite(ctx, balPair("cash:acquirer", "revenue:fees", "EUR", 1), "fee", "evt-fee", balT0+4000)
+	_, ok = ctx.Redis.Get(balKey)
+	ctx.Assert(!ok, "after a write to cash:acquirer EUR, invalidate(ctx, account, currency) must have deleted %s", balKey)
+	fourth := balBalance(ctx, client, "cash:acquirer", "EUR", 0)
+	ctx.Equal(fourth.GetAmount(), 3600, "right after a write the next read must hit the database")
+}
+
+func CheckAsOf(ctx *harness.Ctx) {
+	client := balStart(ctx)
+	atT0 := balBalance(ctx, client, "cash:acquirer", "EUR", balT0)
+	ctx.Equal(atT0.GetAmount(), 4999, "as of T0 only the capture is posted")
+	ctx.Equal(atT0.GetAsOf(), balT0, "the reply's AsOf must be the requested time")
+	earlier := balBalance(ctx, client, "cash:acquirer", "EUR", balT0-1)
+	ctx.Equal(earlier.GetAmount(), 0, "as of T0 - 1 nothing is posted yet")
+	later := balBalance(ctx, client, "cash:acquirer", "EUR", balT0+1000)
+	ctx.Equal(later.GetAmount(), 3499, "as of T0 + 1 s the refund is posted too")
+	keys := ctx.Redis.Keys("bal:*")
+	ctx.Assert(len(keys) == 0, "a point-in-time balance must not be cached, found %q", keys)
+	current := balBalance(ctx, client, "cash:acquirer", "EUR", 0)
+	_, cached := ctx.Redis.Get(balKey)
+	ctx.Assert(current.GetAmount() == 3499 && cached, "the current balance must be cached")
+	// A backdated correction straight in SQL: the history changes, the cached current balance does not know.
+	balCorrectInSQL(ctx, "fix-1", "cash:acquirer", 100, balT0-500)
+	historical := balBalance(ctx, client, "cash:acquirer", "EUR", balT0)
+	ctx.Equal(historical.GetAmount(), 5099, "a point-in-time balance must come from the database (5099 as of T0 after the correction)")
+	still, _ := ctx.Redis.Get(balKey)
+	ctx.Equal(still, "3499", "a point-in-time balance must not overwrite the cached current balance")
+}
+`,
   },
   debrief: `The balance is a fold over the journal, which is why the read side can be cached so aggressively and so briefly: the five-second TTL only matters when an invalidation is lost, because every committed write deletes the key itself. The point-in-time branch bypasses the cache because its answer never changes — the journal is immutable, so "the balance as of Tuesday" is the same number whenever you ask, and caching it under the current key would poison the current balance. Returning NOT_FOUND from the same query that computes the sum avoids a second round trip and a race between them. Real balance services keep running balances per account as a materialised view updated by the writer, snapshot them nightly so a historical query folds a day of entries instead of years, and serve the gRPC streams of balance changes that dashboards subscribe to.`,
 };

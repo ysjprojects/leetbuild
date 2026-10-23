@@ -601,6 +601,198 @@ export async function check_claim_first(ctx) {
   assert.equal(pixel(ctx, api, 3, 7), 5, "bo's tile must be painted");
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"strconv"
+
+	"leetbuild/harness"
+)
+
+var cdBg = context.Background()
+
+func cdBoard(ctx *harness.Ctx) []byte {
+	board, _ := ctx.Redis.Get("board")
+	return []byte(board)
+}
+
+func cdPixel(ctx *harness.Ctx, x, y int) int {
+	b := cdBoard(ctx)
+	if off := y*size + x; off < len(b) {
+		return int(b[off])
+	}
+	return 0
+}
+
+func cdZeros(b []byte) int {
+	n := 0
+	for _, c := range b {
+		if c == 0 {
+			n++
+		}
+	}
+	return n
+}
+
+func cdPlace(ctx *harness.Ctx, user string, x, y, color int) int {
+	wait, err := placeTile(cdBg, user, x, y, color)
+	ctx.NoError(err, "placeTile(ctx, %q, %d, %d, %d) returned an error", user, x, y, color)
+	return wait
+}
+
+// cdRival is a parallel request that runs right after the first command on key; the function it
+// returns gives what that request's placeTile returned, its own error failing the check.
+func cdRival(ctx *harness.Ctx, key, user string, x, y, color int) func(what string) int {
+	var wait int
+	var err error
+	probe := ctx.Redis.After(key, func() any {
+		wait, err = placeTile(cdBg, user, x, y, color)
+		return nil
+	})
+	return func(what string) int {
+		ctx.Assert(probe.Fired, "placeTile never touched %s", what)
+		ctx.Assert(probe.Err == nil, "the parallel placeTile(ctx, %q, %d, %d, %d) failed: %v", user, x, y, color, probe.Err)
+		ctx.NoError(err, "the parallel placeTile(ctx, %q, %d, %d, %d) returned an error", user, x, y, color)
+		return wait
+	}
+}
+
+// cdAPI is POST /place as step 1 deploys it, over this placeTile: 429 with Retry-After for a
+// user on cooldown, 200 once the tile is painted.
+func cdAPI(ctx *harness.Ctx) *harness.HTTP {
+	return ctx.HTTP(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		var req struct {
+			X     int    \`json:"x"\`
+			Y     int    \`json:"y"\`
+			Color int    \`json:"color"\`
+			User  string \`json:"user"\`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			rw.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		wait, err := placeTile(r.Context(), req.User, req.X, req.Y, req.Color)
+		switch {
+		case err != nil:
+			rw.WriteHeader(http.StatusServiceUnavailable)
+		case wait > 0:
+			rw.Header().Set("Retry-After", strconv.Itoa(wait))
+			rw.WriteHeader(http.StatusTooManyRequests)
+		default:
+			rw.WriteHeader(http.StatusOK)
+		}
+	}))
+}
+
+func CheckCooldownKey(ctx *harness.Ctx) {
+	ctx.Equal(cdPlace(ctx, "ana", 3, 7, 12), 0, "a user who never placed a tile is free: placeTile must return 0")
+	ctx.Assert(ctx.Redis.Exists("cooldown:ana") == 1, "after a placement the key cooldown:ana must exist (keys: %s)", harness.Show(ctx.Redis.Keys("*")))
+	ttl := ctx.Redis.TTL("cooldown:ana")
+	ctx.Assert(295 <= ttl && ttl <= 300, "cooldown:ana expires in %d s, expected cooldown = 300 s", ttl)
+	ctx.Equal(cdPlace(ctx, "bo", 3, 8, 1), 0, "the cooldown is per user: bo is not affected by ana's tile")
+	ctx.Clock.Advance(299)
+	ctx.Assert(cdPlace(ctx, "ana", 4, 7, 1) > 0, "299 s after her tile ana is still on cooldown: placeTile must refuse")
+	ctx.Clock.Advance(2)
+	ctx.Equal(ctx.Redis.Exists("cooldown:ana"), 0, "cooldown:ana must be gone after 300 s")
+	ctx.Equal(cdPlace(ctx, "ana", 3, 7, 12), 0, "once the key expired the user is free again")
+}
+
+func CheckAtomicNx(ctx *harness.Ctx) {
+	// A bot fires two requests at once; they reach two app servers. The second one runs right after
+	// the first one's first command on cooldown:ana, the gap Reddit's check-then-write left open.
+	settled := cdRival(ctx, "cooldown:ana", "ana", 4, 7, 5)
+	mine := cdPlace(ctx, "ana", 3, 7, 12)
+	theirs := settled("cooldown:ana")
+	switch {
+	case mine == 0 && theirs == 0:
+		ctx.Fatalf("two parallel placements by ana returned %d and %d: both were painted. A check followed by a separate write lets every parallel request through (about 15 000 tiles slipped past r/place's cooldown that way); let one SET … NX decide", mine, theirs)
+	case mine != 0 && theirs != 0:
+		ctx.Fatalf("two parallel placements by ana returned %d and %d: neither was painted, but one of them must win", mine, theirs)
+	}
+	won, lost := [3]int{3, 7, 12}, [2]int{4, 7}
+	if mine != 0 {
+		won, lost = [3]int{4, 7, 5}, [2]int{3, 7}
+	}
+	ctx.Equal(cdPixel(ctx, won[0], won[1]), won[2], "the winning placement returned 0, so (%d, %d) must show its colour", won[0], won[1])
+	ctx.Equal(cdPixel(ctx, lost[0], lost[1]), 0, "the refused placement painted (%d, %d) anyway", lost[0], lost[1])
+	wait := cdPlace(ctx, "ana", 5, 7, 1)
+	ctx.Assert(wait > 0, "a later tile from the same user within 300 s must be refused, but placeTile returned %d", wait)
+}
+
+func CheckPaint(ctx *harness.Ctx) {
+	off := 7*size + 3
+	cdPlace(ctx, "ana", 3, 7, 12)
+	b := cdBoard(ctx)
+	ctx.Assert(len(b) > off, "the board key is %d bytes after painting (3, 7): expected a write at offset y * size + x = %d", len(b), off)
+	ctx.Equal(b[off], 12, "byte %d of the board must be the colour 12", off)
+	ctx.Equal(cdZeros(b), len(b)-1, "painting one tile must change exactly one byte: the zero bytes")
+	cdPlace(ctx, "bo", size-1, size-1, 15)
+	b = cdBoard(ctx)
+	ctx.Equal(len(b), size*size, "after painting the last pixel the board must be size * size bytes")
+	ctx.Equal(b[len(b)-1], 15, "the last byte")
+	cdPlace(ctx, "cy", 3, 7, 3)
+	ctx.Equal(cdBoard(ctx)[off], 3, "painting over a pixel replaces its colour")
+	ctx.Equal(ctx.Redis.Type("board"), "string", "board must be one string: its type")
+	// 200 placements a second: dee's tile is written while eve's is in progress.
+	settled := cdRival(ctx, "board", "dee", 50, 50, 7)
+	ctx.Equal(cdPlace(ctx, "eve", 10, 10, 9), 0, "eve is free: her tile must be painted")
+	ctx.Equal(settled("the board"), 0, "dee is free: her tile must be painted")
+	ctx.Equal(cdPixel(ctx, 10, 10), 9, "eve's tile at (10, 10): dee's write, started while eve's was in progress, replaced the board with a copy read before eve painted. Write the one byte in place")
+	ctx.Equal(cdPixel(ctx, 50, 50), 7, "dee's tile at (50, 50), painted while eve's was being written: eve's write replaced the board with a copy read before dee painted. Write the one byte in place")
+	ctx.Assert(cdPixel(ctx, size-1, size-1) == 15 && cdPixel(ctx, 3, 7) == 3, "earlier tiles must survive later ones")
+}
+
+func CheckRetryAfter(ctx *harness.Ctx) {
+	cdPlace(ctx, "ana", 3, 7, 12)
+	ctx.Clock.Advance(100)
+	wait := cdPlace(ctx, "ana", 4, 7, 12)
+	ctx.Assert(199 <= wait && wait <= 200, "100 s into a 300 s cooldown placeTile returned %d, expected the TTL (200)", wait)
+	ctx.Clock.Advance(199.5)
+	wait = cdPlace(ctx, "ana", 4, 7, 12)
+	ctx.Assert(wait == 1, "half a second before the cooldown ends placeTile returned %d, expected at least 1", wait)
+	ctx.Clock.Advance(1)
+	ctx.Equal(cdPlace(ctx, "ana", 4, 7, 12), 0, "once the cooldown ended the tile must be painted")
+}
+
+func CheckClaimFirst(ctx *harness.Ctx) {
+	ctx.Equal(cdPlace(ctx, "ana", 3, 7, 12), 0, "ana is free: her tile must be painted")
+	ctx.Assert(cdPlace(ctx, "ana", 3, 7, 5) > 0, "the second tile within the cooldown must be refused")
+	ctx.Equal(cdPixel(ctx, 3, 7), 12, "a refused placement painted the board: (3, 7) must keep the earlier 12. Claim the cooldown first, paint second")
+	// cy's two parallel requests on one pixel: the board must show the one that was accepted.
+	settled := cdRival(ctx, "cooldown:cy", "cy", 6, 7, 5)
+	mine := cdPlace(ctx, "cy", 6, 7, 9)
+	theirs := settled("cooldown:cy")
+	var accepted, refused []int
+	for _, o := range [][2]int{{9, mine}, {5, theirs}} {
+		if o[1] > 0 {
+			refused = append(refused, o[0])
+		} else if o[1] == 0 {
+			accepted = append(accepted, o[0])
+		}
+	}
+	shown := cdPixel(ctx, 6, 7)
+	in := func(colors []int) bool {
+		for _, c := range colors {
+			if c == shown {
+				return true
+			}
+		}
+		return false
+	}
+	ctx.Assert(!in(refused) || in(accepted), "two parallel tiles by cy on (6, 7): colour %v was accepted, %v refused, and the board shows %d: the refused tile was painted. Claim the cooldown first, paint second", accepted, refused, shown)
+	api := cdAPI(ctx)
+	r := api.Post("/place", map[string]any{"x": 3, "y": 7, "color": 5, "user": "ana"})
+	ctx.Equal(r.Status, 429, "through the API a user on cooldown gets 429")
+	retry := r.Header.Get("Retry-After")
+	ctx.Assert(retry == "299" || retry == "300", "Retry-After is %q, expected the TTL (300)", retry)
+	r = api.Post("/place", map[string]any{"x": 3, "y": 7, "color": 5, "user": "bo"})
+	ctx.Equal(r.Status, 200, "another user may paint the same pixel")
+	ctx.Equal(cdPixel(ctx, 3, 7), 5, "bo's tile must be painted")
+}
+`,
   },
   debrief: `The cooldown and the lock are the same key. \`SET NX EX\` answers "was this user free?" and makes them not free in one atomic step, so a thousand parallel requests from one bot produce exactly one tile — the race Reddit shipped with (check in Cassandra, then write, with nothing in between) is simply not expressible here. \`SETRANGE\` is the other half of the design: the board is a flat array in a string, a pixel is one byte at a computed offset, and Redis updates it in place with no read, no lock and no version check, which is why 200 placements per second never contended. Real deployments pack two 4-bit pixels per byte with \`BITFIELD SET u4 #offset\`, keep the per-tile author and timestamp in a wide table for "who placed this?", and make the cooldown adjustable at runtime — Reddit turned the knob several times during the event to shed load.`,
 };

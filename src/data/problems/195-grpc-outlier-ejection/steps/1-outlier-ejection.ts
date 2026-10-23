@@ -1114,6 +1114,274 @@ export async function check_all_ejected(ctx) {
   await one(ctx, lb);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"sort"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"leetbuild/harness"
+
+	pb "inventory/gen/inventory"
+)
+
+var (
+	invTargets = []string{"inv-a:50051", "inv-b:50051", "inv-c:50051"}
+	invStock   = map[string]int32{"sku-1": 7, "sku-2": 42, "sku-3": 0}
+	invSkus    = []string{"sku-1", "sku-2", "sku-3"}
+)
+
+// invPeer is one Inventory instance.
+type invPeer struct {
+	pb.UnimplementedInventoryServer
+}
+
+func (invPeer) GetStock(ctx context.Context, req *pb.StockRequest) (*pb.Stock, error) {
+	sku := req.GetSku()
+	if sku == "" {
+		return nil, status.Error(codes.InvalidArgument, "sku is required")
+	}
+	count, ok := invStock[sku]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "no sku %s", sku)
+	}
+	return &pb.Stock{Sku: sku, Count: count}, nil
+}
+
+func invServe(ctx *harness.Ctx) {
+	for _, t := range invTargets {
+		pb.RegisterInventoryServer(ctx.GRPC.Server(t), invPeer{})
+	}
+}
+
+// invBalancer is three Inventory instances up, and a fresh Balancer over all of them.
+func invBalancer(ctx *harness.Ctx) *Balancer {
+	invServe(ctx)
+	return NewBalancer(append([]string(nil), invTargets...))
+}
+
+// invAfter is the target steps places after target in the list.
+func invAfter(target string, steps int) string {
+	for i, t := range invTargets {
+		if t == target {
+			return invTargets[(i+steps)%len(invTargets)]
+		}
+	}
+	return ""
+}
+
+func invTargetsOf(calls []harness.Call) []string {
+	out := []string{}
+	for _, c := range calls {
+		out = append(out, c.Target)
+	}
+	return out
+}
+
+func invCount(xs []string) map[string]int {
+	out := map[string]int{}
+	for _, x := range xs {
+		out[x]++
+	}
+	return out
+}
+
+// invGet is one GetStock that must succeed: the count it returned and the GetStock calls it made, in order.
+func invGet(ctx *harness.Ctx, lb *Balancer, sku string) (int32, []harness.Call) {
+	n := len(ctx.GRPC.CallsTo("GetStock", ""))
+	count, err := lb.GetStock(context.Background(), sku)
+	made := ctx.GRPC.CallsTo("GetStock", "")[n:]
+	if err != nil {
+		ctx.Fatalf("GetStock(%q) returned %v (%v) after calls to %v, expected the count from a healthy instance", sku, status.Code(err), err, invTargetsOf(made))
+	}
+	return count, made
+}
+
+// invFails is one GetStock that must return a gRPC error: the error and the calls it made.
+func invFails(ctx *harness.Ctx, lb *Balancer, sku string) (error, []harness.Call) {
+	n := len(ctx.GRPC.CallsTo("GetStock", ""))
+	count, err := lb.GetStock(context.Background(), sku)
+	made := ctx.GRPC.CallsTo("GetStock", "")[n:]
+	if err == nil {
+		ctx.Fatalf("GetStock(%q) returned %d after calls to %v, expected a gRPC error", sku, count, invTargetsOf(made))
+	}
+	return err, made
+}
+
+// invOne is a GetStock("sku-1") that makes exactly one call: the target it reached.
+func invOne(ctx *harness.Ctx, lb *Balancer) string {
+	count, made := invGet(ctx, lb, "sku-1")
+	ctx.Equal(len(made), 1, "one GetStock over healthy instances made calls to %v, expected one: calls", invTargetsOf(made))
+	ctx.Equal(count, invStock["sku-1"], "GetStock(%q) must return the count the instance answered", "sku-1")
+	return made[0].Target
+}
+
+func invMany(ctx *harness.Ctx, lb *Balancer, n int) []string {
+	var out []string
+	for range n {
+		out = append(out, invOne(ctx, lb))
+	}
+	return out
+}
+
+func CheckEvenRotation(ctx *harness.Ctx) {
+	lb := invBalancer(ctx)
+	var seq []string
+	for i := range 9 {
+		sku := invSkus[i%3]
+		count, made := invGet(ctx, lb, sku)
+		ctx.Equal(len(made), 1, "call %d over three healthy instances made GetStock calls to %v, expected one: calls", i+1, invTargetsOf(made))
+		request, _ := made[0].Request.(*pb.StockRequest)
+		ctx.Equal(request.GetSku(), sku, "the request must carry the sku: the instance received")
+		ctx.Equal(count, invStock[sku], "GetStock(%q) must return the count the instance answered", sku)
+		seq = append(seq, made[0].Target)
+	}
+	start := -1
+	for i, t := range invTargets {
+		if t == seq[0] {
+			start = i
+		}
+	}
+	ctx.Assert(start >= 0, "the first call reached %s, which is not one of the targets", seq[0])
+	var want []string
+	for i := range 9 {
+		want = append(want, invTargets[(start+i)%3])
+	}
+	ctx.Equal(seq, want, "9 calls: round robin continues after the last target used, in list order")
+	pair := NewBalancer([]string{invTargets[0], invTargets[2]})
+	two := invMany(ctx, pair, 4)
+	ctx.Assert(
+		invCount(two)[invTargets[1]] == 0 && two[0] != two[1] && two[2] == two[0] && two[3] == two[1],
+		"a Balancer over %v must alternate between exactly those, it reached %v", []string{invTargets[0], invTargets[2]}, two,
+	)
+}
+
+func CheckStoppedInstance(ctx *harness.Ctx) {
+	lb := invBalancer(ctx)
+	seq := invMany(ctx, lb, 3)
+	down, survivor := seq[0], seq[1] // down is next in the rotation
+	ctx.GRPC.Stop(down)
+	count, made := invGet(ctx, lb, "sku-2")
+	ctx.Equal(invTargetsOf(made), []string{down, survivor}, "with %s stopped, the call that lands on it must try it once and then %s in the same call: calls", down, survivor)
+	ctx.Equal(count, 42, "the failover call must return the count from %s", survivor)
+	before := len(ctx.GRPC.CallsTo("GetStock", down))
+	rest := invMany(ctx, lb, 6)
+	ctx.Assert(invCount(rest)[down] == 0, "%s is down and was ejected, yet the next 6 calls reached %v", down, rest)
+	ctx.Equal(len(ctx.GRPC.CallsTo("GetStock", down)), before, "%s received calls after it failed (an ejected target gets none): calls to it", down)
+	alternates := true
+	for i := 1; i < len(rest); i++ {
+		alternates = alternates && rest[i] != rest[i-1]
+	}
+	c := invCount(rest)
+	evenly := len(c) == 2
+	for _, n := range c {
+		evenly = evenly && n == 3
+	}
+	ctx.Assert(alternates && evenly, "the 6 calls after the failover must alternate between the two survivors, they reached %v", rest)
+}
+
+func CheckReadmission(ctx *harness.Ctx) {
+	lb := invBalancer(ctx)
+	first := invOne(ctx, lb)
+	out := invAfter(first, 1)
+	ctx.GRPC.Fail("GetStock", codes.Unavailable, "", 1, out)
+	count, made := invGet(ctx, lb, "sku-1")
+	ctx.Equal(invTargetsOf(made), []string{out, invAfter(out, 1)}, "%s answered UNAVAILABLE: the call must go on to %s; calls", out, invAfter(out, 1))
+	ctx.Equal(count, invStock["sku-1"], "the failover call must return the count")
+	for i := range 10 {
+		ctx.Clock.Advance(2.9)
+		target := invOne(ctx, lb)
+		ctx.Assert(target != out, "%s was ejected %.1f s ago and was called again: ejection lasts 30 s", out, 2.9*float64(i+1))
+	}
+	ctx.Clock.Advance(1.5) // 30.5 s since the ejection
+	back := invMany(ctx, lb, 3)
+	sorted := append([]string(nil), back...)
+	sort.Strings(sorted)
+	ctx.Equal(sorted, invTargets, "30.5 s after the ejection %s is back: the next 3 calls (%v) must reach each target once", out, back)
+}
+
+func CheckAttemptDeadline(ctx *harness.Ctx) {
+	lb := invBalancer(ctx)
+	first := invOne(ctx, lb)
+	slow := invAfter(first, 1)
+	next := invAfter(first, 2)
+	ctx.GRPC.SetLatency("GetStock", 1.0, slow)
+	t0 := ctx.Clock.Now()
+	count, made := invGet(ctx, lb, "sku-2")
+	took := float64(ctx.Clock.Now()-t0) / 1000
+	ctx.Equal(invTargetsOf(made), []string{slow, next}, "%s takes 1 s: its attempt must time out and %s serve the same call; calls", slow, next)
+	ctx.Equal(count, 42, "the call must return the count from %s", next)
+	for _, c := range made {
+		ctx.Assert(c.HasDeadline(), "the attempt to %s carries no deadline: a stalled instance would hold the call forever", c.Target)
+		timeout := c.Timeout.Seconds()
+		ctx.Assert(0.19 <= timeout && timeout <= 0.21, "each attempt carries a 0.2 s deadline, the attempt to %s carried %v s", c.Target, timeout)
+	}
+	ctx.Equal(made[0].Code, codes.DeadlineExceeded, "the attempt to %s must end DEADLINE_EXCEEDED", slow)
+	ctx.Assert(took <= 0.25, "the call took %.2f s: one attempt waits at most 0.2 s, not the instance's 1 s", took)
+	rest := invMany(ctx, lb, 4)
+	ctx.Assert(invCount(rest)[slow] == 0, "%s timed out and must be ejected, yet the next 4 calls reached %v", slow, rest)
+	keeper := invAfter(slow, 2) // the one that is neither slow nor the last used
+	ctx.GRPC.SetLatency("GetStock", 0.15, keeper)
+	more := invMany(ctx, lb, 4)
+	ctx.Equal(invCount(more)[keeper], 2, "%s answers in 0.15 s, inside the deadline: it keeps its turn (the next 4 calls reached %v); its calls", keeper, more)
+}
+
+func CheckApplicationErrors(ctx *harness.Ctx) {
+	lb := invBalancer(ctx)
+	cases := []struct {
+		sku  string
+		code codes.Code
+	}{{"ghost", codes.NotFound}, {"", codes.InvalidArgument}}
+	for _, tc := range cases {
+		for range 3 {
+			err, made := invFails(ctx, lb, tc.sku)
+			ctx.Equal(status.Code(err), tc.code, "GetStock(%q) failed (%v): an application error is returned as is", tc.sku, err)
+			ctx.Equal(len(made), 1, "GetStock(%q) made calls to %v: %v is the same answer from every instance, so no retry; calls", tc.sku, invTargetsOf(made), tc.code)
+		}
+	}
+	ctx.GRPC.Fail("GetStock", codes.PermissionDenied, "", 1, "")
+	err, made := invFails(ctx, lb, "sku-1")
+	ctx.Assert(status.Code(err) == codes.PermissionDenied && len(made) == 1, "an injected PERMISSION_DENIED must surface after one call, got %v after %v", status.Code(err), invTargetsOf(made))
+	seq := invMany(ctx, lb, 6)
+	c := invCount(seq)
+	inRotation := true
+	for i, t := range seq[3:] {
+		inRotation = inRotation && t == seq[i]
+	}
+	for _, t := range invTargets {
+		inRotation = inRotation && c[t] == 2
+	}
+	ctx.Assert(inRotation, "application errors eject nothing: the next 6 calls must reach every target twice, in rotation, they reached %v", seq)
+}
+
+func CheckAllEjected(ctx *harness.Ctx) {
+	lb := invBalancer(ctx)
+	for _, t := range invTargets {
+		ctx.GRPC.Stop(t)
+	}
+	err, made := invFails(ctx, lb, "sku-1")
+	targets := invTargetsOf(made)
+	sort.Strings(targets)
+	ctx.Equal(targets, invTargets, "with all three down, one call tries each target exactly once (it called %v)", invTargetsOf(made))
+	ctx.Equal(status.Code(err), codes.Unavailable, "with nothing left to try the call returns UNAVAILABLE")
+	t0 := ctx.Clock.Now()
+	for range 5 {
+		err, made = invFails(ctx, lb, "sku-1")
+		ctx.Equal(status.Code(err), codes.Unavailable, "with every target ejected the call returns UNAVAILABLE")
+		ctx.Equal(len(made), 0, "every target is ejected, yet the call reached %v (fail fast, no RPC): calls", invTargetsOf(made))
+	}
+	ctx.Assert(ctx.Clock.Now()-t0 <= 50, "failing fast spends no time; the 5 calls took %v s", float64(ctx.Clock.Now()-t0)/1000)
+	ctx.Clock.Advance(10)
+	err, made = invFails(ctx, lb, "sku-1")
+	ctx.Assert(status.Code(err) == codes.Unavailable && len(made) == 0, "10 s later every target is still ejected: UNAVAILABLE with no RPC, got %v after %v", status.Code(err), invTargetsOf(made))
+	invServe(ctx) // the instances come back
+	ctx.Clock.Advance(20.5)
+	invOne(ctx, lb)
+}
+`,
   },
   debrief: `The balancer is three pieces of state (a cursor, a map of ejection deadlines, one stub per target) and one rule about status codes. The cursor moves before the attempt, so the next call starts after the target just used whether that attempt succeeded or not, and the loop runs at most once per target, which bounds the worst call at three attempts of 0.2 s each instead of a retry loop that never ends. Ejection is keyed on what the failure says about the instance: \`UNAVAILABLE\` (connection refused, no route) and \`DEADLINE_EXCEEDED\` (it did not answer in time) mean the instance is the problem and another one may do better; \`NOT_FOUND\` or \`INVALID_ARGUMENT\` mean the instance answered correctly about a bad request, every other instance would give the same answer, and ejecting on them would let a single client sending unknown SKUs drain the pool. When nothing is left, failing at once with \`UNAVAILABLE\` is the point: the caller learns the truth in microseconds instead of three timeouts later, and the instances get no load while they recover. This is the shape of gRPC's own \`round_robin\` policy plus the outlier detection Envoy and gRPC's \`outlier_detection\` balancer add on top. Production versions eject after N consecutive failures or on a success-rate statistic rather than one error, grow the ejection time with each repeat, cap the share of the pool that may be ejected at once (Envoy's \`max_ejection_percent\`, 10% by default), and learn about instances from DNS or xDS rather than a fixed list.`,
 };

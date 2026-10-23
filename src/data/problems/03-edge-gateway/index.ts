@@ -68,6 +68,6 @@ changing its shape — which is the shape of every gateway you will meet.`,
     ],
   },
   steps: [tlsListenerStep, tokenBucketStep, grpcProxyStep, auditStreamStep, responseCacheStep],
-  support: {python: protoModules, typescript: {...protoFiles, ...supportModulesTs}},
+  support: {python: protoModules, typescript: {...protoFiles, ...supportModulesTs}, go: {...protoFiles}},
   learn,
 };

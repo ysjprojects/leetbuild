@@ -374,8 +374,8 @@ import (
 const topic = "trip-events"
 
 // Provided (ride_store.go): getStatus is "" for a ride nobody has seen yet.
-func getStatus(ctx context.Context, rideID string) string   { panic("not implemented") }
-func setStatus(ctx context.Context, rideID, status string) { panic("not implemented") }
+var getStatus = func(ctx context.Context, rideID string) string { panic("not implemented") }
+var setStatus = func(ctx context.Context, rideID, status string) { panic("not implemented") }
 
 // transitions maps an event to the states it may follow; "" is the state of an unseen ride.
 var transitions = map[string][]string{
@@ -441,8 +441,8 @@ import (
 const topic = "trip-events"
 
 // Provided (ride_store.go): getStatus is "" for a ride nobody has seen yet.
-func getStatus(ctx context.Context, rideID string) string   { panic("not implemented") }
-func setStatus(ctx context.Context, rideID, status string) { panic("not implemented") }
+var getStatus = func(ctx context.Context, rideID string) string { panic("not implemented") }
+var setStatus = func(ctx context.Context, rideID, status string) { panic("not implemented") }
 
 // transitions maps an event to the states it may follow; "" is the state of an unseen ride.
 var transitions = map[string][]string{
@@ -998,6 +998,137 @@ export async function check_set_then_commit(ctx) {
   } finally {
     restore();
   }
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+func seedTripEvents(ctx *harness.Ctx, events ...[2]string) {
+	for _, e := range events {
+		ctx.Kafka.Seed("trip-events", e[0], map[string]any{"ride_id": e[0], "event": e[1], "ts": 0})
+	}
+}
+
+// rideStatuses stands in for ride_store.go: ride id → status; a ride nobody set is absent.
+func rideStatuses() map[string]string {
+	rides := map[string]string{}
+	getStatus = func(_ context.Context, rideID string) string { return rides[rideID] }
+	setStatus = func(_ context.Context, rideID, status string) { rides[rideID] = status }
+	return rides
+}
+
+func publishTrip(ctx *harness.Ctx, rideID, event string) {
+	ctx.NoError(publishEvent(context.Background(), rideID, event), "publishEvent(%q, %q) returned an error", rideID, event)
+}
+
+func drainRun(ctx *harness.Ctx) {
+	ctx.Drain(func() { _ = run(context.Background()) })
+}
+
+func CheckDurableProducer(ctx *harness.Ctx) {
+	rideStatuses()
+	// The broker writes the record but its acknowledgement is lost: the producer retries.
+	ctx.Kafka.LoseAcks("trip-events", 1)
+	publishTrip(ctx, "r-42", "requested")
+	records := ctx.Kafka.Records("trip-events")
+	ctx.Assert(len(records) >= 1, "publishEvent must produce one record")
+	// kafka-go has no idempotent producer (the step's Go detail): at least once, identical copies.
+	for _, r := range records {
+		ctx.Assert(string(r.Key) == string(records[0].Key) && string(r.Value) == string(records[0].Value), "a retry after a lost ack must write the same key and value, got %q=%q and %q=%q", records[0].Key, records[0].Value, r.Key, r.Value)
+	}
+	// A leader failover right after the ack: a record acknowledged by the leader alone (acks 0 or 1) is gone.
+	publishTrip(ctx, "r-42", "matched")
+	ctx.Kafka.Failover("trip-events")
+	distinct := map[string]bool{}
+	for _, r := range ctx.Kafka.Records("trip-events") {
+		distinct[string(r.Key)+"="+string(r.Value)] = true
+	}
+	ctx.Equal(len(distinct), 2, "a leader failover must not lose an acknowledged event (wait for all in-sync replicas: RequiredAcks: kafka.RequireAll): distinct events left of 2")
+}
+
+func CheckKeyedByRide(ctx *harness.Ctx) {
+	rideStatuses()
+	publishTrip(ctx, "r-42", "requested")
+	publishTrip(ctx, "r-42", "matched")
+	publishTrip(ctx, "r-7", "requested")
+	produced := ctx.Kafka.Records("trip-events")
+	ctx.Equal(len(produced), 3, "records on trip-events")
+	ctx.Equal(ctx.Kafka.Keys("trip-events"), []string{"r-42", "r-42", "r-7"}, "records must be keyed by ride_id")
+	ctx.Equal(produced[0].Partition, produced[1].Partition, "one ride's events must share a partition")
+	var first struct {
+		RideID string \`json:"ride_id"\`
+		Event  string \`json:"event"\`
+	}
+	_ = json.Unmarshal(produced[0].Value, &first)
+	ctx.Assert(first.RideID == "r-42" && first.Event == "requested", "the value must be JSON with ride_id and event: %s", produced[0].Value)
+}
+
+func CheckManualCommit(ctx *harness.Ctx) {
+	seedTripEvents(ctx, [2]string{"r-42", "requested"}, [2]string{"r-42", "matched"})
+	rides := rideStatuses()
+	drainRun(ctx)
+	consumers := ctx.Kafka.Consumers()
+	ctx.Assert(len(consumers) > 0, "no consumer joined the trip-state group")
+	ctx.Equal(consumers[len(consumers)-1].AutoCommit, false, "auto-commit must be off (FetchMessage, not ReadMessage): offsets are committed explicitly, after the status write")
+	ctx.Equal(len(ctx.Kafka.EventsOf("auto-commit")), 0, "auto-commit is on: offsets were committed by the client, not after the write")
+	ctx.Assert(len(ctx.Kafka.EventsOf("manual-commit")) > 0, "no explicit commit happened")
+	ctx.Equal(ctx.Kafka.Lag("trip-state", "trip-events"), 0, "every applied record must be committed: trip-state's lag")
+	ctx.Equal(rides["r-42"], "matched", "after requested, matched the ride's status")
+}
+
+func CheckIllegalSkipped(ctx *harness.Ctx) {
+	seedTripEvents(ctx, [2]string{"r-42", "requested"}, [2]string{"r-42", "matched"}, [2]string{"r-42", "matched"}, [2]string{"r-42", "completed"}, [2]string{"r-42", "started"}, [2]string{"r-99", "started"})
+	rides := rideStatuses()
+	var logged strings.Builder
+	prev := log.Writer()
+	log.SetOutput(&logged)
+	defer log.SetOutput(prev)
+	drainRun(ctx)
+	ctx.Equal(rides["r-42"], "started", "r-42's status (requested → matched → started; the duplicate matched and the early completed are illegal)")
+	_, created := rides["r-99"]
+	ctx.Assert(!created, "started on a ride nobody has seen is illegal and must not create r-99")
+	ctx.Equal(ctx.Kafka.Lag("trip-state", "trip-events"), 0, "illegal events must be committed too, or the partition replays them forever: trip-state's lag")
+	lines := strings.Count(logged.String(), "\\n")
+	ctx.Assert(lines >= 3, "three illegal transitions were skipped but only %d log lines were emitted", lines)
+}
+
+func CheckSetThenCommit(ctx *harness.Ctx) {
+	seedTripEvents(ctx, [2]string{"r-42", "requested"})
+	rides := rideStatuses()
+	var atCommit []string
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
+		status, ok := rides["r-42"]
+		if !ok {
+			status = "<absent>"
+		}
+		atCommit = append(atCommit, status)
+	})
+	drainRun(ctx)
+	ctx.Assert(len(atCommit) > 0, "the offset was never committed")
+	ctx.Equal(atCommit[0], "requested", "the commit must come after setStatus: r-42's status at commit time")
+	// A failing status write must not be committed: the record has to be redelivered.
+	seedTripEvents(ctx, [2]string{"r-7", "requested"})
+	setStatus = func(_ context.Context, rideID, status string) {
+		if rideID == "r-7" {
+			panic("ride store unavailable")
+		}
+		rides[rideID] = status
+	}
+	func() {
+		defer func() { _ = recover() }() // the consumer loop surfaces the store's failure; what matters is what was committed
+		drainRun(ctx)
+	}()
+	_, written := rides["r-7"]
+	ctx.Assert(!written, "r-7's status write failed, yet r-7 has a status")
+	ctx.Equal(ctx.Kafka.Lag("trip-state", "trip-events"), 1, "setStatus failed for r-7, so its offset must not be committed (at-most-once loses the event): trip-state's lag")
 }
 `,
   },

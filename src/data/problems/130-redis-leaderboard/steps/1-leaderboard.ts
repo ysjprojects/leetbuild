@@ -973,6 +973,163 @@ export async function check_remove(ctx) {
   assert.equal(await m.addPoints('weekly', 'bo', 1), 1, 'a removed player who scores again starts from 0');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"sort"
+
+	"leetbuild/harness"
+)
+
+type lbScore struct {
+	player string
+	points int
+}
+
+var (
+	lbBg    = context.Background()
+	lbFive  = []lbScore{{"ana", 40}, {"bo", 75}, {"cy", 10}, {"dee", 60}, {"eli", 25}}
+	lbSeven = []lbScore{{"ana", 70}, {"bo", 60}, {"cy", 50}, {"dee", 40}, {"eli", 30}, {"fay", 20}, {"gus", 10}}
+)
+
+func lbAdd(ctx *harness.Ctx, board, player string, points int) int {
+	total, err := addPoints(lbBg, board, player, points)
+	ctx.NoError(err, "addPoints(%q, %q, %d) returned an error", board, player, points)
+	return total
+}
+
+func lbSeed(ctx *harness.Ctx, board string, scores []lbScore) {
+	for _, s := range scores {
+		lbAdd(ctx, board, s.player, s.points)
+	}
+}
+
+func lbTop(ctx *harness.Ctx, board string, n int) []Row {
+	rows, err := top(lbBg, board, n)
+	ctx.NoError(err, "top(%q, %d) returned an error", board, n)
+	return rows
+}
+
+// lbRank is rankOf's answer as a value (a Standing, or nil when it returned nil), so it compares and prints.
+func lbRank(ctx *harness.Ctx, board, player string) any {
+	s, err := rankOf(lbBg, board, player)
+	ctx.NoError(err, "rankOf(%q, %q) returned an error", board, player)
+	if s == nil {
+		return nil
+	}
+	return *s
+}
+
+func lbAround(ctx *harness.Ctx, board, player string, k int) []Row {
+	rows, err := around(lbBg, board, player, k)
+	ctx.NoError(err, "around(%q, %q, %d) returned an error", board, player, k)
+	return rows
+}
+
+func lbRemove(ctx *harness.Ctx, board, player string) bool {
+	removed, err := remove(lbBg, board, player)
+	ctx.NoError(err, "remove(%q, %q) returned an error", board, player)
+	return removed
+}
+
+// lbExpected is the spec, independent of the learner: score descending, then member descending (Redis's ZREVRANGE rule).
+func lbExpected(scores []lbScore) []Row {
+	ordered := append([]lbScore(nil), scores...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].points != ordered[j].points {
+			return ordered[i].points > ordered[j].points
+		}
+		return ordered[i].player > ordered[j].player
+	})
+	out := make([]Row, len(ordered))
+	for i, s := range ordered {
+		out[i] = Row{Player: s.player, Score: s.points, Rank: i + 1}
+	}
+	return out
+}
+
+func CheckTopOrder(ctx *harness.Ctx) {
+	ctx.Equal(len(lbTop(ctx, "weekly", 3)), 0, "an empty board has no rows: the number of rows top returned")
+	lbSeed(ctx, "weekly", lbFive)
+	ctx.Equal(lbTop(ctx, "weekly", 3), []Row{{"bo", 75, 1}, {"dee", 60, 2}, {"ana", 40, 3}}, "top(%q, 3) must be the three highest scorers, best first, as {Player Score Rank} with ranks 1, 2, 3", "weekly")
+	ctx.Equal(lbTop(ctx, "weekly", 1), []Row{{"bo", 75, 1}}, "top(%q, 1) is the leader alone", "weekly")
+	ctx.Equal(lbTop(ctx, "weekly", 10), lbExpected(lbFive), "n larger than the board returns everyone, still ranked 1..5")
+	before := len(ctx.Redis.RoundTrips())
+	lbTop(ctx, "weekly", 3)
+	sent := []string{}
+	for _, trip := range ctx.Redis.RoundTrips()[before:] {
+		sent = append(sent, trip...)
+	}
+	ctx.Equal(sent, []string{"ZREVRANGE"}, "top is one ZREVRANGE … WITHSCORES (members and scores in one reply): the commands it sent")
+}
+
+func CheckRankOf(ctx *harness.Ctx) {
+	lbSeed(ctx, "weekly", lbFive)
+	lbSeed(ctx, "monthly", []lbScore{{"bo", 5}, {"zed", 90}})
+	for _, row := range lbTop(ctx, "weekly", 5) {
+		ctx.Equal(lbRank(ctx, "weekly", row.Player), Standing{Rank: row.Rank, Score: row.Score}, "top shows %s at rank %d with %d points, so rankOf(%q, %q) must agree: Rank = ZREVRANK + 1, Score = ZSCORE", row.Player, row.Rank, row.Score, "weekly", row.Player)
+	}
+	ctx.Equal(lbRank(ctx, "weekly", "ghost"), nil, "a player who never scored on the board has no rank: nil, not an error and not {0 0}")
+	ctx.Equal(lbRank(ctx, "monthly", "ana"), nil, "boards are independent: ana is on weekly, not on monthly")
+	ctx.Equal(lbRank(ctx, "monthly", "bo"), Standing{Rank: 2, Score: 5}, "bo leads weekly but is second on monthly with 5 points: rankOf(%q, %q)", "monthly", "bo")
+}
+
+func CheckAroundClips(ctx *harness.Ctx) {
+	lbSeed(ctx, "weekly", lbSeven)
+	rows := lbExpected(lbSeven)
+	ctx.Equal(lbAround(ctx, "weekly", "dee", 2), rows[1:6], "around(%q, %q, 2) is bo…fay with ranks 2..6 (two above, dee, two below)", "weekly", "dee")
+	ctx.Equal(lbAround(ctx, "weekly", "ana", 2), rows[0:3], "the leader has nobody above: around(%q, %q, 2) must clip to ranks 1..3, not read a negative start from the end of the set", "weekly", "ana")
+	ctx.Equal(lbAround(ctx, "weekly", "bo", 2), rows[0:4], "around(%q, %q, 2): one above (ana, rank 1), bo, two below", "weekly", "bo")
+	ctx.Equal(lbAround(ctx, "weekly", "gus", 2), rows[4:7], "the last player has nobody below: around(%q, %q, 2) is ranks 5..7", "weekly", "gus")
+	ctx.Equal(lbAround(ctx, "weekly", "fay", 3), rows[2:7], "around(%q, %q, 3) clips at the bottom: ranks 3..7", "weekly", "fay")
+	ctx.Equal(lbAround(ctx, "weekly", "dee", 0), rows[3:4], "k = 0 is the player alone with the absolute rank 4")
+	ctx.Equal(lbAround(ctx, "weekly", "dee", 100), rows, "a window wider than the board is the whole board, ranks 1..7")
+	ctx.Equal(len(lbAround(ctx, "weekly", "zed", 2)), 0, "a player not on the board has no neighbours: the number of rows around(%q, %q, 2) returned", "weekly", "zed")
+}
+
+func CheckTies(ctx *harness.Ctx) {
+	tied := []lbScore{{"mia", 50}, {"zed", 50}, {"abe", 50}, {"kim", 80}, {"lou", 20}, {"bea", 20}}
+	lbSeed(ctx, "weekly", tied)
+	rows := lbExpected(tied)
+	ctx.Equal(lbTop(ctx, "weekly", 6), rows, "equal scores are ordered by Redis: in the descending view the greater member comes first (zed, mia, abe at 50; lou before bea at 20)")
+	for _, row := range rows {
+		ctx.Equal(lbRank(ctx, "weekly", row.Player), Standing{Rank: row.Rank, Score: row.Score}, "rankOf(%q, %q) must agree with top", "weekly", row.Player)
+	}
+	ctx.Equal(lbAround(ctx, "weekly", "mia", 1), rows[1:4], "around(%q, %q, 1) is zed (2), mia (3), abe (4): the same tie order as top", "weekly", "mia")
+	ctx.Equal(lbAround(ctx, "weekly", "abe", 1), rows[2:5], "around(%q, %q, 1) is mia (3), abe (4), lou (5)", "weekly", "abe")
+	lbAdd(ctx, "weekly", "abe", 1)
+	ctx.Equal(lbRank(ctx, "weekly", "abe"), Standing{Rank: 2, Score: 51}, "one more point breaks the tie: abe moves to rank 2 with 51")
+	ctx.Equal(lbTop(ctx, "weekly", 3), []Row{{"kim", 80, 1}, {"abe", 51, 2}, {"zed", 50, 3}}, "after abe's point top is kim, abe, zed")
+}
+
+func CheckAccumulate(ctx *harness.Ctx) {
+	ctx.Equal(lbAdd(ctx, "weekly", "ana", 10), 10, "a new player starts from 0: the first addPoints returns the points given")
+	ctx.Equal(lbAdd(ctx, "weekly", "ana", 5), 15, "addPoints accumulates (ZINCRBY): 10 then 5 is 15, not 5 (ZADD would overwrite)")
+	ctx.Equal(lbAdd(ctx, "weekly", "ana", -3), 12, "negative points subtract: 15 − 3 is 12")
+	ctx.Equal(lbAdd(ctx, "weekly", "bo", 5), 5, "another player's first score is just their points")
+	score, ok := ctx.Redis.ZScore("board:weekly", "ana")
+	ctx.Assert(ok && score == 12, "the board lives in the sorted set board:weekly with the player as member and the total as score; keys: %s, ana's score there: %v (present: %v)", harness.Show(ctx.Redis.Keys("*")), score, ok)
+	ctx.Equal(ctx.Redis.Keys("*"), []string{"board:weekly"}, "one key per board, named board:{board}: the keys")
+	ctx.Equal(lbAdd(ctx, "monthly", "ana", 100), 100, "the same player on another board starts from 0 there")
+	ctx.Equal(lbRank(ctx, "weekly", "ana"), Standing{Rank: 1, Score: 12}, "monthly points must not touch weekly: ana still leads weekly with 12")
+	ctx.Equal(lbRank(ctx, "monthly", "ana"), Standing{Rank: 1, Score: 100}, "ana's standing on monthly")
+	ctx.Equal(lbTop(ctx, "weekly", 5), []Row{{"ana", 12, 1}, {"bo", 5, 2}}, "top reflects the accumulated totals")
+}
+
+func CheckRemove(ctx *harness.Ctx) {
+	lbSeed(ctx, "weekly", lbFive)
+	lbSeed(ctx, "monthly", []lbScore{{"bo", 5}})
+	ctx.Equal(lbRemove(ctx, "weekly", "bo"), true, "removing a player who is on the board returns true")
+	ctx.Equal(lbRank(ctx, "weekly", "bo"), nil, "after remove the player has no rank on that board")
+	ctx.Equal(lbTop(ctx, "weekly", 5), []Row{{"dee", 60, 1}, {"ana", 40, 2}, {"eli", 25, 3}, {"cy", 10, 4}}, "with the leader gone everyone moves up one rank")
+	ctx.Equal(lbAround(ctx, "weekly", "ana", 1), []Row{{"dee", 60, 1}, {"ana", 40, 2}, {"eli", 25, 3}}, "around reflects the new ranks too")
+	ctx.Equal(lbRemove(ctx, "weekly", "bo"), false, "removing a player a second time returns false: there was nothing to remove")
+	ctx.Equal(lbRemove(ctx, "weekly", "ghost"), false, "removing a player who never scored returns false")
+	ctx.Equal(lbRank(ctx, "monthly", "bo"), Standing{Rank: 1, Score: 5}, "remove touches one board only: bo is still on monthly")
+	ctx.Equal(lbAdd(ctx, "weekly", "bo", 1), 1, "a removed player who scores again starts from 0")
+}
+`,
   },
   debrief: `The whole module is two conversions that Redis does for you: **member → position** (\`ZREVRANK\`) and **position range → members** (\`ZREVRANGE\`). \`top\` is the second alone; \`rank_of\` the first; \`around\` the first followed by the second, with the window clamped at 0 *before* it is sent — \`ZREVRANGE key -2 5\` is a valid command that quietly answers from the wrong end of the set, which is why the obvious \`index - k\` fails the clipping check at the top and passes everywhere else. Ranks are numbered from the window's start, not from 1, so a row carries the rank the board shows for it.
 

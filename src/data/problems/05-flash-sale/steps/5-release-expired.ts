@@ -845,6 +845,174 @@ export async function check_release_by_order(ctx) {
   assert.equal(ctx.redis.get(STOCK), '7', \`stock is \${JSON.stringify(ctx.redis.get(STOCK))} after release(o2) raced the sweeper, expected 7: the units went back twice — release must go through the same EXISTS-guarded script\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+const shoeStockKey = "stock:shoe-42"
+
+// placeHold writes a hold of shoe-42 as step 1 does: the key with its safety-net TTL and the
+// expiry-queue member, due expiresIn seconds from now.
+func placeHold(ctx *harness.Ctx, orderID string, qty int, expiresIn int64) string {
+	member := fmt.Sprintf("%s:shoe-42:%d", orderID, qty)
+	ctx.Redis.Set("hold:"+orderID, member, "EX", 2*600)
+	ctx.Redis.Do("ZADD", "holds", ctx.Clock.Now()/1000+expiresIn, member)
+	return member
+}
+
+// stringAt is the string at key, nil when it does not exist.
+func stringAt(ctx *harness.Ctx, key string) any {
+	if v, ok := ctx.Redis.Get(key); ok {
+		return v
+	}
+	return nil
+}
+
+// sweepDue runs the sweeper until the world settles (it loops forever).
+func sweepDue(ctx *harness.Ctx) { ctx.Drain(func() { sweep(context.Background()) }) }
+
+// sighting is a release touching a hold key, and the virtual time it happened at.
+type sighting struct {
+	at     int64
+	member string
+}
+
+func CheckExpiredBatch(ctx *harness.Ctx) {
+	ctx.Redis.Set(shoeStockKey, 0)
+	var expired []string
+	for i := range 150 {
+		expired = append(expired, placeHold(ctx, fmt.Sprintf("e%d", i), 1, -10))
+	}
+	future := placeHold(ctx, "later", 2, 600)
+	// Each hold key is touched once, by the release that gives it back: note when it happened.
+	var seen []sighting
+	for _, member := range expired {
+		orderID := strings.Split(member, ":")[0]
+		ctx.Redis.After("hold:"+orderID, func() any {
+			seen = append(seen, sighting{at: ctx.Clock.Now(), member: member})
+			return nil
+		})
+	}
+	// The sweeper runs in the background while the check moves time on in 100 ms steps: a loop that
+	// sleeps and one that waits on a ticker progress alike, and each tick happens at one instant.
+	go sweep(context.Background())
+	ctx.Tick()
+	for range 30 {
+		ctx.Clock.Advance(0.1)
+		ctx.Tick()
+	}
+	ctx.Assert(len(seen) > 0, "sweep released nothing: 150 holds are past their expiry")
+	var ticks []int64
+	for _, s := range seen {
+		if len(ticks) == 0 || ticks[len(ticks)-1] != s.at {
+			ticks = append(ticks, s.at)
+		}
+	}
+	var firstTick, secondTick []sighting
+	for _, s := range seen {
+		switch {
+		case s.at == ticks[0]:
+			firstTick = append(firstTick, s)
+		case len(ticks) > 1 && s.at == ticks[1]:
+			secondTick = append(secondTick, s)
+		}
+	}
+	ctx.Assert(len(firstTick) <= 100, "the first tick released %d holds; at most batch = 100 per tick", len(firstTick))
+	ctx.Equal(len(firstTick), 100, "holds released by the first tick (the full batch)")
+	ctx.Equal(len(secondTick), 50, "holds released by the second tick (the remaining 50)")
+	gap := secondTick[0].at - firstTick[0].at
+	ctx.Assert(900 <= gap && gap <= 1200, "the loop slept %d ms between ticks, expected sweepInterval = 1000", gap)
+	ctx.Equal(stringAt(ctx, "hold:later"), future, "a hold that expires in 600 s must not be released: only members with a score up to now")
+	_, ok := ctx.Redis.ZScore("holds", future)
+	ctx.Assert(ok, "the unexpired member must stay in holds")
+	members := map[string]bool{}
+	for _, s := range seen {
+		members[s.member] = true
+	}
+	ctx.Equal(len(members), 150, "distinct expired holds released by the sweep")
+	ctx.Equal(stringAt(ctx, shoeStockKey), "150", "stock after releasing 150 holds of 1 on 0: each hold goes back exactly once")
+}
+
+func CheckAtomicRelease(ctx *harness.Ctx) {
+	bg := context.Background()
+	ctx.Redis.Set(shoeStockKey, 3)
+	member := placeHold(ctx, "o1", 2, -5)
+	ok, err := releaseHold(bg, member)
+	ctx.NoError(err, "releaseHold(%q) returned an error", member)
+	ctx.Equal(ok, true, "releasing an existing hold must return true")
+	ctx.Equal(stringAt(ctx, shoeStockKey), "5", "stock after releasing a hold of 2 on 3")
+	ctx.Equal(ctx.Redis.Exists("hold:o1"), 0, "hold:o1 must be deleted by the release")
+	_, indexed := ctx.Redis.ZScore("holds", member)
+	ctx.Assert(!indexed, "the member must be removed from holds by the release")
+	ok, err = releaseHold(bg, member)
+	ctx.NoError(err, "releaseHold(%q) returned an error", member)
+	ctx.Equal(ok, false, "releasing the same hold again must return false")
+	ctx.Equal(stringAt(ctx, shoeStockKey), "5", "stock after a second release (units go back exactly once)")
+
+	ctx.Redis.Set(shoeStockKey, 0)
+	placeHold(ctx, "a", 2, 600)
+	placeHold(ctx, "b", 3, 600)
+	c := placeHold(ctx, "c", 1, 1800)
+	ctx.Clock.Advance(601)
+	sweepDue(ctx)
+	ctx.Equal(stringAt(ctx, shoeStockKey), "5", "stock after sweeping two expired holds of 2 and 3")
+	ctx.Equal(ctx.Redis.Exists("hold:a", "hold:b"), 0, "the sweeper must delete the expired hold keys")
+	var left []string
+	for _, z := range ctx.Redis.ZRangeWithScores("holds", 0, -1) {
+		left = append(left, z.Member)
+	}
+	ctx.Equal(left, []string{c}, "holds must keep only the unexpired member")
+	ctx.Equal(stringAt(ctx, "hold:c"), c, "an unexpired hold must be left alone")
+}
+
+func CheckSkipFulfilled(ctx *harness.Ctx) {
+	ctx.Redis.Set(shoeStockKey, 3)
+	member := "o1:shoe-42:2"
+	ctx.Redis.Do("ZADD", "holds", ctx.Clock.Now()/1000-5, member)
+	ok, err := releaseHold(context.Background(), member)
+	ctx.NoError(err, "releaseHold(%q) returned an error", member)
+	ctx.Equal(ok, false, "a member whose hold:o1 is gone (confirmed) must return false")
+	ctx.Equal(stringAt(ctx, shoeStockKey), "3", "a confirmed order's units were sold, not given back: stock")
+	_, indexed := ctx.Redis.ZScore("holds", member)
+	ctx.Assert(!indexed, "the stale member must be ZREMed so the sweeper never reads it again")
+
+	ctx.Redis.Do("ZADD", "holds", ctx.Clock.Now()/1000-5, "o2:shoe-42:1")
+	sweepDue(ctx)
+	ctx.Equal(stringAt(ctx, shoeStockKey), "3", "sweeping a confirmed order must not touch stock")
+	ctx.Equal(ctx.Redis.ZCard("holds"), 0, "the sweeper must drop the stale member from holds")
+}
+
+func CheckReleaseByOrder(ctx *harness.Ctx) {
+	bg := context.Background()
+	ctx.Redis.Set(shoeStockKey, 3)
+	member := placeHold(ctx, "o1", 2, 600)
+	ctx.NoError(release(bg, "o1"), "release(o1) returned an error")
+	ctx.Equal(stringAt(ctx, shoeStockKey), "5", "stock after release(o1)")
+	ctx.Equal(ctx.Redis.Exists("hold:o1"), 0, "hold:o1 must be gone after release(o1)")
+	_, indexed := ctx.Redis.ZScore("holds", member)
+	ctx.Assert(!indexed, "the member must leave holds after release(o1)")
+	ctx.NoError(release(bg, "o1"), "a second release(o1) returned an error")
+	ctx.Equal(stringAt(ctx, shoeStockKey), "5", "a second release(o1) must not give the units back again")
+	ctx.NoError(release(bg, "never-reserved"), "release(never-reserved) returned an error")
+	ctx.Equal(stringAt(ctx, shoeStockKey), "5", "release of an unknown order must do nothing")
+
+	// The sweeper gets there first: right after release(o2) has read the member, the hold is swept.
+	racing := placeHold(ctx, "o2", 2, -5)
+	ctx.Redis.After("hold:o2", func() any {
+		ctx.Redis.Do("INCRBY", shoeStockKey, 2)
+		ctx.Redis.Del("hold:o2")
+		return ctx.Redis.Do("ZREM", "holds", racing)
+	})
+	ctx.NoError(release(bg, "o2"), "release(o2) returned an error")
+	ctx.Equal(stringAt(ctx, shoeStockKey), "7", "stock after release(o2) raced the sweeper (the units must not go back twice: release must go through the same EXISTS-guarded script)")
+}
+`,
   },
   debrief: `The sorted set is a priority queue keyed by time, and \`ZRANGEBYSCORE … LIMIT\` is the classic way to drain one in bounded slices. The \`EXISTS\` guard inside the script is what makes the sweeper, the API's 503 path and the consumer's no-stock path safe to run concurrently and to repeat: a hold is released at most once no matter who gets there first. Real systems run the sweeper on an elected leader (or shard the sorted set by SKU prefix), treat keyspace notifications only as a hint, and reconcile the Redis counter against the warehouse ledger after the drop — the oversell that any cache-fronted counter eventually produces is caught by accounting, not by more Lua.`,
 };

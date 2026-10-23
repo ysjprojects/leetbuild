@@ -279,7 +279,7 @@ type Candidate struct {
 }
 
 // driverStatus is provided (driver_store.go): driver id → available / on_trip / offline.
-func driverStatus(ctx context.Context, ids []string) map[string]string { panic("not implemented") }
+var driverStatus = func(ctx context.Context, ids []string) map[string]string { panic("not implemented") }
 
 // nearest returns the k closest available drivers, nearest first.
 func nearest(ctx context.Context, city string, lat, lng float64, k int) ([]Candidate, error) {
@@ -311,7 +311,7 @@ type Candidate struct {
 }
 
 // driverStatus is provided (driver_store.go): driver id → available / on_trip / offline.
-func driverStatus(ctx context.Context, ids []string) map[string]string { panic("not implemented") }
+var driverStatus = func(ctx context.Context, ids []string) map[string]string { panic("not implemented") }
 
 // nearest returns the k closest available drivers, nearest first.
 func nearest(ctx context.Context, city string, lat, lng float64, k int) ([]Candidate, error) {
@@ -686,6 +686,159 @@ export async function check_top_k(ctx) {
   ({m} = dispatcher(ctx, {'d-7': 'on_trip'}));
   found = await m.nearest('paris', PICKUP[0], PICKUP[1], 2);
   assert.deepEqual(ids(found), ['d-2', 'd-9'], \`with d-7 on a trip the top 2 are d-2 and d-9, got \${JSON.stringify(ids(found))}: filter first, then cut to k\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"sort"
+
+	"leetbuild/harness"
+)
+
+const pickupLat, pickupLng = 48.85, 2.35
+
+type seededDriver struct {
+	id       string
+	lat, lng float64
+}
+
+// seedDrivers writes the GEO member and, when seen, a live presence key for every driver.
+func seedDrivers(ctx *harness.Ctx, city string, seen bool, drivers ...seededDriver) {
+	for _, d := range drivers {
+		ctx.Redis.Do("GEOADD", "drivers:"+city, d.lng, d.lat, d.id)
+		if seen {
+			ctx.Redis.Set("driver:"+d.id+":seen", "1000", "EX", 30)
+		}
+	}
+}
+
+// storeCalls stands in for driver_store.go: it answers from statuses (default available) and records
+// the ids of every call.
+type storeCalls struct{ calls [][]string }
+
+func standInStore(statuses map[string]string) *storeCalls {
+	s := &storeCalls{}
+	driverStatus = func(_ context.Context, ids []string) map[string]string {
+		s.calls = append(s.calls, append([]string(nil), ids...))
+		out := map[string]string{}
+		for _, id := range ids {
+			status, ok := statuses[id]
+			if !ok {
+				status = "available"
+			}
+			out[id] = status
+		}
+		return out
+	}
+	return s
+}
+
+func nearestIDs(ctx *harness.Ctx, city string, lat, lng float64, k int) ([]Candidate, []string) {
+	found, err := nearest(context.Background(), city, lat, lng, k)
+	ctx.NoError(err, "nearest(%q, %v, %v, %d) returned an error", city, lat, lng, k)
+	ids := []string{}
+	for _, c := range found {
+		ids = append(ids, c.DriverID)
+	}
+	return found, ids
+}
+
+func CheckGeosearch(ctx *harness.Ctx) {
+	seedDrivers(ctx, "paris", true, seededDriver{"d-7", 48.852, 2.352}, seededDriver{"d-9", 48.86, 2.37}, seededDriver{"d-far", 48.9, 2.35})
+	seedDrivers(ctx, "lyon", true, seededDriver{"d-l", 45.76, 4.84})
+	standInStore(nil)
+	_, ids := nearestIDs(ctx, "paris", pickupLat, pickupLng, 10)
+	ctx.Equal(ids, []string{"d-7", "d-9"}, "nearest(paris): within 3 km of (lat 48.85, lng 2.35), lng before lat in the search")
+	for _, id := range ids {
+		ctx.Assert(id != "d-far", "d-far is 5.6 km away and must be outside the 3 km radius")
+	}
+	_, ids = nearestIDs(ctx, "lyon", 45.76, 4.84, 10)
+	ctx.Equal(ids, []string{"d-l"}, "nearest(lyon): the search is on drivers:{city}")
+}
+
+func CheckSortedBounded(ctx *harness.Ctx) {
+	// ~0.111 km apart, 25 within 3 km, seeded in a fixed shuffled order.
+	drivers := make([]seededDriver, 25)
+	for i := range drivers {
+		drivers[i] = seededDriver{fmt.Sprintf("d-%d", i+1), 48.85 + float64(i+1)/1000, 2.35}
+	}
+	state := int64(7)
+	for i := len(drivers) - 1; i > 0; i-- {
+		state = (state*1103515245 + 12345) % 2147483648
+		j := state % int64(i+1)
+		drivers[i], drivers[j] = drivers[j], drivers[i]
+	}
+	seedDrivers(ctx, "paris", true, drivers...)
+	standInStore(nil)
+	found, ids := nearestIDs(ctx, "paris", pickupLat, pickupLng, 25)
+	ctx.Equal(len(found), 20, "drivers for k=25 with 25 in range: the search must ask Redis for Count 20 candidates")
+	dists := make([]float64, len(found))
+	for i, c := range found {
+		dists[i] = c.Dist
+	}
+	ctx.Assert(sort.Float64sAreSorted(dists), "results must be nearest first: distances %v", dists)
+	ctx.Equal(ids[:3], []string{"d-1", "d-2", "d-3"}, "the nearest three")
+	ctx.Assert(math.Abs(dists[0]-0.111) < 0.02, "distances must be in km from WithDist: d-1 is 0.11 km away, got %v", dists[0])
+	ctx.Assert(math.Abs(dists[9]-1.112) < 0.03, "d-10 is 1.11 km away, got %v", dists[9])
+}
+
+func CheckPresenceMget(ctx *harness.Ctx) {
+	seedDrivers(ctx, "paris", true, seededDriver{"d-2", 48.857, 2.35})
+	ctx.Clock.Advance(31) // d-2 went silent: its presence key expired
+	seedDrivers(ctx, "paris", true, seededDriver{"d-7", 48.852, 2.352}, seededDriver{"d-9", 48.86, 2.37})
+	seedDrivers(ctx, "paris", false, seededDriver{"d-5", 48.83, 2.35})
+	store := standInStore(nil)
+	before := len(ctx.Redis.RoundTrips())
+	_, ids := nearestIDs(ctx, "paris", pickupLat, pickupLng, 10)
+	var commands []string
+	for _, trip := range ctx.Redis.RoundTrips()[before:] {
+		commands = append(commands, trip...)
+	}
+	ctx.Equal(ids, []string{"d-7", "d-9"}, "nearest: d-2 and d-5 have no driver:{id}:seen key")
+	mgets, gets := 0, 0
+	for _, c := range commands {
+		switch c {
+		case "MGET":
+			mgets++
+		case "GET":
+			gets++
+		}
+	}
+	ctx.Equal(mgets, 1, "presence must be one MGET over every candidate's seen key: MGETs sent (commands: %v)", commands)
+	ctx.Equal(gets, 0, "no GET per driver: GETs sent (commands: %v)", commands)
+	for _, call := range store.calls {
+		for _, id := range call {
+			ctx.Assert(id != "d-2" && id != "d-5", "silent drivers must be dropped before asking the driver store, which saw %v", store.calls)
+		}
+	}
+}
+
+func CheckAvailableOnly(ctx *harness.Ctx) {
+	seedDrivers(ctx, "paris", true, seededDriver{"d-7", 48.852, 2.352}, seededDriver{"d-2", 48.857, 2.35}, seededDriver{"d-9", 48.86, 2.37}, seededDriver{"d-5", 48.83, 2.35})
+	store := standInStore(map[string]string{"d-7": "on_trip", "d-9": "offline"})
+	_, ids := nearestIDs(ctx, "paris", pickupLat, pickupLng, 10)
+	ctx.Equal(ids, []string{"d-2", "d-5"}, "nearest: d-7 is on_trip and d-9 offline")
+	ctx.Equal(len(store.calls), 1, "the driver store must be asked once with every live candidate (calls: %v)", store.calls)
+	asked := append([]string(nil), store.calls[0]...)
+	sort.Strings(asked)
+	ctx.Equal(asked, []string{"d-2", "d-5", "d-7", "d-9"}, "the driver store must be asked about the four live candidates")
+}
+
+func CheckTopK(ctx *harness.Ctx) {
+	seedDrivers(ctx, "paris", true, seededDriver{"d-7", 48.852, 2.352}, seededDriver{"d-2", 48.857, 2.35}, seededDriver{"d-9", 48.86, 2.37}, seededDriver{"d-5", 48.83, 2.35}, seededDriver{"d-3", 48.87, 2.36})
+	standInStore(nil)
+	found, ids := nearestIDs(ctx, "paris", pickupLat, pickupLng, 2)
+	ctx.Equal(len(found), 2, "k=2: drivers returned (%v)", ids)
+	ctx.Equal(ids, []string{"d-7", "d-2"}, "the two nearest")
+	found, _ = nearestIDs(ctx, "paris", pickupLat, pickupLng, 10)
+	ctx.Equal(len(found), 5, "k=10 with five drivers in range must return all five")
+	standInStore(map[string]string{"d-7": "on_trip"})
+	_, ids = nearestIDs(ctx, "paris", pickupLat, pickupLng, 2)
+	ctx.Equal(ids, []string{"d-2", "d-9"}, "with d-7 on a trip the top 2 (filter first, then cut to k)")
 }
 `,
   },

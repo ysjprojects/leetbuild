@@ -1,6 +1,7 @@
 /**
  * Runtime support modules for the match-engine course: the provided price-time `Book` that step 3
- * (`from book import Book, Order` / `import {Book} from 'book'`) matches orders against.
+ * (`from book import Book, Order` / `import {Book} from 'book'` / `import "exchange/book"`) matches orders
+ * against.
  */
 export const supportModules: Record<string, string> = {
   'book.py': `"""
@@ -175,6 +176,130 @@ export class Book {
     }
     side.splice(index, 0, order);
   }
+}
+`,
+};
+
+/** The same `Book`, for the Go runtime: `import "exchange/book"`, then `book.New().Match(order)`. */
+export const supportModulesGo: Record<string, string> = {
+  'exchange/book/book.go': `// Package book is the provided limit order book: price-time priority.
+//
+// New().Match(order) crosses the incoming order against the resting orders of the opposite side,
+// best price first and oldest first at one price, fills at the resting order's price, and rests any
+// remainder. It returns one Fill per resting order it traded against, in matching order.
+package book
+
+import "fmt"
+
+// Order is a limit order, as the gateway publishes it on the orders topic.
+type Order struct {
+	OrderID       string  \`json:"order_id"\`
+	Symbol        string  \`json:"symbol"\`
+	Side          string  \`json:"side"\`
+	Price         float64 \`json:"price"\`
+	Qty           int64   \`json:"qty"\`
+	ClientOrderID string  \`json:"client_order_id"\`
+}
+
+// Fill is one trade: the incoming order (the taker) against one resting order.
+type Fill struct {
+	Symbol      string  \`json:"symbol"\`
+	Price       float64 \`json:"price"\`
+	Qty         int64   \`json:"qty"\`
+	BuyOrderID  string  \`json:"buy_order_id"\`
+	SellOrderID string  \`json:"sell_order_id"\`
+	TakerSide   string  \`json:"taker_side"\`
+}
+
+// Book is one symbol's order book.
+type Book struct {
+	Bids []Order // best (highest) price first, oldest first within a price
+	Asks []Order // best (lowest) price first, oldest first within a price
+	Last float64 // the price of the last fill, 0 before the first
+}
+
+// New returns an empty book.
+func New() *Book { return &Book{} }
+
+// Bid is the best bid, 0 when there is none.
+func (b *Book) Bid() float64 {
+	if len(b.Bids) == 0 {
+		return 0
+	}
+	return b.Bids[0].Price
+}
+
+// Ask is the best ask, 0 when there is none.
+func (b *Book) Ask() float64 {
+	if len(b.Asks) == 0 {
+		return 0
+	}
+	return b.Asks[0].Price
+}
+
+// Top is (bid, ask, last) as the engine publishes them; 0 for an empty side or no trade yet.
+func (b *Book) Top() (bid, ask, last float64) { return b.Bid(), b.Ask(), b.Last }
+
+// Match crosses order against the book and rests what is left of it. It panics on a side other
+// than BUY or SELL.
+func (b *Book) Match(order Order) []Fill {
+	if order.Side != "BUY" && order.Side != "SELL" {
+		panic(fmt.Sprintf("book: unknown side %q", order.Side))
+	}
+	buying := order.Side == "BUY"
+	resting := &b.Bids
+	if buying {
+		resting = &b.Asks
+	}
+	remaining := order.Qty
+	var fills []Fill
+	for remaining > 0 && len(*resting) > 0 {
+		best := &(*resting)[0]
+		crosses := order.Price <= best.Price
+		if buying {
+			crosses = order.Price >= best.Price
+		}
+		if !crosses {
+			break
+		}
+		qty := min(remaining, best.Qty)
+		buyID, sellID := best.OrderID, order.OrderID
+		if buying {
+			buyID, sellID = order.OrderID, best.OrderID
+		}
+		fills = append(fills, Fill{Symbol: order.Symbol, Price: best.Price, Qty: qty, BuyOrderID: buyID, SellOrderID: sellID, TakerSide: order.Side})
+		b.Last = best.Price
+		remaining -= qty
+		best.Qty -= qty
+		if best.Qty == 0 {
+			*resting = (*resting)[1:]
+		}
+	}
+	if remaining > 0 {
+		order.Qty = remaining
+		b.rest(order)
+	}
+	return fills
+}
+
+// rest inserts order behind every resting order at its price or better.
+func (b *Book) rest(order Order) {
+	side := &b.Asks
+	better := func(p, q float64) bool { return p < q }
+	if order.Side == "BUY" {
+		side = &b.Bids
+		better = func(p, q float64) bool { return p > q }
+	}
+	index := len(*side)
+	for i, resting := range *side {
+		if better(order.Price, resting.Price) {
+			index = i
+			break
+		}
+	}
+	*side = append(*side, Order{})
+	copy((*side)[index+1:], (*side)[index:])
+	(*side)[index] = order
 }
 `,
 };

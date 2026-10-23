@@ -233,7 +233,7 @@ const (
 )
 
 // render fetches the original and resizes it (built in step 4); nil, nil when the origin has no such image.
-func render(ctx context.Context, id string, width int) ([]byte, error) {
+var render = func(ctx context.Context, id string, width int) ([]byte, error) {
 	panic("not implemented")
 }
 
@@ -267,7 +267,7 @@ const (
 )
 
 // render fetches the original and resizes it (built in step 4); nil, nil when the origin has no such image.
-func render(ctx context.Context, id string, width int) ([]byte, error) {
+var render = func(ctx context.Context, id string, width int) ([]byte, error) {
 	panic("not implemented")
 }
 
@@ -511,6 +511,105 @@ export async function check_negative(ctx) {
   ctx.clock.advance(61);
   await m.getThumb('ghost', 256);
   assert.equal(calls.length, 2, 'once the sentinel expires the image is rendered again');
+}
+`,
+    go: `package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/hex"
+
+	"leetbuild/harness"
+)
+
+var caBg = context.Background()
+
+// caJPEG is fake JPEG bytes: the real SOI marker (FF D8 FF, not valid UTF-8) and a label.
+func caJPEG(label string) []byte { return append([]byte{0xff, 0xd8, 0xff}, label...) }
+
+// caHex shows bytes as hex, nil as nil.
+func caHex(b []byte) string {
+	if b == nil {
+		return "nil"
+	}
+	return hex.EncodeToString(b)
+}
+
+// caCall is one render call the stand-in saw.
+type caCall struct {
+	id    string
+	width int
+}
+
+// caResizer stands in for render (the resizer, step 4): it knows cat and records every call.
+func caResizer() *[]caCall {
+	calls := &[]caCall{}
+	render = func(_ context.Context, id string, width int) ([]byte, error) {
+		*calls = append(*calls, caCall{id, width})
+		if id != "cat" {
+			return nil, nil
+		}
+		return caJPEG("JPEG-" + id), nil
+	}
+	return calls
+}
+
+func caGetThumb(ctx *harness.Ctx, id string, width int) []byte {
+	data, err := getThumb(caBg, id, width)
+	ctx.NoError(err, "getThumb(ctx, %q, %d) returned an error", id, width)
+	return data
+}
+
+// caStored is the bytes at key, nil when there is no such key.
+func caStored(ctx *harness.Ctx, key string) []byte {
+	if v, ok := ctx.Redis.Get(key); ok {
+		return []byte(v)
+	}
+	return nil
+}
+
+func CheckKey(ctx *harness.Ctx) {
+	caResizer()
+	got := caGetThumb(ctx, "cat", 256)
+	ctx.Assert(got != nil && bytes.Equal(got, caJPEG("JPEG-cat")), "a miss must return the rendered bytes: got %s, expected %s", caHex(got), caHex(caJPEG("JPEG-cat")))
+	ctx.Assert(ctx.Redis.Exists("thumb:cat:256") == 1, "after a miss the bytes must be stored under thumb:cat:256, keys are %s", harness.Show(ctx.Redis.Keys("*")))
+	stored := caStored(ctx, "thumb:cat:256")
+	ctx.Assert(bytes.Equal(stored, caJPEG("JPEG-cat")), "the cached value must be the rendered bytes, verbatim: stored %s, expected %s", caHex(stored), caHex(caJPEG("JPEG-cat")))
+	caGetThumb(ctx, "cat", 64)
+	ctx.Assert(ctx.Redis.Exists("thumb:cat:64") == 1, "every width is its own entry: thumb:cat:64")
+}
+
+func CheckReadFirst(ctx *harness.Ctx) {
+	calls := caResizer()
+	ctx.Redis.Set("thumb:cat:256", caJPEG("CACHED"))
+	hit := caGetThumb(ctx, "cat", 256)
+	ctx.Assert(hit != nil && bytes.Equal(hit, caJPEG("CACHED")), "a hit must return the cached bytes verbatim: got %s, expected %s", caHex(hit), caHex(caJPEG("CACHED")))
+	ctx.Equal(len(*calls), 0, "render() must not run on a hit")
+	miss := caGetThumb(ctx, "cat", 128)
+	ctx.Assert(miss != nil && bytes.Equal(miss, caJPEG("JPEG-cat")), "a miss must return the rendered bytes: got %s, expected %s", caHex(miss), caHex(caJPEG("JPEG-cat")))
+	ctx.Equal(*calls, []caCall{{"cat", 128}}, "a miss renders exactly once")
+}
+
+func CheckTtl(ctx *harness.Ctx) {
+	caResizer()
+	caGetThumb(ctx, "cat", 256)
+	ttl := ctx.Redis.TTL("thumb:cat:256")
+	ctx.Assert(86000 <= ttl && ttl <= 86400, "expected a TTL of 86400 s on thumb:cat:256, got %d", ttl)
+	ctx.Clock.Advance(86401)
+	ctx.Assert(caStored(ctx, "thumb:cat:256") == nil, "the entry must be gone once the TTL passes")
+}
+
+func CheckNegative(ctx *harness.Ctx) {
+	calls := caResizer()
+	ctx.Assert(caGetThumb(ctx, "ghost", 256) == nil, "a missing image returns nothing")
+	ctx.Assert(caGetThumb(ctx, "ghost", 256) == nil, "a missing image still returns nothing on the second call")
+	ctx.Equal(len(*calls), 1, "render calls for a missing image: the second call must hit the negative cache")
+	ttl := ctx.Redis.TTL("thumb:ghost:256")
+	ctx.Assert(0 < ttl && ttl <= 60, "the negative entry must expire within 60 s, got TTL %d", ttl)
+	ctx.Clock.Advance(61)
+	caGetThumb(ctx, "ghost", 256)
+	ctx.Equal(len(*calls), 2, "once the sentinel expires the image is rendered again")
 }
 `,
   },

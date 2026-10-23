@@ -995,6 +995,178 @@ export async function check_idle_sleep(ctx) {
   assert.equal(ctx.kafka.records('payments').length, 1);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"sort"
+
+	"leetbuild/harness"
+)
+
+const relaySchema = \`
+CREATE TABLE outbox (
+    id text PRIMARY KEY,
+    topic text NOT NULL,
+    key text NOT NULL,
+    payload text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    sent_at timestamptz
+);
+\`
+
+func seedOutbox(ctx *harness.Ctx, rowID, merchant, topic string) {
+	payload, _ := json.Marshal(map[string]any{"event_id": rowID, "type": "payment.captured", "merchant_id": merchant})
+	ctx.DB.Exec("INSERT INTO outbox (id, topic, key, payload) VALUES ($1, $2, $3, $4)", rowID, topic, merchant, string(payload))
+}
+
+// resetOutbox empties the outbox and seeds (id, merchant) rows on the payments topic.
+func resetOutbox(ctx *harness.Ctx, rows ...[2]string) {
+	ctx.DB.Reset(relaySchema)
+	for _, row := range rows {
+		seedOutbox(ctx, row[0], row[1], "payments")
+	}
+}
+
+func relayPass(ctx *harness.Ctx) int {
+	n, err := relayOnce(context.Background())
+	ctx.NoError(err, "relayOnce returned an error")
+	return n
+}
+
+// sentMarks maps row id → marked sent?
+func sentMarks(ctx *harness.Ctx) map[string]bool {
+	marks := map[string]bool{}
+	for _, row := range ctx.DB.Query("SELECT id, sent_at FROM outbox ORDER BY id") {
+		marks[row["id"].(string)] = row["sent_at"] != nil
+	}
+	return marks
+}
+
+func eventIDOf(r harness.KafkaRecord) string {
+	var event struct {
+		EventID string \`json:"event_id"\`
+	}
+	_ = json.Unmarshal(r.Value, &event)
+	return event.EventID
+}
+
+func CheckDurableProducer(ctx *harness.Ctx) {
+	resetOutbox(ctx, [2]string{"e1", "m-1"})
+	ctx.Kafka.LoseAcks("payments", 1) // the broker wrote e1 but its acknowledgement never arrived: the producer retries
+	ctx.Equal(relayPass(ctx), 1, "relayOnce must return how many rows it delivered")
+	// kafka-go has no idempotent producer (the check's detail: RequireAll is what it can promise): at least once, identical copies.
+	records := ctx.Kafka.Records("payments")
+	ctx.Assert(len(records) >= 1, "after one lost acknowledgement the topic holds no record of e1: the retry must deliver it")
+	for _, r := range records {
+		ctx.Assert(string(r.Key) == string(records[0].Key) && string(r.Value) == string(records[0].Value), "the retry after a lost acknowledgement must resend the same record (same key and value, so the event_id lets the ledger dedupe), got %q / %q and %q / %q", records[0].Key, records[0].Value, r.Key, r.Value)
+	}
+	seedOutbox(ctx, "e2", "m-2", "payments")
+	ctx.Equal(relayPass(ctx), 1, "relayOnce over the new row e2")
+	ctx.Kafka.Failover("payments") // the partition leader dies right after acknowledging e2
+	distinct := map[string]bool{}
+	for _, r := range ctx.Kafka.Records("payments") {
+		distinct[string(r.Key)+"|"+string(r.Value)] = true
+	}
+	ctx.Equal(len(distinct), 2, "a leader failover right after the acknowledgement must leave e1 and e2 on payments (e2 acknowledged by the leader alone is lost: produce with RequiredAcks kafka.RequireAll): distinct records")
+}
+
+func CheckKeyed(ctx *harness.Ctx) {
+	resetOutbox(ctx, [2]string{"e1", "m-1"}, [2]string{"e2", "m-2"}, [2]string{"e3", "m-1"})
+	seedOutbox(ctx, "e4", "m-1", "refunds")
+	ctx.Equal(relayPass(ctx), 4, "relayOnce must return how many rows it delivered")
+	records := ctx.Kafka.Records("payments")
+	ctx.Equal(len(records), 3, "records on payments")
+	byID := map[string]harness.KafkaRecord{}
+	var ids []string
+	for _, r := range records {
+		byID[eventIDOf(r)] = r
+		ids = append(ids, eventIDOf(r))
+	}
+	sort.Strings(ids)
+	ctx.Equal(ids, []string{"e1", "e2", "e3"}, "the record value must be the row's payload: event ids on payments")
+	for _, want := range [][2]string{{"e1", "m-1"}, {"e2", "m-2"}, {"e3", "m-1"}} {
+		ctx.Equal(string(byID[want[0]].Key), want[1], "record %s must be keyed by the merchant id", want[0])
+	}
+	ctx.Equal(byID["e1"].Partition, byID["e3"].Partition, "one merchant's events must share a partition: e1 and e3")
+	refunds := ctx.Kafka.Records("refunds")
+	ctx.Assert(len(refunds) == 1 && eventIDOf(refunds[0]) == "e4", "each row goes to its own topic column: refunds must hold e4 alone")
+}
+
+func CheckAckBeforeMark(ctx *harness.Ctx) {
+	resetOutbox(ctx, [2]string{"e1", "m-1"}, [2]string{"e2", "m-2"})
+	ctx.Kafka.FailNext("payments", 1) // the first produce is refused by the broker (a kafka.WriteErrors entry)
+	delivered := relayPass(ctx)
+	var marked, unmarked []string
+	for id, sent := range sentMarks(ctx) {
+		if sent {
+			marked = append(marked, id)
+		} else {
+			unmarked = append(unmarked, id)
+		}
+	}
+	sort.Strings(marked)
+	sort.Strings(unmarked)
+	ctx.Equal(len(marked), 1, "one of two records was acknowledged; rows marked sent: %v - only acknowledged rows may be marked, and acknowledged rows must be", marked)
+	ctx.Equal(len(unmarked), 1, "the record whose delivery failed must stay unsent, rows unsent: %v", unmarked)
+	ctx.Equal(delivered, 1, "relayOnce must return the delivered rows")
+	ctx.Equal(ctx.DB.Events(), []string{"BEGIN", "COMMIT"}, "select, produce, wait for the acknowledgements and update belong to one transaction; the database saw")
+}
+
+func CheckMarkDelivered(ctx *harness.Ctx) {
+	resetOutbox(ctx, [2]string{"e1", "m-1"}, [2]string{"e2", "m-2"}, [2]string{"e3", "m-3"})
+	ctx.Equal(relayPass(ctx), 3, "relayOnce over three rows")
+	marks := sentMarks(ctx)
+	for _, sent := range marks {
+		ctx.Assert(sent, "every delivered row must be marked sent_at, got %v", marks)
+	}
+	ctx.Equal(relayPass(ctx), 0, "a second pass must find nothing: sent rows are not re-published")
+	ctx.Equal(len(ctx.Kafka.Records("payments")), 3, "sent rows were produced again: records on payments")
+	seedOutbox(ctx, "e4", "m-4", "payments")
+	ctx.Kafka.FailNext("payments", 1)
+	refused := relayPass(ctx)
+	ctx.Equal(refused, 0, "a refused delivery is not a delivered row")
+	ctx.Equal(sentMarks(ctx)["e4"], false, "a row whose delivery failed must stay unsent for the next pass")
+	ctx.Equal(relayPass(ctx), 1, "the next pass must pick the unsent row up again")
+	ctx.Equal(sentMarks(ctx)["e4"], true, "the retried row must be marked once delivered")
+	ctx.Equal(len(ctx.Kafka.Records("payments")), 4, "records on payments")
+}
+
+// cancelAfterPasses cancels the relay's context once its passes-th transaction (a pass) has committed.
+func cancelAfterPasses(ctx *harness.Ctx, passes int, cancel context.CancelFunc) {
+	if passes <= 1 {
+		ctx.DB.After("COMMIT", cancel)
+		return
+	}
+	ctx.DB.After("COMMIT", func() { cancelAfterPasses(ctx, passes-1, cancel) })
+}
+
+func CheckIdleSleep(ctx *harness.Ctx) {
+	resetOutbox(ctx)
+	start := ctx.Clock.Now()
+	// Three passes over an empty outbox, then run's context is cancelled; a loop that never sleeps is caught by its passes.
+	idle, stop := context.WithCancel(context.Background())
+	cancelAfterPasses(ctx, 3, stop)
+	ctx.Drain(func() { run(idle) })
+	stop()
+	sleeps := ctx.Clock.Sleeps()
+	ctx.Assert(sleeps >= 2, "run() made %d passes over an empty outbox without sleeping: sleep between passes instead of polling in a tight loop", len(ctx.DB.Events())/2)
+	elapsed := float64(ctx.Clock.Now()-start) / 1000
+	perSleep := elapsed / float64(sleeps)
+	ctx.Assert(0.05 <= perSleep && perSleep <= 5.0, "%d idle sleeps advanced the clock by %.1f s; the idle sleep should be brief (idleSleep)", sleeps, elapsed)
+	// A row arrives: a fresh run() must relay it before it ever sleeps (its context ends with its first pass).
+	seedOutbox(ctx, "e1", "m-1", "payments")
+	fresh, stopFresh := context.WithCancel(context.Background())
+	cancelAfterPasses(ctx, 1, stopFresh)
+	sleptBeforePass := -1
+	ctx.DB.After("BEGIN", func() { sleptBeforePass = ctx.Clock.Sleeps() - sleeps })
+	ctx.Drain(func() { run(fresh) })
+	stopFresh()
+	ctx.Assert(sentMarks(ctx)["e1"] && sleptBeforePass == 0, "run() must relay a pending row before it sleeps")
+	ctx.Equal(len(ctx.Kafka.Records("payments")), 1, "records on payments")
+}
+`,
   },
   debrief: `The relay is where "durable" is decided: \`acks=all\` plus the idempotent producer make the broker side safe, and marking rows only after the acknowledgement makes the database side honest about what was published. Everything else is throughput: batches of 100, \`SKIP LOCKED\` so relays scale out, an idle sleep so an empty table costs nothing. Production relays add a \`sent_at\` sweeper that deletes old rows, back off on broker errors, and are usually replaced by change data capture once volume grows.`,
 };

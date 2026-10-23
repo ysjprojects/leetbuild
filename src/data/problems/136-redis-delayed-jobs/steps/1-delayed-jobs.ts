@@ -1032,6 +1032,198 @@ export async function check_complete(ctx) {
   assert.deepEqual(ctx.redis.keys('*'), [], \`after completing every job nothing remains, but Redis holds \${JSON.stringify(ctx.redis.keys('*'))}\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"sort"
+
+	"leetbuild/harness"
+)
+
+var djBg = context.Background()
+
+func djIDs(jobs []Job) []string {
+	ids := []string{}
+	for _, j := range jobs {
+		ids = append(ids, j.ID)
+	}
+	return ids
+}
+
+func djSchedule(ctx *harness.Ctx, jobID, payload string, runAtMs int64) {
+	ctx.NoError(schedule(djBg, jobID, payload, runAtMs), "schedule(%q, %q, %d) returned an error", jobID, payload, runAtMs)
+}
+
+func djPop(ctx *harness.Ctx, nowMs int64, limit int) []Job {
+	jobs, err := popDue(djBg, nowMs, limit)
+	ctx.NoError(err, "popDue(%d, %d) returned an error", nowMs, limit)
+	return jobs
+}
+
+// djFail is the new runAtMs, or nil when the job was not rescheduled.
+func djFail(ctx *harness.Ctx, jobID string, nowMs int64) any {
+	runAtMs, rescheduled, err := fail(djBg, jobID, nowMs)
+	ctx.NoError(err, "fail(%q, %d) returned an error", jobID, nowMs)
+	if !rescheduled {
+		return nil
+	}
+	return runAtMs
+}
+
+func djComplete(ctx *harness.Ctx, jobID string) {
+	ctx.NoError(complete(djBg, jobID), "complete(%q) returned an error", jobID)
+}
+
+// djScore is the job's score in jobs:delayed, or nil when it is not there.
+func djScore(ctx *harness.Ctx, id string) any {
+	if s, ok := ctx.Redis.ZScore("jobs:delayed", id); ok {
+		return s
+	}
+	return nil
+}
+
+// djHGet is a hash field, or nil when it is missing.
+func djHGet(ctx *harness.Ctx, key, field string) any {
+	if v, ok := ctx.Redis.HGet(key, field); ok {
+		return v
+	}
+	return nil
+}
+
+func djDelayed(ctx *harness.Ctx) []string {
+	ids := []string{}
+	for _, z := range ctx.Redis.ZRangeWithScores("jobs:delayed", 0, -1) {
+		ids = append(ids, z.Member)
+	}
+	return ids
+}
+
+func CheckScheduled(ctx *harness.Ctx) {
+	djSchedule(ctx, "a", "send-email:a", 5000)
+	djSchedule(ctx, "b", "send-email:b", 2000)
+	ctx.Equal(djHGet(ctx, "jobs:payload", "a"), "send-email:a", "jobs:payload a must hold the payload")
+	ctx.Equal(djScore(ctx, "a"), 5000, "jobs:delayed must score a at runAtMs 5000")
+	ctx.Equal(djScore(ctx, "b"), 2000, "jobs:delayed must score b at runAtMs 2000")
+	ctx.Equal(ctx.Redis.Keys("*"), []string{"jobs:delayed", "jobs:payload"}, "schedule must write exactly jobs:payload and jobs:delayed")
+	early := djPop(ctx, 1999, 10)
+	ctx.Assert(len(early) == 0, "at 1999 ms nothing is due (b is due at 2000), got %+v", early)
+	ctx.Equal(ctx.Redis.ZCard("jobs:delayed"), 2, "a pop that returned nothing must remove nothing: ZCARD jobs:delayed")
+	ctx.Equal(djPop(ctx, 2000, 10), []Job{{ID: "b", Payload: "send-email:b", Attempt: 0}}, "at 2000 ms exactly b is due")
+	ctx.Equal(djDelayed(ctx), []string{"a"}, "after popping b jobs:delayed must hold only a")
+	ctx.Equal(djHGet(ctx, "jobs:payload", "b"), "send-email:b", "popping must not delete the payload: complete does")
+}
+
+func CheckDueInOrder(ctx *harness.Ctx) {
+	for _, s := range []struct {
+		id    string
+		runAt int64
+	}{{"j3", 3000}, {"j1", 1000}, {"j5", 5000}, {"j2", 2000}, {"j4", 4000}} {
+		djSchedule(ctx, s.id, "payload-"+s.id, s.runAt)
+	}
+	first := djPop(ctx, 3500, 2)
+	ctx.Equal(djIDs(first), []string{"j1", "j2"}, "at 3500 ms with limit 2 the two earliest due jobs are j1, j2")
+	ctx.Equal(first, []Job{{ID: "j1", Payload: "payload-j1", Attempt: 0}, {ID: "j2", Payload: "payload-j2", Attempt: 0}}, "each job is {ID, Payload, Attempt}")
+	ctx.Equal(djDelayed(ctx), []string{"j3", "j4", "j5"}, "the jobs beyond the limit must stay in jobs:delayed")
+	ctx.Equal(djIDs(djPop(ctx, 3500, 10)), []string{"j3"}, "j3 is the only job still due at 3500 ms")
+	ctx.Equal(djIDs(djPop(ctx, 10000, 10)), []string{"j4", "j5"}, "at 10000 ms the rest pop in runAt order")
+	drained := djPop(ctx, 10000, 10)
+	ctx.Assert(len(drained) == 0, "a drained set pops nothing, got %+v", drained)
+	ctx.Equal(ctx.Redis.ZCard("jobs:delayed"), 0, "every job was popped; jobs:delayed must be empty")
+}
+
+func CheckAtomicClaim(ctx *harness.Ctx) {
+	djSchedule(ctx, "solo", "p", 100)
+	ctx.Equal(djIDs(djPop(ctx, 100, 10)), []string{"solo"}, "the jobs due at 100 ms")
+	ctx.Equal(djScore(ctx, "solo"), nil, "a popped job must be gone from jobs:delayed: the script ZREMs what it returns")
+	for i := range 3 {
+		djSchedule(ctx, fmt.Sprintf("j%d", i), fmt.Sprintf("p%d", i), 1000)
+	}
+	// A second worker's popDue lands right after the first command that touches jobs:delayed —
+	// between a client-side ZRANGEBYSCORE and its ZREM, or after the whole script.
+	rival := ctx.Redis.After("jobs:delayed", func() any {
+		jobs, err := popDue(djBg, 1000, 10)
+		if err != nil {
+			panic(err)
+		}
+		return jobs
+	})
+	mine := djPop(ctx, 1000, 10)
+	ctx.Assert(rival.Fired, "popDue never touched jobs:delayed as a script key: pass it as KEYS[1]")
+	ctx.NoError(rival.Err, "the second worker's popDue failed")
+	his, _ := rival.Result.([]Job)
+	shared := []string{}
+	for _, a := range djIDs(mine) {
+		for _, b := range djIDs(his) {
+			if a == b {
+				shared = append(shared, a)
+			}
+		}
+	}
+	ctx.Assert(len(shared) == 0, "two workers popping at once both got %q: a ZRANGEBYSCORE followed by a separate ZREM lets both read the same ids. Read and remove inside one Lua script", shared)
+	all := append(djIDs(mine), djIDs(his)...)
+	sort.Strings(all)
+	ctx.Assert(fmt.Sprint(all) == "[j0 j1 j2]", "between them the two workers must get every due job once: %q and %q", djIDs(mine), djIDs(his))
+	ctx.Assert(ctx.Redis.ZCard("jobs:delayed") == 0, "jobs:delayed still holds %q after both pops", djDelayed(ctx))
+}
+
+func CheckBackoff(ctx *harness.Ctx) {
+	djSchedule(ctx, "j", "p", 0)
+	now := int64(0)
+	for failures, delay := range []int64{1000, 2000, 4000, 8000} {
+		due := djPop(ctx, now, 10)
+		ctx.Equal(due, []Job{{ID: "j", Payload: "p", Attempt: failures}}, "at %d ms the job is due with %d failure(s) so far", now, failures)
+		ctx.Equal(djFail(ctx, "j", now), now+delay, "failure %d must reschedule at now + %d ms: the runAtMs fail returned", failures+1, delay)
+		ctx.Equal(djScore(ctx, "j"), now+delay, "after failure %d jobs:delayed must score j at now + %d ms", failures+1, delay)
+		ctx.Equal(djHGet(ctx, "jobs:attempts", "j"), fmt.Sprint(failures+1), "jobs:attempts j after %d failure(s)", failures+1)
+		early := djPop(ctx, now+delay-1, 10)
+		ctx.Assert(len(early) == 0, "1 ms before its new runAt the job must not pop, got %+v", early)
+		now += delay
+	}
+	ctx.Equal(djPop(ctx, now, 10), []Job{{ID: "j", Payload: "p", Attempt: 4}}, "the fifth run sees 4 failures")
+	ctx.Equal(djFail(ctx, "j", now), nil, "the fifth failure must not reschedule: fail returns rescheduled false")
+	ctx.Equal(djScore(ctx, "j"), nil, "a dead job must not be in jobs:delayed")
+	ctx.Equal(ctx.Redis.LRange("jobs:dead", 0, -1), []string{"j"}, "jobs:dead")
+	ctx.Equal(djHGet(ctx, "jobs:attempts", "j"), nil, "a dead job's attempt count is dropped")
+	ctx.Equal(djHGet(ctx, "jobs:payload", "j"), "p", "a dead job's payload stays for inspection")
+	late := djPop(ctx, 1_000_000_000, 10)
+	ctx.Assert(len(late) == 0, "a dead job never pops again, got %+v", late)
+}
+
+func CheckBackoffCap(ctx *harness.Ctx) {
+	for _, c := range [][2]int64{{1, 1000}, {2, 2000}, {3, 4000}, {4, 8000}, {5, 16000}, {6, 32000}, {7, 60000}, {8, 60000}, {12, 60000}} {
+		ctx.Equal(backoffMs(int(c[0])), c[1], "backoffMs(%d): baseMs * 2^(attempt - 1) capped at maxBackoffMs", c[0])
+	}
+	djSchedule(ctx, "j", "p", 0)
+	djPop(ctx, 0, 10)
+	ctx.Equal(djFail(ctx, "j", 500000), 501000, "the first failure at 500000 ms must reschedule at 501000")
+	djPop(ctx, 501000, 10)
+	ctx.Equal(djFail(ctx, "j", 501000), 503000, "the second failure at 501000 ms must reschedule at 503000")
+}
+
+func CheckComplete(ctx *harness.Ctx) {
+	djSchedule(ctx, "a", "pa", 0)
+	djSchedule(ctx, "b", "pb", 5000)
+	ctx.Equal(djIDs(djPop(ctx, 0, 10)), []string{"a"}, "the jobs due at 0 ms")
+	djFail(ctx, "a", 0)
+	ctx.Equal(djIDs(djPop(ctx, 1000, 10)), []string{"a"}, "the jobs due at 1000 ms")
+	djComplete(ctx, "a")
+	ctx.Equal(djHGet(ctx, "jobs:payload", "a"), nil, "complete must delete the payload")
+	ctx.Equal(djHGet(ctx, "jobs:attempts", "a"), nil, "complete must delete the attempt count")
+	ctx.Equal(djScore(ctx, "a"), nil, "a completed job is not in jobs:delayed")
+	dead := false
+	for _, id := range ctx.Redis.LRange("jobs:dead", 0, -1) {
+		dead = dead || id == "a"
+	}
+	ctx.Assert(!dead, "a completed job is not in jobs:dead")
+	ctx.Assert(djHGet(ctx, "jobs:payload", "b") == "pb" && djScore(ctx, "b") == 5000.0, "completing a must leave b untouched")
+	ctx.Equal(djIDs(djPop(ctx, 5000, 10)), []string{"b"}, "the jobs due at 5000 ms")
+	djComplete(ctx, "b")
+	keys := ctx.Redis.Keys("*")
+	ctx.Assert(len(keys) == 0, "after completing every job nothing remains, but Redis holds %q", keys)
+}
+`,
   },
   debrief: `The queue is three structures and one script. The sorted set is the index by time, so "what is due" is a range query, not a scan; the hashes keep the payload and the failure count out of the member name so a reschedule is a score update, not a rewrite. The script is the whole point: \`ZRANGEBYSCORE\` then \`ZREM\` from the client is two round trips with a window in between, and every worker that polls in that window runs the same job — the probe in the atomic-claim check lands exactly there. Inside Lua nothing interleaves, so a returned id is a claimed id. The backoff is deliberately plain — doubling from a base, capped, with a hard attempt limit that moves the job to a dead list instead of retrying forever. Real systems (Sidekiq, Celery's Redis broker, BullMQ) add jitter so a thundering herd of retries spreads out, a *processing* set with a visibility timeout so a worker that crashes mid-job is not a lost job, per-queue priorities, and \`SCRIPT LOAD\` + \`EVALSHA\` so the script text is not re-sent on every poll.`,
 };

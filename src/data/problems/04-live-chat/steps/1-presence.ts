@@ -644,6 +644,100 @@ export async function check_batched(ctx) {
   assert(calls.includes('MGET') || trips.length <= 2, \`onlineMembers issued \${JSON.stringify(trips)}: expected SMEMBERS then one MGET (or one pipeline)\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"slices"
+
+	"leetbuild/harness"
+)
+
+var presenceBg = context.Background()
+
+func beatAs(ctx *harness.Ctx, user, server string) {
+	ctx.NoError(heartbeat(presenceBg, user, server), "heartbeat(ctx, %q, %q) returned an error", user, server)
+}
+
+func joinAs(ctx *harness.Ctx, room, user string) {
+	ctx.NoError(joinRoom(presenceBg, room, user), "joinRoom(ctx, %q, %q) returned an error", room, user)
+}
+
+func leaveAs(ctx *harness.Ctx, room, user string) {
+	ctx.NoError(leave(presenceBg, room, user), "leave(ctx, %q, %q) returned an error", room, user)
+}
+
+func onlineIn(ctx *harness.Ctx, room string) map[string]string {
+	online, err := onlineMembers(presenceBg, room)
+	ctx.NoError(err, "onlineMembers(ctx, %q) returned an error", room)
+	return online
+}
+
+// presenceOf is presence:{user} as Redis holds it, nil when the key does not exist.
+func presenceOf(ctx *harness.Ctx, user string) any {
+	if v, ok := ctx.Redis.Get("presence:" + user); ok {
+		return v
+	}
+	return nil
+}
+
+func CheckTtl(ctx *harness.Ctx) {
+	beatAs(ctx, "ana", "srv-a")
+	ctx.Equal(presenceOf(ctx, "ana"), "srv-a", "presence:ana")
+	ttl := ctx.Redis.TTL("presence:ana")
+	ctx.Assert(25 <= ttl && ttl <= 30, "presence:ana has TTL %d, expected 30 s", ttl)
+	ctx.Clock.Advance(20)
+	beatAs(ctx, "ana", "srv-a")
+	ttl = ctx.Redis.TTL("presence:ana")
+	ctx.Assert(25 <= ttl && ttl <= 30, "a heartbeat must restart the 30 s lease; TTL after the second beat is %d", ttl)
+	ctx.Clock.Advance(31)
+	ctx.Equal(presenceOf(ctx, "ana"), nil, "a user who stopped heartbeating must vanish after 30 s: presence:ana")
+}
+
+func CheckMembership(ctx *harness.Ctx) {
+	joinAs(ctx, "room-7", "ana")
+	joinAs(ctx, "room-7", "bo")
+	joinAs(ctx, "room-7", "ana")
+	ctx.Equal(ctx.Redis.SMembers("room:room-7:members"), []string{"ana", "bo"}, "room:room-7:members (a set: joining twice adds once)")
+	leaveAs(ctx, "room-7", "ana")
+	ctx.Equal(ctx.Redis.SMembers("room:room-7:members"), []string{"bo"}, "after ana leaves, room:room-7:members")
+}
+
+func CheckLeaveClears(ctx *harness.Ctx) {
+	joinAs(ctx, "room-7", "ana")
+	beatAs(ctx, "ana", "srv-a")
+	leaveAs(ctx, "room-7", "ana")
+	ctx.Equal(presenceOf(ctx, "ana"), nil, "an explicit leave must DEL presence:{user} instead of waiting for the TTL: presence:ana")
+	ctx.Assert(!ctx.Redis.SIsMember("room:room-7:members", "ana"), "leave must SREM the user from the room set")
+}
+
+func CheckBatched(ctx *harness.Ctx) {
+	online := onlineIn(ctx, "empty-room")
+	ctx.Assert(len(online) == 0, "a room with no members has nobody online: onlineMembers(ctx, %q) is %v", "empty-room", online)
+	for _, user := range []string{"ana", "bo", "cy"} {
+		joinAs(ctx, "room-7", user)
+	}
+	beatAs(ctx, "ana", "srv-a")
+	beatAs(ctx, "cy", "srv-b")
+	beatAs(ctx, "dee", "srv-b") // alive but not a member of room-7
+	online = onlineIn(ctx, "room-7")
+	ctx.Equal(online, map[string]string{"ana": "srv-a", "cy": "srv-b"}, "onlineMembers(ctx, %q) (bo never heartbeat)", "room-7")
+	ctx.Clock.Advance(31)
+	beatAs(ctx, "ana", "srv-a")
+	online = onlineIn(ctx, "room-7")
+	ctx.Equal(online, map[string]string{"ana": "srv-a"}, "after cy's lease expired onlineMembers(ctx, %q)", "room-7")
+	// Round trips: one SMEMBERS plus one MGET (or one pipeline), never a GET per member.
+	before := len(ctx.Redis.RoundTrips())
+	onlineIn(ctx, "room-7")
+	trips := ctx.Redis.RoundTrips()[before:]
+	var calls []string
+	for _, trip := range trips {
+		calls = append(calls, trip...)
+	}
+	ctx.Assert(!slices.Contains(calls, "GET"), "onlineMembers issued %v: resolve every presence key in one MGET or one pipeline, not a GET per member", trips)
+	ctx.Assert(slices.Contains(calls, "MGET") || len(trips) <= 2, "onlineMembers issued %v: expected SMEMBERS then one MGET (or one pipeline)", trips)
+}
+`,
   },
   debrief: `Presence is the canonical use of a TTL as a *liveness lease*: the client renews it, and the absence of renewals is the failure signal — no health checker, no reaper job. Membership stays in a separate set because it outlives the connection. The MGET is the part that scales: one round trip per room view instead of one per member. Real systems shard presence by user, publish transitions (online → offline) instead of polling, and keep a "last seen" timestamp next to the lease so the UI can say "5 minutes ago".`,
 };

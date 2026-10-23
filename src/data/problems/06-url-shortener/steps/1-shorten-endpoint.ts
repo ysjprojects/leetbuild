@@ -369,7 +369,7 @@ var aliasRe = regexp.MustCompile(\`^[A-Za-z0-9_-]{4,32}$\`)
 var store = links.Open("postgres://links")
 
 // nextCode returns a fresh short code from the key service (built in step 2).
-func nextCode(ctx context.Context) (string, error) { panic("not implemented") }
+var nextCode = func(ctx context.Context) (string, error) { panic("not implemented") }
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
@@ -423,7 +423,7 @@ var aliasRe = regexp.MustCompile(\`^[A-Za-z0-9_-]{4,32}$\`)
 var store = links.Open("postgres://links")
 
 // nextCode returns a fresh short code from the key service (built in step 2).
-func nextCode(ctx context.Context) (string, error) { panic("not implemented") }
+var nextCode = func(ctx context.Context) (string, error) { panic("not implemented") }
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
@@ -882,6 +882,144 @@ export async function check_created(ctx) {
   assert.equal(body.code, 'g9Xc', \`the body must carry the code, got \${r.text}\`);
   assert.equal(body.short_url, m.BASE_URL + 'g9Xc', \`short_url must be BASE_URL + code, got \${JSON.stringify(body.short_url)}\`);
   assert.equal(r.headers['location'], body.short_url, \`Location must point at the short url, got \${JSON.stringify(r.headers['location'])}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+const longURL = "https://example.com/launch"
+
+// fakeStore is the links table: what was saved, which names are taken, which were asked about.
+type fakeStore struct {
+	taken       map[string]bool
+	saved       [][2]string
+	existsCalls []string
+}
+
+func (s *fakeStore) Exists(_ context.Context, code string) (bool, error) {
+	s.existsCalls = append(s.existsCalls, code)
+	return s.taken[code], nil
+}
+
+func (s *fakeStore) Save(_ context.Context, code, url string) error {
+	s.saved = append(s.saved, [2]string{code, url})
+	s.taken[code] = true
+	return nil
+}
+
+func (s *fakeStore) Lookup(_ context.Context, code string) (string, error) {
+	for _, pair := range s.saved {
+		if pair[0] == code {
+			return pair[1], nil
+		}
+	}
+	return "", nil
+}
+
+func (s *fakeStore) has(code, url string) bool {
+	for _, pair := range s.saved {
+		if pair[0] == code && pair[1] == url {
+			return true
+		}
+	}
+	return false
+}
+
+// api is the learner's server with the links table and the key service stood in for.
+type api struct {
+	store *fakeStore
+	codes []string
+	http  *harness.HTTP
+}
+
+func newAPI(ctx *harness.Ctx, taken ...string) *api {
+	a := &api{store: &fakeStore{taken: map[string]bool{}}}
+	for _, code := range taken {
+		a.store.taken[code] = true
+	}
+	store = a.store
+	nextCode = func(context.Context) (string, error) {
+		a.codes = append(a.codes, "g9Xc")
+		return "g9Xc", nil
+	}
+	a.http = ctx.Main(main).HTTP()
+	return a
+}
+
+func (a *api) shorten(body map[string]any) *harness.Response { return a.http.Post("/shorten", body) }
+
+func CheckRoute(ctx *harness.Ctx) {
+	a := newAPI(ctx)
+	r := a.shorten(map[string]any{"url": longURL})
+	ctx.Assert(r.Status != 404 && r.Status != 405, "POST /shorten answered %d: no handler is registered for it", r.Status)
+	ctx.Equal(r.Status, 201, "POST /shorten with a valid url")
+}
+
+func CheckValidateUrl(ctx *harness.Ctx) {
+	a := newAPI(ctx)
+	for _, bad := range []string{"ftp://example.com/file", "example.com/no-scheme", "javascript:alert(1)", ""} {
+		r := a.shorten(map[string]any{"url": bad})
+		ctx.Equal(r.Status, 400, "url %q is not http(s)", bad)
+	}
+	tooLong := "https://example.com/" + strings.Repeat("a", 2049-len("https://example.com/"))
+	r := a.shorten(map[string]any{"url": tooLong})
+	ctx.Equal(r.Status, 400, "a %d-character url is over maxURLLen", len(tooLong))
+	ctx.Assert(len(a.store.saved) == 0 && len(a.codes) == 0, "a rejected url must be refused before any code is taken or anything is saved")
+	limit := "https://example.com/" + strings.Repeat("a", 2048-len("https://example.com/"))
+	r = a.shorten(map[string]any{"url": limit})
+	ctx.Equal(r.Status, 201, "a url of exactly 2048 characters is allowed")
+	r = a.shorten(map[string]any{"url": "http://example.com/plain"})
+	ctx.Equal(r.Status, 201, "plain http is allowed")
+}
+
+func CheckAliasFormat(ctx *harness.Ctx) {
+	a := newAPI(ctx)
+	for _, bad := range []string{"abc", "has space", strings.Repeat("a", 33), "dots.are.out", "sl/ash"} {
+		r := a.shorten(map[string]any{"url": longURL, "alias": bad})
+		ctx.Equal(r.Status, 400, "alias %q does not match aliasRe", bad)
+	}
+	ctx.Equal(a.store.existsCalls, []string(nil), "a malformed alias is rejected before the store is asked whether it exists")
+	ctx.Equal(len(a.store.saved), 0, "a malformed alias must not be saved")
+	r := a.shorten(map[string]any{"url": longURL, "alias": "launch_2026-v1"})
+	ctx.Equal(r.Status, 201, "alias \\"launch_2026-v1\\" is valid")
+	var body struct {
+		Code string \`json:"code"\`
+	}
+	r.Decode(&body)
+	ctx.Equal(body.Code, "launch_2026-v1", "the custom alias must become the code")
+}
+
+func CheckAliasTaken(ctx *harness.Ctx) {
+	a := newAPI(ctx, "launch")
+	r := a.shorten(map[string]any{"url": longURL, "alias": "launch"})
+	ctx.Equal(r.Status, 409, "alias \\"launch\\" already exists")
+	ctx.Equal(len(a.store.saved), 0, "a taken alias must not be overwritten")
+	ctx.Equal(len(a.codes), 0, "a taken alias is a client error: no code from nextCode is spent on it")
+	r = a.shorten(map[string]any{"url": longURL, "alias": "launch2"})
+	ctx.Equal(r.Status, 201, "a free alias must be accepted")
+	ctx.Assert(a.store.has("launch2", longURL), "expected store.Save(ctx, \\"launch2\\", url), saved: %v", a.store.saved)
+}
+
+func CheckCreated(ctx *harness.Ctx) {
+	a := newAPI(ctx)
+	r := a.shorten(map[string]any{"url": longURL})
+	ctx.Equal(r.Status, 201, "a valid url without an alias")
+	ctx.Equal(a.codes, []string{"g9Xc"}, "without an alias the code must come from nextCode")
+	ctx.Assert(len(a.store.saved) == 1 && a.store.has("g9Xc", longURL), "expected one store.Save(ctx, \\"g9Xc\\", url), saved: %v", a.store.saved)
+	var body struct {
+		Code     string \`json:"code"\`
+		ShortURL string \`json:"short_url"\`
+	}
+	r.Decode(&body)
+	ctx.Equal(body.Code, "g9Xc", "the body must carry the code")
+	ctx.Equal(body.ShortURL, baseURL+"g9Xc", "short_url must be baseURL + code")
+	ctx.Equal(r.Header.Get("Location"), body.ShortURL, "Location must point at the short url")
 }
 `,
   },

@@ -53,7 +53,7 @@ left is below a dependency's p99.`,
       {from: 'quotes', to: 'pricing', kind: 'grpc', label: 'GetPrice{sku} · timeout budget - RESERVE'},
     ],
   },
-  support: {python: protoModules, typescript: protoFiles},
+  support: {python: protoModules, typescript: protoFiles, go: protoFiles},
   steps: [propagateDeadlineStep],
   learn,
 };

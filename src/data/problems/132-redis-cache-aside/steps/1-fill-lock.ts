@@ -1033,6 +1033,242 @@ export async function check_stale_lock(ctx) {
   assert.equal(ctx.redis.exists('lock:product:42'), 0);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+var (
+	caBg      = context.Background()
+	caProduct = Product{"id": "42", "name": "Espresso machine", "price_cents": 24900, "tags": []string{"kitchen", "coffee"}}
+)
+
+// caJSON is v as JSON decodes it (numbers float64, arrays []any), so a product compares the same
+// whether load returned it or the cache decoded it; a nil Product is nil.
+func caJSON(ctx *harness.Ctx, v any) any {
+	body, err := json.Marshal(v)
+	ctx.NoError(err, "the product %v does not encode as JSON", v)
+	var out any
+	ctx.NoError(json.Unmarshal(body, &out), "the product %v does not decode from JSON", v)
+	return out
+}
+
+// caStored is the JSON value at key, decoded.
+func caStored(ctx *harness.Ctx, key string) any {
+	raw, ok := ctx.Redis.Get(key)
+	ctx.Assert(ok, "%s must hold the product's JSON, it does not exist", key)
+	var out any
+	ctx.Assert(json.Unmarshal([]byte(raw), &out) == nil, "%s must hold the product as JSON, it holds %q", key, raw)
+	return out
+}
+
+// caField is one field of a decoded product (nil when the product is nil).
+func caField(product any, field string) any {
+	fields, _ := product.(map[string]any)
+	return fields[field]
+}
+
+func caGet(ctx *harness.Ctx, productID string, load Load) any {
+	product, err := getProduct(caBg, productID, load)
+	ctx.NoError(err, "getProduct(%q) returned an error", productID)
+	return caJSON(ctx, product)
+}
+
+func caInvalidate(ctx *harness.Ctx, productID string) {
+	ctx.NoError(invalidate(caBg, productID), "invalidate(%q) returned an error", productID)
+}
+
+func caCached(ctx *harness.Ctx, key string) any {
+	if raw, ok := ctx.Redis.Get(key); ok {
+		return raw
+	}
+	return nil
+}
+
+// caSource is a slow source the harness can count: returns catalogue[id] (nil when absent); asserts
+// the fill lock is held while it runs.
+type caSource struct {
+	ctx       *harness.Ctx
+	catalogue map[string]Product
+	calls     []string
+}
+
+func (s *caSource) load(productID string) (Product, error) {
+	s.calls = append(s.calls, productID)
+	ttl := s.ctx.Redis.TTL("lock:product:" + productID)
+	s.ctx.Assert(0 < ttl && ttl <= 5, "load must run under lock:product:%s with SET NX EX 5; its TTL is %d (-2 = no lock, -1 = no expiry)", productID, ttl)
+	return s.catalogue[productID], nil
+}
+
+// caCall is a getProduct running in its own goroutine, as a second worker's request.
+type caCall struct {
+	productID string
+	done      chan struct{}
+	product   Product
+	err       error
+	failure   any
+}
+
+func caGo(productID string, load Load) *caCall {
+	call := &caCall{productID: productID, done: make(chan struct{})}
+	go func() {
+		defer close(call.done)
+		defer func() { call.failure = recover() }()
+		call.product, call.err = getProduct(caBg, productID, load)
+	}()
+	return call
+}
+
+// result lets the call finish and returns what it returned, decoded as JSON.
+func (call *caCall) result(ctx *harness.Ctx) any {
+	ctx.Settle()
+	select {
+	case <-call.done:
+	default:
+		ctx.Fatalf("the concurrent getProduct(%q) never returned", call.productID)
+	}
+	if call.failure != nil {
+		panic(call.failure)
+	}
+	ctx.NoError(call.err, "the concurrent getProduct(%q) returned an error", call.productID)
+	return caJSON(ctx, call.product)
+}
+
+func CheckMissThenHit(ctx *harness.Ctx) {
+	src := &caSource{ctx: ctx, catalogue: map[string]Product{"42": caProduct}}
+	want := caJSON(ctx, caProduct)
+	ctx.Equal(caGet(ctx, "42", src.load), want, "a miss must return what load returned")
+	ctx.Equal(src.calls, []string{"42"}, "a miss calls load once with the product id: the load calls")
+	ctx.Assert(ctx.Redis.Exists("product:42") == 1, "the product must be written to product:42")
+	ctx.Equal(caStored(ctx, "product:42"), want, "product:42 must hold exactly the JSON load returned")
+	ttl := ctx.Redis.TTL("product:42")
+	ctx.Assert(3590 < ttl && ttl <= 3600, "product:42 must expire in 3600 s (ttl); its TTL is %d", ttl)
+	ctx.Equal(caGet(ctx, "42", src.load), want, "a hit must return the cached product")
+	ctx.Equal(len(src.calls), 1, "a hit must not call load: the number of load calls")
+	ctx.Equal(caGet(ctx, "42", src.load), want, "the second hit")
+	ctx.Equal(len(src.calls), 1, "the number of load calls after two hits")
+	ctx.Clock.Advance(3601)
+	ctx.Equal(caCached(ctx, "product:42"), nil, "after 3600 s the key must have expired")
+	ctx.Equal(caGet(ctx, "42", src.load), want, "the call after the TTL")
+	ctx.Equal(src.calls, []string{"42", "42"}, "once the TTL has passed the next call must load again: the load calls")
+	ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "no lock may remain after a fill")
+}
+
+func CheckNegativeCache(ctx *harness.Ctx) {
+	src := &caSource{ctx: ctx, catalogue: map[string]Product{}}
+	ctx.Equal(caGet(ctx, "7", src.load), nil, "a product the source does not have is nil")
+	ctx.Equal(src.calls, []string{"7"}, "the load calls")
+	ctx.Equal(caCached(ctx, "product:7"), "__missing__", "a missing product must be cached as the sentinel %q: product:7", "__missing__")
+	ttl := ctx.Redis.TTL("product:7")
+	ctx.Assert(50 < ttl && ttl <= 60, "the sentinel must expire in 60 s (missingTTL); its TTL is %d", ttl)
+	ctx.Equal(caGet(ctx, "7", src.load), nil, "the sentinel must be served as nil")
+	ctx.Equal(caGet(ctx, "7", src.load), nil, "the sentinel served a second time")
+	ctx.Equal(len(src.calls), 1, "the sentinel must answer without calling load: the number of load calls")
+	src.catalogue["7"] = Product{"id": "7", "name": "Grinder"}
+	ctx.Equal(caGet(ctx, "7", src.load), nil, "while the sentinel lives a product that appeared in the source is still unseen")
+	ctx.Clock.Advance(61)
+	grinder := caJSON(ctx, Product{"id": "7", "name": "Grinder"})
+	ctx.Equal(caGet(ctx, "7", src.load), grinder, "after 60 s the source is asked again")
+	ctx.Equal(src.calls, []string{"7", "7"}, "the load calls")
+	ctx.Equal(caStored(ctx, "product:7"), grinder, "product:7 must hold the product loaded after the sentinel expired")
+}
+
+func CheckInvalidate(ctx *harness.Ctx) {
+	src := &caSource{ctx: ctx, catalogue: map[string]Product{"42": caProduct}}
+	ctx.Equal(caGet(ctx, "42", src.load), caJSON(ctx, caProduct), "the first call returns the product")
+	src.catalogue["42"] = Product{"id": "42", "name": "Espresso machine", "price_cents": 19900, "tags": []string{"kitchen", "coffee"}}
+	ctx.Equal(caField(caGet(ctx, "42", src.load), "price_cents"), 24900, "until invalidated, the cached price is served")
+	caInvalidate(ctx, "42")
+	ctx.Equal(caCached(ctx, "product:42"), nil, "invalidate must delete product:42")
+	ctx.Equal(caField(caGet(ctx, "42", src.load), "price_cents"), 19900, "after invalidate the next call must load the new product")
+	ctx.Equal(src.calls, []string{"42", "42"}, "invalidate then get must load exactly once more: the load calls")
+	ctx.Equal(caField(caStored(ctx, "product:42"), "price_cents"), 19900, "the reloaded product must be cached")
+	ctx.Equal(caGet(ctx, "9", src.load), nil, "an unknown product is nil")
+	ctx.Equal(caCached(ctx, "product:9"), "__missing__", "product:9 must hold the sentinel")
+	src.catalogue["9"] = Product{"id": "9"}
+	caInvalidate(ctx, "9")
+	ctx.Equal(caGet(ctx, "9", src.load), caJSON(ctx, Product{"id": "9"}), "invalidate must also clear a sentinel: a product created after a miss becomes visible")
+	caInvalidate(ctx, "never-cached")
+	ctx.Equal(ctx.Redis.Keys("*"), []string{"product:42", "product:9"}, "invalidating an unknown id must touch nothing else: the keys")
+}
+
+func CheckSingleFlight(ctx *harness.Ctx) {
+	src := &caSource{ctx: ctx, catalogue: map[string]Product{"42": caProduct}}
+	want := caJSON(ctx, caProduct)
+	// The second worker's request lands the instant the first one has taken the lock, before it has loaded anything.
+	var second *caCall
+	probe := ctx.Redis.After("lock:product:42", func() any {
+		second = caGo("42", src.load)
+		return nil
+	})
+	first := caGet(ctx, "42", src.load)
+	ctx.Assert(probe.Fired, "a miss must take lock:product:42")
+	ctx.Equal(first, want, "the first caller must return the product")
+	ctx.Equal(second.result(ctx), want, "the caller that lost the lock must return what the winner wrote")
+	ctx.Assert(len(src.calls) == 1, "two concurrent misses must call load once, it was called %d times: the loser polls product:42 every 50 ms instead of loading", len(src.calls))
+	ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "lock:product:42 must be deleted once the fill is done")
+	ctx.Equal(caStored(ctx, "product:42"), want, "product:42 must hold the product")
+	// The other order: the second request lands between the first one's miss and its lock, fills, and releases.
+	src2 := &caSource{ctx: ctx, catalogue: map[string]Product{"43": {"id": "43"}}}
+	want2 := caJSON(ctx, Product{"id": "43"})
+	var third any
+	probe2 := ctx.Redis.After("product:43", func() any {
+		product, err := getProduct(caBg, "43", src2.load)
+		ctx.NoError(err, "the concurrent getProduct(%q) returned an error", "43")
+		third = caJSON(ctx, product)
+		return nil
+	})
+	ctx.Equal(caGet(ctx, "43", src2.load), want2, "the first caller must return product 43")
+	ctx.Assert(probe2.Err == nil, "the concurrent getProduct(%q) failed: %v", "43", probe2.Err)
+	ctx.Equal(third, want2, "the concurrent caller must return product 43")
+	ctx.Assert(len(src2.calls) == 1, "when the other request fills the key between this one's miss and its lock, load must still run once (it ran %d times): GET the key again after winning the lock", len(src2.calls))
+	ctx.Equal(ctx.Redis.Exists("lock:product:43"), 0, "lock:product:43 must be deleted once the fill is done")
+}
+
+func CheckLockReleased(ctx *harness.Ctx) {
+	attempts := []string{}
+	failing := func(productID string) (Product, error) {
+		attempts = append(attempts, productID)
+		return nil, errors.New("catalogue unreachable")
+	}
+	_, err := getProduct(caBg, "42", failing)
+	ctx.Assert(err != nil && strings.Contains(err.Error(), "catalogue unreachable"), "when load fails, getProduct must return that error, not swallow it or cache anything: it returned %v", err)
+	ctx.Equal(attempts, []string{"42"}, "the load attempts")
+	ctx.Equal(caCached(ctx, "product:42"), nil, "a failed load must cache nothing, not the sentinel either")
+	ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "a failed fill must delete lock:product:42: otherwise every caller waits 5 s for a fill that will never come")
+	src := &caSource{ctx: ctx, catalogue: map[string]Product{"42": caProduct}}
+	sleeps := ctx.Clock.Sleeps()
+	ctx.Equal(caGet(ctx, "42", src.load), caJSON(ctx, caProduct), "the next call after a failure must take the lock and load")
+	ctx.Equal(src.calls, []string{"42"}, "the load calls")
+	ctx.Equal(ctx.Clock.Sleeps(), sleeps, "the next call after a failure must not have to wait: the lock was released, so it wins it at once (sleeps)")
+	ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "no lock may remain after the fill")
+}
+
+func CheckStaleLock(ctx *harness.Ctx) {
+	ctx.Redis.Set("lock:product:42", "stale", "EX", 5) // a worker took the lock and died
+	calls := []string{}
+	load := func(productID string) (Product, error) {
+		calls = append(calls, productID)
+		held, _ := ctx.Redis.Get("lock:product:42")
+		ctx.Assert(held != "stale", "load ran while another worker's lock was still alive: a loser must wait for the lock's TTL, not load on its own")
+		return caProduct, nil
+	}
+	started := ctx.Clock.Now()
+	ctx.Equal(caGet(ctx, "42", load), caJSON(ctx, caProduct), "once the stale lock has expired the caller must load and return the product")
+	waited := float64(ctx.Clock.Now()-started) / 1000
+	ctx.Assert(waited >= 4.9, "the caller must poll every 50 ms for the lock's TTL (5 s) before giving up on the holder; it waited %.2f s", waited)
+	ctx.Assert(waited < 12, "the wait is bounded by the lock's TTL; this took %.2f s of virtual time", waited)
+	ctx.Assert(len(calls) == 1, "the stale lock must cost exactly one load; load was called %d times", len(calls))
+	ctx.Equal(caStored(ctx, "product:42"), caJSON(ctx, caProduct), "product:42 must hold the product")
+	ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "no lock may remain after the fill")
+}
+`,
   },
   debrief: `Three decisions carry this file. The lock is \`SET NX EX\`, one command, because the election and its safety net must be atomic: a holder that dies leaves a lock that expires on its own, and nobody has to detect the death — the losers' bounded wait is sized by that same TTL, which is why \`LOCK_TTL_S\` appears in both places. The winner reads the key **again** after winning, because "miss, then lock" is not atomic: between the two, another request may have finished the whole fill and released, and without the re-read the lock serialises the loads instead of collapsing them. And the sentinel is a value with its own, shorter TTL rather than an absence, because an absence is indistinguishable from a miss — a product page for an id that was deleted or never existed would otherwise cost a database query per request, forever. The \`finally\` around the fill is what makes a failing database a slow minute rather than a stuck hour: with the lock released, the next caller retries at once instead of polling a key nobody will write. Real systems add jitter to the TTL so a batch import does not expire everything in the same second, refresh hot keys ahead of expiry so the lock is rarely contended, coalesce identical requests inside one process before they reach Redis, and push \`invalidate\` through a change stream rather than trusting every writer to call it.`,
 };

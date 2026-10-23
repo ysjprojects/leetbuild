@@ -288,7 +288,8 @@ type upstreamResponse struct {
 	Body        []byte \`json:"body"\`
 }
 
-func upstream(r *http.Request) upstreamResponse {
+// upstream is the step-3 proxy (provided): status, content type and body.
+var upstream = func(r *http.Request) upstreamResponse {
 	panic("not implemented")
 }
 
@@ -337,7 +338,8 @@ type upstreamResponse struct {
 	Body        []byte \`json:"body"\`
 }
 
-func upstream(r *http.Request) upstreamResponse {
+// upstream is the step-3 proxy (provided): status, content type and body.
+var upstream = func(r *http.Request) upstreamResponse {
 	panic("not implemented")
 }
 
@@ -723,6 +725,129 @@ export async function check_x_cache(ctx) {
   assert((hit.headers['content-type'] ?? '').startsWith('application/json'), \`a hit must replay the stored content type, got \${JSON.stringify(hit.headers['content-type'])}\`);
   assert(plainHit.headers['x-cache'] === 'HIT' && plainHit.text === plainMiss.text, 'text responses are cached like any other 200');
   assert((plainHit.headers['content-type'] ?? '').startsWith('text/plain'), \`the hit for a text/plain upstream answered Content-Type \${JSON.stringify(plainHit.headers['content-type'])}: store the content type with the body\`);
+}
+`,
+    go: `package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+// respCache is getItem with the step-3 proxy stood in for: it counts every fetch and answers per item id.
+type respCache struct {
+	calls []string
+	http  *harness.HTTP
+}
+
+func newRespCache(ctx *harness.Ctx) *respCache {
+	rc := &respCache{}
+	upstream = func(r *http.Request) upstreamResponse {
+		rc.calls = append(rc.calls, r.URL.RequestURI())
+		id := r.PathValue("id")
+		switch id {
+		case "ghost":
+			return upstreamResponse{StatusCode: 404, ContentType: "application/json", Body: []byte(\`{"error": "no such item"}\`)}
+		case "down":
+			return upstreamResponse{StatusCode: 503, ContentType: "text/plain", Body: []byte("catalog unavailable")}
+		case "plain":
+			return upstreamResponse{StatusCode: 200, ContentType: "text/plain", Body: []byte(fmt.Sprintf("plain item, fetch %d", len(rc.calls)))}
+		}
+		body, _ := json.Marshal(map[string]any{"id": id, "name": "Kettle", "price_cents": 3499, "fetch": len(rc.calls)})
+		return upstreamResponse{StatusCode: 200, ContentType: "application/json", Body: body}
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /items/{id}", getItem)
+	rc.http = ctx.HTTP(mux)
+	return rc
+}
+
+func respKey(target string) string {
+	sum := sha256.Sum256([]byte(target))
+	return "resp:" + hex.EncodeToString(sum[:])
+}
+
+// respFetch is the fetch number a JSON item body carries.
+func respFetch(r *harness.Response) any {
+	var body struct {
+		Fetch any \`json:"fetch"\`
+	}
+	r.Decode(&body)
+	return body.Fetch
+}
+
+func CheckKeyHash(ctx *harness.Ctx) {
+	rc := newRespCache(ctx)
+	r := rc.http.Get("/items/42?fields=name")
+	ctx.Equal(r.Status, 200, "GET /items/42?fields=name")
+	rc.http.Get("/items/42")
+	keys := ctx.Redis.Keys("*")
+	for _, target := range []string{"/items/42?fields=name", "/items/42"} {
+		ctx.Assert(ctx.Redis.Exists(respKey(target)) == 1, "no entry under resp:sha256(%q) = %q; Redis holds %q", target, respKey(target), keys)
+	}
+	ctx.Equal(len(keys), 2, "two distinct targets must make two distinct keys (Redis holds %q); the key count", keys)
+}
+
+func CheckBypass(ctx *harness.Ctx) {
+	rc := newRespCache(ctx)
+	rc.http.Get("/items/42")
+	second := rc.http.Get("/items/42")
+	ctx.Assert(second.Header.Get("X-Cache") == "HIT" && len(rc.calls) == 1, "a second request within the TTL must be served from the cache")
+	bypass := rc.http.Get("/items/42", "Cache-Control", "no-cache")
+	ctx.Equal(len(rc.calls), 2, "Cache-Control: no-cache must reach the upstream, not the cached entry; upstream calls")
+	ctx.Equal(bypass.Header.Get("X-Cache"), "MISS", "a bypassed request's X-Cache")
+	ctx.Equal(respFetch(bypass), 2, "the bypassed request must answer with the fresh upstream response; its fetch")
+	after := rc.http.Get("/items/42")
+	ctx.Assert(after.Header.Get("X-Cache") == "HIT" && len(rc.calls) == 2, "the bypassed request still refreshes the entry: the next plain request is a hit")
+	ctx.Equal(respFetch(after), 2, "the entry must be refreshed by the bypassed request; the fetch served")
+}
+
+func CheckTtl(ctx *harness.Ctx) {
+	rc := newRespCache(ctx)
+	rc.http.Get("/items/42")
+	ttl := ctx.Redis.TTL(respKey("/items/42"))
+	ctx.Assert(1 <= ttl && ttl <= 10, "the entry's TTL is %d (-1 means no expiry), expected EX 10", ttl)
+	ctx.Clock.Advance(9.0)
+	warm := rc.http.Get("/items/42")
+	ctx.Assert(warm.Header.Get("X-Cache") == "HIT" && len(rc.calls) == 1, "9 s after the store the entry is still fresh")
+	ctx.Clock.Advance(2.0)
+	cold := rc.http.Get("/items/42")
+	ctx.Assert(cold.Header.Get("X-Cache") == "MISS" && len(rc.calls) == 2, "11 s after the store the entry has expired: the upstream must be asked again")
+}
+
+func CheckOnly200(ctx *harness.Ctx) {
+	rc := newRespCache(ctx)
+	ghost := rc.http.Get("/items/ghost")
+	ctx.Equal(ghost.Status, 404, "a 404 from the upstream")
+	ctx.Equal(len(ctx.Redis.Keys("*")), 0, "a 404 was stored (%q); the keys", ctx.Redis.Keys("*"))
+	again := rc.http.Get("/items/ghost")
+	ctx.Assert(again.Status == 404 && len(rc.calls) == 2, "a 404 must be asked upstream again, never served from cache")
+	down := rc.http.Get("/items/down")
+	ctx.Equal(down.Status, 503, "a 503 from the upstream")
+	ctx.Equal(len(ctx.Redis.Keys("*")), 0, "a 503 was stored (%q); the keys", ctx.Redis.Keys("*"))
+	ok := rc.http.Get("/items/42")
+	ctx.Assert(ok.Status == 200 && ctx.Redis.Exists(respKey("/items/42")) == 1, "a 200 must still be stored")
+}
+
+func CheckXCache(ctx *harness.Ctx) {
+	rc := newRespCache(ctx)
+	miss := rc.http.Get("/items/42")
+	hit := rc.http.Get("/items/42")
+	plainMiss := rc.http.Get("/items/plain")
+	plainHit := rc.http.Get("/items/plain")
+	ctx.Equal(miss.Header.Get("X-Cache"), "MISS", "the first request's X-Cache")
+	ctx.Equal(hit.Header.Get("X-Cache"), "HIT", "the second request's X-Cache")
+	ctx.Equal(len(rc.calls), 2, "upstream calls for four requests (one per distinct target)")
+	ctx.Assert(hit.Status == 200 && hit.Text() == miss.Text(), "a hit must replay the stored body")
+	ctx.Assert(strings.HasPrefix(hit.Header.Get("Content-Type"), "application/json"), "a hit must replay the stored content type, got %q", hit.Header.Get("Content-Type"))
+	ctx.Assert(plainHit.Header.Get("X-Cache") == "HIT" && plainHit.Text() == plainMiss.Text(), "text responses are cached like any other 200")
+	ctx.Assert(strings.HasPrefix(plainHit.Header.Get("Content-Type"), "text/plain"), "the hit for a text/plain upstream answered Content-Type %q: store the content type with the body", plainHit.Header.Get("Content-Type"))
 }
 `,
   },

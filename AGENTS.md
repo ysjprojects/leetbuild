@@ -25,7 +25,7 @@ Dependencies are local to this repo. Yarn may not be installed; npm works too.
 npm install --no-package-lock     # or: yarn install --ignore-engines
 npx next dev                      # or: yarn dev
 npx next build                    # or: yarn build
-npx tsx scripts/verify.ts         # all content + Python harnesses
+npx tsx scripts/verify.ts         # all content + Python, TypeScript and Go harnesses
 npx tsx scripts/verify.ts --no-runtime
 npx tsc --noEmit
 npm run lint                      # prettier --check + eslint, what CI runs
@@ -82,9 +82,10 @@ course content, `AGENTS.md`, or the mock-interview feature unless the user names
   dated by its creation) and the posts or docs that explain it, each with its `kind`, `venue` and
   what the problem takes from it. Every link is checked against the live page, never written from
   memory; `yarn verify` enforces the shape.
-- The AI-era courses currently use static review checks only. The classic courses have Python and
-  TypeScript harnesses that execute in the browser runtime. If you add AI-era harnesses, keep the
-  checks outcome-based and update the README.
+- The AI-era courses currently use static review checks only. The classic courses have Python,
+  TypeScript and Go harnesses that execute in the browser runtime (Go's: `goruntime/`, rebuilt into
+  the committed `public/go/runtime.wasm.gz` by `yarn build:go` after any change there). If you add
+  AI-era harnesses, keep the checks outcome-based and update the README.
 
 ## Pull requests
 
@@ -121,7 +122,7 @@ Closes #N. Not done: <what you left out, and why>.
 ## Verification
 
 - `npm run lint`, `npx tsc --noEmit`, `npx next build`: clean
-- `npx tsx scripts/verify.ts`: `103 step(s) × 5 languages checked, 88 python + 88 typescript harness(es) run, 0 problem(s)`
+- `npx tsx scripts/verify.ts`: `<n> step(s), <n> step-language pairs checked, <n> python + <n> typescript + <n> go harness(es) run, 0 problem(s)`
 - <screenshot of /<course-id>, or "no browser available; not screenshotted">
 ```
 

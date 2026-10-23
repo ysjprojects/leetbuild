@@ -815,6 +815,150 @@ export async function check_cancel(ctx) {
   assert.equal(leaked, 0, \`the client went away but ticks:ACME still has \${leaked} subscriber(s) from this call: unsubscribe on the way out\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"io"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"leetbuild/harness"
+
+	pb "exchange/gen/ticks"
+)
+
+// tickClient seeds book:ACME, runs the learner's server and returns a client talking to it.
+func tickClient(ctx *harness.Ctx) pb.TickServiceClient {
+	ctx.Redis.Do("HSET", "book:ACME", "bid", "10.05", "ask", "10.06", "last", "10.05")
+	ctx.Main(main)
+	return pb.NewTickServiceClient(ctx.GRPC.Dial("ticks:9100"))
+}
+
+// tickItem is what the stream delivered: a tick, or the error that ended it (io.EOF: a normal end).
+type tickItem struct {
+	tick *pb.Tick
+	err  error
+}
+
+// tickCall is one SubscribeTicks call, read item by item.
+type tickCall struct {
+	ctx    *harness.Ctx
+	cancel context.CancelFunc
+	items  chan tickItem
+}
+
+func openTicks(ctx *harness.Ctx, client pb.TickServiceClient, symbol string) *tickCall {
+	c, cancel := context.WithCancel(context.Background())
+	call := &tickCall{ctx: ctx, cancel: cancel, items: make(chan tickItem, 64)}
+	stream, err := client.SubscribeTicks(c, &pb.SubscribeRequest{Symbol: symbol})
+	if err != nil {
+		call.items <- tickItem{err: err}
+		return call
+	}
+	go func() {
+		for {
+			tick, err := stream.Recv()
+			call.items <- tickItem{tick, err}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return call
+}
+
+func (t *tickCall) read(what string) tickItem {
+	select {
+	case item := <-t.items:
+		return item
+	case <-time.After(500 * time.Millisecond):
+		t.ctx.Fatalf("the stream sent nothing within 0.5s: expected %s", what)
+		return tickItem{}
+	}
+}
+
+func assertTick(ctx *harness.Ctx, item tickItem, what string, bid, ask, last float64) {
+	ctx.Assert(item.err != io.EOF, "the stream ended before sending %s", what)
+	ctx.Assert(item.err == nil, "the call failed with %v before sending %s", item.err, what)
+	tick := item.tick
+	ctx.Equal(tick.GetSymbol(), "ACME", "%s names the wrong symbol", what)
+	ctx.Equal([]float64{tick.GetBid(), tick.GetAsk(), tick.GetLast()}, []float64{bid, ask, last}, "%s: bid, ask, last", what)
+}
+
+// tickSubscribers counts the subscribers of ticks:{symbol}. Compared as deltas: a subscription leaked
+// by an earlier call stays on the server.
+func tickSubscribers(ctx *harness.Ctx, symbol string) int64 {
+	reply, _ := ctx.Redis.Do("PUBSUB", "NUMSUB", "ticks:"+symbol).([]any)
+	ctx.Assert(len(reply) == 2, "PUBSUB NUMSUB answered %v", reply)
+	n, _ := reply[1].(int64)
+	return n
+}
+
+// subscribedSince waits for the handler to add its subscription on top of the count before the call.
+func subscribedSince(ctx *harness.Ctx, symbol string, before int64) int64 {
+	for i := 0; i < 50 && tickSubscribers(ctx, symbol) <= before; i++ {
+		ctx.Settle()
+	}
+	return tickSubscribers(ctx, symbol) - before
+}
+
+func CheckSnapshotFirst(ctx *harness.Ctx) {
+	client := tickClient(ctx)
+	ctx.Redis.Publish("ticks:ACME", \`{"symbol":"ACME","bid":1,"ask":2,"last":3}\`) // before this client subscribed: must not reach it
+	// The engine publishes a tick the moment the handler has read the hash: a handler that subscribed first forwards it before its snapshot.
+	ctx.Redis.After("book:ACME", func() any {
+		return ctx.Redis.Publish("ticks:ACME", \`{"symbol":"ACME","bid":1,"ask":2,"last":3}\`)
+	})
+	call := openTicks(ctx, client, "ACME")
+	first := call.read("the snapshot of book:ACME")
+	assertTick(ctx, first, "the first tick (the snapshot from the hash, before any Pub/Sub message)", 10.05, 10.06, 10.05)
+	call.cancel()
+}
+
+func CheckNotFound(ctx *harness.Ctx) {
+	client := tickClient(ctx)
+	before := tickSubscribers(ctx, "GHOST")
+	call := openTicks(ctx, client, "GHOST")
+	item := call.read("a NOT_FOUND status")
+	outcome := "sent a tick"
+	if item.err == io.EOF {
+		outcome = "ended normally"
+	}
+	ctx.Assert(item.err != nil && item.err != io.EOF, "an unknown symbol must end the call with NOT_FOUND; the stream %s", outcome)
+	ctx.Equal(status.Code(item.err), codes.NotFound, "an unknown symbol ended the call with status %v", item.err)
+	ctx.Settle()
+	ctx.Equal(tickSubscribers(ctx, "GHOST"), before, "nothing must be subscribed for a symbol that does not exist; subscribers of ticks:GHOST")
+}
+
+func CheckForward(ctx *harness.Ctx) {
+	client := tickClient(ctx)
+	before := tickSubscribers(ctx, "ACME")
+	call := openTicks(ctx, client, "ACME")
+	call.read("the snapshot")
+	ctx.Equal(subscribedSince(ctx, "ACME", before), 1, "after the snapshot the handler must SUBSCRIBE to ticks:ACME; new subscribers")
+	ctx.Redis.Publish("ticks:ACME", \`{"symbol":"ACME","bid":10.07,"ask":10.08,"last":10.07}\`)
+	assertTick(ctx, call.read("the published tick"), "the forwarded tick", 10.07, 10.08, 10.07)
+	ctx.Redis.Publish("ticks:ACME", \`{"symbol":"ACME","bid":10.09,"ask":10.1,"last":10.09}\`)
+	assertTick(ctx, call.read("the second published tick"), "the second forwarded tick", 10.09, 10.1, 10.09)
+	call.cancel()
+}
+
+func CheckCancel(ctx *harness.Ctx) {
+	client := tickClient(ctx)
+	before := tickSubscribers(ctx, "ACME")
+	call := openTicks(ctx, client, "ACME")
+	call.read("the snapshot")
+	ctx.Equal(subscribedSince(ctx, "ACME", before), 1, "the handler must be subscribed to ticks:ACME while the client is connected; new subscribers")
+	call.cancel()
+	for i := 0; i < 20 && tickSubscribers(ctx, "ACME") > before; i++ {
+		ctx.Settle()
+	}
+	leaked := tickSubscribers(ctx, "ACME") - before
+	ctx.Equal(leaked, 0, "the client went away but ticks:ACME still has subscribers from this call: unsubscribe on the way out (defer sub.Close()); leaked subscribers")
+}
+`,
   },
   debrief: `Snapshot-then-stream is the shape of every subscription API: the stream alone cannot tell a new client the current state, and the snapshot alone goes stale in a millisecond. The gap between them is the classic race — a tick published between HGETALL and SUBSCRIBE is lost — which real feeds close with sequence numbers (subscribe first, then snapshot, then drop buffered ticks older than the snapshot's sequence). Checking cancellation on a timer instead of only when a message arrives is what keeps a quiet symbol from pinning a connection forever; at scale, one Redis subscription per process fanning out to all its gRPC streams replaces one connection per client.`,
 };

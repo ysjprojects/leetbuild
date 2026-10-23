@@ -326,8 +326,8 @@ var conn, _ = grpc.NewClient("routing:9000", grpc.WithTransportCredentials(insec
 var stub = pb.NewRoutingClient(conn)
 
 // Provided (geo.go): cell is a ~1 km grid id; haversineKm the great-circle distance.
-func cell(lat, lng float64) string        { panic("not implemented") }
-func haversineKm(a, b *pb.LatLng) float64 { panic("not implemented") }
+var cell = func(lat, lng float64) string { panic("not implemented") }
+var haversineKm = func(a, b *pb.LatLng) float64 { panic("not implemented") }
 
 // Eta is the answer; Estimated is true when the routing service did not answer in time and this is a straight-line guess.
 type Eta struct {
@@ -375,8 +375,8 @@ var conn, _ = grpc.NewClient("routing:9000", grpc.WithTransportCredentials(insec
 var stub = pb.NewRoutingClient(conn)
 
 // Provided (geo.go): cell is a ~1 km grid id; haversineKm the great-circle distance.
-func cell(lat, lng float64) string        { panic("not implemented") }
-func haversineKm(a, b *pb.LatLng) float64 { panic("not implemented") }
+var cell = func(lat, lng float64) string { panic("not implemented") }
+var haversineKm = func(a, b *pb.LatLng) float64 { panic("not implemented") }
 
 // Eta is the answer; Estimated is true when the routing service did not answer in time and this is a straight-line guess.
 type Eta struct {
@@ -806,6 +806,173 @@ export async function check_cache_60s(ctx) {
   eta = await m.etaSeconds(farOrigin, farDest);
   assert(eta.estimated, \`a routing service slower than the deadline must degrade to an estimate, got \${JSON.stringify(eta)}\`);
   assert.equal(ctx.redis.get(key(farOrigin, farDest)), null, 'an estimate must never be cached: a 500 ms outage would become a 60 s one');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"sync"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"leetbuild/harness"
+
+	pb "dispatch/gen/routing"
+)
+
+// geoCell is the provided geo.go's cell: both coordinates floored to 0.01 degrees, as 8 hex digits.
+func geoCell(lat, lng float64) string {
+	row := int64(math.Floor(lat/0.01)) & 0xffff
+	col := int64(math.Floor(lng/0.01)) & 0xffff
+	return fmt.Sprintf("%04x%04x", row, col)
+}
+
+// geoHaversineKm is the provided geo.go's great-circle distance in km.
+func geoHaversineKm(a, b *pb.LatLng) float64 {
+	rad := math.Pi / 180
+	lat1, lat2 := a.GetLat()*rad, b.GetLat()*rad
+	dLat := lat2 - lat1
+	dLng := b.GetLng()*rad - a.GetLng()*rad
+	h := math.Pow(math.Sin(dLat/2), 2) + math.Cos(lat1)*math.Cos(lat2)*math.Pow(math.Sin(dLng/2), 2)
+	return 2 * 6371.0088 * math.Asin(math.Sqrt(h))
+}
+
+// routingPeer is a fake Routing service answering 412 s and counting its calls.
+type routingPeer struct {
+	pb.UnimplementedRoutingServer
+	mu    sync.Mutex
+	calls int
+}
+
+func (p *routingPeer) Eta(context.Context, *pb.EtaRequest) (*pb.EtaReply, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	return &pb.EtaReply{Seconds: 412}, nil
+}
+
+func (p *routingPeer) seen() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.calls
+}
+
+// etaWorld serves the fake Routing peer and installs the provided geo helpers.
+func etaWorld(ctx *harness.Ctx) *routingPeer {
+	cell, haversineKm = geoCell, geoHaversineKm
+	peer := &routingPeer{}
+	pb.RegisterRoutingServer(ctx.GRPC.Server(""), peer)
+	return peer
+}
+
+// etaPair is a distinct origin/destination pair (distinct cache cells) per i.
+func etaPair(i int) (*pb.LatLng, *pb.LatLng) {
+	return &pb.LatLng{Lat: 48.85 + float64(i)/10, Lng: 2.35}, &pb.LatLng{Lat: 48.86 + float64(i)/10, Lng: 2.36}
+}
+
+func etaKey(origin, dest *pb.LatLng) string {
+	return "eta:" + geoCell(origin.GetLat(), origin.GetLng()) + ":" + geoCell(dest.GetLat(), dest.GetLng())
+}
+
+func fallbackSeconds(origin, dest *pb.LatLng) float64 { return geoHaversineKm(origin, dest) / 30 * 3600 }
+
+func etaOK(ctx *harness.Ctx, origin, dest *pb.LatLng) Eta {
+	eta, err := etaSeconds(context.Background(), origin, dest)
+	ctx.NoError(err, "etaSeconds returned an error")
+	return eta
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	etaWorld(ctx)
+	origin, dest := etaPair(0)
+	eta := etaOK(ctx, origin, dest)
+	ctx.Assert(eta.Seconds == 412 && !eta.Estimated, "a routing answer of 412 s must be returned as-is, got %+v", eta)
+	calls := ctx.GRPC.CallsTo("Eta", "")
+	ctx.Assert(len(calls) > 0, "no Eta RPC was made")
+	last := calls[len(calls)-1]
+	ctx.Assert(last.HasDeadline(), "the Eta call carries no deadline")
+	timeout := last.Timeout.Seconds()
+	ctx.Assert(0.4 <= timeout && timeout <= 0.6, "the deadline must be about 500 ms, got %v s", timeout)
+	req, _ := last.Request.(*pb.EtaRequest)
+	ctx.Assert(req != nil && req.GetOrigin().GetLat() == origin.GetLat() && req.GetDest().GetLng() == dest.GetLng(), "the request must carry origin and dest, got %v", last.Request)
+}
+
+func CheckFallback(ctx *harness.Ctx) {
+	etaWorld(ctx)
+	origin, dest := etaPair(0)
+	ctx.GRPC.SetLatency("Eta", 3.0, "")
+	eta := etaOK(ctx, origin, dest)
+	expected := fallbackSeconds(origin, dest)
+	ctx.Assert(eta.Estimated, "a routing service slower than the deadline must degrade to an estimate, got %+v", eta)
+	ctx.Assert(math.Abs(float64(eta.Seconds)-expected) <= 2, "the estimate must be haversineKm / 30 km/h in seconds (about %.0f), got %d", expected, eta.Seconds)
+	ctx.GRPC.SetLatency("Eta", 0.0, "")
+	origin, dest = etaPair(1)
+	ctx.GRPC.Fail("Eta", codes.Unavailable, "routing down", 1, "")
+	eta = etaOK(ctx, origin, dest)
+	ctx.Assert(eta.Estimated && math.Abs(float64(eta.Seconds)-fallbackSeconds(origin, dest)) <= 2, "UNAVAILABLE must degrade to the straight-line estimate, got %+v", eta)
+	origin, dest = etaPair(2)
+	ctx.GRPC.Fail("Eta", codes.InvalidArgument, "bad coordinates", 1, "")
+	eta, err := etaSeconds(context.Background(), origin, dest)
+	ctx.Assert(err != nil, "INVALID_ARGUMENT must propagate, not be turned into an estimate: got %+v", eta)
+	ctx.Equal(status.Code(err), codes.InvalidArgument, "the status that must propagate")
+}
+
+func CheckEstimatedFlag(ctx *harness.Ctx) {
+	etaWorld(ctx)
+	origin, dest := etaPair(0)
+	eta := etaOK(ctx, origin, dest)
+	ctx.Equal(eta.Estimated, false, "a real routing answer must not be flagged as estimated (%+v)", eta)
+	origin, dest = etaPair(1)
+	ctx.GRPC.SetLatency("Eta", 3.0, "")
+	eta = etaOK(ctx, origin, dest)
+	ctx.Equal(eta.Estimated, true, "the straight-line fallback must be flagged Estimated: true so the screen can say '~4 min' (%+v)", eta)
+}
+
+func CheckNoRetry(ctx *harness.Ctx) {
+	etaWorld(ctx)
+	origin, dest := etaPair(0)
+	ctx.GRPC.SetLatency("Eta", 3.0, "")
+	etaOK(ctx, origin, dest)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Eta", "")), 1, "calls to a slow routing service: one attempt, then the fallback")
+	ctx.GRPC.SetLatency("Eta", 0.0, "")
+	origin, dest = etaPair(1)
+	ctx.GRPC.Fail("Eta", codes.Unavailable, "routing down", 3, "")
+	eta := etaOK(ctx, origin, dest)
+	ctx.Assert(eta.Estimated, "UNAVAILABLE must degrade, not fail")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Eta", "")), 2, "calls after the second request: UNAVAILABLE must not be retried")
+}
+
+func CheckCache60s(ctx *harness.Ctx) {
+	peer := etaWorld(ctx)
+	origin, dest := etaPair(0)
+	k := etaKey(origin, dest)
+	eta := etaOK(ctx, origin, dest)
+	ctx.Equal(eta.Seconds, 412, "the routing answer")
+	cached, _ := ctx.Redis.Get(k)
+	ctx.Equal(cached, "412", "%s after a real answer (keys: %v)", k, ctx.Redis.Keys("eta:*"))
+	ttl := ctx.Redis.TTL(k)
+	ctx.Assert(0 < ttl && ttl <= 60, "%s has TTL %d, expected etaTTL (60 s)", k, ttl)
+	nearOrigin := &pb.LatLng{Lat: origin.GetLat() + 0.001, Lng: origin.GetLng() + 0.001} // same ~1 km cell
+	eta = etaOK(ctx, nearOrigin, dest)
+	ctx.Assert(eta.Seconds == 412 && !eta.Estimated, "a nearby origin in the same cell must be served from the cache, got %+v", eta)
+	ctx.Equal(peer.seen(), 1, "a cached cell pair must not call Routing again: calls Routing saw")
+	ctx.Clock.Advance(61)
+	etaOK(ctx, origin, dest)
+	ctx.Equal(peer.seen(), 2, "after 60 s the cached answer has expired and Routing must be asked again: calls Routing saw")
+	seededOrigin, seededDest := etaPair(1)
+	ctx.Redis.Set(etaKey(seededOrigin, seededDest), "99", "EX", 60)
+	eta = etaOK(ctx, seededOrigin, seededDest)
+	ctx.Assert(eta.Seconds == 99 && !eta.Estimated, "a cached value must be returned without an RPC, got %+v", eta)
+	ctx.Equal(peer.seen(), 2, "the cache must be read before calling Routing: calls Routing saw")
+	farOrigin, farDest := etaPair(2)
+	ctx.GRPC.SetLatency("Eta", 3.0, "")
+	eta = etaOK(ctx, farOrigin, farDest)
+	ctx.Assert(eta.Estimated, "a routing service slower than the deadline must degrade to an estimate, got %+v", eta)
+	_, cachedEstimate := ctx.Redis.Get(etaKey(farOrigin, farDest))
+	ctx.Assert(!cachedEstimate, "an estimate must never be cached: a 500 ms outage would become a 60 s one")
 }
 `,
   },

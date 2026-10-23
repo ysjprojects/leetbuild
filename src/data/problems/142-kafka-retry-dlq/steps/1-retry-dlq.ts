@@ -1055,6 +1055,214 @@ export async function check_commits_advance(ctx) {
     }
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
+
+	"github.com/segmentio/kafka-go"
+
+	"leetbuild/harness"
+)
+
+func seedOrder(ctx *harness.Ctx, key string, order int) {
+	ctx.Kafka.Seed("orders", key, map[string]any{"order": order, "sku": "lamp"})
+}
+
+// headerOf is a record's header as text, nil when absent.
+func headerOf(r harness.KafkaRecord, name string) any {
+	if v, ok := r.Header(name); ok {
+		return string(v)
+	}
+	return nil
+}
+
+func headersOf(records []harness.KafkaRecord, name string) []any {
+	out := []any{}
+	for _, r := range records {
+		out = append(out, headerOf(r, name))
+	}
+	return out
+}
+
+func orderOf(r harness.KafkaRecord) any {
+	var event map[string]any
+	if json.Unmarshal(r.Value, &event) != nil {
+		return nil
+	}
+	return event["order"]
+}
+
+// failingHandler returns an error for its first times calls and succeeds after; calls collects the orders it saw.
+func failingHandler(times int, calls *[]int) Handler {
+	return func(event map[string]any) error {
+		order, _ := event["order"].(float64)
+		*calls = append(*calls, int(order))
+		if len(*calls) <= times {
+			return errors.New("warehouse down")
+		}
+		return nil
+	}
+}
+
+// consumeOrders runs the learner's loop until it waits for records that will not come, then stops it.
+func consumeOrders(ctx *harness.Ctx, handler Handler) {
+	c, cancel := context.WithCancel(context.Background())
+	var err error
+	ctx.Drain(func() { err = run(c, handler) })
+	cancel()
+	ctx.Settle()
+	if err != nil && !errors.Is(err, context.Canceled) {
+		ctx.Fatalf("run returned an error: %v", err)
+	}
+}
+
+func noLag(ctx *harness.Ctx) bool {
+	return ctx.Kafka.Lag("fulfilment", "orders") == 0 && ctx.Kafka.Lag("fulfilment", "orders.retry") == 0
+}
+
+func CheckRetryThenSucceed(ctx *harness.Ctx) {
+	seedOrder(ctx, "order-7", 7)
+	var calls []int
+	consumeOrders(ctx, failingHandler(2, &calls))
+	ctx.Equal(calls, []int{7, 7, 7}, "the handler must see the order once per attempt (3 times)")
+	retry := ctx.Kafka.Records("orders.retry")
+	ctx.Equal(headersOf(retry, "attempt"), []any{"1", "2"}, "orders.retry must hold attempt 1 then 2")
+	for _, r := range retry {
+		ctx.Assert(headerOf(r, "error") == "warehouse down", "the error header must carry the handler error's message, got %s", harness.Show(headerOf(r, "error")))
+		ctx.Assert(orderOf(r) == float64(7), "the hand-off must carry the source value unchanged, got %q", r.Value)
+	}
+	ctx.Equal(len(ctx.Kafka.Records("orders.dlq")), 0, "a record that eventually succeeds must not be dead-lettered: records on orders.dlq")
+	ctx.Assert(noLag(ctx), "every handled record must be committed")
+}
+
+func CheckDeadLetter(ctx *harness.Ctx) {
+	seedOrder(ctx, "order-7", 7)
+	var calls []int
+	consumeOrders(ctx, failingHandler(99, &calls))
+	ctx.Equal(len(calls), 3, "a record is tried maxAttempts = 3 times: handler calls")
+	ctx.Equal(headersOf(ctx.Kafka.Records("orders.retry"), "attempt"), []any{"1", "2"}, "the first two failures go to orders.retry")
+	dlq := ctx.Kafka.Records("orders.dlq")
+	ctx.Equal(len(dlq), 1, "the third failure dead-letters the record once: records on orders.dlq")
+	ctx.Equal(headerOf(dlq[0], "attempt"), "3", "the dead letter's attempt header")
+	ctx.Equal(headerOf(dlq[0], "error"), "warehouse down", "the dead letter's error header must carry the handler error's message")
+	ctx.Equal(orderOf(dlq[0]), 7, "the dead letter must carry the source value unchanged: its order")
+	ctx.Assert(noLag(ctx), "dead-lettering commits the source offset")
+}
+
+func CheckKeyedHandoff(ctx *harness.Ctx) {
+	seedOrder(ctx, "order-7", 7)
+	seedOrder(ctx, "order-8", 8)
+	var calls []int
+	consumeOrders(ctx, func(event map[string]any) error {
+		order, _ := event["order"].(float64)
+		calls = append(calls, int(order))
+		if order == 7 {
+			return errors.New("warehouse down")
+		}
+		return nil
+	})
+	handed := append(ctx.Kafka.Records("orders.retry"), ctx.Kafka.Records("orders.dlq")...)
+	ctx.Equal(len(handed), 3, "order 7 fails three times, two retries and a dead letter: hand-offs")
+	var keys []string
+	for _, r := range handed {
+		keys = append(keys, string(r.Key))
+	}
+	for _, key := range keys {
+		ctx.Assert(key == "order-7", "hand-off records must keep the key order-7, got %q", keys)
+	}
+	for _, r := range handed {
+		partitions := make([]int, ctx.Kafka.Partitions(r.Topic))
+		for i := range partitions {
+			partitions[i] = i
+		}
+		want := (&kafka.Hash{}).Balance(kafka.Message{Key: []byte("order-7")}, partitions...)
+		ctx.Equal(r.Partition, want, "a keyed hand-off hashes to the key's partition on %s", r.Topic)
+	}
+	sevens, eights := 0, 0
+	for _, o := range calls {
+		switch o {
+		case 7:
+			sevens++
+		case 8:
+			eights++
+		}
+	}
+	ctx.Assert(eights == 1 && sevens == 3, "order 8 is handled once, order 7 three times; saw %v", calls)
+}
+
+func CheckAckBeforeCommit(ctx *harness.Ctx) {
+	seedOrder(ctx, "order-7", 7)
+	ctx.Kafka.StallFor("orders.retry", 5)
+	var atCommit []int
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, len(ctx.Kafka.Records("orders.retry"))) })
+	var calls []int
+	before := ctx.Clock.Now()
+	consumeOrders(ctx, failingHandler(1, &calls))
+	stalled := false
+	for _, e := range ctx.Kafka.EventsOf("produce-stalled") {
+		stalled = stalled || e.Topic == "orders.retry"
+	}
+	ctx.Assert(stalled, "the hand-off must be produced to orders.retry (it was stalled)")
+	ctx.Assert(len(atCommit) > 0, "the source offset was never committed")
+	ctx.Equal(atCommit[0], 1, "the source offset was committed while the hand-off was still in flight (wait for the acknowledgement first): records on orders.retry at the first commit")
+	ctx.Assert(ctx.Clock.Now()-before > 4000, "the commit must wait out the stall (5 s of virtual time) for the broker's acknowledgement")
+	ctx.Equal(calls, []int{7, 7}, "the retry record must be handled once the broker resumes: handler calls")
+	ctx.Assert(noLag(ctx), "every handled record must be committed")
+}
+
+func CheckPoison(ctx *harness.Ctx) {
+	ctx.Kafka.Seed("orders", "order-9", "not json")
+	seedOrder(ctx, "order-7", 7)
+	var calls []int
+	consumeOrders(ctx, failingHandler(0, &calls))
+	ctx.Equal(calls, []int{7}, "the handler must never see a record that does not parse: handler calls")
+	ctx.Equal(len(ctx.Kafka.Records("orders.retry")), 0, "malformed JSON is not retried: records on orders.retry")
+	dlq := ctx.Kafka.Records("orders.dlq")
+	ctx.Assert(len(dlq) == 1 && string(dlq[0].Key) == "order-9" && string(dlq[0].Value) == "not json", "the malformed record goes to orders.dlq with its key and value")
+	ctx.Equal(headerOf(dlq[0], "attempt"), "1", "dead-lettered on first sight: the attempt header")
+	errText, _ := headerOf(dlq[0], "error").(string)
+	ctx.Assert(errText != "", "the dead letter's error header must say why")
+	ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 0, "a dead-lettered record's offset must be committed: lag on orders")
+}
+
+func CheckCommitsAdvance(ctx *harness.Ctx) {
+	for _, order := range []int{7, 8, 9, 10} {
+		seedOrder(ctx, fmt.Sprintf("order-%d", order), order)
+	}
+	var calls []int
+	eightFailed := false
+	consumeOrders(ctx, func(event map[string]any) error {
+		order, _ := event["order"].(float64)
+		calls = append(calls, int(order))
+		if order == 8 && !eightFailed {
+			eightFailed = true
+			return errors.New("warehouse down")
+		}
+		return nil
+	})
+	sorted := append([]int(nil), calls...)
+	sort.Ints(sorted)
+	ctx.Equal(sorted, []int{7, 8, 8, 9, 10}, "four orders, one retried once: expected five handler calls, saw %v", calls)
+	ctx.Equal(len(ctx.Kafka.EventsOf("auto-commit")), 0, "auto-commit is on (offsets were committed on a timer): auto-commit events")
+	commits := len(ctx.Kafka.Commits("fulfilment"))
+	ctx.Assert(commits >= 5, "each handled record ends with a commit (5 expected), saw %d", commits)
+	for _, topic := range []string{"orders", "orders.retry"} {
+		for partition := range 3 {
+			end := ctx.Kafka.EndOffset(topic, partition)
+			committed, ok := ctx.Kafka.Committed("fulfilment", topic, partition)
+			if !ok {
+				committed = 0
+			}
+			ctx.Equal(committed, end, "%s[%d]: the committed offset must reach the end offset", topic, partition)
+		}
+	}
+}
+`,
   },
   debrief: `The shape is one consumer over two topics and one hand-off function. Re-producing the failed record instead of re-processing it in place is what keeps a poison record from parking the partition behind it; keeping the key keeps a customer's orders on one partition of the retry topic, in order. The attempt count travels in a header so the record's value is never rewritten, and the error header makes the dead letter debuggable without logs. The one subtle line is the flush before the commit: a commit is a promise that the record is dealt with, and it is only true once the retry record is durably on the next topic — produce-then-commit without the wait is at-most-once under a slow broker. Real systems add a delay before re-consuming the retry topic (a \`retry.5s\`, \`retry.1m\` ladder, or pausing the partition until the record's due time), a DLQ consumer that alerts and replays, and a bounded header size so error text cannot grow a record past the broker's limit.`,
 };

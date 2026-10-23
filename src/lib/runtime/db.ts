@@ -27,10 +27,35 @@ export interface DbBridge {
   query(sql: string, paramsJson: string): Promise<string>;
   /** DDL and multi-statement scripts, no result. */
   exec(sql: string): Promise<void>;
+  /**
+   * One statement for the Go driver (goruntime/models/pq/backend.go): every value as its Postgres
+   * text output, null for NULL, with the columns' type OIDs: JSON `{fields: [{name, dataTypeID}],
+   * rows: (string | null)[][], affected}`. Arguments are text (sent as written), raw bytes, or null.
+   */
+  queryText(sql: string, args: (string | Uint8Array | null)[]): Promise<string>;
 }
+
+const hex = (bytes: Uint8Array): string => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+
+/** Arguments as lib/pq sends them: text as written; bytes into a bytea as `\x…`, into any other type as UTF-8 text. */
+const TEXT_SERIALIZERS = new Proxy(
+  {},
+  {
+    get:
+      (_target, oid) =>
+      (value: unknown): string =>
+        typeof value === 'string'
+          ? value
+          : String(oid) === '17'
+          ? `\\x${hex(value as Uint8Array)}`
+          : new TextDecoder().decode(value as Uint8Array),
+  },
+);
 
 export function createDbBridge(open: () => Promise<PGlite>): DbBridge {
   let db: Promise<PGlite> | null = null;
+  /** Every type PGlite parses, left as text (PGlite spreads the map, so it must be a real object). */
+  let raw: Record<string, (text: string) => string> | null = null;
   const ready = (): Promise<PGlite> => {
     if (db === null) db = open();
     return db;
@@ -44,6 +69,19 @@ export function createDbBridge(open: () => Promise<PGlite>): DbBridge {
     async exec(sql) {
       const pg = await ready();
       await pg.exec(sql);
+    },
+    async queryText(sql, args) {
+      const pg = await ready();
+      if (raw === null) {
+        await pg.waitReady;
+        raw = Object.fromEntries(Object.keys(pg.parsers).map(oid => [oid, (text: string): string => text]));
+      }
+      const result = await pg.query<unknown[]>(sql, args, {
+        rowMode: 'array',
+        parsers: raw,
+        serializers: TEXT_SERIALIZERS,
+      });
+      return JSON.stringify({fields: result.fields, rows: result.rows, affected: result.affectedRows ?? -1});
     },
   };
 }

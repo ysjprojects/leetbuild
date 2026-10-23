@@ -458,6 +458,105 @@ export async function check_atomic(ctx) {
   assert.notEqual(received[0], 'reader saw the hash', 'a reader saw the new book:ACME before any tick announced it: without MULTI/EXEC a reader can see one command without the other');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"sort"
+	"strconv"
+
+	"leetbuild/harness"
+)
+
+func publishTop(ctx *harness.Ctx, symbol string, bid, ask, last float64) {
+	ctx.NoError(publishTopOfBook(context.Background(), symbol, bid, ask, last), "publishTopOfBook(%q, %v, %v, %v) returned an error", symbol, bid, ask, last)
+}
+
+// tickListener is another connection subscribed to ticks:{symbol}: every message it received, in order.
+func tickListener(ctx *harness.Ctx, symbol string) *[]string {
+	received := &[]string{}
+	ctx.Redis.Subscribe("ticks:"+symbol, func(_, message string) { *received = append(*received, message) })
+	return received
+}
+
+// numericHash is the hash with every value read as a number.
+func numericHash(ctx *harness.Ctx, key string) map[string]float64 {
+	out := map[string]float64{}
+	for k, v := range ctx.Redis.HGetAll(key) {
+		n, err := strconv.ParseFloat(v, 64)
+		ctx.NoError(err, "%s field %s holds %q, not a number", key, k, v)
+		out[k] = n
+	}
+	return out
+}
+
+// asNumber is the TypeScript Number(v ?? -1): a JSON number, or a string holding one.
+func asNumber(v any) any {
+	switch n := v.(type) {
+	case nil:
+		return -1.0
+	case string:
+		if f, err := strconv.ParseFloat(n, 64); err == nil {
+			return f
+		}
+	}
+	return v
+}
+
+func CheckHash(ctx *harness.Ctx) {
+	publishTop(ctx, "ACME", 10.05, 10.06, 10.05)
+	ctx.Equal(ctx.Redis.Type("book:ACME"), "hash", "the type of book:ACME")
+	ttl := ctx.Redis.TTL("book:ACME")
+	ctx.Equal(ttl, -1, "book:ACME has a TTL of %d s; the top of book is state, not a cache entry; TTL", ttl)
+	publishTop(ctx, "ACME", 10.07, 10.08, 10.07)
+	ctx.Equal(numericHash(ctx, "book:ACME")["bid"], 10.07, "a second update must overwrite the hash with the current top of book; bid")
+}
+
+func CheckFields(ctx *harness.Ctx) {
+	publishTop(ctx, "ACME", 10.05, 10.06, 10.0)
+	fields := []string{}
+	for k := range ctx.Redis.HGetAll("book:ACME") {
+		fields = append(fields, k)
+	}
+	sort.Strings(fields)
+	ctx.Equal(fields, []string{"ask", "bid", "last"}, "book:ACME must have exactly the fields bid, ask, last")
+	ctx.Equal(numericHash(ctx, "book:ACME"), map[string]float64{"bid": 10.05, "ask": 10.06, "last": 10.0}, "book:ACME must hold bid 10.05, ask 10.06, last 10.0")
+	publishTop(ctx, "NEW", 0, 10.5, 0)
+	ctx.Equal(numericHash(ctx, "book:NEW"), map[string]float64{"bid": 0, "ask": 10.5, "last": 0}, "an empty side (0) must still be stored as 0")
+}
+
+func CheckPublish(ctx *harness.Ctx) {
+	received := tickListener(ctx, "ACME")
+	other := tickListener(ctx, "BETA")
+	publishTop(ctx, "ACME", 10.05, 10.06, 10.05)
+	ctx.Settle()
+	ctx.Assert(len(*received) > 0, "nothing was published on ticks:ACME")
+	var tick map[string]any
+	ctx.NoError(json.Unmarshal([]byte((*received)[0]), &tick), "the tick must be JSON, got %q", (*received)[0])
+	ctx.Equal(tick["symbol"], "ACME", "the tick must name the symbol, got %s; symbol", (*received)[0])
+	ctx.Equal([]any{asNumber(tick["bid"]), asNumber(tick["ask"]), asNumber(tick["last"])}, []any{10.05, 10.06, 10.05}, "the tick must repeat bid/ask/last, got %s", (*received)[0])
+	ctx.Equal(len(*other), 0, "the tick for ACME leaked onto ticks:BETA; messages there")
+}
+
+func CheckAtomic(ctx *harness.Ctx) {
+	ctx.Redis.Do("HSET", "book:ACME", "bid", "1", "ask", "2", "last", "1")
+	received := tickListener(ctx, "ACME")
+	// Two readers that land between the commands, as another connection's request would: one reads
+	// the hash the moment a tick is out, the other announces itself the moment the hash changed.
+	var bidWhenTickOut any
+	ctx.Redis.After("ticks:ACME", func() any {
+		bidWhenTickOut, _ = ctx.Redis.HGet("book:ACME", "bid")
+		return nil
+	})
+	ctx.Redis.After("book:ACME", func() any { return ctx.Redis.Publish("ticks:ACME", "reader saw the hash") })
+	publishTop(ctx, "ACME", 10.05, 10.06, 10.05)
+	ctx.Settle()
+	ctx.Assert(len(ctx.Redis.HGetAll("book:ACME")) > 0 && len(*received) > 0, "the hash and the tick must both be produced")
+	ctx.Equal(asNumber(bidWhenTickOut), 10.05, "the tick was published while book:ACME still held an older bid: a reader woken by the tick would read a stale hash. HSet and Publish belong in one TxPipelined; bid when the tick was out")
+	ctx.Assert((*received)[0] != "reader saw the hash", "a reader saw the new book:ACME before any tick announced it: without MULTI/EXEC (TxPipelined) a reader can see one command without the other")
+}
+`,
   },
   debrief: `Two commands, one unit: the transaction is what lets the next step trust a subscriber's tick without re-reading the hash, and lets the snapshot endpoint trust the hash without a tick. The hash has no TTL because expiring it would turn "stale" into "absent", which is a worse lie. A single writer per key (thanks to the partition key) keeps the transaction simple — no WATCH, no Lua. Real market-data feeds add a sequence number to every tick so subscribers can detect gaps, keep the full depth (\`ZADD\` per price level, or a proper feed handler), and multicast at the network layer instead of Pub/Sub, which drops messages for slow subscribers.`,
 };

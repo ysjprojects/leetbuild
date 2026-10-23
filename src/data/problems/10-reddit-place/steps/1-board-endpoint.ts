@@ -383,10 +383,10 @@ const (
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 // placeTile (cooldown.go, step 2) returns the seconds left on the user's cooldown; 0 means painted.
-func placeTile(ctx context.Context, user string, x, y, color int) (int, error) { panic("not implemented") }
+var placeTile = func(ctx context.Context, user string, x, y, color int) (int, error) { panic("not implemented") }
 
 // recordPlacement (placement_events.go, step 3) emits one event per painted tile.
-func recordPlacement(ctx context.Context, user string, x, y, color int) { panic("not implemented") }
+var recordPlacement = func(ctx context.Context, user string, x, y, color int) { panic("not implemented") }
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
@@ -452,10 +452,10 @@ const (
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 // placeTile (cooldown.go, step 2) returns the seconds left on the user's cooldown; 0 means painted.
-func placeTile(ctx context.Context, user string, x, y, color int) (int, error) { panic("not implemented") }
+var placeTile = func(ctx context.Context, user string, x, y, color int) (int, error) { panic("not implemented") }
 
 // recordPlacement (placement_events.go, step 3) emits one event per painted tile.
-func recordPlacement(ctx context.Context, user string, x, y, color int) { panic("not implemented") }
+var recordPlacement = func(ctx context.Context, user string, x, y, color int) { panic("not implemented") }
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
@@ -1038,6 +1038,191 @@ export async function check_placed(ctx) {
   assert.equal(events.length, 1, \`one painted tile must put exactly one record on placements, found \${events.length}: \${JSON.stringify(events)}\`);
   const got = {user: events[0].user, x: events[0].x, y: events[0].y, color: events[0].color};
   assert.deepEqual(got, {user: 'ana', x: 3, y: 7, color: 12}, \`the placement recorded is \${JSON.stringify(got)}, expected the painted tile: recordPlacement(user, x, y, color)\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+var bpTile = map[string]any{"x": 3, "y": 7, "color": 12, "user": "ana"}
+
+// bpEvent is the part of a placements record the checks read.
+type bpEvent struct {
+	User  string \`json:"user"\`
+	X     int    \`json:"x"\`
+	Y     int    \`json:"y"\`
+	Color int    \`json:"color"\`
+}
+
+// bpAPI runs main as deployed: placeTile is step 2's cooldown (SET cooldown:{user} NX EX 300, then
+// SETRANGE board), recordPlacement step 3's producer (one JSON record on placements per tile).
+func bpAPI(ctx *harness.Ctx) *harness.HTTP {
+	placeTile = func(_ context.Context, user string, x, y, color int) (int, error) {
+		key := "cooldown:" + user
+		if !ctx.Redis.Set(key, "1", "NX", "EX", 300) {
+			if ttl := int(ctx.Redis.TTL(key)); ttl > 1 {
+				return ttl, nil
+			}
+			return 1, nil
+		}
+		ctx.Redis.Do("SETRANGE", "board", y*size+x, string([]byte{byte(color)}))
+		return 0, nil
+	}
+	recordPlacement = func(_ context.Context, user string, x, y, color int) {
+		value, _ := json.Marshal(map[string]any{"user": user, "x": x, "y": y, "color": color, "ts": ctx.Clock.Now()})
+		ctx.Kafka.Seed("placements", fmt.Sprintf("%d:%d", x, y), value)
+	}
+	return ctx.Main(main).HTTP()
+}
+
+// bpWith is the tile with some fields replaced.
+func bpWith(fields map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range bpTile {
+		out[k] = v
+	}
+	for k, v := range fields {
+		out[k] = v
+	}
+	return out
+}
+
+func bpPixel(ctx *harness.Ctx, x, y int) int {
+	board, _ := ctx.Redis.Get("board")
+	if off := y*size + x; off < len(board) {
+		return int(board[off])
+	}
+	return 0
+}
+
+func bpZeros(b []byte) int {
+	n := 0
+	for _, c := range b {
+		if c == 0 {
+			n++
+		}
+	}
+	return n
+}
+
+func bpPlacements(ctx *harness.Ctx) []bpEvent {
+	out := []bpEvent{}
+	for _, v := range ctx.Kafka.Values("placements") {
+		var e bpEvent
+		ctx.NoError(json.Unmarshal([]byte(v), &e), "a placements record is not JSON: %q", v)
+		out = append(out, e)
+	}
+	return out
+}
+
+func bpMaxAge1(cache string) bool {
+	for _, part := range strings.Split(strings.ReplaceAll(cache, " ", ""), ",") {
+		if part == "max-age=1" {
+			return true
+		}
+	}
+	return false
+}
+
+func CheckBoardBlob(ctx *harness.Ctx) {
+	api := bpAPI(ctx)
+	n := size * size
+	r := api.Get("/board")
+	ctx.Assert(r.Status != 404 && r.Status != 405, "GET /board answered %d: no handler is registered for it", r.Status)
+	ctx.Equal(r.Status, 200, "GET /board")
+	ct := r.Header.Get("Content-Type")
+	ctx.Assert(strings.HasPrefix(ct, "application/octet-stream"), "Content-Type is %q, expected application/octet-stream", ct)
+	ctx.Assert(len(r.Body) == n, "an untouched board is %d bytes, expected size * size = %d zero bytes", len(r.Body), n)
+	ctx.Equal(bpZeros(r.Body), n, "an untouched board must be all colour 0: the zero bytes")
+	ctx.Redis.Do("SETRANGE", "board", 7*size+3, string([]byte{12}))
+	r = api.Get("/board")
+	ctx.Assert(len(r.Body) == n, "after one SETRANGE the board is %d bytes, expected %d: pad a short key with zeros", len(r.Body), n)
+	ctx.Equal(r.Body[7*size+3], 12, "byte y * size + x of the body must be the colour 12 written to Redis")
+	ctx.Equal(bpZeros(r.Body), n-1, "every other pixel must still be colour 0: the zero bytes")
+	ctx.Redis.Do("SETRANGE", "board", 9*size+1, string([]byte{200})) // a palette wider than 7 bits: every byte value must survive
+	r = api.Get("/board")
+	ctx.Assert(len(r.Body) == n, "after a byte above 127 the board is %d bytes, expected %d: the body must be the raw bytes, not text", len(r.Body), n)
+	ctx.Equal(r.Body[9*size+1], 200, "byte (1, 9) of the body must be 200: read and send the board as bytes, not as a string")
+}
+
+func CheckCacheHeaders(ctx *harness.Ctx) {
+	api := bpAPI(ctx)
+	r := api.Get("/board")
+	cache := r.Header.Get("Cache-Control")
+	ctx.Assert(bpMaxAge1(cache), "Cache-Control is %q, expected public, max-age=1, stale-while-revalidate=5", cache)
+	ctx.Assert(strings.Contains(cache, "public") && strings.Contains(cache, "stale-while-revalidate"), "Cache-Control is %q, expected public, max-age=1, stale-while-revalidate=5", cache)
+	etag := r.Header.Get("ETag")
+	ctx.Assert(etag != "", "GET /board must carry an ETag so caches can revalidate instead of re-downloading the board")
+	again := api.Get("/board")
+	ctx.Equal(again.Header.Get("ETag"), etag, "the same bytes must give the same ETag")
+	r = api.Get("/board", "If-None-Match", etag)
+	ctx.Equal(r.Status, 304, "If-None-Match with the current ETag")
+	ctx.Equal(r.Text(), "", "a 304 has no body")
+	ctx.Equal(r.Header.Get("ETag"), etag, "the 304 must repeat the ETag")
+	ctx.Assert(strings.Contains(r.Header.Get("Cache-Control"), "max-age=1"), "the 304 must repeat Cache-Control so the cache extends its entry")
+	ctx.Redis.Do("SETRANGE", "board", 0, string([]byte{5}))
+	r = api.Get("/board", "If-None-Match", etag)
+	ctx.Equal(r.Status, 200, "after a tile changed the old ETag no longer matches")
+	ctx.Assert(r.Header.Get("ETag") != etag, "a changed board must change the ETag")
+}
+
+func CheckValidate(ctx *harness.Ctx) {
+	api := bpAPI(ctx)
+	bads := []map[string]any{{"x": -1}, {"x": size}, {"y": -1}, {"y": size}, {"color": -1}, {"color": 16}, {"user": ""}}
+	for _, bad := range bads {
+		r := api.Post("/place", bpWith(bad))
+		ctx.Equal(r.Status, 400, "POST /place with %v", bad)
+	}
+	cooling := ctx.Redis.Keys("cooldown:*")
+	ctx.Assert(len(cooling) == 0, "after only rejected requests Redis holds %s: a rejected placement reached placeTile and cost a user their turn", harness.Show(cooling))
+	board, _ := ctx.Redis.Get("board")
+	ctx.Equal(bpZeros([]byte(board)), len(board), "a rejected placement changed the board: the zero bytes")
+	ctx.Assert(len(ctx.Kafka.Records("placements")) == 0, "a rejected placement must not be recorded, but placements holds %+v", bpPlacements(ctx))
+	oks := []map[string]any{{"x": size - 1, "y": size - 1}, {"x": 0, "y": 0}, {"color": 15}, {"color": 0}}
+	for i, ok := range oks {
+		tile := bpWith(ok)
+		tile["user"] = fmt.Sprintf("user%d", i)
+		r := api.Post("/place", tile)
+		ctx.Equal(r.Status, 200, "POST /place with %v is within range", ok)
+		x, y := tile["x"].(int), tile["y"].(int)
+		ctx.Equal(bpPixel(ctx, x, y), tile["color"], "after the accepted tile %v the board byte at (%d, %d)", tile, x, y)
+	}
+}
+
+func CheckCooldown429(ctx *harness.Ctx) {
+	api := bpAPI(ctx)
+	first := api.Post("/place", bpTile)
+	ctx.Equal(first.Status, 200, "ana's first tile")
+	ctx.Clock.Advance(113)
+	r := api.Post("/place", bpWith(map[string]any{"x": 4, "color": 5}))
+	ttl := ctx.Redis.TTL("cooldown:ana")
+	ctx.Assert(r.Status == 429, "113 s after ana's first tile her second one answered %d, expected 429: her cooldown still has %d s to run", r.Status, ttl)
+	ctx.Equal(r.Header.Get("Retry-After"), strconv.FormatInt(ttl, 10), "Retry-After must be the %d s left on ana's cooldown (what placeTile returned)", ttl)
+	ctx.Equal(bpPixel(ctx, 4, 7), 0, "the refused tile was painted: the board byte at (4, 7)")
+	events := bpPlacements(ctx)
+	ctx.Assert(len(events) == 1, "a tile refused by the cooldown is not a placement: expected only ana's first tile on placements, found %+v", events)
+}
+
+func CheckPlaced(ctx *harness.Ctx) {
+	r := bpAPI(ctx).Post("/place", bpTile)
+	ctx.Equal(r.Status, 200, "a painted tile")
+	var body bpEvent
+	r.Decode(&body)
+	ctx.Equal(body, bpEvent{User: "ana", X: 3, Y: 7, Color: 12}, "the body must carry the tile {x, y, color, user}")
+	ctx.Equal(bpPixel(ctx, 3, 7), 12, "after POST /place of %v the board byte at (3, 7) must be 12: placeTile(ctx, user, x, y, color) paints it", bpTile)
+	ttl := ctx.Redis.TTL("cooldown:ana")
+	ctx.Assert(ttl > 0, "after her tile was painted ana is not on cooldown (TTL of cooldown:ana is %d): placeTile(ctx, user, x, y, color) must run with her name", ttl)
+	events := bpPlacements(ctx)
+	ctx.Assert(len(events) == 1, "one painted tile must put exactly one record on placements, found %d: %+v", len(events), events)
+	ctx.Equal(events[0], bpEvent{User: "ana", X: 3, Y: 7, Color: 12}, "the placement recorded must be the painted tile: recordPlacement(ctx, user, x, y, color)")
 }
 `,
   },

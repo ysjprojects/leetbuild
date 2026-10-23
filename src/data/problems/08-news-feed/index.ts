@@ -8,7 +8,7 @@ import {timelineReadStep} from './steps/3-timeline-read';
 import {hydratePostsStep} from './steps/4-hydrate-posts';
 import {likePostStep} from './steps/5-like-post';
 import {engagementRollupStep} from './steps/6-engagement-rollup';
-import {supportModules, supportModulesTs} from './support';
+import {supportModules, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * News feed: a post API that publishes to Kafka → a fan-out-on-write worker pushing post ids into
@@ -81,6 +81,7 @@ batching, idempotent counters — which is what every feed-shaped system is made
   support: {
     python: {...protoModules, ...supportModules},
     typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
   },
   learn,
 };

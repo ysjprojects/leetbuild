@@ -383,7 +383,7 @@ import (
 	"github.com/google/uuid"
 
 	"feed/events"   // events.Publish(ctx, post) — provided (Kafka topic "posts")
-	"feed/posts"    // posts.Post, posts.Save(ctx, post) error — provided
+	"feed/posts"    // posts.Post, posts.Save(ctx, &post) error — provided; a reused Idempotency-Key fills post with the earlier one
 	"feed/timeline" // timeline.Read(ctx, userID, cursor *int64, limit) ([]string, *int64, error) — provided
 )
 
@@ -453,7 +453,7 @@ import (
 	"github.com/google/uuid"
 
 	"feed/events"   // events.Publish(ctx, post) — provided (Kafka topic "posts")
-	"feed/posts"    // posts.Post, posts.Save(ctx, post) error — provided
+	"feed/posts"    // posts.Post, posts.Save(ctx, &post) error — provided; a reused Idempotency-Key fills post with the earlier one
 	"feed/timeline" // timeline.Read(ctx, userID, cursor *int64, limit) ([]string, *int64, error) — provided
 )
 
@@ -499,7 +499,7 @@ func createPost(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:      time.Now().UnixMilli(),
 		IdempotencyKey: key,
 	}
-	if err := posts.Save(r.Context(), post); err != nil {
+	if err := posts.Save(r.Context(), &post); err != nil {
 		http.Error(w, "could not save post", http.StatusServiceUnavailable)
 		return
 	}
@@ -1016,6 +1016,136 @@ export async function check_feed_response(ctx) {
   assert.deepStrictEqual(calls, [['alice', 1700000000500, 5]], \`timeline.read must get the user from X-User-Id, the cursor and the limit as numbers, unchanged: \${JSON.stringify(calls)}\`);
   assert.deepStrictEqual(r.json(), {posts: ['p3', 'p2'], next_cursor: 1700000000200}, \`the body must be the page from timeline.read as posts and next_cursor: \${r.text}\`);
   assert.equal(r.headers['cache-control'], 'private, no-store', \`Cache-Control must be 'private, no-store', got \${JSON.stringify(r.headers['cache-control'])}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"math"
+	"strings"
+
+	"leetbuild/harness"
+
+	"feed/posts"
+	"feed/timeline"
+)
+
+var postHeaders = []string{"X-User-Id", "alice", "Idempotency-Key", "k-1"}
+
+// timelineCall is one call of timeline.Read; cursor is nil or the int64 it pointed at.
+type timelineCall struct {
+	userID string
+	cursor any
+	limit  int
+}
+
+// fakeTimeline swaps timeline.Read on the provided facade: records every call and answers a fixed page.
+func fakeTimeline() *[]timelineCall {
+	calls := &[]timelineCall{}
+	timeline.Read = func(_ context.Context, userID string, cursor *int64, limit int) ([]string, *int64, error) {
+		call := timelineCall{userID: userID, limit: limit}
+		if cursor != nil {
+			call.cursor = *cursor
+		}
+		*calls = append(*calls, call)
+		next := int64(1700000000200)
+		return []string{"p3", "p2"}, &next, nil
+	}
+	return calls
+}
+
+func CheckValidate(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	bad := []struct {
+		body map[string]any
+		why  string
+	}{
+		{map[string]any{"text": ""}, "empty text"},
+		{map[string]any{"text": strings.Repeat("x", 281)}, "281 characters of text"},
+		{map[string]any{"text": "hi", "media_ids": []string{"m1", "m2", "m3", "m4", "m5"}}, "5 media ids"},
+	}
+	for _, b := range bad {
+		r := c.Post("/posts", b.body, postHeaders...)
+		ctx.Equal(r.Status, 400, "%s must answer 400", b.why)
+	}
+	keys := ctx.Redis.Keys("*")
+	ctx.Assert(len(keys) == 0, "a rejected post must not reach the store, but Redis holds %q", keys)
+	ctx.Equal(len(ctx.Kafka.Records("posts")), 0, "a rejected post must not be published")
+	r := c.Post("/posts", map[string]any{"text": strings.Repeat("x", 280), "media_ids": []string{"m1", "m2", "m3", "m4"}}, postHeaders...)
+	ctx.Equal(r.Status, 201, "280 characters and 4 media ids are valid")
+}
+
+func CheckIdempotencyKey(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	r := c.Post("/posts", map[string]any{"text": "hello"}, "X-User-Id", "alice")
+	ctx.Equal(r.Status, 400, "a POST without Idempotency-Key must answer 400")
+	ctx.Assert(len(ctx.Redis.Keys("*")) == 0 && len(ctx.Kafka.Records("posts")) == 0, "a POST without Idempotency-Key must not be saved or published")
+	first := c.Post("/posts", map[string]any{"text": "hello"}, postHeaders...)
+	ctx.Equal(first.Status, 201, "a POST with Idempotency-Key must answer 201")
+	retry := c.Post("/posts", map[string]any{"text": "hello"}, postHeaders...)
+	ctx.Equal(retry.Status, 201, "a retried POST with the same key must answer 201")
+	firstBody, _ := first.JSON().(map[string]any)
+	retryBody, _ := retry.JSON().(map[string]any)
+	ctx.Equal(retryBody["post_id"], firstBody["post_id"], "a retry with the same Idempotency-Key must be the same post: the key must reach posts.Save as IdempotencyKey")
+}
+
+func CheckCreated(ctx *harness.Ctx) {
+	// posts.Save reads idem:alice:k-1 first: what the posts topic held at that moment tells whether publish came before the save.
+	atSave := ctx.Redis.After("idem:alice:k-1", func() any { return len(ctx.Kafka.Records("posts")) })
+	r := ctx.Main(main).HTTP().Post("/posts", map[string]any{"text": "hello", "media_ids": []string{"m1"}}, postHeaders...)
+	ctx.Equal(r.Status, 201, "a valid post must answer 201")
+	body, _ := r.JSON().(map[string]any)
+	postID, _ := body["post_id"].(string)
+	ctx.Assert(postID != "", "the 201 body must carry post_id: %s", r.Text())
+	createdAt, isNumber := body["created_at"].(float64)
+	ctx.Assert(isNumber && createdAt == math.Trunc(createdAt), "created_at must be an integer of milliseconds: %s", r.Text())
+	ctx.Assert(math.Abs(createdAt-float64(ctx.Clock.Now())) < 5000, "created_at must be the current time in milliseconds, got %d", int64(createdAt))
+	saved, err := posts.Get(context.Background(), postID)
+	ctx.NoError(err, "posts.Get(%q)", postID)
+	ctx.Assert(saved != nil, "the post must be in the store after the 201")
+	ctx.Assert(saved.ID == postID && saved.Author == "alice", "the saved post must carry the post_id and the author from X-User-Id: %+v", *saved)
+	ctx.Assert(saved.Text == "hello" && fmt.Sprint(saved.MediaIDs) == "[m1]", "the saved post must carry text and media_ids: %+v", *saved)
+	ctx.Assert(atSave.Fired, "the post must reach posts.Save with its IdempotencyKey")
+	ctx.Equal(atSave.Result, 0, "expected posts.Save then events.Publish, but the posts topic already held records when the store was first asked")
+	values := ctx.Kafka.Values("posts")
+	ctx.Equal(len(values), 1, "expected one record on the posts topic")
+	var published map[string]any
+	ctx.NoError(json.Unmarshal([]byte(values[0]), &published), "the published record must be the saved post as JSON")
+	ctx.Equal(published["post_id"], postID, "the published record must be the saved post")
+	ctx.Equal(r.Header.Get("Cache-Control"), "private, no-store", "Cache-Control")
+}
+
+func CheckFeedLimit(ctx *harness.Ctx) {
+	calls := fakeTimeline()
+	c := ctx.Main(main).HTTP()
+	for _, limit := range []int{0, 51, -1} {
+		r := c.Get(fmt.Sprintf("/feed?limit=%d", limit), postHeaders...)
+		ctx.Equal(r.Status, 400, "limit=%d must answer 400", limit)
+	}
+	ctx.Equal(len(*calls), 0, "a rejected limit must not reach timeline.Read")
+	for _, limit := range []int{1, 50} {
+		r := c.Get(fmt.Sprintf("/feed?limit=%d", limit), postHeaders...)
+		ctx.Equal(r.Status, 200, "limit=%d is valid", limit)
+	}
+	r := c.Get("/feed", postHeaders...)
+	ctx.Equal(r.Status, 200, "GET /feed without limit must use the default")
+	limits := []int{}
+	for _, call := range *calls {
+		limits = append(limits, call.limit)
+	}
+	ctx.Equal(limits, []int{1, 50, 20}, "timeline.Read must receive the limit (default 20)")
+}
+
+func CheckFeedResponse(ctx *harness.Ctx) {
+	calls := fakeTimeline()
+	r := ctx.Main(main).HTTP().Get("/feed?cursor=1700000000500&limit=5", postHeaders...)
+	ctx.Equal(r.Status, 200, "GET /feed must answer 200")
+	ctx.Equal(*calls, []timelineCall{{"alice", int64(1700000000500), 5}}, "timeline.Read must get the user from X-User-Id, the cursor and the limit unchanged")
+	ctx.Equal(r.JSON(), map[string]any{"posts": []any{"p3", "p2"}, "next_cursor": float64(1700000000200)}, "the body must be the page from timeline.Read as posts and next_cursor")
+	ctx.Equal(r.Header.Get("Cache-Control"), "private, no-store", "Cache-Control")
 }
 `,
   },

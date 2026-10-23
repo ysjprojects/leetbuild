@@ -476,12 +476,12 @@ var namespaces = map[string]string{
 var nameRe = regexp.MustCompile(\`^[A-Za-z0-9_-]{1,64}$\`)
 
 // Built in later steps.
-func addBestEffort(ns, name string, delta int64) (int64, error)    { panic("not implemented") } // step 2
-func getBestEffort(ns, name string) (int64, error)                 { panic("not implemented") }
-func clearBestEffort(ns, name string) error                        { panic("not implemented") }
-func appendEvent(ns, name string, delta int64, token string) error { panic("not implemented") } // step 3
-func getRolledUp(ns, name string) (int64, error)                   { panic("not implemented") } // step 4
-func clearRolledUp(ns, name string) error                          { panic("not implemented") }
+var addBestEffort = func(ns, name string, delta int64) (int64, error) { panic("not implemented") } // step 2
+var getBestEffort = func(ns, name string) (int64, error) { panic("not implemented") }
+var clearBestEffort = func(ns, name string) error { panic("not implemented") }
+var appendEvent = func(ns, name string, delta int64, token string) error { panic("not implemented") } // step 3
+var getRolledUp = func(ns, name string) (int64, error) { panic("not implemented") }                   // step 4
+var clearRolledUp = func(ns, name string) error { panic("not implemented") }
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
@@ -546,12 +546,12 @@ var namespaces = map[string]string{
 var nameRe = regexp.MustCompile(\`^[A-Za-z0-9_-]{1,64}$\`)
 
 // Built in later steps.
-func addBestEffort(ns, name string, delta int64) (int64, error)    { panic("not implemented") } // step 2
-func getBestEffort(ns, name string) (int64, error)                 { panic("not implemented") }
-func clearBestEffort(ns, name string) error                        { panic("not implemented") }
-func appendEvent(ns, name string, delta int64, token string) error { panic("not implemented") } // step 3
-func getRolledUp(ns, name string) (int64, error)                   { panic("not implemented") } // step 4
-func clearRolledUp(ns, name string) error                          { panic("not implemented") }
+var addBestEffort = func(ns, name string, delta int64) (int64, error) { panic("not implemented") } // step 2
+var getBestEffort = func(ns, name string) (int64, error) { panic("not implemented") }
+var clearBestEffort = func(ns, name string) error { panic("not implemented") }
+var appendEvent = func(ns, name string, delta int64, token string) error { panic("not implemented") } // step 3
+var getRolledUp = func(ns, name string) (int64, error) { panic("not implemented") }                   // step 4
+var clearRolledUp = func(ns, name string) error { panic("not implemented") }
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
@@ -1295,6 +1295,241 @@ export async function check_read_clear_dispatch(ctx) {
   assert.equal(ctx.redis.exists('rollup:plays:trailer-7'), 0, 'DELETE /counters/plays/trailer-7 must clear the rolled-up buckets rollup:plays:trailer-7');
   n = await count(c, 'plays', 'trailer-7');
   assert.equal(n, 0, \`after the clear plays/trailer-7 reads 0, got \${n}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/segmentio/kafka-go"
+
+	"leetbuild/harness"
+)
+
+const caTopic = "counter-events"
+
+// caAPI is the learner's API as it runs: on the best-effort counters (step 2), the event log (step 3)
+// and the rollup (step 4), which the stand-ins below reproduce.
+type caAPI struct {
+	http   *harness.HTTP
+	folded int // the records of counter-events the rollup has folded so far
+}
+
+func caStart(ctx *harness.Ctx) *caAPI {
+	addBestEffort = func(ns, name string, delta int64) (int64, error) {
+		key := "counter:" + ns + ":" + name
+		ctx.Redis.Set(key, 0, "NX", "EX", 3600)
+		return ctx.Redis.Do("INCRBY", key, delta).(int64), nil
+	}
+	getBestEffort = func(ns, name string) (int64, error) {
+		v, ok := ctx.Redis.Get("counter:" + ns + ":" + name)
+		if !ok {
+			return 0, nil
+		}
+		return strconv.ParseInt(v, 10, 64)
+	}
+	clearBestEffort = func(ns, name string) error {
+		ctx.Redis.Del("counter:" + ns + ":" + name)
+		return nil
+	}
+	events := &kafka.Writer{
+		Addr:         kafka.TCP("kafka:9092"),
+		Topic:        caTopic,
+		Balancer:     &kafka.Hash{},
+		BatchTimeout: 5 * time.Millisecond,
+		RequiredAcks: kafka.RequireAll,
+	}
+	appendEvent = func(ns, name string, delta int64, token string) error {
+		value, _ := json.Marshal(map[string]any{"ns": ns, "name": name, "delta": delta, "token": token, "ts": float64(ctx.Clock.Now()) / 1000})
+		callCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		return events.WriteMessages(callCtx, kafka.Message{Key: []byte(ns + ":" + name), Value: value})
+	}
+	getRolledUp = func(ns, name string) (int64, error) {
+		var sum int64
+		for _, v := range ctx.Redis.HGetAll("rollup:" + ns + ":" + name) {
+			n, _ := strconv.ParseInt(v, 10, 64)
+			sum += n
+		}
+		return sum, nil
+	}
+	clearRolledUp = func(ns, name string) error {
+		ctx.Redis.Del("rollup:" + ns + ":" + name)
+		return nil
+	}
+	return &caAPI{http: ctx.Main(main).HTTP()}
+}
+
+// rollup folds the events not folded yet into their minute buckets, once per token (step 4).
+func (a *caAPI) rollup(ctx *harness.Ctx) {
+	records := ctx.Kafka.Records(caTopic)
+	for _, r := range records[a.folded:] {
+		var e struct {
+			NS, Name, Token string
+			Delta           int64
+			Ts              float64
+		}
+		if json.Unmarshal(r.Value, &e) != nil {
+			continue
+		}
+		if ctx.Redis.Set("seen:"+e.Token, 1, "NX", "EX", 86400) {
+			ctx.Redis.Do("HINCRBY", "rollup:"+e.NS+":"+e.Name, strconv.FormatInt(int64(e.Ts)/60*60, 10), e.Delta)
+		}
+	}
+	a.folded = len(records)
+}
+
+// call is the status the API answered and its body; the body is nil when it is not a JSON object.
+func (a *caAPI) call(method, path string, body map[string]any) (int, map[string]any) {
+	var r *harness.Response
+	if body == nil {
+		r = a.http.Do(method, path, nil)
+	} else {
+		r = a.http.Do(method, path, body)
+	}
+	var decoded map[string]any
+	if json.Unmarshal(r.Body, &decoded) != nil {
+		decoded = nil
+	}
+	return r.Status, decoded
+}
+
+func (a *caAPI) count(ctx *harness.Ctx, ns, name string) any {
+	status, body := a.call("GET", "/counters/"+ns+"/"+name, nil)
+	ctx.Equal(status, 200, "GET /counters/%s/%s must answer 200 with the count", ns, name)
+	return body["count"]
+}
+
+func caUntouched(ctx *harness.Ctx, what string) {
+	keys := ctx.Redis.Keys("*")
+	events := ctx.Kafka.Records(caTopic)
+	ctx.Assert(len(keys) == 0 && len(events) == 0, "%s must be refused before any store is touched, yet Redis holds %q and %s holds %d event(s)", what, keys, caTopic, len(events))
+}
+
+func CheckRoutes(ctx *harness.Ctx) {
+	a := caStart(ctx)
+	status, _ := a.call("POST", "/counters/views/trailer-7/add", map[string]any{"delta": 1, "token": "t-1"})
+	ctx.Assert(status != 404 && status != 405, "POST /counters/views/trailer-7/add answered %d: no handler is registered for it", status)
+	ctx.Equal(status, 200, "a best-effort add")
+	status, _ = a.call("GET", "/counters/views/trailer-7", nil)
+	ctx.Assert(status != 404 && status != 405, "GET /counters/views/trailer-7 answered %d: no handler is registered for it", status)
+	ctx.Equal(status, 200, "GET on a configured namespace")
+	status, _ = a.call("DELETE", "/counters/views/trailer-7", nil)
+	ctx.Assert(status != 404 && status != 405, "DELETE /counters/views/trailer-7 answered %d: no handler is registered for it", status)
+	ctx.Equal(status, 204, "DELETE /counters/views/trailer-7")
+	status, _ = a.call("POST", "/counters/plays/stranger-things/add", map[string]any{"delta": 1, "token": "t-2"})
+	ctx.Equal(status, 202, "POST /counters/plays/stranger-things/add")
+	status, _ = a.call("GET", "/counters/plays/stranger-things", nil)
+	ctx.Equal(status, 200, "GET /counters/plays/stranger-things")
+	status, _ = a.call("DELETE", "/counters/plays/stranger-things", nil)
+	ctx.Equal(status, 204, "DELETE /counters/plays/stranger-things")
+}
+
+func CheckUnknownNamespace(ctx *harness.Ctx) {
+	a := caStart(ctx)
+	status, _ := a.call("POST", "/counters/likes/trailer-7/add", map[string]any{"delta": 1, "token": "t-1"})
+	ctx.Equal(status, 404, "namespace 'likes' is not configured")
+	status, _ = a.call("GET", "/counters/likes/trailer-7", nil)
+	ctx.Equal(status, 404, "GET on an unknown namespace")
+	status, _ = a.call("DELETE", "/counters/likes/trailer-7", nil)
+	ctx.Equal(status, 404, "DELETE on an unknown namespace")
+	status, _ = a.call("POST", "/counters/likes/bad%20name/add", map[string]any{"delta": 0})
+	ctx.Equal(status, 404, "the namespace is checked first: an unknown namespace with a bad name and a bad delta is still a 404")
+	caUntouched(ctx, "an add to an unknown namespace")
+}
+
+func CheckValidate(ctx *harness.Ctx) {
+	a := caStart(ctx)
+	for _, bad := range []string{"bad name", "dots.are.out", strings.Repeat("a", 65), "café"} {
+		path := url.PathEscape(bad)
+		status, _ := a.call("POST", "/counters/views/"+path+"/add", map[string]any{"delta": 1, "token": "t-1"})
+		ctx.Equal(status, 400, "name %q does not match nameRe", bad)
+		status, _ = a.call("POST", "/counters/plays/"+path+"/add", map[string]any{"delta": 1, "token": "t-1"})
+		ctx.Equal(status, 400, "name %q does not match nameRe: an eventually-consistent add", bad)
+		status, _ = a.call("GET", "/counters/views/"+path, nil)
+		ctx.Equal(status, 400, "GET with name %q", bad)
+	}
+	for _, delta := range []int{0, 1_000_001, -1_000_001} {
+		status, _ := a.call("POST", "/counters/views/trailer-7/add", map[string]any{"delta": delta, "token": "t-1"})
+		ctx.Equal(status, 400, "delta %d is zero or beyond ±maxDelta", delta)
+		status, _ = a.call("POST", "/counters/plays/stranger-things/add", map[string]any{"delta": delta, "token": "t-1"})
+		ctx.Equal(status, 400, "delta %d is zero or beyond ±maxDelta: an eventually-consistent add", delta)
+	}
+	status, _ := a.call("POST", "/counters/plays/stranger-things/add", map[string]any{"delta": 1})
+	ctx.Equal(status, 400, "an eventually-consistent add without a token (the token is the idempotency key)")
+	status, _ = a.call("POST", "/counters/plays/stranger-things/add", map[string]any{"delta": 1, "token": ""})
+	ctx.Equal(status, 400, "an empty token is no token")
+	caUntouched(ctx, "a request with a bad name, delta or token")
+	status, _ = a.call("POST", "/counters/views/trailer-7/add", map[string]any{"delta": -1_000_000})
+	ctx.Equal(status, 200, "a best-effort add of exactly -maxDelta without a token is valid")
+	status, _ = a.call("POST", "/counters/views/trailer_7-v2/add", map[string]any{"delta": 1_000_000, "token": "t-1"})
+	ctx.Equal(status, 200, "name 'trailer_7-v2' and delta maxDelta are valid")
+}
+
+func CheckAddDispatch(ctx *harness.Ctx) {
+	a := caStart(ctx)
+	status, body := a.call("POST", "/counters/views/trailer-7/add", map[string]any{"delta": 3, "token": "t-1"})
+	ctx.Equal(status, 200, "a best-effort add")
+	ctx.Equal(body["count"], 3, "the 200 body must carry the new count of the best-effort counter (body %v)", body)
+	status, body = a.call("POST", "/counters/views/trailer-7/add", map[string]any{"delta": 4})
+	ctx.Equal(body["count"], 7, "the second add must return the running count 7 (status %d, body %v)", status, body)
+	cached, _ := ctx.Redis.Get("counter:views:trailer-7")
+	ctx.Equal(cached, "7", "best-effort adds move the cached counter counter:views:trailer-7 at once")
+	ctx.Equal(len(ctx.Kafka.Records(caTopic)), 0, "a best-effort add is not logged as an event, yet %s holds %q", caTopic, ctx.Kafka.Values(caTopic))
+
+	status, body = a.call("POST", "/counters/plays/stranger-things/add", map[string]any{"delta": 1, "token": "t-9f3"})
+	ctx.Equal(status, 202, "an eventually-consistent add (the count is not visible yet)")
+	_, claimed := body["count"]
+	ctx.Assert(!claimed, "a 202 must not claim a count the rollup has not computed, got %v", body)
+	seen := [][]any{}
+	for _, v := range ctx.Kafka.Values(caTopic) {
+		var e map[string]any
+		json.Unmarshal([]byte(v), &e)
+		seen = append(seen, []any{e["ns"], e["name"], e["delta"], e["token"]})
+	}
+	ctx.Equal(seen, [][]any{{"plays", "stranger-things", 1.0, "t-9f3"}}, "an eventually-consistent add is one event on %s carrying the delta and the client's token", caTopic)
+	ctx.Equal(ctx.Redis.Keys("counter:*"), []string{"counter:views:trailer-7"}, "an eventually-consistent add must not touch a best-effort counter: the counter:* keys")
+	ctx.Equal(a.count(ctx, "plays", "stranger-things"), 0, "before the rollup has folded the event the count is not visible yet")
+	a.rollup(ctx)
+	ctx.Equal(a.count(ctx, "plays", "stranger-things"), 1, "once the rollup has folded the event GET must show it")
+
+	ctx.Kafka.Stall(caTopic) // the cluster stops acknowledging
+	start := ctx.Clock.Now()
+	status, _ = a.call("POST", "/counters/plays/stranger-things/add", map[string]any{"delta": 2, "token": "t-a1"})
+	waited := float64(ctx.Clock.Now()-start) / 1000
+	ctx.Assert(status != 202, "with the broker down the event could not be made durable, yet the add answered 202: the client was promised a count that may never arrive")
+	ctx.Equal(status, 503, "with the broker down an event that is not durable (ErrNotDurable) is a 503, which tells the client to retry with the same token")
+	ctx.Assert(waited <= 1.5, "with the broker down the add took %.0f s to answer 503: it must fail as fast as appendEvent gives up (about 1 s)", waited)
+	ctx.Kafka.Resume(caTopic)
+	status, _ = a.call("POST", "/counters/plays/stranger-things/add", map[string]any{"delta": 2, "token": "t-a1"})
+	ctx.Equal(status, 202, "the client's retry with the same token, once the broker is back")
+	a.rollup(ctx)
+	ctx.Equal(a.count(ctx, "plays", "stranger-things"), 3, "the failed add and its retry carry the client's token t-a1, so the rollup counts the 2 once: expected 1 + 2 = 3")
+}
+
+func CheckReadClearDispatch(ctx *harness.Ctx) {
+	a := caStart(ctx)
+	a.call("POST", "/counters/views/trailer-7/add", map[string]any{"delta": 5})
+	a.call("POST", "/counters/plays/trailer-7/add", map[string]any{"delta": 1200, "token": "t-1"})
+	a.call("POST", "/counters/plays/trailer-7/add", map[string]any{"delta": 7, "token": "t-2"})
+	a.rollup(ctx)
+	ctx.Equal(a.count(ctx, "views", "trailer-7"), 5, "GET on the best-effort views/trailer-7 must answer its cached count")
+	ctx.Equal(a.count(ctx, "plays", "trailer-7"), 1207, "GET on the eventually-consistent plays/trailer-7 must answer the rolled-up total")
+	status, _ := a.call("DELETE", "/counters/views/trailer-7", nil)
+	ctx.Equal(status, 204, "DELETE on a best-effort counter")
+	ctx.Equal(ctx.Redis.Exists("counter:views:trailer-7"), 0, "DELETE /counters/views/trailer-7 must clear the cached counter counter:views:trailer-7: EXISTS")
+	ctx.Equal(a.count(ctx, "views", "trailer-7"), 0, "after the clear views/trailer-7 reads 0")
+	ctx.Equal(a.count(ctx, "plays", "trailer-7"), 1207, "clearing views/trailer-7 must leave plays/trailer-7 alone")
+	status, _ = a.call("DELETE", "/counters/plays/trailer-7", nil)
+	ctx.Equal(status, 204, "DELETE on an eventually-consistent counter")
+	ctx.Equal(ctx.Redis.Exists("rollup:plays:trailer-7"), 0, "DELETE /counters/plays/trailer-7 must clear the rolled-up buckets rollup:plays:trailer-7: EXISTS")
+	ctx.Equal(a.count(ctx, "plays", "trailer-7"), 0, "after the clear plays/trailer-7 reads 0")
 }
 `,
   },

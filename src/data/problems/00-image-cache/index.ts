@@ -69,6 +69,6 @@ what transfers to every other cache you will build.`,
     ],
   },
   steps: [serveEndpointStep, cacheAsideStep, stampedeStep, resizeRpcStep, viewEventsStep, countViewsStep],
-  support: {python: protoModules, typescript: protoFiles},
+  support: {python: protoModules, typescript: protoFiles, go: protoFiles},
   learn,
 };

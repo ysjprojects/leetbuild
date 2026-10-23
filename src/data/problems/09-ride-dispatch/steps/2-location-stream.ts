@@ -833,6 +833,170 @@ export async function check_cancel(ctx) {
   assert.equal(ack.count, 1, 'the server must keep serving new streams after a cancel');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"math"
+	"strconv"
+	"strings"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"leetbuild/harness"
+
+	pb "dispatch/gen/locations"
+)
+
+func locUpdate(driverID string, lat, lng float64, ts int64, city string) *pb.LocationUpdate {
+	return &pb.LocationUpdate{DriverId: driverID, City: city, Lat: lat, Lng: lng, Ts: ts}
+}
+
+// locClient runs the learner's main (it serves Locations on :9000) and dials it.
+func locClient(ctx *harness.Ctx) pb.LocationsClient {
+	ctx.Main(main)
+	return pb.NewLocationsClient(ctx.GRPC.Dial("location:9000"))
+}
+
+// pushUpdates is one client stream: send every update, half-close, wait for the single Ack.
+func pushUpdates(ctx *harness.Ctx, client pb.LocationsClient, updates ...*pb.LocationUpdate) *pb.Ack {
+	stream, err := client.UpdateLocations(context.Background())
+	ctx.NoError(err, "opening an UpdateLocations stream")
+	for _, u := range updates {
+		if err := stream.Send(u); err != nil && err != io.EOF {
+			ctx.Fatalf("sending %s's update: %v", u.GetDriverId(), err)
+		}
+	}
+	ack, err := stream.CloseAndRecv()
+	ctx.NoError(err, "the stream must end with an Ack")
+	return ack
+}
+
+// driverPos is the member's GEOPOS in drivers:{city}; ok is false when it is not a member.
+func driverPos(ctx *harness.Ctx, city, driverID string) (lng, lat float64, ok bool) {
+	found, _ := ctx.Redis.Do("GEOPOS", "drivers:"+city, driverID).([]any)
+	if len(found) == 0 {
+		return 0, 0, false
+	}
+	pair, _ := found[0].([]any)
+	if len(pair) != 2 {
+		return 0, 0, false
+	}
+	lng, _ = strconv.ParseFloat(fmt.Sprint(pair[0]), 64)
+	lat, _ = strconv.ParseFloat(fmt.Sprint(pair[1]), 64)
+	return lng, lat, true
+}
+
+func CheckGeoaddLngLat(ctx *harness.Ctx) {
+	client := locClient(ctx)
+	pushUpdates(ctx, client, locUpdate("d-7", 48.85, 2.35, 1000, "paris"), locUpdate("d-2", 48.86, 2.3, 1000, "paris"), locUpdate("d-l", 45.76, 4.84, 1000, "lyon"))
+	lng, lat, ok := driverPos(ctx, "paris", "d-7")
+	ctx.Assert(ok, "drivers:paris has no member d-7 after an update (members: %v)", ctx.Redis.Do("ZRANGE", "drivers:paris", 0, -1))
+	ctx.Assert(math.Abs(lng-2.35) < 1e-3 && math.Abs(lat-48.85) < 1e-3, "d-7 is stored at lng=%.4f lat=%.4f, expected lng=2.35 lat=48.85 (GEOADD takes longitude first)", lng, lat)
+	lng, lat, ok = driverPos(ctx, "paris", "d-2")
+	ctx.Assert(ok, "drivers:paris has no member d-2 after an update")
+	ctx.Assert(math.Abs(lng-2.3) < 1e-3 && math.Abs(lat-48.86) < 1e-3, "d-2 is stored at lng=%.4f lat=%.4f, expected lng=2.30 lat=48.86", lng, lat)
+	_, _, ok = driverPos(ctx, "lyon", "d-l")
+	ctx.Assert(ok, "an update for city lyon must land in drivers:lyon")
+	_, _, ok = driverPos(ctx, "paris", "d-l")
+	ctx.Assert(!ok, "a lyon driver must not be added to drivers:paris: the GEO key is per city")
+}
+
+func CheckPresenceTtl(ctx *harness.Ctx) {
+	client := locClient(ctx)
+	pushUpdates(ctx, client, locUpdate("d-7", 48.85, 2.35, 1000, "paris"))
+	seen, ok := ctx.Redis.Get("driver:d-7:seen")
+	ctx.Assert(ok, "driver:d-7:seen was not written")
+	ctx.Equal(seen, "1000", "driver:d-7:seen must hold the update's ts")
+	ttl := ctx.Redis.TTL("driver:d-7:seen")
+	ctx.Assert(0 < ttl && ttl <= 30, "driver:d-7:seen has TTL %d, expected seenTTL (30 s)", ttl)
+	ctx.Clock.Advance(20)
+	pushUpdates(ctx, client, locUpdate("d-7", 48.851, 2.351, 1020, "paris"))
+	ttl = ctx.Redis.TTL("driver:d-7:seen")
+	ctx.Assert(ttl > 25, "a new update must refresh the presence key: TTL is %d after the second update", ttl)
+	seen, _ = ctx.Redis.Get("driver:d-7:seen")
+	ctx.Equal(seen, "1020", "the presence value must be the latest ts")
+	ctx.Clock.Advance(31)
+	_, ok = ctx.Redis.Get("driver:d-7:seen")
+	ctx.Assert(!ok, "31 s after the last update the presence key must have expired")
+	_, _, ok = driverPos(ctx, "paris", "d-7")
+	ctx.Assert(ok, "the GEO member stays (only the presence key expires)")
+}
+
+func CheckPipelined(ctx *harness.Ctx) {
+	client := locClient(ctx)
+	updates := []*pb.LocationUpdate{locUpdate("d-7", 48.85, 2.35, 1000, "paris"), locUpdate("d-2", 48.86, 2.3, 1001, "paris"), locUpdate("d-9", 48.84, 2.37, 1002, "paris")}
+	before := len(ctx.Redis.RoundTrips())
+	pushUpdates(ctx, client, updates...)
+	trips := ctx.Redis.RoundTrips()[before:]
+	for _, u := range updates {
+		_, _, ok := driverPos(ctx, "paris", u.GetDriverId())
+		ctx.Assert(ok, "%s was not GEOADDed (was the pipeline executed?)", u.GetDriverId())
+		seen, _ := ctx.Redis.Get("driver:" + u.GetDriverId() + ":seen")
+		ctx.Equal(seen, strconv.FormatInt(u.GetTs(), 10), "driver:%s:seen", u.GetDriverId())
+	}
+	direct, pipelines := 0, 0
+	for _, t := range trips {
+		if len(t) == 1 && t[0] != "MULTI" {
+			direct++
+		}
+		if len(t) > 1 {
+			pipelines++
+		}
+	}
+	ctx.Equal(direct, 0, "commands sent outside a pipeline: GEOADD and SET must travel together in one round trip (round trips: %v)", trips)
+	ctx.Assert(1 <= pipelines && pipelines <= len(updates), "%d pipelines executed for %d updates; expected one per update (or per small batch)", pipelines, len(updates))
+}
+
+func CheckAckCount(ctx *harness.Ctx) {
+	client := locClient(ctx)
+	var four []*pb.LocationUpdate
+	for i := range 4 {
+		four = append(four, locUpdate(fmt.Sprintf("d-%d", i), 48.85+float64(i)/1000, 2.35, int64(1000+i), "paris"))
+	}
+	ack := pushUpdates(ctx, client, four...)
+	ctx.Assert(ack != nil, "the stream must end with an Ack, got nil")
+	ctx.Equal(ack.GetCount(), 4, "Ack.Count after 4 updates")
+	ack = pushUpdates(ctx, client, locUpdate("d-7", 48.85, 2.35, 2000, "paris"), locUpdate("d-7", 48.851, 2.35, 2004, "paris"))
+	ctx.Equal(ack.GetCount(), 2, "a second stream of 2 updates: the count is per stream")
+	ack = pushUpdates(ctx, client)
+	ctx.Equal(ack.GetCount(), 0, "a stream that sent nothing must be acknowledged with count 0")
+}
+
+func CheckCancel(ctx *harness.Ctx) {
+	client := locClient(ctx)
+	var logged strings.Builder
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(&logged)
+	log.SetFlags(0) // no timestamp: its digits must not pass for the count
+	func() {
+		defer func() {
+			log.SetOutput(prevOut)
+			log.SetFlags(prevFlags)
+		}()
+		cctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		stream, err := client.UpdateLocations(cctx)
+		ctx.NoError(err, "opening an UpdateLocations stream")
+		_ = stream.Send(locUpdate("d-7", 48.85, 2.35, 1000, "paris"))
+		_ = stream.Send(locUpdate("d-2", 48.86, 2.3, 1001, "paris"))
+		ctx.Settle()
+		_, _, ok := driverPos(ctx, "paris", "d-2")
+		ctx.Assert(ok, "updates must be applied as they arrive, not only when the stream ends")
+		cancel()
+		ctx.Settle()
+		_, err = stream.CloseAndRecv()
+		ctx.Equal(status.Code(err), codes.Canceled, "after a client cancel the call must end CANCELLED (no Ack)")
+		ctx.Equal(ctx.Redis.Do("ZCARD", "drivers:paris"), 2, "the two updates before the cancel stay applied: ZCARD drivers:paris")
+		ctx.Assert(strings.Contains(logged.String(), "2"), "a cancelled stream must log how many updates were applied (2); logged: %q", logged.String())
+	}()
+	ack := pushUpdates(ctx, client, locUpdate("d-9", 48.84, 2.37, 1002, "paris"))
+	ctx.Equal(ack.GetCount(), 1, "the server must keep serving new streams after a cancel")
+}
+`,
   },
   debrief: `A client stream turns thousands of tiny unary calls into one long-lived HTTP/2 stream per driver: no per-message connection setup, back-pressure for free, and one place to notice the driver went away. The write path is deliberately two keys — a GEO set for *where* and a TTL key for *still here* — because a sorted set cannot expire its members. Real location services batch updates per pipeline, shard GEO sets per city cell to spread the write load, map-match the raw GPS onto roads before indexing, and keep a short history per driver to estimate heading and speed.`,
 };

@@ -13,6 +13,7 @@
     "verify": "tsx scripts/verify.ts",
     "protogen": "tsx scripts/protogen.ts",
     "build:runtime": "tsx scripts/build-runtime.ts",
+    "build:go": "tsx scripts/build-go.ts",
     "predev": "tsx scripts/build-runtime.ts",
     "prebuild": "tsx scripts/build-runtime.ts"
   },

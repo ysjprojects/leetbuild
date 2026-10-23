@@ -273,6 +273,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "chat/gen/chat"
+	"chat/subscriptions"
 )
 
 const topic = "chat-messages"
@@ -302,10 +303,9 @@ var reader = kafka.NewReader(kafka.ReaderConfig{
 	// TODO: StartOffset LastOffset — a restarted instance must not replay history to live clients
 })
 
-// localDeliver hands the message to every stream on this instance subscribed to the room (subscriptions.go).
-func localDeliver(room string, msg *pb.ServerMsg) {
-	panic("not implemented")
-}
+// localDeliver hands the message to every stream on this instance subscribed to the room (provided:
+// package chat/subscriptions).
+var localDeliver = subscriptions.LocalDeliver
 
 func publish(ctx context.Context, room string, msg *pb.ServerMsg) error {
 	// TODO: proto.Marshal the message; WriteMessages keyed by room (the writer is Async: no blocking)
@@ -331,6 +331,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	pb "chat/gen/chat"
+	"chat/subscriptions"
 )
 
 const topic = "chat-messages"
@@ -361,10 +362,9 @@ var reader = kafka.NewReader(kafka.ReaderConfig{
 	StartOffset: kafka.LastOffset,
 })
 
-// localDeliver hands the message to every stream on this instance subscribed to the room (subscriptions.go).
-func localDeliver(room string, msg *pb.ServerMsg) {
-	panic("not implemented")
-}
+// localDeliver hands the message to every stream on this instance subscribed to the room (provided:
+// package chat/subscriptions).
+var localDeliver = subscriptions.LocalDeliver
 
 func publish(ctx context.Context, room string, msg *pb.ServerMsg) error {
 	value, err := proto.Marshal(msg)
@@ -798,6 +798,214 @@ export async function check_deliver(ctx) {
   assert.deepEqual(got, want, \`localDeliver received \${JSON.stringify(got)}, expected \${JSON.stringify(want)} (room = the record key, msg = the decoded value)\`);
   const room7 = delivered.filter(([room]) => room === 'room-7').map(([, x]) => x.text);
   assert.deepEqual(room7, ['hi', 'hey'], \`room-7's messages were delivered as \${JSON.stringify(room7)}, expected ['hi', 'hey'] in production order\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"os"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+
+	"google.golang.org/protobuf/proto"
+	"leetbuild/harness"
+
+	pb "chat/gen/chat"
+	"chat/subscriptions"
+)
+
+const fanTopic = "chat-messages"
+
+var fanBg = context.Background()
+
+func fanMsg(room, user, text string, ts int64) *pb.ServerMsg {
+	return &pb.ServerMsg{Room: room, User: user, Text: text, Ts: ts}
+}
+
+// fanDelivery is one message localDeliver handed to a room.
+type fanDelivery struct {
+	room string
+	msg  *pb.ServerMsg
+}
+
+// fanRecording is everything localDeliver hands to its rooms on this instance: real subscriptions
+// on the shared table.
+type fanRecording struct {
+	subs map[string]<-chan *pb.ServerMsg
+	got  []fanDelivery
+}
+
+func recordRooms(rooms ...string) *fanRecording {
+	r := &fanRecording{subs: map[string]<-chan *pb.ServerMsg{}}
+	for _, room := range rooms {
+		r.subs[room] = subscriptions.Subscribe(room)
+	}
+	return r
+}
+
+// take collects what arrived since the last take.
+func (r *fanRecording) take() []fanDelivery {
+	for room, sub := range r.subs {
+		for more := true; more; {
+			select {
+			case msg := <-sub:
+				r.got = append(r.got, fanDelivery{room: room, msg: msg})
+			default:
+				more = false
+			}
+		}
+	}
+	return r.got
+}
+
+func fanTexts(delivered []fanDelivery, room string) []string {
+	var texts []string
+	for _, d := range delivered {
+		if d.room == room {
+			texts = append(texts, d.msg.GetText())
+		}
+	}
+	return texts
+}
+
+// fanSeed puts a record on the topic the way the learner's own publish produces it: the serialized
+// ServerMsg keyed by the room.
+func fanSeed(ctx *harness.Ctx, room string, msg *pb.ServerMsg) {
+	value, err := proto.Marshal(msg)
+	ctx.NoError(err, "proto.Marshal")
+	ctx.Kafka.Seed(fanTopic, room, value)
+}
+
+// onFanSubscribe runs fn(group) the moment a consumer subscribes to the topic, before it reads,
+// the way another instance's message lands between a subscription and its first poll.
+func onFanSubscribe(ctx *harness.Ctx, fn func(group string)) {
+	ctx.Kafka.OnSubscribe(func(group string, topics []string) {
+		if slices.Contains(topics, fanTopic) {
+			fn(group)
+		}
+	})
+}
+
+// fanPublish is one publish, delivered: the Async writer sends in the background, so the harness
+// lets it finish before the next one, as awaiting each publish does in TypeScript.
+func fanPublish(ctx *harness.Ctx, room string, msg *pb.ServerMsg) {
+	ctx.NoError(publish(fanBg, room, msg), "publish(ctx, %q, %v) returned an error", room, msg)
+	ctx.Settle()
+}
+
+func CheckTopicKeyed(ctx *harness.Ctx) {
+	hi := fanMsg("room-7", "ana", "hi", 1700000000000)
+	fanPublish(ctx, "room-7", hi)
+	fanPublish(ctx, "room-8", fanMsg("room-8", "bo", "yo", 1700000000000))
+	fanPublish(ctx, "room-7", fanMsg("room-7", "cy", "hey", 1700000000000))
+	records := ctx.Kafka.Records(fanTopic)
+	ctx.Equal(len(records), 3, "the records three publish calls produced to %q (topics seen: %v)", fanTopic, ctx.Kafka.Topics())
+	keys := ctx.Kafka.Keys(fanTopic)
+	ctx.Equal(keys, []string{"room-7", "room-8", "room-7"}, "the record keys must be the room ids")
+	parsed := &pb.ServerMsg{}
+	ctx.NoError(proto.Unmarshal(records[0].Value, parsed), "the record value must be the serialized ServerMsg")
+	ctx.Assert(proto.Equal(parsed, hi), "the record value must be the serialized ServerMsg; parsed back: %v", parsed)
+	var parts []int
+	for _, r := range records {
+		if string(r.Key) == "room-7" && !slices.Contains(parts, r.Partition) {
+			parts = append(parts, r.Partition)
+		}
+	}
+	sort.Ints(parts)
+	ctx.Equal(len(parts), 1, "room-7's messages landed on partitions %v: keyed by room they stay on one partition; partitions used", parts)
+}
+
+// fanRoom7Texts is what recordFanRoom7 saw, in the instance whose localDeliver it replaced: a second
+// instance compiles its own copy of this file, so its recorder fills its own copy of the slice.
+var fanRoom7Texts []string
+
+func recordFanRoom7(room string, msg *pb.ServerMsg) {
+	if room == "room-7" {
+		fanRoom7Texts = append(fanRoom7Texts, msg.GetText())
+	}
+}
+
+func CheckUniqueGroup(ctx *harness.Ctx) {
+	da := recordRooms("room-7")
+	b := ctx.Instance() // a second process: fresh package variables, its own subscription table
+	b.Set("localDeliver", b.Get("recordFanRoom7"))
+	ga, gb := groupID, b.Get("groupID").(string)
+	host, _ := os.Hostname()
+	ctx.Assert(strings.HasPrefix(ga, "chat-server-"), "groupID is %q, expected chat-server-{hostname}-{pid}", ga)
+	ctx.Assert(strings.Contains(ga, host), "groupID %q does not contain the hostname %q", ga, host)
+	ctx.Assert(len(ga) > len("chat-server-")+len(host)+1, "groupID %q needs a per-process part (pid) after the hostname", ga)
+	ctx.Assert(ga != gb, "two instances on this host computed the same group id %q: with a shared group the topic is split between them instead of broadcast", ga)
+	seeded := map[string]bool{}
+	onFanSubscribe(ctx, func(group string) {
+		// each instance's first subscription is answered by one new message
+		if seeded[group] {
+			return
+		}
+		seeded[group] = true
+		from := "B"
+		if group == ga {
+			from = "A"
+		}
+		fanSeed(ctx, "room-7", fanMsg("room-7", "ana", "hello from "+from, 1700000000000))
+	})
+	runB := b.Get("runConsumer").(func(context.Context))
+	ctx.Drain(func() { runConsumer(fanBg) }) // A joins and sees 'hello from A'
+	ctx.Drain(func() { runB(fanBg) })        // B joins; 'hello from B' is produced while both groups exist
+	ctx.Drain(func() { runConsumer(fanBg) }) // A resumes from its committed offset
+	var groups []string
+	for _, c := range ctx.Kafka.Consumers() {
+		if !slices.Contains(groups, c.Group) {
+			groups = append(groups, c.Group)
+		}
+	}
+	sort.Strings(groups)
+	ctx.Assert(slices.Contains(groups, ga) && slices.Contains(groups, gb), "the broker saw consumer groups %v, expected the readers to use GroupID: groupID (%q, %q)", groups, ga, gb)
+	textsA := fanTexts(da.take(), "room-7")
+	textsB := b.Get("fanRoom7Texts").([]string)
+	ctx.Equal(textsB, []string{"hello from B"}, "what instance B delivered")
+	ctx.Equal(textsA, []string{"hello from A", "hello from B"}, "what instance A delivered: with one group per instance every instance receives every message")
+}
+
+func CheckLatest(ctx *harness.Ctx) {
+	delivered := recordRooms("room-7")
+	fanSeed(ctx, "room-7", fanMsg("room-7", "ana", "yesterday", 1700000000000))
+	onFanSubscribe(ctx, func(string) { fanSeed(ctx, "room-7", fanMsg("room-7", "bo", "now", 1700000000000)) })
+	ctx.Drain(func() { runConsumer(fanBg) })
+	ctx.Assert(len(ctx.Kafka.EventsOf("subscribe")) > 0, "the consumer never subscribed to %q", fanTopic)
+	texts := fanTexts(delivered.take(), "room-7")
+	ctx.Equal(texts, []string{"now"}, "what a freshly started instance delivered: a new group must start at the latest offset (StartOffset: kafka.LastOffset), not replay 'yesterday'")
+}
+
+func CheckDeliver(ctx *harness.Ctx) {
+	recording := recordRooms("room-7", "room-8")
+	expected := []fanDelivery{
+		{room: "room-7", msg: fanMsg("room-7", "ana", "hi", 1)},
+		{room: "room-8", msg: fanMsg("room-8", "bo", "yo", 2)},
+		{room: "room-7", msg: fanMsg("room-7", "cy", "hey", 3)},
+	}
+	onFanSubscribe(ctx, func(string) {
+		for _, e := range expected {
+			fanSeed(ctx, e.room, e.msg)
+		}
+	})
+	ctx.Drain(func() { runConsumer(fanBg) })
+	subscribes := ctx.Kafka.EventsOf("subscribe")
+	ctx.Assert(slices.ContainsFunc(subscribes, func(e harness.KafkaEvent) bool { return slices.Contains(e.Topics, fanTopic) }), "the consumer never subscribed to %q (subscribe events: %v)", fanTopic, subscribes)
+	delivered := recording.take()
+	ctx.Equal(len(delivered), 3, "three records were produced: the calls to localDeliver")
+	shape := func(ds []fanDelivery) []string {
+		var out []string
+		for _, d := range ds {
+			out = append(out, strings.Join([]string{d.room, d.msg.GetUser(), d.msg.GetText(), strconv.FormatInt(d.msg.GetTs(), 10)}, " "))
+		}
+		sort.Strings(out)
+		return out
+	}
+	ctx.Equal(shape(delivered), shape(expected), "what localDeliver received (room = the record key, msg = the decoded value)")
+	ctx.Equal(fanTexts(delivered, "room-7"), []string{"hi", "hey"}, "room-7's messages, in production order")
 }
 `,
   },

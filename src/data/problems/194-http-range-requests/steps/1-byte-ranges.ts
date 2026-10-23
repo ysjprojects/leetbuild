@@ -959,6 +959,164 @@ export async function check_ignored_ranges(ctx) {
     full(await ranged(c, 'clip.bin', {Range: spec}), CLIP, \`Range: \${spec}\`);
 }
 `,
+    go: `package main
+
+import (
+	"bytes"
+	"fmt"
+	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+var (
+	rangeClip   = rangeBytes(7, 3)
+	rangeClipV2 = rangeBytes(11, 5)
+	rangeEmpty  = []byte{}
+	rangeStrong = regexp.MustCompile(\`^"[0-9a-f]{8,64}"$\`)
+)
+
+// rangeBytes is 1000 bytes, byte i being (i*mul + add) % 256.
+func rangeBytes(mul, add int) []byte {
+	data := make([]byte, 1000)
+	for i := range data {
+		data[i] = byte((i*mul + add) % 256)
+	}
+	return data
+}
+
+// rangeAPI seeds files with clip.bin and empty.bin and returns a client of the learner's server.
+func rangeAPI(ctx *harness.Ctx) *harness.HTTP {
+	files = map[string][]byte{"clip.bin": rangeClip, "empty.bin": rangeEmpty}
+	return ctx.Main(main).HTTP()
+}
+
+// rangeHeader is a header's value, or nil when the response does not carry it.
+func rangeHeader(r *harness.Response, name string) any {
+	if _, ok := r.Header[http.CanonicalHeaderKey(name)]; !ok {
+		return nil
+	}
+	return r.Header.Get(name)
+}
+
+func rangeCommon(ctx *harness.Ctx, r *harness.Response, what string) string {
+	ctx.Equal(rangeHeader(r, "Accept-Ranges"), "bytes", "%s: Accept-Ranges", what)
+	etag := r.Header.Get("ETag")
+	ctx.Assert(rangeStrong.MatchString(etag), "%s: ETag was %q, expected a strong quoted hex sha256 prefix such as '\\"9f2c01d4e5b6a7c8\\"'", what, etag)
+	return etag
+}
+
+func rangePartial(ctx *harness.Ctx, r *harness.Response, start, end int, data []byte, what string) string {
+	ctx.Equal(r.Status, 206, "%s: the status", what)
+	ctx.Equal(rangeHeader(r, "Content-Range"), fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)), "%s: Content-Range", what)
+	length := end - start + 1
+	ctx.Equal(rangeHeader(r, "Content-Length"), strconv.Itoa(length), "%s: Content-Length", what)
+	ctx.Assert(bytes.Equal(r.Body, data[start:end+1]), "%s: the body must be exactly bytes %d to %d (%d bytes), got %d bytes that differ", what, start, end, length, len(r.Body))
+	ctype := r.Header.Get("Content-Type")
+	ctx.Assert(strings.HasPrefix(ctype, "application/octet-stream"), "%s: Content-Type was %q, expected application/octet-stream", what, ctype)
+	return rangeCommon(ctx, r, what)
+}
+
+func rangeFull(ctx *harness.Ctx, r *harness.Response, data []byte, what string) string {
+	ctx.Equal(r.Status, 200, "%s: the status (200 with the whole file)", what)
+	ctx.Assert(bytes.Equal(r.Body, data), "%s: the body must be the whole file (%d bytes), got %d bytes", what, len(data), len(r.Body))
+	ctx.Equal(rangeHeader(r, "Content-Range"), nil, "%s: a 200 carries no Content-Range", what)
+	return rangeCommon(ctx, r, what)
+}
+
+func rangeUnsatisfiable(ctx *harness.Ctx, r *harness.Response, size int, what string) string {
+	ctx.Equal(r.Status, 416, "%s: the status", what)
+	ctx.Equal(rangeHeader(r, "Content-Range"), fmt.Sprintf("bytes */%d", size), "%s: Content-Range", what)
+	ctx.Equal(len(r.Body), 0, "%s: a 416 carries no body; its length", what)
+	return rangeCommon(ctx, r, what)
+}
+
+func CheckPartialContent(ctx *harness.Ctx) {
+	c := rangeAPI(ctx)
+	whole := c.Get("/files/clip.bin")
+	etag := rangeFull(ctx, whole, rangeClip, "GET /files/clip.bin without Range")
+	ctype := whole.Header.Get("Content-Type")
+	ctx.Assert(strings.HasPrefix(ctype, "application/octet-stream"), "the 200 Content-Type was %q, expected application/octet-stream", ctype)
+	head := c.Get("/files/clip.bin", "Range", "bytes=0-99")
+	ctx.Equal(rangePartial(ctx, head, 0, 99, rangeClip, "Range: bytes=0-99"), etag, "the 206 must carry the same ETag as the 200")
+	rangePartial(ctx, c.Get("/files/clip.bin", "Range", "bytes=100-199"), 100, 199, rangeClip, "Range: bytes=100-199")
+	missing := c.Get("/files/ghost.bin", "Range", "bytes=0-99")
+	ctx.Equal(missing.Status, 404, "GET /files/ghost.bin")
+}
+
+func CheckSuffixAndOpen(ctx *harness.Ctx) {
+	c := rangeAPI(ctx)
+	for _, tc := range []struct {
+		spec       string
+		start, end int
+	}{
+		{"bytes=-100", 900, 999},
+		{"bytes=900-", 900, 999},
+		{"bytes=-1", 999, 999},
+		{"bytes=0-", 0, 999},
+		{"bytes=-1000", 0, 999},
+		{"bytes=-5000", 0, 999},
+	} {
+		rangePartial(ctx, c.Get("/files/clip.bin", "Range", tc.spec), tc.start, tc.end, rangeClip, "Range: "+tc.spec+" on 1000 bytes")
+	}
+}
+
+func CheckClampEnd(ctx *harness.Ctx) {
+	c := rangeAPI(ctx)
+	for _, tc := range []struct {
+		spec       string
+		start, end int
+	}{
+		{"bytes=950-5000", 950, 999},
+		{"bytes=500-1000", 500, 999},
+		{"bytes=999-999", 999, 999},
+		{"bytes=0-999", 0, 999},
+	} {
+		rangePartial(ctx, c.Get("/files/clip.bin", "Range", tc.spec), tc.start, tc.end, rangeClip, "Range: "+tc.spec+" on 1000 bytes")
+	}
+}
+
+func CheckUnsatisfiable(ctx *harness.Ctx) {
+	c := rangeAPI(ctx)
+	for _, spec := range []string{"bytes=1000-", "bytes=1000-1999", "bytes=5000-6000", "bytes=-0"} {
+		rangeUnsatisfiable(ctx, c.Get("/files/clip.bin", "Range", spec), 1000, "Range: "+spec+" on 1000 bytes")
+	}
+	for _, spec := range []string{"bytes=0-", "bytes=-10"} {
+		rangeUnsatisfiable(ctx, c.Get("/files/empty.bin", "Range", spec), 0, "Range: "+spec+" on an empty file")
+	}
+	rangeFull(ctx, c.Get("/files/empty.bin"), rangeEmpty, "GET /files/empty.bin without Range")
+	rangePartial(ctx, c.Get("/files/clip.bin", "Range", "bytes=999-"), 999, 999, rangeClip, "Range: bytes=999- (the last byte exists)")
+}
+
+func CheckIfRange(ctx *harness.Ctx) {
+	c := rangeAPI(ctx)
+	old := rangePartial(ctx, c.Get("/files/clip.bin", "Range", "bytes=0-499"), 0, 499, rangeClip, "Range: bytes=0-499")
+	same := c.Get("/files/clip.bin", "Range", "bytes=500-", "If-Range", old)
+	rangePartial(ctx, same, 500, 999, rangeClip, "Range: bytes=500- with If-Range equal to the current ETag")
+	files["clip.bin"] = rangeClipV2
+	resumed := c.Get("/files/clip.bin", "Range", "bytes=500-", "If-Range", old)
+	fresh := rangeFull(ctx, resumed, rangeClipV2, "after the file changed, Range: bytes=500- with the old ETag in If-Range")
+	ctx.Assert(fresh != old, "the file changed but its ETag stayed %s", old)
+	current := c.Get("/files/clip.bin", "Range", "bytes=500-", "If-Range", fresh)
+	rangePartial(ctx, current, 500, 999, rangeClipV2, "Range: bytes=500- with If-Range equal to the new ETag")
+	dated := c.Get("/files/clip.bin", "Range", "bytes=500-", "If-Range", "Wed, 21 Oct 2026 07:28:00 GMT")
+	rangeFull(ctx, dated, rangeClipV2, "If-Range carrying an HTTP date")
+	weak := c.Get("/files/clip.bin", "Range", "bytes=500-", "If-Range", "W/"+fresh)
+	rangeFull(ctx, weak, rangeClipV2, "If-Range: W/"+fresh+" (a weak tag never matches strongly)")
+	stale416 := c.Get("/files/clip.bin", "Range", "bytes=5000-", "If-Range", old)
+	rangeFull(ctx, stale416, rangeClipV2, "a stale If-Range with an unsatisfiable Range: the Range is ignored, so not 416")
+}
+
+func CheckIgnoredRanges(ctx *harness.Ctx) {
+	c := rangeAPI(ctx)
+	for _, spec := range []string{"bytes=0-9,20-29", "bytes=50-10", "bytes=abc-def", "bytes=-", "bytes=1-2-3", "items=0-9", "0-9"} {
+		rangeFull(ctx, c.Get("/files/clip.bin", "Range", spec), rangeClip, "Range: "+spec)
+	}
+}
+`,
   },
   debrief: `The handler is a decision in a fixed order: 404, then no \`Range\`, then \`If-Range\`, then the parse. The
 order matters at one place: a stale \`If-Range\` with an unsatisfiable range answers 200, not 416, because RFC

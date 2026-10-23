@@ -539,7 +539,7 @@ func historyKey(x, y int) string { return fmt.Sprintf("history:%d:%d", x, y) }
 func run(ctx context.Context) error {
 	for {
 		// TODO: FetchMessage (ReadMessage commits automatically — not what we want)
-		// TODO: parse JSON (skip + commit malformed records)
+		// TODO: parse JSON (skip + commit malformed records: bad JSON or a missing field)
 		// TODO: ZIncrBy leadersKey 1 user; LPush historyKey(x, y) entry; LTrim 0 historyLen-1; then CommitMessages
 		_ = json.Unmarshal
 		return nil
@@ -620,14 +620,30 @@ type leader struct {
 // historyKey is history:{x}:{y} (provided).
 func historyKey(x, y int) string { return fmt.Sprintf("history:%d:%d", x, y) }
 
+// parse is the placements event, or false when the record is not one: bad JSON, a field of the
+// wrong type, or a field missing.
+func parse(value []byte) (placementEvent, bool) {
+	var event placementEvent
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(value, &fields) != nil || json.Unmarshal(value, &event) != nil {
+		return event, false
+	}
+	for _, name := range []string{"user", "x", "y", "color", "ts"} {
+		if _, ok := fields[name]; !ok {
+			return event, false
+		}
+	}
+	return event, event.User != ""
+}
+
 func run(ctx context.Context) error {
 	for {
 		msg, err := reader.FetchMessage(ctx)
 		if err != nil {
 			return err
 		}
-		var event placementEvent
-		if err := json.Unmarshal(msg.Value, &event); err != nil || event.User == "" {
+		event, ok := parse(msg.Value)
+		if !ok {
 			log.Printf("skipping malformed record at offset %d", msg.Offset)
 			reader.CommitMessages(ctx, msg)
 			continue
@@ -637,8 +653,12 @@ func run(ctx context.Context) error {
 		if err := rdb.ZIncrBy(ctx, leadersKey, 1, event.User).Err(); err != nil {
 			return err // do not commit: the record will be redelivered
 		}
-		rdb.LPush(ctx, key, entry)
-		rdb.LTrim(ctx, key, 0, historyLen-1) // newest first, never more than 10
+		if err := rdb.LPush(ctx, key, entry).Err(); err != nil {
+			return err
+		}
+		if err := rdb.LTrim(ctx, key, 0, historyLen-1).Err(); err != nil { // newest first, never more than 10
+			return err
+		}
 		if err := reader.CommitMessages(ctx, msg); err != nil {
 			return err
 		}
@@ -1218,6 +1238,198 @@ export async function check_endpoints(ctx) {
     r = await c.get('/history', {query: bad});
     assert.equal(r.status, 400, \`GET /history with \${JSON.stringify(bad)} answered \${r.status}, expected 400\`);
   }
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/segmentio/kafka-go"
+	"leetbuild/harness"
+)
+
+const (
+	ldTS      = 1700000000000
+	ldLeaders = "place:leaders"
+)
+
+// ldTile is one placement to seed: user on (x, y) with color.
+type ldTile struct {
+	user        string
+	x, y, color int
+}
+
+// ldEntry is a history entry as the checks read it.
+type ldEntry struct {
+	User  string \`json:"user"\`
+	Color int    \`json:"color"\`
+	Ts    int64  \`json:"ts"\`
+}
+
+// ldSeed puts placements on the topic as step 3's producer does; a bare user name is one tile on (3, 7).
+func ldSeed(ctx *harness.Ctx, tiles ...ldTile) {
+	for i, t := range tiles {
+		value, _ := json.Marshal(map[string]any{"user": t.user, "x": t.x, "y": t.y, "color": t.color, "ts": ldTS + i})
+		ctx.Kafka.Seed("placements", fmt.Sprintf("%d:%d", t.x, t.y), value)
+	}
+}
+
+func ldAt37(user string) ldTile { return ldTile{user, 3, 7, 12} }
+
+// ldRun runs the worker until it returns or waits for records that will not come; what it returned.
+func ldRun(ctx *harness.Ctx) error {
+	var err error
+	ctx.Drain(func() { err = run(context.Background()) })
+	return err
+}
+
+func ldUsers(ctx *harness.Ctx, items []string) []string {
+	users := []string{}
+	for _, item := range items {
+		var e ldEntry
+		ctx.NoError(json.Unmarshal([]byte(item), &e), "a history entry is not JSON: %q", item)
+		users = append(users, e.User)
+	}
+	return users
+}
+
+func CheckConsumer(ctx *harness.Ctx) {
+	ldSeed(ctx, ldAt37("ana"), ldTile{"bo", 4, 7, 5})
+	bo := ctx.Kafka.Records("placements")[1]
+	ctx.Redis.Set("history:4:7", "corrupt") // bo's pixel: the worker's write fails while it handles her tile
+	ldRun(ctx)                              // the worker died on bo's placement
+	// The process is stopped (deploy, SIGTERM): its reader leaves the group.
+	config := reader.Config()
+	reader.Close()
+	committed := ctx.Kafka.CommittedOffset("leaderboard", "placements", bo.Partition)
+	ctx.Assert(committed == -1 || committed <= bo.Offset, "bo's placement never reached her pixel's history, yet group leaderboard committed past it (offset %d) by the time the worker stopped: offsets were acknowledged for what was delivered, not for what was processed. Fetch, write, then CommitMessages", committed)
+	ctx.Redis.Del("history:4:7") // the fault is repaired and the worker restarts
+	reader = kafka.NewReader(config)
+	ctx.NoError(ldRun(ctx), "run returned an error after the restart")
+	history := ctx.Redis.LRange("history:4:7", 0, -1)
+	ctx.Assert(len(history) > 0 && ldUsers(ctx, history)[0] == "bo", "after the restart bo's placement must be replayed into history:4:7, which holds %s: it was lost", harness.Show(history))
+	lag := ctx.Kafka.Lag("leaderboard", "placements")
+	ctx.Assert(lag == 0, "group leaderboard on placements has %d uncommitted record(s) after the worker processed everything: commit each record once it is counted", lag)
+}
+
+func CheckZincrby(ctx *harness.Ctx) {
+	ldSeed(ctx, ldAt37("ana"), ldAt37("bo"), ldTile{"ana", 4, 7, 1}, ldTile{"ana", 5, 7, 2}, ldTile{"cy", 0, 0, 15})
+	ctx.NoError(ldRun(ctx), "run returned an error")
+	ctx.Equal(ctx.Redis.Type(ldLeaders), "zset", "%s must be a sorted set (keys: %s): its type", ldLeaders, harness.Show(ctx.Redis.Keys("*")))
+	for _, want := range []struct {
+		user  string
+		tiles int
+	}{{"ana", 3}, {"bo", 1}, {"cy", 1}} {
+		score, _ := ctx.Redis.ZScore(ldLeaders, want.user)
+		ctx.Equal(score, want.tiles, "%s's score in %s", want.user, ldLeaders)
+	}
+}
+
+func CheckHistoryCapped(ctx *harness.Ctx) {
+	tiles := []ldTile{}
+	for i := 0; i < 12; i++ {
+		tiles = append(tiles, ldTile{fmt.Sprintf("u%02d", i), 3, 7, i % 16})
+	}
+	ldSeed(ctx, append(tiles, ldTile{"zed", 4, 7, 5})...)
+	ctx.NoError(ldRun(ctx), "run returned an error")
+	key := historyKey(3, 7)
+	ctx.Equal(key, "history:3:7", "historyKey(3, 7)")
+	ctx.Equal(ctx.Redis.Type(key), "list", "%s must be a list (keys: %s): its type", key, harness.Show(ctx.Redis.Keys("*")))
+	items := ctx.Redis.LRange(key, 0, -1)
+	ctx.Assert(len(items) == 10, "%s holds %d entries after 12 placements, expected historyLen = 10 (LPUSH + LTRIM 0 9)", key, len(items))
+	want := []string{}
+	for i := 11; i > 1; i-- {
+		want = append(want, fmt.Sprintf("u%02d", i))
+	}
+	ctx.Equal(ldUsers(ctx, items), want, "the list must be newest first and keep the last 10: its users")
+	var first ldEntry
+	ctx.NoError(json.Unmarshal([]byte(items[0]), &first), "a history entry is not JSON")
+	ctx.Assert(first.Color == 11 && first.Ts == ldTS+11, "each entry carries user, color and ts: %s", items[0])
+	other := ctx.Redis.LRange("history:4:7", 0, -1)
+	ctx.Assert(len(other) > 0 && ldUsers(ctx, other)[0] == "zed", "every pixel has its own list")
+}
+
+func CheckCommitAfter(ctx *harness.Ctx) {
+	ldSeed(ctx, ldAt37("ana"))
+	ctx.Kafka.Seed("placements", "bad", "not json")
+	ctx.Kafka.Seed("placements", "bad", \`{"user":"ghost"}\`)
+	placement := ctx.Kafka.Records("placements")[0]
+	type snapshot struct {
+		offsets harness.KafkaOffsets
+		score   float64
+		scored  bool
+		history int64
+	}
+	var atCommit []snapshot
+	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
+		s := snapshot{offsets: harness.KafkaOffsets{}, history: ctx.Redis.LLen("history:3:7")}
+		for tp, offset := range offsets {
+			s.offsets[tp] = offset
+		}
+		s.score, s.scored = ctx.Redis.ZScore(ldLeaders, "ana")
+		atCommit = append(atCommit, s)
+	})
+	ctx.NoError(ldRun(ctx), "run returned an error")
+	ctx.Assert(len(atCommit) > 0, "no offset was ever committed")
+	var covering []snapshot
+	for _, s := range atCommit {
+		if s.offsets[harness.KafkaTopicPartition{Topic: "placements", Partition: placement.Partition}] > placement.Offset {
+			covering = append(covering, s)
+		}
+	}
+	ctx.Assert(len(covering) > 0, "ana's placement was never committed")
+	c := covering[0]
+	ctx.Assert(c.scored && c.score == 1 && c.history == 1, "the commit must come after ZINCRBY and LPUSH: when ana's placement was committed the score was %v (present: %v) and the history held %d entries", c.score, c.scored, c.history)
+	ctx.Equal(ctx.Kafka.Lag("leaderboard", "placements"), 0, "malformed records must be skipped and committed, not left to replay forever: the lag")
+	ctx.Assert(ctx.Redis.ZCard(ldLeaders) == 1, "malformed records must not be counted: %v", ctx.Redis.ZRangeWithScores(ldLeaders, 0, -1))
+}
+
+func CheckEndpoints(ctx *harness.Ctx) {
+	args := []any{"ZADD", ldLeaders}
+	for i := 0; i < 12; i++ {
+		args = append(args, 100-i, fmt.Sprintf("user%02d", i))
+	}
+	ctx.Redis.Do(args...)
+	for i := 0; i < 3; i++ {
+		entry, _ := json.Marshal(ldEntry{User: fmt.Sprintf("u%d", i), Color: i, Ts: ldTS + int64(i)})
+		ctx.Redis.Do("LPUSH", "history:3:7", string(entry))
+	}
+	api := ctx.Main(main).HTTP()
+	r := api.Get("/top")
+	ctx.Equal(r.Status, 200, "GET /top")
+	var rows []map[string]any
+	r.Decode(&rows)
+	ctx.Assert(len(rows) == 10, "expected the 10 top users, got %s", r.Text())
+	users, tiles := []any{}, []any{}
+	wantUsers, wantTiles := []any{}, []any{}
+	for i, row := range rows {
+		users, tiles = append(users, row["user"]), append(tiles, row["tiles"])
+		wantUsers, wantTiles = append(wantUsers, fmt.Sprintf("user%02d", i)), append(wantTiles, float64(100-i))
+	}
+	ctx.Equal(users, wantUsers, "rows must be in descending score order: their users")
+	ctx.Equal(tiles, wantTiles, "each row carries the tile count as %q", "tiles")
+	r = api.Get("/history?x=3&y=7")
+	ctx.Equal(r.Status, 200, "GET /history?x=3&y=7")
+	var entries []map[string]any
+	r.Decode(&entries)
+	got := []any{}
+	for _, e := range entries {
+		got = append(got, e["user"])
+	}
+	ctx.Equal(got, []any{"u2", "u1", "u0"}, "history must be newest first with user, color and ts (%s): its users", r.Text())
+	ctx.Equal(entries[0], map[string]any{"user": "u2", "color": 2.0, "ts": float64(ldTS + 2)}, "each entry is the stored document")
+	r = api.Get("/history?x=0&y=0")
+	ctx.Assert(r.Status == 200, "a pixel nobody painted has an empty history, got %d %s", r.Status, r.Text())
+	var empty []any
+	r.Decode(&empty)
+	ctx.Assert(len(empty) == 0, "a pixel nobody painted has an empty history, got %d %s", r.Status, r.Text())
+	for _, bad := range []string{"x=-1&y=0", fmt.Sprintf("x=0&y=%d", size), fmt.Sprintf("x=%d&y=0", size)} {
+		r = api.Get("/history?" + bad)
+		ctx.Equal(r.Status, 400, "GET /history?%s", bad)
+	}
 }
 `,
   },

@@ -974,6 +974,335 @@ export async function check_returns_attempts(ctx) {
   }
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"math"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+
+	"leetbuild/harness"
+
+	pb "ingest/gen/ingest"
+)
+
+const upLast = 7
+
+func upChunks() [][]byte {
+	var chunks [][]byte
+	for i := range 8 {
+		chunks = append(chunks, []byte(fmt.Sprintf("chunk-%d", i)))
+	}
+	return chunks
+}
+
+// upFault is how one Upload stream ends early: after \`after\` fresh commits, with code; dropAck loses that commit's Ack.
+type upFault struct {
+	code    codes.Code
+	after   int
+	dropAck bool
+	details string
+}
+
+type upChunk struct {
+	uploadID string
+	seq      int32
+	data     string
+}
+
+type upStatusCall struct {
+	uploadID string
+	at       time.Time
+}
+
+// upPeer is the ingest server: a committed point per upload, when each GetStatus and stream came, every chunk each stream delivered.
+type upPeer struct {
+	mu           sync.Mutex
+	committed    map[string]int32
+	statusCalls  []upStatusCall
+	opened       []time.Time
+	streams      [][]upChunk
+	closed       []bool
+	plan         []upFault
+	finalAcked   bool
+	holdFinalAck bool
+}
+
+func (p *upPeer) GetStatus(ctx context.Context, req *pb.StatusRequest) (*pb.StatusResponse, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.statusCalls = append(p.statusCalls, upStatusCall{uploadID: req.GetUploadId(), at: time.Now()})
+	return &pb.StatusResponse{NextSeq: p.committed[req.GetUploadId()]}, nil
+}
+
+func (p *upPeer) Upload(stream pb.Ingest_UploadServer) error {
+	p.mu.Lock()
+	n := len(p.streams)
+	p.opened = append(p.opened, time.Now())
+	p.streams = append(p.streams, nil)
+	p.closed = append(p.closed, false)
+	var f *upFault
+	if len(p.plan) > 0 {
+		f = &p.plan[0]
+		p.plan = p.plan[1:]
+	}
+	p.mu.Unlock()
+	commits := 0
+	for {
+		chunk, err := stream.Recv()
+		if err == io.EOF {
+			p.mu.Lock()
+			p.closed[n] = true
+			p.mu.Unlock()
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		id, seq := chunk.GetUploadId(), chunk.GetSeq()
+		p.mu.Lock()
+		p.streams[n] = append(p.streams[n], upChunk{uploadID: id, seq: seq, data: string(chunk.GetData())})
+		expected := p.committed[id]
+		p.mu.Unlock()
+		if seq > expected {
+			return status.Errorf(codes.FailedPrecondition, "gap: expected seq %d, got %d", expected, seq)
+		}
+		if seq == expected {
+			if p.holdFinalAck && seq == upLast {
+				time.Sleep(50 * time.Millisecond) // a slow final commit: the Ack for seq 7 comes later
+			}
+			p.mu.Lock()
+			p.committed[id] = expected + 1
+			p.mu.Unlock()
+			commits++
+		}
+		p.mu.Lock()
+		ack := &pb.Ack{Seq: p.committed[id] - 1}
+		p.mu.Unlock()
+		if f != nil && commits == f.after {
+			if !f.dropAck {
+				_ = stream.Send(ack)
+			}
+			details := f.details
+			if details == "" {
+				details = "injected " + f.code.String()
+			}
+			return status.Error(f.code, details)
+		}
+		if ack.GetSeq() == upLast {
+			p.mu.Lock()
+			p.finalAcked = true
+			p.mu.Unlock()
+		}
+		if err := stream.Send(ack); err != nil {
+			return err
+		}
+	}
+}
+
+// upFront is the one Ingest service at ingest:9000; it forwards to the server of the latest upStart.
+type upFront struct {
+	pb.UnimplementedIngestServer
+	mu  sync.Mutex
+	cur *upPeer
+}
+
+func (f *upFront) peer() *upPeer {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cur
+}
+
+func (f *upFront) GetStatus(ctx context.Context, req *pb.StatusRequest) (*pb.StatusResponse, error) {
+	return f.peer().GetStatus(ctx, req)
+}
+
+func (f *upFront) Upload(stream pb.Ingest_UploadServer) error { return f.peer().Upload(stream) }
+
+var upServing *upFront
+
+// upStart is a fresh ingest server with the given stream faults, and a client for it.
+func upStart(ctx *harness.Ctx, plan []upFault, holdFinalAck bool) (*upPeer, pb.IngestClient) {
+	p := &upPeer{committed: map[string]int32{}, plan: plan, holdFinalAck: holdFinalAck}
+	if upServing == nil {
+		upServing = &upFront{}
+		pb.RegisterIngestServer(ctx.GRPC.Server("ingest:9000"), upServing)
+	}
+	upServing.mu.Lock()
+	upServing.cur = p
+	upServing.mu.Unlock()
+	conn, err := grpc.NewClient("ingest:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	ctx.NoError(err, "grpc.NewClient")
+	return p, pb.NewIngestClient(conn)
+}
+
+// upFaultOf is a fault after one fresh commit.
+func upFaultOf(code codes.Code) upFault { return upFault{code: code, after: 1} }
+
+// upResult is how upload(ctx, client, "up-1", chunks, maxAttempts) ended.
+type upResult struct {
+	returned int
+	err      error
+	finished time.Time
+}
+
+func upRun(client pb.IngestClient, maxAttempts int) upResult {
+	returned, err := upload(context.Background(), client, "up-1", upChunks(), maxAttempts)
+	return upResult{returned: returned, err: err, finished: time.Now()}
+}
+
+// upSent are the seqs each stream delivered: [[0 1 2 3 4] [5 6 7]].
+func upSent(p *upPeer) [][]int32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := [][]int32{}
+	for _, s := range p.streams {
+		seqs := []int32{}
+		for _, c := range s {
+			seqs = append(seqs, c.seq)
+		}
+		out = append(out, seqs)
+	}
+	return out
+}
+
+func upOK(ctx *harness.Ctx, r upResult, what string) {
+	ctx.NoError(r.err, "%s: upload() returned an error", what)
+}
+
+func upRPCError(ctx *harness.Ctx, r upResult, code codes.Code, what string) {
+	ctx.Assert(r.err != nil, "%s: upload() returned %d instead of an error with %v", what, r.returned, code)
+	st, ok := status.FromError(r.err)
+	ctx.Assert(ok, "%s: upload() returned %v, expected the gRPC status error with %v", what, r.err, code)
+	ctx.Equal(st.Code(), code, "%s: the code of upload()'s error", what)
+}
+
+func CheckCleanUpload(ctx *harness.Ctx) {
+	p, client := upStart(ctx, nil, true)
+	r := upRun(client, 4)
+	p.mu.Lock()
+	ackedOnReturn := p.finalAcked
+	p.mu.Unlock()
+	upOK(ctx, r, "a clean upload")
+	ctx.Equal(len(p.statusCalls), 1, "a clean upload must call GetStatus once, before the stream: GetStatus calls")
+	ctx.Equal(p.statusCalls[0].uploadID, "up-1", "GetStatus must ask for the upload: its upload_id")
+	ctx.Equal(len(p.streams), 1, "a clean upload must open one stream: Upload streams")
+	ctx.Equal(upSent(p), [][]int32{{0, 1, 2, 3, 4, 5, 6, 7}}, "the stream must deliver each chunk once, in order: seqs per stream")
+	for _, c := range p.streams[0] {
+		ctx.Equal(c.uploadID, "up-1", "Chunk seq %d must carry the upload_id", c.seq)
+		ctx.Equal(c.data, fmt.Sprintf("chunk-%d", c.seq), "Chunk seq %d must carry chunks[%d]", c.seq, c.seq)
+	}
+	ctx.Assert(ackedOnReturn, "upload() returned before the server sent Ack{Seq: 7}: the last Send is not the end, the Ack for the last seq is")
+	ctx.Settle()
+	p.mu.Lock()
+	closed := p.closed[0]
+	p.mu.Unlock()
+	ctx.Assert(closed, "upload() returned with the stream's send side still open: CloseSend after the last chunk")
+}
+
+func CheckResumeFromStatus(ctx *harness.Ctx) {
+	p, client := upStart(ctx, nil, false)
+	p.committed["up-1"] = 3
+	r := upRun(client, 4)
+	upOK(ctx, r, "an upload the server already holds seqs 0 to 2 of")
+	ctx.Equal(upSent(p), [][]int32{{3, 4, 5, 6, 7}}, "with GetStatus at NextSeq 3 the streams must start at NextSeq, not at 0: seqs per stream")
+
+	p, client = upStart(ctx, []upFault{{code: codes.Unavailable, after: 5, dropAck: true}}, false)
+	r = upRun(client, 4)
+	upOK(ctx, r, "an upload whose stream died after seq 4 was committed")
+	streams := upSent(p)
+	ctx.Assert(len(streams) == 2 && fmt.Sprint(streams[1]) == "[5 6 7]", "seqs 0 to 4 were committed, the Ack for 4 was lost, then UNAVAILABLE; the streams delivered %v, expected [[0 1 2 3 4] [5 6 7]]: ask GetStatus (NextSeq 5) and resend nothing below it", streams)
+
+	p, client = upStart(ctx, []upFault{{code: codes.Unavailable, after: 8, dropAck: true}}, false)
+	r = upRun(client, 4)
+	upOK(ctx, r, "an upload whose final Ack was lost")
+	ctx.Equal(upSent(p), [][]int32{{0, 1, 2, 3, 4, 5, 6, 7}}, "every chunk was committed and only the final Ack lost: GetStatus says NextSeq 8, so there is nothing to send. Seqs per stream")
+}
+
+func CheckBackoff(ctx *harness.Ctx) {
+	p, client := upStart(ctx, []upFault{upFaultOf(codes.Unavailable), upFaultOf(codes.Aborted), upFaultOf(codes.Unavailable)}, false)
+	started := time.Now()
+	r := upRun(client, 4)
+	upOK(ctx, r, "three failed streams, then a clean one")
+	var times []float64
+	for _, c := range p.statusCalls {
+		times = append(times, c.at.Sub(started).Seconds())
+	}
+	ctx.Equal(len(times), 4, "three failed streams then a clean one must call GetStatus once per attempt: GetStatus calls")
+	ctx.Assert(times[0] < 0.05, "the first GetStatus came %.2f s in; the first attempt does not wait", times[0])
+	var gaps []float64
+	for i := 1; i < len(times); i++ {
+		gaps = append(gaps, math.Round((times[i]-times[i-1])*100)/100)
+	}
+	for i, want := range []float64{0.1, 0.2, 0.4} {
+		ctx.Assert(math.Abs(gaps[i]-want) < 0.05, "the GetStatus calls were %v s apart, expected [0.1 0.2 0.4]: wait baseBackoff << (attempt - 1) after attempt number attempt fails", gaps)
+	}
+	ctx.Equal(upSent(p), [][]int32{{0}, {1}, {2}, {3, 4, 5, 6, 7}}, "seqs per stream")
+}
+
+func CheckGivesUp(ctx *harness.Ctx) {
+	var plan []upFault
+	for i := range 10 {
+		plan = append(plan, upFault{code: codes.Unavailable, after: 1, details: fmt.Sprintf("ingest restarting (%d)", i+1)})
+	}
+	p, client := upStart(ctx, plan, false)
+	r := upRun(client, 3)
+	upRPCError(ctx, r, codes.Unavailable, "a server that drops every stream, maxAttempts 3")
+	ctx.Equal(len(p.streams), 3, "with maxAttempts 3 upload() must open 3 streams: streams")
+	ctx.Equal(status.Convert(r.err).Message(), "ingest restarting (3)", "upload() must return the last error, the third stream's: its message")
+	waited := r.finished.Sub(p.opened[len(p.opened)-1]).Seconds()
+	ctx.Assert(waited < 0.05, "upload() returned %.2f s after its last stream opened: after the last attempt there is nothing to wait for", waited)
+
+	plan = nil
+	for range 10 {
+		plan = append(plan, upFaultOf(codes.Unavailable))
+	}
+	p, client = upStart(ctx, plan, false)
+	r = upRun(client, 4)
+	upRPCError(ctx, r, codes.Unavailable, "a server that drops every stream, maxAttempts 4")
+	ctx.Equal(len(p.streams), 4, "with maxAttempts 4 upload() must open 4 streams: streams")
+}
+
+func CheckOtherCodes(ctx *harness.Ctx) {
+	for _, code := range []codes.Code{codes.InvalidArgument, codes.PermissionDenied} {
+		p, client := upStart(ctx, []upFault{{code: code, after: 2}}, false)
+		started := time.Now()
+		r := upRun(client, 4)
+		upRPCError(ctx, r, code, "a stream that ends with "+code.String())
+		ctx.Assert(len(p.statusCalls) == 1 && len(p.streams) == 1, "%v was retried (%d GetStatus calls, %d streams): only UNAVAILABLE and ABORTED are", code, len(p.statusCalls), len(p.streams))
+		waited := r.finished.Sub(started).Seconds()
+		ctx.Assert(waited < 0.05, "upload() waited %.2f s before returning %v: return it at once", waited, code)
+	}
+}
+
+func CheckReturnsAttempts(ctx *harness.Ctx) {
+	cases := []struct {
+		plan        []upFault
+		maxAttempts int
+		want        int
+		what        string
+	}{
+		{nil, 4, 1, "a clean upload"},
+		{[]upFault{{code: codes.Aborted, after: 3}}, 4, 2, "one ABORTED stream"},
+		{[]upFault{{code: codes.Unavailable, after: 8, dropAck: true}}, 4, 2, "a stream that lost only the final Ack"},
+		{[]upFault{upFaultOf(codes.Unavailable), upFaultOf(codes.Aborted)}, 3, 3, "two failed streams with maxAttempts 3"},
+	}
+	for _, tc := range cases {
+		_, client := upStart(ctx, tc.plan, false)
+		r := upRun(client, tc.maxAttempts)
+		upOK(ctx, r, tc.what)
+		ctx.Equal(r.returned, tc.want, "%s: upload() must return the attempts it used", tc.what)
+	}
+}
+`,
   },
   debrief: `A resumable upload is at-least-once delivery that the server turns into exactly-once storage. The seq is the idempotency key: the server commits seq \`n\` only when its committed point is \`n\`, ignores anything below and refuses anything above. The committed point lives on the server because only the server knows it: a stream can die after a commit and before the Ack crosses the wire, so the client's last Ack is a lower bound. Trusting it resends committed chunks (harmless here, wasted bandwidth, a bug wherever the server is not idempotent); restarting from 0 resends all of them, and a large upload on a flaky link may never finish. Asking \`GetStatus\` costs one round trip per attempt and is always right.
 

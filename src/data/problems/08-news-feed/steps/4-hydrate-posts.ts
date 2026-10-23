@@ -841,6 +841,173 @@ export async function check_order_kept(ctx) {
   assert(JSON.stringify(await m.hydrate([])) === '[]' && calls.length === 2, 'an empty id list must not call the post service');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"reflect"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"leetbuild/harness"
+
+	pb "feed/gen/post"
+)
+
+func samplePost(id string) Post {
+	return Post{ID: id, Author: "ann", Text: "post " + id, MediaIDs: []string{"m-" + id}, CreatedAt: 1700000000000 + int64(id[0])}
+}
+
+// postPeer is the post service: knows its posts, records the ids of every request; onCall runs as a request arrives.
+type postPeer struct {
+	pb.UnimplementedPostServiceServer
+	known  map[string]bool
+	calls  [][]string
+	onCall func()
+}
+
+func (p *postPeer) GetPosts(_ context.Context, req *pb.GetPostsRequest) (*pb.GetPostsReply, error) {
+	ids := append([]string{}, req.GetIds()...)
+	p.calls = append(p.calls, ids)
+	if p.onCall != nil {
+		p.onCall()
+	}
+	reply := &pb.GetPostsReply{}
+	for _, id := range ids {
+		if p.known[id] {
+			s := samplePost(id)
+			reply.Posts = append(reply.Posts, &pb.Post{Id: s.ID, Author: s.Author, Text: s.Text, MediaIds: s.MediaIDs, CreatedAt: s.CreatedAt})
+		}
+	}
+	return reply, nil
+}
+
+func servePosts(ctx *harness.Ctx, served ...string) *postPeer {
+	peer := &postPeer{known: map[string]bool{}}
+	for _, id := range served {
+		peer.known[id] = true
+	}
+	pb.RegisterPostServiceServer(ctx.GRPC.Server(""), peer)
+	return peer
+}
+
+func cacheIDs(ctx *harness.Ctx, ids ...string) {
+	for _, id := range ids {
+		doc, _ := json.Marshal(samplePost(id))
+		ctx.Redis.Set("post:"+id, string(doc))
+	}
+}
+
+func hydrateIDs(ctx *harness.Ctx, ids ...string) []Post {
+	posts, err := Hydrate(context.Background(), append([]string{}, ids...))
+	ctx.NoError(err, "Hydrate(%q) returned an error", ids)
+	return posts
+}
+
+func CheckMgetFirst(ctx *harness.Ctx) {
+	var tripsAtRPC [][]string
+	rpcSeen := false
+	peer := servePosts(ctx, "a", "b")
+	peer.onCall = func() {
+		if !rpcSeen {
+			rpcSeen = true
+			tripsAtRPC = ctx.Redis.RoundTrips()
+		}
+	}
+	cacheIDs(ctx, "a")
+	posts := hydrateIDs(ctx, "a", "b")
+	ctx.Equal(posts, []Post{samplePost("a"), samplePost("b")}, "Hydrate must return the cached post a and the fetched post b")
+	ctx.Equal(peer.calls, [][]string{{"b"}}, "the cached post a must not be requested from the post service: GetPosts requests")
+	mget := false
+	for _, trip := range tripsAtRPC {
+		for _, command := range trip {
+			mget = mget || command == "MGET"
+		}
+	}
+	ctx.Assert(rpcSeen && mget, "the cache must be read with one MGet before GetPosts is called")
+	gets := 0
+	for _, trip := range ctx.Redis.RoundTrips() {
+		for _, command := range trip {
+			if command == "GET" {
+				gets++
+				break
+			}
+		}
+	}
+	ctx.Assert(gets == 0, "read the cache with one MGet, not %d GETs", gets)
+	posts = hydrateIDs(ctx, "a")
+	ctx.Assert(reflect.DeepEqual(posts, []Post{samplePost("a")}) && len(peer.calls) == 1, "when every id is cached GetPosts must not be called at all")
+}
+
+func CheckSingleRpc(ctx *harness.Ctx) {
+	servePosts(ctx, "b", "c", "d")
+	posts := hydrateIDs(ctx, "b", "c", "d")
+	ctx.Equal(posts, []Post{samplePost("b"), samplePost("c"), samplePost("d")}, "unexpected posts")
+	calls := ctx.GRPC.CallsTo("GetPosts", "")
+	ctx.Equal(len(calls), 1, "3 cache misses must be fetched with one GetPosts call")
+	req, _ := calls[0].Request.(*pb.GetPostsRequest)
+	ctx.Equal(req.GetIds(), []string{"b", "c", "d"}, "the request must carry every missed id")
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	servePosts(ctx, "b", "c")
+	ctx.Equal(hydrateIDs(ctx, "b"), []Post{samplePost("b")}, "Hydrate([b])")
+	calls := ctx.GRPC.CallsTo("GetPosts", "")
+	call := calls[len(calls)-1]
+	ctx.Assert(call.HasDeadline(), "the RPC carries no deadline")
+	ctx.Assert(0.5 <= call.Timeout.Seconds() && call.Timeout.Seconds() <= 1.0, "the deadline must be about 800 ms, got %v", call.Timeout)
+	ctx.GRPC.SetLatency("GetPosts", 3.0, "")
+	_, err := Hydrate(context.Background(), []string{"c"})
+	ctx.Assert(err != nil, "a post service slower than the deadline must surface DEADLINE_EXCEEDED")
+	ctx.Equal(status.Code(err), codes.DeadlineExceeded, "a slow post service raised %v", err)
+}
+
+func CheckWriteBack(ctx *harness.Ctx) {
+	peer := servePosts(ctx, "b", "c")
+	hydrateIDs(ctx, "b", "c")
+	for _, id := range []string{"b", "c"} {
+		raw, ok := ctx.Redis.Get("post:" + id)
+		ctx.Assert(ok, "post:%s must be cached after it was fetched", id)
+		var cached, want map[string]any
+		doc, _ := json.Marshal(samplePost(id))
+		json.Unmarshal(doc, &want)
+		ctx.NoError(json.Unmarshal([]byte(raw), &cached), "post:%s must hold the post as JSON, got %q", id, raw)
+		ctx.Equal(cached, want, "post:%s must hold the post as JSON", id)
+		ttl := ctx.Redis.TTL("post:" + id)
+		ctx.Assert(3000 < ttl && ttl <= 3600, "post:%s must expire after an hour (EX 3600), its TTL is %d", id, ttl)
+	}
+	sets := 0
+	var sizes []int
+	for _, trip := range ctx.Redis.RoundTrips() {
+		if len(trip) == 1 && (trip[0] == "SET" || trip[0] == "SETEX") {
+			sets++
+		} else if len(trip) > 1 {
+			sizes = append(sizes, len(trip))
+		}
+	}
+	ctx.Assert(sets == 0, "%d SET(s) were sent one by one: write the fetched posts back through one pipeline", sets)
+	ctx.Equal(sizes, []int{2}, "expected one pipeline carrying the 2 SETs: pipeline command counts")
+	hydrateIDs(ctx, "b", "c")
+	ctx.Equal(len(peer.calls), 1, "once written back, the next hydration of the same ids must not call GetPosts")
+	ctx.Clock.Advance(3601)
+	_, cached := ctx.Redis.Get("post:b")
+	ctx.Assert(!cached, "the cache entry must be gone an hour later")
+}
+
+func CheckOrderKept(ctx *harness.Ctx) {
+	peer := servePosts(ctx, "b")
+	cacheIDs(ctx, "a", "c")
+	var ids []string
+	for _, p := range hydrateIDs(ctx, "d", "c", "b", "a") {
+		ids = append(ids, p.ID)
+	}
+	ctx.Equal(ids, []string{"c", "b", "a"}, "posts must come back in the input order with the deleted post d skipped")
+	ctx.Assert(len(hydrateIDs(ctx, "d")) == 0, "a page of only deleted posts is an empty list, not an error")
+	ctx.Assert(len(hydrateIDs(ctx)) == 0 && len(peer.calls) == 2, "an empty id list must not call the post service")
+}
+`,
   },
   debrief: `Hydration is where a feed's latency budget is really spent, and two decisions keep it flat: the cache is read with one \`MGET\` instead of N \`GET\`s, and the misses are fetched with one RPC instead of N. The write-back makes the cache fill itself from the long tail of pages, and the TTL bounds memory for posts nobody will ask for again. Returning in input order with missing ids skipped is what lets the timeline keep ids of deleted posts for a while without the client ever seeing a hole. Real hydrators add a per-request dedupe (the same id on two pages), negative caching for ids that keep missing, and a hedge: if the RPC exceeds a soft deadline, serve the page with the cached posts only.`,
 };

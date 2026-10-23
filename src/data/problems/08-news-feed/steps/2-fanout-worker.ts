@@ -835,6 +835,130 @@ export async function check_batched_commit(ctx) {
   assert.deepStrictEqual(atCommit[0], [3, 1], \`the commit must come after the last pipeline executed: at commit time \${atCommit[0][0]} pipeline(s) had run and timeline:f1239 had \${atCommit[0][1]} entries\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"leetbuild/harness"
+
+	"feed/graph"
+)
+
+func seedPost(ctx *harness.Ctx, postID, author string) {
+	value, _ := json.Marshal(map[string]any{"post_id": postID, "author": author, "text": "hi", "media_ids": []string{}, "created_at": 1700000000000})
+	ctx.Kafka.Seed("posts", author, value)
+}
+
+// drainWorker fills the follow graph, then runs the learner's loop until it waits for records.
+func drainWorker(ctx *harness.Ctx, followers map[string][]string) {
+	for author, ids := range followers {
+		graph.FollowersOf[author] = ids
+	}
+	ctx.Drain(func() { run(context.Background()) })
+}
+
+// fanoutPipelines are the learner's round trips that carried more than one command.
+func fanoutPipelines(ctx *harness.Ctx) [][]string {
+	var out [][]string
+	for _, trip := range ctx.Redis.RoundTrips() {
+		if len(trip) > 1 {
+			out = append(out, trip)
+		}
+	}
+	return out
+}
+
+func CheckGroup(ctx *harness.Ctx) {
+	seedPost(ctx, "p1", "ann")
+	drainWorker(ctx, map[string][]string{"ann": {"bob"}})
+	subscriptions := ctx.Kafka.EventsOf("subscribe")
+	ctx.Assert(len(subscriptions) > 0, "the consumer must subscribe to a topic")
+	last := subscriptions[len(subscriptions)-1]
+	ctx.Equal(last.Group, "fanout", "GroupID must be fanout")
+	subscribed := false
+	for _, topic := range last.Topics {
+		subscribed = subscribed || topic == "posts"
+	}
+	ctx.Assert(subscribed, "the consumer must subscribe to posts, got %q", last.Topics)
+	ctx.Equal(ctx.Redis.LRange("timeline:bob", 0, -1), []string{"p1"}, "after consuming p1 by ann, timeline:bob")
+}
+
+func CheckManualCommit(ctx *harness.Ctx) {
+	seedPost(ctx, "p1", "ann")
+	seedPost(ctx, "p2", "ann")
+	drainWorker(ctx, map[string][]string{"ann": {"bob", "cat"}})
+	consumers := ctx.Kafka.Consumers()
+	ctx.Assert(len(consumers) > 0 && !consumers[len(consumers)-1].AutoCommit, "the reader must not commit by itself (no CommitInterval, no ReadMessage): offsets would be committed on a timer, before the pushes")
+	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "auto-commit is on: offsets were committed on a timer, before processing")
+	ctx.Assert(len(ctx.Kafka.EventsOf("manual-commit")) > 0, "no explicit commit happened")
+	ctx.Equal(ctx.Kafka.Lag("fanout", "posts"), 0, "every processed record must be committed")
+}
+
+func CheckCelebrity(ctx *harness.Ctx) {
+	seedPost(ctx, "p1", "taylor")
+	seedPost(ctx, "p2", "ann")
+	taylorFans := make([]string, 10_001)
+	for i := range taylorFans {
+		taylorFans[i] = fmt.Sprintf("fan%d", i)
+	}
+	drainWorker(ctx, map[string][]string{"taylor": taylorFans, "ann": {"bob", "cat"}})
+	ctx.Equal(ctx.Redis.LRange("timeline:bob", 0, -1), []string{"p2"}, "ann has 2 followers: her post must be pushed, timeline:bob")
+	pushed := ctx.Redis.Keys("timeline:fan*")
+	ctx.Equal(len(pushed), 0, "taylor has 10 001 followers: her post must not be fanned out, but fan timelines were written")
+	ctx.Equal(ctx.Kafka.Lag("fanout", "posts"), 0, "a skipped celebrity post must still have its offset committed")
+}
+
+func CheckPushTrim(ctx *harness.Ctx) {
+	old := []any{"RPUSH", "timeline:bob"}
+	for i := range 1000 {
+		old = append(old, fmt.Sprintf("old%d", i))
+	}
+	ctx.Redis.Do(old...)
+	seedPost(ctx, "p1", "ann")
+	seedPost(ctx, "p2", "ann")
+	drainWorker(ctx, map[string][]string{"ann": {"bob", "cat"}})
+	bob := ctx.Redis.LRange("timeline:bob", 0, -1)
+	ctx.Assert(len(bob) >= 2 && bob[0] == "p2" && bob[1] == "p1", "timeline:bob must start with the newest post (LPUSH), got %q", bob[:min(3, len(bob))])
+	ctx.Equal(len(bob), 1000, "timeline:bob must be trimmed to 1000 entries")
+	ctx.Equal(bob[len(bob)-1], "old997", "LTRIM must drop the oldest entries: the tail of timeline:bob")
+	ctx.Equal(ctx.Redis.LRange("timeline:cat", 0, -1), []string{"p2", "p1"}, "timeline:cat")
+}
+
+func CheckBatchedCommit(ctx *harness.Ctx) {
+	fans := make([]string, 1240)
+	for i := range fans {
+		fans[i] = fmt.Sprintf("f%d", i)
+	}
+	seedPost(ctx, "p1", "ann")
+	var atCommit [][2]int
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
+		atCommit = append(atCommit, [2]int{len(fanoutPipelines(ctx)), int(ctx.Redis.LLen("timeline:f1239"))})
+	})
+	drainWorker(ctx, map[string][]string{"ann": fans})
+	ctx.Equal(ctx.Redis.LRange("timeline:f1239", 0, -1), []string{"p1"}, "every one of the 1240 followers must receive the post: timeline:f1239")
+	writes := 0
+	for _, trip := range ctx.Redis.RoundTrips() {
+		if len(trip) == 1 && (trip[0] == "LPUSH" || trip[0] == "LTRIM") {
+			writes++
+		}
+	}
+	ctx.Assert(writes == 0, "%d LPUSH/LTRIM were sent one by one: queue them on a pipeline per batch of 500 followers", writes)
+	var sizes []int
+	largest, total := 0, 0
+	for _, trip := range fanoutPipelines(ctx) {
+		sizes = append(sizes, len(trip))
+		largest = max(largest, len(trip))
+		total += len(trip)
+	}
+	ctx.Equal(len(sizes), 3, "1240 followers must take 3 pipelines (500, 500, 240 followers): pipeline Execs observed")
+	ctx.Assert(largest <= 1000 && total == 2480, "each pipeline carries LPush + LTrim for at most 500 followers, observed command counts %v", sizes)
+	ctx.Assert(len(atCommit) > 0, "the offset was never committed")
+	ctx.Assert(atCommit[0] == [2]int{3, 1}, "the commit must come after the last pipeline executed: at commit time %d pipeline(s) had run and timeline:f1239 had %d entries", atCommit[0][0], atCommit[0][1])
+}
+`,
   },
   debrief: `Fan-out on write moves the cost from every read to the one write: a post costs one Redis command pair per follower, after which every follower's feed is a single \`LRANGE\`. The celebrity threshold is what keeps that bounded — one account with 50 million followers would otherwise turn a post into 50 million writes and a minutes-long delay for everyone else on the same partition. Pipelining matters as much as the threshold: 500 commands in one round trip versus 500 round trips is the difference between milliseconds and seconds. Real systems also skip inactive followers (they rebuild the timeline on their next login instead), shard timelines across Redis clusters, and run several worker groups so one hot author cannot stall the rest.`,
 };

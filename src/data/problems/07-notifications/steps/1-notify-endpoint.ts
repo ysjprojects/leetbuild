@@ -371,9 +371,7 @@ type Notification struct {
 }
 
 // enqueue produces the notification to Kafka keyed by user (built in step 2); returns an error when the broker did not ack.
-func enqueue(ctx context.Context, n Notification) error {
-	panic("not implemented")
-}
+var enqueue = func(ctx context.Context, n Notification) error { panic("not implemented") }
 
 func writeID(rw http.ResponseWriter, status int, id string) {
 	rw.Header().Set("Content-Type", "application/json")
@@ -431,9 +429,7 @@ type Notification struct {
 }
 
 // enqueue produces the notification to Kafka keyed by user (built in step 2); returns an error when the broker did not ack.
-func enqueue(ctx context.Context, n Notification) error {
-	panic("not implemented")
-}
+var enqueue = func(ctx context.Context, n Notification) error { panic("not implemented") }
 
 func writeID(rw http.ResponseWriter, status int, id string) {
 	rw.Header().Set("Content-Type", "application/json")
@@ -920,6 +916,164 @@ export async function check_accepted(ctx) {
   r = await post(c, null, 'k2');
   assert.equal(r.status, 202, \`the retry after a 503 answered \${r.status}, expected 202\`);
   assert.equal(enqueued(ctx).length, 2, 'the retry after a 503 must enqueue the notification');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/segmentio/kafka-go"
+
+	"leetbuild/harness"
+)
+
+var notifyBody = map[string]any{"user_id": "u42", "channel": "push", "title": "Shipped", "body": "Your order is on its way", "priority": "normal"}
+
+// busWriter is step 2's producer: every in-sync replica acknowledges, records keyed by user.
+var busWriter = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: "notifications", Balancer: &kafka.Hash{}, RequiredAcks: kafka.RequireAll}
+
+// notifyAPI is the API with the real bus of step 2 behind it: what it enqueued is what the notifications topic holds.
+func notifyAPI(ctx *harness.Ctx) *harness.HTTP {
+	enqueue = func(c context.Context, n Notification) error {
+		value, _ := json.Marshal(n)
+		c, cancel := context.WithTimeout(c, 2*time.Second)
+		defer cancel()
+		err := busWriter.WriteMessages(c, kafka.Message{
+			Key:     []byte(n.UserID),
+			Value:   value,
+			Headers: []kafka.Header{{Key: "priority", Value: []byte(n.Priority)}},
+		})
+		if err != nil {
+			return fmt.Errorf("no ack for %s: %w", n.ID, err)
+		}
+		return nil
+	}
+	return ctx.Main(main).HTTP()
+}
+
+func enqueued(ctx *harness.Ctx) []map[string]string {
+	var out []map[string]string
+	for _, v := range ctx.Kafka.Values("notifications") {
+		var n map[string]string
+		ctx.NoError(json.Unmarshal([]byte(v), &n), "a record on notifications is not a notification as JSON: %q", v)
+		out = append(out, n)
+	}
+	return out
+}
+
+// postNotification sends body (nil: notifyBody) with an Idempotency-Key header unless key is "".
+func postNotification(c *harness.HTTP, body map[string]any, key string) *harness.Response {
+	if body == nil {
+		body = notifyBody
+	}
+	if key == "" {
+		return c.Post("/notifications", body)
+	}
+	return c.Post("/notifications", body, "Idempotency-Key", key)
+}
+
+// notifyBodyWith is notifyBody with fields replaced.
+func notifyBodyWith(fields ...string) map[string]any {
+	out := map[string]any{}
+	for k, v := range notifyBody {
+		out[k] = v
+	}
+	for i := 0; i+1 < len(fields); i += 2 {
+		out[fields[i]] = fields[i+1]
+	}
+	return out
+}
+
+// answeredID is the id of a JSON answer (nil without one); the check fails when the body is not JSON.
+func answeredID(r *harness.Response) any {
+	body, _ := r.JSON().(map[string]any)
+	return body["id"]
+}
+
+// idemValue is what key holds, nil when it does not exist.
+func idemValue(ctx *harness.Ctx, key string) any {
+	if v, ok := ctx.Redis.Get(key); ok {
+		return v
+	}
+	return nil
+}
+
+func CheckValidate(ctx *harness.Ctx) {
+	c := notifyAPI(ctx)
+	bad := [][2]string{{"channel", "fax"}, {"priority", "urgent"}, {"user_id", ""}, {"title", ""}}
+	for _, field := range bad {
+		r := postNotification(c, notifyBodyWith(field[0], field[1]), "k-"+field[0])
+		ctx.Equal(r.Status, 400, "an invalid %s must be answered with 400", field[0])
+	}
+	keys := ctx.Redis.Keys("idem:*")
+	ctx.Assert(len(keys) == 0, "a rejected request must not claim an idempotency key, found %v", keys)
+	ctx.Equal(len(enqueued(ctx)), 0, "a rejected request must not be enqueued: records on notifications")
+	r := postNotification(c, notifyBodyWith("channel", "email", "priority", "high"), "k-ok")
+	ctx.Equal(r.Status, 202, "a valid request must be answered with 202")
+}
+
+func CheckHeaderRequired(ctx *harness.Ctx) {
+	c := notifyAPI(ctx)
+	r := postNotification(c, nil, "")
+	ctx.Equal(r.Status, 400, "a request without Idempotency-Key must be answered with 400")
+	ctx.Equal(len(enqueued(ctx)), 0, "a request without Idempotency-Key must not be enqueued: records on notifications")
+	keys := ctx.Redis.Keys("idem:*")
+	ctx.Assert(len(keys) == 0, "a request without Idempotency-Key must not claim a key, found %v", keys)
+	r = postNotification(c, nil, "k1")
+	ctx.Equal(r.Status, 202, "with the header the same request must be answered with 202")
+}
+
+func CheckReserveNx(ctx *harness.Ctx) {
+	c := notifyAPI(ctx)
+	ctx.Redis.Set("idem:k-taken", "n-earlier")
+	r := postNotification(c, nil, "k1")
+	ctx.Equal(r.Status, 202, "POST must be answered with 202")
+	stored := idemValue(ctx, "idem:k1")
+	ctx.Assert(stored != nil, "idem:k1 must be claimed in Redis")
+	ctx.Equal(stored, answeredID(r), "idem:k1 must hold the id the API answered with (%s)", r.Text())
+	ttl := ctx.Redis.TTL("idem:k1")
+	ctx.Assert(86000 <= ttl && ttl <= 86400, "idem:k1 must expire after 86400 s, TTL is %d", ttl)
+	r = postNotification(c, nil, "k-taken")
+	ctx.Assert(r.Status != 202, "a key that already exists must not be claimed again")
+	ctx.Equal(idemValue(ctx, "idem:k-taken"), "n-earlier", "SET without NX overwrote the id stored under an existing key")
+	ctx.Equal(ctx.Redis.TTL("idem:k-taken"), -1, "a refused SET NX must not touch the existing key's expiry")
+}
+
+func CheckReplay(ctx *harness.Ctx) {
+	c := notifyAPI(ctx)
+	ctx.Redis.Set("idem:k-old", "n-stored")
+	first := postNotification(c, nil, "k1")
+	ctx.Equal(first.Status, 202, "the first POST must be answered with 202")
+	again := postNotification(c, nil, "k1")
+	ctx.Equal(again.Status, 200, "a retry with the same key must be answered with 200")
+	ctx.Equal(answeredID(again), answeredID(first), "the replay answered %s: it must carry the original id", again.Text())
+	ctx.Equal(len(enqueued(ctx)), 1, "enqueue must run once for one key: records on notifications")
+	old := postNotification(c, nil, "k-old")
+	ctx.Assert(old.Status == 200 && answeredID(old) == "n-stored", "a key stored earlier must replay its id with 200, got %d %s", old.Status, old.Text())
+	ctx.Equal(len(enqueued(ctx)), 1, "a replay must not enqueue again: records on notifications")
+}
+
+func CheckAccepted(ctx *harness.Ctx) {
+	c := notifyAPI(ctx)
+	r := postNotification(c, nil, "k1")
+	ctx.Equal(r.Status, 202, "POST must be answered with 202 Accepted")
+	nid := answeredID(r)
+	ctx.Assert(nid != nil && nid != "", "the 202 body must carry the id, got %s", r.Text())
+	ctx.Equal(len(enqueued(ctx)), 1, "enqueue must run once: records on notifications")
+	sent := enqueued(ctx)[0]
+	ctx.Assert(sent["user_id"] == "u42" && sent["id"] == nid, "enqueue received %v: expected the notification with its minted id %v", sent, nid)
+	ctx.Equal(idemValue(ctx, "idem:k1"), nid, "the key must be claimed before enqueue runs, holding the id that was enqueued")
+	ctx.Kafka.FailNext("notifications", 1) // the broker does not acknowledge the next record
+	r = postNotification(c, nil, "k2")
+	ctx.Equal(r.Status, 503, "a failed enqueue must be answered with 503")
+	ctx.Equal(ctx.Redis.Exists("idem:k2"), 0, "a failed enqueue must release idem:k2 so the retry can enqueue again")
+	r = postNotification(c, nil, "k2")
+	ctx.Equal(r.Status, 202, "the retry after a 503 must be answered with 202")
+	ctx.Equal(len(enqueued(ctx)), 2, "the retry after a 503 must enqueue the notification: records on notifications")
 }
 `,
   },

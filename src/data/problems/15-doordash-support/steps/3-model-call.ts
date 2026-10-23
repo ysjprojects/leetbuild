@@ -946,6 +946,177 @@ export async function check_max_tokens(ctx) {
   assert.equal(result.tokens, config.MAX_TOKENS, \`tokens must be the reply's count \${config.MAX_TOKENS}, got \${JSON.stringify(result.tokens)}\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"strings"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"assistant/config"
+	"assistant/model"
+	"assistant/prompt"
+	pb "assistant/gen/support"
+
+	"leetbuild/harness"
+)
+
+const modelQuestion = "My payout has not arrived, when is it paid?"
+
+var modelChunks = []prompt.Chunk{
+	{ID: "pay-0", Text: "Dasher earnings for a week are paid out every Monday by direct deposit and usually arrive within two to three business days, depending on the bank.", Score: 0.71},
+	{ID: "tips-0", Text: "Tips are included in the weekly payout and in Fast Pay.", Score: 0.52},
+	{ID: "undeliverable-0", Text: "If the timer runs out, the app allows the order to be marked as undeliverable and the Dasher is still paid in full for the delivery.", Score: 0.33},
+}
+
+var modelHistory = []prompt.Turn{
+	{Role: "dasher", Text: "Hi, I dashed all of last week."},
+	{Role: "assistant", Text: "Hello! What can I help you with about last week's dashes?"},
+}
+
+// llmPeer is the stand-in model server, answering in mode.
+type llmPeer struct {
+	pb.UnimplementedLlmServer
+	mode string
+}
+
+func (p *llmPeer) Generate(_ context.Context, req *pb.GenerateRequest) (*pb.GenerateReply, error) {
+	text := model.Complete(req.GetPrompt(), int(req.GetMaxTokens()), p.mode)
+	return &pb.GenerateReply{Text: text, Tokens: int32(len(strings.Fields(text))), Model: req.GetModel()}, nil
+}
+
+// modelWorld is what a check compares against: the one prompt and the faithful model's answer to it.
+type modelWorld struct {
+	prompt   string
+	expected string
+}
+
+// serveModels serves both model addresses with the stand-in model in mode.
+func serveModels(ctx *harness.Ctx, mode string) modelWorld {
+	peer := &llmPeer{mode: mode}
+	pb.RegisterLlmServer(ctx.GRPC.Server(config.LLMLarge), peer)
+	pb.RegisterLlmServer(ctx.GRPC.Server(config.LLMSmall), peer)
+	p := prompt.Build(modelQuestion, modelChunks, modelHistory)
+	return modelWorld{prompt: p, expected: model.Complete(p, config.MaxTokens, "faithful")}
+}
+
+// generateOK calls generate and requires a result.
+func generateOK(ctx *harness.Ctx) *Generated {
+	result, err := generate(context.Background(), modelQuestion, modelChunks, modelHistory)
+	ctx.NoError(err, "generate(question, chunks, history) must return {Answer, Model, Tokens}")
+	ctx.Assert(result != nil, "generate must return a *Generated, got nil")
+	return result
+}
+
+// generateFails calls generate, requires an error and returns its status code.
+func generateFails(ctx *harness.Ctx, what string) codes.Code {
+	result, err := generate(context.Background(), modelQuestion, modelChunks, modelHistory)
+	if err == nil {
+		ctx.Fatalf("%s must fail, generate returned %+v", what, result)
+	}
+	return status.Code(err)
+}
+
+func generateCalls(ctx *harness.Ctx, target string) []harness.Call {
+	return ctx.GRPC.CallsTo("Generate", target)
+}
+
+func generateRequest(call harness.Call) *pb.GenerateRequest {
+	req, _ := call.Request.(*pb.GenerateRequest)
+	return req
+}
+
+func replyWords(text string) int { return len(strings.Fields(text)) }
+
+func CheckPrompt(ctx *harness.Ctx) {
+	w := serveModels(ctx, "faithful")
+	result := generateOK(ctx)
+	calls := generateCalls(ctx, config.LLMLarge)
+	ctx.Equal(len(calls), 1, "a healthy large model must be called exactly once: calls to %s", config.LLMLarge)
+	ctx.Equal(len(generateCalls(ctx, config.LLMSmall)), 0, "the small model must not be called while the large one answers")
+	request := generateRequest(calls[0])
+	ctx.Equal(request.GetModel(), "large", "the request to %s must say Model: \\"large\\"", config.LLMLarge)
+	for _, c := range modelChunks {
+		ctx.Assert(strings.Contains(request.GetPrompt(), "[kb:"+c.ID+"] "+c.Text), "the prompt has no '[kb:%s] <text>' line for a retrieved chunk; use prompt.Build", c.ID)
+	}
+	for _, turn := range modelHistory {
+		ctx.Assert(strings.Contains(request.GetPrompt(), turn.Role+": "+turn.Text), "the prompt is missing the history turn %s: %q", turn.Role, turn.Text)
+	}
+	ctx.Assert(strings.Contains(request.GetPrompt(), "Question: "+modelQuestion), "the prompt is missing the 'Question: …' line")
+	ctx.Equal(request.GetPrompt(), w.prompt, "the prompt must be exactly prompt.Build(question, chunks, history): the model parses that format")
+	ctx.Equal(result.Answer, w.expected, "Answer must be the reply's text")
+	ctx.Equal(result.Model, "large", "Model must be the reply's model")
+	ctx.Equal(result.Tokens, replyWords(w.expected), "Tokens must be the reply's token count")
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	serveModels(ctx, "faithful")
+	generateOK(ctx)
+	calls := generateCalls(ctx, config.LLMLarge)
+	call := calls[len(calls)-1]
+	ctx.Assert(call.HasDeadline(), "the Generate call carries no deadline: a stalled model would hold the chat open forever")
+	ctx.Assert(1.5 <= call.Timeout.Seconds() && call.Timeout.Seconds() <= 2.0, "the deadline must be config.DeadlineS = %v s, got %v s", config.DeadlineS, call.Timeout.Seconds())
+	ctx.GRPC.SetLatency("Generate", 3.0, config.LLMLarge)
+	started := ctx.Clock.Now()
+	result := generateOK(ctx)
+	elapsed := ctx.Clock.Now() - started
+	slow := generateCalls(ctx, config.LLMLarge)[1:]
+	for _, c := range slow {
+		ctx.Assert(c.Code == codes.DeadlineExceeded, "a large model slower than the deadline must be abandoned with DEADLINE_EXCEEDED, not waited for")
+	}
+	ctx.Equal(len(slow), 2, "a large model past its deadline earns one retry: calls to %s", config.LLMLarge)
+	ctx.Equal(result.Model, "small", "after two deadlines the small model must answer")
+	ctx.Equal(len(generateCalls(ctx, config.LLMSmall)), 1, "calls to %s", config.LLMSmall)
+	ctx.Assert(4000 <= elapsed && elapsed <= 4800, "two attempts of %v s plus one 200 ms backoff should take about 4200 ms of virtual time, took %d ms (6000 means the deadline was not attached to the call)", config.DeadlineS, elapsed)
+}
+
+func CheckRetryTransient(ctx *harness.Ctx) {
+	w := serveModels(ctx, "faithful")
+	ctx.GRPC.Fail("Generate", codes.Unavailable, "", 1, config.LLMLarge)
+	started := ctx.Clock.Now()
+	result := generateOK(ctx)
+	elapsed := ctx.Clock.Now() - started
+	ctx.Equal(len(generateCalls(ctx, config.LLMLarge)), 2, "one UNAVAILABLE must be retried against the large model: calls to %s", config.LLMLarge)
+	ctx.Equal(len(generateCalls(ctx, config.LLMSmall)), 0, "one UNAVAILABLE is a retry, not a fallback: the small model must not be called")
+	ctx.Equal(result.Model, "large", "the retry must be answered by the large model")
+	ctx.Equal(result.Answer, w.expected, "the retried answer must be the reply's text")
+	ctx.Assert(150 <= elapsed && elapsed <= 500, "the retry must wait a 200 ms backoff (virtual), it waited %d ms", elapsed)
+	ctx.GRPC.Fail("Generate", codes.InvalidArgument, "prompt too long", 1, config.LLMLarge)
+	code := generateFails(ctx, "INVALID_ARGUMENT is not transient: it")
+	ctx.Equal(code, codes.InvalidArgument, "INVALID_ARGUMENT must propagate as is")
+	ctx.Equal(len(generateCalls(ctx, config.LLMLarge)), 3, "INVALID_ARGUMENT must not be retried: it will fail the same way")
+	ctx.Equal(len(generateCalls(ctx, config.LLMSmall)), 0, "INVALID_ARGUMENT must not fall back: the small model gets the same bad request")
+}
+
+func CheckFallbackSmall(ctx *harness.Ctx) {
+	w := serveModels(ctx, "faithful")
+	ctx.GRPC.Stop(config.LLMLarge)
+	result := generateOK(ctx)
+	ctx.Equal(result.Model, "small", "with the large model down the small one must answer")
+	ctx.Equal(result.Answer, w.expected, "the small model's reply must come back as the answer")
+	ctx.Equal(len(generateCalls(ctx, config.LLMLarge)), 2, "a large model that is down earns exactly one retry: calls to %s", config.LLMLarge)
+	ctx.Equal(len(generateCalls(ctx, config.LLMSmall)), 1, "calls to %s", config.LLMSmall)
+	request := generateRequest(generateCalls(ctx, config.LLMSmall)[0])
+	ctx.Assert(request.GetModel() == "small" && request.GetPrompt() == w.prompt && request.GetMaxTokens() == config.MaxTokens, "the fallback must send the same prompt and MaxTokens with Model: \\"small\\"")
+	ctx.GRPC.Stop(config.LLMSmall)
+	code := generateFails(ctx, "both models down")
+	ctx.Equal(code, codes.Unavailable, "both models down must surface UNAVAILABLE")
+	total := len(generateCalls(ctx, ""))
+	ctx.Assert(total == 6, "never more than three model calls per generate: the second generate made %d", total-3)
+}
+
+func CheckMaxTokens(ctx *harness.Ctx) {
+	serveModels(ctx, "verbose")
+	result := generateOK(ctx)
+	request := generateRequest(generateCalls(ctx, config.LLMLarge)[0])
+	ctx.Equal(request.GetMaxTokens(), config.MaxTokens, "the request must carry MaxTokens: config.MaxTokens")
+	ctx.Equal(result.Model, "large", "Model")
+	ctx.Equal(replyWords(result.Answer), config.MaxTokens, "a verbose model is cut at max_tokens by the server: words in the answer")
+	ctx.Equal(result.Tokens, config.MaxTokens, "Tokens must be the reply's count")
+}
+`,
   },
   debrief: `A deadline is a budget, not a timeout: the Dasher is owed an answer within a few seconds, and every call the assistant makes spends from that. Attaching \`DEADLINE_S\` to the call itself is what lets a slow model be abandoned at 2 s instead of 3 — a sleep around the call would still wait for the reply. Retrying only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`, once, after a short backoff, is the difference between a retry and a retry storm: those statuses mean "not right now", while an \`INVALID_ARGUMENT\` fails identically twice. The fallback is the part a model service adds: when the large model fails twice, a smaller one with the same prompt and the same citations is a better outcome than an error page — the guardrail (next step) judges its answer on the same terms, and the hand-off to a person is reserved for answers that fail *that*, not for a model that was slow. LinkedIn's platform post frames the same budget in streaming terms: time to first token and time between tokens are what the user feels, so the model sits behind an interface that can swap in a smaller one when the large one cannot meet them (step 5 streams, and the deadline becomes a budget for the first token). Grab's AI Gateway makes the fallback a property of the gateway rather than of each caller — dynamic routing to another model or provider when one fails, with every request and its outcome recorded. Production clients also propagate the caller's remaining deadline instead of picking a fresh one per hop, add jitter to the backoff, hedge a slow request against a second replica, and open a circuit to the large model once its error rate stays high so the fallback stops paying for two failed calls first.`,
 };

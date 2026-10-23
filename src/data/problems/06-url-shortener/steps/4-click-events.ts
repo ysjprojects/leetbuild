@@ -638,6 +638,107 @@ export async function check_flush(ctx) {
   assert.equal(ctx.kafka.records('clicks').length, 1, 'shutdown() must flush the buffered clicks to the broker');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"log"
+	"sync"
+
+	"leetbuild/harness"
+)
+
+// clickWarnings collects what the learner logs, still passing it on to the original output.
+type clickWarnings struct {
+	guard sync.Mutex
+	lines []string
+}
+
+func (w *clickWarnings) Write(p []byte) (int, error) {
+	w.guard.Lock()
+	defer w.guard.Unlock()
+	w.lines = append(w.lines, string(p))
+	return len(p), nil
+}
+
+func (w *clickWarnings) count() int {
+	w.guard.Lock()
+	defer w.guard.Unlock()
+	return len(w.lines)
+}
+
+func watchClickLog() *clickWarnings {
+	w := &clickWarnings{}
+	log.SetOutput(io.MultiWriter(log.Writer(), w))
+	return w
+}
+
+// settleClicks lets the producer's linger pass and its deliveries settle.
+func settleClicks(ctx *harness.Ctx) {
+	ctx.Clock.Advance(1)
+	ctx.Settle()
+}
+
+func CheckTopic(ctx *harness.Ctx) {
+	recordClick(context.Background(), "g9Xc", "https://news.example/", "Mozilla/5.0")
+	settleClicks(ctx)
+	produced := ctx.Kafka.Records("clicks")
+	ctx.Assert(len(produced) == 1, "expected one record on clicks, found %d (topics: %q)", len(produced), ctx.Kafka.Topics())
+	var event map[string]any
+	ctx.NoError(json.Unmarshal(produced[0].Value, &event), "the value must be JSON: %q", produced[0].Value)
+	ctx.Equal(event["code"], "g9Xc", "the value must be JSON carrying the code (%s)", produced[0].Value)
+	ctx.Assert(event["referrer"] == "https://news.example/" && event["ua"] == "Mozilla/5.0", "the value must carry referrer and ua: %s", produced[0].Value)
+	_, hasTs := event["ts"]
+	ctx.Assert(hasTs, "the event must carry a timestamp")
+}
+
+func CheckKeyed(ctx *harness.Ctx) {
+	recordClick(context.Background(), "g9Xc", "", "")
+	recordClick(context.Background(), "g9Xc", "https://other.example/", "")
+	recordClick(context.Background(), "zz12", "", "")
+	settleClicks(ctx)
+	ctx.Equal(ctx.Kafka.Keys("clicks"), []string{"g9Xc", "g9Xc", "zz12"}, "records must be keyed by the code")
+	produced := ctx.Kafka.Records("clicks")
+	ctx.Equal(produced[0].Partition, produced[1].Partition, "the same code must land on the same partition")
+}
+
+// clickWhileStalled is recordClick while the broker sits on its acknowledgements for 2 s: it must not sit with it.
+func clickWhileStalled(ctx *harness.Ctx) {
+	ctx.Kafka.StallFor("clicks", 2)
+	before := ctx.Clock.Now()
+	recordClick(context.Background(), "g9Xc", "", "")
+	waited := ctx.Clock.Now() - before
+	ctx.Assert(waited < 1000, "recordClick took %d ms while the broker was not acknowledging: the redirect would wait for the broker", waited)
+}
+
+func CheckNonBlocking(ctx *harness.Ctx) {
+	clickWhileStalled(ctx)
+	settleClicks(ctx)
+	ctx.Equal(len(ctx.Kafka.Records("clicks")), 1, "the click must still be handed to the producer")
+	clickWhileStalled(ctx)
+	settleClicks(ctx)
+	ctx.Equal(len(ctx.Kafka.Records("clicks")), 2, "records on clicks after the second click")
+}
+
+func CheckCallback(ctx *harness.Ctx) {
+	warnings := watchClickLog()
+	ctx.Kafka.FailNext("clicks", 1)
+	recordClick(context.Background(), "g9Xc", "", "") // the failure arrives through the Completion callback, not as an error
+	settleClicks(ctx)
+	recordClick(context.Background(), "g9Xc", "", "")
+	shutdown()
+	ctx.Assert(warnings.count() > 0, "a failed delivery must be logged by the Completion callback")
+	ctx.Equal(len(ctx.Kafka.Records("clicks")), 1, "the second click must still be produced after the first one failed")
+}
+
+func CheckFlush(ctx *harness.Ctx) {
+	recordClick(context.Background(), "g9Xc", "", "")
+	shutdown()
+	ctx.Equal(len(ctx.Kafka.Records("clicks")), 1, "shutdown() must flush the buffered clicks to the broker")
+}
+`,
   },
   debrief: `A Kafka producer is a buffer with a background thread: \`produce\`/\`send\` costs microseconds, the network happens later in batches. That is what makes "one event per redirect" free — as long as nobody blocks on the acknowledgement. The key is the ordering and the partitioning contract at once: same code → same partition → the next step's consumer sees every click of a link in order, on one consumer. Real pipelines put the referrer through a domain allow-list before it reaches analytics, enrich the event with a geo lookup, and enable idempotent producers so their own retries cannot double-count a click.`,
 };

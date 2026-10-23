@@ -340,7 +340,7 @@ import (
 // Built in step 2 (read_messages.go): the bucket walk, newest first.
 type storedMessage struct{ ID, AuthorID, Content string }
 
-func readPage(ctx context.Context, channelID, before int64, limit int) ([]storedMessage, error) {
+var readPage = func(ctx context.Context, channelID, before int64, limit int) ([]storedMessage, error) {
 	panic("not implemented")
 }
 
@@ -401,7 +401,7 @@ import (
 // Built in step 2 (read_messages.go): the bucket walk, newest first.
 type storedMessage struct{ ID, AuthorID, Content string }
 
-func readPage(ctx context.Context, channelID, before int64, limit int) ([]storedMessage, error) {
+var readPage = func(ctx context.Context, channelID, before int64, limit int) ([]storedMessage, error) {
 	panic("not implemented")
 }
 
@@ -915,6 +915,272 @@ export async function check_reply(ctx) {
   assert.deepEqual(reply.messages.map(x => [x.author_id, x.content]), [['7', 'b'], ['7', 'a']], \`author_id and content must be copied into each Message: \${JSON.stringify(reply.messages.map(x => [x.author_id, x.content]))}\`);
   reply = await stub.GetMessages(req(CHANNEL, sf(NOW_B, 1000)));
   assert.equal(reply.messages.length, 0, 'an empty page is an empty GetMessagesReply, not an error');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"discord/db"
+	pb "discord/gen/messages"
+	"leetbuild/harness"
+)
+
+const (
+	coEpoch    int64 = 1420070400000
+	coBucketMs int64 = 10 * 24 * 3600 * 1000
+	coInsert         = "INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES ($1, $2, $3, $4, $5)"
+)
+
+func coSnowflake(bucket, offsetMs int64) int64 {
+	return ((bucket*coBucketMs + offsetMs) << 22) | (1 << 17)
+}
+
+// coRow is a stored message: its bucket, its offset in it, its content.
+type coRow struct {
+	bucket, offsetMs int64
+	content          string
+}
+
+// coWorld is the learner's data service serving over the real page walk (step 2) on Postgres.
+type coWorld struct {
+	ctx     *harness.Ctx
+	nowB    int64
+	channel int64 // created last bucket: a page walk reads two buckets
+	hot     int64 // created this bucket: one page walk is exactly one query on Postgres
+	end     int64
+	stub    pb.MessageDataClient
+	gate    chan struct{} // while set, page walks wait for it to close
+}
+
+func coNowBucket() int64 { return (time.Now().UnixMilli() - coEpoch) / coBucketMs }
+
+func coHotRows(nowB int64) []coRow {
+	return []coRow{{nowB, 1000, "a"}, {nowB, 2000, "b"}, {nowB, 3000, "c"}}
+}
+
+// startCoalescer stores rows of the default channel (onHot: of the hot one) and starts the data service.
+func startCoalescer(ctx *harness.Ctx, onHot bool, rows ...coRow) *coWorld {
+	nowB := coNowBucket()
+	w := &coWorld{ctx: ctx, nowB: nowB, channel: coSnowflake(nowB-1, 5000), hot: coSnowflake(nowB, 500), end: coSnowflake(nowB, coBucketMs-1)}
+	channel := w.channel
+	if onHot {
+		channel = w.hot
+	}
+	ctx.DB.Reset(db.Schema)
+	for _, row := range rows {
+		w.insert(channel, row, 7)
+	}
+	readPage = w.walk
+	ctx.Main(main)
+	w.stub = pb.NewMessageDataClient(ctx.GRPC.Dial("data-1:9000"))
+	return w
+}
+
+func (w *coWorld) insert(channel int64, row coRow, author int64) {
+	w.ctx.DB.Exec(coInsert, channel, row.bucket, coSnowflake(row.bucket, row.offsetMs), author, row.content)
+}
+
+// walk is step 2's page walk: from the cursor's bucket down to the channel's, one query per bucket.
+func (w *coWorld) walk(ctx context.Context, channelID, before int64, limit int) ([]storedMessage, error) {
+	if gate := w.gate; gate != nil {
+		<-gate
+	}
+	page := []storedMessage{}
+	for bucket := (before >> 22) / coBucketMs; len(page) < limit && bucket >= (channelID>>22)/coBucketMs; bucket-- {
+		rows, err := db.Query(ctx, "SELECT message_id, author_id, content FROM messages"+
+			" WHERE channel_id = $1 AND bucket = $2 AND message_id < $3 ORDER BY message_id DESC LIMIT $4",
+			channelID, bucket, before, limit-len(page))
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id, author int64
+			var content string
+			if err := rows.Scan(&id, &author, &content); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			page = append(page, storedMessage{ID: strconv.FormatInt(id, 10), AuthorID: strconv.FormatInt(author, 10), Content: content})
+		}
+		rows.Close()
+	}
+	return page, nil
+}
+
+func (w *coWorld) req(channel, before int64, limit int) *pb.GetMessagesRequest {
+	return &pb.GetMessagesRequest{ChannelId: uint64(channel), Before: uint64(before), Limit: uint32(limit)}
+}
+
+func (w *coWorld) get(req *pb.GetMessagesRequest) (*pb.GetMessagesReply, error) {
+	return w.stub.GetMessages(context.Background(), req)
+}
+
+// together sends reqs at once: every call is in before any page walk may start.
+func (w *coWorld) together(reqs ...*pb.GetMessagesRequest) ([]*pb.GetMessagesReply, []error) {
+	replies := make([]*pb.GetMessagesReply, len(reqs))
+	errs := make([]error, len(reqs))
+	w.gate = make(chan struct{})
+	var wg sync.WaitGroup
+	for i, req := range reqs {
+		wg.Add(1)
+		go func(i int, req *pb.GetMessagesRequest) {
+			defer wg.Done()
+			replies[i], errs[i] = w.get(req)
+		}(i, req)
+	}
+	w.ctx.Settle()
+	close(w.gate)
+	wg.Wait()
+	w.gate = nil
+	return replies, errs
+}
+
+// selects counts the reads of the messages table Postgres ran since the query log held since entries.
+func (w *coWorld) selects(since int) int {
+	n := 0
+	for _, q := range w.ctx.DB.Queries()[since:] {
+		text := strings.ToLower(strings.Join(strings.Fields(q.SQL), " "))
+		if strings.HasPrefix(text, "select") && strings.Contains(text, "messages") {
+			n++
+		}
+	}
+	return n
+}
+
+func coContents(reply *pb.GetMessagesReply) []string {
+	out := []string{}
+	for _, m := range reply.GetMessages() {
+		out = append(out, m.GetContent())
+	}
+	return out
+}
+
+func CheckServicer(ctx *harness.Ctx) {
+	nowB := coNowBucket()
+	w := startCoalescer(ctx, false, coRow{nowB, 1000, "a"}, coRow{nowB, 2000, "b"})
+	reply, err := w.get(w.req(w.channel, w.end, 50))
+	ctx.NoError(err, "GetMessages must answer a GetMessagesReply")
+	ctx.Assert(reply != nil, "GetMessages must answer a GetMessagesReply, got nil")
+	ctx.Equal(len(reply.GetMessages()), 2, "two stored messages must come back")
+}
+
+func CheckReadsPage(ctx *harness.Ctx) {
+	nowB := coNowBucket()
+	w := startCoalescer(ctx, false, coRow{nowB - 1, 1000, "old"}, coRow{nowB, 1000, "a"}, coRow{nowB, 2000, "b"}, coRow{nowB, 3000, "c"})
+	w.insert(w.hot, coRow{nowB, 2500, "another channel"}, 9)
+	reply, err := w.get(w.req(w.channel, w.end, 2))
+	ctx.NoError(err, "GetMessages(channel, end, 2)")
+	got := [][3]string{}
+	for _, m := range reply.GetMessages() {
+		got = append(got, [3]string{strconv.FormatUint(m.GetId(), 10), strconv.FormatUint(m.GetAuthorId(), 10), m.GetContent()})
+	}
+	want := [][3]string{{strconv.FormatInt(coSnowflake(nowB, 3000), 10), "7", "c"}, {strconv.FormatInt(coSnowflake(nowB, 2000), 10), "7", "b"}}
+	ctx.Equal(got, want, "limit=2 must return the two newest rows of the channel, ids as exact 64-bit integers")
+	reply, err = w.get(w.req(w.channel, coSnowflake(nowB, 2000), 5))
+	ctx.NoError(err, "GetMessages(channel, <id of b>, 5)")
+	ctx.Equal(coContents(reply), []string{"a", "old"}, "before=<id of b> must walk back to the channel's first bucket: expected a, old")
+	reply, err = w.get(w.req(w.hot, w.end, 5))
+	ctx.NoError(err, "GetMessages(other channel, end, 5)")
+	ctx.Equal(coContents(reply), []string{"another channel"}, "channel_id selects the channel: the other channel's page is its one message")
+}
+
+func CheckSingleFlight(ctx *harness.Ctx) {
+	w := startCoalescer(ctx, true, coHotRows(coNowBucket())...)
+	since := len(ctx.DB.Queries())
+	reqs := []*pb.GetMessagesRequest{}
+	for range 5 {
+		reqs = append(reqs, w.req(w.hot, w.end, 50))
+	}
+	replies, errs := w.together(append(reqs, w.req(w.hot, w.end, 10))...)
+	for _, err := range errs {
+		ctx.NoError(err, "a concurrent GetMessages failed")
+	}
+	reads := w.selects(since)
+	ctx.Assert(reads >= 1, "no database read happened for the concurrent requests")
+	ctx.Equal(reads, 2, "5 identical concurrent GetMessages plus one with another limit must cost Postgres 2 page reads (one query each here): identical requests in flight together must share one read, a different key reads on its own; queries")
+	for _, reply := range replies {
+		ctx.Equal(coContents(reply), []string{"c", "b", "a"}, "every coalesced caller gets the full page")
+	}
+	// One impatient subscriber must not cancel the read for the others.
+	since = len(ctx.DB.Queries())
+	w.gate = make(chan struct{})
+	firstCtx, hangUp := context.WithCancel(context.Background())
+	go w.stub.GetMessages(firstCtx, w.req(w.hot, w.end, 50))
+	type outcome struct {
+		reply *pb.GetMessagesReply
+		err   error
+	}
+	second := make(chan outcome, 1)
+	go func() {
+		reply, err := w.get(w.req(w.hot, w.end, 50))
+		second <- outcome{reply, err}
+	}()
+	ctx.Settle() // both callers are in and waiting on one read that has not finished
+	hangUp()
+	close(w.gate)
+	got := <-second
+	w.gate = nil
+	ctx.Assert(got.err == nil, "a subscriber hung up and the other caller's request failed with %v: the shared read was cancelled with it — nobody owns the in-flight read", got.err)
+	ctx.Equal(coContents(got.reply), []string{"c", "b", "a"}, "the remaining subscriber must still get the full page")
+	ctx.Equal(w.selects(since), 1, "the two callers must have shared one read: queries Postgres ran")
+}
+
+func CheckSlotCleared(ctx *harness.Ctx) {
+	nowB := coNowBucket()
+	w := startCoalescer(ctx, true, coHotRows(nowB)...)
+	reply, err := w.get(w.req(w.hot, w.end, 50))
+	ctx.NoError(err, "GetMessages")
+	ctx.Equal(coContents(reply), []string{"c", "b", "a"}, "expected the page c, b, a")
+	w.insert(w.hot, coRow{nowB, 4000, "d"}, 7)
+	since := len(ctx.DB.Queries())
+	reply, err = w.get(w.req(w.hot, w.end, 50))
+	ctx.NoError(err, "GetMessages after message d was stored")
+	fresh := strings.Join(coContents(reply), ",")
+	ctx.Assert(w.selects(since) == 1 && fresh == "d,c,b,a", "an identical request after the first completed must read again (no stale result): message d was stored since, the reply was %v and Postgres ran %d queries", coContents(reply), w.selects(since))
+	ctx.DB.Exec("ALTER TABLE messages RENAME TO messages_offline") // the store goes away under the read
+	since = len(ctx.DB.Queries())
+	replies, errs := w.together(w.req(w.hot, w.end, 50), w.req(w.hot, w.end, 50))
+	for i, err := range errs {
+		ctx.Assert(err != nil, "a failed database read must fail the callers, one was answered %v", replies[i])
+		ctx.Equal(status.Code(err), codes.Unavailable, "a failed read must surface as UNAVAILABLE")
+	}
+	ctx.Equal(w.selects(since), 1, "both callers must have shared the one failing read: times Postgres was asked")
+	ctx.DB.Exec("ALTER TABLE messages_offline RENAME TO messages")
+	since = len(ctx.DB.Queries())
+	reply, err = w.get(w.req(w.hot, w.end, 50))
+	ctx.Assert(err == nil, "the store is back, yet the next identical request failed with %v: the failed read was kept as the answer instead of leaving inflight", status.Code(err))
+	ctx.Assert(strings.Join(coContents(reply), ",") == "d,c,b,a" && w.selects(since) == 1, "after a failure the next request must read fresh and succeed, got %v from %d queries", coContents(reply), w.selects(since))
+}
+
+func CheckReply(ctx *harness.Ctx) {
+	nowB := coNowBucket()
+	w := startCoalescer(ctx, false, coRow{nowB, 1000, "a"}, coRow{nowB, 2000, "b"})
+	reply, err := w.get(w.req(w.channel, w.end, 50))
+	ctx.NoError(err, "GetMessages")
+	ctx.Equal(len(reply.GetMessages()), 2, "expected 2 messages")
+	ids := []uint64{}
+	pairs := [][2]string{}
+	for _, m := range reply.GetMessages() {
+		ids = append(ids, m.GetId())
+		pairs = append(pairs, [2]string{strconv.FormatUint(m.GetAuthorId(), 10), m.GetContent()})
+	}
+	ctx.Equal(ids, []uint64{uint64(coSnowflake(nowB, 2000)), uint64(coSnowflake(nowB, 1000))}, "Message.Id must carry the exact 64-bit snowflake, newest first")
+	for _, id := range ids {
+		ctx.Assert(id > 1<<53, "ids above 2**53 must survive: they are uint64 on the wire, not floats")
+	}
+	ctx.Equal(pairs, [][2]string{{"7", "b"}, {"7", "a"}}, "author_id and content must be copied into each Message")
+	reply, err = w.get(w.req(w.channel, coSnowflake(nowB, 1000), 50))
+	ctx.NoError(err, "an empty page is an empty GetMessagesReply, not an error")
+	ctx.Equal(len(reply.GetMessages()), 0, "an empty page is an empty GetMessagesReply")
 }
 `,
   },

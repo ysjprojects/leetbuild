@@ -642,6 +642,172 @@ export async function check_atomic_incr(ctx) {
   assert(Number(ctx.redis.get(k)) >= LIMIT, \`\${k} must have counted every request, it holds \${JSON.stringify(ctx.redis.get(k))}\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"strconv"
+
+	"leetbuild/harness"
+)
+
+const (
+	fwLimit  = 100
+	fwWindow = 60
+)
+
+var fwBg = context.Background()
+
+// fwAlign parks the clock one second into a window so a check's hundred calls never straddle a boundary; it returns the window number.
+func fwAlign(ctx *harness.Ctx) int64 {
+	nowS := float64(ctx.Clock.Now()) / 1000
+	ctx.Clock.Advance(fwWindow - math.Mod(nowS, fwWindow) + 1)
+	return ctx.Clock.Now() / 1000 / fwWindow
+}
+
+func fwKey(client string, window int64) string { return fmt.Sprintf("rl:%s:%d", client, window) }
+
+func fwAllow(ctx *harness.Ctx, client string) (bool, int) {
+	allowed, retry, err := allow(fwBg, client)
+	ctx.NoError(err, "allow(%q) returned an error", client)
+	return allowed, retry
+}
+
+// fwFill makes fwLimit calls, every one of which must be allowed.
+func fwFill(ctx *harness.Ctx, client string) {
+	for i := range fwLimit {
+		allowed, retry := fwAllow(ctx, client)
+		ctx.Assert(allowed, "call %d of %d for %q in a fresh window must be allowed, it was denied (retryAfterS %d)", i+1, fwLimit, client, retry)
+		ctx.Equal(retry, 0, "an allowed call answers retryAfterS 0; call %d for %q", i+1, client)
+	}
+}
+
+// fwHeld is the key's value, or nil when it does not exist.
+func fwHeld(ctx *harness.Ctx, k string) any {
+	if v, ok := ctx.Redis.Get(k); ok {
+		return v
+	}
+	return nil
+}
+
+// fwCount is the key's value as a number, and whether it is one.
+func fwCount(ctx *harness.Ctx, k string) (int64, bool) {
+	v, ok := ctx.Redis.Get(k)
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	return n, err == nil
+}
+
+func fwAbs(n int64) int64 {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+func CheckLimit(ctx *harness.Ctx) {
+	window := fwAlign(ctx)
+	fwFill(ctx, "alice")
+	allowed, retry := fwAllow(ctx, "alice")
+	ctx.Equal(allowed, false, "call %d must be denied: the limit is %d per 60-second window", fwLimit+1, fwLimit)
+	ctx.Assert(retry >= 1, "a denied call answers retryAfterS as an integer of at least 1, got %d", retry)
+	allowed, _ = fwAllow(ctx, "alice")
+	ctx.Equal(allowed, false, "every call past the limit stays denied until the window ends")
+	count, ok := fwCount(ctx, fwKey("alice", window))
+	ctx.Assert(ok && count >= fwLimit, "the count must live in rl:alice:%d; it holds %s", window, harness.Show(fwHeld(ctx, fwKey("alice", window))))
+}
+
+func CheckRetryAfter(ctx *harness.Ctx) {
+	window := fwAlign(ctx)
+	k := fwKey("bob", window)
+	fwFill(ctx, "bob")
+	allowed, retry := fwAllow(ctx, "bob")
+	ttl := ctx.Redis.TTL(k)
+	ctx.Equal(allowed, false, "call %d must be denied", fwLimit+1)
+	ctx.Assert(fwAbs(int64(retry)-ttl) <= 1, "retryAfterS must be the key's TTL (%d s left on %s), it was %d", ttl, k, retry)
+	ctx.Clock.Advance(17)
+	allowed, retry = fwAllow(ctx, "bob")
+	ttl = ctx.Redis.TTL(k)
+	ctx.Equal(allowed, false, "17 s into a full window the client is still denied")
+	ctx.Assert(fwAbs(int64(retry)-ttl) <= 1 && 41 <= retry && retry <= 44, "17 s later about 43 s are left; retryAfterS was %d (TTL %d)", retry, ttl)
+	ctx.Clock.Advance(fwWindow - 0.4 - math.Mod(float64(ctx.Clock.Now())/1000, fwWindow))
+	allowed, retry = fwAllow(ctx, "bob")
+	ttl = ctx.Redis.TTL(k)
+	ctx.Equal(allowed, false, "400 ms before the window ends it is still full")
+	ctx.Assert(retry >= 1 && fwAbs(int64(retry)-ttl) <= 1, "in the window's last second retryAfterS is still the TTL (%d) and never 0 (a caller must not retry at once); got %d", ttl, retry)
+}
+
+func CheckWindowRolls(ctx *harness.Ctx) {
+	window := fwAlign(ctx)
+	fwFill(ctx, "carol")
+	allowed, _ := fwAllow(ctx, "carol")
+	ctx.Equal(allowed, false, "call %d must be denied", fwLimit+1)
+	ctx.Clock.Advance(fwWindow)
+	allowed, retry := fwAllow(ctx, "carol")
+	ctx.Equal(allowed, true, "60 s later a new window has started: carol's first call in it must be allowed")
+	ctx.Equal(retry, 0, "an allowed call answers retryAfterS 0")
+	ctx.Equal(fwHeld(ctx, fwKey("carol", window+1)), "1", "the new window counts from 1 in its own key rl:carol:%d", window+1)
+	for i := range fwLimit - 1 {
+		allowed, _ = fwAllow(ctx, "carol")
+		ctx.Assert(allowed, "the new window admits a full %d again; call %d was denied", fwLimit, i+2)
+	}
+	allowed, _ = fwAllow(ctx, "carol")
+	ctx.Equal(allowed, false, "call %d of the new window is denied like the old one's", fwLimit+1)
+}
+
+func CheckTtlSet(ctx *harness.Ctx) {
+	window := fwAlign(ctx)
+	k := fwKey("dan", window)
+	fwAllow(ctx, "dan")
+	ctx.Equal(fwHeld(ctx, k), "1", "after one call %s must hold 1", k)
+	ttl := ctx.Redis.TTL(k)
+	ctx.Assert(ttl != -1, "%s has no TTL: a counter without an expiry never goes away, and the client it belongs to stays blocked forever once it fills", k)
+	ctx.Assert(0 < ttl && ttl <= fwWindow, "the first hit sets a TTL of %d s; %s has %d", fwWindow, k, ttl)
+	ctx.Clock.Advance(30)
+	for range 10 {
+		fwAllow(ctx, "dan")
+	}
+	ttl = ctx.Redis.TTL(k)
+	ctx.Assert(0 < ttl && ttl <= fwWindow-30+1, "30 s and ten hits later about 30 s should be left on %s, not %d: only the hit that created the key sets the TTL, later hits must not re-arm it", k, ttl)
+}
+
+func CheckPerClient(ctx *harness.Ctx) {
+	window := fwAlign(ctx)
+	fwFill(ctx, "erin")
+	allowed, _ := fwAllow(ctx, "erin")
+	ctx.Equal(allowed, false, "call %d must be denied", fwLimit+1)
+	allowed, retry := fwAllow(ctx, "frank")
+	ctx.Equal(allowed, true, "frank has made no requests; erin's full window must not block him")
+	ctx.Equal(retry, 0, "an allowed call answers retryAfterS 0")
+	ctx.Equal(fwHeld(ctx, fwKey("frank", window)), "1", "frank's count lives in rl:frank:%d and starts at 1", window)
+	count, ok := fwCount(ctx, fwKey("erin", window))
+	ctx.Assert(ok && count >= fwLimit, "frank's call must not touch erin's counter")
+	allowed, _ = fwAllow(ctx, "erin")
+	ctx.Equal(allowed, false, "erin stays denied after frank's call")
+}
+
+func CheckAtomicIncr(ctx *harness.Ctx) {
+	window := fwAlign(ctx)
+	k := fwKey("gus", window)
+	probe := ctx.Redis.After(k, func() any { return ctx.Redis.Do("INCR", k) })
+	allowed, _ := fwAllow(ctx, "gus")
+	ctx.Assert(probe.Fired, "allow(ctx, %q) never touched %s: the count must live in that key", "gus", k)
+	ctx.Equal(allowed, true, "the first call of a window is allowed even when another worker's request lands right behind it")
+	ctx.Equal(fwHeld(ctx, k), "2", "after allow(ctx, %q) plus one concurrent request from another worker %s must hold 2: a GET-then-SET overwrote the other worker's increment", "gus", k)
+	for i := range fwLimit - 2 {
+		allowed, _ = fwAllow(ctx, "gus")
+		ctx.Assert(allowed, "call %d of the window (counting the other worker's) must be allowed", i+3)
+	}
+	allowed, _ = fwAllow(ctx, "gus")
+	ctx.Equal(allowed, false, "the other worker used one slot, so this is request %d of the window: it must be denied (a lost update would let it through)", fwLimit+1)
+	count, ok := fwCount(ctx, k)
+	ctx.Assert(ok && count >= fwLimit, "%s must have counted every request, it holds %s", k, harness.Show(fwHeld(ctx, k)))
+}
+`,
   },
   debrief: `Everything hangs on where the increment happens. \`INCR\` runs on the server, single-threaded, so a hundred gateway workers hammering one client's key produce one correct count with no lock and no read-modify-write; \`GET\` then \`SET\` would let two workers both see 99 and both write 100, which is exactly the lost update the race check lands. The window lives in the key **name**, so nothing is ever reset: a new minute is a new key that starts from nothing, and the old one is garbage the moment its TTL fires — which is why the TTL is set on the hit that returns 1 and never touched again (re-arming it on every hit would keep a busy client's key alive forever and extend nothing useful). Answering \`TTL\` as \`retry_after_s\` costs one extra command on the deny path only, and clamping it to 1 keeps a client from retrying inside the same second. Real systems add two things: a Lua script or \`SET key 0 EX 60 NX\` before the \`INCR\` so a crash between \`INCR\` and \`EXPIRE\` cannot leave a key without a TTL, and a **sliding** window (or a token bucket) when the boundary burst — 100 requests at 0:59 and 100 more at 1:00 — is not acceptable.`,
 };

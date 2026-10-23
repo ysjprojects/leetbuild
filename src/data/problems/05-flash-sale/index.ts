@@ -77,6 +77,6 @@ and the exact places where each one can lie to the others.`,
     ],
   },
   steps: [reserveStockStep, checkoutEndpointStep, orderIntakeStep, fulfilmentStep, releaseExpiredStep],
-  support: {python: protoModules, typescript: protoFiles},
+  support: {python: protoModules, typescript: protoFiles, go: protoFiles},
   learn,
 };

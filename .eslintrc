@@ -17,7 +17,7 @@
     "plugin:@next/next/recommended",
     "prettier"
   ],
-  "ignorePatterns": ["*/public", "*/node_modules/*", "*/.next/*", "*/dist/*"],
+  "ignorePatterns": ["*/public", "*/node_modules/*", "*/.next/*", "*/dist/*", "src/lib/runtime/wasmExec.js"],
   "rules": {
     "react/display-name": "off",
     "react-memo/require-usememo": "error",

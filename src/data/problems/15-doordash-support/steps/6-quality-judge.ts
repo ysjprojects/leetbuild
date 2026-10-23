@@ -523,7 +523,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"assistant/config"
-	"assistant/db" // db.Pool: the assistant's pgxpool.Pool; db.Pool.Exec(ctx, sql, args...) autocommits one statement
+	"assistant/db" // db.Pool: the assistant's *sql.DB; db.Pool.ExecContext(ctx, sql, args...) autocommits one statement
 	pb "assistant/gen/support"
 )
 
@@ -599,7 +599,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"assistant/config"
-	"assistant/db" // db.Pool: the assistant's pgxpool.Pool; db.Pool.Exec(ctx, sql, args...) autocommits one statement
+	"assistant/db" // db.Pool: the assistant's *sql.DB; db.Pool.ExecContext(ctx, sql, args...) autocommits one statement
 	pb "assistant/gen/support"
 )
 
@@ -647,7 +647,7 @@ func evaluate(ctx context.Context, question, answer string, sources []string) (S
 
 // recordScores writes one row per (session, turn): a redelivered record overwrites its own row instead of adding a second.
 func recordScores(ctx context.Context, sessionID string, turn int, s Scores) error {
-	_, err := db.Pool.Exec(ctx,
+	_, err := db.Pool.ExecContext(ctx,
 		"INSERT INTO quality_scores (session_id, turn, groundedness, coherence, compliance, pass) VALUES ($1, $2, $3, $4, $5, $6)"+
 			" ON CONFLICT (session_id, turn) DO UPDATE SET groundedness = EXCLUDED.groundedness, coherence = EXCLUDED.coherence,"+
 			" compliance = EXCLUDED.compliance, pass = EXCLUDED.pass",
@@ -1491,6 +1491,370 @@ export async function check_judge_down_retries(ctx) {
   assert.deepEqual(Object.keys(held).sort(), ['s1|1', 's2|1'], \`two distinct (session, turn) pairs were delivered three times: quality_scores must hold exactly those two rows, it holds \${JSON.stringify(Object.keys(held).sort())}\`);
   assert(sameScores(held['s1|1'], evaluate(GROUNDED.question, GROUNDED.answer, GROUNDED.sources)) && sameScores(held['s2|1'], evaluate(HALF.question, HALF.answer, HALF.sources)), "the retried record must end up with the judge's scores, as if it had never failed");
   fullyCommitted(ctx);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"math"
+	"sort"
+	"strings"
+	"sync"
+
+	"github.com/segmentio/kafka-go"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"assistant/config"
+	"assistant/db"
+	"assistant/model"
+	pb "assistant/gen/support"
+
+	"leetbuild/harness"
+)
+
+// qjKind is an answer as the API would have produced it.
+type qjKind struct {
+	question, answer string
+	sources          []string
+}
+
+var (
+	// grounded cites only retrieved chunks.
+	qjGrounded = qjKind{"When do I get paid?", "Based on [kb:pay-0][kb:pay-1]: Dasher earnings for a week are paid out every Monday by direct deposit.", []string{"pay-0", "pay-1"}}
+	// hallucinated invents a policy and a chunk.
+	qjHallucinated = qjKind{"The order was cancelled at the restaurant, do I still get paid?", "Your issue will be resolved within 7 days, guaranteed [kb:policy-404].", []string{"red-card-1"}}
+	// half-grounded has one citation outside its sources.
+	qjHalf = qjKind{"Do my tips come with Fast Pay?", "Based on [kb:tips-0][kb:pay-3]: Tips are included in the weekly payout and in Fast Pay.", []string{"tips-0"}}
+)
+
+// qjSeed puts one turn record on the topic, keyed by its session.
+func qjSeed(ctx *harness.Ctx, sessionID string, n int, kind qjKind, escalated bool) {
+	record := map[string]any{"session_id": sessionID, "turn": n, "dasher_id": "d-" + sessionID, "question": kind.question, "answer": kind.answer, "sources": kind.sources, "escalated": false, "model": "large", "tokens": len(strings.Split(kind.answer, " "))}
+	if escalated {
+		record["answer"], record["sources"], record["escalated"], record["tokens"] = config.HandoffText, []string{}, true, len(strings.Split(config.HandoffText, " "))
+	}
+	value, _ := json.Marshal(record)
+	ctx.Kafka.Seed(config.Topic, sessionID, string(value))
+}
+
+// qjJudge is the judge at judge:50051 (the deterministic rubric of assistant/model); it records what it was asked.
+type qjJudge struct {
+	pb.UnimplementedJudgeServer
+	mu    sync.Mutex
+	calls []*pb.EvaluateRequest
+}
+
+func (j *qjJudge) Evaluate(_ context.Context, req *pb.EvaluateRequest) (*pb.Scores, error) {
+	j.mu.Lock()
+	j.calls = append(j.calls, req)
+	j.mu.Unlock()
+	s := model.Evaluate(req.GetQuestion(), req.GetAnswer(), req.GetContextIds())
+	return &pb.Scores{Groundedness: float32(s.Groundedness), Coherence: float32(s.Coherence), Compliance: float32(s.Compliance), Pass: s.Pass}, nil
+}
+
+func (j *qjJudge) asked() []*pb.EvaluateRequest {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return append([]*pb.EvaluateRequest(nil), j.calls...)
+}
+
+// qjWorker is the learner's consumer in front of the judge and an empty quality_scores table.
+func qjWorker(ctx *harness.Ctx) *qjJudge {
+	ctx.DB.Reset(db.Schema)
+	j := &qjJudge{}
+	pb.RegisterJudgeServer(ctx.GRPC.Server(config.Judge), j)
+	return j
+}
+
+// qjDrain runs the learner's loop until it returns or waits for records that will not come; the
+// error it returned with, nil while it was still waiting.
+func qjDrain(ctx *harness.Ctx) error {
+	loop, cancel := context.WithCancel(context.Background())
+	var err error
+	returned := ctx.Drain(func() { err = run(loop) })
+	cancel()
+	ctx.Settle()
+	if !returned {
+		return nil
+	}
+	return err
+}
+
+// qjRun drains the loop; an error it returns fails the check.
+func qjRun(ctx *harness.Ctx) {
+	ctx.NoError(qjDrain(ctx), "run")
+}
+
+// qjRestart is the consumer coming back: a new process opens the reader the file declares.
+func qjRestart() {
+	reader.Close()
+	reader = kafka.NewReader(kafka.ReaderConfig{
+		Brokers:     []string{"kafka:9092"},
+		GroupID:     config.Group,
+		Topic:       config.Topic,
+		StartOffset: kafka.FirstOffset,
+	})
+}
+
+// qjRows is {"session|turn": row} as the table holds it.
+func qjRows(ctx *harness.Ctx) map[string]harness.Row {
+	out := map[string]harness.Row{}
+	for _, r := range ctx.DB.Query("SELECT * FROM quality_scores ORDER BY session_id, turn") {
+		out[fmt.Sprintf("%v|%v", r["session_id"], r["turn"])] = r
+	}
+	return out
+}
+
+func qjKeys(rows map[string]harness.Row) []string {
+	keys := []string{}
+	for k := range rows {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func qjSameScores(row harness.Row, want model.Scores) bool {
+	near := func(v any, w float64) bool {
+		f, ok := v.(float64)
+		return ok && math.Abs(f-w) < 1e-3
+	}
+	pass, _ := row["pass"].(bool)
+	return near(row["groundedness"], want.Groundedness) && near(row["coherence"], want.Coherence) && near(row["compliance"], want.Compliance) && pass == want.Pass
+}
+
+// qjCommit is a commit as the broker saw it, with the database's query log at that instant.
+type qjCommit struct {
+	group   string
+	offsets harness.KafkaOffsets
+	queries []harness.DBQuery
+}
+
+func qjWatchCommits(ctx *harness.Ctx) *[]qjCommit {
+	var mu sync.Mutex
+	seen := &[]qjCommit{}
+	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
+		copied := harness.KafkaOffsets{}
+		for tp, o := range offsets {
+			copied[tp] = o
+		}
+		mu.Lock()
+		*seen = append(*seen, qjCommit{group, copied, ctx.DB.Queries()})
+		mu.Unlock()
+	})
+	return seen
+}
+
+// qjRowWritten reports whether an INSERT into quality_scores for (sessionID, turn) had run by the end of this query log.
+func qjRowWritten(queries []harness.DBQuery, sessionID string, turn int) bool {
+	for _, q := range queries {
+		if !strings.Contains(strings.ToLower(q.SQL), "insert into quality_scores") {
+			continue
+		}
+		hasSession, hasTurn := false, false
+		for _, a := range q.Args {
+			hasSession = hasSession || a == sessionID
+			hasTurn = hasTurn || fmt.Sprint(a) == fmt.Sprint(turn)
+		}
+		if hasSession && hasTurn {
+			return true
+		}
+	}
+	return false
+}
+
+// qjCommitted is a record of the topic and the query log at the commit that first covered its offset.
+type qjCommitted struct {
+	sessionID string
+	turn      int
+	queries   []harness.DBQuery
+}
+
+func qjNewlyCommitted(ctx *harness.Ctx, commits []qjCommit) []qjCommitted {
+	var out []qjCommitted
+	done := map[int]int64{}
+	for _, c := range commits {
+		if c.group != config.Group {
+			continue
+		}
+		for tp, offset := range c.offsets {
+			if tp.Topic != config.Topic {
+				continue
+			}
+			for _, r := range ctx.Kafka.Records(config.Topic) {
+				if r.Partition == tp.Partition && done[tp.Partition] <= r.Offset && r.Offset < offset {
+					var t struct {
+						SessionID string \`json:"session_id"\`
+						Turn      int    \`json:"turn"\`
+					}
+					_ = json.Unmarshal(r.Value, &t)
+					out = append(out, qjCommitted{t.SessionID, t.Turn, c.queries})
+				}
+			}
+			if offset > done[tp.Partition] {
+				done[tp.Partition] = offset
+			}
+		}
+	}
+	return out
+}
+
+func qjFullyCommitted(ctx *harness.Ctx) {
+	lag := ctx.Kafka.Lag(config.Group, config.Topic)
+	ctx.Assert(lag == 0, "%d record(s) of %s are not committed for group %s after the consumer handled them", lag, config.Topic, config.Group)
+}
+
+func CheckGroupManualCommit(ctx *harness.Ctx) {
+	qjSeed(ctx, "s1", 1, qjGrounded, false)
+	qjSeed(ctx, "s2", 1, qjHallucinated, false)
+	qjSeed(ctx, "s1", 2, qjHalf, false)
+	qjWorker(ctx)
+	qjRun(ctx)
+	subscriptions := ctx.Kafka.EventsOf("subscribe")
+	ctx.Assert(len(subscriptions) > 0, "the consumer never subscribed to a topic")
+	last := subscriptions[len(subscriptions)-1]
+	ctx.Equal(last.Group, config.Group, "GroupID must be config.Group")
+	subscribed := false
+	for _, t := range last.Topics {
+		subscribed = subscribed || t == config.Topic
+	}
+	ctx.Assert(subscribed, "the consumer must subscribe to config.Topic (%q), got %q", config.Topic, last.Topics)
+	members := 0
+	autoCommit := false
+	for _, c := range ctx.Kafka.Consumers() {
+		if c.Group == config.Group {
+			members++
+			autoCommit = autoCommit || c.AutoCommit
+		}
+	}
+	ctx.Assert(members > 0 && !autoCommit, "the consumer commits on its own (ReadMessage, or a CommitInterval): offsets would be acknowledged before the row is written — FetchMessage and CommitMessages after recordScores")
+	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "offsets were auto-committed")
+	manual := false
+	for _, e := range ctx.Kafka.EventsOf("manual-commit") {
+		manual = manual || e.Group == config.Group
+	}
+	ctx.Assert(manual, "no explicit commit happened for group %s", config.Group)
+	held := qjRows(ctx)
+	ctx.Assert(len(held) == 3, "three answered turns were on %s, quality_scores holds %d row(s): the consumer must read from the beginning (kafka.FirstOffset) and score every record", config.Topic, len(held))
+	qjFullyCommitted(ctx)
+}
+
+func CheckScoresPerTurn(ctx *harness.Ctx) {
+	qjSeed(ctx, "s1", 1, qjGrounded, false)
+	qjSeed(ctx, "s2", 1, qjHallucinated, false)
+	qjSeed(ctx, "s1", 2, qjHalf, false)
+	j := qjWorker(ctx)
+	qjRun(ctx)
+	ctx.Assert(len(ctx.GRPC.CallsTo("Evaluate", config.Judge)) > 0, "no Judge.Evaluate reached %s: every answered turn is judged", config.Judge)
+	asked := j.asked()
+	ctx.Assert(len(asked) == 3, "three answered turns must mean three Evaluate calls, the judge saw %d", len(asked))
+	for _, kind := range []qjKind{qjGrounded, qjHallucinated, qjHalf} {
+		var first *pb.EvaluateRequest
+		for _, c := range asked {
+			if c.GetAnswer() == kind.answer && first == nil {
+				first = c
+			}
+		}
+		ctx.Assert(first != nil, "the judge was never asked about %q…", kind.answer[:40])
+		ctx.Equal(first.GetQuestion(), kind.question, "Evaluate must carry the record's question")
+		ctx.Equal(first.GetContextIds(), kind.sources, "ContextIds must be the record's sources")
+	}
+	held := qjRows(ctx)
+	ctx.Equal(qjKeys(held), []string{"s1|1", "s1|2", "s2|1"}, "one row per (session_id, turn) was expected in quality_scores")
+	for _, tc := range []struct {
+		key  string
+		kind qjKind
+	}{{"s1|1", qjGrounded}, {"s2|1", qjHallucinated}, {"s1|2", qjHalf}} {
+		want := model.Evaluate(tc.kind.question, tc.kind.answer, tc.kind.sources)
+		row := held[tc.key]
+		ctx.Assert(qjSameScores(row, want), "%s: the row holds groundedness %v, coherence %v, compliance %v, pass %v; the judge said %+v: store the judge's scores as they came", tc.key, row["groundedness"], row["coherence"], row["compliance"], row["pass"], want)
+	}
+	ctx.Equal(held["s1|1"]["pass"], true, "the grounded answer cites only its sources: the judge passes it, and the row must say so")
+	ctx.Equal(held["s2|1"]["pass"], false, "the hallucinated answer cites [kb:policy-404], which was never retrieved, and promises an outcome: it must be stored as a failure")
+	ctx.Equal(held["s1|2"]["pass"], false, "an answer with one citation outside its sources scores 0.5 on groundedness: stored as a failure")
+}
+
+func CheckEscalatedCommitted(ctx *harness.Ctx) {
+	qjSeed(ctx, "s1", 1, qjGrounded, false)
+	qjSeed(ctx, "s1", 2, qjGrounded, true)
+	qjSeed(ctx, "s3", 1, qjGrounded, true)
+	qjSeed(ctx, "s2", 1, qjHallucinated, false)
+	j := qjWorker(ctx)
+	if err := qjDrain(ctx); err != nil {
+		ctx.Fatalf("an escalated turn must not stop the consumer, but run() returned %v", err)
+	}
+	asked := j.asked()
+	ctx.Assert(len(asked) == 2, "two answered turns and two handoffs: the judge must be asked twice, it was asked %d time(s)", len(asked))
+	for _, c := range asked {
+		ctx.Assert(c.GetAnswer() != config.HandoffText, "the handoff text is not an answer: an escalated turn must not be sent to the judge")
+	}
+	ctx.Equal(qjKeys(qjRows(ctx)), []string{"s1|1", "s2|1"}, "escalated turns produce no row in quality_scores")
+	lag := ctx.Kafka.Lag(config.Group, config.Topic)
+	ctx.Assert(lag == 0, "%d record(s) not committed: an escalated turn's offset must be committed too, or it is redelivered forever", lag)
+}
+
+func CheckCommitAfterWrite(ctx *harness.Ctx) {
+	qjSeed(ctx, "s1", 1, qjGrounded, false)
+	qjSeed(ctx, "s2", 1, qjHalf, false)
+	qjWorker(ctx)
+	commits := qjWatchCommits(ctx)
+	qjRun(ctx)
+	committed := qjNewlyCommitted(ctx, *commits)
+	ctx.Assert(len(committed) > 0, "the offsets of s1 and s2 were never committed by group %s", config.Group)
+	for _, c := range committed {
+		ctx.Assert(qjRowWritten(c.queries, c.sessionID, c.turn), "the offset of (%s, %d) was committed before its row was in quality_scores: commit only after recordScores returned", c.sessionID, c.turn)
+	}
+	// Postgres starts refusing: turn 99 now violates a constraint, so the write fails.
+	ctx.DB.Exec("ALTER TABLE quality_scores ADD CONSTRAINT scores_down CHECK (turn <> 99) NOT VALID")
+	qjSeed(ctx, "s1", 99, qjGrounded, false)
+	_ = qjDrain(ctx) // the failed write surfaces here; what matters is what was committed
+	_, written := qjRows(ctx)["s1|99"]
+	ctx.Assert(!written, "the write of turn 99 failed and must have left no row")
+	ctx.Equal(ctx.Kafka.Lag(config.Group, config.Topic), 1, "a record whose write failed must not be committed: it has to come back; records not committed")
+	ctx.DB.Exec("ALTER TABLE quality_scores DROP CONSTRAINT scores_down")
+	qjRestart()
+	qjRun(ctx)
+	held := qjRows(ctx)
+	_, written = held["s1|99"]
+	ctx.Assert(written, "after a restart turn 99 must be redelivered and written, quality_scores holds %q", qjKeys(held))
+	ctx.Assert(len(held) == 3, "three answered turns, %d rows: each (session, turn) is written once", len(held))
+	qjFullyCommitted(ctx)
+}
+
+func CheckJudgeDownRetries(ctx *harness.Ctx) {
+	qjSeed(ctx, "s1", 1, qjGrounded, false)
+	qjSeed(ctx, "s2", 1, qjHalf, false)
+	qjSeed(ctx, "s1", 1, qjGrounded, false) // the producer retried: a duplicate
+	qjWorker(ctx)
+	commits := qjWatchCommits(ctx)
+	// The judge's first answer is UNAVAILABLE (a deploy, a restart); it is back for every call after that.
+	ctx.GRPC.Fail("Evaluate", codes.Unavailable, "", 1, config.Judge)
+	if err := qjDrain(ctx); err != nil && status.Code(err) != codes.Unavailable {
+		ctx.Fatalf("run: %v", err)
+	}
+	if ctx.Kafka.Lag(config.Group, config.Topic) > 0 {
+		// The consumer stopped on the failure instead of retrying in place: acceptable only if nothing was committed for it.
+		qjRestart()
+		qjRun(ctx)
+	}
+	calls := ctx.GRPC.CallsTo("Evaluate", config.Judge)
+	ctx.Assert(len(calls) >= 4, "three records (one a duplicate) and one UNAVAILABLE answer mean at least four Evaluate calls — the failed one and a retry — the judge saw %d: an UNAVAILABLE judge means ask again later, not skip", len(calls))
+	unavailable := false
+	for _, c := range calls {
+		unavailable = unavailable || c.Code == codes.Unavailable
+	}
+	ctx.Assert(unavailable, "the UNAVAILABLE call never happened")
+	for _, c := range qjNewlyCommitted(ctx, *commits) {
+		ctx.Assert(qjRowWritten(c.queries, c.sessionID, c.turn), "the offset of (%s, %d) was committed while no row existed for it: a judge answering UNAVAILABLE must leave the offset uncommitted", c.sessionID, c.turn)
+	}
+	held := qjRows(ctx)
+	ctx.Equal(qjKeys(held), []string{"s1|1", "s2|1"}, "two distinct (session, turn) pairs were delivered three times: quality_scores must hold exactly those two rows")
+	ctx.Assert(qjSameScores(held["s1|1"], model.Evaluate(qjGrounded.question, qjGrounded.answer, qjGrounded.sources)) && qjSameScores(held["s2|1"], model.Evaluate(qjHalf.question, qjHalf.answer, qjHalf.sources)), "the retried record must end up with the judge's scores, as if it had never failed")
+	qjFullyCommitted(ctx)
 }
 `,
   },

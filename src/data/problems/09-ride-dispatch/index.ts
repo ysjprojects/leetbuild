@@ -76,6 +76,10 @@ you must not let take you down.`,
     ],
   },
   steps: [requestRideStep, locationStreamStep, nearestDriversStep, offerLockStep, tripEventsStep, etaStep],
-  support: {python: {...protoModules, ...supportModules}, typescript: {...protoFiles, ...supportModulesTs}},
+  support: {
+    python: {...protoModules, ...supportModules},
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: protoFiles,
+  },
   learn,
 };

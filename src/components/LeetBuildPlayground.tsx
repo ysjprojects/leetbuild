@@ -1158,7 +1158,13 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
             ? filesRef.current[s.id] ?? codeFor(s, language).starter
             : codeFor(s, language).solution;
       }
-      return {files, support: problem.support?.[language] ?? {}, harness, checks: [...checks]};
+      return {
+        files,
+        support: problem.support?.[language] ?? {},
+        harness,
+        checks: [...checks],
+        entry: fileName(step.file, language),
+      };
     },
     [problem, step, language],
   );

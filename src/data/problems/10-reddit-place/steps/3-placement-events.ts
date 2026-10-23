@@ -296,7 +296,7 @@ func recordPlacement(ctx context.Context, user string, x, y, color int) {
 }
 
 func shutdown() {
-	// TODO: close the writer so buffered placements reach the broker
+	// TODO: close the writer so buffered placements reach the broker; give up after a few seconds
 }
 `,
       solution: `package main
@@ -343,8 +343,16 @@ func recordPlacement(ctx context.Context, user string, x, y, color int) {
 }
 
 func shutdown() {
-	if err := writer.Close(); err != nil {
-		log.Printf("closing placements writer: %v", err)
+	// Close flushes and waits for every batch; a broker that is down must not hold the stop forever.
+	closed := make(chan error, 1)
+	go func() { closed <- writer.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			log.Printf("closing placements writer: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		log.Printf("placements writer not flushed after 5 s")
 	}
 }
 `,
@@ -738,6 +746,180 @@ export async function check_flush(ctx) {
   await m.shutdown();
   const took = (ctx.clock.now() - start) / 1000;
   assert(took <= 10, \`with the broker down, shutdown() took \${took.toFixed(0)} s: flush with a timeout so a stop is not held for the producer's whole request timeout\`);
+}
+`,
+    go: `package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"log"
+	"math"
+	"net/http"
+	"reflect"
+	"sort"
+	"strconv"
+
+	"github.com/segmentio/kafka-go"
+
+	"leetbuild/harness"
+)
+
+var (
+	peBg   = context.Background()
+	peTile = map[string]any{"x": 3, "y": 7, "color": 12, "user": "ana"}
+)
+
+// peLogged collects what the package logs from now on; the returned func restores the logger.
+func peLogged() (*bytes.Buffer, func()) {
+	buf := &bytes.Buffer{}
+	prev := log.Writer()
+	log.SetOutput(buf)
+	return buf, func() { log.SetOutput(prev) }
+}
+
+// peReopen gives the package a new writer configured like the closed one: kafka-go's Close is final,
+// unlike the TypeScript and Python flush, and the API keeps producing after a shutdown() here.
+func peReopen() {
+	closed := reflect.ValueOf(writer).Elem()
+	fresh := reflect.New(closed.Type()).Elem()
+	for i := 0; i < closed.NumField(); i++ {
+		if closed.Type().Field(i).IsExported() {
+			fresh.Field(i).Set(closed.Field(i))
+		}
+	}
+	writer = fresh.Addr().Interface().(*kafka.Writer)
+}
+
+func pePixel(ctx *harness.Ctx, x, y int) int {
+	board, _ := ctx.Redis.Get("board")
+	if off := y*100 + x; off < len(board) {
+		return int(board[off])
+	}
+	return 0
+}
+
+func pePlacements(ctx *harness.Ctx) []map[string]any {
+	out := []map[string]any{}
+	for _, v := range ctx.Kafka.Values("placements") {
+		var e map[string]any
+		ctx.NoError(json.Unmarshal([]byte(v), &e), "a placements record is not a JSON object: %q", v)
+		out = append(out, e)
+	}
+	return out
+}
+
+func peUsers(ctx *harness.Ctx) []string {
+	users := []string{}
+	for _, e := range pePlacements(ctx) {
+		user, _ := e["user"].(string)
+		users = append(users, user)
+	}
+	return users
+}
+
+// peAPI is POST /place as step 1 deploys it: step 2's cooldown and paint, then this recordPlacement.
+func peAPI(ctx *harness.Ctx) *harness.HTTP {
+	return ctx.HTTP(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		var req struct {
+			X     int    \`json:"x"\`
+			Y     int    \`json:"y"\`
+			Color int    \`json:"color"\`
+			User  string \`json:"user"\`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			rw.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		key := "cooldown:" + req.User
+		if !ctx.Redis.Set(key, "1", "NX", "EX", 300) {
+			rw.Header().Set("Retry-After", strconv.FormatInt(max(1, ctx.Redis.TTL(key)), 10))
+			rw.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		ctx.Redis.Do("SETRANGE", "board", req.Y*100+req.X, string([]byte{byte(req.Color)}))
+		recordPlacement(r.Context(), req.User, req.X, req.Y, req.Color)
+		rw.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(rw).Encode(req)
+	}))
+}
+
+func CheckTopic(ctx *harness.Ctx) {
+	recordPlacement(peBg, "ana", 3, 7, 12)
+	ctx.Settle()
+	produced := pePlacements(ctx)
+	ctx.Equal(len(produced), 1, "the records on placements")
+	event := produced[0]
+	got := map[string]any{"user": event["user"], "x": event["x"], "y": event["y"], "color": event["color"]}
+	ctx.Equal(got, map[string]any{"user": "ana", "x": 3.0, "y": 7.0, "color": 12.0}, "the value must be JSON carrying user, x, y and color: %v", event)
+	ts, ok := event["ts"].(float64)
+	ctx.Assert(ok && ts == math.Trunc(ts) && math.Abs(ts-float64(ctx.Clock.Now())) < 60000, "ts must be the current time in epoch milliseconds, got %v", event["ts"])
+}
+
+func CheckKeyedByTile(ctx *harness.Ctx) {
+	recordPlacement(peBg, "ana", 3, 7, 12)
+	recordPlacement(peBg, "bo", 3, 7, 5)
+	recordPlacement(peBg, "ana", 7, 3, 12)
+	ctx.Settle()
+	ctx.Equal(ctx.Kafka.Keys("placements"), []string{"3:7", "3:7", "7:3"}, "records must be keyed by the tile %q", "x:y")
+	records := ctx.Kafka.Records("placements")
+	ctx.Equal(records[0].Partition, records[1].Partition, "two placements on the same pixel must land on the same partition, in order")
+}
+
+func CheckNonBlocking(ctx *harness.Ctx) {
+	api := peAPI(ctx)
+	ctx.Kafka.Stall("") // the brokers stop answering
+	start := ctx.Clock.Now()
+	r := api.Post("/place", peTile)
+	took := float64(ctx.Clock.Now()-start) / 1000
+	ctx.Assert(took < 0.5, "with the broker not answering, POST /place took %.1f s: recordPlacement must hand the record to the writer and return, not wait for the acknowledgement", took)
+	ctx.Equal(r.Status, 200, "with the broker not answering, POST /place must still answer 200: the tile is painted, the event follows when the broker is back")
+	ctx.Equal(pePixel(ctx, 3, 7), 12, "the tile must be on the board while its event waits for the broker")
+	start = ctx.Clock.Now()
+	recordPlacement(peBg, "bo", 4, 7, 1)
+	took = float64(ctx.Clock.Now()-start) / 1000
+	ctx.Assert(took < 0.5, "recordPlacement waited %.1f s for a broker that does not answer: enqueue and return", took)
+	ctx.Kafka.Resume("")
+	recordPlacement(peBg, "cy", 5, 7, 2) // the writer's retries get served again
+	ctx.Settle()
+	users := peUsers(ctx)
+	sort.Strings(users)
+	ctx.Equal(users, []string{"ana", "bo", "cy"}, "once the broker answered again every placement handed to the writer must be delivered: the users of the tiles on placements")
+}
+
+func CheckCallback(ctx *harness.Ctx) {
+	records, restore := peLogged()
+	defer restore()
+	ctx.Kafka.FailNext("placements", 1)
+	recordPlacement(peBg, "ana", 3, 7, 12) // the failure arrives through the Completion callback, not as an error
+	recordPlacement(peBg, "ana", 4, 7, 12)
+	shutdown()
+	ctx.Assert(records.Len() > 0, "a failed delivery must be logged by the Completion callback")
+	ctx.Equal(len(ctx.Kafka.Records("placements")), 1, "the second placement must still be produced after the first one failed: the records on placements")
+	// Through the API: a broker failure must not undo a painted tile.
+	peReopen()
+	records.Reset()
+	ctx.Kafka.FailNext("placements", 1)
+	r := peAPI(ctx).Post("/place", map[string]any{"x": 5, "y": 7, "color": 9, "user": "cy"})
+	ctx.Equal(r.Status, 200, "with the broker failing, POST /place must still answer 200: the tile is painted, the event is best effort")
+	ctx.Equal(pePixel(ctx, 5, 7), 9, "the tile must stay on the board even though its event was not delivered")
+	shutdown()
+	ctx.Assert(records.Len() > 0, "the failed delivery of cy's placement must be logged")
+}
+
+func CheckFlush(ctx *harness.Ctx) {
+	ctx.Kafka.StallFor("", 2) // the broker is slow to answer at the moment of the stop
+	recordPlacement(peBg, "ana", 3, 7, 12)
+	shutdown()
+	ctx.Equal(peUsers(ctx), []string{"ana"}, "shutdown() returned with ana's placement still in the writer's buffer (the broker answered after 2 s): flush so a clean stop loses nothing. The users of the tiles on placements")
+	peReopen()
+	ctx.Kafka.Stall("") // now the broker is down for good
+	recordPlacement(peBg, "bo", 4, 7, 1)
+	start := ctx.Clock.Now()
+	shutdown()
+	took := float64(ctx.Clock.Now()-start) / 1000
+	ctx.Assert(took <= 10, "with the broker down, shutdown() took %.0f s: flush with a timeout so a stop is not held for the writer's whole write timeout", took)
 }
 `,
   },

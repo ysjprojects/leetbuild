@@ -365,7 +365,7 @@ type Entry struct {
 }
 
 // writeTransaction writes the rows and returns the transaction id (built in step 4, ledger_writer.go).
-func writeTransaction(ctx context.Context, entries []Entry, description string, eventID *string, postedAt int64, settles *string) (string, error) {
+var writeTransaction = func(ctx context.Context, entries []Entry, description string, eventID *string, postedAt int64, settles *string) (string, error) {
 	panic("not implemented")
 }
 
@@ -431,7 +431,7 @@ type Entry struct {
 }
 
 // writeTransaction writes the rows and returns the transaction id (built in step 4, ledger_writer.go).
-func writeTransaction(ctx context.Context, entries []Entry, description string, eventID *string, postedAt int64, settles *string) (string, error) {
+var writeTransaction = func(ctx context.Context, entries []Entry, description string, eventID *string, postedAt int64, settles *string) (string, error) {
 	panic("not implemented")
 }
 
@@ -1129,6 +1129,287 @@ export async function check_created(ctx) {
   assert.equal(payload?.posted_at, Number(t.posted_at), \`the body must carry the posted_at the journal got (\${t.posted_at}), got \${JSON.stringify(payload?.posted_at)}\`);
   assert.deepEqual(payload?.entries, BALANCED.entries, \`the body must echo the cleaned entries (account, currency, amount only), got \${JSON.stringify(payload?.entries)}\`);
   assert.equal(r.headers['location'], \`/transactions/\${t.id}\`, \`Location must be /transactions/\${t.id}, got \${JSON.stringify(r.headers['location'])}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"time"
+
+	"github.com/google/uuid"
+
+	ledgerdb "ledger/db"
+	"leetbuild/harness"
+)
+
+const ledgerSchema = \`
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL REFERENCES transactions (id),
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL,
+    posted_at bigint NOT NULL
+);
+\`
+
+const ledgerEUR = "EUR"
+
+func ledgerBalanced() map[string]any {
+	return map[string]any{
+		"description": "capture ch_1",
+		"entries": []any{
+			map[string]any{"account": "cash:acquirer", "currency": ledgerEUR, "amount": 4999},
+			map[string]any{"account": "clearing:payments", "currency": ledgerEUR, "amount": -4999},
+		},
+	}
+}
+
+func ledgerEntriesOf(currency string, amounts ...any) []any {
+	accounts := []string{"cash:acquirer", "clearing:payments", "revenue:fees"}
+	out := []any{}
+	for i, amount := range amounts {
+		out = append(out, map[string]any{"account": accounts[i], "currency": currency, "amount": amount})
+	}
+	return out
+}
+
+// ledgerJournalWrite is the journal writer of step 4 (ledger_writer.go): one database transaction,
+// insert-or-skip on the event id, the entries at the transaction's posted_at.
+func ledgerJournalWrite(ctx context.Context, entries []Entry, description string, eventID *string, postedAt int64, settles *string) (string, error) {
+	transactionID := uuid.NewString()
+	if postedAt == 0 {
+		postedAt = time.Now().UnixMilli()
+	}
+	duplicate := false
+	err := ledgerdb.Transaction(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			"INSERT INTO transactions (id, event_id, description, settles, posted_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (event_id) DO NOTHING",
+			transactionID, eventID, description, settles, postedAt)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			duplicate = true
+			return nil
+		}
+		for _, e := range entries {
+			if _, err := tx.ExecContext(ctx,
+				"INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES ($1, $2, $3, $4, $5)",
+				transactionID, e.Account, e.Currency, e.Amount, postedAt); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil || duplicate {
+		return "", err
+	}
+	return transactionID, nil
+}
+
+// ledgerAPI is the learner's API in front of the real journal writer (step 4) and an empty ledger database.
+func ledgerAPI(ctx *harness.Ctx) *harness.HTTP {
+	ctx.DB.Reset(ledgerSchema)
+	writeTransaction = ledgerJournalWrite
+	return ctx.Main(main).HTTP()
+}
+
+func ledgerJSON(v any) string {
+	data, _ := json.Marshal(v)
+	return string(data)
+}
+
+func ledgerPost(ctx *harness.Ctx, c *harness.HTTP, body any) (r *harness.Response) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			ctx.Fatalf("POST /transactions with %s crashed the service with %v — validate before writing: the journal only takes integer amounts in one currency", ledgerJSON(body), rec)
+		}
+	}()
+	r = c.Post("/transactions", body)
+	if r.Status == 500 {
+		ctx.Fatalf("POST /transactions with %s crashed the service: %s — validate before writing: the journal only takes integer amounts in one currency", ledgerJSON(body), r.Text())
+	}
+	return r
+}
+
+func ledgerBody(r *harness.Response) map[string]any {
+	var body map[string]any
+	r.Decode(&body)
+	return body
+}
+
+func ledgerJournal(ctx *harness.Ctx) ([]harness.Row, []harness.Row) {
+	return ctx.DB.Query("SELECT * FROM transactions ORDER BY posted_at, id"), ctx.DB.Query("SELECT * FROM entries ORDER BY transaction_id, account")
+}
+
+func ledgerAssertNothingWritten(ctx *harness.Ctx, why string) {
+	transactions, entries := ledgerJournal(ctx)
+	pairs := [][2]any{}
+	for _, e := range entries {
+		pairs = append(pairs, [2]any{e["account"], e["amount"]})
+	}
+	ctx.Assert(len(transactions) == 0 && len(entries) == 0, "%s, yet the journal now holds %d transaction(s) and %d entr(ies): %v", why, len(transactions), len(entries), pairs)
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	c := ledgerAPI(ctx)
+	r := ledgerPost(ctx, c, ledgerBalanced())
+	ctx.Assert(r.Status != 404 && r.Status != 405, "POST /transactions answered %d: no handler is registered for it", r.Status)
+	ctx.Equal(r.Status, 201, "POST /transactions with a balanced body answered %s", r.Text())
+	transactions, _ := ledgerJournal(ctx)
+	ctx.Equal(len(transactions), 1, "a balanced POST must leave one transaction in the journal")
+	ctx.Equal(ledgerBody(r)["transaction_id"], transactions[0]["id"], "the answer must carry the id of the transaction written to the journal (answer %s)", r.Text())
+}
+
+func CheckTwoEntriesBalanced(ctx *harness.Ctx) {
+	c := ledgerAPI(ctx)
+	cases := []struct {
+		body map[string]any
+		why  string
+	}{
+		{map[string]any{"entries": ledgerEntriesOf(ledgerEUR, 4999)}, "a single entry"},
+		{map[string]any{"entries": []any{}}, "no entries"},
+		{map[string]any{}, "a body without entries"},
+		{map[string]any{"entries": []any{
+			map[string]any{"currency": ledgerEUR, "amount": 4999},
+			map[string]any{"account": "clearing:payments", "currency": ledgerEUR, "amount": -4999},
+		}}, "an entry without an account"},
+		{map[string]any{"entries": ledgerEntriesOf(ledgerEUR, 4999, -4000)}, "entries summing to 999"},
+		{map[string]any{"entries": ledgerEntriesOf(ledgerEUR, 4999, -4999, 1)}, "three entries summing to 1"},
+	}
+	for _, tc := range cases {
+		r := ledgerPost(ctx, c, tc.body)
+		ctx.Equal(r.Status, 422, "%s is not double entry", tc.why)
+		reason, _ := ledgerBody(r)["error"].(string)
+		ctx.Assert(reason != "", "a 422 must say why in {error: reason}, got %s", r.Text())
+	}
+	ledgerAssertNothingWritten(ctx, "every request so far was refused")
+	r := ledgerPost(ctx, c, map[string]any{"entries": ledgerEntriesOf(ledgerEUR, 4999, -4850, -149)})
+	ctx.Equal(r.Status, 201, "three entries netting to zero are a valid transaction (answer %s)", r.Text())
+	transactions, entries := ledgerJournal(ctx)
+	ctx.Assert(len(transactions) == 1 && len(entries) == 3, "the valid transaction must leave one transaction and its three entries, found %d and %d", len(transactions), len(entries))
+	var total int64
+	for _, e := range entries {
+		amount, _ := e["amount"].(int64)
+		total += amount
+	}
+	ctx.Equal(total, 0, "the journal's entries must net to zero")
+}
+
+func CheckIntegerAmounts(ctx *harness.Ctx) {
+	c := ledgerAPI(ctx)
+	cases := []struct {
+		bad any
+		why string
+	}{{49.99, "a float"}, {"4999", "a string"}, {true, "a boolean"}, {0, "zero"}, {nil, "a missing amount"}}
+	for _, tc := range cases {
+		body := map[string]any{"entries": []any{
+			map[string]any{"account": "cash:acquirer", "currency": ledgerEUR, "amount": tc.bad},
+			map[string]any{"account": "clearing:payments", "currency": ledgerEUR, "amount": -4999},
+		}}
+		r := ledgerPost(ctx, c, body)
+		ctx.Equal(r.Status, 422, "amount %s (%s) is not an integer in minor units", ledgerJSON(tc.bad), tc.why)
+	}
+	r := ledgerPost(ctx, c, map[string]any{"entries": []any{
+		map[string]any{"account": "cash:acquirer", "currency": ledgerEUR, "amount": 49.99},
+		map[string]any{"account": "clearing:payments", "currency": ledgerEUR, "amount": -49.99},
+	}})
+	ctx.Equal(r.Status, 422, "49.99 against -49.99 nets to zero but is a float")
+	r = ledgerPost(ctx, c, map[string]any{"entries": ledgerEntriesOf(ledgerEUR, 4999, 0, -4999)})
+	ctx.Equal(r.Status, 422, "an entry with amount 0 moves nothing and must be refused")
+	ledgerAssertNothingWritten(ctx, "every amount so far was refused")
+	r = ledgerPost(ctx, c, map[string]any{"entries": ledgerEntriesOf(ledgerEUR, -250000, 250000)})
+	ctx.Equal(r.Status, 201, "a credit first and a debit second is fine (answer %s)", r.Text())
+	_, entries := ledgerJournal(ctx)
+	amounts := []int64{}
+	for _, e := range entries {
+		amount, _ := e["amount"].(int64)
+		amounts = append(amounts, amount)
+	}
+	sort.Slice(amounts, func(i, j int) bool { return amounts[i] < amounts[j] })
+	ctx.Equal(amounts, []int64{-250000, 250000}, "the journal must hold the integer amounts -250000 and 250000")
+}
+
+func CheckOneCurrency(ctx *harness.Ctx) {
+	c := ledgerAPI(ctx)
+	mixed := map[string]any{"entries": []any{
+		map[string]any{"account": "cash:acquirer", "currency": "EUR", "amount": 4999},
+		map[string]any{"account": "clearing:payments", "currency": "USD", "amount": -4999},
+	}}
+	r := ledgerPost(ctx, c, mixed)
+	ctx.Equal(r.Status, 422, "EUR against USD cannot balance")
+	for _, bad := range []string{"eur", "EURO", "E1R", ""} {
+		r = ledgerPost(ctx, c, map[string]any{"entries": ledgerEntriesOf(bad, 4999, -4999)})
+		ctx.Equal(r.Status, 422, "currency %q does not match ^[A-Z]{3}$", bad)
+	}
+	r = ledgerPost(ctx, c, map[string]any{"entries": []any{
+		map[string]any{"account": "a", "amount": 1},
+		map[string]any{"account": "b", "amount": -1},
+	}})
+	ctx.Equal(r.Status, 422, "entries without a currency")
+	ledgerAssertNothingWritten(ctx, "every currency so far was refused")
+	r = ledgerPost(ctx, c, map[string]any{"entries": ledgerEntriesOf("GBP", 4999, -4999)})
+	ctx.Equal(r.Status, 201, "GBP on every entry is valid (answer %s)", r.Text())
+	_, entries := ledgerJournal(ctx)
+	currencies := []string{}
+	for _, e := range entries {
+		currency, _ := e["currency"].(string)
+		currencies = append(currencies, currency)
+	}
+	ctx.Equal(currencies, []string{"GBP", "GBP"}, "the journal must hold two GBP entries")
+}
+
+func CheckCreated(ctx *harness.Ctx) {
+	c := ledgerAPI(ctx)
+	body := ledgerBalanced()
+	body["settles"] = "tx-0"
+	noted := []any{}
+	for _, e := range body["entries"].([]any) {
+		entry := map[string]any{"note": "ignored"}
+		for k, v := range e.(map[string]any) {
+			entry[k] = v
+		}
+		noted = append(noted, entry)
+	}
+	body["entries"] = noted
+	r := ledgerPost(ctx, c, body)
+	ctx.Equal(r.Status, 201, "a valid body must be answered 201 Created (answer %s)", r.Text())
+	transactions, entries := ledgerJournal(ctx)
+	ctx.Equal(len(transactions), 1, "one valid POST must write exactly one transaction")
+	t := transactions[0]
+	ctx.Equal(len(entries), 2, "the transaction must have its two entries in the journal")
+	stored := [][3]any{}
+	for _, e := range entries {
+		stored = append(stored, [3]any{e["account"], e["currency"], e["amount"]})
+	}
+	sort.Slice(stored, func(i, j int) bool { return fmt.Sprint(stored[i]) < fmt.Sprint(stored[j]) })
+	ctx.Equal(stored, [][3]any{{"cash:acquirer", "EUR", int64(4999)}, {"clearing:payments", "EUR", int64(-4999)}}, "the journal holds the entries")
+	ctx.Equal(t["description"], "capture ch_1", "the description must be passed through to the journal")
+	ctx.Equal(t["settles"], "tx-0", "the settles field must be passed through to the journal")
+	ctx.Equal(t["event_id"], nil, "an API-originated transaction has no event id")
+	now := time.Now().UnixMilli()
+	postedAt, _ := t["posted_at"].(int64)
+	ctx.Assert(postedAt-now < 5000 && now-postedAt < 5000, "posted_at must be now in milliseconds (%d), the journal holds %d", now, postedAt)
+	payload := ledgerBody(r)
+	ctx.Equal(payload["transaction_id"], t["id"], "the body must carry the journal's transaction id (answer %s)", r.Text())
+	ctx.Equal(payload["posted_at"], t["posted_at"], "the body must carry the posted_at the journal got")
+	ctx.Equal(payload["entries"], []any{
+		map[string]any{"account": "cash:acquirer", "currency": "EUR", "amount": float64(4999)},
+		map[string]any{"account": "clearing:payments", "currency": "EUR", "amount": float64(-4999)},
+	}, "the body must echo the cleaned entries (account, currency, amount only)")
+	ctx.Equal(r.Header.Get("Location"), fmt.Sprintf("/transactions/%v", t["id"]), "Location must point at the transaction")
 }
 `,
   },

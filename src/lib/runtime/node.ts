@@ -1,16 +1,19 @@
 /**
  * The runtimes in Node, for `yarn verify`. Python: Pyodide from the npm package (its packages come
  * from the CDN on first use and are cached under node_modules), assets from `public/py` on disk.
- * TypeScript: esbuild (native) as the transpiler. Both: fengari and PGlite from npm.
+ * TypeScript: esbuild (native) as the transpiler. Go: the interpreter's WebAssembly from
+ * `public/go` on disk. All: fengari and PGlite from npm.
  */
 import {PGlite} from '@electric-sql/pglite';
 import {vector} from '@electric-sql/pglite-pgvector';
 import {transform} from 'esbuild';
 import {readFile} from 'node:fs/promises';
 import {resolve} from 'node:path';
+import {gunzipSync} from 'node:zlib';
 import {loadPyodide} from 'pyodide';
 
 import {createDbBridge} from './db';
+import {createGoRuntime} from './go';
 import {luaEval} from './lua';
 import {bootPython, runPython} from './python';
 import {reportUnhandledRejection} from './ts/harness';
@@ -48,6 +51,14 @@ export function createNodeTypeScriptRuntime(): NodeRuntime {
       });
       return {code: out.code, map: out.map};
     },
+    luaEval,
+    db: createDbBridge(openPglite),
+  });
+}
+
+export async function createNodeGoRuntime(assetDir = resolve(process.cwd(), 'public/go')): Promise<NodeRuntime> {
+  return createGoRuntime({
+    wasm: async () => gunzipSync(await readFile(resolve(assetDir, 'runtime.wasm.gz'))),
     luaEval,
     db: createDbBridge(openPglite),
   });

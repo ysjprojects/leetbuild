@@ -1146,6 +1146,193 @@ export async function check_fast_worker(ctx) {
   assert(peak < HIGH, \`the queue reached \${peak} with a worker that returns at once; the drain loop must run between deliveries\`);
 }
 `,
+    go: `package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+
+	"leetbuild/harness"
+)
+
+const seededJobs = 200
+
+// jobTrace is what the harness's worker saw: stats() per job and every 10 ms, every job, and the
+// finished jobs per partition.
+type jobTrace struct {
+	mu      sync.Mutex
+	samples []Status
+	jobs    []Job
+	done    [3]int64
+}
+
+func (t *jobTrace) sample() {
+	s := Stats()
+	t.mu.Lock()
+	t.samples = append(t.samples, s)
+	t.mu.Unlock()
+}
+
+func (t *jobTrace) finished(partition int) int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.done[partition]
+}
+
+func seedJobs(ctx *harness.Ctx) {
+	for i := range seededJobs {
+		ctx.Kafka.SeedPartition("jobs", i%3, fmt.Sprintf("job-%d", i), fmt.Sprintf("job-%d", i))
+	}
+}
+
+// runJobs runs Run with the harness's worker until every job is committed (or the sleep budget
+// ends the run), then stops it.
+func runJobs(ctx *harness.Ctx, slow bool, t *jobTrace) {
+	// Poll(10 ms) while paused and the 10 ms sampler each jump the clock: 200 jobs need far more than 500 jumps.
+	ctx.Clock.SetSleepLimit(5000)
+	worker := func(job Job) {
+		t.sample()
+		t.mu.Lock()
+		t.jobs = append(t.jobs, job)
+		t.mu.Unlock()
+		if slow {
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.mu.Lock()
+		t.done[job.Partition]++
+		t.mu.Unlock()
+	}
+	allCommitted := make(chan struct{})
+	var once sync.Once
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
+		if ctx.Kafka.Lag("workers", "jobs") == 0 {
+			once.Do(func() { close(allCommitted) })
+		}
+	})
+	ticker := time.NewTicker(10 * time.Millisecond)
+	go func() {
+		for range ticker.C {
+			t.sample()
+		}
+	}()
+	ran := make(chan error, 1)
+	go func() { ran <- Run(worker) }()
+	var runErr error
+	returned := false
+	ctx.Drain(func() {
+		select {
+		case <-allCommitted:
+		case runErr = <-ran:
+			returned = true
+		}
+	})
+	ticker.Stop()
+	Stop()
+	if !returned {
+		ctx.Drain(func() { runErr = <-ran })
+	}
+	ctx.NoError(runErr, "Run returned an error")
+	ctx.Equal(Stats().Processed, seededJobs, "processed jobs")
+}
+
+func CheckBounded(ctx *harness.Ctx) {
+	seedJobs(ctx)
+	t := &jobTrace{}
+	runJobs(ctx, true, t)
+	peak := 0
+	for _, s := range t.samples {
+		peak = max(peak, s.Queued)
+	}
+	ctx.Assert(peak <= highWater, "the queue held %d jobs at one point; it must never exceed highWater = 20", peak)
+	ctx.Equal(Stats().Queued, 0, "once every job is processed the queue must be empty: Stats().Queued")
+}
+
+func CheckPauseResume(ctx *harness.Ctx) {
+	seedJobs(ctx)
+	t := &jobTrace{}
+	runJobs(ctx, true, t)
+	first := -1
+	for i, s := range t.samples {
+		if s.Paused {
+			first = i
+			break
+		}
+	}
+	ctx.Assert(first >= 0, "with a worker ten times slower than the fetcher the consumer was never paused: pause the topic when the queue reaches highWater")
+	ctx.Assert(t.samples[first].Queued >= highWater-1, "the consumer paused with only %d queued; the pause belongs at highWater = 20", t.samples[first].Queued)
+	var resumes []int
+	for i := 1; i < len(t.samples); i++ {
+		if t.samples[i-1].Paused && !t.samples[i].Paused {
+			resumes = append(resumes, i)
+		}
+	}
+	ctx.Assert(len(resumes) > 0, "the consumer paused but never resumed")
+	for _, i := range resumes {
+		ctx.Assert(t.samples[i].Queued <= lowWater, "resumed with %d still queued; resume only once the queue is down to lowWater = 5", t.samples[i].Queued)
+	}
+	ctx.Assert(len(resumes) >= 2, "paused and resumed %d time(s) over 200 jobs; the cycle should repeat as the slow worker drains", len(resumes))
+	ctx.Assert(!Stats().Paused, "once every job is processed the consumer must not be left paused")
+}
+
+func CheckInOrder(ctx *harness.Ctx) {
+	seedJobs(ctx)
+	t := &jobTrace{}
+	runJobs(ctx, true, t)
+	ctx.Equal(len(t.jobs), seededJobs, "worker calls for 200 jobs")
+	seen := map[string]bool{}
+	for _, j := range t.jobs {
+		seen[fmt.Sprintf("%d@%d", j.Partition, j.Offset)] = true
+	}
+	ctx.Equal(len(seen), seededJobs, "some job reached the worker more than once: distinct jobs")
+	for p := range 3 {
+		var offsets []int64
+		for _, j := range t.jobs {
+			if int(j.Partition) == p {
+				offsets = append(offsets, j.Offset)
+			}
+		}
+		for i, o := range offsets {
+			ctx.Assert(o == int64(i), "partition %d was processed out of order: offsets %v…", p, offsets[:min(8, len(offsets))])
+		}
+	}
+	for _, j := range t.jobs {
+		ctx.Equal(j.Value, fmt.Sprintf("job-%d", 3*j.Offset+int64(j.Partition)), "the job at %d@%d carried the wrong value", j.Partition, j.Offset)
+	}
+}
+
+func CheckCommitAfter(ctx *harness.Ctx) {
+	seedJobs(ctx)
+	t := &jobTrace{}
+	var violations []string
+	ctx.Kafka.OnCommit(func(g string, offsets harness.KafkaOffsets) {
+		for tp, o := range offsets {
+			switch {
+			case g != "workers" || tp.Topic != "jobs":
+				violations = append(violations, fmt.Sprintf("a commit for %s/%s: the group is workers, the topic jobs", g, tp.Topic))
+			case o > t.finished(tp.Partition):
+				violations = append(violations, fmt.Sprintf("partition %d: committed offset %d while the worker had finished %d of its jobs", tp.Partition, o, t.finished(tp.Partition)))
+			}
+		}
+	})
+	runJobs(ctx, true, t)
+	ctx.Equal(len(ctx.Kafka.EventsOf("auto-commit")), 0, "auto-commit is on (offsets were committed on a timer, before the worker ran): auto-commit events")
+	ctx.Assert(len(violations) == 0, "%v", violations)
+	ctx.Equal(ctx.Kafka.Lag("workers", "jobs"), 0, "processed jobs never committed")
+}
+
+func CheckFastWorker(ctx *harness.Ctx) {
+	seedJobs(ctx)
+	t := &jobTrace{}
+	runJobs(ctx, false, t)
+	peak := 0
+	for _, s := range t.samples {
+		ctx.Assert(!s.Paused, "the worker kept up, yet the consumer was paused: pause only when the queue reaches highWater")
+		peak = max(peak, s.Queued)
+	}
+	ctx.Assert(peak < highWater, "the queue reached %d with a worker that returns at once; the drain loop must run between deliveries", peak)
+}
+`,
   },
   debrief: `Backpressure in a Kafka consumer is a hysteresis loop over a bounded queue: fetch until HIGH, pause, drain until LOW, resume. The gap between the two marks is what stops the consumer from flapping pause/resume on every record; the queue bound is what keeps memory flat no matter how far the topic runs ahead. Pausing keeps the consumer in the group — it still polls, heartbeats and serves rebalance callbacks — where simply blocking in the poll loop would trip \`max.poll.interval.ms\` and hand the partitions to someone else. Committing from the drain loop after the worker returns keeps the delivery guarantee at-least-once: nothing in the queue is committed, so a crash replays it rather than losing it. Real consumers bound the queue in bytes as well as records, pause partitions individually when one key runs hot, and (with the Java client, which is single-threaded) route the commits back to the poll thread and cap \`max.poll.records\` so a single poll cannot overshoot the high-water mark.`,
 };

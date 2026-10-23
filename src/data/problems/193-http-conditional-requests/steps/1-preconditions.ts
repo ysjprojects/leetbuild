@@ -1763,5 +1763,205 @@ export async function check_weak_strong(ctx) {
   assert.deepEqual(r.json(), {text: 'a'}, \`the doc should hold 'a', got \${r.text}\`);
 }
 `,
+    go: `package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"math"
+	"net/http"
+	"time"
+
+	"leetbuild/harness"
+)
+
+const condStale = "\\"0000000000000000\\""
+
+func condEtagOf(text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return "\\"" + hex.EncodeToString(sum[:])[:16] + "\\""
+}
+
+// condTS is the epoch seconds of an HTTP date, NaN when it does not parse.
+func condTS(httpDate string) float64 {
+	t, err := http.ParseTime(httpDate)
+	if err != nil {
+		return math.NaN()
+	}
+	return float64(t.Unix())
+}
+
+// condDate is epoch seconds as an IMF-fixdate.
+func condDate(seconds float64) string {
+	return time.Unix(int64(seconds), 0).UTC().Format(http.TimeFormat)
+}
+
+// condIMF reports whether lm is an IMF-fixdate that survives a round trip.
+func condIMF(lm string) bool {
+	return lm != "" && !math.IsNaN(condTS(lm)) && condDate(condTS(lm)) == lm
+}
+
+func condCreate(ctx *harness.Ctx, c *harness.HTTP, id, text string) (string, string) {
+	r := c.Put("/docs/"+id, map[string]any{"text": text})
+	ctx.Equal(r.Status, 201, "PUT /docs/%s on a missing doc without preconditions", id)
+	ok := c.Get("/docs/" + id)
+	ctx.Equal(ok.Status, 200, "GET /docs/%s after creating it", id)
+	return ok.Header.Get("ETag"), ok.Header.Get("Last-Modified")
+}
+
+func CheckNotModified(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	condCreate(ctx, c, "readme", "hello")
+	ok := c.Get("/docs/readme")
+	ctx.Equal(ok.JSON(), map[string]any{"text": "hello"}, "GET /docs/readme")
+	etag := ok.Header.Get("ETag")
+	lm := ok.Header.Get("Last-Modified")
+	ctx.Equal(etag, condEtagOf("hello"), "ETag must be the quoted first 16 hex digits of sha256(text)")
+	ctx.Assert(condIMF(lm), "Last-Modified was %q, not an IMF-fixdate like 'Thu, 22 Oct 2026 10:00:00 GMT'", lm)
+	r := c.Get("/docs/readme", "If-None-Match", etag)
+	ctx.Equal(r.Status, 304, "If-None-Match with the current ETag")
+	ctx.Equal(r.Text(), "", "a 304 carries no body")
+	ctx.Equal(r.Header.Get("ETag"), etag, "the 304 must repeat ETag")
+	ctx.Equal(r.Header.Get("Last-Modified"), lm, "the 304 must repeat Last-Modified")
+	r = c.Get("/docs/readme", "If-None-Match", condStale)
+	ctx.Equal(r.Status, 200, "If-None-Match with a stale tag")
+	r = c.Get("/docs/readme", "If-Modified-Since", lm)
+	ctx.Equal(r.Status, 304, "If-Modified-Since equal to Last-Modified")
+	ctx.Assert(r.Text() == "" && r.Header.Get("ETag") == etag && r.Header.Get("Last-Modified") == lm, "the If-Modified-Since 304 must carry ETag and Last-Modified and no body")
+	r = c.Get("/docs/readme", "If-Modified-Since", condDate(condTS(lm)+3600))
+	ctx.Equal(r.Status, 304, "If-Modified-Since an hour after Last-Modified")
+	r = c.Get("/docs/readme", "If-Modified-Since", condDate(condTS(lm)-1))
+	ctx.Equal(r.Status, 200, "If-Modified-Since one second before Last-Modified")
+	r = c.Get("/docs/ghost", "If-None-Match", "*")
+	ctx.Equal(r.Status, 404, "GET of a missing doc with If-None-Match: *")
+}
+
+func CheckPrecedence(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	etag, lm := condCreate(ctx, c, "log", "a")
+	t := condTS(lm)
+	r := c.Get("/docs/log", "If-None-Match", condStale, "If-Modified-Since", lm)
+	ctx.Equal(r.Status, 200, "a stale If-None-Match with a fresh If-Modified-Since (If-None-Match is present, so If-Modified-Since is ignored)")
+	r = c.Get("/docs/log", "If-None-Match", etag, "If-Modified-Since", condDate(t-3600))
+	ctx.Equal(r.Status, 304, "a matching If-None-Match with an old If-Modified-Since")
+	r = c.Get("/docs/log", "If-Unmodified-Since", condDate(t-1))
+	ctx.Equal(r.Status, 412, "If-Unmodified-Since one second before Last-Modified")
+	r = c.Get("/docs/log", "If-Unmodified-Since", lm)
+	ctx.Equal(r.Status, 200, "If-Unmodified-Since equal to Last-Modified")
+	r = c.Get("/docs/log", "If-Match", condStale, "If-None-Match", etag)
+	ctx.Equal(r.Status, 412, "a failing If-Match with a matching If-None-Match (If-Match is evaluated first)")
+	r = c.Put("/docs/log", map[string]any{"text": "b"}, "If-Match", etag, "If-Unmodified-Since", condDate(t-3600))
+	ctx.Equal(r.Status, 200, "a matching If-Match with an old If-Unmodified-Since (If-Match is present, so If-Unmodified-Since is ignored)")
+	r = c.Put("/docs/log", map[string]any{"text": "c"}, "If-Match", etag, "If-Unmodified-Since", condDate(t+3600))
+	ctx.Equal(r.Status, 412, "a stale If-Match with a passing If-Unmodified-Since")
+	r = c.Get("/docs/log")
+	ctx.Equal(r.JSON(), map[string]any{"text": "b"}, "the doc should hold 'b'")
+}
+
+func CheckLostUpdate(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	condCreate(ctx, c, "plan", "v1")
+	alice := c.Get("/docs/plan")
+	bob := c.Get("/docs/plan")
+	e1 := alice.Header.Get("ETag")
+	ctx.Assert(e1 != "" && bob.Header.Get("ETag") == e1, "two reads of the same doc must see the same ETag")
+	lm1 := condTS(alice.Header.Get("Last-Modified"))
+	ctx.Clock.Advance(30)
+	a := c.Put("/docs/plan", map[string]any{"text": "alice"}, "If-Match", e1)
+	ctx.Equal(a.Status, 200, "Alice's PUT with the current If-Match")
+	ctx.Equal(a.Header.Get("ETag"), condEtagOf("alice"), "a successful write returns the new ETag")
+	lm2 := a.Header.Get("Last-Modified")
+	moved := math.NaN()
+	if lm2 != "" {
+		moved = condTS(lm2) - lm1
+	}
+	ctx.Assert(moved >= 29 && moved <= 32, "30 s later the write's Last-Modified should move 30 s: was %q, now %q", alice.Header.Get("Last-Modified"), lm2)
+	b := c.Put("/docs/plan", map[string]any{"text": "bob"}, "If-Match", e1)
+	ctx.Equal(b.Status, 412, "Bob's PUT with the ETag Alice already replaced (a lost update)")
+	now := c.Get("/docs/plan")
+	ctx.Equal(now.JSON(), map[string]any{"text": "alice"}, "after Bob's refused write the doc must hold Alice's text")
+	retry := c.Put("/docs/plan", map[string]any{"text": "alice + bob"}, "If-Match", now.Header.Get("ETag"))
+	ctx.Equal(retry.Status, 200, "Bob's retry with the fresh ETag")
+	r := c.Delete("/docs/plan", "If-Match", e1)
+	ctx.Equal(r.Status, 412, "DELETE with a stale If-Match")
+	r = c.Delete("/docs/plan", "If-Match", retry.Header.Get("ETag"))
+	ctx.Equal(r.Status, 204, "DELETE with the current If-Match")
+	r = c.Get("/docs/plan")
+	ctx.Equal(r.Status, 404, "GET after the DELETE")
+}
+
+func CheckPreconditionRequired(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	_, lm := condCreate(ctx, c, "spec", "draft")
+	r := c.Put("/docs/spec", map[string]any{"text": "blind"})
+	ctx.Equal(r.Status, 428, "PUT on an existing doc without If-Match")
+	r = c.Put("/docs/spec", map[string]any{"text": "blind"}, "If-Unmodified-Since", lm)
+	ctx.Equal(r.Status, 428, "PUT with only a passing If-Unmodified-Since (If-Match is required)")
+	r = c.Put("/docs/spec", map[string]any{"text": "blind"}, "If-None-Match", condStale)
+	ctx.Equal(r.Status, 428, "PUT with only a non-matching If-None-Match")
+	r = c.Delete("/docs/spec")
+	ctx.Equal(r.Status, 428, "DELETE on an existing doc without If-Match")
+	r = c.Get("/docs/spec")
+	var got struct {
+		Text any \`json:"text"\`
+	}
+	if r.Status == 200 {
+		r.Decode(&got)
+	}
+	ctx.Assert(r.Status == 200 && got.Text == "draft", "a 428 must change nothing, the doc is now %d %s", r.Status, r.Text())
+	r = c.Delete("/docs/ghost", "If-Match", condStale)
+	ctx.Equal(r.Status, 404, "DELETE of a missing doc")
+	r = c.Put("/docs/fresh", map[string]any{"text": "new"})
+	ctx.Equal(r.Status, 201, "PUT on a missing doc without preconditions")
+}
+
+func CheckCreateOnly(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	r := c.Put("/docs/notes", map[string]any{"text": "first"}, "If-None-Match", "*")
+	ctx.Equal(r.Status, 201, "PUT with If-None-Match: * on a missing doc")
+	ctx.Equal(r.Header.Get("ETag"), condEtagOf("first"), "the 201's ETag")
+	lm := r.Header.Get("Last-Modified")
+	ctx.Assert(condIMF(lm), "the 201 carries an IMF-fixdate Last-Modified, got %q", lm)
+	r = c.Put("/docs/notes", map[string]any{"text": "second"}, "If-None-Match", "*")
+	ctx.Equal(r.Status, 412, "a second PUT with If-None-Match: *")
+	r = c.Get("/docs/notes")
+	ctx.Equal(r.JSON(), map[string]any{"text": "first"}, "the refused create must not overwrite")
+	r = c.Put("/docs/other", map[string]any{"text": "x"}, "If-Match", "*")
+	ctx.Equal(r.Status, 412, "PUT with If-Match: * on a missing doc")
+	r = c.Get("/docs/other")
+	ctx.Equal(r.Status, 404, "If-Match: * on a missing doc must not create it")
+	r = c.Put("/docs/notes", map[string]any{"text": "third"}, "If-Match", "*")
+	ctx.Equal(r.Status, 200, "PUT with If-Match: * on an existing doc")
+	ctx.Equal(r.Header.Get("ETag"), condEtagOf("third"), "the 200's ETag")
+	r = c.Get("/docs/notes", "If-None-Match", "*")
+	ctx.Equal(r.Status, 304, "GET with If-None-Match: * on an existing doc")
+}
+
+func CheckWeakStrong(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	etag, _ := condCreate(ctx, c, "faq", "q")
+	weak := "W/" + etag
+	r := c.Put("/docs/faq", map[string]any{"text": "x"}, "If-Match", weak)
+	ctx.Equal(r.Status, 412, "PUT with If-Match: %s (a weak tag never matches strongly)", weak)
+	r = c.Get("/docs/faq", "If-Match", weak)
+	ctx.Equal(r.Status, 412, "GET with If-Match: %s", weak)
+	r = c.Get("/docs/faq", "If-None-Match", weak)
+	ctx.Equal(r.Status, 304, "GET with If-None-Match: %s (weak comparison ignores W/)", weak)
+	r = c.Put("/docs/faq", map[string]any{"text": "x"}, "If-Match", etag, "If-None-Match", weak)
+	ctx.Equal(r.Status, 412, "PUT whose If-None-Match matches weakly")
+	r = c.Get("/docs/faq", "If-Match", condStale+", "+etag)
+	ctx.Equal(r.Status, 200, "If-Match listing the current tag second")
+	r = c.Get("/docs/faq", "If-None-Match", condStale+", "+weak)
+	ctx.Equal(r.Status, 304, "If-None-Match listing the weak current tag second")
+	r = c.Get("/docs/faq", "If-Modified-Since", "not a date")
+	ctx.Equal(r.Status, 200, "an unparseable If-Modified-Since (it is ignored)")
+	r = c.Get("/docs/faq", "If-Unmodified-Since", "yesterday")
+	ctx.Equal(r.Status, 200, "an unparseable If-Unmodified-Since (it is ignored)")
+	r = c.Put("/docs/faq", map[string]any{"text": "a"}, "If-Match", etag)
+	ctx.Equal(r.Status, 200, "PUT with the strong current tag")
+	r = c.Get("/docs/faq")
+	ctx.Equal(r.JSON(), map[string]any{"text": "a"}, "the doc should hold 'a'")
+}
+`,
   },
 };

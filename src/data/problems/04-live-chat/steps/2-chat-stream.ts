@@ -307,12 +307,18 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "chat/gen/chat"
+	"chat/subscriptions"
 )
 
-// Built in step 3 (room_bus.go) and provided (subscriptions.go).
-func publish(ctx context.Context, room string, msg *pb.ServerMsg) error { panic("not implemented") }
-func subscribe(room string) <-chan *pb.ServerMsg                       { panic("not implemented") }
-func unsubscribe(room string, sub <-chan *pb.ServerMsg)                { panic("not implemented") }
+// Built in step 3 (room_bus.go): sends msg to every instance.
+var publish = func(ctx context.Context, room string, msg *pb.ServerMsg) error { panic("not implemented") }
+
+// Provided: this instance's subscription table (package chat/subscriptions). subscribe returns a
+// channel that receives every message delivered to the room here; unsubscribe stops it.
+var (
+	subscribe   = subscriptions.Subscribe
+	unsubscribe = subscriptions.Unsubscribe
+)
 
 type chatServer struct {
 	pb.UnimplementedChatServer
@@ -349,12 +355,18 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "chat/gen/chat"
+	"chat/subscriptions"
 )
 
-// Built in step 3 (room_bus.go) and provided (subscriptions.go).
-func publish(ctx context.Context, room string, msg *pb.ServerMsg) error { panic("not implemented") }
-func subscribe(room string) <-chan *pb.ServerMsg                       { panic("not implemented") }
-func unsubscribe(room string, sub <-chan *pb.ServerMsg)                { panic("not implemented") }
+// Built in step 3 (room_bus.go): sends msg to every instance.
+var publish = func(ctx context.Context, room string, msg *pb.ServerMsg) error { panic("not implemented") }
+
+// Provided: this instance's subscription table (package chat/subscriptions). subscribe returns a
+// channel that receives every message delivered to the room here; unsubscribe stops it.
+var (
+	subscribe   = subscriptions.Subscribe
+	unsubscribe = subscriptions.Unsubscribe
+)
 
 type chatServer struct {
 	pb.UnimplementedChatServer
@@ -836,6 +848,236 @@ export async function check_cancel_cleanup(ctx) {
   await settle();
   n = subs.subscribers('room-7');
   assert.equal(n, 0, \`the client finished its stream but room-7 still has \${n} subscription(s): clean up however the call ends\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"io"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"leetbuild/harness"
+
+	pb "chat/gen/chat"
+	"chat/subscriptions"
+)
+
+func chatJoin(room, user string) *pb.ClientMsg {
+	return &pb.ClientMsg{Kind: &pb.ClientMsg_Join{Join: &pb.Join{Room: room, User: user}}}
+}
+
+func chatSay(text string) *pb.ClientMsg {
+	return &pb.ClientMsg{Kind: &pb.ClientMsg_Say{Say: &pb.Say{Text: text}}}
+}
+
+func chatServerMsg(user, text string, ts int64) *pb.ServerMsg {
+	return &pb.ServerMsg{Room: "room-7", User: user, Text: text, Ts: ts}
+}
+
+// chatPublished is one publish(ctx, room, msg) the stream handler made.
+type chatPublished struct {
+	room string
+	msg  *pb.ServerMsg
+}
+
+// chatBus stands in for step 3's room bus: publish only records.
+type chatBus struct {
+	mu        sync.Mutex
+	published []chatPublished
+}
+
+func (b *chatBus) all() []chatPublished {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]chatPublished(nil), b.published...)
+}
+
+// chatEnd is how a stream ended: its status code (OK when the server returned nil).
+type chatEnd struct{ code codes.Code }
+
+// chatClientStream is the client side of one stream: what arrived, how it ended, and a read with a
+// (virtual) 1 s patience.
+type chatClientStream struct {
+	stream pb.Chat_ChatClient
+	cancel context.CancelFunc
+	inbox  chan *pb.ServerMsg
+	ended  chan chatEnd
+	end    *chatEnd
+}
+
+func openChat(ctx *harness.Ctx, client pb.ChatClient) *chatClientStream {
+	callCtx, cancel := context.WithCancel(context.Background())
+	stream, err := client.Chat(callCtx)
+	ctx.NoError(err, "opening a Chat stream")
+	s := &chatClientStream{stream: stream, cancel: cancel, inbox: make(chan *pb.ServerMsg, 64), ended: make(chan chatEnd, 1)}
+	go func() {
+		for {
+			msg, err := stream.Recv()
+			if err == io.EOF {
+				s.ended <- chatEnd{code: codes.OK}
+				return
+			}
+			if err != nil {
+				s.ended <- chatEnd{code: status.Code(err)}
+				return
+			}
+			s.inbox <- msg
+		}
+	}()
+	return s
+}
+
+func (s *chatClientStream) send(ctx *harness.Ctx, msg *pb.ClientMsg) {
+	ctx.NoError(s.stream.Send(msg), "sending %v", msg)
+}
+
+// status is how the stream ended, nil while it is open.
+func (s *chatClientStream) status() *chatEnd {
+	if s.end == nil {
+		select {
+		case e := <-s.ended:
+			s.end = &e
+		default:
+		}
+	}
+	return s.end
+}
+
+// read is the next message the server sent, nil when none arrives within 1 s or the stream ended.
+func (s *chatClientStream) read() *pb.ServerMsg {
+	select {
+	case msg := <-s.inbox:
+		return msg
+	default:
+	}
+	if s.status() != nil {
+		return nil
+	}
+	select {
+	case msg := <-s.inbox:
+		return msg
+	case e := <-s.ended:
+		s.end = &e
+		select {
+		case msg := <-s.inbox:
+			return msg
+		default:
+			return nil
+		}
+	case <-time.After(time.Second):
+		return nil
+	}
+}
+
+// startChat runs the learner's server with publish recording, and returns a client on it.
+func startChat(ctx *harness.Ctx) (pb.ChatClient, *chatBus) {
+	bus := &chatBus{}
+	publish = func(_ context.Context, room string, msg *pb.ServerMsg) error {
+		bus.mu.Lock()
+		defer bus.mu.Unlock()
+		bus.published = append(bus.published, chatPublished{room: room, msg: msg})
+		return nil
+	}
+	ctx.Main(main)
+	return pb.NewChatClient(ctx.GRPC.Dial("chat-server:9000")), bus
+}
+
+func joinedChat(ctx *harness.Ctx, client pb.ChatClient, room, user string) *chatClientStream {
+	s := openChat(ctx, client)
+	s.send(ctx, chatJoin(room, user))
+	ctx.Settle()
+	if e := s.status(); e != nil {
+		hint := ""
+		if e.code == codes.Unavailable {
+			hint = " (main registered no Chat handler)"
+		}
+		ctx.Fatalf("the stream ended with %v right after the join%s", e.code, hint)
+	}
+	return s
+}
+
+func CheckJoinFirst(ctx *harness.Ctx) {
+	client, bus := startChat(ctx)
+	s := openChat(ctx, client)
+	s.send(ctx, chatSay("hi"))
+	ctx.Settle()
+	e := s.status()
+	ctx.Assert(e != nil, "a stream whose first message is a say must end with InvalidArgument, but it did not fail")
+	ctx.Assert(e.code != codes.Unavailable, "main registered no Chat handler")
+	ctx.Assert(e.code == codes.InvalidArgument || e.code == codes.FailedPrecondition, "a say before any join ended the call with %v, expected InvalidArgument", e.code)
+	ctx.Equal(subscriptions.Subscribers("room-7"), 0, "a rejected first message must not leave a subscription behind: subscriptions in room-7")
+	ctx.Assert(len(bus.all()) == 0, "a rejected first message must not be published, got %v", bus.all())
+	second := openChat(ctx, client)
+	second.send(ctx, chatJoin("room-7", "ana"))
+	ctx.Settle()
+	if e := second.status(); e != nil {
+		ctx.Fatalf("a stream that starts with a join must stay open, but it ended with %v", e.code)
+	}
+}
+
+func CheckSayPublishes(ctx *harness.Ctx) {
+	client, bus := startChat(ctx)
+	s := joinedChat(ctx, client, "room-7", "ana")
+	s.send(ctx, chatSay("hi"))
+	s.send(ctx, chatSay("anyone here?"))
+	ctx.Settle()
+	got := bus.all()
+	ctx.Equal(len(got), 2, "two says must publish exactly two messages (published: %v)", got)
+	for i, text := range []string{"hi", "anyone here?"} {
+		room, msg := got[i].room, got[i].msg
+		ctx.Equal(room, "room-7", "the room publish was called with")
+		ctx.Equal([]string{msg.GetRoom(), msg.GetUser(), msg.GetText()}, []string{"room-7", "ana", text}, "the published ServerMsg's room, user and text")
+		delta := msg.GetTs() - ctx.Clock.Now()
+		ctx.Assert(-60000 < delta && delta < 60000, "ServerMsg.Ts is %d, expected the current time in milliseconds", msg.GetTs())
+	}
+	// Nothing is written back directly: the first thing this client reads is what the bus delivers.
+	subscriptions.LocalDeliver("room-7", chatServerMsg("bo", "hello ana", 1))
+	first := s.read()
+	ctx.Assert(first != nil, "nothing reached the client after the bus delivered a message")
+	ctx.Equal([]string{first.GetUser(), first.GetText()}, []string{"bo", "hello ana"}, "the client received %v before anything came from the bus: a say reaches its sender through publish, never through a direct write; user and text", first)
+}
+
+func CheckSubscribeForward(ctx *harness.Ctx) {
+	client, bus := startChat(ctx)
+	s := joinedChat(ctx, client, "room-7", "ana")
+	n := subscriptions.Subscribers("room-7")
+	ctx.Equal(n, 1, "after the join, the subscriptions in room-7 on this instance (subscribe(room))")
+	subscriptions.LocalDeliver("room-7", chatServerMsg("bo", "hello ana", 1))
+	subscriptions.LocalDeliver("room-7", chatServerMsg("cy", "hi both", 2))
+	first := s.read()
+	second := s.read()
+	if first == nil || second == nil {
+		what := "nothing"
+		if first != nil {
+			what = "one message"
+		}
+		ctx.Fatalf("the client received %s after the bus delivered two: forward every message the subscription yields", what)
+	}
+	ctx.Equal([]string{first.GetUser(), first.GetText()}, []string{"bo", "hello ana"}, "the first forwarded message's user and text")
+	ctx.Equal([]string{second.GetUser(), second.GetText()}, []string{"cy", "hi both"}, "the second forwarded message's user and text (forward in order)")
+	ctx.Assert(len(bus.all()) == 0, "forwarding bus messages must not publish them again")
+}
+
+func CheckCancelCleanup(ctx *harness.Ctx) {
+	client, _ := startChat(ctx)
+	s := joinedChat(ctx, client, "room-7", "ana")
+	ctx.Equal(subscriptions.Subscribers("room-7"), 1, "after the join, the subscriptions in room-7")
+	s.cancel()
+	ctx.Settle()
+	n := subscriptions.Subscribers("room-7")
+	ctx.Equal(n, 0, "the client hung up: unsubscribe once stream.Context() is done; subscriptions left in room-7 on this instance")
+	// A client that closes its side normally must be cleaned up the same way.
+	second := openChat(ctx, client)
+	second.send(ctx, chatJoin("room-7", "bo"))
+	ctx.Settle()
+	ctx.NoError(second.stream.CloseSend(), "closing the client side")
+	ctx.Settle()
+	n = subscriptions.Subscribers("room-7")
+	ctx.Equal(n, 0, "the client finished its stream: clean up however the call ends; subscriptions left in room-7")
 }
 `,
   },

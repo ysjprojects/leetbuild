@@ -31,6 +31,7 @@ export const SHAPE_AFTER_WRONG = 2;
 const RUNTIME_DOWNLOAD: Partial<Record<Language, string>> = {
   python: 'the Python runtime (~10 MB)',
   typescript: 'the TypeScript compiler (~14 MB)',
+  go: 'the Go interpreter (~9 MB)',
 };
 
 const Fragment: FC<{text: string}> = memo(({text}) => (

@@ -9,7 +9,7 @@ import {eventIngestionStep} from './steps/3-event-ingestion';
 import {exactlyOnceLedgerStep} from './steps/4-exactly-once-ledger';
 import {clearingStep} from './steps/5-clearing';
 import {balanceServiceStep} from './steps/6-balance-service';
-import {supportModules, supportModulesTs} from './support';
+import {supportModules, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Stripe's Ledger, rebuilt as the six mechanisms its engineering post describes: an HTTPS
@@ -134,6 +134,7 @@ corrections. The six pieces above are the ledger itself: the part everything els
   support: {
     python: {...protoModules, ...supportModules},
     typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles, ...supportModulesGo},
   },
   learn,
 };

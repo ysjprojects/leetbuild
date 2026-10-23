@@ -948,6 +948,173 @@ export async function check_locked(ctx) {
   assert(!m.lock.locked, 'a failed refill must release the lock, or every later request deadlocks');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"sort"
+	"sync"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"leetbuild/harness"
+
+	pb "shortener/gen/keys"
+)
+
+const firstCounter = 3842000
+
+// keyPeer is the key service: hands out blocks of 'block' counters; successive blocks start 1000 apart, so a
+// client that keeps minting past the end of a block produces a code the service never issued.
+type keyPeer struct {
+	pb.UnimplementedKeyServiceServer
+	guard            sync.Mutex
+	next             uint64
+	block            uint32
+	sizes            []uint32
+	lockedDuringCall []bool
+}
+
+func (p *keyPeer) ReserveBlock(_ context.Context, req *pb.ReserveRequest) (*pb.ReserveReply, error) {
+	held := lockHeld()
+	p.guard.Lock()
+	defer p.guard.Unlock()
+	p.sizes = append(p.sizes, req.GetSize())
+	p.lockedDuringCall = append(p.lockedDuringCall, held)
+	start := p.next
+	p.next += 1000
+	return &pb.ReserveReply{Start: start, Size: min(req.GetSize(), p.block)}, nil
+}
+
+// lockHeld reports whether the learner's mu is held, without waiting for it.
+func lockHeld() bool {
+	if mu.TryLock() {
+		mu.Unlock()
+		return false
+	}
+	return true
+}
+
+func serveKeys(ctx *harness.Ctx, block uint32) *keyPeer {
+	p := &keyPeer{next: firstCounter, block: block}
+	pb.RegisterKeyServiceServer(ctx.GRPC.Server("keys:9000"), p)
+	return p
+}
+
+func reserveCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("ReserveBlock", "")) }
+
+// keyFailure is the gRPC status a failed nextCode surfaced; the check fails when it returned a code.
+func keyFailure(ctx *harness.Ctx, resolvedMessage string) *status.Status {
+	_, err := nextCode(context.Background())
+	ctx.Assert(err != nil, "%s", resolvedMessage)
+	st, ok := status.FromError(err)
+	ctx.Assert(ok, "nextCode failed with %v, expected a gRPC status error", err)
+	return st
+}
+
+func mintCode(ctx *harness.Ctx) string {
+	code, err := nextCode(context.Background())
+	ctx.NoError(err, "nextCode")
+	return code
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	serveKeys(ctx, 1)
+	ctx.Equal(mintCode(ctx), base62(firstCounter), "nextCode must hand out the first counter of the reserved block")
+	calls := ctx.GRPC.CallsTo("ReserveBlock", "")
+	ctx.Assert(len(calls) > 0, "nextCode handed out a code without calling ReserveBlock")
+	call := calls[len(calls)-1]
+	ctx.Assert(call.HasDeadline(), "ReserveBlock carries no deadline: a slow key service would stall every shorten request")
+	timeout := call.Timeout.Seconds()
+	ctx.Assert(0.4 <= timeout && timeout <= 0.6, "the deadline must be 500 ms, got %v s", timeout)
+	ctx.GRPC.SetLatency("ReserveBlock", 3.0, "")
+	st := keyFailure(ctx, "a key service slower than the deadline must surface DEADLINE_EXCEEDED")
+	ctx.Equal(st.Code(), codes.DeadlineExceeded, "the status a slow key service surfaced")
+	ctx.Equal(reserveCalls(ctx), 2, "DEADLINE_EXCEEDED is not UNAVAILABLE: it must not be retried")
+}
+
+func CheckRetryUnavailable(ctx *harness.Ctx) {
+	serveKeys(ctx, 1)
+	ctx.GRPC.Fail("ReserveBlock", codes.Unavailable, "key service restarting", 1, "")
+	ctx.Equal(mintCode(ctx), base62(firstCounter), "one UNAVAILABLE must be retried and the second attempt's block used")
+	ctx.Equal(reserveCalls(ctx), 2, "expected exactly one retry after UNAVAILABLE")
+	ctx.GRPC.Fail("ReserveBlock", codes.ResourceExhausted, "quota", 1, "")
+	st := keyFailure(ctx, "RESOURCE_EXHAUSTED must propagate, not be retried or swallowed")
+	ctx.Equal(st.Code(), codes.ResourceExhausted, "RESOURCE_EXHAUSTED must propagate")
+	ctx.Equal(reserveCalls(ctx), 3, "only UNAVAILABLE is worth a second attempt")
+	ctx.GRPC.Fail("ReserveBlock", codes.Unavailable, "down", 50, "")
+	st = keyFailure(ctx, "a key service that stays UNAVAILABLE must return an error, not a code")
+	ctx.Equal(st.Code(), codes.Unavailable, "the status after the retries")
+	ctx.Equal(reserveCalls(ctx)-3, 2, "attempts against a down key service; retries must stop after the second")
+}
+
+func CheckRefillWhenEmpty(ctx *harness.Ctx) {
+	peer := serveKeys(ctx, 3)
+	ctx.Equal(reserveCalls(ctx), 0, "no block is reserved before the first code is needed")
+	for i := range 3 {
+		mintCode(ctx)
+		ctx.Equal(reserveCalls(ctx), 1, "code %d of a block of 3 reserved another block: refill only when remaining is 0", i+1)
+	}
+	mintCode(ctx)
+	ctx.Equal(reserveCalls(ctx), 2, "the 4th code needs a new block: expected a second ReserveBlock")
+	mintCode(ctx)
+	mintCode(ctx)
+	ctx.Equal(reserveCalls(ctx), 2, "codes 5 and 6 come from the second block without an RPC")
+	mintCode(ctx)
+	ctx.Equal(reserveCalls(ctx), 3, "the 7th code needs a third block")
+	ctx.Equal(peer.sizes, []uint32{blockSize, blockSize, blockSize}, "ReserveBlock must ask for blockSize (%d) counters", blockSize)
+}
+
+func CheckBase62Advance(ctx *harness.Ctx) {
+	serveKeys(ctx, 3)
+	var got []string
+	for range 5 {
+		got = append(got, mintCode(ctx))
+	}
+	var want []string
+	for _, n := range []uint64{firstCounter, firstCounter + 1, firstCounter + 2, firstCounter + 1000, firstCounter + 1001} {
+		want = append(want, base62(n))
+	}
+	ctx.Equal(got, want, "the codes handed out: base62 of 3842000, 3842001, 3842002 then the next block 3843000, 3843001")
+	unique := map[string]bool{}
+	for _, code := range got {
+		unique[code] = true
+	}
+	ctx.Assert(len(unique) == 5, "codes must be unique, got %q", got)
+}
+
+func CheckLocked(ctx *harness.Ctx) {
+	peer := serveKeys(ctx, 2)
+	mintCode(ctx)
+	ctx.Equal(peer.lockedDuringCall, []bool{true}, "the refill must happen under the lock: another request could reserve a second block meanwhile")
+	ctx.Assert(!lockHeld(), "mu must be released once the code is handed out")
+	mintCode(ctx)
+	mintCode(ctx)
+	ctx.Equal(peer.lockedDuringCall, []bool{true, true}, "every refill, not only the first, happens under the lock")
+	concurrent := make([]string, 3)
+	errs := make([]error, 3)
+	var wg sync.WaitGroup
+	for i := range 3 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			concurrent[i], errs[i] = nextCode(context.Background())
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		ctx.NoError(err, "a concurrent nextCode")
+	}
+	ctx.Assert(reserveCalls(ctx) == 3, "three concurrent nextCode calls on a block of 2 reserved %d blocks: without the lock every caller sees an empty block and reserves its own", reserveCalls(ctx)-2)
+	want := []string{base62(firstCounter + 1001), base62(firstCounter + 2000), base62(firstCounter + 2001)}
+	sort.Strings(concurrent)
+	sort.Strings(want)
+	ctx.Equal(concurrent, want, "concurrent callers must get the last code of the block and then two consecutive codes of one new block")
+	ctx.GRPC.Fail("ReserveBlock", codes.Unavailable, "down", 50, "")
+	_, _ = nextCode(context.Background()) // the block is used up: this refill fails; what matters is the lock
+	ctx.Assert(!lockHeld(), "a failed refill must release mu, or every later request deadlocks")
+}
+`,
   },
   debrief: `Reserving a block turns a coordination problem into a local one: one RPC per thousand codes, and a key service outage only matters when the block runs dry. The codes are sequential, which is fine for a shortener (and is what a database sequence would give you) — a counter is unguessable only if you need it to be, and then you add a random prefix or encrypt it. Real key services pre-fetch the next block before the current one is empty, so the refill never sits on a request path, and survive their own restarts by persisting the high-water mark.`,
 };

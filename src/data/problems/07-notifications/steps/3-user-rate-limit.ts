@@ -547,6 +547,98 @@ export async function check_over_limit(ctx) {
   assert.equal(await m.allowed('u42', 'n-23'), true, "an hour later the user's budget is back");
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"slices"
+
+	"leetbuild/harness"
+)
+
+func rlAllowed(ctx *harness.Ctx, userID, notificationID string) bool {
+	ok, err := allowed(context.Background(), userID, notificationID)
+	ctx.NoError(err, "allowed(%q, %q) returned an error", userID, notificationID)
+	return ok
+}
+
+func rlMembers(ctx *harness.Ctx, key string) []string {
+	var members []string
+	for _, z := range ctx.Redis.ZRangeWithScores(key, 0, -1) {
+		members = append(members, z.Member)
+	}
+	return members
+}
+
+func rlDropped(ctx *harness.Ctx, userID string) any {
+	if v, ok := ctx.Redis.Get("dropped:" + userID); ok {
+		return v
+	}
+	return nil
+}
+
+func CheckZsetKey(ctx *harness.Ctx) {
+	before := ctx.Clock.Now()
+	ctx.Equal(rlAllowed(ctx, "u42", "n-1"), true, "the first notification of the hour must be allowed")
+	after := ctx.Clock.Now()
+	ctx.Equal(ctx.Redis.Type("rl:u42"), "zset", "rl:u42 must be a sorted set")
+	score, ok := ctx.Redis.ZScore("rl:u42", "n-1")
+	ctx.Assert(ok, "n-1 must be a member of rl:u42, members are %v", rlMembers(ctx, "rl:u42"))
+	ctx.Assert(float64(before) <= score && score <= float64(after), "n-1 is scored %v, expected the current time in milliseconds (about %d)", score, before)
+	rlAllowed(ctx, "u7", "n-2")
+	ctx.Assert(ctx.Redis.ZCard("rl:u42") == 1 && ctx.Redis.ZCard("rl:u7") == 1, "each user has their own rl:{user} set")
+}
+
+func CheckTrimWindow(ctx *harness.Ctx) {
+	rlAllowed(ctx, "u42", "n-1")
+	rlAllowed(ctx, "u42", "n-2")
+	ctx.Clock.Advance(1800)
+	rlAllowed(ctx, "u42", "n-3")
+	ctx.Equal(ctx.Redis.ZCard("rl:u42"), 3, "after 30 min all three events are still in the window: members of rl:u42")
+	ctx.Clock.Advance(1801)
+	ctx.Equal(rlAllowed(ctx, "u42", "n-4"), true, "allowed(u42, n-4)")
+	ctx.Equal(rlMembers(ctx, "rl:u42"), []string{"n-3", "n-4"}, "events older than an hour must be trimmed: rl:u42")
+}
+
+func CheckPipeline(ctx *harness.Ctx) {
+	ctx.Equal(rlAllowed(ctx, "u42", "n-1"), true, "the first notification of the hour must be allowed")
+	var trips [][]string
+	for _, trip := range ctx.Redis.RoundTrips() {
+		var commands []string
+		for _, c := range trip {
+			if c != "MULTI" && c != "EXEC" {
+				commands = append(commands, c)
+			}
+		}
+		trips = append(trips, commands)
+	}
+	ttl := ctx.Redis.TTL("rl:u42")
+	ctx.Assert(ttl > 0, "rl:u42 has no expiry (TTL %d): an idle user would leave a sorted set behind forever", ttl)
+	ctx.Assert(3500 <= ttl && ttl <= 3600, "rl:u42 must expire after 3600 s, TTL is %d", ttl)
+	four := slices.IndexFunc(trips, func(trip []string) bool {
+		return slices.Contains(trip, "ZADD") && slices.Contains(trip, "ZREMRANGEBYSCORE") && slices.Contains(trip, "ZCARD") && slices.Contains(trip, "EXPIRE")
+	})
+	ctx.Assert(four >= 0, "an allowed check must cost one round trip carrying ZADD, ZREMRANGEBYSCORE, ZCARD and EXPIRE together; the round trips were %v", trips)
+	ctx.Equal(len(trips), 1, "an allowed check must cost one round trip (%v): round trips", trips)
+	ctx.Clock.Advance(3601)
+	ctx.Equal(ctx.Redis.Exists("rl:u42"), 0, "an idle user's set must expire with the window")
+}
+
+func CheckOverLimit(ctx *harness.Ctx) {
+	for i := range 20 {
+		ctx.Equal(rlAllowed(ctx, "u42", fmt.Sprintf("n-%d", i)), true, "notification %d of 20 must be allowed", i+1)
+	}
+	ctx.Equal(rlDropped(ctx, "u42"), nil, "nothing was dropped yet: dropped:u42 must not exist")
+	ctx.Equal(rlAllowed(ctx, "u42", "n-20"), false, "the 21st notification of the hour must be dropped")
+	ctx.Equal(rlDropped(ctx, "u42"), "1", "dropped:u42")
+	ctx.Equal(rlAllowed(ctx, "u42", "n-21"), false, "the 22nd notification of the hour must be dropped")
+	ctx.Equal(rlDropped(ctx, "u42"), "2", "dropped:u42")
+	ctx.Equal(rlAllowed(ctx, "u7", "n-22"), true, "another user's budget is untouched")
+	ctx.Clock.Advance(3601)
+	ctx.Equal(rlAllowed(ctx, "u42", "n-23"), true, "an hour later the user's budget is back")
+}
+`,
   },
   debrief: `A sorted set scored by time is a sliding window with no bookkeeping: add, trim, count, and the TTL cleans up after idle users. The four commands travel together so the check costs one round trip, and because the whole thing is per user it shards trivially. Real systems wrap the same four commands in a Lua script so the add-trim-count is atomic against concurrent workers, remove the member again when the decision is "drop" (so dropped pings do not eat the budget), and prefer a cheaper approximation — sliding log with coarse buckets, or a token bucket — once the limit is thousands per window instead of twenty.`,
 };

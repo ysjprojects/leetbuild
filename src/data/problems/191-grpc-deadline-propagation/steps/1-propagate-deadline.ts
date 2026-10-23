@@ -957,6 +957,176 @@ export async function check_validates_first(ctx) {
   assert.equal(q.total_cents, 3499, \`GetQuote(kettle, 1) must still succeed with 3499, got \${q.total_cents}\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"leetbuild/harness"
+
+	pb "quotes/gen/quotes"
+)
+
+const (
+	pricingPeerTarget = "pricing:50051"
+	timeoutTolerance  = 10 * time.Millisecond // slack on every recorded timeout
+	noDeadline        = -1.0                  // a GetQuote without any deadline
+)
+
+var unitPrices = map[string]int32{"kettle": 3499, "mug": 799}
+
+// pricingPeer is Pricing served at pricing:50051.
+type pricingPeer struct {
+	pb.UnimplementedPricingServer
+}
+
+func (p *pricingPeer) GetPrice(_ context.Context, req *pb.PriceRequest) (*pb.Price, error) {
+	unit, ok := unitPrices[req.GetSku()]
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "no price for %s", req.GetSku())
+	}
+	return &pb.Price{UnitCents: unit}, nil
+}
+
+// startQuotes serves pricing, runs the learner's server, and returns a Quotes client on it.
+func startQuotes(ctx *harness.Ctx) pb.QuotesClient {
+	pb.RegisterPricingServer(ctx.GRPC.Server(pricingPeerTarget), &pricingPeer{})
+	ctx.Main(main)
+	return pb.NewQuotesClient(ctx.GRPC.Dial("quotes:50050"))
+}
+
+// callQuote is GetQuote with an incoming deadline of deadline seconds (noDeadline: none at all).
+func callQuote(client pb.QuotesClient, sku string, qty int32, deadline float64) (*pb.Quote, error) {
+	c := context.Background()
+	if deadline != noDeadline {
+		var cancel context.CancelFunc
+		c, cancel = context.WithTimeout(c, time.Duration(deadline*float64(time.Second)))
+		defer cancel()
+	}
+	return client.GetQuote(c, &pb.QuoteRequest{Sku: sku, Qty: qty})
+}
+
+func mustQuote(ctx *harness.Ctx, client pb.QuotesClient, sku string, qty int32, deadline float64) *pb.Quote {
+	q, err := callQuote(client, sku, qty, deadline)
+	if err != nil {
+		within := fmt.Sprintf("with deadline %v s", deadline)
+		if deadline == noDeadline {
+			within = "without a deadline"
+		}
+		ctx.Fatalf("GetQuote(%s, %d) %s failed with %v: %s", sku, qty, within, status.Code(err), status.Convert(err).Message())
+	}
+	return q
+}
+
+func quoteCode(client pb.QuotesClient, sku string, qty int32, deadline float64) codes.Code {
+	_, err := callQuote(client, sku, qty, deadline)
+	return status.Code(err)
+}
+
+func priceCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("GetPrice", "") }
+
+func assertPriceTimeout(ctx *harness.Ctx, c harness.Call, expected time.Duration, why string) {
+	ctx.Assert(c.HasDeadline(), "the GetPrice call carries no deadline (%s): pricing could outlive the caller", why)
+	off := c.Timeout - expected
+	ctx.Assert(-timeoutTolerance <= off && off <= timeoutTolerance, "the GetPrice timeout was %.3f s, expected %v ± %v (%s)", c.Timeout.Seconds(), expected, timeoutTolerance, why)
+}
+
+func CheckPropagatesDeadline(ctx *harness.Ctx) {
+	client := startQuotes(ctx)
+	q := mustQuote(ctx, client, "kettle", 2, 0.8)
+	ctx.Equal([]any{q.GetSku(), q.GetQty(), q.GetTotalCents()}, []any{"kettle", int32(2), int32(6998)}, "GetQuote(kettle, 2): sku, qty and total_cents 3499 * 2 = 6998")
+	calls := priceCalls(ctx)
+	ctx.Equal(len(calls), 1, "the GetPrice calls one quote made")
+	ctx.Equal(calls[0].Target, pricingPeerTarget, "where GetPrice went")
+	req, _ := calls[0].Request.(*pb.PriceRequest)
+	ctx.Equal(req.GetSku(), "kettle", "the sku GetPrice was asked for")
+	assertPriceTimeout(ctx, calls[0], 750*time.Millisecond, "0.8 s incoming minus reserve 50 ms")
+	mug := mustQuote(ctx, client, "mug", 3, 0.3)
+	ctx.Equal(mug.GetTotalCents(), 2397, "GetQuote(mug, 3)'s total_cents (799 * 3)")
+	calls = priceCalls(ctx)
+	assertPriceTimeout(ctx, calls[len(calls)-1], 250*time.Millisecond, "0.3 s incoming minus reserve 50 ms: the timeout follows the caller, it is not a constant")
+}
+
+func CheckDefaultBudget(ctx *harness.Ctx) {
+	client := startQuotes(ctx)
+	mustQuote(ctx, client, "kettle", 2, noDeadline)
+	calls := priceCalls(ctx)
+	ctx.Equal(len(calls), 1, "the GetPrice calls one quote made")
+	assertPriceTimeout(ctx, calls[0], 950*time.Millisecond, "no incoming deadline: defaultBudget 1 s minus reserve 50 ms")
+	ctx.Clock.Advance(30)
+	mustQuote(ctx, client, "kettle", 2, noDeadline)
+	calls = priceCalls(ctx)
+	assertPriceTimeout(ctx, calls[len(calls)-1], 950*time.Millisecond, "a second call 30 s later: the default is per request, not a deadline fixed at start-up")
+}
+
+func CheckBudgetExhausted(ctx *harness.Ctx) {
+	client := startQuotes(ctx)
+	for _, deadline := range []float64{0.04, 0} {
+		got := quoteCode(client, "kettle", 2, deadline)
+		ctx.Equal(got, codes.DeadlineExceeded, "an incoming deadline of %v s (the budget is under reserve 50 ms)", deadline)
+		ctx.Equal(len(priceCalls(ctx)), 0, "with %v s left pricing was called: a call that cannot finish must not be started; GetPrice calls", deadline)
+	}
+	mustQuote(ctx, client, "kettle", 2, 0.1)
+	calls := priceCalls(ctx)
+	ctx.Equal(len(calls), 1, "an incoming deadline of 0.1 s must still call pricing once: GetPrice calls")
+	assertPriceTimeout(ctx, calls[0], 50*time.Millisecond, "0.1 s incoming minus reserve 50 ms")
+}
+
+func CheckSlowPricing(ctx *harness.Ctx) {
+	client := startQuotes(ctx)
+	ctx.GRPC.SetLatency("GetPrice", 0.9, pricingPeerTarget)
+	started := ctx.Clock.Now()
+	got := quoteCode(client, "kettle", 2, 0.8)
+	elapsed := float64(ctx.Clock.Now()-started) / 1000
+	ctx.Equal(got, codes.DeadlineExceeded, "pricing takes 0.9 s and the caller allows 0.8 s: GetQuote's status")
+	calls := priceCalls(ctx)
+	ctx.Equal(len(calls), 1, "the times a timed-out pricing call was made: the budget is spent, never retry")
+	assertPriceTimeout(ctx, calls[0], 750*time.Millisecond, "0.8 s incoming minus reserve 50 ms")
+	ctx.Assert(elapsed <= 0.8+timeoutTolerance.Seconds(), "the failure took %.3f s, after the caller's 0.8 s deadline: nobody was waiting for it", elapsed)
+	q := mustQuote(ctx, client, "kettle", 2, noDeadline)
+	ctx.Equal(q.GetTotalCents(), 6998, "with no incoming deadline the 0.9 s pricing call fits the 0.95 s default: total_cents")
+	ctx.Equal(len(priceCalls(ctx)), 2, "the GetPrice calls in total")
+}
+
+func CheckStatusMapping(ctx *harness.Ctx) {
+	client := startQuotes(ctx)
+	got := quoteCode(client, "ghost", 2, 0.8)
+	ctx.Equal(got, codes.NotFound, "pricing answered NotFound for ghost: GetQuote's status")
+	for _, c := range [][2]codes.Code{
+		{codes.Unavailable, codes.Unavailable},
+		{codes.DeadlineExceeded, codes.DeadlineExceeded},
+		{codes.InvalidArgument, codes.Internal},
+		{codes.PermissionDenied, codes.Internal},
+		{codes.ResourceExhausted, codes.Internal},
+	} {
+		ctx.GRPC.Fail("GetPrice", c[0], "pricing broke", 1, "")
+		got = quoteCode(client, "kettle", 2, 0.8)
+		ctx.Equal(got, c[1], "pricing failed with %v: GetQuote's status", c[0])
+	}
+	ctx.Equal(len(priceCalls(ctx)), 6, "the GetPrice calls six failing quotes made: never retry, not even Unavailable")
+	q := mustQuote(ctx, client, "kettle", 2, 0.8)
+	ctx.Equal(q.GetTotalCents(), 6998, "after the failures a healthy pricing must give total_cents 6998")
+}
+
+func CheckValidatesFirst(ctx *harness.Ctx) {
+	client := startQuotes(ctx)
+	for _, c := range []struct {
+		sku      string
+		qty      int32
+		deadline float64
+	}{{"", 2, 0.8}, {"kettle", 0, 0.8}, {"kettle", -3, 0.8}, {"", 2, 0.04}} {
+		got := quoteCode(client, c.sku, c.qty, c.deadline)
+		ctx.Equal(got, codes.InvalidArgument, "GetQuote(sku=%q, qty=%d) with deadline %v s (validation comes first)", c.sku, c.qty, c.deadline)
+	}
+	ctx.Equal(len(priceCalls(ctx)), 0, "the GetPrice calls invalid requests made")
+	q := mustQuote(ctx, client, "kettle", 1, 0.8)
+	ctx.Equal(q.GetTotalCents(), 3499, "GetQuote(kettle, 1) must still succeed: total_cents")
+}
+`,
   },
   debrief: `A deadline is a property of the request: the moment after which the original caller stops caring. Each hop reads what is left, keeps a little back, and hands the rest down, so the whole tree of calls gives up together instead of the leaves working on for a caller that has already timed out. The reserve exists because a server that spends its entire budget downstream has no time left to report the failure; with 50 ms held back it answers DEADLINE_EXCEEDED itself, inside the caller's window, rather than having the caller's own timer fire on a silent connection. "No deadline" and "zero left" are opposites, which is why the test is \`is None\` and not truthiness. The call is never retried because a retry inside a spent budget only adds load at the moment a dependency is slowest. Statuses are translated rather than relayed: NOT_FOUND, UNAVAILABLE and DEADLINE_EXCEEDED mean something the caller can act on, while a downstream INVALID_ARGUMENT or PERMISSION_DENIED is this server's bug and becomes INTERNAL. Go and grpc-java do most of this implicitly (an outgoing call made with the incoming \`ctx\` or \`Context\` inherits its deadline, and grpc-js has the \`parent\` call option); production servers add the reserve on top, propagate cancellation as well as the deadline, export the remaining budget as a metric, and shed work early when the budget left is smaller than the dependency's p99.`,
 };

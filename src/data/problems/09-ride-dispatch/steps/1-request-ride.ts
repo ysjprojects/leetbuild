@@ -368,8 +368,8 @@ type Ride struct {
 }
 
 // Provided (dispatch.go): startMatching records the ride and looks for a driver; getRide is nil for unknown ids.
-func startMatching(ride *Ride) { panic("not implemented") }
-func getRide(id string) *Ride  { panic("not implemented") }
+var startMatching = func(ride *Ride) { panic("not implemented") }
+var getRide = func(id string) *Ride { panic("not implemented") }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -440,8 +440,8 @@ type Ride struct {
 }
 
 // Provided (dispatch.go): startMatching records the ride and looks for a driver; getRide is nil for unknown ids.
-func startMatching(ride *Ride) { panic("not implemented") }
-func getRide(id string) *Ride  { panic("not implemented") }
+var startMatching = func(ride *Ride) { panic("not implemented") }
+var getRide = func(id string) *Ride { panic("not implemented") }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -939,6 +939,139 @@ export async function check_not_found(ctx) {
   assert.equal(r.status, 200);
   ride = r.json();
   assert.equal(ride.driver_id, 'd-7', \`once matched the body must carry driver_id, got \${r.text}\`);
+}
+`,
+    go: `package main
+
+import (
+	"leetbuild/harness"
+)
+
+var (
+	ridePickup  = map[string]any{"lat": 48.85, "lng": 2.35}
+	rideDropoff = map[string]any{"lat": 48.86, "lng": 2.34}
+)
+
+func rideBody(pickup, dropoff map[string]any) map[string]any {
+	return map[string]any{"rider_id": "u-1", "pickup": pickup, "dropoff": dropoff}
+}
+
+// dispatchBook stands in for the provided dispatch.go: it records rides and the ids handed to matching.
+type dispatchBook struct {
+	rides    map[string]Ride
+	matching []string
+}
+
+func (b *dispatchBook) setDriver(id, driverID string) {
+	ride := b.rides[id]
+	ride.ID = id
+	ride.DriverID = driverID
+	ride.Status = "matched"
+	b.rides[id] = ride
+}
+
+// rideAPI runs the learner's main with the provided hand-off stood in for.
+func rideAPI(ctx *harness.Ctx) (*harness.HTTP, *dispatchBook) {
+	book := &dispatchBook{rides: map[string]Ride{}}
+	startMatching = func(ride *Ride) {
+		book.rides[ride.ID] = *ride
+		book.matching = append(book.matching, ride.ID)
+	}
+	getRide = func(id string) *Ride {
+		ride, ok := book.rides[id]
+		if !ok {
+			return nil
+		}
+		return &ride
+	}
+	return ctx.Main(main).HTTP(), book
+}
+
+// rideField is a string field of the JSON body, "" when absent.
+func rideField(r *harness.Response, name string) string {
+	body, _ := r.JSON().(map[string]any)
+	v, _ := body[name].(string)
+	return v
+}
+
+func CheckValidate(ctx *harness.Ctx) {
+	c, book := rideAPI(ctx)
+	idem := []string{"Idempotency-Key", "k-valid"}
+	bad := []struct {
+		what string
+		body map[string]any
+	}{
+		{"pickup lat 90.5", rideBody(map[string]any{"lat": 90.5, "lng": 2.35}, rideDropoff)},
+		{"pickup lat -91", rideBody(map[string]any{"lat": -91, "lng": 2.35}, rideDropoff)},
+		{"dropoff lng 180.5", rideBody(ridePickup, map[string]any{"lat": 48.86, "lng": 180.5})},
+		{"dropoff lng -181", rideBody(ridePickup, map[string]any{"lat": 48.86, "lng": -181})},
+	}
+	for _, b := range bad {
+		r := c.Post("/rides", b.body, idem...)
+		ctx.Equal(r.Status, 400, "POST /rides with %s", b.what)
+	}
+	ctx.Equal(ctx.Redis.Keys("idem:*"), []string{}, "a rejected request must not touch Redis (validation comes first): the idem keys")
+	ctx.Equal(book.matching, []string(nil), "a rejected request must not reach startMatching: the rides it saw")
+	r := c.Post("/rides", rideBody(map[string]any{"lat": 90, "lng": -180}, rideDropoff), idem...)
+	ctx.Equal(r.Status, 202, "lat 90 / lng -180 are the bounds and valid")
+}
+
+func CheckIdempotencyKey(ctx *harness.Ctx) {
+	c, book := rideAPI(ctx)
+	r := c.Post("/rides", rideBody(ridePickup, rideDropoff))
+	ctx.Equal(r.Status, 400, "POST /rides without Idempotency-Key")
+	ctx.Equal(book.matching, []string(nil), "a request without Idempotency-Key must not start matching: the rides startMatching saw")
+	r = c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-1")
+	ctx.Equal(r.Status, 202, "POST /rides with Idempotency-Key")
+}
+
+func CheckDedupeNx(ctx *harness.Ctx) {
+	c, book := rideAPI(ctx)
+	ctx.Redis.Set("idem:k-old", "r-existing", "EX", 3600)
+	r := c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-new")
+	ctx.Equal(r.Status, 202, "a fresh key")
+	rideID := rideField(r, "ride_id")
+	stored, ok := ctx.Redis.Get("idem:k-new")
+	ctx.Assert(ok, "idem:k-new was not written: SetNX idem:{key} rideID idemTTL")
+	ctx.Equal(stored, rideID, "idem:k-new must hold the ride id the response carries")
+	ttl := ctx.Redis.TTL("idem:k-new")
+	ctx.Assert(3500 < ttl && ttl <= 3600, "idem:k-new has TTL %d, expected idemTTL (3600 s)", ttl)
+	r = c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-old")
+	old, _ := ctx.Redis.Get("idem:k-old")
+	ctx.Equal(old, "r-existing", "an existing idem key was overwritten: the SET must be NX")
+	ctx.Equal(r.Status, 200, "a key that already exists")
+	ctx.Equal(rideField(r, "ride_id"), "r-existing", "the replay must carry the stored ride id (body %s)", r.Text())
+	ctx.Equal(book.matching, []string{rideID}, "startMatching must run only for the new ride")
+}
+
+func CheckReplayOrAccept(ctx *harness.Ctx) {
+	c, book := rideAPI(ctx)
+	first := c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-1")
+	ctx.Equal(first.Status, 202, "a new ride (accepted, not matched)")
+	rideID := rideField(first, "ride_id")
+	ctx.Assert(rideID != "", "the 202 body must carry ride_id, got %s", first.Text())
+	ctx.Equal(rideField(first, "status"), "matching", "the 202 body's status (body %s)", first.Text())
+	ctx.Equal(book.matching, []string{rideID}, "startMatching must run exactly once for a new ride")
+	again := c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-1")
+	ctx.Equal(again.Status, 200, "the retry (replayed)")
+	ctx.Equal(rideField(again, "ride_id"), rideID, "the retry must return the same ride id (body %s)", again.Text())
+	ctx.Equal(book.matching, []string{rideID}, "the retry must not start matching a second ride")
+}
+
+func CheckNotFound(ctx *harness.Ctx) {
+	c, book := rideAPI(ctx)
+	r := c.Get("/rides/nope")
+	ctx.Equal(r.Status, 404, "GET /rides/nope")
+	created := c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-1")
+	rideID := rideField(created, "ride_id")
+	r = c.Get("/rides/" + rideID)
+	ctx.Equal(r.Status, 200, "GET /rides/%s", rideID)
+	ctx.Equal(rideField(r, "status"), "matching", "the ride's status (body %s)", r.Text())
+	ctx.Equal(rideField(r, "driver_id"), "", "no driver yet: driver_id must be absent")
+	book.setDriver(rideID, "d-7")
+	r = c.Get("/rides/" + rideID)
+	ctx.Equal(r.Status, 200, "GET /rides/%s once matched", rideID)
+	ctx.Equal(rideField(r, "driver_id"), "d-7", "once matched the body must carry driver_id (body %s)", r.Text())
 }
 `,
   },

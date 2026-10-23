@@ -886,6 +886,159 @@ export async function check_retryable(ctx) {
   assert.deepEqual(devices.disabled, [], 'only INVALID_ARGUMENT / NOT_FOUND disable the token');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"sync"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"leetbuild/harness"
+
+	"notify/devices"
+	pb "notify/gen/push"
+)
+
+// pushPeer is the push gateway: it answers every token but "stale" (NOT_FOUND) and counts the calls that reached it.
+type pushPeer struct {
+	pb.UnimplementedPushGatewayServer
+	mu    sync.Mutex
+	calls int
+}
+
+func (p *pushPeer) Send(ctx context.Context, req *pb.SendRequest) (*pb.SendReply, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	if req.GetDeviceToken() == "stale" {
+		return nil, status.Error(codes.NotFound, "unregistered device token")
+	}
+	return &pb.SendReply{MessageId: fmt.Sprintf("m-%s-%d", req.GetDeviceToken(), p.calls)}, nil
+}
+
+func servePushPeer(ctx *harness.Ctx) *pushPeer {
+	p := &pushPeer{}
+	pb.RegisterPushGatewayServer(ctx.GRPC.Server(""), p)
+	return p
+}
+
+func pushSend(token string) (string, error) {
+	return sendPush(context.Background(), token, "Shipped", "On its way", "order-1")
+}
+
+// pushWait is one sendPush that first met injected failures: its result, the virtual seconds it took and the sleeps it took.
+type pushWait struct {
+	result  string
+	seconds float64
+	sleeps  int
+}
+
+func pushWaited(ctx *harness.Ctx, code codes.Code, times int) pushWait {
+	ctx.GRPC.Fail("Send", code, "", times, "")
+	started := ctx.Clock.Now()
+	sleeps := ctx.Clock.Sleeps()
+	result, err := pushSend("tok-1")
+	ctx.NoError(err, "sendPush after %d %v returned an error", times, code)
+	return pushWait{
+		result:  result,
+		seconds: math.Round(float64(ctx.Clock.Now()-started)/1000*1e6) / 1e6,
+		sleeps:  ctx.Clock.Sleeps() - sleeps,
+	}
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	servePushPeer(ctx)
+	id, err := pushSend("tok-1")
+	ctx.NoError(err, "sendPush returned an error")
+	ctx.Equal(id, "m-tok-1-1", "sendPush must return the gateway's message_id")
+	ctx.GRPC.Fail("Send", codes.Unavailable, "", 1, "")
+	id, err = pushSend("tok-1")
+	ctx.NoError(err, "one UNAVAILABLE must be retried and succeed")
+	ctx.Equal(id, "m-tok-1-2", "one UNAVAILABLE must be retried and succeed")
+	calls := ctx.GRPC.CallsTo("Send", "")
+	ctx.Equal(len(calls), 3, "expected 3 calls (one success, one failure, one retry)")
+	for _, call := range calls {
+		ctx.Assert(call.HasDeadline(), "an RPC carries no deadline")
+		timeout := call.Timeout.Seconds()
+		ctx.Assert(2.5 <= timeout && timeout <= 3.0, "every call must carry a deadline of about 3 s, got %v s", timeout)
+	}
+	request, ok := calls[0].Request.(*pb.SendRequest)
+	ctx.Assert(ok, "the call carried no SendRequest, got %v", calls[0].Request)
+	ctx.Equal(
+		[]string{request.GetDeviceToken(), request.GetTitle(), request.GetBody(), request.GetCollapseKey()},
+		[]string{"tok-1", "Shipped", "On its way", "order-1"},
+		"the request must carry token, title, body and collapse_key",
+	)
+}
+
+func CheckBackoff(ctx *harness.Ctx) {
+	servePushPeer(ctx)
+	one := pushWaited(ctx, codes.Unavailable, 1)
+	ctx.Equal(one.result, "m-tok-1-1", "one UNAVAILABLE must be retried and succeed")
+	ctx.Equal(one.sleeps, 1, "expected one backoff sleep between the two attempts: sleeps")
+	ctx.Assert(0.2 <= one.seconds && one.seconds <= 0.45, "the first backoff must be about 200 ms plus jitter, it was %v s", one.seconds)
+	two := pushWaited(ctx, codes.ResourceExhausted, 2)
+	ctx.Equal(two.result, "m-tok-1-2", "two RESOURCE_EXHAUSTED must be retried and the third attempt succeed")
+	ctx.Equal(two.sleeps, 2, "expected two backoff sleeps before the third attempt: sleeps")
+	ctx.Assert(0.6 <= two.seconds && two.seconds <= 1.05, "the two backoffs must be about 200 + 400 ms plus jitter, together they were %v s", two.seconds)
+	seen := map[float64]bool{one.seconds: true}
+	for range 6 {
+		seen[pushWaited(ctx, codes.Unavailable, 1).seconds] = true
+	}
+	ctx.Assert(len(seen) > 1, "every first backoff lasted exactly %v s: add jitter so retries do not synchronise", one.seconds)
+}
+
+func CheckBounded(ctx *harness.Ctx) {
+	peer := servePushPeer(ctx)
+	ctx.GRPC.Fail("Send", codes.Unavailable, "", 50, "")
+	_, err := pushSend("tok-1")
+	ctx.Assert(err != nil, "a gateway that stays UNAVAILABLE must return an error wrapping ErrRetryable, sendPush returned nil")
+	ctx.ErrorIs(err, ErrRetryable, "a gateway that stays UNAVAILABLE must return an error wrapping ErrRetryable")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Send", "")), 3, "attempts against a down gateway")
+	ctx.Equal(peer.calls, 0, "no attempt reached the gateway (every one was UNAVAILABLE): calls the gateway answered")
+}
+
+func CheckStaleToken(ctx *harness.Ctx) {
+	servePushPeer(ctx)
+	id, err := pushSend("stale")
+	ctx.NoError(err, "NOT_FOUND means the token is unregistered: sendPush must return a nil error")
+	ctx.Equal(id, "", "NOT_FOUND means the token is unregistered: the message id")
+	ctx.Equal(devices.Disabled, []string{"stale"}, "the stale token must be disabled: devices.Disabled")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Send", "")), 1, "NOT_FOUND must not be retried: calls to Send")
+	ctx.GRPC.Fail("Send", codes.InvalidArgument, "malformed token", 1, "")
+	id, err = pushSend("bad")
+	ctx.NoError(err, "INVALID_ARGUMENT means the token is bad: sendPush must return a nil error")
+	ctx.Equal(id, "", "INVALID_ARGUMENT means the token is bad: the message id")
+	ctx.Equal(devices.Disabled, []string{"stale", "bad"}, "the bad token must be disabled: devices.Disabled")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Send", "")), 2, "INVALID_ARGUMENT must not be retried: calls to Send")
+	ctx.Equal(ctx.Clock.Sleeps(), 0, "a stale token must not wait for a backoff: sleeps")
+}
+
+func CheckRetryable(ctx *harness.Ctx) {
+	servePushPeer(ctx)
+	ctx.GRPC.SetLatency("Send", 5.0, "")
+	_, slow := pushSend("tok-1")
+	ctx.Assert(slow != nil, "a gateway slower than the deadline must return an error wrapping ErrRetryable, sendPush returned nil")
+	ctx.ErrorIs(slow, ErrRetryable, "a gateway slower than the deadline must return an error wrapping ErrRetryable")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Send", "")), 1, "DEADLINE_EXCEEDED must not be retried (the consumer re-queues the record instead): calls to Send")
+	ctx.GRPC.SetLatency("Send", 0.0, "")
+	ctx.GRPC.Fail("Send", codes.ResourceExhausted, "", 3, "")
+	_, exhausted := pushSend("tok-1")
+	ctx.Assert(exhausted != nil, "exhausted retries must return an error wrapping ErrRetryable, sendPush returned nil")
+	ctx.ErrorIs(exhausted, ErrRetryable, "exhausted retries must return an error wrapping ErrRetryable")
+	ctx.GRPC.Fail("Send", codes.PermissionDenied, "bad credentials", 1, "")
+	_, denied := pushSend("tok-1")
+	ctx.Assert(denied != nil, "PERMISSION_DENIED must propagate as an error, sendPush returned nil")
+	ctx.Assert(!errors.Is(denied, ErrRetryable), "PERMISSION_DENIED is not transient: it must propagate as a plain error, not ErrRetryable")
+	ctx.Equal(status.Code(denied), codes.PermissionDenied, "PERMISSION_DENIED must propagate with its status code (%v)", denied)
+	ctx.Equal(devices.Disabled, []string(nil), "only INVALID_ARGUMENT / NOT_FOUND disable the token: devices.Disabled")
+}
+`,
   },
   debrief: `Three decisions make a provider call safe to put inside a consumer: a deadline, so one stuck call cannot hold a partition; retries only for the statuses that mean "not right now", with backoff and jitter so a provider recovering from an outage is not hit by every worker at once; and a distinct retryable error, so the caller can park the work instead of blocking on it. Disabling a stale token on the spot is what keeps the gateway's error rate honest. Real clients also honour \`Retry-After\` metadata from the gateway, use a circuit breaker when the error rate stays high, and collapse duplicate notifications with the \`collapse_key\` on the device.`,
 };

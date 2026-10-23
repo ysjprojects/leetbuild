@@ -27,11 +27,11 @@ Implement the \`Chat\` server on \`[::]:9000\` (\`serve()\` exported; the checks
   \`buildPrompt(message, chunks, history)\` — the one format.
 - \`Llm.Stream(model="large", prompt, max_tokens=MAX_TOKENS)\` on \`LLM_LARGE\` with a **deadline of
   \`DEADLINE_S\`** on the call. Relay every \`Token\` as a \`ChatEvent{token}\` **as it arrives** — never
-  collect the whole answer first. The deadline is the budget for the **first** token: a large model that
-  answers \`UNAVAILABLE\` before its first token gets the same prompt sent to \`LLM_SMALL\` with
-  \`model="small"\`; a model that is silent past the deadline ends the chat stream with
-  \`DEADLINE_EXCEEDED\` — two seconds are gone, a second model would start the budget over, and the app
-  owns the retry.
+  collect the whole answer first. As on any gRPC call, the deadline bounds the **whole** stream, so a
+  model slow to start leaves less time for the answer. A large model that answers \`UNAVAILABLE\` before
+  its first token gets the same prompt sent to \`LLM_SMALL\` with \`model="small"\`; a model that is
+  silent past the deadline ends the chat stream with \`DEADLINE_EXCEEDED\` — two seconds are gone, a
+  second model would start the budget over, and the app owns the retry.
 - Every **8 tokens**, run tier 1 of the guardrail (\`guardrail.tier1\`, no RPC) on the text so far —
   **complete sentences only**: cut at the last \`.\`, \`!\` or \`?\`; an unfinished sentence looks unlike
   every chunk and would fail on its own. If it fails, **cancel** the model stream (the rest of the
@@ -65,7 +65,7 @@ Implement the \`Chat\` server on \`[::]:9000\` (\`serve()\` exported; the checks
         kind: 'sync',
       },
       {from: 'Chat', to: 'llm-large', label: 'Llm.Stream(large, prompt, max_tokens 120) · deadline 2 s', kind: 'sync'},
-      {from: 'llm-large', to: 'Chat', label: 'Token "Based " · Token "on " · … (one every ~100 ms)', kind: 'reply'},
+      {from: 'llm-large', to: 'Chat', label: 'Token "Based " · Token "on " · … (one every ~40 ms)', kind: 'reply'},
       {
         from: 'Chat',
         to: 'Dasher app',
@@ -93,7 +93,7 @@ Implement the \`Chat\` server on \`[::]:9000\` (\`serve()\` exported; the checks
       id: 'tokens-stream',
       title: 'Relays every token as it arrives, then a done event with the sources',
       detail:
-        'The first `ChatEvent{token}` reaches the app while the model has produced only a few of its 32 tokens (the stand-in pauses 0.1 s of virtual time between tokens); the tokens joined equal the model\'s text; the done event says `sources: [red-card-0, red-card-1]`, `escalated: false`, `model: "large"`; the judge was asked once; both turns are on `conv:<session_id>` with a TTL.',
+        'The first `ChatEvent{token}` reaches the app while the model has produced only a few of its 32 tokens (the stand-in pauses 40 ms of virtual time between tokens); the tokens joined equal the model\'s text; the done event says `sources: [red-card-0, red-card-1]`, `escalated: false`, `model: "large"`; the judge was asked once; both turns are on `conv:<session_id>` with a TTL.',
       match: {
         python: {
           all: [/ChatEvent\(token=/, /await \w+\.read\(\)|async for \w+ in /, /done=True/, /cited_ids\(/],
@@ -610,6 +610,23 @@ func dial(target string) pb.LlmClient {
 var large = dial(config.LLMLarge)
 var small = dial(config.LLMSmall)
 
+// Built in the earlier steps of the course; provided here.
+var (
+	// search returns the k chunks nearest to the question, best first (step 2).
+	search = func(ctx context.Context, question string, k int) ([]prompt.Chunk, error) { panic("not implemented") }
+	// tier1 returns why an answer fails the cheap checks, nil when it passes (step 4).
+	tier1 = func(answer string, chunks []prompt.Chunk) []string { panic("not implemented") }
+	// check runs tier 1, then the judge (step 4).
+	check = func(ctx context.Context, question, answer string, chunks []prompt.Chunk) Verdict { panic("not implemented") }
+)
+
+// Verdict is what check returns (step 4): tier 1's reasons, or the judge's.
+type Verdict struct {
+	OK           bool
+	Groundedness float64
+	Reasons      []string
+}
+
 // history is the conversation so far: the JSON turns of conv:<session>, oldest first.
 func history(ctx context.Context, sessionID string) ([]prompt.Turn, error) {
 	raw, err := rdb.LRange(ctx, "conv:"+sessionID, 0, -1).Result()
@@ -716,6 +733,23 @@ func dial(target string) pb.LlmClient {
 
 var large = dial(config.LLMLarge)
 var small = dial(config.LLMSmall)
+
+// Built in the earlier steps of the course; provided here.
+var (
+	// search returns the k chunks nearest to the question, best first (step 2).
+	search = func(ctx context.Context, question string, k int) ([]prompt.Chunk, error) { panic("not implemented") }
+	// tier1 returns why an answer fails the cheap checks, nil when it passes (step 4).
+	tier1 = func(answer string, chunks []prompt.Chunk) []string { panic("not implemented") }
+	// check runs tier 1, then the judge (step 4).
+	check = func(ctx context.Context, question, answer string, chunks []prompt.Chunk) Verdict { panic("not implemented") }
+)
+
+// Verdict is what check returns (step 4): tier 1's reasons, or the judge's.
+type Verdict struct {
+	OK           bool
+	Groundedness float64
+	Reasons      []string
+}
 
 // history is the conversation so far: the JSON turns of conv:<session>, oldest first.
 func history(ctx context.Context, sessionID string) ([]prompt.Turn, error) {
@@ -1261,7 +1295,7 @@ import support_pb2_grpc
 from assistant import config, kb, model
 from assistant.db import SCHEMA
 
-GAP_S = 0.1  # virtual seconds between two tokens of the stand-in model
+GAP_S = 0.04  # virtual seconds between two tokens of the stand-in model: 48 tokens fit in the 2 s deadline
 STREAM = "/support.Llm/Stream"  # the full path: the learner's Chat.Stream shares the short name
 JUDGE = "/support.Judge/Evaluate"
 SESSION = "s-7"
@@ -1382,7 +1416,7 @@ async def check_tokens_stream(ctx):
     assert len(tokens) == w.large.total, f"one ChatEvent per Token: the model produced {w.large.total}, the app saw {len(tokens)}"
     first = seen[0]
     assert first.produced < w.large.total, f"the first token reached the app only after the model had produced all {w.large.total} tokens: relay each Token as it arrives, do not collect the answer first"
-    assert first.at - started <= 3 * GAP_S, f"the first token arrived {first.at - started:.1f} s (virtual) after the request; the model pauses {GAP_S} s per token, so a relayed first token is there within a few tenths"
+    assert first.at - started <= 3 * GAP_S, f"the first token arrived {first.at - started:.2f} s (virtual) after the request; the model pauses {GAP_S} s per token, so a relayed first token is there within about a tenth of a second"
     assert list(done.sources) == ["red-card-0", "red-card-1"], f"the done event's sources are the chunk ids the answer cites, in order: expected ['red-card-0', 'red-card-1'], got {list(done.sources)}"
     assert done.escalated is False and done.model == "large", f"a grounded answer from the large model ends with escalated=False, model='large', got {done}"
     assert len(ctx.grpc.calls_to(JUDGE, config.JUDGE)) == 1, f"the full guardrail.check runs once when the stream ends: expected one Evaluate call, saw {len(ctx.grpc.calls_to(JUDGE, config.JUDGE))}"
@@ -1474,7 +1508,7 @@ async def check_fallback_deadline(ctx):
 `,
     typescript: `import {credentials} from '@grpc/grpc-js';
 
-const GAP_MS = 100; // virtual milliseconds between two tokens of the stand-in model
+const GAP_MS = 40; // virtual milliseconds between two tokens of the stand-in model: 48 tokens fit in the 2 s deadline
 const STREAM = '/support.Llm/Stream'; // the full path: the learner's Chat.Stream shares the short name
 const JUDGE = '/support.Judge/Evaluate';
 const SESSION = 's-7';
@@ -1622,7 +1656,7 @@ export async function check_tokens_stream(ctx) {
   assert.equal(tokens.length, w.large.total, \`one ChatEvent per Token: the model produced \${w.large.total}, the app saw \${tokens.length}\`);
   const first = outcome.seen[0];
   assert(first.produced < w.large.total, \`the first token reached the app only after the model had produced all \${w.large.total} tokens: relay each Token as it arrives, do not collect the answer first\`);
-  assert(first.at - started <= 3 * GAP_MS, \`the first token arrived \${Math.round(first.at - started)} ms (virtual) after the request; the model pauses \${GAP_MS} ms per token, so a relayed first token is there within a few hundred\`);
+  assert(first.at - started <= 3 * GAP_MS, \`the first token arrived \${Math.round(first.at - started)} ms (virtual) after the request; the model pauses \${GAP_MS} ms per token, so a relayed first token is there within about a hundred\`);
   assert.deepEqual(done.sources, ['red-card-0', 'red-card-1'], \`the done event's sources are the chunk ids the answer cites, in order: expected ["red-card-0","red-card-1"], got \${JSON.stringify(done.sources)}\`);
   assert(done.escalated === false && done.model === 'large', \`a grounded answer from the large model ends with escalated: false, model: 'large', got \${JSON.stringify(done)}\`);
   assert.equal(evaluations(w).length, 1, \`the full guardrail check runs once when the stream ends: expected one Evaluate call, saw \${evaluations(w).length}\`);
@@ -1704,6 +1738,401 @@ export async function check_fallback_deadline(ctx) {
   assert.equal(history(ctx).length, before, 'a stream that failed with a status answered nothing: conv:<session_id> must not change');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+
+	"assistant/chunk"
+	"assistant/config"
+	"assistant/db"
+	"assistant/embed"
+	"assistant/kb"
+	"assistant/model"
+	"assistant/prompt"
+	pb "assistant/gen/support"
+
+	"leetbuild/harness"
+)
+
+const (
+	streamGap      = 40 * time.Millisecond // virtual time between two tokens of the stand-in model: 48 tokens fit in the 2 s deadline
+	streamMethod   = "/support.Llm/Stream"  // the full path: the learner's Chat.Stream shares the short name
+	streamSession  = "s-7"
+	streamQuestion = "My red card was declined at the restaurant, what do I do?"
+)
+
+var streamPast = []prompt.Turn{
+	{Role: "dasher", Text: "Hi, I am at the restaurant for order 4471."},
+	{Role: "assistant", Text: "Hello! What is happening with the order?"},
+}
+
+// streamLLM is the stand-in model server, streaming: one Token per word, streamGap of virtual time between two.
+type streamLLM struct {
+	pb.UnimplementedLlmServer
+	mode      string
+	mu        sync.Mutex
+	produced  int // tokens handed to the client by the latest stream
+	total     int
+	cancelled bool
+}
+
+func (p *streamLLM) Generate(_ context.Context, req *pb.GenerateRequest) (*pb.GenerateReply, error) {
+	text := model.Complete(req.GetPrompt(), int(req.GetMaxTokens()), p.mode)
+	return &pb.GenerateReply{Text: text, Tokens: int32(len(strings.Fields(text))), Model: req.GetModel()}, nil
+}
+
+func (p *streamLLM) Stream(req *pb.GenerateRequest, srv pb.Llm_StreamServer) error {
+	tokens := model.Tokens(model.Complete(req.GetPrompt(), int(req.GetMaxTokens()), p.mode))
+	p.mu.Lock()
+	p.produced, p.total, p.cancelled = 0, len(tokens), false
+	p.mu.Unlock()
+	for i, t := range tokens {
+		if srv.Context().Err() != nil {
+			p.mu.Lock()
+			p.cancelled = true
+			p.mu.Unlock()
+			return srv.Context().Err()
+		}
+		p.mu.Lock()
+		p.produced++
+		p.mu.Unlock()
+		if err := srv.Send(&pb.Token{Text: t, Index: int32(i)}); err != nil {
+			return err
+		}
+		time.Sleep(streamGap)
+	}
+	return nil
+}
+
+// state is produced, total and cancelled, read together.
+func (p *streamLLM) state() (int, int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.produced, p.total, p.cancelled
+}
+
+type streamJudge struct {
+	pb.UnimplementedJudgeServer
+}
+
+func (streamJudge) Evaluate(_ context.Context, req *pb.EvaluateRequest) (*pb.Scores, error) {
+	s := model.Evaluate(req.GetQuestion(), req.GetAnswer(), req.GetContextIds())
+	return &pb.Scores{Groundedness: float32(s.Groundedness), Coherence: float32(s.Coherence), Compliance: float32(s.Compliance), Pass: s.Pass}, nil
+}
+
+// streamWorld is the learner's Chat server in front of the stand-ins.
+type streamWorld struct {
+	large, small *streamLLM
+	chat         pb.ChatClient
+}
+
+// streamSentences splits an answer on . ! ? as step 4's guardrail does.
+func streamSentences(text string) []string {
+	var out []string
+	for _, s := range strings.FieldsFunc(text, func(r rune) bool { return r == '.' || r == '!' || r == '?' }) {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// streamNeighbours stands in for the earlier steps: search as step 2 built it (pgvector over
+// kb_chunks), tier1 and check as step 4 built them (cheap checks, then the judge).
+func streamNeighbours() {
+	search = func(ctx context.Context, question string, k int) ([]prompt.Chunk, error) {
+		rows, err := db.Pool.QueryContext(ctx,
+			"SELECT id, text, embedding <=> $1::vector AS distance FROM kb_chunks ORDER BY embedding <=> $1::vector LIMIT $2",
+			embed.ToPgvector(embed.Embed(question)), k)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []prompt.Chunk
+		for rows.Next() {
+			var c prompt.Chunk
+			var distance float64
+			if err := rows.Scan(&c.ID, &c.Text, &distance); err != nil {
+				return nil, err
+			}
+			c.Score = 1 - distance
+			out = append(out, c)
+		}
+		return out, rows.Err()
+	}
+	tier1 = func(answer string, chunks []prompt.Chunk) []string {
+		ids := map[string]bool{}
+		var vectors [][]float64
+		for _, c := range chunks {
+			ids[c.ID] = true
+			vectors = append(vectors, embed.Embed(c.Text))
+		}
+		var reasons []string
+		for _, id := range prompt.CitedIds(answer) {
+			if !ids[id] {
+				reasons = append(reasons, fmt.Sprintf("cites [kb:%s], which was not retrieved", id))
+			}
+		}
+		for _, s := range streamSentences(answer) {
+			v := embed.Embed(s)
+			best := 0.0
+			for _, w := range vectors {
+				if c := embed.Cosine(v, w); c > best {
+					best = c
+				}
+			}
+			if best < config.MinSimilarity {
+				reasons = append(reasons, fmt.Sprintf("sentence unlike any retrieved chunk: %q", s))
+			}
+		}
+		return reasons
+	}
+	conn, _ := grpc.NewClient(config.Judge, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	judge := pb.NewJudgeClient(conn)
+	check = func(ctx context.Context, question, answer string, chunks []prompt.Chunk) Verdict {
+		if reasons := tier1(answer, chunks); len(reasons) > 0 {
+			return Verdict{Reasons: reasons}
+		}
+		var ids []string
+		for _, c := range chunks {
+			ids = append(ids, c.ID)
+		}
+		callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		scores, err := judge.Evaluate(callCtx, &pb.EvaluateRequest{Question: question, Answer: answer, ContextIds: ids})
+		if err != nil {
+			return Verdict{Reasons: []string{"judge " + status.Code(err).String()}}
+		}
+		return Verdict{OK: scores.GetPass(), Groundedness: float64(scores.GetGroundedness())}
+	}
+}
+
+// streamStart indexes the KB, serves the model (in mode) and the judge, seeds a history and starts the learner's server.
+func streamStart(ctx *harness.Ctx, mode string) *streamWorld {
+	ctx.DB.Reset(db.Schema)
+	for _, a := range kb.Articles {
+		for position, text := range chunk.Chunk(a.Body) {
+			ctx.DB.Exec("INSERT INTO kb_chunks (id, article, position, text, embedding) VALUES ($1, $2, $3, $4, $5::vector)",
+				fmt.Sprintf("%s-%d", a.ID, position), a.ID, position, text, embed.ToPgvector(embed.Embed(text)))
+		}
+	}
+	for _, t := range streamPast {
+		raw, _ := json.Marshal(t)
+		ctx.Redis.Do("RPUSH", "conv:"+streamSession, string(raw))
+	}
+	w := &streamWorld{large: &streamLLM{mode: mode}, small: &streamLLM{mode: mode}}
+	pb.RegisterLlmServer(ctx.GRPC.Server(config.LLMLarge), w.large)
+	pb.RegisterLlmServer(ctx.GRPC.Server(config.LLMSmall), w.small)
+	pb.RegisterJudgeServer(ctx.GRPC.Server(config.Judge), streamJudge{})
+	streamNeighbours()
+	ctx.Main(main)
+	w.chat = pb.NewChatClient(ctx.GRPC.Dial("chat:9000"))
+	return w
+}
+
+// streamSeen is one ChatEvent, the model's token count and the virtual time when it arrived.
+type streamSeen struct {
+	event    *pb.ChatEvent
+	produced int
+	at       int64
+}
+
+// streamOutcome is every event of one Chat.Stream call and the status it failed with, if any.
+type streamOutcome struct {
+	seen []streamSeen
+	err  error
+}
+
+func (w *streamWorld) produced() int {
+	l, _, _ := w.large.state()
+	s, _, _ := w.small.state()
+	return l + s
+}
+
+func (w *streamWorld) stream(ctx *harness.Ctx, message, session string) streamOutcome {
+	var out streamOutcome
+	call, err := w.chat.Stream(context.Background(), &pb.ChatRequest{SessionId: session, DasherId: "d-9", Message: message})
+	if err != nil {
+		out.err = err
+		return out
+	}
+	for {
+		event, err := call.Recv()
+		if errors.Is(err, io.EOF) {
+			return out
+		}
+		if err != nil {
+			out.err = err
+			return out
+		}
+		out.seen = append(out.seen, streamSeen{event, w.produced(), ctx.Clock.Now()})
+	}
+}
+
+// streamSplit is the token events and the done event, checked for shape.
+func streamSplit(ctx *harness.Ctx, o streamOutcome) (tokens []*pb.ChatEvent, done *pb.ChatEvent, joined string) {
+	if o.err != nil {
+		ctx.Fatalf("Chat.Stream failed with %v (%s) after %d event(s)", status.Code(o.err), status.Convert(o.err).Message(), len(o.seen))
+	}
+	ctx.Assert(len(o.seen) > 0, "Chat.Stream ended without a single event")
+	done = o.seen[len(o.seen)-1].event
+	ctx.Assert(done.GetDone(), "the last event must be the done event, got %v", done)
+	for _, s := range o.seen[:len(o.seen)-1] {
+		ctx.Assert(!s.event.GetDone() && s.event.GetToken() != "", "every event before the last one carries a token and Done: false")
+		tokens = append(tokens, s.event)
+		joined += s.event.GetToken()
+	}
+	return tokens, done, joined
+}
+
+func streamHistory(ctx *harness.Ctx) []prompt.Turn {
+	var turns []prompt.Turn
+	for _, raw := range ctx.Redis.LRange("conv:"+streamSession, 0, -1) {
+		var t prompt.Turn
+		_ = json.Unmarshal([]byte(raw), &t)
+		turns = append(turns, t)
+	}
+	return turns
+}
+
+func streamAssertHistory(ctx *harness.Ctx, answer string) {
+	want := append(append([]prompt.Turn{}, streamPast...), prompt.Turn{Role: "dasher", Text: streamQuestion}, prompt.Turn{Role: "assistant", Text: answer})
+	ctx.Equal(streamHistory(ctx), want, "conv:%s must hold the two seeded turns, then the dasher's question and the assistant's turn", streamSession)
+	ttl := ctx.Redis.TTL("conv:" + streamSession)
+	ctx.Assert(0 < ttl && ttl <= config.HistoryTTL, "conv:%s must expire in config.HistoryTTL (%d) seconds, its TTL is %d", streamSession, config.HistoryTTL, ttl)
+}
+
+func streamCalls(ctx *harness.Ctx, target string) []harness.Call {
+	return ctx.GRPC.CallsTo(streamMethod, target)
+}
+
+func streamRequest(call harness.Call) *pb.GenerateRequest {
+	req, _ := call.Request.(*pb.GenerateRequest)
+	return req
+}
+
+func streamEvaluations(ctx *harness.Ctx) int {
+	return len(ctx.GRPC.CallsTo("/support.Judge/Evaluate", config.Judge))
+}
+
+func CheckTokensStream(ctx *harness.Ctx) {
+	w := streamStart(ctx, "faithful")
+	started := ctx.Clock.Now()
+	outcome := w.stream(ctx, streamQuestion, streamSession)
+	tokens, done, joined := streamSplit(ctx, outcome)
+	large := streamCalls(ctx, config.LLMLarge)
+	ctx.Equal(len(large), 1, "a healthy large model is streamed from exactly once: Llm.Stream calls to %s", config.LLMLarge)
+	expected := model.Complete(streamRequest(large[0]).GetPrompt(), config.MaxTokens, "faithful")
+	ctx.Equal(joined, expected, "the tokens joined must be the model's text")
+	_, total, _ := w.large.state()
+	ctx.Assert(len(tokens) == total, "one ChatEvent per Token: the model produced %d, the app saw %d", total, len(tokens))
+	first := outcome.seen[0]
+	ctx.Assert(first.produced < total, "the first token reached the app only after the model had produced all %d tokens: relay each Token as it arrives, do not collect the answer first", total)
+	ctx.Assert(first.at-started <= int64(3*streamGap/time.Millisecond), "the first token arrived %d ms (virtual) after the request; the model pauses %v per token, so a relayed first token is there within about a hundred ms", first.at-started, streamGap)
+	ctx.Equal(done.GetSources(), []string{"red-card-0", "red-card-1"}, "the done event's Sources are the chunk ids the answer cites, in order")
+	ctx.Assert(!done.GetEscalated() && done.GetModel() == "large", "a grounded answer from the large model ends with Escalated: false, Model: \\"large\\", got %v", done)
+	ctx.Equal(streamEvaluations(ctx), 1, "the full guardrail check runs once when the stream ends: Evaluate calls")
+	streamAssertHistory(ctx, expected)
+}
+
+func CheckPrompt(ctx *harness.Ctx) {
+	w := streamStart(ctx, "faithful")
+	streamSplit(ctx, w.stream(ctx, streamQuestion, streamSession))
+	large := streamCalls(ctx, config.LLMLarge)
+	ctx.Equal(len(large), 1, "Llm.Stream calls to %s", config.LLMLarge)
+	request := streamRequest(large[0])
+	ctx.Equal(request.GetModel(), "large", "the request to %s must say Model: \\"large\\"", config.LLMLarge)
+	ctx.Equal(request.GetMaxTokens(), config.MaxTokens, "the request must carry MaxTokens: config.MaxTokens")
+	// The nearest chunks straight from the database, as search would rank them.
+	q := embed.ToPgvector(embed.Embed(streamQuestion))
+	var ranked []prompt.Chunk
+	for _, r := range ctx.DB.Query("SELECT id, text FROM kb_chunks ORDER BY embedding <=> $1::vector LIMIT $2", q, config.TopK) {
+		id, _ := r["id"].(string)
+		text, _ := r["text"].(string)
+		ranked = append(ranked, prompt.Chunk{ID: id, Text: text})
+	}
+	for _, c := range ranked {
+		ctx.Assert(strings.Contains(request.GetPrompt(), "[kb:"+c.ID+"] "+c.Text), "the prompt has no '[kb:%s] <text>' line, one of the %d nearest chunks: the context is search(message) through prompt.Build", c.ID, config.TopK)
+	}
+	for _, t := range streamPast {
+		ctx.Assert(strings.Contains(request.GetPrompt(), t.Role+": "+t.Text), "the prompt is missing the history turn %s: %q from conv:%s", t.Role, t.Text, streamSession)
+	}
+	ctx.Equal(request.GetPrompt(), prompt.Build(streamQuestion, ranked, streamPast), "the prompt must be exactly prompt.Build(message, chunks, history): the model parses that format")
+}
+
+func CheckGuardMidStream(ctx *harness.Ctx) {
+	w := streamStart(ctx, "verbose")
+	tokens, done, _ := streamSplit(ctx, w.stream(ctx, streamQuestion, streamSession))
+	n := len(tokens)
+	ctx.Assert(n > 40, "the app saw %d tokens: tier 1 fired on an unfinished sentence ('Additionally, please note that this may vary by' alone looks unlike every chunk) — judge complete sentences only", n)
+	ctx.Assert(n <= 48, "the app saw %d tokens: the filler sentence completes at token 44, so the guard at token 48 must stop the stream", n)
+	ctx.Assert(done.GetEscalated() && len(done.GetSources()) == 0, "a failed tier 1 ends with Escalated: true and no Sources, got %v", done)
+	ctx.Equal(done.GetModel(), "large", "the done event names the model that was streaming")
+	time.Sleep(5 * streamGap)
+	produced, total, cancelled := w.large.state()
+	ctx.Assert(cancelled, "the guard fired but the model stream was not cancelled: the model kept generating tokens nobody will read")
+	ctx.Assert(produced < total, "after the cancel the model must stop: it produced %d of %d tokens", produced, total)
+	ctx.Equal(streamEvaluations(ctx), 0, "tier 1 failed mid-stream: the judge is not consulted")
+	streamAssertHistory(ctx, config.HandoffText)
+}
+
+func CheckGuardAtEnd(ctx *harness.Ctx) {
+	w := streamStart(ctx, "hallucinate")
+	tokens, done, joined := streamSplit(ctx, w.stream(ctx, streamQuestion, streamSession))
+	invented := model.Complete(streamRequest(streamCalls(ctx, config.LLMLarge)[0]).GetPrompt(), config.MaxTokens, "hallucinate")
+	produced, total, cancelled := w.large.state()
+	ctx.Assert(joined == invented, "the invented sentence completes only at its last token, so all %d tokens are relayed before the guard can see it; the app saw %d", total, len(tokens))
+	ctx.Assert(!cancelled && produced == total, "the model's stream ended by itself: nothing to cancel")
+	ctx.Assert(done.GetEscalated() && len(done.GetSources()) == 0, "the full check fails on [kb:policy-404]: the done event must say Escalated: true with no Sources, got %v", done)
+	ctx.Equal(done.GetModel(), "large", "the done event names the model that was streaming")
+	ctx.Equal(streamEvaluations(ctx), 0, "a tier-1 failure (a citation that was never retrieved) never reaches the judge")
+	streamAssertHistory(ctx, config.HandoffText)
+}
+
+func CheckFallbackDeadline(ctx *harness.Ctx) {
+	w := streamStart(ctx, "faithful")
+	ctx.GRPC.Fail(streamMethod, codes.Unavailable, "", 1, config.LLMLarge)
+	outcome := w.stream(ctx, streamQuestion, streamSession)
+	_, done, joined := streamSplit(ctx, outcome)
+	ctx.Equal(len(streamCalls(ctx, config.LLMLarge)), 1, "UNAVAILABLE on a stream is a fallback, not a retry: Llm.Stream calls to %s", config.LLMLarge)
+	small := streamCalls(ctx, config.LLMSmall)
+	ctx.Equal(len(small), 1, "the large model UNAVAILABLE must mean one Llm.Stream call to %s", config.LLMSmall)
+	ctx.Assert(streamRequest(small[0]).GetModel() == "small" && streamRequest(small[0]).GetPrompt() == streamRequest(streamCalls(ctx, config.LLMLarge)[0]).GetPrompt(), "the fallback sends the same prompt with Model: \\"small\\"")
+	expected := model.Complete(streamRequest(small[0]).GetPrompt(), config.MaxTokens, "faithful")
+	ctx.Equal(joined, expected, "the small model's tokens must reach the app")
+	ctx.Assert(done.GetModel() == "small" && !done.GetEscalated(), "the done event must say Model: \\"small\\", Escalated: false, got %v", done)
+	_, smallTotal, _ := w.small.state()
+	ctx.Assert(outcome.seen[0].produced < smallTotal, "the small model's tokens must be relayed as they arrive too")
+	streamAssertHistory(ctx, expected)
+	// A large model that is silent for 3 s: the deadline on the call ends the wait at config.DeadlineS.
+	ctx.GRPC.SetLatency(streamMethod, 3.0, config.LLMLarge)
+	before := len(streamHistory(ctx))
+	started := ctx.Clock.Now()
+	stalled := w.stream(ctx, streamQuestion, "s-8")
+	elapsed := ctx.Clock.Now() - started
+	ctx.Assert(stalled.err != nil, "a large model silent past config.DeadlineS must end the chat stream with DEADLINE_EXCEEDED; it answered %d event(s) instead", len(stalled.seen))
+	ctx.Equal(status.Code(stalled.err), codes.DeadlineExceeded, "the chat stream must end with DEADLINE_EXCEEDED")
+	calls := streamCalls(ctx, config.LLMLarge)
+	call := calls[len(calls)-1]
+	ctx.Assert(call.HasDeadline() && 1.5 <= call.Timeout.Seconds() && call.Timeout.Seconds() <= 2.0, "the Llm.Stream call must carry a deadline of config.DeadlineS (%v s), got %v", config.DeadlineS, call.Timeout)
+	ctx.Assert(elapsed <= 2500, "the deadline must end the wait at %v s of virtual time, the stream waited %d ms (3000 means the model's stall was waited out)", config.DeadlineS, elapsed)
+	ctx.Equal(len(streamCalls(ctx, config.LLMSmall)), 1, "a deadline is not a fallback: the budget is spent, the small model must not be called")
+	ctx.Equal(len(streamHistory(ctx)), before, "a stream that failed with a status answered nothing: conv:<session_id> must not change")
+}
+`,
   },
-  debrief: `Streaming changes what "fast" means. A unary answer is judged by one number — time to the reply — while a stream is judged by two: time to the first token, which is what the Dasher feels as responsiveness, and time between tokens, which is what they feel as the answer being typed. LinkedIn's platform post makes those the metrics the serving layer is held to, and they are why a relay that collects the whole answer before writing anything is wrong even though it sends the same bytes: it turns the stream back into a unary call with extra steps. The deadline moves with the metric — it is the budget for the first token, not for the answer — and so does the fallback: \`UNAVAILABLE\` before the first token is cheap to redirect to a smaller model, while a model that dies mid-answer has already shown the Dasher half a sentence, and the honest outcome is a status the app can act on. The guard moves too, and loses something on the way. Tier 1 needs a complete sentence to compare against the chunks, so it runs on a trailing window and sees an invented sentence only at its full stop: the hallucinating model's one sentence reaches the app before the handoff does, which a unary guardrail would never have allowed. What the incremental guard buys is the cancel. A model that has gone off the rails will happily produce a hundred more tokens, each one a slice of GPU time that nobody will read; cancelling the upstream stream the moment tier 1 fails is how the server stops paying for them, and in production the cancellation has to propagate all the way to the inference engine, which is why serving stacks treat client disconnects and cancellations as first-class events rather than letting the request run to completion. Production adds what this step leaves out: an idle timeout between tokens next to the first-token deadline, a client that reconnects with the tokens it already has, and the offline judge of the next step scoring every streamed turn — including the ones the Dasher saw half of.`,
+  debrief: `Streaming changes what "fast" means. A unary answer is judged by one number — time to the reply — while a stream is judged by two: time to the first token, which is what the Dasher feels as responsiveness, and time between tokens, which is what they feel as the answer being typed. LinkedIn's platform post makes those the metrics the serving layer is held to, and they are why a relay that collects the whole answer before writing anything is wrong even though it sends the same bytes: it turns the stream back into a unary call with extra steps. The deadline does not move — gRPC bounds the whole call, so the answer has to stream within it and a model slow to start spends the answer's time — but the fallback moves with the metric: \`UNAVAILABLE\` before the first token is cheap to redirect to a smaller model, while a model that dies mid-answer has already shown the Dasher half a sentence, and the honest outcome is a status the app can act on. The guard moves too, and loses something on the way. Tier 1 needs a complete sentence to compare against the chunks, so it runs on a trailing window and sees an invented sentence only at its full stop: the hallucinating model's one sentence reaches the app before the handoff does, which a unary guardrail would never have allowed. What the incremental guard buys is the cancel. A model that has gone off the rails will happily produce a hundred more tokens, each one a slice of GPU time that nobody will read; cancelling the upstream stream the moment tier 1 fails is how the server stops paying for them, and in production the cancellation has to propagate all the way to the inference engine, which is why serving stacks treat client disconnects and cancellations as first-class events rather than letting the request run to completion. Production adds what this step leaves out: a first-token timer and an idle timeout between tokens inside the call's deadline, a client that reconnects with the tokens it already has, and the offline judge of the next step scoring every streamed turn — including the ones the Dasher saw half of.`,
 };

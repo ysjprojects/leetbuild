@@ -183,3 +183,176 @@ export const timeline = {
 };
 `,
 };
+
+/**
+ * The same provided packages for the Go runtime, imported as `feed/graph`, `feed/ids`, `feed/posts`,
+ * `feed/events` and `feed/timeline`.
+ */
+export const supportModulesGo: Record<string, string> = {
+  'feed/graph/graph.go': `// Package graph is the follow graph (provided): in-memory tables the harness and your own
+// experiments fill.
+package graph
+
+import "context"
+
+// FollowersOf maps an author id to the ids of every user following them.
+var FollowersOf = map[string][]string{}
+
+// CelebritiesFollowedBy maps a user id to the celebrity accounts they follow.
+var CelebritiesFollowedBy = map[string][]string{}
+
+// Followers returns the ids of every user following authorID.
+func Followers(ctx context.Context, authorID string) ([]string, error) {
+	return append([]string(nil), FollowersOf[authorID]...), nil
+}
+
+// CelebritiesFollowed returns the ids of the celebrity accounts userID follows (their posts are
+// pulled at read time, not pushed).
+func CelebritiesFollowed(ctx context.Context, userID string) ([]string, error) {
+	return append([]string(nil), CelebritiesFollowedBy[userID]...), nil
+}
+`,
+  'feed/ids/ids.go': `// Package ids: post ids carry their creation time, "<created_at ms>-<suffix>".
+package ids
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/google/uuid"
+)
+
+// NewID returns a fresh id for a post created at createdAtMs.
+func NewID(createdAtMs int64) string {
+	return fmt.Sprintf("%d-%s", createdAtMs, strings.ReplaceAll(uuid.NewString(), "-", "")[:8])
+}
+
+// CreatedAt is the milliseconds since the epoch encoded in postID.
+func CreatedAt(postID string) int64 {
+	prefix, _, _ := strings.Cut(postID, "-")
+	ms, _ := strconv.ParseInt(prefix, 10, 64)
+	return ms
+}
+`,
+  'feed/posts/posts.go': `// Package posts is the post store (provided): each post as JSON at post:{id}, the posts:{author}
+// index scored by created_at, and the Idempotency-Key dedupe.
+package posts
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+const (
+	PostTTL        = time.Hour
+	IdempotencyTTL = 24 * time.Hour
+)
+
+// Post is a post as it is stored and published.
+type Post struct {
+	ID             string   \`json:"post_id"\`
+	Author         string   \`json:"author"\`
+	Text           string   \`json:"text"\`
+	MediaIDs       []string \`json:"media_ids"\`
+	CreatedAt      int64    \`json:"created_at"\`
+	IdempotencyKey string   \`json:"idempotency_key,omitempty"\`
+}
+
+var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+
+// Save stores the post and indexes it under its author. A post whose idempotency key its author
+// already used is that earlier post: *post is overwritten with it, and nothing new is stored.
+func Save(ctx context.Context, post *Post) error {
+	idem := ""
+	if post.IdempotencyKey != "" {
+		idem = "idem:" + post.Author + ":" + post.IdempotencyKey
+		existing, err := rdb.Get(ctx, idem).Bytes()
+		if err == nil {
+			return json.Unmarshal(existing, post)
+		}
+		if !errors.Is(err, redis.Nil) {
+			return err
+		}
+	}
+	doc, err := json.Marshal(post)
+	if err != nil {
+		return err
+	}
+	if err := rdb.Set(ctx, "post:"+post.ID, doc, PostTTL).Err(); err != nil {
+		return err
+	}
+	if err := rdb.ZAdd(ctx, "posts:"+post.Author, redis.Z{Score: float64(post.CreatedAt), Member: post.ID}).Err(); err != nil {
+		return err
+	}
+	if idem != "" {
+		return rdb.Set(ctx, idem, doc, IdempotencyTTL).Err()
+	}
+	return nil
+}
+
+// Get returns the post postID, nil when there is none.
+func Get(ctx context.Context, postID string) (*Post, error) {
+	raw, err := rdb.Get(ctx, "post:"+postID).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var post Post
+	if err := json.Unmarshal(raw, &post); err != nil {
+		return nil, err
+	}
+	return &post, nil
+}
+`,
+  'feed/events/events.go': `// Package events is the publisher of the "posts" topic (provided): one record per new post, keyed
+// by the author id.
+package events
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"github.com/segmentio/kafka-go"
+
+	"feed/posts"
+)
+
+const Topic = "posts"
+
+var writer = &kafka.Writer{
+	Addr:         kafka.TCP("kafka:9092"),
+	Topic:        Topic,
+	Balancer:     &kafka.Hash{},
+	BatchTimeout: 5 * time.Millisecond,
+}
+
+// Publish produces post to Topic and returns once the broker acknowledged it.
+func Publish(ctx context.Context, post posts.Post) error {
+	value, err := json.Marshal(post)
+	if err != nil {
+		return err
+	}
+	return writer.WriteMessages(ctx, kafka.Message{Key: []byte(post.Author), Value: value})
+}
+`,
+  'feed/timeline/timeline.go': `// Package timeline is the home-timeline read (provided as a facade): step 3 builds the real one.
+package timeline
+
+import "context"
+
+// Read returns a page of post ids for userID's home timeline, newest first, created before cursor
+// (nil: from the newest), and the cursor of the next page (nil after the last). It is a variable so
+// the read of step 3 can be plugged in; until then every page is empty.
+var Read = func(ctx context.Context, userID string, cursor *int64, limit int) ([]string, *int64, error) {
+	return []string{}, nil, nil
+}
+`,
+};

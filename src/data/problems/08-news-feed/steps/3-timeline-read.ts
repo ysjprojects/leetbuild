@@ -698,6 +698,146 @@ export async function check_cursor(ctx) {
   assert.equal(nextCursor, null, \`an empty page has no next_cursor, got \${JSON.stringify(nextCursor)}\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"leetbuild/harness"
+
+	"feed/graph"
+)
+
+// postIDAt is a post id carrying its timestamp: "<created_at ms>-<tag>" (ids.CreatedAt parses the prefix).
+func postIDAt(ms int, tag string) string { return fmt.Sprintf("%d-%s", ms, tag) }
+
+// pushIDs are fan-out writes: ids given oldest first end up newest first in the list.
+func pushIDs(ctx *harness.Ctx, user string, ids ...string) {
+	for _, id := range ids {
+		ctx.Redis.Do("LPUSH", "timeline:"+user, id)
+	}
+}
+
+func pullIDs(ctx *harness.Ctx, author string, ids ...string) {
+	for _, id := range ids {
+		prefix, _, _ := strings.Cut(id, "-")
+		ms, _ := strconv.Atoi(prefix)
+		ctx.Redis.Do("ZADD", "posts:"+author, ms, id)
+	}
+}
+
+func readTimeline(ctx *harness.Ctx, userID string, cursor *int64, limit int) ([]string, *int64) {
+	page, next, err := Read(context.Background(), userID, cursor, limit)
+	ctx.NoError(err, "Read(%q, %v, %d) returned an error", userID, cursorValue(cursor), limit)
+	return page, next
+}
+
+// cursorValue is the cursor a pointer holds, nil for none.
+func cursorValue(cursor *int64) any {
+	if cursor == nil {
+		return nil
+	}
+	return *cursor
+}
+
+func cursorAt(ms int64) *int64 { return &ms }
+
+func CheckPushed(ctx *harness.Ctx) {
+	var ids []string
+	for i := range 10 {
+		ids = append(ids, postIDAt(100+i, "a"))
+	}
+	pushIDs(ctx, "alice", ids...)
+	page, next := readTimeline(ctx, "alice", nil, 3)
+	ctx.Equal(page, []string{postIDAt(109, "a"), postIDAt(108, "a"), postIDAt(107, "a")}, "with 10 pushed ids and limit 3 the page must be the 3 newest")
+	ctx.Equal(cursorValue(next), 107, "the next cursor must be the created_at of the last id of the page (107)")
+	page, _ = readTimeline(ctx, "alice", nil, 20)
+	var newestFirst []string
+	for i := len(ids) - 1; i >= 0; i-- {
+		newestFirst = append(newestFirst, ids[i])
+	}
+	ctx.Equal(page, newestFirst, "with limit 20 every pushed id must be returned newest first")
+}
+
+func CheckPulled(ctx *harness.Ctx) {
+	var taylor []string
+	for i := range 5 {
+		taylor = append(taylor, postIDAt(200+i, "t"))
+	}
+	nasa := []string{postIDAt(150, "n"), postIDAt(151, "n")}
+	pullIDs(ctx, "taylor", taylor...)
+	pullIDs(ctx, "nasa", nasa...)
+	graph.CelebritiesFollowedBy["alice"] = []string{"taylor", "nasa"}
+	page, next := readTimeline(ctx, "alice", nil, 4)
+	ctx.Equal(page, []string{postIDAt(204, "t"), postIDAt(203, "t"), postIDAt(202, "t"), postIDAt(201, "t")}, "nothing was pushed: the page must be the 4 newest celebrity posts")
+	ctx.Equal(cursorValue(next), 201, "the next cursor")
+	page, _ = readTimeline(ctx, "alice", nil, 10)
+	want := []string{taylor[4], taylor[3], taylor[2], taylor[1], taylor[0], nasa[1], nasa[0]}
+	ctx.Equal(page, want, "every post of every followed celebrity must be pulled, newest first")
+	page, _ = readTimeline(ctx, "bob", nil, 10)
+	ctx.Assert(len(page) == 0, "bob follows no celebrity and has no timeline: expected an empty page, got %q", page)
+}
+
+func CheckSinglePipeline(ctx *harness.Ctx) {
+	pushIDs(ctx, "alice", postIDAt(100, "a"), postIDAt(300, "a"))
+	pullIDs(ctx, "taylor", postIDAt(200, "t"))
+	pullIDs(ctx, "nasa", postIDAt(400, "n"))
+	graph.CelebritiesFollowedBy["alice"] = []string{"taylor", "nasa"}
+	page, _ := readTimeline(ctx, "alice", nil, 10)
+	ctx.Equal(page, []string{postIDAt(400, "n"), postIDAt(300, "a"), postIDAt(200, "t"), postIDAt(100, "a")}, "unexpected page")
+	var reads []string
+	var pipelines [][]string
+	for _, trip := range ctx.Redis.RoundTrips() {
+		if len(trip) > 1 {
+			pipelines = append(pipelines, trip)
+		} else if len(trip) == 1 && (trip[0] == "LRANGE" || trip[0] == "ZREVRANGEBYSCORE" || trip[0] == "ZRANGE") {
+			reads = append(reads, trip[0])
+		}
+	}
+	ctx.Assert(len(reads) == 0, "%d Redis read(s) were sent outside a pipeline (%v): queue the LRange and every ZRevRangeByScore on one pipeline", len(reads), reads)
+	ctx.Equal(len(pipelines), 1, "a page must cost one round trip: pipeline Execs observed")
+	ctx.Equal(len(pipelines[0]), 3, "the pipeline must carry the LRange and one ZRevRangeByScore per celebrity (3 commands for 2 celebrities)")
+}
+
+func CheckMerged(ctx *harness.Ctx) {
+	pushIDs(ctx, "alice", postIDAt(100, "a"), postIDAt(300, "a"), postIDAt(500, "a"))
+	pullIDs(ctx, "taylor", postIDAt(200, "t"), postIDAt(400, "t"), postIDAt(600, "t"))
+	pullIDs(ctx, "nasa", postIDAt(500, "a")) // the same post also arrived through fan-out
+	graph.CelebritiesFollowedBy["alice"] = []string{"taylor", "nasa"}
+	page, next := readTimeline(ctx, "alice", nil, 4)
+	ctx.Equal(page, []string{postIDAt(600, "t"), postIDAt(500, "a"), postIDAt(400, "t"), postIDAt(300, "a")}, "pushed and pulled ids must be merged newest first and cut to limit")
+	ctx.Equal(cursorValue(next), 300, "the next cursor")
+	page, _ = readTimeline(ctx, "alice", nil, 10)
+	copies := 0
+	for _, id := range page {
+		if id == postIDAt(500, "a") {
+			copies++
+		}
+	}
+	ctx.Assert(copies == 1, "an id present in both sources must appear once, got %q", page)
+	ctx.Equal(page, []string{postIDAt(600, "t"), postIDAt(500, "a"), postIDAt(400, "t"), postIDAt(300, "a"), postIDAt(200, "t"), postIDAt(100, "a")}, "the full merge must be every distinct id newest first")
+}
+
+func CheckCursor(ctx *harness.Ctx) {
+	for i := range 10 {
+		pushIDs(ctx, "alice", postIDAt(100+2*i, "a")) // 100, 102, ..., 118; LRANGE 0 5 sees 118..108
+	}
+	pullIDs(ctx, "taylor", postIDAt(109, "t"), postIDAt(113, "t"), postIDAt(115, "t"), postIDAt(121, "t"))
+	graph.CelebritiesFollowedBy["alice"] = []string{"taylor"}
+	page, next := readTimeline(ctx, "alice", cursorAt(115), 3)
+	ctx.Equal(page, []string{postIDAt(114, "a"), postIDAt(113, "t"), postIDAt(112, "a")}, "with cursor 115 only ids created before 115 may appear (the bound is exclusive, from both sources)")
+	ctx.Equal(cursorValue(next), 112, "the next cursor")
+	page, next = readTimeline(ctx, "alice", next, 3)
+	ctx.Equal(page, []string{postIDAt(110, "a"), postIDAt(109, "t"), postIDAt(108, "a")}, "the next page must continue below the cursor without overlap")
+	ctx.Equal(cursorValue(next), 108, "the next cursor")
+	page, next = readTimeline(ctx, "alice", cursorAt(100), 3)
+	ctx.Assert(len(page) == 0, "nothing is older than 100: expected an empty page, got %q", page)
+	ctx.Equal(cursorValue(next), nil, "an empty page has no next cursor")
+}
+`,
   },
   debrief: `The read is where the hybrid pays off: one pipeline, a handful of replies, a sort of at most a few dozen ids — regardless of how many followers the celebrities have. Both sources answer the same question ("posts older than the cursor, newest first") and the merge hides which one each id came from. The honest limitation: a plain list cannot seek by time, so deep pagination over the pushed ids degrades — real feeds keep the timeline itself as a sorted set scored by \`created_at\` (or a time-sortable id such as a Snowflake), apply ranking after this candidate step, and cache the hydrated first page per user for a few seconds.`,
 };

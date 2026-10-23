@@ -282,11 +282,14 @@ const (
 )
 
 // merchantOf returns the merchant id from the verified API key (authentication is provided).
-func merchantOf(r *http.Request) string {
+var merchantOf = func(r *http.Request) string {
 	return r.Context().Value(merchantKey{}).(string)
 }
 
 type merchantKey struct{}
+
+// checkout is the checkout handler (built in step 1).
+var checkout = func(rw http.ResponseWriter, r *http.Request) { panic("not implemented") }
 
 // rateLimit rejects a merchant's requests with 429 once it is over limit this minute.
 func rateLimit(next http.Handler) http.Handler {
@@ -330,11 +333,14 @@ const (
 )
 
 // merchantOf returns the merchant id from the verified API key (authentication is provided).
-func merchantOf(r *http.Request) string {
+var merchantOf = func(r *http.Request) string {
 	return r.Context().Value(merchantKey{}).(string)
 }
 
 type merchantKey struct{}
+
+// checkout is the checkout handler (built in step 1).
+var checkout = func(rw http.ResponseWriter, r *http.Request) { panic("not implemented") }
 
 // rateLimit rejects a merchant's requests with 429 once it is over limit this minute.
 func rateLimit(next http.Handler) http.Handler {
@@ -721,6 +727,121 @@ export async function check_headers(ctx) {
   assert.equal(over.headers['x-ratelimit-remaining'], '0', \`the 429 must carry X-RateLimit-Remaining: 0, got \${JSON.stringify(over.headers['x-ratelimit-remaining'])}\`);
   assert(lastOk.status === 200 && lastOk.headers['x-ratelimit-remaining'] === '0', \`the 100th request is allowed with X-RateLimit-Remaining: 0, got \${lastOk.status} / \${JSON.stringify(lastOk.headers['x-ratelimit-remaining'])}\`);
   assert(fresh.status === 200 && fresh.headers['x-ratelimit-remaining'] === '99', \`a merchant's first request leaves 99, got X-RateLimit-Remaining \${JSON.stringify(fresh.headers['x-ratelimit-remaining'])}\`);
+}
+`,
+    go: `package main
+
+import (
+	"fmt"
+	"math"
+	"net/http"
+
+	"leetbuild/harness"
+)
+
+// limitedAPI is the learner's server with the provided authentication swapped for the X-Merchant
+// header, and step 1's checkout for a plain 200.
+func limitedAPI(ctx *harness.Ctx) *harness.HTTP {
+	merchantOf = func(r *http.Request) string {
+		if m := r.Header.Get("X-Merchant"); m != "" {
+			return m
+		}
+		return "m42"
+	}
+	checkout = func(rw http.ResponseWriter, r *http.Request) {
+		rw.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(rw, \`{"status":"ok"}\`)
+	}
+	return ctx.Main(main).HTTP()
+}
+
+// minuteAt moves the clock so the current minute is at :second (plus half a second); returns the integer seconds now.
+func minuteAt(ctx *harness.Ctx, second float64) int64 {
+	now := float64(ctx.Clock.Now()) / 1000
+	target := math.Floor(now) - math.Mod(math.Floor(now), 60) + second + 0.5
+	if target < now {
+		target += 60
+	}
+	ctx.Clock.Advance(target - now)
+	return ctx.Clock.Now() / 1000
+}
+
+func merchantPost(c *harness.HTTP, merchant string) *harness.Response {
+	return c.Post("/checkout", nil, "X-Merchant", merchant)
+}
+
+func counter(ctx *harness.Ctx, key string) any {
+	if v, ok := ctx.Redis.Get(key); ok {
+		return v
+	}
+	return nil
+}
+
+func CheckWindowKey(ctx *harness.Ctx) {
+	c := limitedAPI(ctx)
+	now := minuteAt(ctx, 5)
+	minute := now / 60
+	r := merchantPost(c, "m42")
+	ctx.Equal(r.Status, 200, "the first request of the minute")
+	key := fmt.Sprintf("rl:m42:%d", minute)
+	ctx.Equal(counter(ctx, key), "1", "after one request %s (keys: %v)", key, ctx.Redis.Keys("rl:*"))
+	merchantPost(c, "m7")
+	ctx.Equal(counter(ctx, fmt.Sprintf("rl:m7:%d", minute)), "1", "each merchant has its own counter")
+	ctx.Equal(counter(ctx, key), "1", "another merchant's request must not count against m42")
+	ctx.Clock.Advance(60)
+	merchantPost(c, "m42")
+	ctx.Equal(counter(ctx, fmt.Sprintf("rl:m42:%d", minute+1)), "1", "a minute later the counter must live under rl:m42:%d (keys: %v)", minute+1, ctx.Redis.Keys("rl:*"))
+	ctx.Equal(counter(ctx, key), "1", "the previous window's counter is left alone: the key name is the window")
+}
+
+func CheckIncrExpire(ctx *harness.Ctx) {
+	c := limitedAPI(ctx)
+	now := minuteAt(ctx, 5)
+	key := fmt.Sprintf("rl:m42:%d", now/60)
+	for range 3 {
+		merchantPost(c, "m42")
+	}
+	ctx.Equal(counter(ctx, key), "3", "after three requests %s", key)
+	ttl := ctx.Redis.TTL(key)
+	ctx.Assert(110 <= ttl && ttl <= 120, "%s has TTL %d, expected 120 s set when the key was created", key, ttl)
+	ctx.Clock.Advance(30)
+	merchantPost(c, "m42")
+	ttl = ctx.Redis.TTL(key)
+	ctx.Assert(80 <= ttl && ttl <= 90, "30 s later %s has TTL %d: the expiry is set once, when Incr returns 1, not on every request", key, ttl)
+	ctx.Clock.Advance(100)
+	ctx.Equal(ctx.Redis.Exists(key), 0, "%s must have expired 120 s after it was created", key)
+}
+
+func CheckTooMany(ctx *harness.Ctx) {
+	c := limitedAPI(ctx)
+	now := minuteAt(ctx, 5)
+	ctx.Redis.Set(fmt.Sprintf("rl:m42:%d", now/60), 98) // 98 checkouts already this minute
+	r99 := merchantPost(c, "m42")
+	r100 := merchantPost(c, "m42")
+	r101 := merchantPost(c, "m42")
+	r102 := merchantPost(c, "m42")
+	other := merchantPost(c, "m7")
+	ctx.Clock.Advance(60)
+	later := merchantPost(c, "m42")
+	ctx.Assert(r99.Status == 200 && r100.Status == 200, "requests 99 and 100 are within the limit, got %d and %d", r99.Status, r100.Status)
+	ctx.Equal(r101.Status, 429, "the 101st request of the minute")
+	ctx.Equal(r102.Status, 429, "the 102nd request, for the rest of the window,")
+	ctx.Equal(other.Status, 200, "one merchant over its limit must not block another")
+	ctx.Equal(later.Status, 200, "in the next minute the merchant is allowed again")
+}
+
+func CheckHeaders(ctx *harness.Ctx) {
+	c := limitedAPI(ctx)
+	now := minuteAt(ctx, 43)
+	ctx.Redis.Set(fmt.Sprintf("rl:m42:%d", now/60), 99)
+	lastOk := merchantPost(c, "m42")
+	over := merchantPost(c, "m42")
+	fresh := merchantPost(c, "m7")
+	ctx.Equal(over.Status, 429, "the 101st request")
+	ctx.Equal(over.Header.Get("Retry-After"), "17", "at :43 the 429 must say Retry-After: 17 (seconds left in the window)")
+	ctx.Equal(over.Header.Get("X-RateLimit-Remaining"), "0", "the 429 must carry X-RateLimit-Remaining: 0")
+	ctx.Assert(lastOk.Status == 200 && lastOk.Header.Get("X-RateLimit-Remaining") == "0", "the 100th request is allowed with X-RateLimit-Remaining: 0, got %d / %q", lastOk.Status, lastOk.Header.Get("X-RateLimit-Remaining"))
+	ctx.Assert(fresh.Status == 200 && fresh.Header.Get("X-RateLimit-Remaining") == "99", "a merchant's first request leaves 99, got X-RateLimit-Remaining %q", fresh.Header.Get("X-RateLimit-Remaining"))
 }
 `,
   },

@@ -823,6 +823,119 @@ export async function check_commit_after(ctx) {
   assert.equal(ctx.kafka.lag('engine', 'orders'), 0, 'the malformed record must be skipped and committed so the partition does not stall');
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"leetbuild/harness"
+)
+
+type seededOrder struct {
+	orderID, symbol, side string
+	price                 float64
+	qty                   int
+}
+
+func seedOrders(ctx *harness.Ctx, orders ...seededOrder) {
+	for _, o := range orders {
+		value := fmt.Sprintf("{%q:%q,%q:%q,%q:%q,%q:%v,%q:%d,%q:%q}", "order_id", o.orderID, "symbol", o.symbol, "side", o.side, "price", o.price, "qty", o.qty, "client_order_id", "c-"+o.orderID)
+		ctx.Kafka.Seed("orders", o.symbol, value)
+	}
+}
+
+// runEngine drains the orders topic through the learner's loop.
+func runEngine(ctx *harness.Ctx) {
+	ctx.Drain(func() { _ = run(context.Background()) })
+}
+
+func tradesOnBroker(ctx *harness.Ctx) []map[string]any {
+	var out []map[string]any
+	for _, v := range ctx.Kafka.Values("trades") {
+		var t map[string]any
+		ctx.NoError(json.Unmarshal([]byte(v), &t), "a trades record is not JSON: %q", v)
+		out = append(out, t)
+	}
+	return out
+}
+
+func CheckGroup(ctx *harness.Ctx) {
+	seedOrders(ctx, seededOrder{"o-1", "ACME", "BUY", 10.05, 100})
+	runEngine(ctx)
+	subscriptions := ctx.Kafka.EventsOf("subscribe")
+	ctx.Assert(len(subscriptions) > 0, "the consumer never subscribed")
+	last := subscriptions[len(subscriptions)-1]
+	ctx.Equal(last.Group, "engine", "the consumer joined the wrong group")
+	ctx.Equal(last.Topics, []string{"orders"}, "the consumer's topics")
+	delivered := 0
+	for _, e := range ctx.Kafka.EventsOf("deliver") {
+		if e.Group == "engine" {
+			delivered++
+		}
+	}
+	ctx.Assert(delivered > 0, "group engine consumed nothing from orders")
+}
+
+func CheckManualCommit(ctx *harness.Ctx) {
+	seedOrders(ctx, seededOrder{"o-1", "ACME", "BUY", 10.05, 100})
+	runEngine(ctx)
+	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "offsets were auto-committed: FetchMessage, not ReadMessage, and no CommitInterval; the offset moves only when the engine says so")
+	ctx.Assert(len(ctx.Kafka.EventsOf("manual-commit")) > 0, "the engine never committed the offset explicitly")
+	lag := ctx.Kafka.Lag("engine", "orders")
+	ctx.Equal(lag, 0, "after draining, the engine still has %d uncommitted orders", lag)
+}
+
+func CheckMatch(ctx *harness.Ctx) {
+	seedOrders(ctx,
+		seededOrder{"o-1", "ACME", "BUY", 10.05, 100},
+		seededOrder{"o-2", "BETA", "SELL", 9.0, 100}, // another symbol: must not cross with ACME
+		seededOrder{"o-3", "ACME", "SELL", 10.0, 60}, // crosses o-1 at the resting price
+	)
+	runEngine(ctx)
+	fills := tradesOnBroker(ctx)
+	ctx.Equal(len(fills), 1, "expected exactly one fill (ACME 60 @ 10.05), trades %v; trades", fills)
+	fill := fills[0]
+	ctx.Assert(fill["symbol"] == "ACME" && fill["qty"] == 60.0 && fill["price"] == 10.05, "the fill must be 60 ACME at the resting price 10.05, got %v", fill)
+	ctx.Assert(fill["buy_order_id"] == "o-1" && fill["sell_order_id"] == "o-3", "the fill must name o-1 (buy) and o-3 (sell), got %v", fill)
+}
+
+func CheckTrades(ctx *harness.Ctx) {
+	seedOrders(ctx,
+		seededOrder{"o-1", "ACME", "SELL", 10.05, 50},
+		seededOrder{"o-2", "ACME", "SELL", 10.06, 50},
+		seededOrder{"o-3", "ACME", "BUY", 10.1, 80}, // fills 50 @ 10.05 then 30 @ 10.06
+	)
+	runEngine(ctx)
+	records := ctx.Kafka.Records("trades")
+	ctx.Equal(len(records), 2, "two fills must become two trades records")
+	keys := ctx.Kafka.Keys("trades")
+	for _, k := range keys {
+		ctx.Assert(k == "ACME", "trades must be keyed by the symbol, got %q", keys)
+	}
+	ctx.Equal(records[0].Partition, records[1].Partition, "one symbol's trades must stay on one partition")
+	var fills [][2]any
+	for _, t := range tradesOnBroker(ctx) {
+		fills = append(fills, [2]any{t["price"], t["qty"]})
+	}
+	ctx.Equal(fills, [][2]any{{10.05, 50.0}, {10.06, 30.0}}, "expected fills [[10.05, 50], [10.06, 30]] in price-time order")
+}
+
+func CheckCommitAfter(ctx *harness.Ctx) {
+	seedOrders(ctx, seededOrder{"o-1", "ACME", "BUY", 10.05, 100}, seededOrder{"o-2", "ACME", "SELL", 10.0, 40})
+	ctx.Kafka.Seed("orders", "ACME", "this is not an order")
+	// The trades topic's leader is slow to acknowledge: a trade is on the broker only once the write returned.
+	ctx.Kafka.StallFor("trades", 0.2)
+	var seen []int // trades on the broker at the moment of each commit
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { seen = append(seen, len(ctx.Kafka.Records("trades"))) })
+	runEngine(ctx)
+	ctx.Equal(len(seen), 3, "expected one commit per record (two orders and one malformed)")
+	ctx.Equal(seen[1], 1, "the offset of the crossing order was committed while its trade was still waiting for the broker's acknowledgement: WriteMessages before committing; trades on the broker at that commit")
+	ctx.Equal(len(tradesOnBroker(ctx)), 1, "expected one fill")
+	ctx.Equal(ctx.Kafka.Lag("engine", "orders"), 0, "the malformed record must be skipped and committed so the partition does not stall; uncommitted orders")
+}
+`,
   },
   debrief: `The consumer group turns the partition key into ownership: whoever holds the \`ACME\` partition holds the \`ACME\` book, so the hottest structure in the system runs single-threaded with no lock. Producing the trades before committing keeps the offset honest — but with an in-memory book, a replay is not idempotent, which is the gap that separates this exercise from a real engine. Real engines close it by making the book a pure function of the sequenced input: on restart they rebuild from a snapshot plus the log (the commit is just a bookmark), and they deduplicate by sequence number so a replayed order is recognised, not re-matched. Add to that a warm standby consuming the same partition a few messages behind, and you have the failover story of every exchange.`,
 };

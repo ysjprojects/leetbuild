@@ -469,7 +469,7 @@ func authorize(ctx context.Context, amountCents int64, currency, cardToken, idem
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
 			backoff := baseBackoff << (attempt - 1)
-			time.Sleep(backoff + rand.N(backoff)) // jitter: spread retries across servers
+			time.Sleep(backoff + time.Duration(rand.Int64N(int64(backoff)))) // jitter: spread retries across servers
 		}
 		callCtx, cancel := context.WithTimeout(ctx, deadline)
 		reply, err := stub.Authorize(callCtx, req)
@@ -918,6 +918,161 @@ export async function check_status_mapping(ctx) {
   assert.equal(calls(ctx).length, 2, 'INVALID_ARGUMENT must not be retried');
   result = await authorize(m, 'tok_visa', 'k3');
   assert(result.status === 'APPROVED' && result.authorization_id === 'auth-k3');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"strings"
+	"sync"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"leetbuild/harness"
+
+	pb "payments/gen/provider"
+)
+
+// providerPeer approves everything but tok_expired (INVALID_ARGUMENT) and records every request it saw.
+type providerPeer struct {
+	pb.UnimplementedPaymentProviderServer
+	mu       sync.Mutex
+	requests []*pb.AuthorizeRequest
+}
+
+func (p *providerPeer) Authorize(_ context.Context, req *pb.AuthorizeRequest) (*pb.AuthorizeReply, error) {
+	p.mu.Lock()
+	p.requests = append(p.requests, req)
+	p.mu.Unlock()
+	if req.GetCardToken() == "tok_expired" {
+		return nil, status.Error(codes.InvalidArgument, "card expired")
+	}
+	return &pb.AuthorizeReply{AuthorizationId: "auth-" + req.GetIdempotencyKey()}, nil
+}
+
+func serveProvider(ctx *harness.Ctx) *providerPeer {
+	p := &providerPeer{}
+	pb.RegisterPaymentProviderServer(ctx.GRPC.Server(""), p)
+	return p
+}
+
+func authorizeCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Authorize", "") }
+
+func authorizeWith(token, key string) (AuthResult, error) {
+	return authorize(context.Background(), 4999, "EUR", token, key)
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	serveProvider(ctx)
+	result, err := authorizeWith("tok_visa", "k1")
+	ctx.NoError(err, "authorize against a provider that answers")
+	ctx.Equal(result.Status, Approved, "a provider that answers must give Approved")
+	ctx.Equal(result.AuthorizationID, "auth-k1", "AuthorizationID must be the provider's")
+	calls := authorizeCalls(ctx)
+	ctx.Assert(len(calls) > 0, "the provider was never called")
+	call := calls[len(calls)-1]
+	ctx.Assert(call.HasDeadline(), "the RPC carries no deadline: a hung provider would hang checkout")
+	timeout := call.Timeout.Seconds()
+	ctx.Assert(2.5 <= timeout && timeout <= 3.5, "the deadline must be about 3 s, got %.2f s", timeout)
+	ctx.GRPC.SetLatency("Authorize", 30.0, "")
+	result, err = authorizeWith("tok_visa", "k2")
+	ctx.NoError(err, "authorize against a provider slower than the deadline")
+	ctx.Assert(result.Status != Approved, "a provider slower than the deadline cannot have answered")
+	calls = authorizeCalls(ctx)
+	ctx.Equal(len(calls), 2, "a DEADLINE_EXCEEDED attempt must not be retried: calls so far")
+	last := calls[len(calls)-1]
+	ctx.Assert(last.HasDeadline() && last.Timeout.Seconds() <= 3.5, "every attempt carries the deadline")
+}
+
+func CheckIdempotencyKey(ctx *harness.Ctx) {
+	p := serveProvider(ctx)
+	_, err := authorizeWith("tok_visa", "k1")
+	ctx.NoError(err, "authorize against a provider that answers")
+	ctx.Assert(len(p.requests) > 0, "the provider was never called")
+	req := p.requests[len(p.requests)-1]
+	ctx.Equal(req.GetIdempotencyKey(), "k1", "the request's IdempotencyKey")
+	ctx.Equal([]any{req.GetAmountCents(), req.GetCurrency(), req.GetCardToken()}, []any{int64(4999), "EUR", "tok_visa"}, "amount, currency and card token must be in the request")
+	ctx.GRPC.Fail("Authorize", codes.Unavailable, "restarting", 1, "")
+	result, err := authorizeWith("tok_visa", "k2")
+	ctx.NoError(err, "one UNAVAILABLE then success")
+	ctx.Equal(result.Status, Approved, "one UNAVAILABLE then success")
+	var keys []string
+	for _, call := range authorizeCalls(ctx)[1:] {
+		sent, _ := call.Request.(*pb.AuthorizeRequest)
+		keys = append(keys, sent.GetIdempotencyKey())
+	}
+	ctx.Equal(keys, []string{"k2", "k2"}, "every attempt of one authorization must carry the same key")
+}
+
+func CheckRetryUnavailable(ctx *harness.Ctx) {
+	serveProvider(ctx)
+	ctx.GRPC.Fail("Authorize", codes.Unavailable, "restarting", 1, "")
+	result, err := authorizeWith("tok_visa", "k1")
+	ctx.NoError(err, "one UNAVAILABLE must be retried and succeed")
+	ctx.Equal(result.Status, Approved, "one UNAVAILABLE must be retried and succeed")
+	ctx.Equal(len(authorizeCalls(ctx)), 2, "attempts after one UNAVAILABLE")
+	// Down for exactly the three allowed attempts: a fourth attempt would reach a provider that is back.
+	ctx.GRPC.Fail("Authorize", codes.Unavailable, "down", 3, "")
+	result, err = authorizeWith("tok_visa", "k2")
+	ctx.Assert(err != nil, "a provider that stays UNAVAILABLE must return an error after the last attempt, got %+v", result)
+	ctx.Equal(len(authorizeCalls(ctx))-2, 3, "attempts against a down provider")
+	ctx.GRPC.Fail("Authorize", codes.PermissionDenied, "bad api key", 5, "")
+	result, err = authorizeWith("tok_visa", "k3")
+	ctx.Assert(err != nil, "PERMISSION_DENIED must propagate as an error, got %+v", result)
+	ctx.Equal(len(authorizeCalls(ctx)), 6, "only UNAVAILABLE is retried; PERMISSION_DENIED must be returned after one attempt: calls so far")
+}
+
+func CheckBackoffJitter(ctx *harness.Ctx) {
+	serveProvider(ctx)
+	var gaps [][2]float64
+	var slept []int64 // virtual ms each authorization slept in total (sleeps are the only thing advancing the clock here)
+	for n := range 4 {
+		ctx.GRPC.Fail("Authorize", codes.Unavailable, "restarting", 2, "")
+		before := len(authorizeCalls(ctx))
+		start := ctx.Clock.Now()
+		result, err := authorizeWith("tok_visa", fmt.Sprintf("k%d", n))
+		ctx.NoError(err, "two UNAVAILABLE then success")
+		ctx.Equal(result.Status, Approved, "two UNAVAILABLE then success")
+		attempts := authorizeCalls(ctx)[before:]
+		ctx.Equal(len(attempts), 3, "attempts")
+		gaps = append(gaps, [2]float64{
+			float64(attempts[1].Started.Sub(attempts[0].Started).Milliseconds()),
+			float64(attempts[2].Started.Sub(attempts[1].Started).Milliseconds()),
+		})
+		slept = append(slept, ctx.Clock.Now()-start)
+	}
+	ctx.Assert(ctx.Clock.Sleeps() >= 8, "the client must sleep before each retry")
+	for _, gap := range gaps {
+		ctx.Assert(200 <= gap[0] && gap[0] <= 450, "the wait before the 2nd attempt was %.0f ms, expected 200 ms base plus up to 200 ms jitter", gap[0])
+		ctx.Assert(400 <= gap[1] && gap[1] <= 850, "the wait before the 3rd attempt was %.0f ms, expected 400 ms (doubled) plus up to 400 ms jitter", gap[1])
+	}
+	distinct := map[float64]bool{}
+	for _, s := range slept {
+		distinct[math.Round(float64(s)/5)] = true
+	}
+	ctx.Assert(len(distinct) > 1, "every authorization waited about %d ms before its retries: add random jitter so a fleet does not retry in lockstep", slept[0])
+}
+
+func CheckStatusMapping(ctx *harness.Ctx) {
+	serveProvider(ctx)
+	ctx.GRPC.SetLatency("Authorize", 30.0, "")
+	result, err := authorizeWith("tok_visa", "k1")
+	ctx.NoError(err, "a timed-out authorization is a result, not an error")
+	ctx.Equal(result.Status, Pending, "a timed-out authorization must be Pending (the charge may exist)")
+	ctx.Equal(len(authorizeCalls(ctx)), 1, "DEADLINE_EXCEEDED must not be retried (a second attempt could charge twice): calls so far")
+	ctx.GRPC.SetLatency("Authorize", 0.0, "")
+	result, err = authorizeWith("tok_expired", "k2")
+	ctx.NoError(err, "a declined card is a result, not an error")
+	ctx.Equal(result.Status, Declined, "INVALID_ARGUMENT must be Declined")
+	ctx.Assert(strings.Contains(result.Reason, "card expired"), "Declined must carry the provider's message, got Reason %q", result.Reason)
+	ctx.Equal(len(authorizeCalls(ctx)), 2, "INVALID_ARGUMENT must not be retried: calls so far")
+	result, err = authorizeWith("tok_visa", "k3")
+	ctx.NoError(err, "authorize against a provider that answers")
+	ctx.Assert(result.Status == Approved && result.AuthorizationID == "auth-k3", "a card the provider accepts must be Approved with its AuthorizationID, got %+v", result)
 }
 `,
   },

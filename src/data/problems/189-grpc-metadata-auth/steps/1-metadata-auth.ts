@@ -988,6 +988,169 @@ export async function check_admin_deletes(ctx) {
   assert.equal(code, 'INVALID_ARGUMENT', \`the admin's DeleteNote with an empty id answered \${code} (\${details}), expected INVALID_ARGUMENT\`);
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"leetbuild/harness"
+
+	pb "notes/gen/notes"
+)
+
+const (
+	readerAuth = "Bearer reader-7f3a"
+	adminAuth  = "Bearer admin-91c2"
+)
+
+var notesSeed = map[string]string{"n-1": "buy milk", "n-2": "ship the release notes", "n-3": "rotate the admin token"}
+
+// badCredential is what a caller sent: every one of them must be Unauthenticated.
+type badCredential struct {
+	label string
+	md    []string // metadata pairs
+}
+
+var badCredentials = []badCredential{
+	{"no authorization", nil},
+	{"an empty authorization", []string{"authorization", ""}},
+	{"a bare token", []string{"authorization", "reader-7f3a"}},
+	{"Basic instead of Bearer", []string{"authorization", "Basic admin-91c2"}},
+	{"'Bearer' without a space", []string{"authorization", "Beareradmin-91c2"}},
+	{"'Bearer ' with no token", []string{"authorization", "Bearer "}},
+	{"an unknown token", []string{"authorization", "Bearer guest-0000"}},
+	{"a known token with a suffix", []string{"authorization", "Bearer admin-91c2x"}},
+	{"the admin credentials under another key", []string{"token", adminAuth}},
+}
+
+// notesAt is the learner's server, its notes seeded, served on notes:50051, and a client on it.
+type notesAt struct {
+	srv    *notesServer
+	client pb.NotesClient
+}
+
+func startNotes(ctx *harness.Ctx) *notesAt {
+	srv := &notesServer{notes: copyNotes(notesSeed)}
+	pb.RegisterNotesServer(ctx.GRPC.Server("notes:50051"), srv)
+	return &notesAt{srv: srv, client: pb.NewNotesClient(ctx.GRPC.Dial("notes:50051"))}
+}
+
+// stored is the server's notes now.
+func (n *notesAt) stored() map[string]string {
+	n.srv.mu.Lock()
+	defer n.srv.mu.Unlock()
+	return copyNotes(n.srv.notes)
+}
+
+func copyNotes(notes map[string]string) map[string]string {
+	out := make(map[string]string, len(notes))
+	for id, text := range notes {
+		out[id] = text
+	}
+	return out
+}
+
+// notesReply is the outcome of one call: its code, details, and the reply when it is OK.
+type notesReply struct {
+	code    codes.Code
+	details string
+	note    *pb.Note
+	deleted *pb.DeleteNoteResponse
+}
+
+func (n *notesAt) call(method, id string, pairs ...string) notesReply {
+	c, cancel := context.WithTimeout(metadata.NewOutgoingContext(context.Background(), metadata.Pairs(pairs...)), 2*time.Second)
+	defer cancel()
+	var r notesReply
+	var err error
+	if method == "GetNote" {
+		r.note, err = n.client.GetNote(c, &pb.GetNoteRequest{Id: id})
+	} else {
+		r.deleted, err = n.client.DeleteNote(c, &pb.DeleteNoteRequest{Id: id})
+	}
+	r.code, r.details = status.Code(err), status.Convert(err).Message()
+	return r
+}
+
+func CheckReaderReads(ctx *harness.Ctx) {
+	n := startNotes(ctx)
+	for _, id := range []string{"n-1", "n-2"} {
+		r := n.call("GetNote", id, "authorization", readerAuth)
+		ctx.Equal(r.code, codes.OK, "GetNote(%s) with %q (%s)", id, readerAuth, r.details)
+		ctx.Equal([]string{r.note.GetId(), r.note.GetText()}, []string{id, notesSeed[id]}, "GetNote(%s) must answer Note{%s, %q}; id and text", id, id, notesSeed[id])
+	}
+	r := n.call("GetNote", "n-3", "authorization", adminAuth)
+	ctx.Equal(r.code, codes.OK, "the admin token holds notes.read too, but GetNote(n-3) failed (%s)", r.details)
+	ctx.Equal(r.note.GetText(), notesSeed["n-3"], "GetNote(n-3)'s text")
+	ctx.Equal(n.stored(), notesSeed, "reading must not change the notes")
+}
+
+func CheckUnauthenticated(ctx *harness.Ctx) {
+	n := startNotes(ctx)
+	for _, bad := range badCredentials {
+		for _, method := range []string{"GetNote", "DeleteNote"} {
+			r := n.call(method, "n-1", bad.md...)
+			ctx.Equal(r.code, codes.Unauthenticated, "%s(n-1) with %s %q (%s)", method, bad.label, bad.md, r.details)
+		}
+	}
+	ctx.Equal(n.stored(), notesSeed, "no unauthenticated call may delete anything: the notes")
+}
+
+func CheckPermissionDenied(ctx *harness.Ctx) {
+	n := startNotes(ctx)
+	r := n.call("DeleteNote", "n-2", "authorization", readerAuth)
+	ctx.Equal(r.code, codes.PermissionDenied, "DeleteNote(n-2) with the reader token (%s): the token is known, it lacks notes.write", r.details)
+	ctx.Equal(n.stored()["n-2"], notesSeed["n-2"], "a PermissionDenied delete must leave the note in the notes")
+	read := n.call("GetNote", "n-2", "authorization", readerAuth)
+	ctx.Assert(read.code == codes.OK && read.note.GetText() == notesSeed["n-2"], "after the refused delete the reader must still read n-2, got %v (%s)", read.code, read.details)
+	for _, c := range [][2]string{{"ghost", "a missing note"}, {"", "an empty id"}} {
+		r = n.call("DeleteNote", c[0], "authorization", readerAuth)
+		ctx.Equal(r.code, codes.PermissionDenied, "the reader's DeleteNote of %s (%s): authorize before you validate or look up", c[1], r.details)
+	}
+	ctx.Equal(n.stored(), notesSeed, "the reader must not be able to delete anything: the notes")
+}
+
+func CheckAuthFirst(ctx *harness.Ctx) {
+	n := startNotes(ctx)
+	r := n.call("GetNote", "", "authorization", readerAuth)
+	ctx.Equal(r.code, codes.InvalidArgument, "GetNote with an empty id and valid credentials (%s)", r.details)
+	r = n.call("GetNote", "ghost", "authorization", readerAuth)
+	ctx.Equal(r.code, codes.NotFound, "GetNote(ghost) with valid credentials (%s)", r.details)
+	for _, bad := range []badCredential{badCredentials[0], badCredentials[2], badCredentials[6]} {
+		for _, method := range []string{"GetNote", "DeleteNote"} {
+			exists := n.call(method, "n-1", bad.md...)
+			for _, c := range [][2]string{{"ghost", "a missing note"}, {"", "an empty id"}} {
+				r = n.call(method, c[0], bad.md...)
+				ctx.Equal(r.code, codes.Unauthenticated, "%s of %s with %s (%s): authenticate before you validate or look up", method, c[1], bad.label, r.details)
+				ctx.Equal([]string{r.code.String(), r.details}, []string{exists.code.String(), exists.details}, "%s with %s must answer the same for %s as for an existing note; code and details", method, bad.label, c[1])
+			}
+		}
+	}
+	ctx.Equal(n.stored(), notesSeed, "no unauthenticated call may delete anything: the notes")
+}
+
+func CheckAdminDeletes(ctx *harness.Ctx) {
+	n := startNotes(ctx)
+	r := n.call("DeleteNote", "n-3", "authorization", adminAuth)
+	ctx.Equal(r.code, codes.OK, "DeleteNote(n-3) with the admin token (%s)", r.details)
+	ctx.Equal(r.deleted.GetDeleted(), true, "DeleteNote must answer Deleted: true, got %v", r.deleted)
+	_, kept := n.stored()["n-3"]
+	ctx.Assert(!kept, "after the admin's delete n-3 must be gone from the notes")
+	ctx.Equal(n.stored(), map[string]string{"n-1": notesSeed["n-1"], "n-2": notesSeed["n-2"]}, "only n-3 may be deleted: the notes")
+	for _, token := range []string{adminAuth, readerAuth} {
+		r = n.call("GetNote", "n-3", "authorization", token)
+		ctx.Equal(r.code, codes.NotFound, "GetNote(n-3) after the delete with %q (%s)", token, r.details)
+	}
+	r = n.call("DeleteNote", "n-3", "authorization", adminAuth)
+	ctx.Equal(r.code, codes.NotFound, "deleting n-3 a second time (%s)", r.details)
+	r = n.call("DeleteNote", "", "authorization", adminAuth)
+	ctx.Equal(r.code, codes.InvalidArgument, "the admin's DeleteNote with an empty id (%s)", r.details)
+}
+`,
   },
   debrief: `The order of the gates is the whole design. Authentication answers "who is this?", and only a caller with an answer gets \`PERMISSION_DENIED\`, which says "I know you, and you may not". Validation and lookup come last because their answers carry information: \`NOT_FOUND\` against \`PERMISSION_DENIED\` tells an anonymous caller which ids exist, and an id space that can be probed for free is a leak even when the contents stay hidden. That is also why the auth failure has fixed details, independent of the request. Credentials ride in metadata rather than in the request message so that one helper (in production an interceptor, or a sidecar such as Envoy's ext_authz) can judge every RPC of every service the same way without knowing its messages. Real systems verify a signed token (a JWT checked against a JWKS, or an mTLS client certificate) instead of a lookup table, compare secrets in constant time, cache introspection results briefly, and log every denial with the caller's identity; some go further and answer \`NOT_FOUND\` instead of \`PERMISSION_DENIED\` when even the existence of a resource is private to its owner.`,
 };

@@ -220,7 +220,10 @@ export interface Step {
    * results decide acceptance and the static matchers become advisory. Python: a module with one
    * `check_<id>(ctx)` per entry of `checks` (`-` in the id becomes `_`), see
    * public/py/runtime/leetbuild/harness.py for `ctx`. TypeScript: a module exporting one
-   * `check_<id>(ctx)` the same way, see src/lib/runtime/ts/harness.ts. Go, Scala and C++ have none.
+   * `check_<id>(ctx)` the same way, see src/lib/runtime/ts/harness.ts. Go: a file of the learner's
+   * package (compiled beside the step's file as harness_test.go) with one
+   * `func Check<Id>(ctx *harness.Ctx)` per check (`release-atomic` → `CheckReleaseAtomic`), see
+   * goruntime/harness/ctx.go. Scala and C++ have none.
    */
   harness?: Partial<Record<Language, string>>;
 }
@@ -323,7 +326,9 @@ export interface Problem {
   steps: Step[];
   /**
    * Modules every step of the course can import when it runs, per language: generated protobuf
-   * code (`resizer_pb2.py`), provided helpers (`payments/db.py`). Path → source.
+   * code (`resizer_pb2.py`), provided helpers (`payments/db.py`). Path → source. Go: helper
+   * packages keyed by import path (`payments/db/db.go`) and the `.proto` sources, from which the
+   * runtime generates the packages the step files import (`chat/gen/chat`).
    */
   support?: Partial<Record<Language, Record<string, string>>>;
   /** Company-tagged courses: the company whose writing the course is derived from. */

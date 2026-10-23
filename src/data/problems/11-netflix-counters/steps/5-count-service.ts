@@ -422,8 +422,8 @@ var nameRe = regexp.MustCompile(\`^[A-Za-z0-9_-]{1,64}$\`)
 const cacheTTL = 2 * time.Second
 
 // Provided: step 2's getCount and step 4's getCount (the sum over the minute buckets).
-func getBestEffort(ctx context.Context, ns, name string) (int64, error) { panic("not implemented") }
-func getRolledUp(ctx context.Context, ns, name string) (int64, error)   { panic("not implemented") }
+var getBestEffort = func(ctx context.Context, ns, name string) (int64, error) { panic("not implemented") }
+var getRolledUp = func(ctx context.Context, ns, name string) (int64, error) { panic("not implemented") }
 
 type total struct {
 	Count int64 \`json:"count"\`
@@ -491,8 +491,8 @@ var nameRe = regexp.MustCompile(\`^[A-Za-z0-9_-]{1,64}$\`)
 const cacheTTL = 2 * time.Second
 
 // Provided: step 2's getCount and step 4's getCount (the sum over the minute buckets).
-func getBestEffort(ctx context.Context, ns, name string) (int64, error) { panic("not implemented") }
-func getRolledUp(ctx context.Context, ns, name string) (int64, error)   { panic("not implemented") }
+var getBestEffort = func(ctx context.Context, ns, name string) (int64, error) { panic("not implemented") }
+var getRolledUp = func(ctx context.Context, ns, name string) (int64, error) { panic("not implemented") }
 
 type total struct {
 	Count int64 \`json:"count"\`
@@ -975,6 +975,162 @@ export async function check_reply(ctx) {
   reply = await get(stub, 'plays', 'stranger-things');
   now = Math.floor(Date.now() / 1000);
   assert(reply.count === 1207 && Math.abs(reply.as_of - now) <= 1, \`an eventually-consistent reply carries the rolled-up 1207 and a current as_of, got [\${reply.count}, \${reply.as_of}]\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"strconv"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"leetbuild/harness"
+
+	pb "counters/gen/counters"
+)
+
+const csKey = "total:plays:stranger-things"
+
+// csService runs the learner's CounterService on the real stores of steps 2 and 4 (the best-effort
+// counter counter:{ns}:{name}, the minute buckets of rollup:{ns}:{name}) and returns a client on it.
+func csService(ctx *harness.Ctx) pb.CounterServiceClient {
+	getBestEffort = func(_ context.Context, ns, name string) (int64, error) {
+		v, ok := ctx.Redis.Get("counter:" + ns + ":" + name)
+		if !ok {
+			return 0, nil
+		}
+		return strconv.ParseInt(v, 10, 64)
+	}
+	getRolledUp = func(_ context.Context, ns, name string) (int64, error) {
+		return csSum(ctx, "rollup:"+ns+":"+name), nil
+	}
+	ctx.Main(main)
+	return pb.NewCounterServiceClient(ctx.GRPC.Dial("counters:9000"))
+}
+
+func csSum(ctx *harness.Ctx, key string) int64 {
+	var sum int64
+	for _, v := range ctx.Redis.HGetAll(key) {
+		n, _ := strconv.ParseInt(v, 10, 64)
+		sum += n
+	}
+	return sum
+}
+
+// csAddBestEffort is step 2's addCount: SET NX with the hour's TTL, then INCRBY.
+func csAddBestEffort(ctx *harness.Ctx, ns, name string, delta int64) {
+	key := "counter:" + ns + ":" + name
+	ctx.Redis.Set(key, 0, "NX", "EX", 3600)
+	ctx.Redis.Do("INCRBY", key, delta)
+}
+
+// csPlays makes eventually-consistent adds to plays/stranger-things as production does: each event is
+// claimed under seen:{token} and folded into its minute bucket (steps 3 and 4).
+func csPlays(ctx *harness.Ctx, adds ...csAdd) {
+	bucket := strconv.FormatInt(ctx.Clock.Now()/1000/60*60, 10)
+	for _, a := range adds {
+		if ctx.Redis.Set("seen:"+a.token, 1, "NX", "EX", 86400) {
+			ctx.Redis.Do("HINCRBY", "rollup:plays:stranger-things", bucket, a.delta)
+		}
+	}
+}
+
+type csAdd struct {
+	token string
+	delta int64
+}
+
+func csGet(stub pb.CounterServiceClient, ns, name string) (*pb.GetCountReply, error) {
+	callCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	return stub.GetCount(callCtx, &pb.GetCountRequest{Namespace: ns, Name: name})
+}
+
+func csMustGet(ctx *harness.Ctx, stub pb.CounterServiceClient, ns, name string) *pb.GetCountReply {
+	reply, err := csGet(stub, ns, name)
+	ctx.NoError(err, "GetCount(%q, %q) failed", ns, name)
+	return reply
+}
+
+func csFailsWith(ctx *harness.Ctx, stub pb.CounterServiceClient, ns, name string, code codes.Code) {
+	reply, err := csGet(stub, ns, name)
+	if err != nil {
+		ctx.Equal(status.Code(err).String(), code.String(), "GetCount(%q, %q) failed with the wrong code", ns, name)
+		return
+	}
+	ctx.Fatalf("GetCount(%q, %q) answered %d instead of failing with %s", ns, name, reply.GetCount(), code)
+}
+
+func CheckNotFound(ctx *harness.Ctx) {
+	stub := csService(ctx)
+	csFailsWith(ctx, stub, "likes", "stranger-things", codes.NotFound)
+	csFailsWith(ctx, stub, "", "stranger-things", codes.NotFound)
+	keys := ctx.Redis.Keys("*")
+	ctx.Assert(len(keys) == 0, "an unknown namespace must not leave anything in the cache, Redis holds %q", keys)
+}
+
+func CheckInvalidArgument(ctx *harness.Ctx) {
+	stub := csService(ctx)
+	for _, bad := range []string{"bad name", "", strings.Repeat("a", 65), "dots.are.out"} {
+		csFailsWith(ctx, stub, "plays", bad, codes.InvalidArgument)
+		csFailsWith(ctx, stub, "views", bad, codes.InvalidArgument)
+	}
+	keys := ctx.Redis.Keys("*")
+	ctx.Assert(len(keys) == 0, "a bad name must be refused before any store is consulted, yet Redis holds %q", keys)
+	csFailsWith(ctx, stub, "likes", "bad name", codes.NotFound) // the namespace is checked first
+}
+
+func CheckCacheKeyTtl(ctx *harness.Ctx) {
+	stub := csService(ctx)
+	csPlays(ctx, csAdd{"t-1", 1200}, csAdd{"t-2", 7})
+	reply := csMustGet(ctx, stub, "plays", "stranger-things")
+	ctx.Equal(reply.GetCount(), 1207, "GetCount must answer the rolled-up total")
+	cached, ok := ctx.Redis.Get(csKey)
+	ctx.Assert(ok, "the total must be cached under %s, keys are %q", csKey, ctx.Redis.Keys("*"))
+	var doc map[string]any
+	json.Unmarshal([]byte(cached), &doc)
+	ctx.Assert(doc["count"] == 1207.0 && doc["as_of"] == float64(reply.GetAsOf()), "%s must hold JSON {count, as_of} matching the reply, got %s", csKey, cached)
+	ttl := ctx.Redis.TTL(csKey)
+	ctx.Assert(1 <= ttl && ttl <= 2, "%s expires in %d s, expected cacheTTL (2 s)", csKey, ttl)
+	ctx.Clock.Advance(3)
+	ctx.Equal(ctx.Redis.Exists(csKey), 0, "%s must be gone after 2 s: EXISTS", csKey)
+}
+
+func CheckCacheAside(ctx *harness.Ctx) {
+	stub := csService(ctx)
+	csPlays(ctx, csAdd{"t-1", 1200}, csAdd{"t-2", 7})
+	first := csMustGet(ctx, stub, "plays", "stranger-things")
+	ctx.Equal(first.GetCount(), 1207, "GetCount must answer the rolled-up total")
+	csPlays(ctx, csAdd{"t-3", 93}) // the buckets move on to 1300
+	ctx.Clock.Advance(1)
+	second := csMustGet(ctx, stub, "plays", "stranger-things")
+	ctx.Equal([]int64{second.GetCount(), second.GetAsOf()}, []int64{first.GetCount(), first.GetAsOf()}, "1 s after the first read the buckets moved to 1300, but a read within cacheTTL is served from %s: [count, as_of]", csKey)
+	ctx.Clock.Advance(1.5)
+	third := csMustGet(ctx, stub, "plays", "stranger-things")
+	ctx.Equal(third.GetCount(), 1300, "2.5 s after the total was cached the entry has expired and the next read must sum the buckets again")
+	ctx.Assert(third.GetAsOf() >= first.GetAsOf()+2, "as_of must be the time of the recomputation (%d or later), got %d", first.GetAsOf()+2, third.GetAsOf())
+}
+
+func CheckReply(ctx *harness.Ctx) {
+	stub := csService(ctx)
+	csAddBestEffort(ctx, "views", "trailer-7", 42)
+	reply := csMustGet(ctx, stub, "views", "trailer-7")
+	ctx.Equal(reply.GetCount(), 42, "a best-effort namespace answers the counter's count")
+	now := ctx.Clock.Now() / 1000
+	ctx.Assert(reply.GetAsOf()-now <= 1 && now-reply.GetAsOf() <= 1, "a best-effort reply's as_of is now (%d), got %d", now, reply.GetAsOf())
+	ctx.Equal(ctx.Redis.Exists("total:views:trailer-7"), 0, "best-effort counters are not cached (they are already one GET away): EXISTS total:views:trailer-7")
+	csAddBestEffort(ctx, "views", "trailer-7", 8)
+	reply = csMustGet(ctx, stub, "views", "trailer-7")
+	ctx.Equal(reply.GetCount(), 50, "a best-effort read goes straight to the counter: right after another add of 8 GetCount must answer 50")
+	csPlays(ctx, csAdd{"t-1", 1200}, csAdd{"t-2", 7})
+	reply = csMustGet(ctx, stub, "plays", "stranger-things")
+	now = ctx.Clock.Now() / 1000
+	ctx.Assert(reply.GetCount() == 1207 && reply.GetAsOf()-now <= 1 && now-reply.GetAsOf() <= 1, "an eventually-consistent reply carries the rolled-up 1207 and a current as_of, got [%d, %d]", reply.GetCount(), reply.GetAsOf())
 }
 `,
   },

@@ -1299,6 +1299,272 @@ export async function check_retry_succeeds(ctx) {
   allCommitted(ctx);
 }
 `,
+    go: `package main
+
+import (
+	"errors"
+	"regexp"
+	"sort"
+	"strconv"
+
+	"leetbuild/harness"
+)
+
+var (
+	checkTiers       = []int64{5000, 30000, 300000}
+	checkRetryTopics = []string{"tasks.retry.5s", "tasks.retry.30s", "tasks.retry.5m"}
+	epochMillis      = regexp.MustCompile("^[0-9]+$")
+)
+
+const checkGroup = "tasks-workers"
+
+type taskCall struct {
+	key, value string
+	at         int64
+}
+
+// recordHeader is a header's value as text, nil when absent.
+func recordHeader(r harness.KafkaRecord, name string) any {
+	if v, ok := r.Header(name); ok {
+		return string(v)
+	}
+	return nil
+}
+
+// seedTask puts a record on partition 0 of topic, with the attempt and not_before headers when >= 0.
+func seedTask(ctx *harness.Ctx, topic, key, value string, attempt, notBefore int64) {
+	var headers []harness.KafkaHeader
+	if attempt >= 0 {
+		headers = append(headers, harness.KafkaHeader{Key: "attempt", Value: []byte(strconv.FormatInt(attempt, 10))})
+	}
+	if notBefore >= 0 {
+		headers = append(headers, harness.KafkaHeader{Key: "not_before", Value: []byte(strconv.FormatInt(notBefore, 10))})
+	}
+	ctx.Kafka.SeedPartition(topic, 0, key, value, headers...)
+}
+
+// taskWorker runs the learner's loop with a handler that records (key, value, clock ms), moves the
+// clock by advance[key] seconds, and fails with "boom" for keys in fails.
+func taskWorker(ctx *harness.Ctx, fails []string, advance map[string]float64) []taskCall {
+	var calls []taskCall
+	handler := func(key, value string) error {
+		calls = append(calls, taskCall{key, value, ctx.Clock.Now()})
+		if s, ok := advance[key]; ok {
+			ctx.Clock.Advance(s)
+		}
+		for _, f := range fails {
+			if f == key {
+				return errors.New("boom")
+			}
+		}
+		return nil
+	}
+	ctx.Drain(func() { _ = run(handler) })
+	return calls
+}
+
+func callsOf(calls []taskCall, key string) []taskCall {
+	var out []taskCall
+	for _, c := range calls {
+		if c.key == key {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func touches(offsets harness.KafkaOffsets, topic string) bool {
+	for tp := range offsets {
+		if tp.Topic == topic {
+			return true
+		}
+	}
+	return false
+}
+
+func allCommitted(ctx *harness.Ctx) {
+	for _, topic := range append([]string{"tasks"}, checkRetryTopics...) {
+		ctx.Equal(ctx.Kafka.Lag(checkGroup, topic), 0, "%s: handled record(s) left uncommitted", topic)
+	}
+}
+
+func CheckGroup(ctx *harness.Ctx) {
+	seedTask(ctx, "tasks", "a", "job-a", -1, -1)
+	calls := taskWorker(ctx, nil, nil)
+	subscriptions := ctx.Kafka.EventsOf("subscribe")
+	ctx.Assert(len(subscriptions) > 0, "the consumer must subscribe to the topics")
+	last := subscriptions[len(subscriptions)-1]
+	ctx.Equal(last.Group, checkGroup, "group.id")
+	for _, topic := range append([]string{"tasks"}, checkRetryTopics...) {
+		found := false
+		for _, t := range last.Topics {
+			found = found || t == topic
+		}
+		ctx.Assert(found, "the consumer must subscribe to %s as well; it subscribed to %v", topic, last.Topics)
+	}
+	ctx.Equal(len(ctx.Kafka.EventsOf("auto-commit")), 0, "auto-commit is on: offsets were committed on a timer, before processing")
+	ctx.Assert(len(ctx.Kafka.EventsOf("manual-commit")) > 0, "no explicit commit happened")
+	var seen []string
+	for _, c := range calls {
+		seen = append(seen, c.key+"="+c.value)
+	}
+	ctx.Equal(seen, []string{"a=job-a"}, "the handler must see (key, value) once per record: key=value handled")
+	allCommitted(ctx)
+}
+
+func CheckEscalates(ctx *harness.Ctx) {
+	seedTask(ctx, "tasks", "a", "job-a", -1, -1)
+	for _, key := range []string{"f1", "f2", "f3"} {
+		seedTask(ctx, "tasks", key, "job-"+key, -1, -1)
+	}
+	calls := taskWorker(ctx, []string{"a"}, map[string]float64{"f1": 6, "f2": 40, "f3": 400})
+	tries := callsOf(calls, "a")
+	ctx.Equal(len(tries), 4, "a record that always fails is tried once on tasks and once per tier: the handler's calls for it")
+	for _, c := range tries {
+		ctx.Equal(c.value, "job-a", "every retry must hand the handler the original value")
+	}
+	for i, topic := range checkRetryTopics {
+		records := ctx.Kafka.Records(topic)
+		ctx.Equal(len(records), 1, "%s must hold the failed record exactly once: records", topic)
+		ctx.Equal([]string{string(records[0].Key), string(records[0].Value)}, []string{"a", "job-a"}, "%s: the hand-off must keep key a and value job-a", topic)
+		ctx.Equal(recordHeader(records[0], "attempt"), strconv.Itoa(i+1), "%s: the attempt header", topic)
+		raw, _ := recordHeader(records[0], "not_before").(string)
+		ctx.Assert(epochMillis.MatchString(raw), "%s: the hand-off needs a not_before header in epoch milliseconds, got %v", topic, recordHeader(records[0], "not_before"))
+		notBefore, _ := strconv.ParseInt(raw, 10, 64)
+		gap := notBefore - tries[i].at
+		ctx.Assert(gap >= checkTiers[i]-5 && gap <= checkTiers[i]+2000, "%s: not_before must be the failure time + %d ms, it is %d ms after the handler failed", topic, checkTiers[i], gap)
+		ctx.Assert(tries[i+1].at >= notBefore-5, "%s: the record was handled %d ms before its not_before", topic, notBefore-tries[i+1].at)
+	}
+	dlq := ctx.Kafka.Records("tasks.dlq")
+	ctx.Equal(len(dlq), 1, "after the last tier the record is dead-lettered once: records on tasks.dlq")
+	ctx.Assert(string(dlq[0].Key) == "a" && string(dlq[0].Value) == "job-a", "the dead letter must keep the key and value")
+	ctx.Equal(recordHeader(dlq[0], "attempt"), "4", "the dead letter's attempt header")
+	ctx.Equal(recordHeader(dlq[0], "error"), "boom", "the dead letter's error header must carry the handler error's message")
+	var others []string
+	for _, c := range calls {
+		if c.key != "a" {
+			others = append(others, c.key)
+		}
+	}
+	sort.Strings(others)
+	ctx.Equal(others, []string{"f1", "f2", "f3"}, "the other tasks records must each be handled once")
+	allCommitted(ctx)
+}
+
+// waitingWorld seeds one retry record due in 5 s on tasks.retry.5s and six tasks records whose
+// handlers each move the clock 1 s.
+func waitingWorld(ctx *harness.Ctx) (t0 int64, fillers []string, advance map[string]float64) {
+	t0 = ctx.Clock.Now()
+	seedTask(ctx, "tasks.retry.5s", "x", "job-x", 1, t0+5000)
+	advance = map[string]float64{}
+	for i := 1; i <= 6; i++ {
+		key := "f" + strconv.Itoa(i)
+		fillers = append(fillers, key)
+		seedTask(ctx, "tasks", key, "job-"+key, -1, -1)
+		advance[key] = 1
+	}
+	return t0, fillers, advance
+}
+
+func CheckNotBefore(ctx *harness.Ctx) {
+	t0, _, advance := waitingWorld(ctx)
+	type commitAt struct {
+		offsets harness.KafkaOffsets
+		at      int64
+	}
+	var commits []commitAt
+	ctx.Kafka.OnCommit(func(_ string, offsets harness.KafkaOffsets) {
+		commits = append(commits, commitAt{offsets, ctx.Clock.Now()})
+	})
+	calls := taskWorker(ctx, nil, advance)
+	xs := callsOf(calls, "x")
+	ctx.Equal(len(xs), 1, "the retry record must be handled exactly once: the handler's calls for it")
+	ctx.Assert(xs[0].at >= t0+5000-5, "the retry record was handled %d ms before its not_before: a record that is not due is paused, not processed", t0+5000-xs[0].at)
+	for _, c := range commits {
+		ctx.Assert(!(touches(c.offsets, "tasks.retry.5s") && c.at < xs[0].at), "tasks.retry.5s was committed before its record was handled: a record that is not due must not be skipped")
+	}
+	ctx.Assert(len(ctx.Kafka.Records("tasks.retry.30s")) == 0 && len(ctx.Kafka.Records("tasks.dlq")) == 0, "a retry that succeeds is not forwarded")
+	allCommitted(ctx)
+}
+
+func CheckNonBlocking(ctx *harness.Ctx) {
+	t0, fillers, advance := waitingWorld(ctx)
+	calls := taskWorker(ctx, nil, advance)
+	xs := callsOf(calls, "x")
+	ctx.Assert(len(xs) == 1 && xs[0].at >= t0+5000-5, "the retry record must be handled exactly once, no earlier than its not_before")
+	var handled []string
+	before := 0
+	for _, c := range calls {
+		if c.key == "x" {
+			continue
+		}
+		handled = append(handled, c.key)
+		if c.at < t0+5000 {
+			before++
+		}
+	}
+	sort.Strings(handled)
+	ctx.Equal(handled, fillers, "every tasks record must be handled once")
+	ctx.Assert(before >= 3, "only %d of the 6 tasks records were handled before the retry record was due: a paused retry partition must not block tasks", before)
+	// The clock when the last handler returned: a Poll(timeout) loop keeps waiting (and moving the
+	// clock) after the work is done, which TypeScript's consumer.run does not.
+	var finished int64
+	for _, c := range calls {
+		finished = max(finished, c.at+int64(advance[c.key]*1000))
+	}
+	moved := finished - t0
+	ctx.Assert(moved <= 6000+2000, "the clock moved %d ms while the handlers moved it 6000 ms: the worker slept the delay away instead of pausing the partition", moved)
+	allCommitted(ctx)
+}
+
+func CheckFlushBeforeCommit(ctx *harness.Ctx) {
+	t0 := ctx.Clock.Now()
+	seedTask(ctx, "tasks", "a", "job-a", -1, -1)
+	ctx.Kafka.StallFor("tasks.retry.5s", 2)
+	type commitAt struct {
+		offsets harness.KafkaOffsets
+		n       int
+		at      int64
+	}
+	var commits []commitAt
+	ctx.Kafka.OnCommit(func(_ string, offsets harness.KafkaOffsets) {
+		commits = append(commits, commitAt{offsets, len(ctx.Kafka.Records("tasks.retry.5s")), ctx.Clock.Now()})
+	})
+	taskWorker(ctx, []string{"a"}, nil)
+	stalled := false
+	for _, e := range ctx.Kafka.EventsOf("produce-stalled") {
+		stalled = stalled || e.Topic == "tasks.retry.5s"
+	}
+	ctx.Assert(stalled, "the failure must be produced to tasks.retry.5s (it was stalled)")
+	var source []commitAt
+	for _, c := range commits {
+		if touches(c.offsets, "tasks") {
+			source = append(source, c)
+		}
+	}
+	ctx.Assert(len(source) > 0, "the tasks offset was never committed")
+	ctx.Equal(source[0].n, 1, "the tasks offset was committed while the hand-off was still in flight (Flush and check the delivery report first): records on tasks.retry.5s at the commit")
+	ctx.Assert(source[0].at >= t0+2000, "the commit must wait out the stall (2 s of virtual time) for the broker's acknowledgement")
+	ctx.Equal(ctx.Kafka.Lag(checkGroup, "tasks"), 0, "the failed record's offset must be committed once the hand-off is acknowledged: lag on tasks")
+}
+
+func CheckRetrySucceeds(ctx *harness.Ctx) {
+	seedTask(ctx, "tasks.retry.5s", "b", "job-b", 1, 0)
+	seedTask(ctx, "tasks", "c", "job-c", -1, -1)
+	calls := taskWorker(ctx, nil, nil)
+	var seen []string
+	for _, c := range calls {
+		seen = append(seen, c.key+"="+c.value)
+	}
+	sort.Strings(seen)
+	ctx.Equal(seen, []string{"b=job-b", "c=job-c"}, "a due retry record and a tasks record are each handled once: key=value handled")
+	for _, topic := range []string{"tasks.retry.30s", "tasks.retry.5m", "tasks.dlq"} {
+		ctx.Equal(len(ctx.Kafka.Records(topic)), 0, "a record whose handler succeeds is not forwarded: records on %s", topic)
+	}
+	ctx.Equal(len(ctx.Kafka.Records("tasks.retry.5s")), 1, "a record whose handler succeeds is not re-produced: records on tasks.retry.5s")
+	allCommitted(ctx)
+}
+`,
   },
   debrief: `Two decisions carry the whole design. First, the delay is **data, not control flow**: a \`not_before\` header on a record in a topic named for its tier, so the delay survives a restart, is visible to anyone reading the topic, and costs the consumer no thread. Second, a record that is not due is handled by **\`pause\` + \`seek\`, never by \`sleep\` and never by committing past it**: pausing a partition tells the fetcher to stop asking for it while every other partition — the main topic above all — keeps flowing, and seeking back puts the record under the cursor so that \`resume\` delivers exactly it. Since the record is not committed while it waits, a crash replays it, which is correct — nothing was done. The tiers are the reason there is one topic per delay: a single retry topic with mixed \`not_before\` values would have a 5-minute record block a 5-second one behind it (head-of-line blocking inside the retry topic itself), whereas within one tier every record waits the same time, so the head is always the first due. Real systems add rebalance handling (a paused partition that is revoked must be forgotten, and the new owner pauses it again from the committed offset), a cap on how long a pause may last before the record is moved on anyway, per-tier consumer groups so a slow tier cannot starve the main loop's poll interval, and a dead-letter replayer that puts \`tasks.dlq\` records back on \`tasks\` once the dependency is healthy.`,
 };

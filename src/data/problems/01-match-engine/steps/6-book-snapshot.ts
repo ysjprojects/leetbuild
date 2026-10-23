@@ -534,6 +534,95 @@ export async function check_no_store(ctx) {
   assert(cacheControl.toLowerCase().includes('no-store'), \`the 200 carries Cache-Control \${JSON.stringify(cacheControl)}, expected no-store\`);
 }
 `,
+    go: `package main
+
+import (
+	"strconv"
+	"strings"
+
+	"leetbuild/harness"
+)
+
+func seedBook(ctx *harness.Ctx, symbol, bid, ask, last string) {
+	ctx.Redis.Do("HSET", "book:"+symbol, "bid", bid, "ask", ask, "last", last)
+}
+
+// bodyNumber is the TypeScript Number(body[k] ?? -1): a JSON number, or a string holding one.
+func bodyNumber(v any) float64 {
+	switch n := v.(type) {
+	case nil:
+		return -1
+	case float64:
+		return n
+	case string:
+		if f, err := strconv.ParseFloat(n, 64); err == nil {
+			return f
+		}
+	}
+	return -2
+}
+
+func CheckValidate(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	seedBook(ctx, "ACME", "10.05", "10.06", "10.05")
+	// A probe on each invalid symbol's key: it fires if any Redis command ever touches it.
+	var touched []string
+	for _, symbol := range []string{"acme", "ACME1", "TOOLONGX", "AC-ME"} {
+		key := "book:" + symbol
+		ctx.Redis.After(key, func() any {
+			touched = append(touched, key)
+			return nil
+		})
+		r := c.Get("/book/" + symbol)
+		ctx.Equal(r.Status, 400, "GET /book/%s", symbol)
+	}
+	ctx.Equal(touched, []string(nil), "an invalid symbol must be rejected before any Redis call; keys read")
+	r := c.Get("/book/ACME")
+	ctx.Equal(r.Status, 200, "GET /book/ACME")
+}
+
+func CheckHash(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	seedBook(ctx, "ACME", "10.05", "10.06", "10.05")
+	seedBook(ctx, "BETA", "1", "2", "1.5")
+	r := c.Get("/book/ACME")
+	ctx.Equal(r.Status, 200, "GET /book/ACME")
+	var body map[string]any
+	r.Decode(&body)
+	ctx.Equal(body["symbol"], "ACME", "the body must name the symbol, got %s; symbol", r.Text())
+	got := map[string]float64{}
+	for _, k := range []string{"bid", "ask", "last"} {
+		got[k] = bodyNumber(body[k])
+	}
+	ctx.Equal(got, map[string]float64{"bid": 10.05, "ask": 10.06, "last": 10.05}, "the body must carry bid/ask/last from book:ACME, got %s", r.Text())
+	r2 := c.Get("/book/BETA")
+	last := -1.0
+	if r2.Status == 200 {
+		var beta map[string]any
+		r2.Decode(&beta)
+		last = bodyNumber(beta["last"])
+	}
+	ctx.Assert(r2.Status == 200 && last == 1.5, "GET /book/BETA must read book:BETA, got %d %s", r2.Status, r2.Text())
+}
+
+func CheckNotFound(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	r := c.Get("/book/GHOST")
+	ctx.Equal(r.Status, 404, "GET /book/GHOST with no hash")
+	seedBook(ctx, "GHOST", "10.05", "10.06", "10.05")
+	r = c.Get("/book/GHOST")
+	ctx.Equal(r.Status, 200, "once book:GHOST exists, GET /book/GHOST")
+}
+
+func CheckNoStore(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	seedBook(ctx, "ACME", "10.05", "10.06", "10.05")
+	r := c.Get("/book/ACME")
+	ctx.Equal(r.Status, 200, "GET /book/ACME")
+	cacheControl := r.Header.Get("Cache-Control")
+	ctx.Assert(strings.Contains(strings.ToLower(cacheControl), "no-store"), "the 200 carries Cache-Control %q, expected no-store", cacheControl)
+}
+`,
   },
   debrief: `The same three-exit shape as the first HTTPS step — validate, look up, represent — with the cache policy flipped: \`no-store\` because the resource's truth has a lifetime of one trade. Validating the path segment before the Redis call is not pedantry; it is what keeps \`GET /book/../../admin\`-style input from ever reaching a key. Real market-data APIs add \`ETag\`s made from the tick sequence number (so a poll can be cheap when nothing changed), rate limits per API key, and serve depth (the full ladder) from a snapshot log rather than one hash.`,
 };

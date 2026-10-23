@@ -513,13 +513,13 @@ type Order struct {
 }
 
 // confirm turns the reservation into a sale: DEL hold:{order_id}, ZREM holds (provided).
-func confirm(ctx context.Context, orderID string) error { panic("not implemented") }
+var confirm = func(ctx context.Context, orderID string) error { panic("not implemented") }
 
 // release gives the hold back to stock (step 5).
-func release(ctx context.Context, orderID string) error { panic("not implemented") }
+var release = func(ctx context.Context, orderID string) error { panic("not implemented") }
 
 // publishFailed dead-letters the order on orders-failed (provided).
-func publishFailed(ctx context.Context, order Order) error { panic("not implemented") }
+var publishFailed = func(ctx context.Context, order Order) error { panic("not implemented") }
 
 // allocate returns false when the warehouse has no physical stock for the order.
 func allocate(ctx context.Context, order Order) (bool, error) {
@@ -580,13 +580,13 @@ type Order struct {
 }
 
 // confirm turns the reservation into a sale: DEL hold:{order_id}, ZREM holds (provided).
-func confirm(ctx context.Context, orderID string) error { panic("not implemented") }
+var confirm = func(ctx context.Context, orderID string) error { panic("not implemented") }
 
 // release gives the hold back to stock (step 5).
-func release(ctx context.Context, orderID string) error { panic("not implemented") }
+var release = func(ctx context.Context, orderID string) error { panic("not implemented") }
 
 // publishFailed dead-letters the order on orders-failed (provided).
-func publishFailed(ctx context.Context, order Order) error { panic("not implemented") }
+var publishFailed = func(ctx context.Context, order Order) error { panic("not implemented") }
 
 // allocate returns false when the warehouse has no physical stock for the order.
 func allocate(ctx context.Context, order Order) (bool, error) {
@@ -1214,6 +1214,204 @@ export async function check_commit_after(ctx) {
   assert(error !== null, 'an unexpected status must propagate out of the loop, not be swallowed');
   assert.equal(ctx.kafka.lag('fulfilment', 'orders'), 1, 'a record whose outcome is unknown must stay uncommitted so it is redelivered after a restart');
   assert(!calls(log, 'confirm').includes('o2') && !calls(log, 'release').includes('o2'), 'an unexpected status must neither confirm nor release the hold');
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"slices"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"leetbuild/harness"
+
+	pb "flashsale/gen/warehouse"
+)
+
+const phantomSKU = "phantom-9"
+
+// allocation is what the warehouse peer was asked to allocate.
+type allocation struct {
+	orderID string
+	sku     string
+	qty     uint32
+}
+
+// warehousePeer has no physical stock for phantom-9 and allocates everything else.
+type warehousePeer struct {
+	pb.UnimplementedWarehouseServer
+	allocated []allocation
+}
+
+func (w *warehousePeer) Allocate(_ context.Context, req *pb.AllocateRequest) (*pb.AllocateReply, error) {
+	if req.Sku == phantomSKU {
+		return nil, status.Error(codes.FailedPrecondition, "no physical stock")
+	}
+	w.allocated = append(w.allocated, allocation{req.OrderId, req.Sku, req.Qty})
+	return &pb.AllocateReply{ShipmentId: "ship-" + req.OrderId}, nil
+}
+
+// outcome is one call the consumer made to confirm, release or publishFailed.
+type outcome struct {
+	kind    string
+	orderID string
+	order   Order
+}
+
+// fulfilmentLog records the calls to the stand-ins for confirm, release (step 5) and publishFailed.
+type fulfilmentLog struct{ entries []outcome }
+
+func (l *fulfilmentLog) ids(kind string) []string {
+	var out []string
+	for _, e := range l.entries {
+		if e.kind == kind {
+			out = append(out, e.orderID)
+		}
+	}
+	return out
+}
+
+func orderFor(orderID, sku string) Order { return Order{OrderID: orderID, SKU: sku, Qty: 2} }
+
+// seedOrders puts orders on the orders topic as the checkout API writes them: keyed by sku.
+func seedOrders(ctx *harness.Ctx, orders ...Order) {
+	for _, o := range orders {
+		ctx.Kafka.Seed("orders", o.SKU, map[string]any{"order_id": o.OrderID, "sku": o.SKU, "qty": o.Qty, "user": "ada"})
+	}
+}
+
+// fulfilment seeds orders, serves the warehouse peer and records the provided services.
+func fulfilment(ctx *harness.Ctx, orders ...Order) (*warehousePeer, *fulfilmentLog) {
+	seedOrders(ctx, orders...)
+	peer := &warehousePeer{}
+	pb.RegisterWarehouseServer(ctx.GRPC.Server(""), peer)
+	l := &fulfilmentLog{}
+	confirm = func(_ context.Context, orderID string) error {
+		l.entries = append(l.entries, outcome{kind: "confirm", orderID: orderID})
+		return nil
+	}
+	release = func(_ context.Context, orderID string) error {
+		l.entries = append(l.entries, outcome{kind: "release", orderID: orderID})
+		return nil
+	}
+	publishFailed = func(_ context.Context, order Order) error {
+		l.entries = append(l.entries, outcome{kind: "failed", orderID: order.OrderID, order: order})
+		return nil
+	}
+	return peer, l
+}
+
+// drainRun runs the consume loop until it returns or waits for records that will not come, then
+// stops it (cancelling its context) so a later run is the only one reading. It returns run's error
+// when run returned by itself.
+func drainRun(ctx *harness.Ctx) error {
+	runCtx, cancel := context.WithCancel(context.Background())
+	var err error
+	returned := ctx.Drain(func() { err = run(runCtx) })
+	cancel()
+	ctx.Settle()
+	if !returned {
+		return nil
+	}
+	return err
+}
+
+func CheckGroupManualCommit(ctx *harness.Ctx) {
+	fulfilment(ctx, orderFor("o1", "shoe-42"))
+	drainRun(ctx)
+	subscriptions := ctx.Kafka.EventsOf("subscribe")
+	ctx.Assert(len(subscriptions) > 0, "the consumer must subscribe to a topic")
+	last := subscriptions[len(subscriptions)-1]
+	ctx.Equal(last.Group, "fulfilment", "GroupID")
+	ctx.Assert(slices.Contains(last.Topics, "orders"), "the consumer must read orders, got %q", last.Topics)
+	ctx.Equal(len(ctx.Kafka.EventsOf("auto-commit")), 0, "offsets were committed on a timer, before the outcome is handled: auto-commits")
+	ctx.Assert(len(ctx.Kafka.EventsOf("manual-commit")) > 0, "the consumer never committed an offset itself")
+	ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 0, "the handled record must be committed: lag")
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	fulfilment(ctx, orderFor("o1", "shoe-42"))
+	drainRun(ctx)
+	calls := ctx.GRPC.CallsTo("Allocate", "")
+	ctx.Assert(len(calls) > 0, "no Allocate RPC reached the warehouse")
+	last := calls[len(calls)-1]
+	ctx.Assert(last.HasDeadline(), "the Allocate RPC carries no deadline: a hung warehouse would stall the partition forever")
+	timeout := last.Timeout.Seconds()
+	ctx.Assert(4 < timeout && timeout <= 5, "the deadline is %v s, expected 5 s", timeout)
+	ctx.GRPC.SetLatency("Allocate", 30, "")
+	before := len(calls)
+	_, err := allocate(context.Background(), orderFor("o2", "shoe-42"))
+	ctx.Assert(err != nil, "a warehouse slower than the deadline must fail with DeadlineExceeded, not succeed")
+	ctx.Equal(status.Code(err), codes.DeadlineExceeded, "the code a slow warehouse failed with")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Allocate", "")), before+1, "DeadlineExceeded must not be retried: Allocate calls")
+}
+
+func CheckBackoffBounded(ctx *harness.Ctx) {
+	peer, _ := fulfilment(ctx)
+	ctx.GRPC.Fail("Allocate", codes.Unavailable, "", 2, "")
+	started := ctx.Clock.Now()
+	ok, err := allocate(context.Background(), orderFor("o1", "shoe-42"))
+	ctx.NoError(err, "two Unavailable answers followed by success must end as allocated")
+	ctx.Equal(ok, true, "two Unavailable answers followed by success must end as allocated")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Allocate", "")), 3, "Allocate calls (two Unavailable, then success)")
+	ctx.Equal(ctx.Clock.Sleeps(), 2, "sleeps before the retries (never before the first call)")
+	waited := ctx.Clock.Now() - started
+	ctx.Assert(740 <= waited && waited <= 900, "waited %d ms across two retries, expected 250 + 500 = 750 ms (backoff << (attempt-1))", waited)
+	ctx.Equal(peer.allocated, []allocation{{"o1", "shoe-42", 2}}, "the warehouse must see the order's id, sku and qty")
+
+	ctx.GRPC.Fail("Allocate", codes.InvalidArgument, "qty", 1, "")
+	_, err = allocate(context.Background(), orderFor("o2", "shoe-42"))
+	ctx.Assert(err != nil, "InvalidArgument must propagate, not be retried or swallowed")
+	ctx.Equal(status.Code(err), codes.InvalidArgument, "InvalidArgument must propagate unchanged: the code")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Allocate", "")), 4, "InvalidArgument must not be retried: Allocate calls")
+
+	ctx.GRPC.Fail("Allocate", codes.Unavailable, "", 50, "")
+	started = ctx.Clock.Now()
+	_, err = allocate(context.Background(), orderFor("o3", "shoe-42"))
+	ctx.Assert(err != nil, "a warehouse that stays Unavailable must fail after maxAttempts, not succeed")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Allocate", ""))-4, 4, "attempts against a down warehouse")
+	waited = ctx.Clock.Now() - started
+	ctx.Assert(1740 <= waited && waited <= 1900, "waited %d ms across three retries, expected 250 + 500 + 1000 = 1750 ms", waited)
+}
+
+func CheckNoStock(ctx *harness.Ctx) {
+	ghost := orderFor("o2", phantomSKU)
+	_, l := fulfilment(ctx, orderFor("o1", "shoe-42"), ghost)
+	drainRun(ctx)
+	ctx.Equal(l.ids("release"), []string{"o2"}, "release calls (only the order without physical stock)")
+	var failed []Order
+	for _, e := range l.entries {
+		if e.kind == "failed" {
+			failed = append(failed, e.order)
+		}
+	}
+	ctx.Equal(failed, []Order{ghost}, "publishFailed calls (the whole order o2)")
+	ctx.Equal(l.ids("confirm"), []string{"o1"}, "confirm calls")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Allocate", "")), 2, "FailedPrecondition is final, it must not be retried: Allocate calls")
+	ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 0, "a no-stock order is handled (released and dead-lettered) and must be committed: lag")
+}
+
+func CheckCommitAfter(ctx *harness.Ctx) {
+	_, l := fulfilment(ctx, orderFor("o1", "shoe-42"))
+	var atCommit [][]outcome
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, append([]outcome(nil), l.entries...)) })
+	drainRun(ctx)
+	ctx.Equal(l.ids("confirm"), []string{"o1"}, "a successful allocation must confirm the sale: confirm calls")
+	ctx.Assert(len(atCommit) > 0, "the offset was never committed")
+	confirmedFirst := false
+	for _, e := range atCommit[0] {
+		confirmedFirst = confirmedFirst || e.kind == "confirm" && e.orderID == "o1"
+	}
+	ctx.Assert(confirmedFirst, "the commit came before confirm(o1): a crash in between would lose the sale")
+	ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 0, "the handled record must be committed: lag")
+
+	ctx.GRPC.Fail("Allocate", codes.Internal, "warehouse bug", 1, "")
+	seedOrders(ctx, orderFor("o2", "shoe-42"))
+	err := drainRun(ctx)
+	ctx.Assert(err != nil, "an unexpected status must propagate out of the loop, not be swallowed")
+	ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 1, "a record whose outcome is unknown must stay uncommitted so it is redelivered after a restart: lag")
+	ctx.Assert(!slices.Contains(l.ids("confirm"), "o2") && !slices.Contains(l.ids("release"), "o2"), "an unexpected status must neither confirm nor release the hold")
 }
 `,
   },

@@ -433,13 +433,13 @@ type Order struct {
 }
 
 // reserve is the atomic stock reservation (step 1); false when sold out.
-func reserve(ctx context.Context, sku, orderID string, qty int) (bool, error) { panic("not implemented") }
+var reserve = func(ctx context.Context, sku, orderID string, qty int) (bool, error) { panic("not implemented") }
 
 // release gives a hold back to stock (step 5).
-func release(ctx context.Context, orderID string) error { panic("not implemented") }
+var release = func(ctx context.Context, orderID string) error { panic("not implemented") }
 
 // enqueueOrder is the durable intake through Kafka (step 3); it errors when the broker did not acknowledge.
-func enqueueOrder(ctx context.Context, order Order) error { panic("not implemented") }
+var enqueueOrder = func(ctx context.Context, order Order) error { panic("not implemented") }
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
@@ -499,13 +499,13 @@ type Order struct {
 }
 
 // reserve is the atomic stock reservation (step 1); false when sold out.
-func reserve(ctx context.Context, sku, orderID string, qty int) (bool, error) { panic("not implemented") }
+var reserve = func(ctx context.Context, sku, orderID string, qty int) (bool, error) { panic("not implemented") }
 
 // release gives a hold back to stock (step 5).
-func release(ctx context.Context, orderID string) error { panic("not implemented") }
+var release = func(ctx context.Context, orderID string) error { panic("not implemented") }
 
 // enqueueOrder is the durable intake through Kafka (step 3); it errors when the broker did not acknowledge.
-func enqueueOrder(ctx context.Context, order Order) error { panic("not implemented") }
+var enqueueOrder = func(ctx context.Context, order Order) error { panic("not implemented") }
 
 func writeJSON(rw http.ResponseWriter, status int, body any) {
 	rw.Header().Set("Content-Type", "application/json")
@@ -1041,6 +1041,188 @@ export async function check_accepted(ctx) {
   const reservedId = calls(down.log, 'reserve')[0][2];
   const releases = calls(down.log, 'release');
   assert.deepEqual(releases, [['release', reservedId]], \`the hold \${reservedId} must be released when the enqueue fails; release calls: \${JSON.stringify(releases)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"errors"
+
+	"leetbuild/harness"
+)
+
+// checkoutBody is the valid request, with fields replaced (or removed, for nil) by overrides.
+func checkoutBody(overrides map[string]any) map[string]any {
+	body := map[string]any{"sku": "shoe-42", "qty": 2, "user": "ada"}
+	for k, v := range overrides {
+		if v == nil {
+			delete(body, k)
+		} else {
+			body[k] = v
+		}
+	}
+	return body
+}
+
+// serviceCall is one call the endpoint made to reserve, release or enqueueOrder.
+type serviceCall struct {
+	kind    string
+	sku     string
+	orderID string
+	qty     int
+	order   Order
+}
+
+// serviceLog records the calls to the stand-ins for steps 1, 5 and 3.
+type serviceLog struct{ entries []serviceCall }
+
+func (l *serviceLog) of(kind string) []serviceCall {
+	var out []serviceCall
+	for _, e := range l.entries {
+		if e.kind == kind {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// standIns swaps steps 1, 5 and 3 for recording fakes: reserve answers !soldOut, enqueueOrder
+// fails when brokerDown.
+func standIns(soldOut, brokerDown bool) *serviceLog {
+	l := &serviceLog{}
+	reserve = func(_ context.Context, sku, orderID string, qty int) (bool, error) {
+		l.entries = append(l.entries, serviceCall{kind: "reserve", sku: sku, orderID: orderID, qty: qty})
+		return !soldOut, nil
+	}
+	release = func(_ context.Context, orderID string) error {
+		l.entries = append(l.entries, serviceCall{kind: "release", orderID: orderID})
+		return nil
+	}
+	enqueueOrder = func(_ context.Context, order Order) error {
+		l.entries = append(l.entries, serviceCall{kind: "enqueue", order: order})
+		if brokerDown {
+			return errors.New("no ack within 2s")
+		}
+		return nil
+	}
+	return l
+}
+
+// checkoutServer is the learner's server with the provided services stood in for.
+func checkoutServer(ctx *harness.Ctx, soldOut, brokerDown bool) (*serviceLog, *harness.HTTP) {
+	l := standIns(soldOut, brokerDown)
+	return l, ctx.Main(main).HTTP()
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	_, c := checkoutServer(ctx, false, false)
+	r := c.Post("/checkout", checkoutBody(nil))
+	ctx.Assert(r.Status != 404, "no handler is registered for POST /checkout")
+	ctx.Equal(r.Status, 202, "POST /checkout with a valid body")
+}
+
+func CheckValidate(ctx *harness.Ctx) {
+	l, c := checkoutServer(ctx, false, false)
+	bad := []struct {
+		label string
+		body  map[string]any
+	}{
+		{"a missing sku", checkoutBody(map[string]any{"sku": nil})},
+		{"a missing user", checkoutBody(map[string]any{"user": nil})},
+		{"qty 0", checkoutBody(map[string]any{"qty": 0})},
+		{"qty 6", checkoutBody(map[string]any{"qty": 6})},
+	}
+	for _, b := range bad {
+		r := c.Post("/checkout", b.body)
+		ctx.Equal(r.Status, 400, "%s", b.label)
+	}
+	ctx.Equal(len(l.of("reserve")), 0, "a 400 must be decided before stock is touched: reserve calls for a bad body")
+	ctx.Equal(len(ctx.Redis.Keys("attempts:*")), 0, "a 400 must be decided before the attempt counter is touched: attempts:* keys")
+	r := c.Post("/checkout", checkoutBody(map[string]any{"qty": 5}))
+	ctx.Equal(r.Status, 202, "qty 5 is the maximum and must be accepted")
+	r = c.Post("/checkout", checkoutBody(map[string]any{"qty": 1}))
+	ctx.Equal(r.Status, 202, "qty 1 is the minimum and must be accepted")
+}
+
+func CheckAttemptLimit(ctx *harness.Ctx) {
+	l, c := checkoutServer(ctx, false, false)
+	body := checkoutBody(map[string]any{"user": "bot"})
+	r := c.Post("/checkout", body)
+	ctx.Equal(r.Status, 202, "the first attempt")
+	count, _ := ctx.Redis.Get("attempts:bot")
+	ctx.Equal(count, "1", "attempts:bot after one request")
+	ttl := ctx.Redis.TTL("attempts:bot")
+	ctx.Assert(0 < ttl && ttl <= 60, "attempts:bot has TTL %d; the window must be set to 60 s when the counter is created", ttl)
+	c.Post("/checkout", body)
+	count, _ = ctx.Redis.Get("attempts:bot")
+	ctx.Equal(count, "2", "every request must INCR attempts:{user}")
+	reserves := len(l.of("reserve"))
+	ctx.Redis.Set("attempts:bot", 20, "KEEPTTL")
+	r = c.Post("/checkout", body)
+	ctx.Equal(r.Status, 429, "the 21st attempt in the window")
+	ctx.Equal(r.Header.Get("Retry-After"), "60", "the Retry-After header")
+	ctx.Equal(len(l.of("reserve")), reserves, "a 429 must be decided before reserve is called (a bot must not cost a Lua call): reserve calls")
+	ctx.Clock.Advance(61)
+	r = c.Post("/checkout", body)
+	ctx.Equal(r.Status, 202, "after the 60 s window the counter must have expired")
+	r = c.Post("/checkout", checkoutBody(map[string]any{"user": "grace"}))
+	ctx.Equal(r.Status, 202, "the limit is per user: another user must not be throttled")
+}
+
+func CheckSoldOut(ctx *harness.Ctx) {
+	l, c := checkoutServer(ctx, true, false)
+	r := c.Post("/checkout", checkoutBody(nil))
+	ctx.Equal(r.Status, 409, "a reservation that returned false")
+	var body struct {
+		Error string \`json:"error"\`
+	}
+	r.Decode(&body)
+	ctx.Equal(body.Error, "SOLD_OUT", "the 409 body's error (body %s)", r.Text())
+	ctx.Equal(len(l.of("enqueue")), 0, "a sold-out order must not be enqueued: enqueueOrder calls")
+	ctx.Equal(len(l.of("release")), 0, "nothing was reserved, so nothing must be released: release calls")
+}
+
+func CheckAccepted(ctx *harness.Ctx) {
+	l, c := checkoutServer(ctx, false, false)
+	r := c.Post("/checkout", checkoutBody(nil))
+	ctx.Equal(r.Status, 202, "a reserved and enqueued order")
+	reserves, enqueues := l.of("reserve"), l.of("enqueue")
+	ctx.Equal(len(reserves), 1, "reserve calls")
+	ctx.Equal(len(enqueues), 1, "enqueueOrder calls")
+	reserveAt, enqueueAt := -1, -1
+	for i, e := range l.entries {
+		if e.kind == "reserve" && reserveAt < 0 {
+			reserveAt = i
+		}
+		if e.kind == "enqueue" && enqueueAt < 0 {
+			enqueueAt = i
+		}
+	}
+	ctx.Assert(reserveAt < enqueueAt, "reserve must run before enqueueOrder")
+	first := reserves[0]
+	ctx.Equal([]any{first.sku, first.qty}, []any{"shoe-42", 2}, "reserve's sku and qty")
+	ctx.Assert(first.orderID != "", "reserve must be called with a generated order id")
+	ctx.Equal(enqueues[0].order, Order{OrderID: first.orderID, SKU: "shoe-42", Qty: 2, User: "ada"}, "the order enqueueOrder received")
+	var body struct {
+		OrderID string \`json:"order_id"\`
+		Status  string \`json:"status"\`
+	}
+	r.Decode(&body)
+	ctx.Equal(body.OrderID, first.orderID, "the 202 body's order_id must be the id that was reserved (body %s)", r.Text())
+	ctx.Equal(body.Status, "reserved", "the 202 body's status must be reserved, nothing is paid yet (body %s)", r.Text())
+	ctx.Equal(len(l.of("release")), 0, "a successful enqueue must not release the hold: release calls")
+
+	down := standIns(false, true)
+	r = c.Post("/checkout", checkoutBody(nil))
+	ctx.Equal(r.Status, 503, "when enqueueOrder fails the endpoint")
+	downReserves := down.of("reserve")
+	ctx.Assert(len(downReserves) > 0, "reserve was never called")
+	var released []string
+	for _, e := range down.of("release") {
+		released = append(released, e.orderID)
+	}
+	ctx.Equal(released, []string{downReserves[0].orderID}, "the hold must be released when the enqueue fails: release calls")
 }
 `,
   },

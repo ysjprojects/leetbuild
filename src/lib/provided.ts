@@ -293,10 +293,18 @@ const helperLines = (
   ...(uses.length === 0 ? [] : [`${comment} The steps use: ${uses.join(', ')}`]),
 ];
 
-/** Go: every `<module>/<pkg>` import that is not the generated package, as `<pkg>/<pkg>.go`. */
+const goSupportNote = (importPath: string): string =>
+  `Provided by the course: the runtime compiles it as the package "${importPath}", so the import works as written.`;
+
+/**
+ * Go: every `<module>/<pkg>` import that is not the generated package, as `<pkg>/<pkg>.go`. A package
+ * the course ships in Go (`support.go`, keyed by import path: `shortener/links/links.go`) shows its
+ * real files; any other gets a stub saying how the steps use it.
+ */
 function goHelpers(problem: Problem): ProvidedFile[] {
   const code = allCode(problem, 'go');
   const modules = new Set([...code.matchAll(/"([\w.-]+)\/gen\/\w+"/g)].map(m => m[1]));
+  const shipped = Object.entries(problem.support?.go ?? {}).filter(([path]) => path.endsWith('.go'));
   const out = new Map<string, ProvidedFile>();
   for (const m of code.matchAll(/^\s*(?:(\w+)\s+)?"([\w./-]+)"/gm)) {
     const [, alias, path] = m;
@@ -304,6 +312,14 @@ function goHelpers(problem: Problem): ProvidedFile[] {
     if (!modules.has(mod) || path.includes('/gen/')) continue;
     const rel = path.slice(mod.length + 1);
     const pkg = rel.split('/').pop() ?? rel;
+    const real = shipped.filter(([file]) => file.slice(0, file.lastIndexOf('/')) === path);
+    if (real.length > 0) {
+      for (const [file, text] of real) {
+        const shown = `${rel}/${file.slice(file.lastIndexOf('/') + 1)}`;
+        out.set(shown, {path: shown, syntax: 'go', note: goSupportNote(path), text});
+      }
+      continue;
+    }
     const file = `${rel}/${pkg}.go`;
     if (out.has(file)) continue;
     const uses = usesOf(code, alias ?? pkg).map(u => `${alias ?? pkg}.${u}`);

@@ -372,9 +372,10 @@ export async function fetch_messages(channelId: bigint, before: bigint, limit: n
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"sort"
 	"strconv"
 	"sync"
@@ -395,9 +396,8 @@ const (
 
 // hashKey is a 64-bit position on the ring (provided).
 func hashKey(key string) uint64 {
-	h := fnv.New64a()
-	h.Write([]byte(key))
-	return h.Sum64()
+	sum := md5.Sum([]byte(key))
+	return binary.BigEndian.Uint64(sum[:8])
 }
 
 type point struct {
@@ -463,9 +463,10 @@ func fetchMessages(ctx context.Context, channelID, before int64, limit int) ([]*
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"sort"
 	"strconv"
 	"sync"
@@ -486,9 +487,8 @@ const (
 
 // hashKey is a 64-bit position on the ring (provided).
 func hashKey(key string) uint64 {
-	h := fnv.New64a()
-	h.Write([]byte(key))
-	return h.Sum64()
+	sum := md5.Sum([]byte(key))
+	return binary.BigEndian.Uint64(sum[:8])
 }
 
 type point struct {
@@ -1155,6 +1155,296 @@ export async function check_deadline(ctx) {
   assert(rows === null, \`\${owner} took 2 s to answer and fetch_messages waited \${((ctx.clock.now() - started) / 1000).toFixed(1)} s for \${rows?.length} messages: a data service slower than the deadline must surface DEADLINE_EXCEEDED\`);
   const waited = (ctx.clock.now() - started) / 1000;
   assert(waited <= 0.5, \`the API waited \${waited.toFixed(1)} s for a stalled instance, the deadline is 300 ms\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strconv"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"discord/db"
+	pb "discord/gen/messages"
+	"leetbuild/harness"
+)
+
+const (
+	rtBucketMs int64 = 10 * 24 * 3600 * 1000
+	rtInsert         = "INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES ($1, $2, $3, $4, $5)"
+	rtB        int64 = 430
+)
+
+func rtSnowflake(bucket, offsetMs int64) int64 {
+	return ((bucket*rtBucketMs + offsetMs) << 22) | (1 << 17)
+}
+
+var rtEnd = rtSnowflake(rtB+1, rtBucketMs-1)
+
+// rtChannels are twelve channels created in bucket rtB.
+var rtChannels = func() []int64 {
+	out := []int64{}
+	for i := range 12 {
+		out = append(out, rtSnowflake(rtB, int64(1000*i+1)))
+	}
+	return out
+}()
+
+// rtPage is what Postgres holds for rtChannels[i], newest first.
+func rtPage(i int) []string {
+	return []string{fmt.Sprintf("%d:2", i), fmt.Sprintf("%d:1", i), fmt.Sprintf("%d:0", i)}
+}
+
+func rtKeys(n int) []int64 {
+	out := []int64{}
+	for i := range n {
+		out = append(out, rtSnowflake(425, int64(i)*4096*7919))
+	}
+	return out
+}
+
+func rtKey(channel int64) string { return strconv.FormatInt(channel, 10) }
+
+// rtPeer is step 3's data service: the page walk over Postgres behind MessageData.GetMessages.
+type rtPeer struct {
+	pb.UnimplementedMessageDataServer
+}
+
+func (p *rtPeer) GetMessages(ctx context.Context, req *pb.GetMessagesRequest) (*pb.GetMessagesReply, error) {
+	channel, before, limit := int64(req.GetChannelId()), int64(req.GetBefore()), int(req.GetLimit())
+	reply := &pb.GetMessagesReply{}
+	for bucket := (before >> 22) / rtBucketMs; len(reply.Messages) < limit && bucket >= (channel>>22)/rtBucketMs; bucket-- {
+		rows, err := db.Query(ctx, "SELECT message_id, author_id, content FROM messages"+
+			" WHERE channel_id = $1 AND bucket = $2 AND message_id < $3 ORDER BY message_id DESC LIMIT $4",
+			channel, bucket, before, limit-len(reply.Messages))
+		if err != nil {
+			return nil, status.Error(codes.Unavailable, "messages store: "+err.Error())
+		}
+		for rows.Next() {
+			var id, author int64
+			var content string
+			rows.Scan(&id, &author, &content)
+			reply.Messages = append(reply.Messages, &pb.Message{Id: uint64(id), AuthorId: uint64(author), Content: content})
+		}
+		rows.Close()
+	}
+	return reply, nil
+}
+
+// rtCluster fills Postgres and serves the data service at every one of the learner's instances.
+func rtCluster(ctx *harness.Ctx) {
+	ctx.DB.Reset(db.Schema)
+	for i, channel := range rtChannels {
+		for j := range 3 {
+			ctx.DB.Exec(rtInsert, channel, rtB, rtSnowflake(rtB, int64(1000*i+10+j)), 7, fmt.Sprintf("%d:%d", i, j))
+		}
+	}
+	for _, node := range instances {
+		pb.RegisterMessageDataServer(ctx.GRPC.Server(node), &rtPeer{})
+	}
+}
+
+// rtFetch is fetchMessages for one channel: the contents it returned and the one GetMessages call it made.
+func rtFetch(ctx *harness.Ctx, channel int64) ([]string, harness.Call, error) {
+	n := len(ctx.GRPC.CallsTo("GetMessages", ""))
+	rows, err := fetchMessages(context.Background(), channel, rtEnd, 50)
+	if err != nil {
+		return nil, harness.Call{}, err
+	}
+	calls := ctx.GRPC.CallsTo("GetMessages", "")[n:]
+	ctx.Equal(len(calls), 1, "fetchMessages for channel %d must make one GetMessages call; calls", channel)
+	page := []string{}
+	for _, m := range rows {
+		page = append(page, m.GetContent())
+	}
+	return page, calls[0], nil
+}
+
+// rtPoint is one virtual node of the ring the harness rebuilds by hand.
+type rtPoint struct {
+	pos  uint64
+	node string
+}
+
+// rtPoints are the vnodes points hashed from node#i for every node, sorted by position.
+func rtPoints(nodes []string) []rtPoint {
+	points := []rtPoint{}
+	for _, node := range nodes {
+		for i := 0; i < vnodes; i++ {
+			points = append(points, rtPoint{hashKey(fmt.Sprintf("%s#%d", node, i)), node})
+		}
+	}
+	sort.SliceStable(points, func(a, b int) bool { return points[a].pos < points[b].pos })
+	return points
+}
+
+// rtExpected is the clockwise rule applied by hand: the first point at or after hashKey(key), wrapping.
+func rtExpected(points []rtPoint, key int64) string {
+	h := hashKey(rtKey(key))
+	i := sort.Search(len(points), func(i int) bool { return points[i].pos >= h })
+	if i == len(points) {
+		return points[0].node
+	}
+	return points[i].node
+}
+
+func rtPick(ctx *harness.Ctx, r *Ring, key int64) string {
+	node, err := r.Pick(rtKey(key))
+	ctx.NoError(err, "Pick(%d)", key)
+	return node
+}
+
+func CheckVirtualNodes(ctx *harness.Ctx) {
+	ctx.Assert(vnodes >= 50, "vnodes is %d: a handful of points per instance cannot split the ring evenly", vnodes)
+	r := NewRing(instances...)
+	keys := rtKeys(3000)
+	shares := map[string]int{}
+	for _, k := range keys {
+		shares[rtPick(ctx, r, k)]++
+	}
+	owners := []string{}
+	for node := range shares {
+		owners = append(owners, node)
+	}
+	sort.Strings(owners)
+	want := append([]string{}, instances...)
+	sort.Strings(want)
+	ctx.Equal(owners, want, "every instance must own part of the ring: instances the picks landed on")
+	for node, n := range shares {
+		share := float64(n) / float64(len(keys))
+		ctx.Assert(0.2 <= share && share <= 0.5, "%s receives %.0f%% of 3000 channels; with vnodes points per instance the split should be close to a third each: %v", node, 100*share, shares)
+	}
+	only := NewRing("data-9:9000")
+	for _, k := range keys[:50] {
+		ctx.Equal(rtPick(ctx, only, k), "data-9:9000", "a ring with one instance picks it for every key")
+	}
+	_, err := NewRing().Pick(rtKey(rtChannels[0]))
+	ctx.Assert(err != nil, "Pick on an empty ring must return an error: there is no instance to route to")
+}
+
+func CheckClockwisePick(ctx *harness.Ctx) {
+	for _, nodes := range [][]string{instances, instances[:2], {"data-7:9000", "data-8:9000", "data-9:9000", "data-10:9000"}} {
+		r := NewRing(nodes...)
+		points := rtPoints(nodes)
+		for _, key := range rtKeys(400) {
+			want := rtExpected(points, key)
+			ctx.Equal(rtPick(ctx, r, key), want, "Pick(%d) on %v: the first point at or after hashKey(key) among the vnodes points hashed from node#i, wrapping to the first point", key, nodes)
+		}
+	}
+	reversed := []string{}
+	for i := len(instances) - 1; i >= 0; i-- {
+		reversed = append(reversed, instances[i])
+	}
+	a, b := NewRing(instances...), NewRing(reversed...)
+	for _, k := range rtChannels {
+		ctx.Assert(rtPick(ctx, a, k) == rtPick(ctx, b, k), "the mapping must not depend on the order instances were added")
+	}
+}
+
+func CheckRemoveMinimal(ctx *harness.Ctx) {
+	r := NewRing(instances...)
+	keys := rtKeys(1500)
+	before := map[int64]string{}
+	for _, k := range keys {
+		before[k] = rtPick(ctx, r, k)
+	}
+	r.Remove("data-2:9000")
+	after := map[int64]string{}
+	for _, k := range keys {
+		after[k] = rtPick(ctx, r, k)
+		ctx.Assert(after[k] != "data-2:9000", "a removed instance must receive nothing")
+	}
+	stayed, moved := 0, 0
+	homes := map[string]bool{}
+	for _, k := range keys {
+		if before[k] != "data-2:9000" {
+			stayed++
+			if after[k] != before[k] {
+				moved++
+			}
+		} else {
+			homes[after[k]] = true
+		}
+	}
+	ctx.Equal(moved, 0, "of %d channels that did not live on data-2, some changed instance when data-2 left: removing a node must drop only its own points; moved", stayed)
+	got := []string{}
+	for node := range homes {
+		got = append(got, node)
+	}
+	sort.Strings(got)
+	ctx.Equal(got, []string{"data-1:9000", "data-3:9000"}, "data-2's channels must spread over both survivors")
+	r.Add("data-2:9000")
+	for _, k := range keys {
+		ctx.Assert(rtPick(ctx, r, k) == before[k], "adding the instance back must restore the exact previous mapping")
+	}
+	r.Remove("data-1:9000")
+	r.Remove("data-3:9000")
+	for _, k := range keys[:20] {
+		ctx.Assert(rtPick(ctx, r, k) == "data-2:9000", "with one instance left every key goes to it")
+	}
+}
+
+func CheckRouteByChannel(ctx *harness.Ctx) {
+	rtCluster(ctx)
+	homes := map[int64]string{}
+	targets := map[string]bool{}
+	for i, channel := range rtChannels {
+		got, call, err := rtFetch(ctx, channel)
+		ctx.NoError(err, "fetchMessages for channel %d", channel)
+		owner := rtPick(ctx, ring, channel)
+		ctx.Equal(call.Target, owner, "fetchMessages for channel %d must reach the instance ring.Pick names: a channel's reads must go to the instance that owns it on the ring", channel)
+		req, _ := call.Request.(*pb.GetMessagesRequest)
+		ctx.Assert(req != nil && req.GetChannelId() == uint64(channel) && req.GetBefore() == uint64(rtEnd) && req.GetLimit() == 50, "the request must carry channel_id %d, before %d and limit 50 as given, the data service received %v", channel, rtEnd, call.Request)
+		ctx.Equal(got, rtPage(i), "fetchMessages must return the data service's page for channel %d", channel)
+		homes[channel] = call.Target
+		targets[call.Target] = true
+	}
+	ctx.Assert(len(targets) >= 2, "twelve channels all reached %v: the ring must spread channels over the instances", targets)
+	for range 3 {
+		_, call, err := rtFetch(ctx, rtChannels[0])
+		ctx.NoError(err, "fetchMessages for channel %d", rtChannels[0])
+		ctx.Equal(call.Target, homes[rtChannels[0]], "repeated reads of one channel must all reach the same instance")
+	}
+	gone := homes[rtChannels[0]]
+	ctx.GRPC.Stop(gone) // the instance goes down; service discovery drops it from the ring
+	ring.Remove(gone)
+	for i, channel := range rtChannels {
+		got, call, err := rtFetch(ctx, channel)
+		if err != nil {
+			ctx.Fatalf("after %s went down and left the ring, channel %d failed with %v: its reads must follow the ring to a live instance", gone, channel, status.Code(err))
+		}
+		ctx.Assert(call.Target != gone, "channel %d still dialled %s after it left the ring", channel, gone)
+		if homes[channel] != gone {
+			ctx.Equal(call.Target, homes[channel], "channel %d lived on %s, which is still up, yet moved when %s left", channel, homes[channel], gone)
+		}
+		ctx.Equal(call.Target, rtPick(ctx, ring, channel), "channel %d must reach the instance the ring now names", channel)
+		ctx.Equal(got, rtPage(i), "the new owner must answer channel %d's real page", channel)
+	}
+}
+
+func CheckDeadline(ctx *harness.Ctx) {
+	rtCluster(ctx)
+	channel := rtChannels[1]
+	got, call, err := rtFetch(ctx, channel)
+	ctx.NoError(err, "fetchMessages for channel %d", channel)
+	ctx.Equal(got, rtPage(1), "expected channel %d's page", channel)
+	ctx.Assert(call.HasDeadline(), "GetMessages carries no deadline: a stalled data service would hold the API request forever")
+	timeout := call.Timeout.Seconds()
+	ctx.Assert(0.25 <= timeout && timeout <= 0.35, "the deadline must be 300 ms, the call carried %.3f s", timeout)
+	owner := call.Target
+	ctx.GRPC.SetLatency("GetMessages", 2.0, owner) // that instance stalls for 2 s
+	started := ctx.Clock.Now()
+	rows, err := fetchMessages(context.Background(), channel, rtEnd, 50)
+	if err != nil {
+		ctx.Equal(status.Code(err), codes.DeadlineExceeded, "expected DEADLINE_EXCEEDED from the stalled instance")
+	}
+	waited := float64(ctx.Clock.Now()-started) / 1000
+	ctx.Assert(err != nil, "%s took 2 s to answer and fetchMessages waited %.1f s for %d messages: a data service slower than the deadline must surface DEADLINE_EXCEEDED", owner, waited, len(rows))
+	ctx.Assert(waited <= 0.5, "the API waited %.1f s for a stalled instance, the deadline is 300 ms", waited)
 }
 `,
   },

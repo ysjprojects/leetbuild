@@ -624,11 +624,40 @@ import (
 	"github.com/segmentio/kafka-go"
 
 	"assistant/config" // config.Topic, config.HistoryTTL (seconds), config.RateLimitPerMinute
-	"assistant/prompt" // prompt.Turn{Role, Text}
+	"assistant/prompt" // prompt.Turn{Role, Text}, prompt.Chunk{ID, Text, Score}
 )
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: config.Topic, RequiredAcks: kafka.RequireOne}
+
+// Built in the later steps of the course; provided here.
+var (
+	// cachedAnswer is the {answer, sources} remembered for this question, or nil (kb_search, step 2).
+	cachedAnswer = func(ctx context.Context, question string) (*CachedAnswer, error) { panic("not implemented") }
+	// rememberAnswer caches an answer for the question (kb_search, step 2).
+	rememberAnswer = func(ctx context.Context, question, answer string, sources []string) error { panic("not implemented") }
+	// search returns the k chunks nearest to the question, best first (kb_search, step 2).
+	search = func(ctx context.Context, question string, k int) ([]prompt.Chunk, error) { panic("not implemented") }
+	// answerOrEscalate is the model's answer once the guardrail passed it, or the handoff (guardrail, step 4).
+	answerOrEscalate = func(ctx context.Context, question string, chunks []prompt.Chunk, history []prompt.Turn) (Outcome, error) {
+		panic("not implemented")
+	}
+)
+
+// CachedAnswer is what kb_search remembers for a question.
+type CachedAnswer struct {
+	Answer  string   \`json:"answer"\`
+	Sources []string \`json:"sources"\`
+}
+
+// Outcome is what the guardrail lets the Dasher see: the answer or the handoff.
+type Outcome struct {
+	Answer    string
+	Sources   []string
+	Escalated bool
+	Model     string
+	Tokens    int32
+}
 
 type ChatRequest struct {
 	SessionID string \`json:"session_id"\`
@@ -722,11 +751,40 @@ import (
 	"github.com/segmentio/kafka-go"
 
 	"assistant/config" // config.Topic, config.HistoryTTL (seconds), config.RateLimitPerMinute
-	"assistant/prompt" // prompt.Turn{Role, Text}
+	"assistant/prompt" // prompt.Turn{Role, Text}, prompt.Chunk{ID, Text, Score}
 )
 
 var rdb = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: config.Topic, RequiredAcks: kafka.RequireOne}
+
+// Built in the later steps of the course; provided here.
+var (
+	// cachedAnswer is the {answer, sources} remembered for this question, or nil (kb_search, step 2).
+	cachedAnswer = func(ctx context.Context, question string) (*CachedAnswer, error) { panic("not implemented") }
+	// rememberAnswer caches an answer for the question (kb_search, step 2).
+	rememberAnswer = func(ctx context.Context, question, answer string, sources []string) error { panic("not implemented") }
+	// search returns the k chunks nearest to the question, best first (kb_search, step 2).
+	search = func(ctx context.Context, question string, k int) ([]prompt.Chunk, error) { panic("not implemented") }
+	// answerOrEscalate is the model's answer once the guardrail passed it, or the handoff (guardrail, step 4).
+	answerOrEscalate = func(ctx context.Context, question string, chunks []prompt.Chunk, history []prompt.Turn) (Outcome, error) {
+		panic("not implemented")
+	}
+)
+
+// CachedAnswer is what kb_search remembers for a question.
+type CachedAnswer struct {
+	Answer  string   \`json:"answer"\`
+	Sources []string \`json:"sources"\`
+}
+
+// Outcome is what the guardrail lets the Dasher see: the answer or the handoff.
+type Outcome struct {
+	Answer    string
+	Sources   []string
+	Escalated bool
+	Model     string
+	Tokens    int32
+}
 
 type ChatRequest struct {
 	SessionID string \`json:"session_id"\`
@@ -1772,6 +1830,450 @@ export async function check_recorded(ctx) {
   assert.equal(recs.length, 5, \`once the broker answers, the record handed to the producer during the stall must arrive: \${TOPIC} holds \${recs.length} records, expected 5\`);
   const turns = recs.map(([, v]) => \`\${v.session_id}:\${v.turn}\`).sort();
   assert.deepEqual(turns, ['s1:1', 's1:2', 's1:3', 's2:1', 's2:2'], \`every turn once, numbered within its session: \${JSON.stringify(turns)}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"assistant/chunk"
+	"assistant/config"
+	"assistant/db"
+	"assistant/embed"
+	"assistant/kb"
+	"assistant/model"
+	"assistant/prompt"
+	pb "assistant/gen/support"
+
+	"leetbuild/harness"
+)
+
+const (
+	apiLoginQ    = "I forgot my password and cannot sign in"
+	apiRedCardQ  = "My red card was declined at checkout"
+	apiReferralQ = "Can I get a referral bonus for a friend"
+)
+
+// apiLLM is the stand-in model at both addresses: faithful unless the check flips mode; every reply it gave.
+type apiLLM struct {
+	pb.UnimplementedLlmServer
+	mu      sync.Mutex
+	mode    string
+	replies []string
+}
+
+func (p *apiLLM) Generate(_ context.Context, req *pb.GenerateRequest) (*pb.GenerateReply, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	text := model.Complete(req.GetPrompt(), int(req.GetMaxTokens()), p.mode)
+	p.replies = append(p.replies, text)
+	return &pb.GenerateReply{Text: text, Tokens: int32(len(strings.Fields(text))), Model: req.GetModel()}, nil
+}
+
+func (p *apiLLM) setMode(mode string) {
+	p.mu.Lock()
+	p.mode = mode
+	p.mu.Unlock()
+}
+
+func (p *apiLLM) lastReply() (string, int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.replies) == 0 {
+		return "", 0
+	}
+	n := len(p.replies)
+	return p.replies[n-1], n
+}
+
+type apiJudge struct {
+	pb.UnimplementedJudgeServer
+}
+
+func (apiJudge) Evaluate(_ context.Context, req *pb.EvaluateRequest) (*pb.Scores, error) {
+	s := model.Evaluate(req.GetQuestion(), req.GetAnswer(), req.GetContextIds())
+	return &pb.Scores{Groundedness: float32(s.Groundedness), Coherence: float32(s.Coherence), Compliance: float32(s.Compliance), Pass: s.Pass}, nil
+}
+
+func apiSentences(text string) []string {
+	var out []string
+	for _, s := range strings.FieldsFunc(text, func(r rune) bool { return r == '.' || r == '!' || r == '?' }) {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// apiPasses is step 4's check: every citation retrieved, every sentence like some chunk, then the judge's pass.
+func apiPasses(ctx context.Context, judge pb.JudgeClient, question, answer string, chunks []prompt.Chunk) bool {
+	ids := map[string]bool{}
+	var vectors [][]float64
+	var idList []string
+	for _, c := range chunks {
+		ids[c.ID] = true
+		idList = append(idList, c.ID)
+		vectors = append(vectors, embed.Embed(c.Text))
+	}
+	for _, id := range prompt.CitedIds(answer) {
+		if !ids[id] {
+			return false
+		}
+	}
+	for _, s := range apiSentences(answer) {
+		v := embed.Embed(s)
+		best := 0.0
+		for _, w := range vectors {
+			if c := embed.Cosine(v, w); c > best {
+				best = c
+			}
+		}
+		if best < config.MinSimilarity {
+			return false
+		}
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	scores, err := judge.Evaluate(callCtx, &pb.EvaluateRequest{Question: question, Answer: answer, ContextIds: idList})
+	return err == nil && scores.GetPass()
+}
+
+// apiNeighbours stands in for the later steps as the course builds them: kb_search (step 2: pgvector
+// over kb_chunks, the answer cache in Redis) and the guardrail (step 4) over the model call (step 3).
+func apiNeighbours(ctx *harness.Ctx) {
+	key := func(question string) string {
+		sum := sha256.Sum256([]byte(strings.Join(strings.Fields(strings.ToLower(question)), " ")))
+		return "answer:" + hex.EncodeToString(sum[:])
+	}
+	cachedAnswer = func(_ context.Context, question string) (*CachedAnswer, error) {
+		raw, ok := ctx.Redis.Get(key(question))
+		if !ok {
+			return nil, nil
+		}
+		var out CachedAnswer
+		if err := json.Unmarshal([]byte(raw), &out); err != nil {
+			return nil, err
+		}
+		return &out, nil
+	}
+	rememberAnswer = func(_ context.Context, question, answer string, sources []string) error {
+		value, _ := json.Marshal(CachedAnswer{Answer: answer, Sources: sources})
+		ctx.Redis.Set(key(question), string(value), "EX", config.CacheTTL)
+		return nil
+	}
+	search = func(c context.Context, question string, k int) ([]prompt.Chunk, error) {
+		rows, err := db.Pool.QueryContext(c,
+			"SELECT id, text, embedding <=> $1::vector AS distance FROM kb_chunks ORDER BY embedding <=> $1::vector LIMIT $2",
+			embed.ToPgvector(embed.Embed(question)), k)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []prompt.Chunk
+		for rows.Next() {
+			var ch prompt.Chunk
+			var distance float64
+			if err := rows.Scan(&ch.ID, &ch.Text, &distance); err != nil {
+				return nil, err
+			}
+			ch.Score = 1 - distance
+			out = append(out, ch)
+		}
+		return out, rows.Err()
+	}
+	llmConn, _ := grpc.NewClient(config.LLMLarge, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	llm := pb.NewLlmClient(llmConn)
+	judgeConn, _ := grpc.NewClient(config.Judge, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	judge := pb.NewJudgeClient(judgeConn)
+	answerOrEscalate = func(c context.Context, question string, chunks []prompt.Chunk, history []prompt.Turn) (Outcome, error) {
+		modelName := ""
+		for range 2 {
+			callCtx, cancel := context.WithTimeout(c, 2*time.Second)
+			reply, err := llm.Generate(callCtx, &pb.GenerateRequest{Model: "large", Prompt: prompt.Build(question, chunks, history), MaxTokens: config.MaxTokens})
+			cancel()
+			if err != nil {
+				return Outcome{}, err
+			}
+			modelName = reply.GetModel()
+			if apiPasses(c, judge, question, reply.GetText(), chunks) {
+				return Outcome{Answer: reply.GetText(), Sources: prompt.CitedIds(reply.GetText()), Model: modelName, Tokens: reply.GetTokens()}, nil
+			}
+		}
+		return Outcome{Answer: config.HandoffText, Sources: []string{}, Escalated: true, Model: modelName}, nil
+	}
+}
+
+// apiWorld is the learner's app over an indexed knowledge base, with the model and the judge served.
+type apiWorld struct {
+	llm  *apiLLM
+	http *harness.HTTP
+}
+
+func apiServe(ctx *harness.Ctx) *apiWorld {
+	ctx.DB.Reset(db.Schema)
+	for _, a := range kb.Articles {
+		for position, text := range chunk.Chunk(a.Body) {
+			ctx.DB.Exec("INSERT INTO kb_chunks (id, article, position, text, embedding) VALUES ($1, $2, $3, $4, $5::vector)",
+				fmt.Sprintf("%s-%d", a.ID, position), a.ID, position, text, embed.ToPgvector(embed.Embed(text)))
+		}
+	}
+	w := &apiWorld{llm: &apiLLM{mode: "faithful"}}
+	pb.RegisterLlmServer(ctx.GRPC.Server(config.LLMLarge), w.llm)
+	pb.RegisterLlmServer(ctx.GRPC.Server(config.LLMSmall), w.llm)
+	pb.RegisterJudgeServer(ctx.GRPC.Server(config.Judge), apiJudge{})
+	apiNeighbours(ctx)
+	w.http = ctx.Main(main).HTTP()
+	return w
+}
+
+func apiGenerates(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Generate", "") }
+
+func apiHistory(ctx *harness.Ctx, sessionID string) []prompt.Turn {
+	var turns []prompt.Turn
+	for _, raw := range ctx.Redis.LRange("conv:"+sessionID, 0, -1) {
+		var t prompt.Turn
+		_ = json.Unmarshal([]byte(raw), &t)
+		turns = append(turns, t)
+	}
+	return turns
+}
+
+// apiRecord is one record of the topic: its key and its JSON value.
+type apiRecord struct {
+	key   string
+	value map[string]any
+}
+
+func apiRecords(ctx *harness.Ctx) []apiRecord {
+	var out []apiRecord
+	for _, r := range ctx.Kafka.Records(config.Topic) {
+		var v map[string]any
+		_ = json.Unmarshal(r.Value, &v)
+		out = append(out, apiRecord{string(r.Key), v})
+	}
+	return out
+}
+
+func apiStrings(v any) []string {
+	list, _ := v.([]any)
+	out := []string{}
+	for _, x := range list {
+		out = append(out, fmt.Sprint(x))
+	}
+	return out
+}
+
+func apiShow(v any) string {
+	raw, _ := json.Marshal(v)
+	return string(raw)
+}
+
+func (w *apiWorld) chat(ctx *harness.Ctx, sessionID, dasherID, message string, expect int) map[string]any {
+	r := w.http.Post("/chat", map[string]any{"session_id": sessionID, "dasher_id": dasherID, "message": message})
+	ctx.Assert(r.Status == expect, "POST /chat (%q from %s in %s) answered %d %s, expected %d", message, dasherID, sessionID, r.Status, r.Text(), expect)
+	data, ok := r.JSON().(map[string]any)
+	ctx.Assert(ok, "POST /chat must answer a JSON object, got %s", r.Text())
+	return data
+}
+
+func CheckValidate(ctx *harness.Ctx) {
+	w := apiServe(ctx)
+	bad := []struct {
+		what string
+		body any
+	}{
+		{"no session_id", map[string]any{"dasher_id": "d1", "message": "hi"}},
+		{"an empty session_id", map[string]any{"session_id": "", "dasher_id": "d1", "message": "hi"}},
+		{"no dasher_id", map[string]any{"session_id": "s1", "message": "hi"}},
+		{"an empty dasher_id", map[string]any{"session_id": "s1", "dasher_id": "   ", "message": "hi"}},
+		{"no message", map[string]any{"session_id": "s1", "dasher_id": "d1"}},
+		{"an empty message", map[string]any{"session_id": "s1", "dasher_id": "d1", "message": ""}},
+		{"a message that is not a string", map[string]any{"session_id": "s1", "dasher_id": "d1", "message": 7}},
+		{"a body that is not an object", []any{"s1", "d1", "hi"}},
+	}
+	for _, b := range bad {
+		r := w.http.Post("/chat", b.body)
+		ctx.Assert(r.Status == 400, "POST /chat with %s answered %d %s, expected 400", b.what, r.Status, r.Text())
+		ctx.Equal(r.JSON(), map[string]any{"error": "invalid_request"}, "the 400 for %s must be {\\"error\\": \\"invalid_request\\"}", b.what)
+	}
+	ctx.Assert(len(ctx.Redis.Keys("*")) == 0, "a rejected request must touch nothing, Redis holds %q", ctx.Redis.Keys("*"))
+	ctx.Equal(len(apiGenerates(ctx)), 0, "a rejected request must not reach the model")
+	ctx.Equal(len(ctx.Kafka.Records(config.Topic)), 0, "a rejected request must not be recorded")
+	data := w.chat(ctx, "s1", "d1", apiLoginQ, 200)
+	ctx.Assert(data["answer"] != nil && data["answer"] != "", "a valid request must be answered, got %s", apiShow(data))
+}
+
+func CheckAnswerAndHistory(ctx *harness.Ctx) {
+	w := apiServe(ctx)
+	data := w.chat(ctx, "s1", "d1", apiLoginQ, 200)
+	answer, replies := w.llm.lastReply()
+	ctx.Assert(replies >= 1, "the first question of a session must reach the model (no cache, no history)")
+	ctx.Equal(data["answer"], answer, "answer must be what the guardrail passed on — the model's reply")
+	ctx.Assert(strings.HasPrefix(answer, "Based on [kb:login-"), "the question about signing in must be answered from the login article's chunks (search → the prompt), the model answered %q", answer)
+	ctx.Equal(apiStrings(data["sources"]), prompt.CitedIds(answer), "sources must be the chunk ids the answer cites, in order")
+	ctx.Assert(data["escalated"] == false && data["model"] == "large" && data["cached"] == false, "a grounded first answer is escalated: false, model: \\"large\\", cached: false; got %s", apiShow(data))
+	ctx.Equal(data["turn"], 1, "the first Dasher turn of a session is turn 1")
+	turns := apiHistory(ctx, "s1")
+	ctx.Equal(turns, []prompt.Turn{{Role: "dasher", Text: apiLoginQ}, {Role: "assistant", Text: answer}}, "conv:s1 must hold the Dasher's turn then the assistant's as JSON {role, text}")
+	ttl := ctx.Redis.TTL("conv:s1")
+	ctx.Assert(config.HistoryTTL-5 <= ttl && ttl <= config.HistoryTTL, "conv:s1 must expire after config.HistoryTTL = %d s, its TTL is %d", config.HistoryTTL, ttl)
+	callsBefore := len(apiGenerates(ctx))
+	data = w.chat(ctx, "s1", "d1", apiRedCardQ, 200)
+	ctx.Assert(len(apiGenerates(ctx)) > callsBefore, "a new question in the session must reach the model")
+	request, _ := apiGenerates(ctx)[callsBefore].Request.(*pb.GenerateRequest)
+	text := request.GetPrompt()
+	ctx.Assert(strings.Contains(text, "dasher: "+apiLoginQ) && strings.Contains(text, "assistant: "+answer), "the second question's prompt must carry the first exchange as history (load conv:<session_id> and pass it to answerOrEscalate); the prompt has no such lines")
+	ctx.Equal(data["turn"], 2, "the second Dasher turn of the session is turn 2")
+	turns = apiHistory(ctx, "s1")
+	var roles []string
+	for _, t := range turns {
+		roles = append(roles, t.Role)
+	}
+	ctx.Assert(len(turns) == 4 && strings.Join(roles, ",") == "dasher,assistant,dasher,assistant", "after two exchanges conv:s1 holds four turns, dasher and assistant alternating; it holds %+v", turns)
+	ctx.Assert(turns[2].Text == apiRedCardQ && turns[3].Text == data["answer"], "the second exchange must be appended after the first (RPUSH)")
+	other := w.chat(ctx, "s2", "d1", apiReferralQ, 200)
+	ctx.Assert(fmt.Sprint(other["turn"]) == "1" && len(apiHistory(ctx, "s2")) == 2, "another session starts at turn 1 with its own conv:<session_id>")
+}
+
+func CheckAnswerCache(ctx *harness.Ctx) {
+	w := apiServe(ctx)
+	first := w.chat(ctx, "s1", "d1", apiLoginQ, 200)
+	calls := len(apiGenerates(ctx))
+	queries := len(ctx.DB.Queries())
+	again := w.chat(ctx, "s2", "d2", "  i FORGOT my   password and cannot SIGN in ", 200)
+	ctx.Assert(again["cached"] == true, "the same question in different casing and spacing must be answered from the cache (cached: true), got %s", apiShow(again))
+	ctx.Equal(again["model"], "cache", "a cached answer reports model \\"cache\\"")
+	ctx.Assert(again["answer"] == first["answer"] && apiShow(again["sources"]) == apiShow(first["sources"]), "the cached answer must be the remembered answer and sources, got %s", apiShow(again))
+	ctx.Assert(again["escalated"] == false && fmt.Sprint(again["turn"]) == "1", "a cached answer is escalated: false and still counts as a turn (turn 1 of s2), got %s", apiShow(again))
+	ctx.Assert(len(apiGenerates(ctx)) == calls, "a cache hit must not call the model, yet %d Generate call(s) were made", len(apiGenerates(ctx))-calls)
+	var searched []string
+	for _, q := range ctx.DB.Queries()[queries:] {
+		if strings.Contains(strings.ToLower(q.SQL), "kb_chunks") {
+			searched = append(searched, q.SQL)
+		}
+	}
+	ctx.Assert(len(searched) == 0, "a cache hit must not search kb_chunks, yet the request ran %q", searched)
+	ctx.Equal(len(apiHistory(ctx, "s2")), 2, "a cached exchange is still appended to the session's history")
+	w.llm.setMode("hallucinate")
+	calls = len(apiGenerates(ctx))
+	bad := w.chat(ctx, "s3", "d3", apiRedCardQ, 200)
+	ctx.Assert(len(apiGenerates(ctx)) > calls, "a new question must reach the model")
+	ctx.Assert(bad["escalated"] == true, "a hallucinated answer ([kb:policy-404] was never retrieved) must be escalated by the guardrail: escalated true, got %s", apiShow(bad))
+	sources, isList := bad["sources"].([]any)
+	ctx.Assert(bad["answer"] == config.HandoffText && isList && len(sources) == 0, "an escalated turn answers config.HandoffText with no sources, got %s", apiShow(bad))
+	ctx.Assert(bad["cached"] == false && (bad["model"] == "large" || bad["model"] == "small"), "an escalated turn is not cached and reports the model that answered, got %s", apiShow(bad))
+	for _, k := range ctx.Redis.Keys("answer:*") {
+		v, _ := ctx.Redis.Get(k)
+		ctx.Assert(!strings.Contains(v, "policy-404"), "the hallucinated answer must never be remembered")
+	}
+	turns := apiHistory(ctx, "s3")
+	ctx.Assert(len(turns) > 0 && turns[len(turns)-1] == prompt.Turn{Role: "assistant", Text: config.HandoffText}, "the hand-off is what the Dasher saw, so it is the assistant turn in conv:s3; the history holds %+v", turns)
+	calls = len(apiGenerates(ctx))
+	twice := w.chat(ctx, "s4", "d4", apiRedCardQ, 200)
+	ctx.Assert(len(apiGenerates(ctx)) > calls, "an escalation is never cached: the same question from another session must call the model again, it was answered without a call")
+	ctx.Assert(twice["escalated"] == true && twice["cached"] == false, "still hallucinating, still escalated and uncached; got %s", apiShow(twice))
+	ctx.Settle()
+	var recorded []map[string]any
+	for _, r := range apiRecords(ctx) {
+		if r.value["session_id"] == "s3" {
+			recorded = append(recorded, r.value)
+		}
+	}
+	ctx.Assert(len(recorded) == 1 && recorded[0]["escalated"] == true && recorded[0]["answer"] == config.HandoffText, "an escalated turn is still recorded on %s with escalated true; found %s", config.Topic, apiShow(recorded))
+}
+
+func CheckRateLimit(ctx *harness.Ctx) {
+	w := apiServe(ctx)
+	limit := config.RateLimitPerMinute
+	for i := range limit {
+		data := w.chat(ctx, "s1", "d1", apiLoginQ, 200)
+		ctx.Equal(data["turn"], i+1, "turn")
+	}
+	minute := ctx.Clock.Now() / 60000
+	key := fmt.Sprintf("rl:d1:%d", minute)
+	count, _ := ctx.Redis.Get(key)
+	ctx.Assert(count == fmt.Sprint(limit), "the counter %s must be INCRed once per request (%d), Redis holds %q under %q", key, limit, count, ctx.Redis.Keys("rl:*"))
+	ttl := ctx.Redis.TTL(key)
+	ctx.Assert(0 < ttl && ttl <= 60, "%s must EXPIRE within 60 s, its TTL is %d", key, ttl)
+	r := w.http.Post("/chat", map[string]any{"session_id": "s1", "dasher_id": "d1", "message": apiLoginQ})
+	ctx.Assert(r.Status == 429, "request %d of d1 within the minute answered %d %s, expected 429", limit+1, r.Status, r.Text())
+	ctx.Equal(r.JSON(), map[string]any{"error": "rate_limited"}, "the 429 body must be {\\"error\\": \\"rate_limited\\"}")
+	ctx.Equal(len(apiHistory(ctx, "s1")), 2*limit, "a limited request must not be appended to the history")
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records(config.Topic)), limit, "a limited request must not be recorded")
+	other := w.chat(ctx, "s2", "d2", apiLoginQ, 200)
+	ctx.Assert(other["answer"] != nil && other["answer"] != "", "the limit is per Dasher: d2 must still be answered")
+	ctx.Clock.Advance(60)
+	data := w.chat(ctx, "s1", "d1", apiLoginQ, 200)
+	ctx.Assert(fmt.Sprint(data["turn"]) == fmt.Sprint(limit+1), "the first request of the next minute must be answered (turn %d), got %s", limit+1, apiShow(data))
+	_, exists := ctx.Redis.Get(key)
+	ctx.Assert(!exists, "the previous minute's counter %s must have expired", key)
+}
+
+func CheckRecorded(ctx *harness.Ctx) {
+	w := apiServe(ctx)
+	a := w.chat(ctx, "s1", "d1", apiLoginQ, 200)
+	b := w.chat(ctx, "s1", "d1", apiRedCardQ, 200)
+	c2 := w.chat(ctx, "s2", "d2", apiLoginQ, 200)
+	ctx.Settle()
+	recs := apiRecords(ctx)
+	ctx.Assert(len(recs) == 3, "three answered turns must leave three records on %s, found %d", config.Topic, len(recs))
+	var keys []string
+	for _, r := range recs {
+		keys = append(keys, r.key)
+	}
+	ctx.Equal(keys, []string{"s1", "s1", "s2"}, "records must be keyed by the session id")
+	fields := []string{"session_id", "turn", "dasher_id", "question", "answer", "sources", "escalated", "model", "tokens"}
+	for _, r := range recs {
+		var missing []string
+		for _, f := range fields {
+			if _, ok := r.value[f]; !ok {
+				missing = append(missing, f)
+			}
+		}
+		ctx.Assert(len(missing) == 0, "a record must carry %q, this one lacks %q", fields, missing)
+	}
+	first, second, third := recs[0].value, recs[1].value, recs[2].value
+	ctx.Assert(first["session_id"] == "s1" && fmt.Sprint(first["turn"]) == "1" && first["dasher_id"] == "d1" && first["question"] == apiLoginQ, "the first record is s1 turn 1 by d1 asking %q, got %s", apiLoginQ, apiShow(first))
+	ctx.Assert(first["answer"] == a["answer"] && apiShow(first["sources"]) == apiShow(a["sources"]) && first["escalated"] == false && first["model"] == "large", "the record carries what the Dasher was answered: %s; got %s", apiShow(a), apiShow(first))
+	answerText, _ := a["answer"].(string)
+	ctx.Equal(first["tokens"], len(strings.Fields(answerText)), "tokens is the generate result's token count")
+	ctx.Assert(fmt.Sprint(second["turn"]) == "2" && second["question"] == apiRedCardQ && second["answer"] == b["answer"], "the second record of s1 is turn 2, got %s", apiShow(second))
+	ctx.Assert(third["session_id"] == "s2" && fmt.Sprint(third["turn"]) == "1" && third["model"] == "cache" && fmt.Sprint(third["tokens"]) == "0", "s2's first turn was a cache hit: turn 1, model \\"cache\\", tokens 0; got %s", apiShow(third))
+	ctx.Assert(third["answer"] == c2["answer"] && third["escalated"] == false, "s2's cached turn carries the cached answer, escalated false; got %s", apiShow(third))
+	ctx.Kafka.Stall(config.Topic) // the broker stops acknowledging
+	before := ctx.Clock.Now()
+	d := w.chat(ctx, "s2", "d2", apiReferralQ, 200)
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited < 0.5, "with the broker stalled the reply took %.1f s of virtual time: hand the record to the writer in a goroutine and answer, never wait for the write on the request path", waited)
+	ctx.Assert(fmt.Sprint(d["turn"]) == "2" && d["answer"] != nil && d["answer"] != "", "the reply must not depend on the broker, got %s", apiShow(d))
+	ctx.Equal(len(apiRecords(ctx)), 3, "nothing can reach the topic while the broker is stalled: records")
+	ctx.Kafka.Resume(config.Topic)
+	ctx.Clock.Advance(30) // the producer's next attempt finds the broker back
+	ctx.Settle()
+	e := w.chat(ctx, "s1", "d1", apiReferralQ, 200)
+	ctx.Equal(e["turn"], 3, "turn")
+	ctx.Settle()
+	recs = apiRecords(ctx)
+	ctx.Assert(len(recs) == 5, "once the broker answers, the record handed to the writer during the stall must arrive: %s holds %d records, expected 5", config.Topic, len(recs))
+	var turns []string
+	for _, r := range recs {
+		turns = append(turns, fmt.Sprintf("%v:%v", r.value["session_id"], r.value["turn"]))
+	}
+	sort.Strings(turns)
+	ctx.Equal(turns, []string{"s1:1", "s1:2", "s1:3", "s2:1", "s2:2"}, "every turn once, numbered within its session")
 }
 `,
   },

@@ -58,6 +58,6 @@ the token, token expiry, a database index behind the store, and going backwards.
     ],
   },
   steps: [pageTokensStep],
-  support: {python: protoModules, typescript: protoFiles},
+  support: {python: protoModules, typescript: protoFiles, go: protoFiles},
   learn,
 };

@@ -908,6 +908,145 @@ export async function check_count_read(ctx) {
   assert(r.status === 200 && JSON.stringify(r.json()) === JSON.stringify({likes: 2}), \`after two likes GET must answer likes 2, got \${r.status} \${r.text}\`);
 }
 `,
+    go: `package main
+
+import (
+	"encoding/json"
+	"reflect"
+	"sort"
+
+	"leetbuild/harness"
+)
+
+// answeredLikes reports whether the body is exactly {"likes": n}.
+func answeredLikes(r *harness.Response, n int) bool {
+	var body any
+	return json.Unmarshal(r.Body, &body) == nil && reflect.DeepEqual(body, map[string]any{"likes": float64(n)})
+}
+
+// redisString is the string at key, nil when the key does not exist.
+func redisString(ctx *harness.Ctx, key string) any {
+	if v, ok := ctx.Redis.Get(key); ok {
+		return v
+	}
+	return nil
+}
+
+func engagementEvents(ctx *harness.Ctx) []map[string]any {
+	var out []map[string]any
+	for _, value := range ctx.Kafka.Values("engagement") {
+		var event map[string]any
+		ctx.NoError(json.Unmarshal([]byte(value), &event), "an engagement event must be JSON, got %q", value)
+		out = append(out, event)
+	}
+	return out
+}
+
+func CheckIdempotentLike(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	r := c.Post("/posts/p1/like", nil, "X-User-Id", "alice")
+	ctx.Equal(r.Status, 200, "the first like must answer 200")
+	ctx.Equal(r.JSON(), map[string]any{"likes": float64(1)}, "the first like must answer likes 1")
+	r = c.Post("/posts/p1/like", nil, "X-User-Id", "alice")
+	ctx.Equal(r.Status, 409, "a second like by the same user must answer 409")
+	ctx.Equal(redisString(ctx, "likes:p1"), "1", "a duplicate like must not move the counter: likes:p1")
+	r = c.Post("/posts/p1/like", nil, "X-User-Id", "bob")
+	ctx.Assert(r.Status == 200 && answeredLikes(r, 2), "a like by another user counts: expected 200 likes 2, got %d %s", r.Status, r.Text())
+	ctx.Equal(ctx.Redis.SMembers("liked:p1"), []string{"alice", "bob"}, "liked:p1 must hold the users who liked")
+}
+
+func CheckCountAfterMembership(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	ctx.Redis.Do("SADD", "liked:p1", "alice") // the fact exists; the counter does not yet
+	r := c.Post("/posts/p1/like", nil, "X-User-Id", "alice")
+	ctx.Equal(r.Status, 409, "SADD returned 0 for alice: expected 409")
+	ctx.Equal(redisString(ctx, "likes:p1"), nil, "the counter must not move when SADD added nothing: likes:p1")
+	ctx.Settle()
+	ctx.Equal(len(ctx.Kafka.Records("engagement")), 0, "a rejected like must not produce an event")
+	r = c.Post("/posts/p1/like", nil, "X-User-Id", "bob")
+	ctx.Assert(r.Status == 200 && answeredLikes(r, 1), "bob is a new member: expected 200 likes 1, got %d %s", r.Status, r.Text())
+	ctx.Equal(redisString(ctx, "likes:p1"), "1", "likes:p1 must be 1 after one successful INCR")
+	ctx.Equal(ctx.Redis.SCard("liked:p1"), 2, "liked:p1 must hold alice and bob: %q", ctx.Redis.SMembers("liked:p1"))
+}
+
+func CheckUnlike(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	r := c.Delete("/posts/p1/like", "X-User-Id", "alice")
+	ctx.Equal(r.Status, 409, "unliking a post alice never liked must answer 409")
+	ctx.Equal(redisString(ctx, "likes:p1"), nil, "a rejected unlike must not touch the counter: likes:p1")
+	c.Post("/posts/p1/like", nil, "X-User-Id", "alice")
+	c.Post("/posts/p1/like", nil, "X-User-Id", "bob")
+	r = c.Delete("/posts/p1/like", "X-User-Id", "alice")
+	ctx.Assert(r.Status == 200 && answeredLikes(r, 1), "unlike after a like must answer 200 with the decremented count, got %d %s", r.Status, r.Text())
+	ctx.Equal(ctx.Redis.SMembers("liked:p1"), []string{"bob"}, "SREM must remove alice from liked:p1")
+	r = c.Delete("/posts/p1/like", "X-User-Id", "alice")
+	ctx.Equal(r.Status, 409, "a repeated unlike must answer 409")
+	ctx.Equal(redisString(ctx, "likes:p1"), "1", "the counter must equal the set size (1): likes:p1")
+	ctx.Settle()
+	var kinds []any
+	for _, event := range engagementEvents(ctx) {
+		kinds = append(kinds, event["type"])
+	}
+	ctx.Equal(kinds, []any{"like", "like", "unlike"}, "expected like, like, unlike events")
+}
+
+func CheckEvent(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	c.Post("/posts/p1/like", nil, "X-User-Id", "alice")
+	c.Post("/posts/p1/like", nil, "X-User-Id", "alice") // 409: no event
+	c.Post("/posts/p2/like", nil, "X-User-Id", "alice")
+	c.Delete("/posts/p1/like", "X-User-Id", "alice")
+	ctx.Settle()
+	records := ctx.Kafka.Records("engagement")
+	ctx.Equal(len(records), 3, "expected 3 engagement events (like, like, unlike)")
+	// kafka-go's async Writer batches per partition: the records of two posts may land out of request
+	// order, while each post's own records keep theirs.
+	events := engagementEvents(ctx)
+	var keys []string
+	var p1Events []map[string]any
+	var p1Partitions []int
+	for i, record := range records {
+		keys = append(keys, string(record.Key))
+		if string(record.Key) == "p1" {
+			p1Events = append(p1Events, events[i])
+			p1Partitions = append(p1Partitions, record.Partition)
+		}
+	}
+	sort.Strings(keys)
+	ctx.Equal(keys, []string{"p1", "p1", "p2"}, "events must be keyed by the post id: keys")
+	ctx.Equal(p1Partitions[0], p1Partitions[1], "one post's events must land on one partition")
+	like, unlike := p1Events[0], p1Events[1]
+	ctx.Assert(like["type"] == "like" && like["post_id"] == "p1" && like["user_id"] == "alice", "the like event must carry type, post_id and user_id: %v", like)
+	ctx.Assert(unlike["type"] == "unlike" && unlike["post_id"] == "p1", "the unlike event must carry type unlike: %v", unlike)
+	ids := map[any]bool{}
+	allSet := true
+	for _, event := range events {
+		id, _ := event["event_id"].(string)
+		allSet = allSet && id != ""
+		ids[event["event_id"]] = true
+	}
+	ctx.Assert(allSet && len(ids) == 3, "every event needs its own event_id, got %v", events)
+	// The broker stops acknowledging: a request that waits for the produce hangs (and then fails) with it.
+	ctx.Kafka.Stall("engagement")
+	before := ctx.Clock.Now()
+	r := c.Post("/posts/p3/like", nil, "X-User-Id", "alice")
+	ctx.Equal(r.Status, 200, "while the broker does not acknowledge, the like must still answer 200 — the request must not wait for the broker")
+	waited := ctx.Clock.Now() - before
+	ctx.Assert(waited < 1000, "the request waited %d ms for the broker: produce fire-and-forget (Async), never wait for the acknowledgement", waited)
+	ctx.Kafka.Resume("")
+}
+
+func CheckCountRead(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	r := c.Get("/posts/fresh/likes")
+	ctx.Equal(r.Status, 200, "a post nobody liked must answer 200")
+	ctx.Equal(r.JSON(), map[string]any{"likes": float64(0)}, "a post nobody liked has 0 likes")
+	c.Post("/posts/p1/like", nil, "X-User-Id", "alice")
+	c.Post("/posts/p1/like", nil, "X-User-Id", "bob")
+	r = c.Get("/posts/p1/likes")
+	ctx.Assert(r.Status == 200 && answeredLikes(r, 2), "after two likes GET must answer likes 2, got %d %s", r.Status, r.Text())
+}
+`,
   },
   debrief: `The set is the fact ("alice likes p1") and the counter is a derived number; letting \`SADD\`'s return value gate the \`INCR\` is what makes a retried request harmless. Keying the engagement event by post id keeps a post's likes and unlikes in order on one partition, and the fire-and-forget produce keeps the broker off the request path. Real systems make the two Redis commands atomic (a Lua script or \`MULTI\`), keep the sets in a sharded cluster because \`liked:{post}\` of a viral post has millions of members, and eventually move the counter to the rollup stream of step 6 so the request path only writes the fact.`,
 };

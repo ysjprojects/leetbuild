@@ -1,7 +1,7 @@
 /**
  * Checks every /leetbuild problem: the shape of the problem (steps, diagram, sequences, hints,
  * widgets), for every step in every language that the starter fails at least one static check
- * while the reference solution passes them all, and for every step with a Python or TypeScript
+ * while the reference solution passes them all, and for every step with a Python, TypeScript or Go
  * harness that the solution passes every runtime check while the starter does not (the harnesses
  * run in the browser runtimes, here in Node). Run after editing problems:
  *
@@ -10,15 +10,21 @@
  *   yarn verify --file src/data/problems/00-image-cache/index.ts   # one problem file, not via the index
  *   yarn verify --verbose                     # list every check result
  *   yarn verify --no-runtime                  # static checks only (no Pyodide boot)
- *   yarn verify --runtime typescript          # execute only the TypeScript harnesses (no Pyodide boot)
+ *   yarn verify --runtime go                  # execute only the Go harnesses (no Pyodide boot)
  */
+import {existsSync, readFileSync} from 'node:fs';
 import {resolve} from 'node:path';
 
 import {architectureProblems} from '../src/lib/architecture';
 import {gpuProblems} from '../src/lib/gpuFigure';
 import {describePattern, judge, matches, stripComments} from '../src/lib/judge';
 import {malformedBlocksOf, widgetsOf} from '../src/lib/markdown';
-import {type NodeRuntime, createNodePythonRuntime, createNodeTypeScriptRuntime} from '../src/lib/runtime/node';
+import {
+  type NodeRuntime,
+  createNodeGoRuntime,
+  createNodePythonRuntime,
+  createNodeTypeScriptRuntime,
+} from '../src/lib/runtime/node';
 import {type RunJob, type RunResult} from '../src/lib/runtime/types';
 import {STEP_POINTS} from '../src/lib/scoring';
 import {
@@ -33,6 +39,7 @@ import {
   SYSTEMS_CONCEPTS,
 } from '../src/lib/types';
 import {WIDGETS} from '../src/lib/widgets';
+import {GO_RUNTIME_MANIFEST, goRuntimeHash} from './go-runtime';
 
 const args = process.argv.slice(2);
 const flag = (name: string): string | null => {
@@ -342,6 +349,7 @@ function runJob(problem: Problem, step: Step, language: Language, code: string):
     support: problem.support?.[language] ?? {},
     harness: step.harness?.[language] ?? '',
     checks: step.checks.map(c => c.id),
+    entry: fileName(step.file, language),
   };
 }
 
@@ -353,29 +361,59 @@ const describeRun = (run: RunResult): string =>
         .map(c => `${c.id}${c.message ? ` (${c.message})` : ''}`)
         .join(', ');
 
-/** Languages graded by execution, each with how a harness declares `check_<id>` and how its Node runtime boots. */
+/** `check_<id>`, the Python and TypeScript harness function for a check. */
+const snakeCheckName = (id: string): string => `check_${id.replace(/-/g, '_')}`;
+
+/** `Check<Id>`, the Go harness function for a check: `release-atomic` → `CheckReleaseAtomic` (goruntime/host). */
+const goCheckName = (id: string): string =>
+  `Check${id
+    .split(/[-_ ]/)
+    .filter(part => part !== '')
+    .map(part => part[0].toUpperCase() + part.slice(1))
+    .join('')}`;
+
+/** Languages graded by execution, each with its harness's check names, how a harness declares one, and how its Node runtime boots. */
 const EXECUTING: {
   language: Language;
+  checkName: (id: string) => string;
   declares: (harness: string, name: string) => boolean;
   boot: () => Promise<NodeRuntime>;
 }[] = [
   {
     language: 'python',
+    checkName: snakeCheckName,
     declares: (harness, name) => new RegExp(`^(async )?def ${name}\\(`, 'm').test(harness),
     boot: createNodePythonRuntime,
   },
   {
     language: 'typescript',
+    checkName: snakeCheckName,
     declares: (harness, name) =>
       new RegExp(`^export (async function ${name}\\b|const ${name}\\s*=)`, 'm').test(harness),
     boot: async () => createNodeTypeScriptRuntime(),
   },
+  {
+    language: 'go',
+    checkName: goCheckName,
+    declares: (harness, name) => new RegExp(`^func ${name}\\(\\w+ \\*harness\\.Ctx\\)`, 'm').test(harness),
+    boot: createNodeGoRuntime,
+  },
 ];
+
+/** The Go runtime's WebAssembly must come from the committed goruntime/ sources (`yarn build:go` records their hash). */
+function goRuntimeFreshness(): string[] {
+  if (!existsSync(GO_RUNTIME_MANIFEST)) return [`${GO_RUNTIME_MANIFEST} is missing: run yarn build:go`];
+  const built = (JSON.parse(readFileSync(GO_RUNTIME_MANIFEST, 'utf8')) as {hash?: string}).hash;
+  return built === goRuntimeHash()
+    ? []
+    : ['public/go/runtime.wasm.gz was built from other goruntime/ sources than these: run yarn build:go'];
+}
 
 /** Runtime checks of one problem in one language: harness shape, solution passes, starter does not. */
 async function verifyRuntime(
   problem: Problem,
   language: Language,
+  checkName: (id: string) => string,
   declares: (harness: string, name: string) => boolean,
   runtime: NodeRuntime,
 ): Promise<string[]> {
@@ -385,7 +423,7 @@ async function verifyRuntime(
     if (harness === undefined) continue;
     const tag = `${problem.id}/${step.id} [${language} runtime]`;
     for (const check of step.checks) {
-      const name = `check_${check.id.replace(/-/g, '_')}`;
+      const name = checkName(check.id);
       if (!declares(harness, name)) errors.push(`${tag}: harness defines no ${name}`);
     }
     const solution = await runtime.run(runJob(problem, step, language, codeFor(step, language).solution));
@@ -407,8 +445,8 @@ async function verifyRuntime(
 }
 
 async function main(): Promise<void> {
-  const errors: string[] = judgeSelfTest();
-  console.log(`${errors.length === 0 ? '✓' : '✗'} judge self-tests`);
+  const errors: string[] = [...judgeSelfTest(), ...goRuntimeFreshness()];
+  console.log(`${errors.length === 0 ? '✓' : '✗'} judge self-tests, Go runtime built from these sources`);
   const problems = await loadProblems();
   const ids = new Set<string>();
   let steps = 0;
@@ -430,9 +468,9 @@ async function main(): Promise<void> {
     if (!selected.includes(problem)) continue;
     const started = Date.now();
     const e = verifyProblem(problem);
-    for (const {language, declares} of EXECUTING) {
+    for (const {language, checkName, declares} of EXECUTING) {
       const runtime = runtimes[language];
-      if (runtime !== undefined) e.push(...(await verifyRuntime(problem, language, declares, runtime)));
+      if (runtime !== undefined) e.push(...(await verifyRuntime(problem, language, checkName, declares, runtime)));
       harnesses[language] =
         (harnesses[language] ?? 0) + problem.steps.filter(s => s.harness?.[language] !== undefined).length;
     }

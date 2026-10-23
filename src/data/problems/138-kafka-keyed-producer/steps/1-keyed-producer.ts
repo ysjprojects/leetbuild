@@ -775,6 +775,116 @@ export async function check_non_blocking(ctx) {
   assert.deepEqual(m.stats(), {delivered: 1, failed: 0}, \`the delivery handlers must count it: \${JSON.stringify(m.stats())}\`);
 }
 `,
+    go: `package main
+
+import (
+	"encoding/json"
+	"fmt"
+
+	"leetbuild/harness"
+)
+
+const keyedTopic = "order-events"
+
+// keyedStats is stats() as the TypeScript harness compares it, once the delivery-report goroutine
+// has counted what was reported.
+func keyedStats(ctx *harness.Ctx) map[string]int64 {
+	ctx.Settle()
+	d, f := stats()
+	return map[string]int64{"delivered": d, "failed": f}
+}
+
+func CheckKeyed(ctx *harness.Ctx) {
+	for _, t := range []string{"placed", "paid", "shipped"} {
+		emit("o-1", t)
+	}
+	emit("o-2", "placed")
+	shutdown()
+	produced := ctx.Kafka.Records(keyedTopic)
+	ctx.Equal(ctx.Kafka.Keys(keyedTopic), []string{"o-1", "o-1", "o-1", "o-2"}, "records must be keyed by the order id")
+	expected := ctx.Kafka.PartitionFor(keyedTopic, []byte("o-1"))
+	var types []string
+	for _, r := range produced[:3] {
+		ctx.Assert(r.Partition == expected, "every event of order o-1 must land on the partition its key hashes to")
+		var event map[string]any
+		_ = json.Unmarshal(r.Value, &event)
+		t, _ := event["type"].(string)
+		types = append(types, t)
+	}
+	ctx.Equal(types, []string{"placed", "paid", "shipped"}, "events of one order must keep their order")
+}
+
+func CheckValue(ctx *harness.Ctx) {
+	ctx.Clock.Advance(1000)
+	before := float64(ctx.Clock.Now()) / 1000
+	emit("o-7", "paid")
+	shutdown()
+	produced := ctx.Kafka.Records(keyedTopic)
+	ctx.Equal(len(produced), 1, "expected one record on %s", keyedTopic)
+	var event map[string]any
+	if err := json.Unmarshal(produced[0].Value, &event); err != nil {
+		ctx.Fatalf("the value must be JSON: %s (%v)", produced[0].Value, err)
+	}
+	ctx.Assert(event["order_id"] == "o-7" && event["type"] == "paid", "the value must carry order_id and type: %s", produced[0].Value)
+	ts, ok := event["ts"].(float64)
+	ctx.Assert(ok && ts >= before-1 && ts <= float64(ctx.Clock.Now())/1000+1, "ts must be the current time in seconds (clock at %.0f), got %v", before, event["ts"])
+}
+
+func CheckDelivered(ctx *harness.Ctx) {
+	ctx.Kafka.StallFor(keyedTopic, 2) // the broker answers 2 s later
+	for i := range 4 {
+		emit(fmt.Sprintf("o-%d", i), "placed")
+	}
+	pending := shutdown()
+	ctx.Equal(pending, 0, "shutdown() must return 0 once everything is delivered")
+	n := len(ctx.Kafka.Records(keyedTopic))
+	ctx.Assert(n == 4, "shutdown() must flush: %d of 4 records reached the broker", n)
+	ctx.Equal(keyedStats(ctx), map[string]int64{"delivered": 4, "failed": 0}, "the delivery reports must count 4 delivered, 0 failed")
+}
+
+func CheckCallback(ctx *harness.Ctx) {
+	ctx.Kafka.FailNext(keyedTopic, 1)
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ctx.Fatalf("emit() must not panic on a failed delivery; the delivery report carries it: %v", r)
+			}
+		}()
+		emit("o-1", "placed")
+	}()
+	emit("o-1", "paid")
+	pending := shutdown()
+	ctx.Equal(pending, 0, "a failed record is not pending: shutdown()")
+	ctx.Equal(keyedStats(ctx), map[string]int64{"delivered": 1, "failed": 1}, "expected 1 delivered and 1 failed")
+	ctx.Equal(len(ctx.Kafka.Records(keyedTopic)), 1, "the second event must still be delivered after the first failed")
+}
+
+func CheckBounded(ctx *harness.Ctx) {
+	ctx.Kafka.Stall(keyedTopic) // dead until resumed
+	for i := range 3 {
+		emit("o-9", fmt.Sprintf("event-%d", i))
+	}
+	started := ctx.Clock.Now()
+	pending := shutdown()
+	waited := ctx.Clock.Now() - started
+	ctx.Assert(waited <= 5500, "shutdown() waited %.1f s on a dead broker: give up after 5 s", float64(waited)/1000)
+	ctx.Equal(pending, 3, "shutdown() must return the 3 records still undelivered")
+	d, f := stats()
+	ctx.Equal(map[string]int64{"delivered": d, "failed": f}, map[string]int64{"delivered": 0, "failed": 0}, "records still in flight are neither delivered nor failed")
+}
+
+func CheckNonBlocking(ctx *harness.Ctx) {
+	ctx.Kafka.StallFor(keyedTopic, 2) // the broker answers 2 s later
+	started := ctx.Clock.Now()
+	emit("o-3", "placed")
+	waited := ctx.Clock.Now() - started
+	ctx.Assert(waited < 1000, "emit() took %d ms with the broker stalled: hand the record to the producer and return", waited)
+	ctx.Equal(len(ctx.Kafka.Records(keyedTopic)), 0, "the record is in flight until the broker answers")
+	ctx.Equal(shutdown(), 0, "shutdown()")
+	ctx.Equal(len(ctx.Kafka.Records(keyedTopic)), 1, "the in-flight record must reach the broker once it answers")
+	ctx.Equal(keyedStats(ctx), map[string]int64{"delivered": 1, "failed": 0}, "the delivery reports must count it")
+}
+`,
   },
   debrief: `The producer is a queue with a background thread; \`produce\` costs microseconds and \`emit\` must stay that cheap, so the only honest place to learn what happened is the delivery callback — which librdkafka runs inside \`poll\`/\`flush\`, hence the \`poll(0)\` after every produce. The key is the ordering contract: same order id → same partition → same order, whatever the partition count. \`acks=all\` means an acknowledged record survives a leader failover. \`flush(5)\` is the one wait a clean stop is allowed: it drains the queue if the broker is alive and returns the count it could not deliver if not, so the process exits either way and the number is logged instead of lost. Real systems add \`enable.idempotence\` so retries after a lost ack do not duplicate, a bounded queue (\`queue.buffering.max.messages\`) with a policy for when it is full, and a \`message.timeout.ms\` short enough that a dead broker fails records through the callback instead of holding them for five minutes.`,
 };

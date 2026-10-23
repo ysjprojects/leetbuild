@@ -5,10 +5,15 @@ export interface RunJob {
   files: Record<string, string>;
   /** The course's support files by path (`payments/db.py`, `resizer_pb2.py`, `keys.proto`). */
   support: Record<string, string>;
-  /** The step's harness module (`check_<id>(ctx)` functions). */
+  /** The step's harness module (`check_<id>(ctx)` functions; Go: `Check<Id>(ctx)` in harness_test.go). */
   harness: string;
   /** Check ids to run, in verdict order. */
   checks: string[];
+  /**
+   * The step's own file among `files` (`lease_lock.go`). Go needs it: every Go step file is a whole
+   * program (`package main`), so the runtime compiles that one file with the harness.
+   */
+  entry?: string;
 }
 
 /**
@@ -54,8 +59,8 @@ export interface RunResult {
   ms: number;
 }
 
-/** Boot phases the runtimes report: Pyodide's, esbuild's, then the LeetBuild runtime itself. */
-export type Phase = 'pyodide' | 'packages' | 'esbuild' | 'runtime';
+/** Boot phases the runtimes report: Pyodide's, esbuild's, the Go interpreter's, then the LeetBuild runtime itself. */
+export type Phase = 'pyodide' | 'packages' | 'esbuild' | 'go' | 'runtime';
 
 export type WorkerIn = {type: 'boot'} | {type: 'run'; id: number; job: RunJob};
 export type WorkerOut =

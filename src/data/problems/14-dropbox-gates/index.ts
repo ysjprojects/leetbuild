@@ -109,6 +109,6 @@ dependency on the critical path of every request.`,
     ],
   },
   steps: [gateApiStep, gateSnapshotStep, gatesRpcStep, exposureLogStep],
-  support: {python: protoModules, typescript: protoFiles},
+  support: {python: protoModules, typescript: protoFiles, go: protoFiles},
   learn,
 };

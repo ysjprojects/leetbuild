@@ -658,6 +658,79 @@ export async function check_drain_bound(ctx) {
   assert(ctx.process.exited !== null, '11 s after SIGTERM the process is still alive with a connection held open: bound the drain to DRAIN_MS (10 s) with a timer that exits anyway');
 }
 `,
+    go: `package main
+
+import (
+	"crypto/tls"
+	"net/http"
+	"strings"
+	"syscall"
+
+	"leetbuild/harness"
+)
+
+func CheckHealthz(ctx *harness.Ctx) {
+	r := ctx.Main(main).HTTP().Get("/healthz")
+	ctx.Equal(r.Status, 200, "GET /healthz")
+	ctype := r.Header.Get("Content-Type")
+	ctx.Assert(strings.HasPrefix(ctype, "application/json"), "GET /healthz must answer JSON, got Content-Type %q", ctype)
+	ctx.Equal(r.JSON(), map[string]any{"ok": true}, "GET /healthz body")
+}
+
+func CheckTlsMin(ctx *harness.Ctx) {
+	p := ctx.Main(main)
+	servers := p.Servers()
+	ctx.Assert(len(servers) > 0, "main() never started listening: nothing is serving")
+	s := servers[len(servers)-1]
+	ctx.Assert(strings.HasSuffix(s.Addr, ":8443"), "the listener is configured on %q, expected :8443", s.Addr)
+	srv, _ := s.Server.(*http.Server)
+	ctx.Assert(s.TLS, "the server listens without TLS: serve it with srv.ListenAndServeTLS(%q, %q) so it terminates TLS", "cert.pem", "key.pem")
+	ctx.Assert(s.CertFile != "" && s.KeyFile != "" || srv != nil && srv.TLSConfig != nil && len(srv.TLSConfig.Certificates) > 0, "the listener must be configured with cert.pem and key.pem")
+	ctx.Assert(srv != nil && srv.TLSConfig != nil && srv.TLSConfig.MinVersion != 0, "TLSConfig.MinVersion is not set: the floor must be tls.VersionTLS12, set explicitly on the server's TLSConfig")
+	ctx.Equal(srv.TLSConfig.MinVersion, tls.VersionTLS12, "TLSConfig.MinVersion (the floor must be tls.VersionTLS12)")
+}
+
+func CheckHsts(ctx *harness.Ctx) {
+	c := ctx.Main(main).HTTP()
+	ok := c.Get("/healthz")
+	missing := c.Get("/no-such-route")
+	for _, tc := range []struct {
+		name string
+		r    *harness.Response
+	}{{"/healthz", ok}, {"/no-such-route", missing}} {
+		values := tc.r.Header.Values("Strict-Transport-Security")
+		ctx.Assert(len(values) > 0, "%s (%d) carries no Strict-Transport-Security header: add it in a middleware wrapped around the mux so every response has it", tc.name, tc.r.Status)
+		value := tc.r.Header.Get("Strict-Transport-Security")
+		ctx.Assert(strings.Contains(strings.ReplaceAll(value, " ", ""), "max-age=63072000"), "%s: Strict-Transport-Security is %q, expected max-age=63072000", tc.name, value)
+	}
+}
+
+func CheckSigterm(ctx *harness.Ctx) {
+	p := ctx.Main(main)
+	release := p.HTTP().Hold("GET", "/healthz", nil) // a request in flight when the signal lands
+	ctx.Assert(p.Listening(), "the server must keep serving until SIGTERM arrives")
+	ctx.Assert(p.Signal(syscall.SIGTERM) > 0, "main() installed no SIGTERM handler (signal.Notify): the process would die mid-request when the orchestrator stops it")
+	ctx.Tick()
+	ctx.Assert(!p.Listening(), "the SIGTERM handler ran but the server was not told to stop: call srv.Shutdown so the listener closes and in-flight requests drain")
+	ctx.Assert(p.Running(), "the process ended while a request was still in flight: wait for srv.Shutdown to return before main returns")
+	release()
+	ctx.Tick()
+	ctx.Assert(!p.Running(), "the drain finished but the process is still running: return from main once srv.Shutdown has returned")
+}
+
+func CheckDrainBound(ctx *harness.Ctx) {
+	p := ctx.Main(main)
+	p.HTTP().Hold("GET", "/healthz", nil) // a client holding its request open through the drain
+	ctx.Assert(p.Signal(syscall.SIGTERM) > 0, "main() installed no SIGTERM handler (signal.Notify)")
+	ctx.Tick()
+	ctx.Clock.Advance(9)
+	ctx.Tick()
+	ctx.Assert(p.Running(), "9 s into the drain, with a request still in flight, the process already ended: give open connections the full 10 s")
+	ctx.Clock.Advance(2)
+	ctx.Tick()
+	ctx.Assert(!p.Running(), "11 s after SIGTERM the process is still alive with a connection held open: bound the drain to drainTimeout (10 s) with context.WithTimeout")
+}
+`,
   },
   debrief: `The listener is where three cross-cutting policies live, because it is the one place every request passes: the TLS floor (a property of the context, checked once per handshake), HSTS (a middleware, so a new route cannot forget it) and graceful shutdown (close the accept socket first, then wait with a deadline). Real gateways add OCSP stapling, certificate hot-reload, ALPN for HTTP/2, and health checks that go *unhealthy* a few seconds before the drain starts so the load balancer stops sending traffic first.`,
 };

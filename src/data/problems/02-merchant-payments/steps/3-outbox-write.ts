@@ -806,6 +806,130 @@ export async function check_event_id(ctx) {
   }
 }
 `,
+    go: `package main
+
+import (
+	"context"
+	"encoding/json"
+	"regexp"
+	"sort"
+
+	"leetbuild/harness"
+)
+
+const outboxSchema = \`
+CREATE TABLE orders (
+    id text PRIMARY KEY,
+    merchant_id text NOT NULL,
+    amount_cents bigint NOT NULL,
+    currency text NOT NULL,
+    status text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE outbox (
+    id text PRIMARY KEY,
+    topic text NOT NULL,
+    key text NOT NULL CHECK (key <> 'm-broken'),
+    payload text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    sent_at timestamptz
+);
+\`
+
+var (
+	firstOrder  = Order{ID: "o-1", MerchantID: "m-42"}
+	someCapture = Capture{AmountCents: 4999, Currency: "EUR"}
+	uuidV4      = regexp.MustCompile("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+)
+
+func tableRows(ctx *harness.Ctx, table string) []harness.Row {
+	return ctx.DB.Query("SELECT * FROM " + table + " ORDER BY created_at, id")
+}
+
+func captureOrder(ctx *harness.Ctx, order Order) string {
+	eventID, err := recordCapture(context.Background(), order, someCapture)
+	ctx.NoError(err, "recordCapture(%+v) returned an error", order)
+	return eventID
+}
+
+func decodePayload(ctx *harness.Ctx, row harness.Row) map[string]any {
+	text, _ := row["payload"].(string)
+	var event map[string]any
+	if json.Unmarshal([]byte(text), &event) != nil {
+		ctx.Fatalf("outbox.payload must be the event as JSON, got %s", harness.Show(row["payload"]))
+	}
+	return event
+}
+
+func CheckAtomic(ctx *harness.Ctx) {
+	ctx.DB.Reset(outboxSchema)
+	captureOrder(ctx, firstOrder)
+	ctx.Equal(len(tableRows(ctx, "orders")), 1, "orders rows")
+	ctx.Equal(len(tableRows(ctx, "outbox")), 1, "outbox rows next to the order")
+	ctx.Equal(ctx.DB.Events(), []string{"BEGIN", "COMMIT"}, "both rows must be written in one transaction; the database saw")
+	// The outbox insert for merchant m-broken violates a constraint: the order must roll back with it.
+	_, err := recordCapture(context.Background(), Order{ID: "o-2", MerchantID: "m-broken"}, someCapture)
+	ctx.Assert(err != nil, "a failed outbox insert must propagate (the transaction rolls back), not be swallowed")
+	events := ctx.DB.Events()
+	ctx.Equal(events[len(events)-1], "ROLLBACK", "the failed transaction must roll back; the last event the database saw")
+	var ids []any
+	for _, o := range tableRows(ctx, "orders") {
+		ids = append(ids, o["id"])
+	}
+	ctx.Equal(ids, []any{"o-1"}, "the outbox insert failed, so the orders row o-2 must not be committed: the two writes belong in one transaction")
+}
+
+func CheckOutboxRow(ctx *harness.Ctx) {
+	ctx.DB.Reset(outboxSchema)
+	eventID := captureOrder(ctx, firstOrder)
+	outbox := tableRows(ctx, "outbox")
+	ctx.Equal(len(outbox), 1, "outbox rows")
+	row := outbox[0]
+	ctx.Equal(row["topic"], "payments", "outbox.topic")
+	ctx.Equal(row["key"], "m-42", "outbox.key must be the merchant id")
+	ctx.Equal(row["sent_at"], nil, "a fresh outbox row is unsent: outbox.sent_at")
+	event := decodePayload(ctx, row)
+	for _, field := range []struct {
+		name  string
+		value any
+	}{{"type", "payment.captured"}, {"merchant_id", "m-42"}, {"order_id", "o-1"}, {"amount_cents", 4999}, {"currency", "EUR"}} {
+		ctx.Equal(event[field.name], field.value, "payload.%s", field.name)
+	}
+	ctx.Equal(event["event_id"], row["id"], "payload.event_id must equal the row id")
+	ctx.Equal(eventID, row["id"], "recordCapture must return the outbox row id")
+}
+
+func CheckNoDualWrite(ctx *harness.Ctx) {
+	ctx.DB.Reset(outboxSchema)
+	captureOrder(ctx, firstOrder)
+	ctx.Equal(len(ctx.Kafka.EventsOf("producer", "client")), 0, "this file must not create a Kafka client or producer (the relay publishes committed outbox rows): producer events")
+	ctx.Equal(len(ctx.Kafka.Records("payments")), 0, "records recordCapture produced to Kafka from the request path")
+	ctx.Equal(len(tableRows(ctx, "outbox")), 1, "the event must be an outbox row instead: outbox rows")
+}
+
+func CheckEventId(ctx *harness.Ctx) {
+	ctx.DB.Reset(outboxSchema)
+	first := captureOrder(ctx, firstOrder)
+	second := captureOrder(ctx, Order{ID: "o-2", MerchantID: "m-42"})
+	for _, eventID := range []string{first, second} {
+		ctx.Assert(uuidV4.MatchString(eventID), "the event id must be a random (version 4) UUID, got %q", eventID)
+	}
+	ctx.Assert(first != second, "every event needs its own UUID")
+	outbox := tableRows(ctx, "outbox")
+	var ids []string
+	for _, row := range outbox {
+		id, _ := row["id"].(string)
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	want := []string{first, second}
+	sort.Strings(want)
+	ctx.Equal(ids, want, "outbox row ids must be the returned event ids")
+	for _, row := range outbox {
+		ctx.Equal(decodePayload(ctx, row)["event_id"], row["id"], "payload.event_id must be the same UUID as the row id")
+	}
+}
+`,
   },
   debrief: `A dual write has no atomicity: two systems, two failure points, and no way to make the second write conditional on the first surviving. The outbox borrows the database's transaction so the event is committed exactly when the order is; publishing becomes a separate, retryable job. Real systems either poll the table like the relay you build next or tail the write-ahead log with change data capture (Debezium), and they garbage-collect sent rows so the table does not grow forever.`,
 };

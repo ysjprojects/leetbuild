@@ -477,6 +477,18 @@ type Outcome struct {
 var judgeConn, _ = grpc.NewClient(config.Judge, grpc.WithTransportCredentials(insecure.NewCredentials()))
 var judge = pb.NewJudgeClient(judgeConn)
 
+// Generated is what generate returns (built in step 3): the answer and which model gave it.
+type Generated struct {
+	Answer string
+	Model  string
+	Tokens int32
+}
+
+// generate calls the model with a deadline, one retry and the smaller fallback (built in step 3).
+var generate = func(ctx context.Context, question string, chunks []prompt.Chunk, history []prompt.Turn) (*Generated, error) {
+	panic("not implemented")
+}
+
 // sentences splits the answer on . ! ? — a "Based on [kb:…]:" prefix has no terminator, so it stays in the first one.
 func sentences(text string) []string {
 	var out []string
@@ -548,6 +560,18 @@ type Outcome struct {
 
 var judgeConn, _ = grpc.NewClient(config.Judge, grpc.WithTransportCredentials(insecure.NewCredentials()))
 var judge = pb.NewJudgeClient(judgeConn)
+
+// Generated is what generate returns (built in step 3): the answer and which model gave it.
+type Generated struct {
+	Answer string
+	Model  string
+	Tokens int32
+}
+
+// generate calls the model with a deadline, one retry and the smaller fallback (built in step 3).
+var generate = func(ctx context.Context, question string, chunks []prompt.Chunk, history []prompt.Turn) (*Generated, error) {
+	panic("not implemented")
+}
 
 // sentences splits the answer on . ! ? — a "Based on [kb:…]:" prefix has no terminator, so it stays in the first one.
 func sentences(text string) []string {
@@ -1247,6 +1271,198 @@ export async function check_escalate_after_retry(ctx) {
   result = await answer(w);
   assert(result.escalated === true && result.answer === w.config.HANDOFF_TEXT && [...result.sources].length === 0, \`with the judge down an unjudged answer must not reach the Dasher: expected the handoff, got \${JSON.stringify(result)}\`);
   assert.equal(generations(ctx).length, 5, \`the judge down still earns one more generation before the handoff: expected 2 Generate calls, saw \${generations(ctx).length - 3}\`);
+}
+`,
+    go: `package main
+
+import (
+	"context"
+	"math"
+	"strconv"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"assistant/chunk"
+	"assistant/config"
+	"assistant/kb"
+	"assistant/model"
+	"assistant/prompt"
+	pb "assistant/gen/support"
+
+	"leetbuild/harness"
+)
+
+const guardQuestion = "My payout has not arrived, when is it paid?"
+
+var guardHistory = []prompt.Turn{{Role: "dasher", Text: "Hi, I dashed all of last week."}}
+
+// guardLLM is the stand-in model server at both addresses; the check may switch its mode.
+type guardLLM struct {
+	pb.UnimplementedLlmServer
+	mode string
+}
+
+func (p *guardLLM) Generate(_ context.Context, req *pb.GenerateRequest) (*pb.GenerateReply, error) {
+	text := model.Complete(req.GetPrompt(), int(req.GetMaxTokens()), p.mode)
+	return &pb.GenerateReply{Text: text, Tokens: int32(len(strings.Fields(text))), Model: req.GetModel()}, nil
+}
+
+// guardJudge is the stand-in judge: the deterministic rubric of assistant/model.
+type guardJudge struct {
+	pb.UnimplementedJudgeServer
+}
+
+func (guardJudge) Evaluate(_ context.Context, req *pb.EvaluateRequest) (*pb.Scores, error) {
+	s := model.Evaluate(req.GetQuestion(), req.GetAnswer(), req.GetContextIds())
+	return &pb.Scores{Groundedness: float32(s.Groundedness), Coherence: float32(s.Coherence), Compliance: float32(s.Compliance), Pass: s.Pass}, nil
+}
+
+// guardWorld is the real KB chunks the checks retrieve and the answers they send.
+type guardWorld struct {
+	llm      *guardLLM
+	chunks   []prompt.Chunk
+	ids      []string
+	prompt   string
+	faithful string // "Based on [kb:pay-0][kb:pay-1]: Dasher earnings … depending on the bank."
+	stray    string // the same sentence, one citation swapped for a chunk that was never retrieved
+	offTopic string // the faithful answer plus a sentence of words the knowledge base never uses
+	risky    string // the faithful sentence with a promise in it: tier 1 cannot see it, the judge's compliance rule can
+}
+
+// kbChunk is a real KB chunk, as kb_search would have returned it.
+func kbChunk(id string) prompt.Chunk {
+	at := strings.LastIndex(id, "-")
+	a, _ := kb.Find(id[:at])
+	position, _ := strconv.Atoi(id[at+1:])
+	return prompt.Chunk{ID: id, Text: chunk.Chunk(a.Body)[position], Score: 0.5}
+}
+
+// serveGuard serves both model addresses and the judge, and stands in for generate (step 3) with one
+// Generate on the large model.
+func serveGuard(ctx *harness.Ctx, mode string) *guardWorld {
+	w := &guardWorld{llm: &guardLLM{mode: mode}, ids: []string{"pay-0", "pay-1", "tips-0", "referrals-1"}}
+	for _, id := range w.ids {
+		w.chunks = append(w.chunks, kbChunk(id))
+	}
+	w.prompt = prompt.Build(guardQuestion, w.chunks, guardHistory)
+	w.faithful = model.Complete(w.prompt, config.MaxTokens, "faithful")
+	w.stray = strings.Replace(w.faithful, "[kb:pay-1]", "[kb:policy-404]", 1)
+	w.offTopic = w.faithful + " Reboot the router and reinstall the firmware."
+	w.risky = w.faithful[:len(w.faithful)-1] + ", which we guarantee."
+	pb.RegisterLlmServer(ctx.GRPC.Server(config.LLMLarge), w.llm)
+	pb.RegisterLlmServer(ctx.GRPC.Server(config.LLMSmall), w.llm)
+	pb.RegisterJudgeServer(ctx.GRPC.Server(config.Judge), guardJudge{})
+	conn, err := grpc.NewClient(config.LLMLarge, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	ctx.NoError(err, "dial %s", config.LLMLarge)
+	llm := pb.NewLlmClient(conn)
+	generate = func(c context.Context, question string, chunks []prompt.Chunk, history []prompt.Turn) (*Generated, error) {
+		callCtx, cancel := context.WithTimeout(c, 2*time.Second)
+		defer cancel()
+		reply, err := llm.Generate(callCtx, &pb.GenerateRequest{Model: "large", Prompt: prompt.Build(question, chunks, history), MaxTokens: config.MaxTokens})
+		if err != nil {
+			return nil, err
+		}
+		return &Generated{Answer: reply.GetText(), Model: reply.GetModel(), Tokens: reply.GetTokens()}, nil
+	}
+	return w
+}
+
+func evaluations(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Evaluate", config.Judge) }
+
+func generations(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Generate", "") }
+
+func (w *guardWorld) verdict(answer string) Verdict {
+	return check(context.Background(), guardQuestion, answer, w.chunks)
+}
+
+func (w *guardWorld) outcome(ctx *harness.Ctx) Outcome {
+	result, err := answerOrEscalate(context.Background(), guardQuestion, w.chunks, guardHistory)
+	ctx.NoError(err, "answerOrEscalate must return {Answer, Sources, Escalated, Model}")
+	return result
+}
+
+func CheckCitedChunksOnly(ctx *harness.Ctx) {
+	w := serveGuard(ctx, "faithful")
+	v := w.verdict(w.stray)
+	ctx.Assert(!v.OK, "an answer citing [kb:policy-404], which was never retrieved, must fail: got %+v", v)
+	ctx.Assert(len(v.Reasons) > 0, "a failed check must say why: Reasons is empty")
+	named := false
+	for _, r := range v.Reasons {
+		named = named || strings.Contains(r, "policy-404")
+	}
+	ctx.Assert(named, "a reason must name the stray chunk id policy-404, got %q", v.Reasons)
+	ctx.Assert(len(evaluations(ctx)) == 0, "tier 1 failed, so the judge must not be called — it was called %d time(s)", len(evaluations(ctx)))
+}
+
+func CheckSentenceSimilarity(ctx *harness.Ctx) {
+	w := serveGuard(ctx, "faithful")
+	v := w.verdict(w.offTopic)
+	ctx.Assert(!v.OK, "a sentence unlike every retrieved chunk (cosine 0.00 < %v) must fail tier 1: got %+v", config.MinSimilarity, v)
+	ctx.Assert(len(v.Reasons) > 0, "a failed check must say why: Reasons is empty")
+	ctx.Assert(len(evaluations(ctx)) == 0, "tier 1 failed, so the judge must not be called — it was called %d time(s)", len(evaluations(ctx)))
+	v = w.verdict(w.faithful)
+	ctx.Assert(v.OK, "the faithful answer cites retrieved chunks and its one sentence is the top chunk's (cosine 0.58): it must pass, got %+v", v)
+}
+
+func CheckJudgeVerdict(ctx *harness.Ctx) {
+	w := serveGuard(ctx, "faithful")
+	v := w.verdict(w.faithful)
+	calls := evaluations(ctx)
+	ctx.Equal(len(calls), 1, "an answer that clears tier 1 goes to the judge exactly once: Evaluate calls to %s", config.Judge)
+	request, _ := calls[0].Request.(*pb.EvaluateRequest)
+	ctx.Equal(request.GetQuestion(), guardQuestion, "Evaluate must carry the question")
+	ctx.Equal(request.GetAnswer(), w.faithful, "Evaluate must carry the answer as generated")
+	ctx.Equal(request.GetContextIds(), w.ids, "ContextIds must be the retrieved chunk ids")
+	ctx.Assert(calls[0].HasDeadline(), "the Evaluate call carries no deadline: a stalled judge would hold the chat open forever")
+	ctx.Assert(1.5 <= calls[0].Timeout.Seconds() && calls[0].Timeout.Seconds() <= 2.0, "the deadline must be config.DeadlineS = %v s, got %v s", config.DeadlineS, calls[0].Timeout.Seconds())
+	ctx.Assert(v.OK, "the judge passed this answer (groundedness 1.0, compliance 1.0): OK must be true, got %+v", v)
+	ctx.Assert(math.Abs(v.Groundedness-1) < 1e-6, "Groundedness must be the judge's score 1.0, got %v", v.Groundedness)
+	ctx.Equal(len(v.Reasons), 0, "a passing verdict has no reasons, got %q: len(Reasons)", v.Reasons)
+}
+
+func CheckJudgeFailsClosed(ctx *harness.Ctx) {
+	w := serveGuard(ctx, "faithful")
+	v := w.verdict(w.risky)
+	ctx.Equal(len(evaluations(ctx)), 1, "the promise is invisible to tier 1 (same citations, cosine 0.56): the judge must be asked once")
+	ctx.Assert(!v.OK, "the judge scores 'guarantee' as compliance 0.0 and does not pass it: OK must be false, got %+v", v)
+	ctx.Assert(math.Abs(v.Groundedness-1) < 1e-6, "Groundedness is the judge's score (1.0: every citation is in context), got %v", v.Groundedness)
+	ctx.Assert(len(v.Reasons) > 0, "a failed check must say why: Reasons is empty")
+	ctx.GRPC.Stop(config.Judge)
+	v = w.verdict(w.faithful)
+	ctx.Assert(!v.OK, "with the judge unreachable (UNAVAILABLE) nothing vouched for the answer: OK must be false, got %+v", v)
+	calls := evaluations(ctx)
+	ctx.Equal(len(calls), 2, "the judge must still be asked when it is down (that is how the call fails): Evaluate calls")
+	ctx.Equal(calls[len(calls)-1].Code, codes.Unavailable, "the last Evaluate call's status")
+}
+
+func CheckEscalateAfterRetry(ctx *harness.Ctx) {
+	w := serveGuard(ctx, "hallucinate")
+	result := w.outcome(ctx)
+	ctx.Equal(len(generations(ctx)), 2, "a failed check earns the model one more try: Generate calls")
+	ctx.Equal(len(evaluations(ctx)), 0, "the invented answer fails tier 1 both times: the judge must never be called")
+	ctx.Assert(result.Escalated, "two rejected answers must escalate, got %+v", result)
+	ctx.Equal(result.Answer, config.HandoffText, "an escalated turn answers with config.HandoffText")
+	ctx.Assert(!strings.Contains(result.Answer, "policy-404") && !strings.Contains(result.Answer, "resolved within 7 days"), "the rejected answer must never leave answerOrEscalate")
+	ctx.Equal(len(result.Sources), 0, "an escalated turn has no sources, got %q: len(Sources)", result.Sources)
+	ctx.Equal(result.Model, "large", "Model must be the one that answered")
+	ctx.Equal(result.Tokens, 0, "an escalated turn has no answer to count: Tokens")
+	w.llm.mode = "faithful"
+	result = w.outcome(ctx)
+	ctx.Assert(len(generations(ctx)) == 3, "a passing answer needs one Generate call, saw %d", len(generations(ctx))-2)
+	ctx.Equal(len(evaluations(ctx)), 1, "a passing answer is judged exactly once: Evaluate calls")
+	gens := generations(ctx)
+	last, _ := gens[len(gens)-1].Request.(*pb.GenerateRequest)
+	ctx.Assert(last.GetPrompt() == w.prompt, "generate must be given the question, chunks and history: the prompt differs from prompt.Build(question, chunks, history)")
+	ctx.Assert(result.Answer == w.faithful && strings.Join(result.Sources, ",") == "pay-0,pay-1" && !result.Escalated && result.Model == "large", "a passing answer comes back as generated with its cited ids as Sources (pay-0, pay-1), not escalated, model large; got %+v", result)
+	ctx.Equal(result.Tokens, len(strings.Fields(w.faithful)), "Tokens must be the count generate reported")
+	ctx.GRPC.Stop(config.Judge)
+	result = w.outcome(ctx)
+	ctx.Assert(result.Escalated && result.Answer == config.HandoffText && len(result.Sources) == 0, "with the judge down an unjudged answer must not reach the Dasher: expected the handoff, got %+v", result)
+	ctx.Assert(len(generations(ctx)) == 5, "the judge down still earns one more generation before the handoff: expected 2 Generate calls, saw %d", len(generations(ctx))-3)
 }
 `,
   },
