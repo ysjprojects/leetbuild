@@ -9,6 +9,7 @@ export const nvfp4PtqStep: Step = {
   title: 'PTQ of a small LM: NVFP4 against MXFP4 and INT4',
   concept: 'pytorch',
   file: 'nvfp4_ptq',
+  localOnly: 'its self-test runs for minutes on the single CPU thread PyTorch gets in the browser',
   focus: ['calib-batch', 'calib-hooks', 'q-qkv', 'q-proj', 'q-fc1', 'q-fc2', 'keep-embed', 'keep-head', 'compare'],
   task: `## Task
 

@@ -9,3 +9,4 @@ tsconfig.tsbuildinfo
 public/py/worker.js
 public/ts/worker.js
 public/go/worker.js
+public/py/torch/

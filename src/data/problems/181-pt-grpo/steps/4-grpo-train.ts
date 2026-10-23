@@ -5,6 +5,8 @@ export const grpoTrainStep: Step = {
   title: 'The training loop: rollouts, rewards, μ clipped steps',
   concept: 'pytorch',
   file: 'grpo_train',
+  localOnly:
+    'its self-test bounds training to 60 s, which the single CPU thread PyTorch gets in the browser does not meet',
   focus: ['ref-copy', 'prompts', 'rollout', 'reward', 'group-norm', 'loss', 'adamw'],
   task: `## Task
 

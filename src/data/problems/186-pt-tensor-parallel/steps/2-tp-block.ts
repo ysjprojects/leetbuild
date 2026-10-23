@@ -5,6 +5,8 @@ export const tpBlockStep: Step = {
   title: 'A parallel block: MLP, attention by heads, LayerNorms replicated',
   concept: 'pytorch',
   file: 'tp_block',
+  localOnly:
+    'its self-test runs the ranks as gloo processes through torch.multiprocessing, which the browser runtime cannot start',
   focus: [
     'ln1',
     'qkv-r0',

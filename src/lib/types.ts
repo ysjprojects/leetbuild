@@ -92,6 +92,14 @@ export function fileName(stem: string, language: Language): string {
   return `${stem}.${FILE_EXTENSION[language]}`;
 }
 
+/**
+ * Whether a step runs as a program in the browser — Run executes the step's file as
+ * `python file.py` would, its self-test included, on PyTorch for Pyodide (CPU, single-threaded):
+ * the deep-learning track's PyTorch steps, unless they are `localOnly`.
+ */
+export const runsAsProgram = (problem: Problem, step: Step, language: Language): boolean =>
+  problem.track === 'dllm' && problem.language === 'python' && language === 'python' && step.localOnly === undefined;
+
 export type Concept = 'http' | 'grpc' | 'kafka' | 'redis' | 'pytorch' | 'cuda';
 
 /** The four every systems course covers over its steps. */
@@ -116,7 +124,9 @@ export const DIFFICULTIES: readonly Difficulty[] = ['easy', 'medium', 'hard'];
  * Which track a problem belongs to. `systems` is the classic build-a-system track (the default
  * when omitted); `ai` is the AI-era track, where every starter is a plausible model-generated
  * draft that the learner has to review, fix and verify; `dllm` is the deep-learning track — PyTorch
- * and CUDA problems in a fixed language, judged by static checks and run on the learner's own machine.
+ * and CUDA problems in a fixed language, judged by static checks. A PyTorch step's file also runs
+ * in the browser as a program (Run executes its self-test, see `runsAsProgram`); CUDA runs only on
+ * the learner's own GPU.
  */
 export type Track = 'systems' | 'ai' | 'dllm';
 
@@ -226,6 +236,12 @@ export interface Step {
    * goruntime/harness/ctx.go. Scala and C++ have none.
    */
   harness?: Partial<Record<Language, string>>;
+  /**
+   * A PyTorch step whose program the browser runtime cannot run: why (its self-test needs
+   * `torch.distributed` processes, or trains for minutes on one CPU thread). Run stays off for it,
+   * and the self-test is for the learner's own machine.
+   */
+  localOnly?: string;
 }
 
 /**

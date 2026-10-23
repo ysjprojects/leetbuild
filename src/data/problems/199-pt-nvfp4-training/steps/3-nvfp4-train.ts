@@ -5,6 +5,7 @@ export const nvfp4TrainStep: Step = {
   title: 'NVFP4Linear: three quantized GEMMs, and a tiny LM trained with them',
   concept: 'pytorch',
   file: 'nvfp4_train',
+  localOnly: 'its self-test runs for minutes on the single CPU thread PyTorch gets in the browser',
   focus: ['fprop', 'dgrad', 'q-wgrad', 'wgrad', 'w-reuse', 'grads', 'lm-qkv', 'lm-proj', 'lm-fc', 'lm-fc2'],
   task: `## Task
 

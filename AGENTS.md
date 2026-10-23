@@ -68,8 +68,11 @@ course content, `AGENTS.md`, or the mock-interview feature unless the user names
 - All five languages are mandatory in every step of a course. A deep-learning problem (`track: 'dllm'`)
   fixes one language instead — `language: 'python'` (PyTorch) or `'cuda'` — and its steps carry code
   and matchers for that language only; it has no harness, and its reference solution is a complete
-  program ending in a self-test the learner runs on their own machine. The catalogue maximum is the
-  live sum over every problem (`STEP_POINTS` in `src/lib/scoring.ts`); adding content never re-balances it.
+  program ending in a self-test that prints `PASS`. A PyTorch step's program also runs in the browser
+  (Run, on PyTorch for Pyodide), and `yarn verify` runs it there: the solution's self-test passes, the
+  starter's does not. A step whose self-test cannot run there (gloo processes, minutes of training on
+  one CPU thread) says why in `localOnly`. The catalogue maximum is the live sum over every problem
+  (`STEP_POINTS` in `src/lib/scoring.ts`); adding content never re-balances it.
 - A deep-learning problem is drawn as a model or kernel, never as a system: titled `figures` instead
   of `diagram`, layer stacks (`architecture`, `src/lib/architecture.ts`) for PyTorch models and GPU
   figures (`gpu`, `src/lib/gpuFigure.ts`, after Modal's GPU Glossary) for CUDA kernels, as many as
@@ -122,7 +125,7 @@ Closes #N. Not done: <what you left out, and why>.
 ## Verification
 
 - `npm run lint`, `npx tsc --noEmit`, `npx next build`: clean
-- `npx tsx scripts/verify.ts`: `<n> step(s), <n> step-language pairs checked, <n> python + <n> typescript + <n> go harness(es) run, 0 problem(s)`
+- `npx tsx scripts/verify.ts`: `<n> step(s), <n> step-language pairs checked, <n> python + <n> typescript + <n> go harness(es) run, <n> python program(s) run, 0 problem(s)`
 - <screenshot of /<course-id>, or "no browser available; not screenshotted">
 ```
 

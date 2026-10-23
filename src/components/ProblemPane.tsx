@@ -18,6 +18,7 @@ import {
   fileName,
   isArchitectureFigure,
   LANGUAGE_LABEL,
+  runsAsProgram,
   sourceCredit,
   stepKey,
 } from '@/lib/types';
@@ -699,8 +700,12 @@ const ProblemPane: FC<{
                 then submit.{' '}
                 {step.harness?.[language] !== undefined
                   ? 'Your code runs in the browser: each check exercises it and reports what it observed.'
+                  : runsAsProgram(problem, step, language)
+                  ? 'The checks read the shape of your code. Run executes the file here in the browser, PyTorch on the CPU, and the console shows its self-test, which prints PASS when it holds.'
                   : problem.track === 'dllm'
-                  ? 'The checks read the shape of your code. Run the file on your own machine: the reference ends in a self-test that prints PASS.'
+                  ? `The checks read the shape of your code. Run the file on your own machine: the reference ends in a self-test that prints PASS${
+                      step.localOnly === undefined ? '' : ` (it does not run here: ${step.localOnly})`
+                    }.`
                   : 'The checks read the shape of your code; nothing is executed in this language.'}
               </p>
               {step.sequence !== undefined ? (

@@ -5,6 +5,8 @@ export const ddpStep: Step = {
   title: 'DDP: broadcast, gradient buckets, async all-reduce',
   concept: 'pytorch',
   file: 'ddp',
+  localOnly:
+    'its self-test runs the ranks as gloo processes through torch.multiprocessing, which the browser runtime cannot start',
   focus: ['stage-ddp', 'ddp-r0', 'ddp-r1', 'ddp-r2', 'ddp-r3'],
   task: `## Task
 

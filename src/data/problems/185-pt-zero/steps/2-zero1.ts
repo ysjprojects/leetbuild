@@ -5,6 +5,8 @@ export const zero1Step: Step = {
   title: 'ZeRO-1: AdamW with sharded moments',
   concept: 'pytorch',
   file: 'zero1',
+  localOnly:
+    'its self-test runs the ranks as gloo processes through torch.multiprocessing, which the browser runtime cannot start',
   focus: ['stage-zero1', 'zero1-r0', 'zero1-r1', 'zero1-r2', 'zero1-r3'],
   task: `## Task
 

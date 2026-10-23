@@ -12,6 +12,7 @@ class Clock:
     def __init__(self) -> None:
         self._real_time = time.time
         self._real_monotonic = time.monotonic
+        self._real_perf_counter = time.perf_counter
         self._real_sleep = time.sleep
         self._real_async_sleep = asyncio.sleep
         self.offset = 0.0
@@ -29,6 +30,15 @@ class Clock:
         time.sleep = self.sleep
         asyncio.sleep = self.async_sleep
         asyncio.tasks.sleep = self.async_sleep
+
+    def uninstall(self) -> None:
+        """Give the real clock back: a program run (`python file.py`) times itself in real time."""
+        time.time = self._real_time
+        time.monotonic = self._real_monotonic
+        time.perf_counter = self._real_perf_counter
+        time.sleep = self._real_sleep
+        asyncio.sleep = self._real_async_sleep
+        asyncio.tasks.sleep = self._real_async_sleep
 
     def reset(self, sleep_limit: int | None = None) -> None:
         self.offset = 0.0

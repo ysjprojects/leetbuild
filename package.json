@@ -14,8 +14,9 @@
     "protogen": "tsx scripts/protogen.ts",
     "build:runtime": "tsx scripts/build-runtime.ts",
     "build:go": "tsx scripts/build-go.ts",
-    "predev": "tsx scripts/build-runtime.ts",
-    "prebuild": "tsx scripts/build-runtime.ts"
+    "fetch:torch": "tsx scripts/fetch-torch.ts",
+    "predev": "tsx scripts/build-runtime.ts && tsx scripts/fetch-torch.ts",
+    "prebuild": "tsx scripts/build-runtime.ts && tsx scripts/fetch-torch.ts"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.3",

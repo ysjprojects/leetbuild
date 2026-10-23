@@ -10,7 +10,7 @@
 import type {PyodideInterface} from 'pyodide';
 
 import type {DbBridge} from './db';
-import type {RunJob, RunResult, RuntimeCheckResult} from './types';
+import type {OutputLine, RunJob, RunResult, RuntimeCheckResult} from './types';
 
 export const PYODIDE_VERSION = '314.0.7';
 export const PYODIDE_INDEX_URL = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/`;
@@ -18,6 +18,13 @@ export const PYODIDE_INDEX_URL = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VE
 export const PYODIDE_PACKAGES = ['fastapi', 'httpx', 'sortedcontainers', 'protobuf', 'micropip'];
 /** Pure-Python wheels vendored under `public/py/wheels` (not built into Pyodide). */
 export const WHEELS = ['redis-8.1.0-py3-none-any.whl', 'fakeredis-2.39.0-py3-none-any.whl'];
+/**
+ * PyTorch for the deep-learning problems' programs: an unofficial CPU build for this Pyodide's ABI
+ * (`pyemscripten_2026_0`, CPython 3.14.2; https://github.com/mmtftr/pyodide-pytorch), served from
+ * `public/py/torch/` (scripts/fetch-torch.ts), with the Pyodide packages it imports.
+ */
+export const TORCH_WHEEL = 'torch-2.13.0+pyodide314.0.2.r7-cp314-cp314-pyemscripten_2026_0_wasm32.whl';
+export const TORCH_PACKAGES = ['numpy', 'typing-extensions', 'sympy', 'networkx', 'jinja2', 'fsspec'];
 /** The runtime's own modules under `public/py/runtime`, copied into Pyodide's filesystem at boot. */
 export const RUNTIME_FILES = [
   'leetbuild/__init__.py',
@@ -28,6 +35,7 @@ export const RUNTIME_FILES = [
   'leetbuild/db.py',
   'leetbuild/lua.py',
   'leetbuild/harness.py',
+  'leetbuild/program.py',
   'confluent_kafka/__init__.py',
   'grpc/__init__.py',
   'grpc/_utilities.py',
@@ -119,16 +127,57 @@ leetbuild.boot()
 `);
 }
 
-/** Run one step's harness against the learner's files. The runtime must be booted. */
-export async function runPython(pyodide: PyodideInterface, job: RunJob): Promise<RunResult> {
+/** Load PyTorch into a booted runtime: once per instance, before the first program that imports it. */
+export async function loadTorch(pyodide: PyodideInterface, assets: Assets): Promise<void> {
+  await pyodide.loadPackage(TORCH_PACKAGES, {messageCallback: () => undefined});
+  mkdirTree(pyodide, WHEEL_DIR);
+  pyodide.FS.writeFile(`${WHEEL_DIR}/${TORCH_WHEEL}`, await assets.read(`torch/${TORCH_WHEEL}`));
+  await pyodide.runPythonAsync(`
+import micropip
+await micropip.install(${JSON.stringify(`emfs:${WHEEL_DIR}/${TORCH_WHEEL}`)}, deps=False)
+import torch
+`);
+}
+
+/** Whether a job's files import PyTorch (a deep-learning step's program): `loadTorch` must run first. */
+export const needsTorch = (job: RunJob): boolean =>
+  Object.values(job.files).some(src => /^\s*(?:import|from)\s+torch\b/m.test(src));
+
+/**
+ * Run one step's harness against the learner's files, or the step's file as a program
+ * (`job.program`). Lines go to `onOutput` as they are printed. The runtime must be booted (and
+ * PyTorch loaded when the program needs it).
+ */
+export async function runPython(
+  pyodide: PyodideInterface,
+  job: RunJob,
+  onOutput?: (line: OutputLine) => void,
+): Promise<RunResult> {
   const started = Date.now();
   const stdout: string[] = [];
   const stderr: string[] = [];
-  pyodide.setStdout({batched: line => stdout.push(line)});
-  pyodide.setStderr({batched: line => stderr.push(line)});
+  pyodide.setStdout({
+    batched: text => {
+      stdout.push(text);
+      onOutput?.({stream: 'stdout', text});
+    },
+  });
+  pyodide.setStderr({
+    batched: text => {
+      stderr.push(text);
+      onOutput?.({stream: 'stderr', text});
+    },
+  });
   try {
     writeTree(pyodide, WORK_DIR, job.files);
     writeTree(pyodide, SUPPORT_DIR, job.support);
+    if (job.program === true) {
+      const runProgram = pyodide.runPython('from leetbuild.program import run_program\nrun_program') as (
+        entry: string,
+      ) => number;
+      const exit = runProgram(job.entry ?? '');
+      return {checks: [], stdout: stdout.join('\n'), stderr: stderr.join('\n'), exit, ms: Date.now() - started};
+    }
     const runChecks = pyodide.runPython('from leetbuild.harness import run_checks\nrun_checks') as (
       harness: string,
       ids: unknown,

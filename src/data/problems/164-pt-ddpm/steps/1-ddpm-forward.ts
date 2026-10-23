@@ -5,6 +5,7 @@ export const ddpmForwardStep: Step = {
   title: 'The schedule, q(x_t | x_0) in one step, and the simple loss',
   concept: 'pytorch',
   file: 'ddpm_schedule',
+  localOnly: 'its self-test runs for minutes on the single CPU thread PyTorch gets in the browser',
   focus: ['x0', 'draw', 'q-sample', 'eps-train', 'loss'],
   task: `## Task
 

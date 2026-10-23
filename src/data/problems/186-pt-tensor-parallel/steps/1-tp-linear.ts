@@ -5,6 +5,8 @@ export const tpLinearStep: Step = {
   title: 'f, g and the column- and row-parallel linears',
   concept: 'pytorch',
   file: 'tp_linear',
+  localOnly:
+    'its self-test runs the ranks as gloo processes through torch.multiprocessing, which the browser runtime cannot start',
   focus: ['f-attn', 'g-attn', 'f-mlp', 'fc-r0', 'fc-r1', 'down-r0', 'down-r1', 'g-mlp'],
   task: `## Task
 

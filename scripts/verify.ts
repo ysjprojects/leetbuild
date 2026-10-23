@@ -36,9 +36,11 @@ import {
   fileName,
   isArchitectureFigure,
   problemLanguages,
+  runsAsProgram,
   SYSTEMS_CONCEPTS,
 } from '../src/lib/types';
 import {WIDGETS} from '../src/lib/widgets';
+import {fetchTorch} from './fetch-torch';
 import {GO_RUNTIME_MANIFEST, goRuntimeHash} from './go-runtime';
 
 const args = process.argv.slice(2);
@@ -274,6 +276,10 @@ function verifyProblem(problem: Problem): string[] {
     errors.push(`${problem.id}: a deep-learning problem fixes its language`);
   if (problem.track === 'dllm' && !single)
     errors.push(`${problem.id}: a deep-learning problem lists its one concept (pytorch or cuda)`);
+  // Only a PyTorch step's program runs in the browser, so only one can be kept off it.
+  for (const step of problem.steps)
+    if (step.localOnly !== undefined && !(problem.track === 'dllm' && problem.language === 'python'))
+      errors.push(`${problem.id}/${step.id}: localOnly is for a deep-learning PyTorch step`);
   for (const concept of problem.concepts)
     if (!covered.has(concept)) errors.push(`${problem.id}: lists concept ${concept} but no step exercises it`);
   // The playground shows a course as one filesystem per language: two steps may not own one file.
@@ -400,6 +406,44 @@ const EXECUTING: {
   },
 ];
 
+/** A run's ending, for a message: the runtime failure, or the exit status and the last lines it printed to stderr. */
+const describeProgram = (run: RunResult): string =>
+  run.error ??
+  `exit ${run.exit ?? '?'}${
+    run.stderr === '' ? '' : `: ${run.stderr.split('\n').slice(-3).join(' | ').slice(0, 300)}`
+  }`;
+
+/** A self-test that held: the program exited 0 and printed PASS. */
+const selfTestPasses = (run: RunResult): boolean =>
+  run.error === undefined && run.exit === 0 && /\bPASS\b/.test(run.stdout);
+
+/**
+ * A PyTorch problem's programs (`runsAsProgram`), as Run executes them in the browser: each step's
+ * solution, run as `python file.py` beside the other steps' solutions, passes its self-test; its
+ * starter does not. `localOnly` steps are left out. Returns the problems and how many programs ran.
+ */
+async function verifyPrograms(problem: Problem, runtime: NodeRuntime): Promise<{errors: string[]; ran: number}> {
+  const errors: string[] = [];
+  let ran = 0;
+  for (const step of problem.steps) {
+    if (!runsAsProgram(problem, step, 'python')) continue;
+    const tag = `${problem.id}/${step.id} [python program]`;
+    const run = (code: string): Promise<RunResult> =>
+      runtime.run({...runJob(problem, step, 'python', code), harness: '', checks: [], program: true});
+    const solution = await run(codeFor(step, 'python').solution);
+    if (!selfTestPasses(solution)) errors.push(`${tag}: the solution's self-test fails — ${describeProgram(solution)}`);
+    const starter = await run(codeFor(step, 'python').starter);
+    if (selfTestPasses(starter)) errors.push(`${tag}: the starter's self-test already passes`);
+    ran += 1;
+    if (verbose) {
+      console.log(
+        `    python program  solution exit ${solution.exit} (${solution.ms} ms) · starter exit ${starter.exit}`,
+      );
+    }
+  }
+  return {errors, ran};
+}
+
 /** The Go runtime's WebAssembly must come from the committed goruntime/ sources (`yarn build:go` records their hash). */
 function goRuntimeFreshness(): string[] {
   if (!existsSync(GO_RUNTIME_MANIFEST)) return [`${GO_RUNTIME_MANIFEST} is missing: run yarn build:go`];
@@ -452,12 +496,16 @@ async function main(): Promise<void> {
   let steps = 0;
   let checked = 0;
   const harnesses: Partial<Record<Language, number>> = {};
+  let programs = 0;
   const selected = problems.filter(p => onlyProblem === null || p.id === onlyProblem || onlyProblem.endsWith(p.id));
   const runtimes: Partial<Record<Language, NodeRuntime>> = {};
   if (withRuntime)
     for (const {language, boot} of EXECUTING) {
       if (onlyRuntime !== null && onlyRuntime !== language) continue;
-      if (!selected.some(p => p.steps.some(s => s.harness?.[language] !== undefined))) continue;
+      const programsHere =
+        language === 'python' && selected.some(p => p.steps.some(s => runsAsProgram(p, s, language)));
+      if (!programsHere && !selected.some(p => p.steps.some(s => s.harness?.[language] !== undefined))) continue;
+      if (programsHere) await fetchTorch();
       const started = Date.now();
       runtimes[language] = await boot();
       console.log(`✓ ${language} runtime booted (${Date.now() - started} ms)`);
@@ -473,6 +521,11 @@ async function main(): Promise<void> {
       if (runtime !== undefined) e.push(...(await verifyRuntime(problem, language, checkName, declares, runtime)));
       harnesses[language] =
         (harnesses[language] ?? 0) + problem.steps.filter(s => s.harness?.[language] !== undefined).length;
+    }
+    if (runtimes.python !== undefined) {
+      const checked = await verifyPrograms(problem, runtimes.python);
+      e.push(...checked.errors);
+      programs += checked.ran;
     }
     steps += problem.steps.length;
     checked += problem.steps.length * problemLanguages(problem).length;
@@ -497,10 +550,15 @@ async function main(): Promise<void> {
   console.log(
     `\n${steps} step(s), ${checked} step-language pairs checked, ${ran} harness(es)${
       withRuntime ? ' run' : ' skipped'
-    }, ${errors.length} problem(s)`,
+    }, ${programs} python program(s) run, ${errors.length} problem(s)`,
   );
   for (const e of errors) console.log(`  - ${e}`);
   process.exitCode = errors.length === 0 ? 0 : 1;
 }
 
-void main();
+// Loudly: the TypeScript runtime handles unhandled rejections for the learner's code, so a crash here
+// would otherwise end the process quietly with status 0.
+main().catch(error => {
+  console.error(error);
+  process.exit(1);
+});

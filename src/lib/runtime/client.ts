@@ -8,7 +8,7 @@
  * boots a fresh one.
  */
 import type {Language} from '../types';
-import type {Phase, RunJob, RunResult, WorkerIn, WorkerOut} from './types';
+import type {OutputLine, Phase, RunJob, RunResult, WorkerIn, WorkerOut} from './types';
 
 export type RuntimeStatus =
   | {state: 'idle'}
@@ -18,6 +18,8 @@ export type RuntimeStatus =
   | {state: 'failed'; message: string};
 
 export const RUN_TIMEOUT_MS = 20_000;
+/** A program run's budget (a deep-learning step's self-test trains on the CPU, single-threaded). */
+export const PROGRAM_TIMEOUT_MS = 120_000;
 
 /** Languages graded by execution, with their worker bundle (`yarn build:runtime` writes it under public/) and first boot phase. */
 export const RUNTIMES: Partial<Record<Language, {workerUrl: string; firstPhase: Phase}>> = {
@@ -32,12 +34,18 @@ export const STATUS_TEXT: Record<Phase, string> = {
   esbuild: 'starting TypeScript (downloading the compiler, ~14 MB the first time)',
   go: 'starting Go (downloading the interpreter, ~9 MB the first time)',
   runtime: 'installing the LeetBuild runtime',
+  torch: 'loading PyTorch (~40 MB the first time)',
 };
 
 interface Pending {
   resolve: (result: RunResult) => void;
-  /** The budget timer; starts when the runtime is ready, so a slow first download is never charged to the run. */
+  /**
+   * The budget timer. It starts when the runtime is ready, or for a program when its code starts
+   * (after PyTorch loads), so a slow first download is never charged to the run.
+   */
   timer: number | null;
+  program: boolean;
+  onOutput?: (line: OutputLine) => void;
 }
 
 export class RuntimeRunner {
@@ -60,18 +68,20 @@ export class RuntimeRunner {
     if (this.worker === null) this.spawn().postMessage({type: 'boot'} satisfies WorkerIn);
   }
 
-  run(job: RunJob): Promise<RunResult> {
+  /** Run a job; `onOutput` gets each line the run prints while it runs. */
+  run(job: RunJob, onOutput?: (line: OutputLine) => void): Promise<RunResult> {
     const worker = this.worker ?? this.spawn();
     const id = this.nextId++;
+    const program = job.program === true;
     if (this.ready) this.setStatus({state: 'running'});
     return new Promise<RunResult>(resolve => {
-      this.pending.set(id, {resolve, timer: this.ready ? this.budget(id) : null});
+      this.pending.set(id, {resolve, timer: this.ready && !program ? this.budget(id, false) : null, program, onOutput});
       worker.postMessage({type: 'run', id, job} satisfies WorkerIn);
     });
   }
 
-  private budget(id: number): number {
-    return window.setTimeout(() => this.timeout(id), RUN_TIMEOUT_MS);
+  private budget(id: number, program: boolean): number {
+    return window.setTimeout(() => this.timeout(id), program ? PROGRAM_TIMEOUT_MS : RUN_TIMEOUT_MS);
   }
 
   private spawn(): Worker {
@@ -91,8 +101,20 @@ export class RuntimeRunner {
         return;
       case 'ready':
         this.ready = true;
-        for (const [id, pending] of this.pending) if (pending.timer === null) pending.timer = this.budget(id);
+        for (const [id, pending] of this.pending) {
+          if (pending.timer === null && !pending.program) pending.timer = this.budget(id, false);
+        }
         this.setStatus(this.pending.size > 0 ? {state: 'running'} : {state: 'ready'});
+        return;
+      case 'started': {
+        const pending = this.pending.get(message.id);
+        if (pending === undefined) return;
+        pending.timer ??= this.budget(message.id, pending.program);
+        this.setStatus({state: 'running'});
+        return;
+      }
+      case 'output':
+        this.pending.get(message.id)?.onOutput?.({stream: message.stream, text: message.text});
         return;
       case 'boot-failed':
         this.fail(`the runtime could not start: ${message.message}`);
@@ -115,14 +137,15 @@ export class RuntimeRunner {
     this.pending.delete(id);
     this.terminate();
     this.setStatus({state: 'idle'});
+    const budget = pending.program ? PROGRAM_TIMEOUT_MS : RUN_TIMEOUT_MS;
     pending.resolve({
       checks: [],
       stdout: '',
       stderr: '',
       error: `the run did not finish within ${
-        RUN_TIMEOUT_MS / 1000
-      } s (an endless loop?); the runtime restarts on the next submit`,
-      ms: RUN_TIMEOUT_MS,
+        budget / 1000
+      } s (an endless loop?); the runtime restarts on the next run`,
+      ms: budget,
     });
   }
 

@@ -1,4 +1,4 @@
-/** What every runtime (Python in Pyodide, TypeScript in the worker) takes and reports. */
+/** What every runtime (Python in Pyodide, TypeScript in the worker, Go in yaegi) takes and reports. */
 
 export interface RunJob {
   /** The learner's files by file name (`thumb_server.py`, `thumb_server.ts`). */
@@ -14,6 +14,11 @@ export interface RunJob {
    * program (`package main`), so the runtime compiles that one file with the harness.
    */
   entry?: string;
+  /**
+   * Run `entry` as a program (`python file.py`: its `__main__` block, the self-test a deep-learning
+   * step ends with) instead of the harness's checks, which are then empty. Python only.
+   */
+  program?: boolean;
 }
 
 /**
@@ -56,15 +61,27 @@ export interface RunResult {
   stderr: string;
   /** The run could not complete (runtime failure, timeout); `checks` is then empty. */
   error?: string;
+  /** A program run's exit status: 0 when it ran to the end, 1 on an uncaught exception, or what it exited with. */
+  exit?: number;
   ms: number;
 }
 
-/** Boot phases the runtimes report: Pyodide's, esbuild's, the Go interpreter's, then the LeetBuild runtime itself. */
-export type Phase = 'pyodide' | 'packages' | 'esbuild' | 'go' | 'runtime';
+/** A line the program printed, as it printed it. */
+export interface OutputLine {
+  stream: 'stdout' | 'stderr';
+  text: string;
+}
+
+/** Boot phases the runtimes report: Pyodide's, esbuild's, the Go interpreter's, the LeetBuild runtime itself, PyTorch. */
+export type Phase = 'pyodide' | 'packages' | 'esbuild' | 'go' | 'runtime' | 'torch';
 
 export type WorkerIn = {type: 'boot'} | {type: 'run'; id: number; job: RunJob};
 export type WorkerOut =
   | {type: 'phase'; phase: Phase}
   | {type: 'ready'}
   | {type: 'boot-failed'; message: string}
+  /** The run's code starts executing (what it needed is loaded): its budget starts now. */
+  | {type: 'started'; id: number}
+  /** A line the run printed, while it runs. */
+  | ({type: 'output'; id: number} & OutputLine)
   | {type: 'result'; id: number; result: RunResult};

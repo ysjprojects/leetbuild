@@ -1,5 +1,6 @@
-import {type FC, memo, useCallback, useMemo, useState} from 'react';
+import {type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from 'react';
 
+import type {BottomTab, ConsoleRun} from '@/lib/console';
 import {type CheckResult, type Verdict, describeMatcher} from '@/lib/judge';
 import {type MetricRow, comparedRows, metricByCheck, total} from '@/lib/metrics';
 import {type RuntimeStatus, STATUS_TEXT} from '@/lib/runtime/client';
@@ -197,19 +198,89 @@ SubmissionCode.displayName = 'SubmissionCode';
 
 const EMPTY_HISTORY: Submission[] = [];
 
-const Output: FC<{stdout: string; stderr: string}> = memo(({stdout, stderr}) => {
-  const text = [stdout, stderr].filter(s => s !== '').join('\n');
-  if (text === '') return null;
+/** The bottom panel's switch: the step's objectives (its checks) or the console of the last run. */
+const PanelTabs: FC<{tab: BottomTab; onTab: (tab: BottomTab) => void; consoleRun: ConsoleRun | null}> = memo(
+  ({tab, onTab, consoleRun}) => {
+    const showChecks = useCallback(() => onTab('checks'), [onTab]);
+    const showConsole = useCallback(() => onTab('console'), [onTab]);
+    const tabClass = (active: boolean): string =>
+      `rounded-md px-2 py-0.5 font-bold uppercase tracking-wider transition ${
+        active ? 'bg-ink-700 text-iris-300' : 'text-ink-400 hover:text-ink-100'
+      }`;
+    return (
+      <div className="flex items-center gap-1" role="tablist">
+        <button
+          aria-selected={tab === 'checks'}
+          className={tabClass(tab === 'checks')}
+          onClick={showChecks}
+          role="tab"
+          type="button">
+          Checks
+        </button>
+        <button
+          aria-selected={tab === 'console'}
+          className={tabClass(tab === 'console')}
+          onClick={showConsole}
+          role="tab"
+          title="what the last run printed, as it printed it"
+          type="button">
+          Console
+          {consoleRun?.running === true ? (
+            <span className="bg-iris-300 ml-1.5 inline-block h-1.5 w-1.5 animate-pulse rounded-full align-middle" />
+          ) : consoleRun !== null && tab !== 'console' && consoleRun.lines.length > 0 ? (
+            <span className="font-code text-ink-400 ml-1.5 normal-case tracking-normal">{consoleRun.lines.length}</span>
+          ) : null}
+        </button>
+      </div>
+    );
+  },
+);
+PanelTabs.displayName = 'PanelTabs';
+
+/** The last run's output, line by line as it was printed (stderr in red), and how the run ended. */
+const ConsoleView: FC<{run: ConsoleRun | null; idle: string}> = memo(({run, idle}) => {
+  const end = useRef<HTMLDivElement>(null);
+  const count = run?.lines.length ?? 0;
+  const running = run?.running === true;
+  // Follow the output while it comes in, as a terminal does.
+  useEffect(() => {
+    if (running) end.current?.scrollIntoView({block: 'nearest'});
+  }, [count, running]);
+  if (run === null) return <p className="text-ink-300 text-[12px]">{idle}</p>;
+  const seconds = run.ms === undefined ? '' : ` · ${(run.ms / 1000).toFixed(1)} s`;
   return (
-    <details className="border-ink-700 bg-ink-850 mt-3 rounded-lg border px-3 py-2">
-      <summary className="text-ink-300 cursor-pointer text-[11px] font-semibold uppercase tracking-wider">
-        Output · {text.split('\n').length} line{text.split('\n').length === 1 ? '' : 's'}
-      </summary>
-      <pre className="font-code text-ink-200 mt-2 max-h-48 overflow-auto whitespace-pre-wrap text-[11px]">{text}</pre>
-    </details>
+    <div className="border-ink-700 bg-ink-950 font-code rounded-lg border px-3 py-2 text-[11px] leading-relaxed">
+      <p className="text-ink-400">$ {run.label}</p>
+      {count > 0 ? (
+        <pre className="whitespace-pre-wrap break-words">
+          {run.lines.map((line, i) => (
+            <span className={line.stream === 'stderr' ? 'text-danger-300' : 'text-ink-100'} key={i}>
+              {line.text}
+              {'\n'}
+            </span>
+          ))}
+        </pre>
+      ) : null}
+      {running ? (
+        <p className="text-iris-300 animate-pulse">▍</p>
+      ) : run.error !== undefined ? (
+        <p className="text-warning-300 mt-1">✗ {run.error}</p>
+      ) : run.exit === undefined ? (
+        <p className="text-ink-400 mt-1">
+          done{seconds}
+          {count === 0 ? ' · nothing printed' : ''}
+        </p>
+      ) : (
+        <p className={`mt-1 ${run.exit === 0 ? 'text-success-300' : 'text-danger-300'}`}>
+          {run.exit === 0 ? '✓' : '✗'} exited with status {run.exit}
+          {seconds}
+        </p>
+      )}
+      <div ref={end} />
+    </div>
   );
 });
-Output.displayName = 'VerdictOutput';
+ConsoleView.displayName = 'ConsoleView';
 
 /** One metric row: your total, the reference's, the difference; per-check values in the tooltips. */
 const MetricLine: FC<{row: MetricRow; step: Step; yours: readonly CheckResult[]; reference: readonly CheckResult[]}> =
@@ -336,6 +407,8 @@ const VerdictPane: FC<{
   stale: boolean;
   /** The step runs in the browser runtime for this language (a harness exists). */
   executes: boolean;
+  /** The step's file runs in the browser as a program (a PyTorch step): Run executes its self-test. */
+  program: boolean;
   /** A submission is being executed. */
   running: boolean;
   runtime: RuntimeStatus;
@@ -357,6 +430,11 @@ const VerdictPane: FC<{
   comparing?: boolean;
   /** A GitHub issue prefilled for this step and the last verdict. */
   issueUrl?: string;
+  /** The last run's console. */
+  consoleRun: ConsoleRun | null;
+  /** Which view the panel shows: the checks or the console. */
+  tab: BottomTab;
+  onTab: (tab: BottomTab) => void;
 }> = memo(
   ({
     step,
@@ -366,6 +444,7 @@ const VerdictPane: FC<{
     earned,
     stale,
     executes,
+    program,
     running,
     runtime,
     nextTitle,
@@ -377,6 +456,9 @@ const VerdictPane: FC<{
     reference = null,
     comparing = false,
     issueUrl,
+    consoleRun,
+    tab,
+    onTab,
   }) => {
     const showShape = attempt.wrong >= SHAPE_AFTER_WRONG;
     const runError = verdict?.run?.error;
@@ -390,21 +472,33 @@ const VerdictPane: FC<{
     return (
       <div className="flex h-full min-h-0 flex-col">
         <div className="border-ink-700 text-ink-300 flex shrink-0 flex-wrap items-center gap-2 border-b px-3 py-1.5 text-[11px]">
-          <span className="text-iris-400 font-bold uppercase tracking-wider">Checks</span>
+          {executes || program ? (
+            <PanelTabs consoleRun={consoleRun} onTab={onTab} tab={tab} />
+          ) : (
+            <span className="text-iris-400 font-bold uppercase tracking-wider">Checks</span>
+          )}
           <span className="font-code">
             {step.checks.length} for this step · {attempt.wrong} wrong submission{attempt.wrong === 1 ? '' : 's'}
           </span>
-          {executes ? (
+          {executes || program ? (
             <span
               className="border-iris-400/40 bg-iris-400/10 text-iris-200 rounded-full border px-2 py-0.5 text-[10px]"
-              title={`your code runs in the browser: ${LANGUAGE_LABEL[language]}, Redis, Kafka, gRPC and Postgres in-page; these checks exercise it`}>
+              title={
+                program
+                  ? 'your file runs in the browser as a program: Python with PyTorch on the CPU, single-threaded; the checks read its shape'
+                  : `your code runs in the browser: ${LANGUAGE_LABEL[language]}, Redis, Kafka, gRPC and Postgres in-page; these checks exercise it`
+              }>
               runs in the browser
             </span>
           ) : null}
           {running ? (
             <span className="text-iris-200 ml-auto flex items-center gap-1.5">
               <span className="bg-iris-300 h-1.5 w-1.5 animate-pulse rounded-full" />
-              {runtime.state === 'booting' ? STATUS_TEXT[runtime.phase] : 'running your code…'}
+              {runtime.state === 'booting'
+                ? STATUS_TEXT[runtime.phase]
+                : program
+                ? 'running your program…'
+                : 'running your code…'}
             </span>
           ) : stale && verdict !== null ? (
             <span className="text-warning-300 ml-auto">
@@ -413,197 +507,221 @@ const VerdictPane: FC<{
           ) : null}
         </div>
         <div aria-live="polite" className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
-          {verdict === null ? (
-            <p className="text-ink-300 mb-2 text-[12px]">
-              {executes
-                ? `Run (${RUN_KEYS}) tries the example check — the first one — without recording anything. Submit (${SUBMIT_KEYS}) runs all ${step.checks.length} checks and counts; each one exercises your implementation and reports what it observed. The first run downloads ${RUNTIME_DOWNLOAD[language]}.`
-                : `Submit (${SUBMIT_KEYS}) to run the checks. Each one is a property a correct implementation has; failures show what was expected.`}
-            </p>
-          ) : runError !== undefined ? (
-            <div className="border-warning-400/60 bg-warning-400/10 mb-3 rounded-xl border p-3">
-              <p className="text-warning-300 text-[11px] font-bold uppercase tracking-wider">Runtime</p>
-              <p className="text-ink-50 mt-0.5 text-lg font-extrabold">Could not run</p>
-              <p className="text-warning-200 mt-0.5 text-[12px]">{runError}. This did not count as a submission.</p>
-            </div>
-          ) : verdict.trial === true ? (
-            <div
-              className={`mb-3 rounded-xl border p-3 ${
-                verdict.accepted ? 'border-iris-400/60 bg-iris-400/10' : 'border-warning-400/60 bg-warning-400/10'
-              }`}>
-              <p
-                className={`text-[11px] font-bold uppercase tracking-wider ${
-                  verdict.accepted ? 'text-iris-300' : 'text-warning-300'
-                }`}>
-                Run · example only
-              </p>
-              <p className="text-ink-50 mt-0.5 text-lg font-extrabold">
-                {verdict.accepted ? 'Example passed' : 'Example failed'}
-              </p>
-              <p className={`mt-0.5 text-[12px] ${verdict.accepted ? 'text-iris-200' : 'text-warning-200'}`}>
-                {verdict.accepted
-                  ? `Check 1 passed${
-                      verdict.run !== undefined ? ` in ${verdict.run.ms} ms` : ''
-                    }; nothing was recorded. Submit (${SUBMIT_KEYS}) runs all ${
-                      step.checks.length
-                    } checks and scores the step.`
-                  : `Check 1 failed; nothing was recorded. The message under it says what the harness observed.`}
-              </p>
-            </div>
-          ) : verdict.accepted ? (
-            <div className="border-success-400/60 bg-success-400/10 mb-3 flex flex-wrap items-center gap-3 rounded-xl border p-3">
-              <div className="min-w-0 flex-1">
-                <p className="text-success-300 text-[11px] font-bold uppercase tracking-wider">Result</p>
-                <p className="text-ink-50 mt-0.5 text-lg font-extrabold">
-                  Accepted
-                  {earned !== null ? (
-                    <span className="font-code text-success-200 ml-2 text-[13px] font-semibold">+{earned} pts</span>
-                  ) : null}
-                </p>
-                <p className="text-success-200 mt-0.5 text-[12px]">
-                  {verdict.passed}/{verdict.total} checks passed
-                  {verdict.run !== undefined ? ` in ${verdict.run.ms} ms` : ''}
-                  {attempt.status === 'revealed' ? ' · this step was revealed, so it scores 0' : ''}.
-                  {onNext === undefined
-                    ? onCertificate !== undefined
-                      ? ' That was the last step: the course is complete and your certificate is ready.'
-                      : ' That was the last step — read the debrief in the step pane.'
-                    : ' The debrief is in the step pane when you want it.'}
-                </p>
-                {shareUrl !== undefined && attempt.status === 'accepted' ? (
-                  <div className="-ml-1.5 mt-1.5">
-                    <LinkedInButton label="Share this step on LinkedIn" title={POST_HINT} url={shareUrl} />
-                  </div>
-                ) : null}
-              </div>
-              {onNext !== undefined ? (
-                <button
-                  className="bg-success-400 text-ink-950 hover:bg-success-300 shrink-0 rounded-lg px-3 py-1.5 text-left text-[12px] font-bold transition"
-                  onClick={onNext}
-                  title={nextTitle}
-                  type="button">
-                  next step →
-                  {nextTitle !== undefined ? (
-                    <span className="block max-w-[14rem] truncate text-[11px] font-normal opacity-80">{nextTitle}</span>
-                  ) : null}
-                </button>
-              ) : onCertificate !== undefined ? (
-                <button
-                  className="bg-success-400 text-ink-950 hover:bg-success-300 shrink-0 rounded-lg px-3 py-1.5 text-left text-[12px] font-bold transition"
-                  onClick={onCertificate}
-                  type="button">
-                  Get your certificate
-                  <span className="block text-[11px] font-normal opacity-80">download · add to LinkedIn · share</span>
-                </button>
-              ) : null}
-            </div>
-          ) : (
-            <div className="border-danger-400/60 bg-danger-400/10 mb-3 rounded-xl border p-3">
-              <p className="text-danger-300 text-[11px] font-bold uppercase tracking-wider">Result</p>
-              <p className="text-ink-50 mt-0.5 text-lg font-extrabold">Wrong Answer</p>
-              <p className="text-danger-200 mt-0.5 text-[12px]">
-                {verdict.passed}/{verdict.total} checks passed.{' '}
-                {common !== null
-                  ? 'Every failing check hit the same thing:'
-                  : verdict.run !== undefined
-                  ? 'Each failing check says what it observed.'
-                  : showShape
-                  ? 'Failing checks now show the shape the judge expects.'
-                  : `Fix the failing ones and submit again — after ${SHAPE_AFTER_WRONG} wrong submissions, failing checks show the exact shape the judge expects.`}
-              </p>
-              {common !== null ? <p className="font-code text-ink-50 mt-1.5 text-[12px]">{common}</p> : null}
-            </div>
-          )}
-          {verdict !== null &&
-          verdict.accepted &&
-          verdict.trial !== true &&
-          verdict.run !== undefined &&
-          onCompare !== undefined ? (
-            <Comparison
-              comparing={comparing}
-              file={fileName(step.file, language)}
-              onCompare={onCompare}
-              reference={reference}
-              step={step}
-              yours={verdict.results}
+          {tab === 'console' ? (
+            <ConsoleView
+              idle={
+                program
+                  ? `Run (${RUN_KEYS}) runs ${fileName(
+                      step.file,
+                      language,
+                    )} as a program here in the browser — Python with PyTorch on the CPU — and shows what it prints.`
+                  : `What your code prints when you Run (${RUN_KEYS}) or Submit (${SUBMIT_KEYS}) shows here.`
+              }
+              run={consoleRun}
             />
-          ) : null}
-          <ul className="space-y-1.5">
-            {step.checks.map((check, i) => {
-              const result = verdict?.results.find(r => r.id === check.id) ?? null;
-              const tone =
-                result === null
-                  ? 'border-ink-700 bg-ink-850'
-                  : result.passed
-                  ? 'border-success-400/40 bg-success-400/5'
-                  : 'border-danger-400/50 bg-danger-400/5';
-              return (
-                <li className={`rounded-lg border px-3 py-2 ${tone}`} key={check.id}>
-                  <p className="text-ink-100 flex items-center gap-2 text-[13px]">
-                    <span
-                      className={`font-code flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] ${
-                        result === null
-                          ? 'border-ink-500 border text-transparent'
-                          : result.passed
-                          ? 'bg-success-400 text-ink-950'
-                          : 'bg-danger-400 text-ink-950'
-                      }`}>
-                      {result === null ? '·' : result.passed ? '✓' : '✗'}
-                    </span>
-                    <span className="font-code text-ink-400 text-[10px]">{i + 1}</span>
-                    <span className="font-semibold">{check.title}</span>
-                    {executes && i === 0 ? (
-                      <span
-                        className="border-ink-600 text-ink-400 shrink-0 rounded-full border px-1.5 text-[10px]"
-                        title={`the check Run (${RUN_KEYS}) exercises without recording anything`}>
-                        example
-                      </span>
-                    ) : null}
-                    {result !== null && result.shape !== undefined && result.shape !== result.passed ? (
-                      <span
-                        className={`ml-auto shrink-0 rounded-full border px-1.5 text-[10px] ${
-                          result.passed ? 'border-ink-600 text-ink-400' : 'border-warning-400/50 text-warning-300'
-                        }`}
-                        title={
-                          result.passed
-                            ? 'Your code passes this check but is shaped differently from the reference solution — that is fine; the runtime result decides.'
-                            : 'Your code is shaped like the reference solution but does not pass when run: the logic, not the spelling, is off.'
-                        }>
-                        {result.passed ? 'unlike the reference' : 'looks right, fails'}
-                      </span>
-                    ) : null}
+          ) : (
+            <>
+              {verdict === null ? (
+                <p className="text-ink-300 mb-2 text-[12px]">
+                  {executes
+                    ? `Run (${RUN_KEYS}) tries the example check — the first one — without recording anything. Submit (${SUBMIT_KEYS}) runs all ${step.checks.length} checks and counts; each one exercises your implementation and reports what it observed. The first run downloads ${RUNTIME_DOWNLOAD[language]}.`
+                    : program
+                    ? `Submit (${SUBMIT_KEYS}) checks the shape of your code: each check is a property a correct implementation has. Run (${RUN_KEYS}) runs ${fileName(
+                        step.file,
+                        language,
+                      )} here in the browser as a program — Python with PyTorch on the CPU — and shows its self-test in the console; nothing is recorded. The first run downloads PyTorch (~40 MB).`
+                    : `Submit (${SUBMIT_KEYS}) to run the checks. Each one is a property a correct implementation has; failures show what was expected.`}
+                </p>
+              ) : runError !== undefined ? (
+                <div className="border-warning-400/60 bg-warning-400/10 mb-3 rounded-xl border p-3">
+                  <p className="text-warning-300 text-[11px] font-bold uppercase tracking-wider">Runtime</p>
+                  <p className="text-ink-50 mt-0.5 text-lg font-extrabold">Could not run</p>
+                  <p className="text-warning-200 mt-0.5 text-[12px]">{runError}. This did not count as a submission.</p>
+                </div>
+              ) : verdict.trial === true ? (
+                <div
+                  className={`mb-3 rounded-xl border p-3 ${
+                    verdict.accepted ? 'border-iris-400/60 bg-iris-400/10' : 'border-warning-400/60 bg-warning-400/10'
+                  }`}>
+                  <p
+                    className={`text-[11px] font-bold uppercase tracking-wider ${
+                      verdict.accepted ? 'text-iris-300' : 'text-warning-300'
+                    }`}>
+                    Run · example only
                   </p>
-                  {result !== null && !result.passed ? (
-                    <>
-                      {result.message !== undefined && result.message !== common ? (
-                        <p className="font-code text-danger-200 mt-1 pl-6 text-[12px]">{result.message}</p>
+                  <p className="text-ink-50 mt-0.5 text-lg font-extrabold">
+                    {verdict.accepted ? 'Example passed' : 'Example failed'}
+                  </p>
+                  <p className={`mt-0.5 text-[12px] ${verdict.accepted ? 'text-iris-200' : 'text-warning-200'}`}>
+                    {verdict.accepted
+                      ? `Check 1 passed${
+                          verdict.run !== undefined ? ` in ${verdict.run.ms} ms` : ''
+                        }; nothing was recorded. Submit (${SUBMIT_KEYS}) runs all ${
+                          step.checks.length
+                        } checks and scores the step.`
+                      : `Check 1 failed; nothing was recorded. The message under it says what the harness observed.`}
+                  </p>
+                </div>
+              ) : verdict.accepted ? (
+                <div className="border-success-400/60 bg-success-400/10 mb-3 flex flex-wrap items-center gap-3 rounded-xl border p-3">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-success-300 text-[11px] font-bold uppercase tracking-wider">Result</p>
+                    <p className="text-ink-50 mt-0.5 text-lg font-extrabold">
+                      Accepted
+                      {earned !== null ? (
+                        <span className="font-code text-success-200 ml-2 text-[13px] font-semibold">+{earned} pts</span>
                       ) : null}
-                      <p className="text-ink-200 mt-1 pl-6 text-[12px]">
-                        <InlineMarkdown source={check.detail} />
-                      </p>
-                      {showShape && result.shape === undefined ? (
-                        <ExpectedShape check={check} language={language} />
+                    </p>
+                    <p className="text-success-200 mt-0.5 text-[12px]">
+                      {verdict.passed}/{verdict.total} checks passed
+                      {verdict.run !== undefined ? ` in ${verdict.run.ms} ms` : ''}
+                      {attempt.status === 'revealed' ? ' · this step was revealed, so it scores 0' : ''}.
+                      {onNext === undefined
+                        ? onCertificate !== undefined
+                          ? ' That was the last step: the course is complete and your certificate is ready.'
+                          : ' That was the last step — read the debrief in the step pane.'
+                        : ' The debrief is in the step pane when you want it.'}
+                    </p>
+                    {shareUrl !== undefined && attempt.status === 'accepted' ? (
+                      <div className="-ml-1.5 mt-1.5">
+                        <LinkedInButton label="Share this step on LinkedIn" title={POST_HINT} url={shareUrl} />
+                      </div>
+                    ) : null}
+                  </div>
+                  {onNext !== undefined ? (
+                    <button
+                      className="bg-success-400 text-ink-950 hover:bg-success-300 shrink-0 rounded-lg px-3 py-1.5 text-left text-[12px] font-bold transition"
+                      onClick={onNext}
+                      title={nextTitle}
+                      type="button">
+                      next step →
+                      {nextTitle !== undefined ? (
+                        <span className="block max-w-[14rem] truncate text-[11px] font-normal opacity-80">
+                          {nextTitle}
+                        </span>
                       ) : null}
-                    </>
+                    </button>
+                  ) : onCertificate !== undefined ? (
+                    <button
+                      className="bg-success-400 text-ink-950 hover:bg-success-300 shrink-0 rounded-lg px-3 py-1.5 text-left text-[12px] font-bold transition"
+                      onClick={onCertificate}
+                      type="button">
+                      Get your certificate
+                      <span className="block text-[11px] font-normal opacity-80">
+                        download · add to LinkedIn · share
+                      </span>
+                    </button>
                   ) : null}
-                </li>
-              );
-            })}
-          </ul>
-          {verdict?.run !== undefined ? <Output stderr={verdict.run.stderr} stdout={verdict.run.stdout} /> : null}
-          <Submissions history={attempt.history ?? EMPTY_HISTORY} onView={onViewSubmission} />
-          {issueUrl !== undefined ? (
-            <p className="text-ink-500 mt-3 text-[11px]">
-              Something wrong with this step — the task, a hint, a check, the verdict?{' '}
-              <a
-                className="text-iris-300 hover:text-iris-200 transition"
-                href={issueUrl}
-                rel="noreferrer"
-                target="_blank"
-                title="opens a GitHub issue prefilled with the step, the language, your browser and the last verdict">
-                report it ›
-              </a>
-            </p>
-          ) : null}
+                </div>
+              ) : (
+                <div className="border-danger-400/60 bg-danger-400/10 mb-3 rounded-xl border p-3">
+                  <p className="text-danger-300 text-[11px] font-bold uppercase tracking-wider">Result</p>
+                  <p className="text-ink-50 mt-0.5 text-lg font-extrabold">Wrong Answer</p>
+                  <p className="text-danger-200 mt-0.5 text-[12px]">
+                    {verdict.passed}/{verdict.total} checks passed.{' '}
+                    {common !== null
+                      ? 'Every failing check hit the same thing:'
+                      : verdict.run !== undefined
+                      ? 'Each failing check says what it observed.'
+                      : showShape
+                      ? 'Failing checks now show the shape the judge expects.'
+                      : `Fix the failing ones and submit again — after ${SHAPE_AFTER_WRONG} wrong submissions, failing checks show the exact shape the judge expects.`}
+                  </p>
+                  {common !== null ? <p className="font-code text-ink-50 mt-1.5 text-[12px]">{common}</p> : null}
+                </div>
+              )}
+              {verdict !== null &&
+              verdict.accepted &&
+              verdict.trial !== true &&
+              verdict.run !== undefined &&
+              onCompare !== undefined ? (
+                <Comparison
+                  comparing={comparing}
+                  file={fileName(step.file, language)}
+                  onCompare={onCompare}
+                  reference={reference}
+                  step={step}
+                  yours={verdict.results}
+                />
+              ) : null}
+              <ul className="space-y-1.5">
+                {step.checks.map((check, i) => {
+                  const result = verdict?.results.find(r => r.id === check.id) ?? null;
+                  const tone =
+                    result === null
+                      ? 'border-ink-700 bg-ink-850'
+                      : result.passed
+                      ? 'border-success-400/40 bg-success-400/5'
+                      : 'border-danger-400/50 bg-danger-400/5';
+                  return (
+                    <li className={`rounded-lg border px-3 py-2 ${tone}`} key={check.id}>
+                      <p className="text-ink-100 flex items-center gap-2 text-[13px]">
+                        <span
+                          className={`font-code flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] ${
+                            result === null
+                              ? 'border-ink-500 border text-transparent'
+                              : result.passed
+                              ? 'bg-success-400 text-ink-950'
+                              : 'bg-danger-400 text-ink-950'
+                          }`}>
+                          {result === null ? '·' : result.passed ? '✓' : '✗'}
+                        </span>
+                        <span className="font-code text-ink-400 text-[10px]">{i + 1}</span>
+                        <span className="font-semibold">{check.title}</span>
+                        {executes && i === 0 ? (
+                          <span
+                            className="border-ink-600 text-ink-400 shrink-0 rounded-full border px-1.5 text-[10px]"
+                            title={`the check Run (${RUN_KEYS}) exercises without recording anything`}>
+                            example
+                          </span>
+                        ) : null}
+                        {result !== null && result.shape !== undefined && result.shape !== result.passed ? (
+                          <span
+                            className={`ml-auto shrink-0 rounded-full border px-1.5 text-[10px] ${
+                              result.passed ? 'border-ink-600 text-ink-400' : 'border-warning-400/50 text-warning-300'
+                            }`}
+                            title={
+                              result.passed
+                                ? 'Your code passes this check but is shaped differently from the reference solution — that is fine; the runtime result decides.'
+                                : 'Your code is shaped like the reference solution but does not pass when run: the logic, not the spelling, is off.'
+                            }>
+                            {result.passed ? 'unlike the reference' : 'looks right, fails'}
+                          </span>
+                        ) : null}
+                      </p>
+                      {result !== null && !result.passed ? (
+                        <>
+                          {result.message !== undefined && result.message !== common ? (
+                            <p className="font-code text-danger-200 mt-1 pl-6 text-[12px]">{result.message}</p>
+                          ) : null}
+                          <p className="text-ink-200 mt-1 pl-6 text-[12px]">
+                            <InlineMarkdown source={check.detail} />
+                          </p>
+                          {showShape && result.shape === undefined ? (
+                            <ExpectedShape check={check} language={language} />
+                          ) : null}
+                        </>
+                      ) : null}
+                    </li>
+                  );
+                })}
+              </ul>
+              <Submissions history={attempt.history ?? EMPTY_HISTORY} onView={onViewSubmission} />
+              {issueUrl !== undefined ? (
+                <p className="text-ink-500 mt-3 text-[11px]">
+                  Something wrong with this step — the task, a hint, a check, the verdict?{' '}
+                  <a
+                    className="text-iris-300 hover:text-iris-200 transition"
+                    href={issueUrl}
+                    rel="noreferrer"
+                    target="_blank"
+                    title="opens a GitHub issue prefilled with the step, the language, your browser and the last verdict">
+                    report it ›
+                  </a>
+                </p>
+              ) : null}
+            </>
+          )}
         </div>
       </div>
     );

@@ -64,6 +64,7 @@ export const ddpmSampleStep: Step = {
   title: 'The reverse step, the T → 0 sampler, and DDIM on a strided schedule',
   concept: 'pytorch',
   file: 'ddpm_sample',
+  localOnly: 'its self-test runs for minutes on the single CPU thread PyTorch gets in the browser',
   focus: ['eps-pred', 'mean', 'noise-step', 'samples'],
   task: `## Task
 

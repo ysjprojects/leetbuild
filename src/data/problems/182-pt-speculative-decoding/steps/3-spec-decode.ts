@@ -5,6 +5,7 @@ export const specDecodeStep: Step = {
   title: 'The speculative loop: one target pass per round',
   concept: 'pytorch',
   file: 'spec_decode',
+  localOnly: 'its self-test runs for minutes on the single CPU thread PyTorch gets in the browser',
   focus: ['target-pass', 'rollback', 'tcache-before', 'tcache-scored', 'tcache-rolled', 'dcache-rolled'],
   task: `## Task
 

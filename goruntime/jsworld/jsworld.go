@@ -7,6 +7,7 @@
 package jsworld
 
 import (
+	"math"
 	"sync"
 	"sync/atomic"
 	"syscall/js"
@@ -72,7 +73,10 @@ type jsClock struct{ b js.Value }
 
 func (c *jsClock) Now() time.Time {
 	ms := c.b.Call("now").Float()
-	return time.Unix(0, int64(ms*1e6))
+	// Whole milliseconds exactly, the fraction apart: ms*1e6 at the epoch's magnitude is past float64's
+	// exact integers, and its rounding shows in differences (400 ms apart coming out 399.99974 ms).
+	whole := math.Floor(ms)
+	return time.UnixMilli(int64(whole)).Add(time.Duration((ms - whole) * float64(time.Millisecond)))
 }
 
 func millis(d time.Duration) float64 {

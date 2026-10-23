@@ -5,6 +5,8 @@ export const zero3Step: Step = {
   title: 'ZeRO-3: sharded weights, gathered per layer',
   concept: 'pytorch',
   file: 'zero3',
+  localOnly:
+    'its self-test runs the ranks as gloo processes through torch.multiprocessing, which the browser runtime cannot start',
   focus: [
     'shard-rest',
     'fwd-gather',

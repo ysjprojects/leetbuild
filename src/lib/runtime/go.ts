@@ -197,6 +197,8 @@ export async function createGoRuntime(host: GoHost): Promise<GoRuntime> {
   const compiled = await WebAssembly.compile(await host.wasm());
   let api: GoApi | null = null;
   let exited: Promise<void> = Promise.resolve();
+  /** The current program has exited (a fatal Go error): its API must not be called again. */
+  let dead = false;
   let disable = async (): Promise<void> => undefined;
 
   /** A fresh Go program on a fresh bridge; the previous program, if any, is cut off first. */
@@ -210,7 +212,15 @@ export async function createGoRuntime(host: GoHost): Promise<GoRuntime> {
     const program = new scope.Go();
     const instance = await WebAssembly.instantiate(compiled, program.importObject);
     // run() executes main up to its `select {}` synchronously, so the API is in place on return.
-    exited = program.run(instance).catch(() => undefined);
+    dead = false;
+    exited = program.run(instance).then(
+      () => {
+        dead = true;
+      },
+      () => {
+        dead = true;
+      },
+    );
     const started = scope.__lbGoRuntime;
     if (started === undefined) throw new Error('the Go runtime did not start');
     return started;
@@ -242,7 +252,13 @@ export async function createGoRuntime(host: GoHost): Promise<GoRuntime> {
           const timedOut = new Promise<'timeout'>(resolve => {
             budget = CLOCK.realTimeout(() => resolve('timeout'), CHECK_BUDGET_MS);
           });
-          const outcome = await Promise.race([api.run(payload, id), timedOut, exited.then(() => 'exited' as const)]);
+          if (dead) api = await start();
+          const live = api;
+          // A program that died between two checks throws on the call itself: a crash, like dying during one.
+          const running = new Promise<string>((resolve, reject) => {
+            live.run(payload, id).then(resolve, reject);
+          }).catch(() => 'exited' as const);
+          const outcome = await Promise.race([running, timedOut, exited.then(() => 'exited' as const)]);
           if (outcome === 'exited') {
             checks.push({id, passed: false, message: 'the Go runtime crashed during this check'});
             api = await start();

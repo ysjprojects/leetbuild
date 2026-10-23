@@ -90,10 +90,12 @@ export class Clock {
   /**
    * Stop following real time until the next reset: the clock moves only when advanced or when it
    * jumps to a sleep. The Go runtime's checks run this way, its interpreted code being slow enough
-   * for real time to show (a rate limiter would refill between two requests).
+   * for real time to show (a rate limiter would refill between two requests). It stops on a whole
+   * second, so that sub-second arithmetic on epoch seconds (a float64 of seconds is coarse to a
+   * quarter microsecond today) rounds the same in every run.
    */
   freeze(): void {
-    this.frozenAt ??= realNow();
+    this.frozenAt ??= Math.floor(realNow() / 1000) * 1000;
   }
 
   /** Keep idle turns from jumping to pending sleeps until `release` (the Go harness's tick). */

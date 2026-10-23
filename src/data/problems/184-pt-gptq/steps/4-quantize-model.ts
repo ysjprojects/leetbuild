@@ -5,6 +5,7 @@ export const quantizeModelStep: Step = {
   title: 'The whole model: sequential calibration, swap, perplexity',
   concept: 'pytorch',
   file: 'gptq_model',
+  localOnly: 'its self-test runs for minutes on the single CPU thread PyTorch gets in the browser',
   focus: ['calib-ids', 'embed-cache', 'collect', 'solve', 'swap', 'propagate', 'ppl'],
   task: `## Task
 

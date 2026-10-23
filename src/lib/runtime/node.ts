@@ -15,7 +15,7 @@ import {loadPyodide} from 'pyodide';
 import {createDbBridge} from './db';
 import {createGoRuntime} from './go';
 import {luaEval} from './lua';
-import {bootPython, runPython} from './python';
+import {bootPython, loadTorch, needsTorch, runPython} from './python';
 import {reportUnhandledRejection} from './ts/harness';
 import type {RunJob, RunResult} from './types';
 import {createTypeScriptRuntime} from './typescript';
@@ -29,12 +29,15 @@ const openPglite = async (): Promise<PGlite> => new PGlite({extensions: {vector}
 
 export async function createNodePythonRuntime(assetDir = resolve(process.cwd(), 'public/py')): Promise<NodeRuntime> {
   const pyodide = await loadPyodide({stdout: () => undefined, stderr: () => undefined});
-  await bootPython(
-    pyodide,
-    {read: path => readFile(resolve(assetDir, path))},
-    {luaEval, db: createDbBridge(openPglite)},
-  );
-  return {run: job => runPython(pyodide, job)};
+  const assets = {read: (path: string) => readFile(resolve(assetDir, path))};
+  await bootPython(pyodide, assets, {luaEval, db: createDbBridge(openPglite)});
+  let torch: Promise<void> | null = null;
+  return {
+    run: async job => {
+      if (job.program === true && needsTorch(job)) await (torch ??= loadTorch(pyodide, assets));
+      return runPython(pyodide, job);
+    },
+  };
 }
 
 export function createNodeTypeScriptRuntime(): NodeRuntime {

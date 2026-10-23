@@ -4,6 +4,7 @@ import {type CSSProperties, type FC, Fragment, memo, useCallback, useEffect, use
 
 import {problems} from '@/data/problems';
 import {downloadCertificate} from '@/lib/certificate';
+import {type BottomTab, type ConsoleRun, finished} from '@/lib/console';
 import {downloadMarkdown, exportFileName, problemToMarkdown, problemUrl, siteUrl} from '@/lib/export';
 import {type TreeNode, buildTree} from '@/lib/fileTree';
 import {type Badge, badgeOf, dayKey, earnedBadges, streakOf} from '@/lib/gamify';
@@ -11,7 +12,7 @@ import {type Verdict, exampleCheck, judge, narrow, withRuntime} from '@/lib/judg
 import {type ProvidedFile, isProvidedId, providedFiles, providedId, providedPath} from '@/lib/provided';
 import {stepIssueUrl} from '@/lib/report';
 import {type RuntimeStatus, getRunner} from '@/lib/runtime/client';
-import type {RunJob} from '@/lib/runtime/types';
+import type {OutputLine, RunJob} from '@/lib/runtime/types';
 import {
   type StepAttempt,
   type Submission,
@@ -50,6 +51,7 @@ import {
   LANGUAGE_LABEL,
   LANGUAGE_STACK,
   LANGUAGES,
+  runsAsProgram,
   stepKey,
   stepPath,
 } from '@/lib/types';
@@ -665,6 +667,9 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   /** The reference solution's verdict for the accepted step, once compared; the run is in progress while `comparing`. */
   const [reference, setReference] = useState<Verdict | null>(null);
   const [comparing, setComparing] = useState(false);
+  /** The last run's console (what it printed, how it ended) and which view the bottom panel shows. */
+  const [consoleRun, setConsoleRun] = useState<ConsoleRun | null>(null);
+  const [bottomTab, setBottomTab] = useState<BottomTab>('checks');
   /** Bumped per submit and on every mount: a run that finishes after the step changed must not show its verdict. */
   const submitSeq = useRef(0);
   /** Below `lg` the problem pane is an accordion over the editor; this is its state (the `lg` sidebar is `layout.pane`). */
@@ -704,6 +709,8 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   // A deep-learning problem is written in one language; everything else follows the learner's choice.
   const language = problem?.language ?? progress.language;
   const runner = useMemo(() => getRunner(language), [language]);
+  /** A PyTorch problem's step runs as a program in the browser: Run executes the file's self-test; Submit stays static. */
+  const program = problem !== null && step !== null && runsAsProgram(problem, step, language);
   const attemptKey = problem !== null && step !== null ? stepKey(problem.id, step.id) : null;
   const attempt: StepAttempt = attemptKey === null ? OPEN_ATTEMPT : progress.attempts[attemptKey] ?? OPEN_ATTEMPT;
   /** The step's own file — what Submit judges and the solution diffs against, whichever tab is open. */
@@ -793,6 +800,8 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
       setReference(null);
       setVerdictCode('');
       setEarned(null);
+      setConsoleRun(null);
+      setBottomTab('checks');
     },
     [openTab],
   );
@@ -1092,8 +1101,8 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
 
   // A step that runs in the browser boots the runtime as soon as it opens, so Submit does not wait for the download.
   useEffect(() => {
-    if (loaded && step?.harness?.[language] !== undefined) runner?.prewarm();
-  }, [loaded, step, language, runner]);
+    if (loaded && (step?.harness?.[language] !== undefined || program)) runner?.prewarm();
+  }, [loaded, step, language, runner, program]);
 
   /** Record a decided verdict: the attempt, the submission history (with the code judged), the score, the celebration. */
   const record = useCallback(
@@ -1169,6 +1178,14 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     [problem, step, language],
   );
 
+  /** Start the console for a run; the returned sink drops lines once another run or step took over. */
+  const capture = useCallback((label: string, token: number) => {
+    setConsoleRun({label, lines: [], running: true});
+    return (line: OutputLine): void => {
+      if (submitSeq.current === token) setConsoleRun(c => (c === null ? c : {...c, lines: [...c.lines, line]}));
+    };
+  }, []);
+
   const submit = useCallback(() => {
     if (problem === null || step === null || attemptKey === null || running) return;
     const src = filesRef.current[step.id] ?? codeFor(step, language).starter;
@@ -1191,17 +1208,19 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     setVerdict(null);
     setReference(null);
     setRunning(true);
-    void runner.run(job).then(run => {
+    const onOutput = capture(`submit · ${step.checks.length} checks`, token);
+    void runner.run(job, onOutput).then(run => {
       setRunning(false);
       const decided = withRuntime(result, run);
       // A runtime that could not run the code is not a wrong submission; a decided run is recorded even if the
       // learner moved on, but its verdict is only shown for the step it belongs to.
       if (run.error === undefined) record(decided, src);
       if (submitSeq.current !== token) return;
+      setConsoleRun(c => (c === null ? c : finished(c, run)));
       setVerdict(decided);
       showVerdict();
     });
-  }, [problem, step, attemptKey, language, running, runner, assemble, record, showVerdict]);
+  }, [problem, step, attemptKey, language, running, runner, assemble, record, showVerdict, capture]);
 
   /** Run: execute the example check only and show what happened; no attempt, history or score is touched. */
   const trial = useCallback(() => {
@@ -1219,13 +1238,37 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     setReference(null);
     setEarned(null);
     setRunning(true);
-    void runner.run(job).then(run => {
+    const onOutput = capture('run · example check', token);
+    void runner.run(job, onOutput).then(run => {
       setRunning(false);
       if (submitSeq.current !== token) return;
+      setConsoleRun(c => (c === null ? c : finished(c, run)));
       setVerdict({...withRuntime(result, run), trial: true});
       showVerdict();
     });
-  }, [problem, step, language, running, runner, assemble, showVerdict]);
+  }, [problem, step, language, running, runner, assemble, showVerdict, capture]);
+
+  /**
+   * Run a PyTorch step's file as a program — `python file.py`, its self-test included — in the browser,
+   * beside the course's other files (as `assemble` mounts them). The console shows it; nothing is recorded.
+   */
+  const runProgram = useCallback(() => {
+    if (step === null || running || runner === null) return;
+    const job = assemble('', []);
+    if (job === null) return;
+    const token = ++submitSeq.current;
+    const onOutput = capture(`python ${fileName(step.file, language)}`, token);
+    setBottomTab('console');
+    setRunning(true);
+    void runner.run({...job, program: true}, onOutput).then(run => {
+      setRunning(false);
+      if (submitSeq.current !== token) return;
+      setConsoleRun(c => (c === null ? c : finished(c, run)));
+    });
+  }, [step, running, runner, assemble, capture, language]);
+
+  /** What Run does: the example check where a harness exists, the program for a PyTorch step. */
+  const runStep = program ? runProgram : trial;
 
   /**
    * Against the reference: the reference solution in place of the step's file, the same checks, the
@@ -1427,7 +1470,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
         submit();
       } else if (modKey && !e.shiftKey && !e.altKey && e.code === 'Quote') {
         e.preventDefault();
-        trial();
+        runStep();
       } else if (modKey && e.shiftKey && !e.altKey && e.code === 'KeyF' && problem !== null) {
         e.preventDefault();
         toggleFocus();
@@ -1456,7 +1499,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     return () => window.removeEventListener('keydown', onKey);
   }, [
     submit,
-    trial,
+    runStep,
     problem,
     toggleExplorer,
     togglePaneSidebar,
@@ -1703,15 +1746,19 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                       type="button">
                       reset
                     </button>
-                    {step.harness?.[language] !== undefined ? (
+                    {step.harness?.[language] !== undefined || program ? (
                       <button
                         className="border-ink-600 text-ink-200 hover:border-iris-400/60 hover:text-ink-50 rounded-lg border px-2.5 py-[3px] text-[12px] font-semibold transition disabled:cursor-wait disabled:opacity-60"
                         disabled={running || comparing}
-                        onClick={trial}
-                        title={`${RUN_SHORTCUT} · runs ${fileName(
-                          step.file,
-                          language,
-                        )} against the example check; nothing is recorded`}
+                        onClick={runStep}
+                        title={`${RUN_SHORTCUT} · ${
+                          program
+                            ? `runs ${fileName(
+                                step.file,
+                                language,
+                              )} as a program in the browser, its self-test included`
+                            : `runs ${fileName(step.file, language)} against the example check`
+                        }; nothing is recorded`}
                         type="button">
                         Run {RUN_KEYS}
                       </button>
@@ -1755,7 +1802,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                     fileKey={`${problem.id}/${openFile}/${language}`}
                     language={language}
                     onChange={onCodeChange}
-                    onRun={trial}
+                    onRun={runStep}
                     onSubmit={submit}
                     resetKey={resetKey}
                     value={openCode}
@@ -1770,6 +1817,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                 <VerdictPane
                   attempt={attempt}
                   comparing={comparing}
+                  consoleRun={consoleRun}
                   earned={earned}
                   executes={step.harness?.[language] !== undefined}
                   issueUrl={issueUrl}
@@ -1778,13 +1826,16 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                   onCertificate={certified ? onCertificate : undefined}
                   onCompare={compare}
                   onNext={stepIndex + 1 < problem.steps.length ? onNextStep : undefined}
+                  onTab={setBottomTab}
                   onViewSubmission={onViewSubmission}
+                  program={program}
                   reference={reference}
                   running={running}
                   runtime={runtimeStatus}
                   shareUrl={stepShareUrl}
                   stale={verdict !== null && verdictCode !== stepCode}
                   step={step}
+                  tab={bottomTab}
                   verdict={verdict}
                 />
               </div>

@@ -5,6 +5,8 @@ export const tpVocabStep: Step = {
   title: 'The vocabulary: parallel embedding, tied head, parallel cross-entropy',
   concept: 'pytorch',
   file: 'tp_vocab',
+  localOnly:
+    'its self-test runs the ranks as gloo processes through torch.multiprocessing, which the browser runtime cannot start',
   focus: ['vocab-embed', 'lm-logits', 'ce-max', 'ce-sumexp', 'ce-target', 'ce-loss'],
   task: `## Task
 

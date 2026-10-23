@@ -8,7 +8,7 @@ import type {PyodideInterface} from 'pyodide';
 
 import {createDbBridge, openPgliteFromCdn} from './db';
 import {luaEval} from './lua';
-import {bootPython, PYODIDE_INDEX_URL, runPython} from './python';
+import {type Assets, bootPython, loadTorch, needsTorch, PYODIDE_INDEX_URL, runPython} from './python';
 import type {WorkerIn, WorkerOut} from './types';
 
 /** Pyodide comes from the CDN at run time: it locates its own .wasm/.data next to its module URL. */
@@ -23,6 +23,16 @@ const scope = self as unknown as WorkerScope;
 const post = (message: WorkerOut): void => scope.postMessage(message);
 
 let booting: Promise<PyodideInterface> | null = null;
+let torch: Promise<void> | null = null;
+
+/** The runtime's assets, from this site's `/py`. */
+const assets: Assets = {
+  read: async path => {
+    const response = await fetch(`/py/${path}`);
+    if (!response.ok) throw new Error(`${path}: ${response.status}`);
+    return new Uint8Array(await response.arrayBuffer());
+  },
+};
 
 const boot = async (): Promise<PyodideInterface> => {
   post({type: 'phase', phase: 'pyodide'});
@@ -30,23 +40,23 @@ const boot = async (): Promise<PyodideInterface> => {
   // files inside the bundle; the CDN copies resolve them relative to their own URL.
   const {loadPyodide} = (await import(/* webpackIgnore: true */ PYODIDE_MODULE_URL)) as typeof import('pyodide');
   const pyodide = await loadPyodide({indexURL: PYODIDE_INDEX_URL});
-  await bootPython(
-    pyodide,
-    {
-      read: async path => {
-        const response = await fetch(`/py/${path}`);
-        if (!response.ok) throw new Error(`${path}: ${response.status}`);
-        return new Uint8Array(await response.arrayBuffer());
-      },
-    },
-    {
-      luaEval,
-      db: createDbBridge(openPgliteFromCdn),
-    },
-    phase => post({type: 'phase', phase}),
+  await bootPython(pyodide, assets, {luaEval, db: createDbBridge(openPgliteFromCdn)}, phase =>
+    post({type: 'phase', phase}),
   );
   post({type: 'ready'});
   return pyodide;
+};
+
+/** PyTorch, loaded on the first program that imports it (~40 MB the first time, then cached). */
+const withTorch = (pyodide: PyodideInterface): Promise<void> => {
+  if (torch === null) {
+    post({type: 'phase', phase: 'torch'});
+    torch = loadTorch(pyodide, assets).catch(error => {
+      torch = null;
+      throw error;
+    });
+  }
+  return torch;
 };
 
 const ready = (): Promise<PyodideInterface> => {
@@ -72,6 +82,7 @@ scope.onmessage = async event => {
   let pyodide: PyodideInterface;
   try {
     pyodide = await ready();
+    if (message.job.program === true && needsTorch(message.job)) await withTorch(pyodide);
   } catch (error) {
     const text = error instanceof Error ? error.message : String(error);
     post({
@@ -81,5 +92,11 @@ scope.onmessage = async event => {
     });
     return;
   }
-  post({type: 'result', id: message.id, result: await runPython(pyodide, message.job)});
+  const {id} = message;
+  post({type: 'started', id});
+  post({
+    type: 'result',
+    id,
+    result: await runPython(pyodide, message.job, line => post({type: 'output', id, ...line})),
+  });
 };
