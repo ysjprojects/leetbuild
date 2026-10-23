@@ -40,10 +40,10 @@ values NVFP4 stores as 0 at least halves (17.3 % to 5.4 %), **while the relative
 does not fall** (0.076 to 0.097). Then it prints \`PASS\`.
 
 > A rotation does not make a tensor easier to round on average: it makes every block look like the
-> same Gaussian. What that buys is that no block is dominated by one value and no small value is
-> flushed, which matters for the gradients a GEMM sums, not for the error norm of the tensor.`,
+> same Gaussian. What that buys is that no block is dominated by one value and far fewer small values
+> are flushed; the paper's evidence that this helps wgrad is the training loss, not the tensor's error norm.`,
   hints: [
-    'Sylvester: start with `H = torch.ones(1, 1)` and, while `H.shape[0] < d`, set `H = torch.cat([torch.cat([H, H], dim=1), torch.cat([H, -H], dim=1)], dim=0)`. Divide by `math.sqrt(d)` once at the end.',
+    'Grow `H` from `torch.ones(1, 1)` until it is `d` wide: each doubling is one `torch.cat` of `[H, H]` and `[H, -H]` along `dim=1`, then one along `dim=0`. Divide by `math.sqrt(d)` once at the end, not per doubling.',
     '`torch.randint(0, 2, (d,), generator=generator).float() * 2 - 1` gives the signs. `signs.unsqueeze(1) * H` multiplies row `i` by `signs[i]`, which is `torch.diag(signs) @ H` without the matrix.',
     'For the tiling, `x.reshape(*x.shape[:-1], x.shape[-1] // d, d) @ H` multiplies every 16-wide tile at once (the matmul broadcasts over the leading dims); `.reshape(x.shape)` merges them back. A transposed input (`dy.T`) is not contiguous, which `reshape` handles and `view` does not.',
   ],
@@ -312,9 +312,9 @@ the E4M3 scale already maps a heavy-tailed block's maximum almost exactly onto 6
 spreads that maximum's energy over the coarse E2M1 grid. MXFP4, with power-of-two scales, gains much
 more from rotations. The NVFP4 pretraining paper applies the transform only to the wgrad inputs:
 there it lowers the validation loss of its 1.2B model, while rotating the fprop or dgrad inputs makes
-that model worse, and the random signs and a larger matrix only pay off on the 12B run over 10T
-tokens. The benefit is about the gradients summed over the token dimension, not about a tensor's
-error norm. Transformer Engine computes the
+that model worse, and the random signs and the matrix size make no measurable difference at 1.2B and
+only matter at 12B. The paper credits the transform with bounding block-level outliers; its evidence
+is the training loss, not a tensor's error norm. Transformer Engine computes the
 16 × 16 matrix once and caches it; per the paper the transform is a batched matmul of \`m · k · 16\`
 multiply-adds, bound by reading the tensor, and can be fused with the kernels around it.`,
 };

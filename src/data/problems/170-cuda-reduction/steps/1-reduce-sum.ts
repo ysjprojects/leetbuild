@@ -22,13 +22,13 @@ reference at a relative tolerance of \`1e-5\`.
   and no \`cub::\`/\`thrust::\`.
 - **Warp reduction.** \`__device__ float warp_reduce_sum(float v)\`: \`v += __shfl_down_sync(0xffffffff, v,
   offset)\` for \`offset = 16, 8, 4, 2, 1\`; lane 0 ends with the warp's sum. The mask is the full
-  \`0xffffffff\` — not \`__activemask()\`, not the unsynchronised \`__shfl_down\`.
+  \`0xffffffff\`, not \`__activemask()\`, not the unsynchronised \`__shfl_down\`.
 - **One shared slot per warp.** \`lane = threadIdx.x % 32\`, \`warp = threadIdx.x / 32\`; lane 0 of each warp
   writes \`warp_sums[warp]\` (\`__shared__ float warp_sums[32]\`), then \`__syncthreads()\`.
 - **Warp 0 finishes the block.** It reads \`lane < blockDim.x / 32 ? warp_sums[lane] : 0\`, calls
   \`warp_reduce_sum\` again, and lane 0 does **one** \`atomicAdd(out, v)\` for the whole block.
 - **Block size** is a multiple of 32, at most 1024; the host rejects anything else before launching.
-- Forbidden: the interleaved-addressing tree (\`if (tid % (2 * s) == 0)\` with \`s *= 2\`) — half the lanes
+- Forbidden: the interleaved-addressing tree (\`if (tid % (2 * s) == 0)\` with \`s *= 2\`): half the lanes
   of every warp idle at the first level and the \`%\` costs more than the add.
 - The self-test zeroes \`*out\` with \`cudaMemset\` before **every** launch (atomics accumulate), checks the
   launch, copies the float back, reports ms per launch and GB/s over 20 launches, and prints \`PASS\`.
@@ -38,12 +38,12 @@ Step through the warp's five shuffles beside the shared-memory tree they replace
 :::widget warp-reduce
 
 > A sum of 16 M floats moves 64 MiB and does 16 M adds: it is bandwidth-bound, so the kernel reads each
-> element exactly once, coalesced, and keeps every later step — shuffles, 32 shared slots, one atomic —
+> element exactly once, coalesced, and keeps every later step (shuffles, 32 shared slots, one atomic)
 > off the memory bus.`,
   hints: [
     'Write `warp_reduce_sum` first: `for (int offset = 16; offset > 0; offset >>= 1) v += __shfl_down_sync(0xffffffff, v, offset);`. After it only lane 0 is meaningful; the other lanes hold partial sums you never read.',
-    'The kernel is three stages in one register `v`: the grid-stride loop, `v = warp_reduce_sum(v)` then `if (lane == 0) warp_sums[warp] = v;`, `__syncthreads()`, and `if (warp == 0) { v = lane < blockDim.x / 32 ? warp_sums[lane] : 0.0f; v = warp_reduce_sum(v); if (lane == 0) atomicAdd(out, v); }`.',
-    'Every thread must reach `__syncthreads()` — no `return` for threads with `i >= n`; the grid-stride loop simply does zero iterations for them and they contribute 0.0f. The slots past `blockDim.x / 32` are never written, which is why warp 0 reads 0 there instead of `warp_sums[lane]`.',
+    'Keep one register `v` through three stages. After the grid-stride loop, reduce the warp and let lane 0 park `v` in `warp_sums[warp]`. After the one barrier, only warp 0 continues: each lane loads a slot (or 0), reduces again, and only lane 0 of warp 0 touches `out`.',
+    'Every thread must reach `__syncthreads()`: no `return` for threads with `i >= n`; the grid-stride loop simply does zero iterations for them and they contribute 0.0f. The slots past `blockDim.x / 32` are never written, which is why warp 0 reads 0 there instead of `warp_sums[lane]`.',
   ],
   checks: [
     {
@@ -62,7 +62,7 @@ Step through the warp's five shuffles beside the shared-memory tree they replace
       id: 'warp-shuffle',
       title: 'Reduces a warp with __shfl_down_sync over the full mask, offsets 16 … 1',
       detail:
-        '`v += __shfl_down_sync(0xffffffff, v, offset)` in a loop halving `offset` from 16 to 1 — five register-to-register steps, no shared memory and no barrier. `__activemask()` or the removed `__shfl_down` would make the mask depend on who happens to be converged.',
+        '`v += __shfl_down_sync(0xffffffff, v, offset)` in a loop halving `offset` from 16 to 1: five register-to-register steps, no shared memory and no barrier. `__activemask()` would make the mask depend on who happens to be converged, and `__shfl_down` without `_sync` is unavailable on sm_70 and newer.',
       match: {
         cuda: {
           all: [
@@ -77,7 +77,7 @@ Step through the warp's five shuffles beside the shared-memory tree they replace
       id: 'warp-lane',
       title: 'Lane and warp come from threadIdx.x; warp 0 reads only blockDim.x / 32 slots',
       detail:
-        '`lane = threadIdx.x % 32`, `warp = threadIdx.x / 32` (or `& 31`, `>> 5`), and the second pass reads `warp_sums[lane]` only for `lane < blockDim.x / 32` — a 128-thread block has four warps, so the other 28 slots were never written.',
+        '`lane = threadIdx.x % 32`, `warp = threadIdx.x / 32` (or `& 31`, `>> 5`), and the second pass reads `warp_sums[lane]` only for `lane < blockDim.x / 32`: a 128-thread block has four warps, so the other 28 slots were never written.',
       match: {
         cuda: {
           all: [
@@ -92,7 +92,7 @@ Step through the warp's five shuffles beside the shared-memory tree they replace
       id: 'shared-slots',
       title: 'One shared slot per warp, a barrier between the write and the read, no interleaved tree',
       detail:
-        '`__shared__ float warp_sums[32]`, written by lane 0 of each warp, then `__syncthreads()`, then read by warp 0 — 32 floats instead of one per thread, and exactly one barrier. The classic `if (tid % (2 * s) == 0)` / `s *= 2` tree is not accepted: it diverges every warp at every level.',
+        '`__shared__ float warp_sums[32]`, written by lane 0 of each warp, then `__syncthreads()`, then read by warp 0: 32 floats instead of one per thread, and exactly one barrier. The classic `if (tid % (2 * s) == 0)` / `s *= 2` tree is not accepted: it leaves most lanes of every warp masked off.',
       match: {
         cuda: {
           all: [/__shared__\s+float\s+\w+\s*\[[^\]]+\]/, /__syncthreads\(\)/],
@@ -108,7 +108,7 @@ Step through the warp's five shuffles beside the shared-memory tree they replace
       id: 'block-combine',
       title: 'Lane 0 of warp 0 combines the block once with atomicAdd(out, …)',
       detail:
-        'After the second `warp_reduce_sum`, `if (lane == 0) atomicAdd(out, v)` — 512 atomics for 16 M elements, not one per thread; the kernel never writes `*out` with `=`. A second-stage launch over per-block partials (`out[blockIdx.x] = …`) is the deterministic alternative.',
+        'After the second `warp_reduce_sum`, `if (lane == 0) atomicAdd(out, v)`: 512 atomics for 16 M elements, not one per element; the kernel never writes `*out` with `=`. A second-stage launch over per-block partials (`out[blockIdx.x] = …`) is the deterministic alternative.',
       match: {
         cuda: {
           all: [
@@ -133,7 +133,7 @@ Step through the warp's five shuffles beside the shared-memory tree they replace
   ],
   code: {
     cuda: {
-      starter: `// reduce_sum.cu — sum n floats on the GPU: a grid-stride partial per thread, warp shuffles, one shared
+      starter: `// reduce_sum.cu: sum n floats on the GPU with a grid-stride partial per thread, warp shuffles, one shared
 // slot per warp, one atomicAdd per block.
 //   nvcc -O2 -o reduce_sum reduce_sum.cu && ./reduce_sum
 #include <cuda_runtime.h>
@@ -249,7 +249,7 @@ int main() {
   return ok ? 0 : 1;
 }
 `,
-      solution: `// reduce_sum.cu — sum n floats on the GPU: a grid-stride partial per thread, warp shuffles, one shared
+      solution: `// reduce_sum.cu: sum n floats on the GPU with a grid-stride partial per thread, warp shuffles, one shared
 // slot per warp, one atomicAdd per block.
 //   nvcc -O2 -o reduce_sum reduce_sum.cu && ./reduce_sum
 #include <cuda_runtime.h>
@@ -383,5 +383,5 @@ int main() {
 `,
     },
   },
-  debrief: `The kernel is shaped by one number: 64 MiB in, 4 bytes out. A sum does one add per 4-byte load, so it runs at memory bandwidth or not at all, and everything after the load must stay off the bus. The **grid-stride loop** is what makes the global reads the only traffic — each element is read once, by consecutive threads at consecutive addresses, and a thread holding 2048 partial adds in a register costs nothing extra; it also decouples the grid from \`n\`, so 64 blocks and 512 blocks both cover 16 M elements and the same kernel serves a 1 000-element row of a LayerNorm and a 100 M-element gradient norm. The **shuffles** replace Mark Harris's shared-memory tree inside the warp: five register moves, no \`__shared__\` traffic, no barrier, and no idle lanes — the interleaved \`tid % (2 * s)\` tree leaves half of every warp waiting at the first level and all but one lane by the last. The full mask \`0xffffffff\` says "all 32 lanes take part" up front; since Volta, threads of a warp may be at different program counters, and \`__activemask()\` reports whoever happens to be converged — a reduction over that set is silently wrong. **One shared slot per warp** is the smallest hand-off the block needs: 32 floats, one \`__syncthreads()\` between the writes and warp 0's reads, and a guard at \`blockDim.x / 32\` because a 128-thread block fills four slots and leaves 28 uninitialised. The **atomic** happens once per block — 512 of them for 16 M elements — so contention is a non-issue; what it costs is determinism: float addition is not associative, and the order blocks arrive varies run to run, so the last digits of \`sum\` move. That is exactly why PyTorch's \`torch.use_deterministic_algorithms(True)\` disables atomic-based reductions and why the two-stage version (\`out[blockIdx.x] = v\`, then a second launch over the partials) exists. Production reductions go further along the same lines: \`float4\` loads to issue 16 bytes per thread per instruction, several independent accumulators per thread so the adds pipeline, CUB's \`DeviceReduce\` with a single pass and decoupled look-back, \`cooperative_groups::reduce\` for the warp step, and PyTorch's \`Reduce.cuh\` that fuses the sum with the \`x²\` of a norm or the \`exp(x − max)\` of a softmax so the data is read once for the whole op. Triton's \`tl.sum\` and \`torch.compile\` generate the same shape: a per-program partial, a tree within the program, one combine across programs.`,
+  debrief: `The kernel is shaped by one number: 64 MiB in, 4 bytes out. A sum does one add per 4-byte load, so it runs at memory bandwidth or not at all, and everything after the load must stay off the bus. The **grid-stride loop** is what makes the global reads the only traffic: each element is read once, by consecutive threads at consecutive addresses, and a thread holding 2048 partial adds in a register costs nothing extra; it also decouples the grid from \`n\`, so 64 blocks and 512 blocks both cover 16 M elements and the same kernel serves a 1 000-element row of a LayerNorm and a 100 M-element gradient norm. The **shuffles** replace Mark Harris's shared-memory tree inside the warp: five register moves, no \`__shared__\` traffic, no barrier, and no masked-off lanes, where the interleaved \`tid % (2 * s)\` tree leaves half of every warp waiting at the first level and all but one lane by the fifth. The full mask \`0xffffffff\` says "all 32 lanes take part" up front; since Volta, threads of a warp may be at different program counters, and \`__activemask()\` reports whoever happens to be converged, so a reduction over that set is silently wrong. **One shared slot per warp** is the smallest hand-off the block needs: 32 floats, one \`__syncthreads()\` between the writes and warp 0's reads, and a guard at \`blockDim.x / 32\` because a 128-thread block fills four slots and leaves 28 uninitialised. The **atomic** happens once per block (512 of them for 16 M elements), so contention is a non-issue; what it costs is determinism: float addition is not associative, and the order blocks arrive varies run to run, so the last digits of \`sum\` move. The atomics are also the longest sequential chain in the sum (512 adds, against 128 in a thread), which a two-stage version (\`out[blockIdx.x] = v\`, then a second launch over the partials) turns into a tree with a fixed order. Production reductions go further along the same lines: \`float4\` loads to issue 16 bytes per thread per instruction, several independent accumulators per thread so the adds pipeline, \`cooperative_groups::reduce\` or \`cub::WarpReduce\` for the warp step, and \`cub::DeviceReduce\`, two-stage and run-to-run deterministic by default, with a single-launch atomic mode like this one (\`not_guaranteed\`) and a bitwise-reproducible one (\`gpu_to_gpu\`) since CCCL 3.1. PyTorch's \`Reduce.cuh\` template applies the map inside the reduction (the square of a norm, Welford's update for a variance) so the data is read once for the whole op. Triton's \`tl.sum\` and \`torch.compile\` generate the same shape: a per-program partial, a tree within the program, one combine across programs.`,
 };

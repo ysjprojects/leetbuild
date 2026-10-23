@@ -164,8 +164,9 @@ Three details decide whether the numbers downstream mean anything:
   should get credit for it. Row 3 above never emitted EOS and was cut at \`max_new_tokens\`, so all three
   of its tokens count.
 - **Log-probs at the sampling temperature.** The completions were drawn from \`softmax(logits / T)\`, so
-  \`token_logprobs\` divides by the same \`T\` before \`log_softmax\`. Otherwise the ratio is not 1 at the
-  first inner step, and the clipping engages before the policy has moved.
+  \`token_logprobs\` divides by the same \`T\` before \`log_softmax\`. \`π_old\` in the ratio must be the
+  distribution that drew the tokens, or the importance weights correct for a policy that never sampled
+  them and k3 stops being an unbiased KL.
 - **Shift by one.** The logits at position \`t\` predict token \`t + 1\`. The completion's \`L\` tokens are
   scored by the logits at \`P − 1 … P + L − 2\`, gathered at \`seqs[:, P:]\`.
 
@@ -176,7 +177,7 @@ How each mistake shows up:
 | logits at \`P … P + L − 1\` (no shift) | each token is scored by the distribution of the token after it; the reward never rises |
 | \`repeat(G, 1)\` instead of \`repeat_interleave\` | groups mix prompts; advantages compare answers to different questions |
 | mask stops before the EOS | the policy is never credited for stopping; completions ramble to the budget |
-| log-probs at \`T = 1\` after sampling at \`T = 0.7\` | the ratio starts away from 1 and \`clip_frac\` is high from step one |
+| log-probs at \`T = 1\` after sampling at \`T = 0.7\` | \`π_old\` is not the policy that drew the tokens, so the update is biased; if \`old_logp\` comes from the sampler, the ratio also starts away from 1 and \`clip_frac\` is high from step one |
 | sampling with a graph | memory grows with every generated token, for gradients nobody uses |
 
 The self-test checks \`token_logprobs\` the slow way: re-run the model on every prefix \`seqs[i, :P + t]\`
@@ -195,8 +196,8 @@ Q: A completion is \`[4, EOS, EOS]\` with \`L = 3\`. Which positions does the ma
 # Verifiable rewards and the group baseline
 
 The reward is a program. DeepSeek-R1-Zero used two: an accuracy reward that checks the final answer and
-a format reward that checks the answer is written in the expected tags. The toy task here has the same
-shape, small enough for a 26k-parameter model to learn from scratch:
+a format reward that checks the reasoning sits between \`<think>\` and \`</think>\` tags. The toy task
+here has the same shape, small enough for a 26k-parameter model to learn from scratch:
 
 | completion of \`3 + 1 =\` | accuracy | format | reward |
 |---|---|---|---|
@@ -266,6 +267,7 @@ far enough in the direction the advantage wants:
 | A < 0 | ρ ≥ 0.8 | \`ρA\` | pushes ρ down |
 | A < 0 | ρ < 0.8 | clipped | 0: far enough |
 | A > 0 | ρ < 0.8 | \`ρA\` (smaller) | still pushes up: a mistake is always corrected |
+| A < 0 | ρ > 1.2 | \`ρA\` (smaller) | still pushes down: a mistake is always corrected |
 
 The widget above draws both curves: the dashed parts are the flat, zero-gradient regions. At the first
 inner step \`ρ = 1\` everywhere, the clip is inactive and the gradient of \`−ρA\` with respect to \`logp\` is
@@ -284,8 +286,17 @@ from the sampled tokens. With \`r = π_ref(x) / π_θ(x)\` and \`x ~ π_θ\`, Jo
 
 k3 is k1 plus \`r − 1\`, which has expectation 0 under \`π_θ\`, and is never negative because
 \`log r ≤ r − 1\`. The self-test draws 400,000 tokens from a 5-way categorical and finds the k3 mean
-within 1% of the exact KL (0.1405 against 0.1411). Its gradient with respect to \`logp\` is
-\`1 − r\`: it pulls each sampled token's log-prob towards the reference's.
+within 1% of the exact KL (0.1405 against 0.1411). Two caveats:
+
+- **The gradient is not the KL's.** Per token, \`d k3 / d logp = 1 − r\`: it pulls each sampled token's
+  log-prob towards the reference's. But autograd does not differentiate the sampling distribution, so in
+  expectation \`(1 − r) ∇log π_θ\` is the gradient of the reverse, per-token \`KL(π_ref ‖ π_θ)\`, not of the
+  \`KL(π_θ ‖ π_ref)\` the value estimates ([Tang and Munos, 2025](https://arxiv.org/abs/2506.09477)). On
+  the 5-way categorical above, the expected gradient equals \`∇KL(π_ref ‖ π)\` exactly and differs from
+  \`∇KL(π ‖ π_ref)\` in every coordinate. Both gradients vanish at \`π_θ = π_ref\`, so it still regularises,
+  and at small KL the two divergences nearly agree.
+- **Unbiased only on-policy.** The tokens come from \`π_old\`. From the second inner step on, \`π_θ\` is no
+  longer the policy that sampled them, and the k3 mean is no longer an unbiased \`KL(π_θ ‖ π_ref)\`.
 
 :::quiz
 Q: A token has \`A = −1\` and its ratio has fallen to \`ρ = 0.5\` after two inner steps, with \`ε = 0.2\`. What does the surrogate do to it?
@@ -310,7 +321,7 @@ dr_grpo     loss = Σ_it m_it · ℓ_it / (N · max_new_tokens)       Dr. GRPO, 
 \`\`\`
 
 Under \`seq-mean\` a token's weight is \`1 / (N · |o_i|)\`: a token in a 1,000-token answer counts 1/1,000
-as much as a 1-token answer. For a wrong answer (\`A < 0\`) that means long completions are penalised
+as much as one in a 1-token answer. For a wrong answer (\`A < 0\`) that means long completions are penalised
 less per token, so the policy learns that rambling is a cheaper way to be wrong. The self-test's
 gradients make the weights visible:
 
@@ -334,10 +345,10 @@ Q: Under \`seq-mean\`, two wrong completions have the same advantage, one with 1
 
 # The loop, and why it learns
 
-\`grpo_train\` is DeepSeekMath's Algorithm 1 at toy scale: copy the policy as the reference, then per
-iteration sample prompts, roll out under \`no_grad\`, score \`old_logp\` and \`ref_logp\`, compute rewards
-and advantages, and take μ = 2 AdamW steps on the same rollouts. The self-test's run (seed 0, one CPU
-thread):
+\`grpo_train\` is the inner loop of DeepSeekMath's Algorithm 1 at toy scale: copy the policy as the
+reference, then per iteration sample prompts, roll out under \`no_grad\`, score \`old_logp\` and
+\`ref_logp\`, compute rewards and advantages, and take μ = 2 AdamW steps on the same rollouts. The
+self-test's run (seed 0, one CPU thread):
 
 | iteration | mean reward (of 1.5) | flat groups (of 32) | mean k3 KL | clip fraction |
 |---|---|---|---|---|
@@ -351,8 +362,8 @@ Greedy decoding then answers 24 of the 25 problems exactly. Three things in that
 
 - **It learns because the start is not hopeless.** The random policy already earns a non-zero reward in
   some completions, so 21 of 32 groups carry signal at iteration 0. A task where the base model never
-  succeeds produces only flat groups and zero gradient; this is why R1-Zero needed a strong base model,
-  and why curricula and SFT warm-ups exist.
+  succeeds produces only flat groups and zero gradient; this is why R1-Zero starts from a strong base model
+  (DeepSeek-V3-Base), and why curricula and SFT warm-ups exist.
 - **Success starves the gradient.** As the policy improves, more groups are all right; by the end 25 of
   32 prompts contribute nothing but KL. Larger G, harder prompts or dynamic sampling keep the batch
   informative.
@@ -372,7 +383,7 @@ Q: With \`mu = 1\`, what are the ratio and the clip fraction at every step?
 - [ ] Undefined, since \`old_logp\` is never computed
 > With one inner step the policy that is scored is the policy that sampled, so \`logp − old_logp = 0\`.
 > Clipping only matters when μ > 1 reuses the rollouts after the policy has moved. TRL's default
-> \`num_iterations = 1\` is this case.
+> \`num_iterations = 1\` is this case, and so were DeepSeekMath's own runs (one update per rollout batch).
 :::
 
 # What to take away
@@ -382,7 +393,8 @@ Q: With \`mu = 1\`, what are the ratio and the clip fraction at every step?
 - The rollout's contract is three tensors: grouped rows, a mask through the first EOS, and per-token
   log-probs at the sampling temperature, shifted by one.
 - Clipping is one-sided: it stops the gradient only after a token has moved far enough in the direction
-  its advantage wants. k3 estimates the KL from sampled tokens without bias or negative values.
+  its advantage wants. k3 estimates the KL from on-policy tokens without bias or negative values, but as
+  a loss its gradient is the reverse KL's.
 - Std normalisation and per-sequence averaging are choices with biases (difficulty, length); Dr. GRPO
   removes both, DAPO aggregates per token.
 - RL with verifiable rewards needs a policy that sometimes succeeds: flat groups carry no gradient, at

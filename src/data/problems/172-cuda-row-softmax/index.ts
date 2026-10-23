@@ -4,7 +4,7 @@ import {learn} from './learn';
 import {rowSoftmaxStep} from './steps/1-row-softmax';
 
 /**
- * Drill: row-wise softmax as one CUDA kernel — one block per row, a block-wide max and a block-wide
+ * Drill: row-wise softmax as one CUDA kernel: one block per row, a block-wide max and a block-wide
  * sum through warp shuffles and shared memory, exp(x − max) so a row of 1e4 logits does not
  * overflow, and a fully masked row that comes out as zeros rather than NaN. The kernel inside every
  * attention score normalisation and every output-head probability.
@@ -25,12 +25,12 @@ Softmax turns a row of logits into a probability distribution, \`y_c = exp(x_c) 
 transformer runs it constantly: over every row of the attention scores \`QKᵀ / √d\` (with a causal or
 padding mask written in as \`-inf\`), over the vocabulary at the output head, inside the cross-entropy loss.
 Written as the formula it is wrong on a GPU: \`expf\` overflows fp32 above \`x ≈ 88.7\`, and logits pass that
-routinely. The fix is a shift by the row max, and the shift is what shapes the kernel — the max must be known
+routinely. The fix is a shift by the row max, and the shift is what shapes the kernel: the max must be known
 before the first \`exp\`, so softmax is a max reduction, then a sum reduction, then a write.
 
 The surface is one file, \`row_softmax.cu\`, compiled with \`nvcc\`:
 
-- \`__global__ void softmax_rows(const float* x, float* y, int rows, int cols)\` — row-major fp32,
+- \`__global__ void softmax_rows(const float* x, float* y, int rows, int cols)\`: row-major fp32,
   \`y[r][c] = exp(x[r][c] − m_r) / Σ_c exp(x[r][c] − m_r)\` with \`m_r = max_c x[r][c]\`, any \`cols\`.
 - **One block per row**: \`row = blockIdx.x\`, \`THREADS = 256\` threads stride the row by \`blockDim.x\`. The
   host launches \`LAUNCH(softmax_rows, rows, THREADS, d_x, d_y, rows, cols)\` and is written for you.
@@ -72,8 +72,8 @@ and the run prints \`FAIL\`.
 
 Fp16/bf16 inputs with fp32 accumulation, the warp-per-row and register-resident variants for short rows,
 vectorised \`float4\` loads, fusing the scale and mask into the kernel, the backward pass
-\`dx = y ⊙ (dy − Σ y ⊙ dy)\`, and the online softmax that fuses max and sum into one pass — the guide covers
-it, FlashAttention is built on it.`,
+\`dx = y ⊙ (dy − Σ y ⊙ dy)\`, and the online softmax that fuses max and sum into one pass (the guide covers
+it; FlashAttention is built on it).`,
   figures: [
     {
       title: 'One block per row',
@@ -95,7 +95,7 @@ it, FlashAttention is built on it.`,
                 rows: 6,
                 cells: Array.from({length: 32}, (_, k) => `w${k % 8}`),
                 marks: [
-                  {cols: [0, 31], rows: [0, 0], tone: 'register'},
+                  {cols: [0, 31], rows: [0, 0], tone: 'a'},
                   {cols: [0, 31], rows: [1, 1], tone: 'muted', label: 'row 1: all -inf'},
                   {cols: [16, 31], rows: [2, 2], tone: 'muted', label: 'masked half'},
                 ],

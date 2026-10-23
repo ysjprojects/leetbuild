@@ -48,17 +48,17 @@ and one host function. \`BLOCK_THREADS = 512\` and \`ELEMS_PER_BLOCK = 2 * BLOCK
   after \`exclusive_scan\`.
 - Forbidden: a serial loop by one thread over the tile (\`if (tid == 0) for …\`), \`atomicAdd\` for the
   carry, \`thrust\`/\`cub\`. The block scan is the Blelloch tree, O(n) adds.
-- The self-test (given, keep it) runs \`n = 1, 1023, 1024, 1000003\` — one partial block, one exact block,
-  977 blocks with a partial tail — against a CPU loop for both variants, reports the **max abs error**
-  (must be 0) and the \`cudaEvent\` time of the largest exclusive scan, and prints \`PASS\`.
+- The self-test (given, keep it) runs \`n = 1, 1023, 1024, 1000003\` (two partial blocks, one exact block,
+  977 blocks with a partial tail) against a CPU loop for both variants, reports the **max abs error**
+  (must be 0) and the \`cudaEvent\` time of each exclusive scan, and prints \`PASS\`.
 
-> A scan looks sequential — every output depends on every input before it — but the sum is associative,
+> A scan looks sequential (every output depends on every input before it), but the sum is associative,
 > so a tree reduces the array in log n levels and a second tree walks the partial sums back down. Two
 > trees, 2n adds, no element waits for its predecessor.`,
   hints: [
-    'Load `temp[ai + CONFLICT_FREE_OFFSET(ai)]` and `temp[bi + CONFLICT_FREE_OFFSET(bi)]` with `ai = tid`, `bi = tid + BLOCK_THREADS`, zero when `base + ai >= n`. Up-sweep: `offset = 1`; for `d` from `ELEMS_PER_BLOCK >> 1` down to 1, after a `__syncthreads()` threads `tid < d` take `a = offset * (2 * tid + 1) - 1`, `b = offset * (2 * tid + 2) - 1`, pad both, `temp[b] += temp[a]`; then `offset <<= 1`.',
-    'Between the sweeps thread 0 saves `temp[last]` (`last = ELEMS_PER_BLOCK - 1` padded) to `block_sums[blockIdx.x]` and sets it to 0. Down-sweep mirrors the up-sweep: `d` from 1 doubling, `offset >>= 1` first, `__syncthreads()`, the same `a`/`b`, then `t = temp[a]; temp[a] = temp[b]; temp[b] += t`. One more `__syncthreads()` before writing `out`.',
-    'On the host, `scan_block` over `blocks` leaves every block correct relative to its own start; the scan of `block_sums` is what each block is missing, and it is just another exclusive scan — call `exclusive_scan(d_sums, d_offsets, blocks)` and let the recursion bottom out at one block. Then `add_block_offsets` adds `offsets[blockIdx.x]` to each element.',
+    'Thread `tid < d` owns the pair `a = offset * (2 * tid + 1) - 1`, `b = offset * (2 * tid + 2) - 1` at every level of both sweeps; only `offset` changes. It starts at 1, doubles after each up-sweep level and halves before each down-sweep level. Compute `a` and `b` first, then pad each with `CONFLICT_FREE_OFFSET`.',
+    'Between the sweeps thread 0 saves `temp[last]` (`last = ELEMS_PER_BLOCK - 1`, padded) to `block_sums[blockIdx.x]` and sets it to 0; it wrote that root itself, so it needs no barrier first. Each down-sweep level is `offset >>= 1`, `__syncthreads()`, the same `a`/`b`, then `t = temp[a]; temp[a] = temp[b]; temp[b] += t`. One more `__syncthreads()` before writing `out`.',
+    'On the host, `scan_block` over `blocks` leaves every block correct relative to its own start; the scan of `block_sums` is what each block is missing, and it is just another exclusive scan: call `exclusive_scan(d_sums, d_offsets, blocks)` and let the recursion bottom out at one block. Then `add_block_offsets` adds `offsets[blockIdx.x]` to each element.',
   ],
   checks: [
     {
@@ -91,7 +91,7 @@ and one host function. \`BLOCK_THREADS = 512\` and \`ELEMS_PER_BLOCK = 2 * BLOCK
       id: 'down-sweep',
       title: 'The root is cleared, then the down-sweep distributes partial sums',
       detail:
-        'Expected the root set to 0 after the up-sweep and `for (int d = 1; d < ELEMS_PER_BLOCK; d <<= 1)` doing the swap-and-add `t = temp[a]; temp[a] = temp[b]; temp[b] += t` — the step that turns a reduction tree into an exclusive scan. Without the clear the result is off by the block total.',
+        'Expected the root set to 0 after the up-sweep and `for (int d = 1; d < ELEMS_PER_BLOCK; d <<= 1)` doing the swap-and-add `t = temp[a]; temp[a] = temp[b]; temp[b] += t`, the step that turns a reduction tree into an exclusive scan. Without the clear the result is off by the block total.',
       match: {
         cuda: {
           all: [
@@ -106,7 +106,7 @@ and one host function. \`BLOCK_THREADS = 512\` and \`ELEMS_PER_BLOCK = 2 * BLOCK
       id: 'barriers',
       title: 'A __syncthreads() separates every tree level and precedes the store',
       detail:
-        'Expected `__syncthreads();` right before the `if (tid < d)` of each level and one before `out[...] = temp[...]`: level d reads what level 2d wrote. A barrier inside the `if (tid < d)` branch is undefined (not every thread reaches it) — expected none there.',
+        'Expected `__syncthreads();` right before the `if (tid < d)` of each level and one before `out[...] = temp[...]`: level d reads what level 2d wrote. A barrier inside the `if (tid < d)` branch is reached by only some threads, which the CUDA Programming Guide says may hang or corrupt results; expected none there.',
       match: {
         cuda: {
           all: [
@@ -121,7 +121,7 @@ and one host function. \`BLOCK_THREADS = 512\` and \`ELEMS_PER_BLOCK = 2 * BLOCK
       id: 'bank-conflicts',
       title: 'Tree indices are padded so a level never hits one bank 32 times',
       detail:
-        'Expected `#define LOG_NUM_BANKS 5`, `#define CONFLICT_FREE_OFFSET(i) ((i) >> LOG_NUM_BANKS)`, `temp` declared `ELEMS_PER_BLOCK + CONFLICT_FREE_OFFSET(ELEMS_PER_BLOCK - 1)` long, and every tree index padded with `a += CONFLICT_FREE_OFFSET(a)`. At stride 16 and above the unpadded indices `offset·(2·tid+1)−1` of a warp all fall in one bank and the level serialises 32-way.',
+        'Expected `#define LOG_NUM_BANKS 5`, `#define CONFLICT_FREE_OFFSET(i) ((i) >> LOG_NUM_BANKS)`, `temp` declared `ELEMS_PER_BLOCK + CONFLICT_FREE_OFFSET(ELEMS_PER_BLOCK - 1)` long, and every tree index padded with `a += CONFLICT_FREE_OFFSET(a)`. Unpadded, the indices `offset·(2·tid+1)−1` of a warp are `2·offset` apart: 2-way conflicts at offset 1, rising to 32-way at offset 16 (all 32 lanes in one bank).',
       match: {
         cuda: {
           all: [
@@ -171,7 +171,7 @@ and one host function. \`BLOCK_THREADS = 512\` and \`ELEMS_PER_BLOCK = 2 * BLOCK
       id: 'no-serial-scan',
       title: 'No single thread walks the tile, no atomics, no library scan',
       detail:
-        'Expected `scan_block` with the given signature and no `if (tid == 0) for (...)` loop over the tile (one thread doing 1023 serial adds while 511 wait), no `atomicAdd` carry (serialised across blocks, nondeterministic order), and no `thrust::`/`cub::` — the point is the tree.',
+        'Expected `scan_block` with the given signature and no `if (tid == 0) for (...)` loop over the tile (one thread doing 1023 serial adds while 511 wait), no `atomicAdd` carry (serialised across blocks, nondeterministic order), and no `thrust::`/`cub::`: the point is the tree.',
       match: {
         cuda: {
           all: [
@@ -188,7 +188,7 @@ and one host function. \`BLOCK_THREADS = 512\` and \`ELEMS_PER_BLOCK = 2 * BLOCK
   ],
   code: {
     cuda: {
-      starter: `// prefix_scan.cu — work-efficient (Blelloch) exclusive scan of int arrays of any length.
+      starter: `// prefix_scan.cu: work-efficient (Blelloch) exclusive scan of int arrays of any length.
 // Build and run: nvcc -O2 -o prefix_scan prefix_scan.cu && ./prefix_scan
 #include <cuda_runtime.h>
 
@@ -245,7 +245,7 @@ static void inclusive_scan(const int* d_in, int* d_out, int n) {
   LAUNCH_CHECK();
 }
 
-// ---- self-test: both variants against a CPU loop, timing of the largest exclusive scan ----------
+// ---- self-test: both variants against a CPU loop, cudaEvent time of each exclusive scan ---------
 static bool check_scan(int n) {
   std::vector<int> h_in(n), h_excl(n), h_incl(n);
   for (int i = 0; i < n; ++i) h_in[i] = (i * 7) % 13 - 3;  // small signed ints: no overflow in 1e6 of them
@@ -303,7 +303,7 @@ int main() {
   return 0;
 }
 `,
-      solution: `// prefix_scan.cu — work-efficient (Blelloch) exclusive scan of int arrays of any length.
+      solution: `// prefix_scan.cu: work-efficient (Blelloch) exclusive scan of int arrays of any length.
 // Build and run: nvcc -O2 -o prefix_scan prefix_scan.cu && ./prefix_scan
 #include <cuda_runtime.h>
 
@@ -425,7 +425,7 @@ static void inclusive_scan(const int* d_in, int* d_out, int n) {
   LAUNCH_CHECK();
 }
 
-// ---- self-test: both variants against a CPU loop, timing of the largest exclusive scan ----------
+// ---- self-test: both variants against a CPU loop, cudaEvent time of each exclusive scan ---------
 static bool check_scan(int n) {
   std::vector<int> h_in(n), h_excl(n), h_incl(n);
   for (int i = 0; i < n; ++i) h_in[i] = (i * 7) % 13 - 3;  // small signed ints: no overflow in 1e6 of them
@@ -485,5 +485,5 @@ int main() {
 `,
     },
   },
-  debrief: `The kernel is GPU Gems 3's chapter 39 with the two details that chapter spends most of its pages on. **Work efficiency** is why there are two sweeps rather than one: the obvious parallel scan (Hillis–Steele: at stride k every element adds the one k behind it) does n·log₂n − (n − 1) adds, 9,217 per 1024-element tile; the up-sweep/down-sweep pair does 2(n − 1) = 2,046, and the GPU's adds are not free. **Bank-conflict-free indexing** is why every index into \`temp\` is padded by \`i >> 5\`: the tree touches \`offset·(2·tid+1)−1\`, and from stride 16 upward those 32 addresses of a warp are 32 apart or more — the same bank each — so the level serialises 32-way; adding one word every 32 moves each of them to its own bank. The carry across blocks is a second scan because blocks cannot wait for each other inside a launch: \`block_sums\` is what each block is missing, scanning it is the same problem on \`n / 1024\` elements, and the recursion bottoms out at one block. The tail block scans zeros rather than branching, so no thread's control flow depends on \`n\`. What production does differently: CUB's \`DeviceScan\` (what \`torch.cumsum\` and \`thrust::exclusive_scan\` call) runs a **single pass** — Merrill and Garland's decoupled look-back lets each block publish its aggregate and then its inclusive prefix in global memory, and the next block spins briefly on its predecessors instead of waiting for a second launch, which halves the bytes moved; inside the block it scans with warp shuffles (\`__shfl_up_sync\`) and registers rather than a shared-memory tree, and it is templated over the operator, so the same code does max-scan, segmented scan and the scatter offsets of a radix sort. In an LLM serving stack this is the kernel behind the token-to-expert offsets of a mixture-of-experts layer, the \`cu_seqlens\` of a variable-length attention batch and every stream compaction of a sampling loop.`,
+  debrief: `The kernel is GPU Gems 3's chapter 39 with the two details that chapter spends most of its pages on. **Work efficiency** is why there are two sweeps rather than one: the obvious parallel scan (Hillis–Steele: at stride k every element adds the one k behind it) does n·log₂n − (n − 1) adds, 9,217 per 1024-element tile; the up-sweep/down-sweep pair does 2(n − 1) = 2,046, and the GPU's adds are not free. **Bank-conflict-free indexing** is why every index into \`temp\` is padded by \`i >> 5\`: the tree touches \`offset·(2·tid+1)−1\`, so a warp's addresses are \`2·offset\` apart, and at offset 16 all 32 of them fall in one bank (32-way; the levels around it are 2- to 16-way). Adding one word every 32 moves each of them to its own bank, at every level of a 1024-element tile. The carry across blocks is a second scan because blocks cannot wait for each other inside a launch: \`block_sums\` is what each block is missing, scanning it is the same problem on \`n / 1024\` elements, and the recursion bottoms out at one block. The tail block scans zeros rather than branching, so the tree's control flow never depends on \`n\`. What production does differently: CUB's \`DeviceScan\` (what \`thrust::exclusive_scan\` calls, and \`torch.cumsum\` on a 1-D CUDA tensor) runs a **single pass**. Merrill and Garland's decoupled look-back lets each block publish its aggregate and then its inclusive prefix in global memory, and a block spins briefly on its predecessors' flags instead of waiting for a second launch, which halves the bytes moved (~2n instead of ~4n); inside the block it scans with warp shuffles (\`__shfl_up_sync\`) and registers rather than a shared-memory tree, and it is templated over the operator, so the same code does max-scan, scan-by-key and the scatter offsets of a radix sort. In an LLM serving stack this is the kernel behind the token-to-expert offsets of a mixture-of-experts layer, the \`cu_seqlens\` of a variable-length attention batch and every stream compaction of a sampling loop.`,
 };

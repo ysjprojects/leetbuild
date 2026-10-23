@@ -676,9 +676,10 @@ replicated; that costs \`p\` copies of the stream's activations and of the Layer
 what sequence parallelism (Korthikanti et al., 2022) removes by splitting those regions along the sequence
 and turning each all-reduce into a reduce-scatter and an all-gather of the same total volume. The qkv
 regrouping is a checkpoint-format detail with teeth: Megatron stores its fused \`linear_qkv\` interleaved
-per head group (\`[q_h, k_h, v_h]\` for each group), so a plain chunk is right there, while a GPT-2 or
-Hugging Face checkpoint stores \`[Q; K; V]\` and must be regrouped on load as here; grouped-query attention
-adds the constraint that the number of KV heads divides \`p\` too (or KV heads are replicated). The counter
+per head group (the group's q heads, then its k and v), so a plain chunk is right there, while a GPT-2
+checkpoint stores \`c_attn\` as \`[Q; K; V]\` and must be regrouped on load as here. Grouped-query attention
+adds the constraint that \`p\` divides the number of KV heads too; with fewer KV heads than ranks, each KV
+head is replicated. The counter
 is the poor man's \`torch.distributed.tensor.debug.CommDebugMode\`: four all-reduces of \`B · T · d\` per
 layer per step (two forward, two backward) is the number to check before anything else, and production
 adds dropout under a per-rank CUDA RNG state (\`get_cuda_rng_tracker\`) so a split dropout mask differs

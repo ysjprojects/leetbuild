@@ -4,15 +4,15 @@ import {learn} from './learn';
 import {normsStep} from './steps/1-norms';
 
 /**
- * Drill: the two normalisations every transformer block applies to its residual stream — LayerNorm
- * (GPT-2, BERT) and RMSNorm (Llama, Mistral, Gemma) — written as nn.Modules from the statistics up,
+ * Drill: the two normalisations every transformer block applies to its residual stream, LayerNorm
+ * (GPT-2, BERT) and RMSNorm (Llama, Mistral, Gemma), written as nn.Modules from the statistics up,
  * with the float32 upcast that keeps a half-precision row from overflowing.
  */
 export const ptLayernormRmsnormProblem: Problem = {
   id: 'pt-layernorm-rmsnorm',
   title: 'LayerNorm and RMSNorm from scratch',
   tagline:
-    'Centre and scale a row with the biased variance, or scale it by its root mean square — eps under the root, rsqrt, and the statistic taken in float32 even when the model runs in bfloat16.',
+    'Centre and scale a row with the biased variance, or scale it by its root mean square: eps under the root, rsqrt, and the statistic taken in float32 even when the model runs in bfloat16.',
   difficulty: 'easy',
   track: 'dllm',
   language: 'python',
@@ -24,10 +24,10 @@ A transformer block is a residual stream of shape \`(B, T, D)\` and two sublayer
 add back into it. Before each sublayer the row is **normalised**: every token's \`D\` features are
 rescaled to a fixed magnitude, so the attention logits and the MLP's pre-activations see inputs of the
 same size at layer 1 and layer 80, whatever the residual stream has accumulated. GPT-2 and BERT use
-**LayerNorm** — subtract the row's mean, divide by its standard deviation, then a learned per-feature
-scale and shift. Llama, Mistral, Gemma and Qwen use **RMSNorm** — skip the mean, divide by the root mean
-square, one learned scale. Pre-norm placement (norm before the sublayer, not after) is what lets models
-with a hundred blocks train without warm-up tricks.
+**LayerNorm**: subtract the row's mean, divide by its standard deviation, then a learned per-feature
+scale and shift. Llama, Mistral, Gemma and Qwen use **RMSNorm**: skip the mean, divide by the root mean
+square, one learned scale. Pre-norm placement (norm before the sublayer, not after) keeps the gradients
+of a deep stack well scaled at initialisation, which is why every current LLM uses it.
 
 Both are a handful of lines, and the lines are where the numerics live: the variance is biased, \`eps\`
 goes inside the square root, the root is a reciprocal square root, and a \`bfloat16\` row is normalised in
@@ -100,14 +100,14 @@ every one of those starts from.`,
                       sub: 'σ² = x.var(unbiased=False)',
                       shape: '[B, T, 1]',
                       detail:
-                        'Divide by `D`, not `D − 1`: Bessel’s correction scales the whole output by `sqrt(D / (D − 1))`, 0.8% at `D = 64`.',
+                        'Divide by `D`, not `D − 1`: Bessel’s correction shrinks the normalised row by a factor `sqrt(D / (D − 1))`, 0.8% at `D = 64`.',
                     },
                     {
                       id: 'ln-scale',
                       label: 'Centre and scale',
                       sub: '(x − μ) · rsqrt(σ² + 1e-5)',
                       detail:
-                        '`eps` inside the root, so a constant row (σ² = 0) gives `0` rather than `0 / 0`; one `rsqrt` per row, then a multiply per element.',
+                        '`eps` keeps a constant row (σ² = 0) finite: without it the row is `0 · rsqrt(0) = 0 · ∞ = NaN`. Inside the root it floors σ at `√eps`, as `F.layer_norm` does. One `rsqrt` per row, then a multiply per element.',
                     },
                     {
                       id: 'ln-affine',
@@ -115,7 +115,7 @@ every one of those starts from.`,
                       sub: '· weight + bias · (D,) each',
                       shape: '[B, T, D]',
                       detail:
-                        '`weight` starts at ones and `bias` at zeros: the identity at initialisation, 2D parameters.',
+                        '`weight` starts at ones and `bias` at zeros: the identity at initialisation, 2·D parameters.',
                     },
                   ],
                 },
@@ -184,8 +184,8 @@ every one of those starts from.`,
         ],
         notes: [
           {at: 'ln-var', text: 'Divide by **D**, not D − 1', side: 'left'},
-          {at: 'ln-scale', text: 'eps **inside** the root: a flat row gives bias, not NaN', side: 'left'},
-          {at: 'rms-up', text: 'fp16 x² overflows at **|x| > 256**'},
+          {at: 'ln-scale', text: '**eps** under the root: a flat row gives bias, not NaN', side: 'left'},
+          {at: 'rms-up', text: 'fp16 x² overflows at **|x| ≥ 256**'},
           {at: 'rms-ms', text: '**1** reduction instead of 2'},
           {at: 'add', text: 'Pre-norm: the stream itself is never normalised'},
         ],
@@ -221,7 +221,7 @@ every one of those starts from.`,
       date: '2020-02-12',
       venue: 'ICML 2020',
       takes:
-        'Why the norm sits before each sublayer: pre-norm gradients at initialisation stay bounded at any depth, post-norm ones do not.',
+        'Why the norm sits before each sublayer: at initialisation post-norm gradients near the output are large and need a learning-rate warm-up, pre-norm ones are well behaved.',
     },
     {
       kind: 'code',

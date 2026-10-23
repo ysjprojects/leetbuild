@@ -4,7 +4,7 @@ import {learn} from './learn';
 import {bpeStep} from './steps/1-bpe';
 
 /**
- * Drill: the byte-level BPE tokenizer every GPT reads through — 256 byte tokens, a merge list
+ * Drill: the byte-level BPE tokenizer every GPT reads through: 256 byte tokens, a merge list
  * learned by repeatedly fusing the most frequent adjacent pair of the corpus, an encoder that
  * replays those merges in rank order, and a decoder that never raises on a split character.
  */
@@ -20,20 +20,20 @@ export const ptBpeTokenizerProblem: Problem = {
   minutes: 45,
   statement: `# Byte-pair encoding: train the merges, encode, decode
 
-A language model never sees text. It sees integers — token ids — and the first thing in front of
-every GPT, Llama and Claude is the function that turns a string into them and back. Since GPT-2 that
-function is **byte-level byte-pair encoding**: the base vocabulary is the 256 byte values, so any
-string in any script is encodable with nothing out of vocabulary, and on top of it sits a list of
-**merges** learned from a corpus — "these two adjacent tokens occur together so often that they get
-an id of their own". GPT-2 learned 50,000 of them; the embedding table of the model has exactly one
-row per byte, one per merge and one per special token.
+A language model never sees text. It sees integers (token ids), and the first thing in front of
+every language model is the function that turns a string into them and back. Since GPT-2, that
+function is **byte-level byte-pair encoding** for the GPT family, Llama 3 and many others: the base
+vocabulary is the 256 byte values, so any string in any script is encodable with nothing out of
+vocabulary, and on top of it sits a list of **merges** learned from a corpus ("these two adjacent
+tokens occur together so often that they get an id of their own"). GPT-2 learned 50,000 of them; its
+embedding table has exactly one row per byte, one per merge and one per special token (50,257).
 
 The algorithm is older than transformers: Sennrich, Haddow and Birch (2016) borrowed it from a 1994
-compression scheme to give neural translation an open vocabulary. Training is a loop — count every
+compression scheme to give neural translation an open vocabulary. Training is a loop: count every
 adjacent pair across the corpus, merge the most frequent one everywhere, record it, repeat until the
 vocabulary is the size you want. Encoding new text replays those merges **in the order they were
 learned**, because that order is the only one that reproduces the segmentation the model was trained
-on. Decoding concatenates the tokens' bytes and decodes UTF-8 — with care, because a token boundary
+on. Decoding concatenates the tokens' bytes and decodes UTF-8, with care, because a token boundary
 may fall inside a multi-byte character.
 
 The surface is one class, pure Python, no tensors:
@@ -64,9 +64,9 @@ class BPETokenizer:
 python bpe.py
 \`\`\`
 
-A passing run prints one line of statistics — the number of merges learned on the self-test corpus,
-the first two merged tokens (\`b'es'\`, \`b'est'\`) and the bytes-per-token ratio at three vocabulary
-sizes — followed by \`PASS\`. The starter stops at the first \`NotImplementedError\`.
+A passing run prints one line of statistics (the number of merges learned on the self-test corpus,
+the first two merged tokens \`b'es'\` and \`b'est'\`, and the bytes-per-token ratio at three vocabulary
+sizes) followed by \`PASS\`, in well under a second. The starter stops at the first \`NotImplementedError\`.
 
 ## Left out on purpose
 
@@ -97,7 +97,7 @@ byte fallback are the same.`,
               {
                 id: 'regex',
                 label: 'Pre-tokenizer regex',
-                sub: "'s|'t| ?\\p{L}+| ?\\p{N}+|…",
+                sub: "'s|'t|…| ?\\p{L}+| ?\\p{N}+|…",
                 detail:
                   'GPT-2’s `encoder.py` splits the string into chunks (contractions, letters with their leading space, digits, punctuation) and runs BPE inside each, so no merge crosses a word boundary. The drill merges across the whole corpus.',
               },
@@ -279,7 +279,7 @@ byte fallback are the same.`,
       url: 'https://huggingface.co/docs/transformers/en/tokenizer_summary',
       venue: 'Hugging Face Transformers docs',
       takes:
-        'Byte-level BPE set beside WordPiece, Unigram and SentencePiece: what each scores a merge by, and why GPT-2 needs no unknown token.',
+        'Byte-level BPE set beside WordPiece, Unigram and SentencePiece: how each builds its vocabulary, and why GPT-2 needs no unknown token.',
     },
   ],
   steps: [bpeStep],

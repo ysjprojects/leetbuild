@@ -273,7 +273,7 @@ def scatter_to_tp(x: torch.Tensor) -> torch.Tensor:
 
 
 class ColumnParallelLinear(nn.Module):
-    """Y = X Aᵀ with A split by output rows: this rank holds A[r · out/p : (r+1) · out/p, :]."""
+    """Y = X Wᵀ with W split by output rows: this rank holds W[r · out/p : (r+1) · out/p, :]."""
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True, gather_output: bool = False):
         super().__init__()
@@ -290,7 +290,7 @@ class ColumnParallelLinear(nn.Module):
 
 
 class RowParallelLinear(nn.Module):
-    """Y = X Aᵀ with A split by input columns: this rank holds A[:, r · in/p : (r+1) · in/p]."""
+    """Y = X Wᵀ with W split by input columns: this rank holds W[:, r · in/p : (r+1) · in/p]."""
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True, input_is_parallel: bool = True):
         super().__init__()
@@ -505,7 +505,7 @@ def scatter_to_tp(x: torch.Tensor) -> torch.Tensor:
 
 
 class ColumnParallelLinear(nn.Module):
-    """Y = X Aᵀ with A split by output rows: this rank holds A[r · out/p : (r+1) · out/p, :]."""
+    """Y = X Wᵀ with W split by output rows: this rank holds W[r · out/p : (r+1) · out/p, :]."""
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True, gather_output: bool = False):
         super().__init__()
@@ -535,7 +535,7 @@ class ColumnParallelLinear(nn.Module):
 
 
 class RowParallelLinear(nn.Module):
-    """Y = X Aᵀ with A split by input columns: this rank holds A[:, r · in/p : (r+1) · in/p]."""
+    """Y = X Wᵀ with W split by input columns: this rank holds W[:, r · in/p : (r+1) · in/p]."""
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True, input_is_parallel: bool = True):
         super().__init__()
@@ -670,15 +670,17 @@ rank needs the whole input and returns a slice of the output: forward is free, b
 inner dimension, so each rank's product is a partial sum of the output (g), while the gradient of the
 sum with respect to each partial is the identity. f and g are transposes of each other, and every
 Megatron layer is built from these two plus the gather and scatter you wrote for the edges. The
-\`.clone()\` before each in-place \`all_reduce\` matters: autograd may hand the same buffer to another
-consumer, and a collective that overwrites a saved tensor corrupts the graph silently. Megatron's
-\`megatron/core/tensor_parallel/mappings.py\` has the same four classes
+\`.clone()\` before each in-place \`all_reduce\` makes the operators safe wherever they sit: summing in place
+a tensor that autograd saved for backward makes \`backward()\` raise "modified by an inplace operation".
+Megatron's \`_reduce\` skips the copy and sums in place, which is safe where it uses it, on a fresh matmul
+output or gradient that nothing else holds. Its \`megatron/core/tensor_parallel/mappings.py\` has the same four classes
 (\`_CopyToModelParallelRegion\`, \`_ReduceFromModelParallelRegion\`, \`_ScatterToModelParallelRegion\`,
 \`_GatherFromModelParallelRegion\`) plus the sequence-parallel variants that replace the all-reduce with a
 reduce-scatter and an all-gather. What production adds: NCCL over NVLink instead of gloo over loopback,
 the input-gradient all-reduce launched asynchronously so it overlaps the weight-gradient GEMM
-(\`LinearWithGradAccumulationAndAsyncCommunication\`), and the master weight initialised whole and then
-split (\`_initialize_affine_weight_cpu\`), so a fresh model is the same whatever \`p\` is. The processes here
+(\`LinearWithGradAccumulationAndAsyncCommunication\`), and a choice of init: by default each rank draws its
+shard on its GPU under a tracked RNG, so a fresh model depends on \`p\`; with \`use_cpu_initialization\` the
+master weight is drawn whole and then split (\`_initialize_affine_weight_cpu\`), the same whatever \`p\` is. The processes here
 rendezvous through a file (\`init_method="file://<tmp>/rendezvous"\`) rather than \`MASTER_ADDR\`/\`MASTER_PORT\`: on one
 machine the TCP store adds nothing, and on a host whose name does not resolve its start-up stalls for
 about 35 s; \`GLOO_SOCKET_IFNAME\` pins gloo to the loopback device for the same reason.`,

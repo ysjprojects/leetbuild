@@ -4,7 +4,7 @@ import {learn} from './learn';
 import {flashAttentionStep} from './steps/1-flash-attention';
 
 /**
- * Drill: exact causal attention computed in query/key tiles with an online softmax — the
+ * Drill: exact causal attention computed in query/key tiles with an online softmax: the
  * FlashAttention algorithm written as a PyTorch loop, so the [T, T] score matrix never exists and
  * the running max, running sum and rescaling that make streaming exact are the learner's to write.
  */
@@ -20,13 +20,13 @@ export const ptFlashAttentionTiledProblem: Problem = {
   minutes: 75,
   statement: `# Tiled attention with online softmax (FlashAttention in PyTorch)
 
-Attention is \`softmax(q kᵀ / √hd) v\`. Written as three ops it materialises the score matrix — \`[B, H, T, T]\`
-in float32, read and written several times — and at \`T = 32k\` that matrix, not the model, is what fills the
-GPU. FlashAttention's observation is that the softmax of a row can be computed **in pieces**: walk the keys in
-tiles, keep the max and the sum seen so far, and rescale what was accumulated under the old max when a new tile
-raises it. The output is exact, the intermediates are one tile, and the kernel never leaves on-chip memory. Every
-frontier model trains and serves through a kernel of this shape — \`F.scaled_dot_product_attention\` dispatches
-to one on CUDA.
+Attention is \`softmax(q kᵀ / √hd) v\`. Written as three ops it materialises the score matrix (\`[B, H, T, T]\`
+in float32, written and read back twice) and at \`T = 32k\` that matrix, not the model, is what fills the GPU.
+FlashAttention (Dao et al., Stanford, 2022) computes the softmax of a row **in pieces**: walk the keys in tiles,
+keep the max and the sum seen so far, and rescale what was accumulated under the old max when a new tile raises
+it. The output is exact, the intermediates are one tile, and the scores never leave on-chip memory. LLM training
+and serving stacks run attention through kernels of this shape; \`F.scaled_dot_product_attention\` dispatches to
+one on CUDA when the dtype, head size and mask allow.
 
 Here the algorithm is written as a PyTorch loop, which is what the kernel does with tensor cores and shared
 memory, minus the hardware: the shape of the computation is the lesson.
@@ -35,7 +35,7 @@ The surface is one function and one test helper:
 
 - \`flash_attention(q, k, v, block_q, block_k, causal=True) -> out\` over \`q\`, \`k\`, \`v\` of shape \`[B, H, T, hd]\`,
   computed in float32 (float64 kept for \`gradcheck\`), returned in the input dtype, never holding a \`[T, T]\`
-  tensor — scores are \`[B, H, block_q, block_k]\` tiles, the causal mask is applied inside a tile and
+  tensor: scores are \`[B, H, block_q, block_k]\` tiles, the causal mask is applied inside a tile and
   fully masked tiles are skipped.
 - \`NoFullScores(T)\`, a \`TorchFunctionMode\` the self-test wraps the call in: it raises if any op returns a
   tensor whose trailing shape is \`[T, T]\`.
@@ -55,14 +55,16 @@ python flash_attention.py
 Needs PyTorch 2.x, CPU is enough. A passing run prints \`PASS\`: four causal tile shapes on \`T = 37\` (not a
 multiple of any of them) match \`F.scaled_dot_product_attention(is_causal=True)\` within \`atol=1e-5\` with no
 \`[T, T]\` tensor ever created, a tile larger than \`T\` degenerates to one tile, the non-causal variant matches
-the unmasked reference, and \`torch.autograd.gradcheck\` in float64 passes on a \`[1, 2, 7, 4]\` case.
+the unmasked reference, \`q * 30\` (scores past float32 \`exp\`'s overflow at 88.7) still matches within
+\`atol=1e-4\`, and \`torch.autograd.gradcheck\` in float64 passes on a \`[1, 2, 7, 4]\` case. About 3 s on a laptop
+CPU.
 
 ## Left out on purpose
 
 The backward pass with recomputation (autograd here saves every tile, so training memory stays \`O(T²)\`),
 padding and attention masks beyond causal, multi-query / grouped-query heads, dropout, the SRAM/HBM
-accounting that picks \`block_q\` and \`block_k\` on a real GPU, and the FlashAttention-2 loop order and warp
-partitioning — the kernel engineering on top of the algorithm written here.`,
+accounting that picks \`block_q\` and \`block_k\` on a real GPU, and FlashAttention-2's parallelism over the
+sequence and warp partitioning: the kernel engineering on top of the algorithm written here.`,
   figures: [
     {
       title: 'Tiled attention, online softmax',

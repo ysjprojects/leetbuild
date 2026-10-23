@@ -8,9 +8,9 @@ export const gpt2ModelStep: Step = {
   focus: ['wte', 'wpe', 'drop0', 'ln1', 'attn', 'drop1', 'add1', 'ln2', 'mlp', 'drop2', 'add2', 'lnf', 'head'],
   task: `## Task
 
-Write GPT-2 as nanoGPT does: a config, three small modules and the model, every tensor in the
-shapes the paper fixes. No \`nn.MultiheadAttention\`, \`nn.TransformerEncoderLayer\` or
-\`F.scaled_dot_product_attention\` — the attention is the point.
+Write GPT-2 as nanoGPT does: a config, three small modules and the model, every tensor in GPT-2's
+shapes. No \`nn.MultiheadAttention\`, \`nn.TransformerEncoderLayer\` or
+\`F.scaled_dot_product_attention\`: the attention is the point.
 
 - \`GPTConfig\`: a \`@dataclass\` with \`vocab_size=50257\`, \`block_size=1024\`, \`n_layer=12\`,
   \`n_head=12\`, \`n_embd=768\`, \`dropout=0.0\`, \`bias=True\`.
@@ -37,11 +37,11 @@ shapes the paper fixes. No \`nn.MultiheadAttention\`, \`nn.TransformerEncoderLay
 :::
 
 - \`MLP(config)\`: \`c_fc\` to \`4 * n_embd\`, \`nn.GELU()\`, \`c_proj\` back, dropout.
-- \`Block(config)\`: pre-norm residuals — \`x = x + attn(ln_1(x))\`, \`x = x + mlp(ln_2(x))\` with
+- \`Block(config)\`: pre-norm residuals, \`x = x + attn(ln_1(x))\` then \`x = x + mlp(ln_2(x))\`, with
   \`nn.LayerNorm(n_embd, bias=config.bias)\` (PyTorch ≥ 2.1).
-- \`GPT(config)\`: \`transformer = nn.ModuleDict(wte, wpe, drop, h, ln_f)\` — \`wte\` is
+- \`GPT(config)\`: \`transformer = nn.ModuleDict(wte, wpe, drop, h, ln_f)\` (\`wte\` is
   \`nn.Embedding(vocab_size, n_embd)\`, \`wpe\` is \`nn.Embedding(block_size, n_embd)\`, \`h\` the
-  \`n_layer\` blocks — and \`lm_head = nn.Linear(n_embd, vocab_size, bias=False)\` **tied** to the
+  \`n_layer\` blocks) and \`lm_head = nn.Linear(n_embd, vocab_size, bias=False)\` **tied** to the
   token table: \`self.lm_head.weight = self.transformer.wte.weight\`, one tensor under two names.
 - Init as GPT-2: every \`nn.Linear\` and \`nn.Embedding\` weight \`normal(0, 0.02)\`, biases zero, then
   every parameter named \`c_proj.weight\` re-drawn with \`std = 0.02 / sqrt(2 * n_layer)\`.
@@ -50,7 +50,7 @@ shapes the paper fixes. No \`nn.MultiheadAttention\`, \`nn.TransformerEncoderLay
   \`loss = F.cross_entropy(logits.view(-1, V), targets.view(-1), ignore_index=-1)\` when targets are
   given, else \`None\`.
 - \`num_params(non_embedding=True)\`: every parameter once (the tied tensor counts once), minus
-  \`wpe.weight.numel()\` when \`non_embedding\` — nanoGPT's "123.65M" for GPT-2 small (124.44M with it).
+  \`wpe.weight.numel()\` when \`non_embedding\`: nanoGPT's "123.65M" for GPT-2 small (124.44M with it).
 
 :::widget model-size {"preset": "gpt2"}
 
@@ -60,7 +60,7 @@ the loss against a manual log-softmax to 1e-6 and \`F.cross_entropy\`, the count
 assertion and that every parameter receives a gradient, then prints \`PASS\`.
 
 > One tensor, two jobs: the token table maps ids to vectors on the way in and vectors to logits on
-> the way out — 38.6M of GPT-2 small's parameters saved, and the model's largest matrix trained from both ends.`,
+> the way out. That saves 38.6M of GPT-2 small's parameters, and the model's largest matrix is trained from both ends.`,
   hints: [
     'Build attention in the shape order `(B, T, 3C)` → split → `view(B, T, nh, hd)` → `transpose(1, 2)` → `(B, nh, T, hd)`; after `att @ v` reverse it: `transpose(1, 2).contiguous().view(B, T, C)`. Slice the mask buffer to `[:, :, :T, :T]`.',
     'Tie after both modules exist: create `lm_head`, then assign `self.lm_head.weight = self.transformer.wte.weight`. `self.apply(self._init_weights)` initialises the shared tensor twice, harmlessly; the `c_proj` rescale is a loop over `named_parameters()` after `apply`.',
@@ -110,7 +110,7 @@ assertion and that every parameter receives a gradient, then prints \`PASS\`.
       id: 'pre-norm-block',
       title: 'Pre-norm residual block with a GELU MLP',
       detail:
-        'Each block is `x = x + self.attn(self.ln_1(x))` then `x = x + self.mlp(self.ln_2(x))` — LayerNorm on the branch, the residual stream untouched — with `nn.GELU()` between `c_fc` and `c_proj`.',
+        'Each block is `x = x + self.attn(self.ln_1(x))` then `x = x + self.mlp(self.ln_2(x))` (LayerNorm on the branch, the residual stream untouched), with `nn.GELU()` between `c_fc` and `c_proj`.',
       match: {
         python: {
           all: [
@@ -172,7 +172,7 @@ assertion and that every parameter receives a gradient, then prints \`PASS\`.
       id: 'num-params',
       title: 'num_params excludes the position table only',
       detail:
-        'The count sums every parameter once (the tied weight is one tensor) and subtracts `self.transformer.wpe.weight.numel()` when `non_embedding` — the 123.65M figure nanoGPT prints for GPT-2 small (124.44M with the position table).',
+        'The count sums every parameter once (the tied weight is one tensor) and subtracts `self.transformer.wpe.weight.numel()` when `non_embedding`: the 123.65M figure nanoGPT prints for GPT-2 small (124.44M with the position table).',
       match: {
         python: {
           all: [
@@ -510,5 +510,5 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `The file is nanoGPT's \`model.py\` with nothing hidden. Three choices carry the model. **Fused qkv**: one \`(C, 3C)\` matmul instead of three — the same FLOPs, a third of the kernel launches and one contiguous read of \`x\`; the \`view/transpose\` dance that follows is free (a view) until \`.contiguous()\` after \`att @ v\`, which is the one copy. **Pre-norm**: LayerNorm sits on the branch, so the residual stream is an unnormalised sum of every block's output and gradients flow through the identity path untouched — GPT-2 moved LayerNorm here from the post-norm original Transformer, and that is what keeps the 48-layer GPT-2 XL trainable. The \`1/sqrt(2 · n_layer)\` rescale of the \`c_proj\` weights is the complement: \`2 · n_layer\` branches add into the stream, and shrinking each keeps its variance of order one at the last layer. **Tying**: \`lm_head.weight = wte.weight\` is a Python assignment of the same \`nn.Parameter\`, so the optimizer sees it once and both gradients accumulate into it; \`num_params\` subtracts only \`wpe\` for the same reason. What frameworks add: \`F.scaled_dot_product_attention\` dispatches to FlashAttention-2 so the \`(B, nh, T, T)\` score matrix never materialises (at \`T = 1024\`, \`nh = 12\` that is 24 MiB per sequence in bf16, read and written three times here); \`torch.compile\` fuses the GELU, the residual adds and the LayerNorms into a handful of kernels; and \`F.cross_entropy\` on \`(B·T, 50257)\` logits is replaced by a fused, chunked kernel so the logits tensor — the largest activation in the model — is never stored in full.`,
+  debrief: `The file is nanoGPT's \`model.py\` with nothing hidden. Three choices carry the model. **Fused qkv**: one \`(C, 3C)\` matmul instead of three, the same FLOPs with a third of the kernel launches and one read of \`x\`; the \`split/view/transpose\` that follows makes views only, and \`.contiguous()\` after \`att @ v\` is the one explicit copy. **Pre-norm**: LayerNorm sits on the branch, so the residual stream is an unnormalised sum of every block's output and gradients reach the embeddings through the identity path. GPT-2 moved LayerNorm here from the post-norm original Transformer and added \`ln_f\`; post-norm puts a normalisation on the gradient path at every layer, and Xiong et al. (2020) show it needs the warmup that pre-norm can drop. The \`1/sqrt(2 · n_layer)\` rescale of the \`c_proj\` weights is the complement: \`2 · n_layer\` branches add into the stream, and shrinking each keeps its variance of order one at the last layer. **Tying**: \`lm_head.weight = wte.weight\` is a Python assignment of the same \`nn.Parameter\`, so the optimizer sees it once and both gradients accumulate into it; \`num_params\` subtracts only \`wpe\` for the same reason. What frameworks add: \`F.scaled_dot_product_attention\` dispatches to a FlashAttention kernel on GPUs, so the \`(B, nh, T, T)\` score matrix never reaches HBM (at \`T = 1024\`, \`nh = 12\` it is 24 MiB per sequence per layer in bf16, written and re-read by every elementwise op here); \`torch.compile\` fuses the GELU, the residual adds and the LayerNorms into a few kernels; and a fused, chunked cross-entropy over the \`(B·T, 50257)\` logits avoids ever storing the model's largest single activation in full.`,
 };

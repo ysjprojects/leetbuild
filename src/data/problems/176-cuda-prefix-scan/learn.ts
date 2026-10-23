@@ -2,7 +2,7 @@
  * The learning guide for the prefix-scan drill: what a scan is and where a model stack uses it,
  * Hillis–Steele against Blelloch (work efficiency), the up-sweep and down-sweep on a worked example
  * with the barrier race beside it, shared-memory bank conflicts and the padding offset, the carry
- * across blocks, and what CUB's single-pass decoupled look-back adds — a figure or a table where one
+ * across blocks, and what CUB's single-pass decoupled look-back adds: a figure or a table where one
  * says it faster than prose, a pop quiz per section. Rendered at \`/cuda-prefix-scan/learn\`.
  */
 export const learn = `# The mechanism at a glance
@@ -28,7 +28,7 @@ sort, \`torch.cumsum\`.
       ]}
     ]},
     {"id": "hbm", "label": "Global memory", "sub": "HBM", "detail": "n = 1,000,003 ints. A cell of in and out is one 1,024-element tile; a cell of block_sums one int.", "tone": "global", "stretch": true, "items": [
-      {"id": "g-in", "array": "in[n]", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"], "marks": [{"cols": [2, 2], "tone": "shared", "label": "tile 2"}, {"cols": [11, 11], "tone": "bad", "label": "579"}], "detail": "The last tile holds 579 elements; its block loads zeros past n."},
+      {"id": "g-in", "array": "in[n]", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"], "marks": [{"cols": [2, 2], "tone": "shared", "label": "tile 2"}, {"cols": [11, 11], "tone": "muted", "label": "579"}], "detail": "The last tile holds 579 elements; its block loads zeros past n."},
       {"id": "g-out", "array": "out[n]", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"], "marks": [{"cols": [2, 2], "tone": "shared", "label": "from 0"}], "detail": "Each tile's scan as if it began the array, until the block sums are added back."},
       {"id": "g-sums", "array": "block_sums[977]", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"], "marks": [{"cols": [2, 2], "tone": "shared", "label": "root"}], "detail": "The root of the up-sweep, the tile's total, saved before it is cleared."}
     ]}
@@ -59,7 +59,7 @@ The contract the drill implements, in one file \`prefix_scan.cu\`, with \`BLOCK_
 
 The sequential version is one line, \`out[i] = acc; acc += in[i];\`, and every iteration depends on the last.
 The parallel version rests on one fact: \`+\` is **associative**, so the sum of a range can be built from the
-sums of its halves in any grouping — a tree.
+sums of its halves in any grouping: a tree.
 
 # Work efficiency: Hillis–Steele against Blelloch
 
@@ -79,7 +79,8 @@ level 2 (stride 4):  x[i] += x[i-4]   for i >= 4
 
 **Blelloch** (1990): an **up-sweep** builds a reduction tree in place (n − 1 adds), the root is replaced by
 the identity 0, and a **down-sweep** walks back down the same tree handing each left child its parent's
-value and each right child parent + left (n − 1 adds, n − 1 swaps).
+value and each right child parent + left (n − 1 adds, n − 1 swaps). Blelloch calls the exclusive result a
+*prescan*.
 
 | | Hillis–Steele | Blelloch (this drill) |
 | --- | --- | --- |
@@ -88,15 +89,14 @@ value and each right child parent + left (n − 1 adds, n − 1 swaps).
 | Adds, n = 2²⁰ | 19,922,945 | 2,097,150 |
 | Levels (barriers) | log₂n = 10 per tile | 2·log₂n = 20 per tile |
 | Result | inclusive | exclusive |
-| In place | no — needs two buffers, a level reads what its neighbours overwrite | yes |
-| Work-efficient | no — O(n log n) against the sequential O(n) | yes — O(n) |
+| In place | no: needs two buffers, a level reads what its neighbours overwrite | yes |
+| Work-efficient | no: O(n log n) against the sequential O(n) | yes: O(n) |
 
 A scan is **work-efficient** when it does asymptotically as many operations as the sequential loop.
 Hillis–Steele has fewer levels, which wins when the array fits in one warp and there are idle lanes to burn
-(warp-shuffle scans use it); over a 1024-element tile and a million-element array, the 4.5× and 9.5× extra
-adds cost more than the ten saved barriers. Each Blelloch level also halves (then doubles) the active
-threads, so the tile needs only \`n / 2\` threads — two elements per thread, which is why
-\`ELEMS_PER_BLOCK = 2 * BLOCK_THREADS\`.
+(warp-shuffle scans use it). Over a 1024-element tile its 4.5× the adds (9.5× at n = 2²⁰) cost more than
+the ten barriers it saves. Each Blelloch level also halves (then doubles) the active threads, so the tile
+needs only \`n / 2\` threads, two elements per thread, which is why \`ELEMS_PER_BLOCK = 2 * BLOCK_THREADS\`.
 
 :::quiz
 Q: Why does the drill's tile hold 2 × BLOCK_THREADS elements rather than one per thread?
@@ -146,7 +146,7 @@ The same two sweeps on 16 values, one level at a time:
 :::widget scan-sweep
 
 The root holds the total (25) after the up-sweep, which is exactly the number the next level of the
-multi-block scan needs — the drill takes it for free before clearing it. Clearing it is what makes the
+multi-block scan needs; the drill takes it for free before clearing it. Clearing it is what makes the
 result exclusive: the down-sweep propagates "the sum of everything to my left" from the root, and the root
 has nothing to its left.
 
@@ -161,27 +161,28 @@ offset 1 while warp 0 (tid 0–31) starts offset 2:
 | Value read | stale \`in[65]\`, not \`in[64] + in[65]\` | \`in[64] + in[65]\` |
 | Outcome | \`temp[67]\` gets a wrong partial sum that propagates up the tree: max abs error ≠ 0, varying run to run, \`FAIL\` | correct partial sum, same result every run |
 
-The barrier sits *outside* \`if (tid < d)\`: \`__syncthreads()\` must be reached by every thread of the block,
-and a barrier inside a branch only some threads take is undefined behaviour — a hang on some GPUs, silent
-corruption on others; the CUDA C++ Programming Guide's synchronisation-functions section states the rule.
+The barrier sits *outside* \`if (tid < d)\`. \`__syncthreads()\` is allowed in conditional code only if the
+condition evaluates the same across the whole block; otherwise, in the
+[CUDA Programming Guide](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cpp-language-extensions.html#thread-block-synchronization-functions)'s
+words, "execution may hang or produce unintended side effects".
 
 :::quiz
 Q: The up-sweep's last level has one active thread (thread 0 adds temp[511] into temp[1023]). Does thread 0 need a __syncthreads() before reading the root to clear it?
-- [x] No — thread 0 wrote the root itself, so it sees its own write; the down-sweep's first barrier publishes the cleared root to the rest
-- [ ] Yes — shared memory writes are never visible to the writing thread until a barrier
-- [ ] Yes — otherwise thread 1 might clear it first
-> A thread always sees its own prior writes. The barrier is needed only where one thread reads another's write, which is the first down-sweep level reading the cleared root — and that level starts with __syncthreads().
+- [x] No: thread 0 wrote the root itself, so it sees its own write; the down-sweep's first barrier publishes the cleared root to the rest
+- [ ] Yes: shared memory writes are never visible to the writing thread until a barrier
+- [ ] Yes: otherwise thread 1 might clear it first
+> A thread always sees its own prior writes. The barrier is needed only where one thread reads another's write, which is the first down-sweep level reading the cleared root, and that level starts with __syncthreads().
 :::
 
 # Bank conflicts and the padding offset
 
 Shared memory is split into 32 **banks**, 4 bytes wide; word \`i\` lives in bank \`i mod 32\`. A warp's 32 accesses
 complete in one cycle when they fall in 32 different banks, and serialise when several hit one bank at
-different addresses — a k-way **bank conflict** costs k cycles
-([CUDA C++ Programming Guide, shared memory](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory-5-x)).
+different addresses: a k-way **bank conflict** costs k cycles
+([CUDA Programming Guide, shared memory bank conflicts](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html#writing-cuda-kernels-shared-memory-bank-conflicts)).
 
 The tree's indices are the worst case for this. At stride \`offset\`, consecutive threads touch
-\`a = offset·(2·tid + 1) − 1\` — addresses \`2·offset\` apart. Once that spacing is a multiple of 32, every
+\`a = offset·(2·tid + 1) − 1\`: addresses \`2·offset\` apart. Once that spacing is a multiple of 32, every
 active lane of a warp lands in the same bank:
 
 | offset | Active threads | Spacing of \`a\` across a warp | Unpadded conflict | Padded (\`a + (a >> 5)\`) |
@@ -208,24 +209,31 @@ a += CONFLICT_FREE_OFFSET(a);
 b += CONFLICT_FREE_OFFSET(b);
 \`\`\`
 
-At offset 16, thread \`t\` reads \`a = 32t + 15\`; padded it is \`33t + 15\`, bank \`(t + 15) mod 32\` — 32 lanes,
+At offset 16, thread \`t\` reads \`a = 32t + 15\`; padded it is \`33t + 15\`, bank \`(t + 15) mod 32\`: 32 lanes,
 32 banks. The same shift spreads every other level of a 1024-element tile, and the load and the store (where
 \`ai = tid\` is already contiguous) stay conflict-free because the pad only changes every 32 elements. The
 cost is 31 words of shared memory (124 bytes on 4,096) and one shift and add per index. The figure at the top
 of this guide draws the first 128 words: the grey cells are pad words, the highlighted ones the offset-16
 reads of threads 0 … 3, each one bank further along.
 
-- Every index into \`temp\` must be padded — the load, both tree indices, the root, the store. Padding one
+Two details differ from the chapter. GPU Gems targeted the G80, which served shared memory per half-warp
+from 16 banks, so its macro shifts by \`LOG_NUM_BANKS = 4\`; every GPU since Fermi has 32 banks per full
+warp, hence 5. Its printed macro also adds a second term, \`n >> (2 * LOG_NUM_BANKS)\`, for deeper trees;
+for a 1,024-element tile the single term already clears every level (the table above). The load layout is
+the chapter's: \`tid\` and \`tid + n/2\` rather than \`2·tid\` and \`2·tid + 1\`, which would be a 2-way
+conflict on every load and store.
+
+- Every index into \`temp\` must be padded: the load, both tree indices, the root, the store. Padding one
   and not another reads the wrong slot, which is a correctness bug, not a slowdown.
 - The padding is the reason \`temp\` is sized \`ELEMS_PER_BLOCK + CONFLICT_FREE_OFFSET(ELEMS_PER_BLOCK - 1)\`:
   the largest padded index is \`1023 + 31 = 1054\`.
 
 :::quiz
 Q: Without padding, the offset-16 level takes about how much longer than it would conflict-free?
-- [ ] No longer — the hardware broadcasts when addresses collide
-- [x] About 32× — all 32 lanes hit bank 15 at 32 different addresses and are served one at a time
-- [ ] About 2× — only the read conflicts, not the write
-> Broadcast only helps when lanes read the *same* address. Here they read 32 different words in one bank, so the access replays 32 times; padding moves lane t to bank (t + 15) mod 32.
+- [ ] No longer: the hardware broadcasts when addresses collide
+- [x] About 32×: all 32 lanes hit bank 15 at 32 different addresses and are served one at a time
+- [ ] About 2×: only the read conflicts, not the write
+> Broadcast only helps when lanes read the *same* address. Here they read 32 different words in one bank, so the access is split into 32 requests; padding moves lane t to bank (t + 15) mod 32.
 :::
 
 :::details Why not just change the indexing instead of padding?
@@ -235,7 +243,7 @@ A tree can also be laid out so each level's active elements are contiguous (stor
 # Scanning across blocks
 
 One block scans 1024 elements; a million needs 977 blocks, and blocks cannot wait for each other inside a
-launch — the hardware runs them in any order and need not have them resident at the same time. So the carry
+launch: the hardware runs them in any order and need not have them resident at the same time. So the carry
 crosses a launch boundary, and the carry is itself a scan. For \`n = 1,000,003\` that is three launches,
 each ordered after the last by the stream:
 
@@ -259,9 +267,9 @@ reads and writes.
     ]},
     {"id": "hbm2", "label": "Global memory", "sub": "HBM", "detail": "A cell of out is one tile; a cell of block_sums and offsets is one int.", "tone": "global", "stretch": true, "items": [
       {"id": "out-part", "array": "out[n]", "sub": "after launch 1 · from 0", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"]},
-      {"id": "sums", "array": "block_sums[977]", "sub": "one per tile", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"], "marks": [{"cols": [0, 0], "tone": "register", "label": "s0"}, {"cols": [1, 1], "tone": "register", "label": "s1"}]},
-      {"id": "offsets", "array": "offsets[977]", "sub": "scan of the sums", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"], "marks": [{"cols": [2, 2], "tone": "register", "label": "s0 + s1"}]},
-      {"id": "out-final", "array": "out[n]", "sub": "after launch 3 · final", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"], "marks": [{"cols": [2, 2], "tone": "register", "label": "+ (s0 + s1)"}]}
+      {"id": "sums", "array": "block_sums[977]", "sub": "one per tile", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"], "marks": [{"cols": [0, 0], "tone": "a", "label": "s0"}, {"cols": [1, 1], "tone": "a", "label": "s1"}]},
+      {"id": "offsets", "array": "offsets[977]", "sub": "scan of the sums", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"], "marks": [{"cols": [2, 2], "tone": "a", "label": "s0 + s1"}]},
+      {"id": "out-final", "array": "out[n]", "sub": "after launch 3 · final", "cols": 12, "cells": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "…", "976"], "marks": [{"cols": [2, 2], "tone": "a", "label": "+ (s0 + s1)"}]}
     ]}
   ],
   "arrows": [
@@ -280,8 +288,8 @@ reads and writes.
 - **Recursion depth.** Each level divides n by 1024: 977 block sums fit one block, so a million elements
   take two levels; a billion would take three. The recursion bottoms out at \`blocks == 1\` with
   \`block_sums = nullptr\`, which is why the root store is guarded.
-- **The tail block.** n = 1,000,003 leaves 579 elements in the last block. It loads zeros past \`n\` —
-  zero is the identity of \`+\`, so the scan of the real elements is unchanged — and guards the stores with
+- **The tail block.** n = 1,000,003 leaves 579 elements in the last block. It loads zeros past \`n\`
+  (zero is the identity of \`+\`, so the scan of the real elements is unchanged) and guards the stores with
   \`< n\`. No thread's control flow inside the tree depends on \`n\`.
 - **Bytes.** \`scan_block\` reads n and writes n ints; \`add_block_offsets\` reads and writes them again:
   about 4n ints of traffic for a scan whose minimum is 2n. That second pass is what production removes.
@@ -305,10 +313,10 @@ Q: Block 5 finishes its tile scan before block 4 has even started. Why is block 
 
 # What CUB adds: a single pass with decoupled look-back
 
-Production scans — CUB's \`DeviceScan\`, which \`thrust::exclusive_scan\` and \`torch.cumsum\` on CUDA call —
-make one pass over the data. Merrill and Garland's
-[decoupled look-back](https://research.nvidia.com/publication/2016-03_single-pass-parallel-prefix-scan-decoupled-look-back)
-lets a tile learn its prefix from its predecessors *during* the launch, without the deadlock a naive
+Production scans make one pass. CUB's \`DeviceScan\` (what \`thrust::exclusive_scan\` calls, and \`torch.cumsum\`
+on a 1-D CUDA tensor) uses Merrill and Garland's
+[decoupled look-back](https://research.nvidia.com/publication/2016-03_single-pass-parallel-prefix-scan-decoupled-look-back),
+which lets a tile learn its prefix from its predecessors *during* the launch, without the deadlock a naive
 spin-wait risks. Here is the block that drew tile 6, in the middle of its look-back:
 
 :::gpu
@@ -337,7 +345,7 @@ spin-wait risks. Here is the block that drew tile 6, in the middle of its look-b
 | | This drill (scan-then-propagate) | CUB single pass |
 | --- | --- | --- |
 | Global traffic | ~4n words | ~2n words |
-| Launches for n = 10⁶ | 3, plus two \`cudaMalloc\`s | 1, scratch sized by a query call |
+| Launches for n = 10⁶ | 3, plus two \`cudaMalloc\`s | 2 (tile-status init, then the scan), scratch sized by a query call |
 | In-block scan | shared-memory tree, 2 elements per thread | warp shuffles in registers, many elements per thread |
 | Operator | \`+\` on \`int\` | any associative operator and type; segmented and by-key variants |
 | Ordering trick | kernel boundary | per-tile status flags {X, A, P} and a look-back window |
@@ -345,15 +353,15 @@ spin-wait risks. Here is the block that drew tile 6, in the middle of its look-b
 Each tile publishes its own aggregate (**A**) as soon as it has reduced its data, so a successor never waits
 for a whole chain of inclusive prefixes; the first predecessor that has published its inclusive prefix
 (**P**) ends the look-back. The paper takes the tile id from an atomic counter rather than \`blockIdx.x\`, so
-every tile a block waits on has already started. The result runs at memory-copy speed, which is the ceiling
-for a bandwidth-bound primitive.
+every tile a block waits on has already started. On Kepler and Maxwell the paper measures CUB matching
+\`memcpy\` throughput for large inputs, the ceiling for a bandwidth-bound primitive.
 
 :::quiz
 Q: Why does decoupled look-back publish a tile's aggregate before its inclusive prefix?
 - [ ] The aggregate is needed by add_block_offsets
 - [x] A successor can sum aggregates of several predecessors without waiting for each of them to finish its own look-back, so the wait does not grow with the tile's position
 - [ ] Publishing twice makes the status update atomic
-> If tiles published only inclusive prefixes, tile k would wait for tile k−1, which waits for k−2 — a serial chain across the whole array. Aggregates are known early and locally; summing a few of them back to the first inclusive prefix keeps the latency short.
+> If tiles published only inclusive prefixes, tile k would wait for tile k−1, which waits for k−2: a serial chain across the whole array. Aggregates are known early and locally; summing a few of them back to the first inclusive prefix keeps the latency short.
 :::
 
 # What to take away
@@ -363,8 +371,8 @@ Q: Why does decoupled look-back publish a tile's aggregate before its inclusive 
   work-efficient, exclusive.
 - **A barrier per level, outside the branch.** Each level reads other threads' writes from the level
   before; \`__syncthreads()\` before \`if (tid < d)\` and once more before the store.
-- **Pad every shared index.** \`i + (i >> 5)\` turns the tree's power-of-two strides from a 32-way bank
-  conflict into none, for 31 extra words.
+- **Pad every shared index.** \`i + (i >> 5)\` turns the tree's power-of-two strides from up to 32-way bank
+  conflicts into none, for 31 extra words.
 - **Carry across blocks with a second scan.** Blocks cannot wait for each other inside a launch, so the block
   totals are scanned by the same function and added back in a later launch; the tail block scans zeros.
 - **Production makes it one pass.** CUB's decoupled look-back, warp-shuffle tile scans and generic

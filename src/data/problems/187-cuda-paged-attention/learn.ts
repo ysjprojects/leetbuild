@@ -46,7 +46,7 @@ One thread block of v1, for head 5 of a sequence with 70 tokens in five blocks:
         {"id": "v1-acc", "array": "acc[4]", "sub": "channels lane + 32j", "cols": 4, "tone": "register", "detail": "\`acc[j] += p × v_row[lane + 32j]\` over the warp’s tokens: a partial output for 4 of the 128 channels."}
       ]},
       {"label": "Shared memory", "tone": "shared", "layout": "column", "items": [
-        {"id": "v1-logits", "array": "logits[80]", "sub": "a row = one KV block · 70 used", "cols": 16, "rows": 5, "tone": "shared", "marks": [{"rows": [4,4], "cols": [6,15], "tone": "muted", "label": "past seq_len"}], "detail": "Dynamic shared memory, \`⌈70 / 16⌉ × 16 × 4 = 320\` bytes here. Scores first, then \`__expf(logit − qk_max)\` in place. Slots 70 … 79 of the last block are never stored or read."},
+        {"id": "v1-logits", "array": "logits[80]", "sub": "a row = one KV block · 70 used", "cols": 16, "rows": 5, "tone": "shared", "marks": [{"rows": [4,4], "cols": [6,15], "tone": "muted", "label": "past seq_len"}], "detail": "\`⌈70 / 16⌉ × 16 = 80\` floats (320 bytes) of the dynamic shared memory, which the host sizes for the batch’s longest sequence. Scores first, then \`__expf(logit − qk_max)\` in place. Slots 70 … 79 of the last block are never stored or read."},
         {"id": "v1-red", "array": "red_max, red_sum", "sub": "one slot per warp each", "cols": 8, "cells": ["m0", "m1", "m2", "m3", "l0", "l1", "l2", "l3"], "tone": "shared", "detail": "Two arrays: each warp’s butterfly result goes in, \`__syncthreads()\`, every thread folds the four. One shared array would let a fast warp overwrite a max with its sum."},
         {"id": "v1-out-smem", "array": "out_smem[4][128]", "sub": "a cell = 8 channels", "cols": 16, "rows": 4, "tone": "shared", "detail": "Each warp’s \`acc\` for all 128 channels; after a barrier thread \`i\` adds the four rows for channel \`i\`."}
       ]}
@@ -55,7 +55,7 @@ One thread block of v1, for head 5 of a sequence with 70 tokens in five blocks:
       {"id": "v1-table", "array": "block_tables[1]", "sub": "logical → physical", "cols": 5, "cells": ["7", "2", "12", "5", "9"], "detail": "Sequence 1’s row of \`block_tables\`. Logical block \`b\` of the context is physical block \`block_tables[1][b]\`; every K and V address goes through it."},
       {"id": "v1-k", "array": "k_cache [16][16]", "sub": "a row = one block · a cell = one slot", "cols": 16, "rows": 16, "marks": [{"rows": [7,7], "cols": [0,15], "tone": "a", "label": "logical 0"},{"rows": [2,2], "cols": [0,15], "tone": "a", "label": "logical 1"},{"rows": [12,12], "cols": [0,15], "tone": "a", "label": "logical 2"},{"rows": [5,5], "cols": [0,15], "tone": "a", "label": "logical 3"},{"rows": [9,9], "cols": [0,5], "tone": "a", "label": "logical 4"},{"rows": [9,9], "cols": [6,15], "tone": "muted", "label": "stale"}], "detail": "An illustrative 16-block pool. Sequence 1 owns blocks 7, 2, 12, 5 and 9 in that logical order; the last holds 6 tokens and 10 stale slots (NaN in the test)."},
       {"id": "v1-v", "array": "v_cache [16][16]", "sub": "same blocks, same slots", "cols": 16, "rows": 16, "marks": [{"rows": [7,7], "cols": [0,15], "tone": "a", "label": "logical 0"},{"rows": [2,2], "cols": [0,15], "tone": "a", "label": "logical 1"},{"rows": [12,12], "cols": [0,15], "tone": "a", "label": "logical 2"},{"rows": [5,5], "cols": [0,15], "tone": "a", "label": "logical 3"},{"rows": [9,9], "cols": [0,5], "tone": "a", "label": "logical 4"},{"rows": [9,9], "cols": [6,15], "tone": "muted", "label": "stale"}], "detail": "Read in the second pass with the same warp split; the stale tail is never touched."},
-      {"id": "v1-out", "array": "out [8][32][128]", "sub": "a row = one sequence", "cols": 8, "rows": 8, "marks": [{"rows": [1,1], "cols": [1,1], "tone": "b", "label": "head 5"}], "detail": "\`out[1][5][i] = (Σ_w out_smem[w][i]) / exp_sum\`: one store per channel, the only global write of the kernel."}
+      {"id": "v1-out", "array": "out [8][32][128]", "sub": "a row = one sequence · a cell = 4 heads", "cols": 8, "rows": 8, "marks": [{"rows": [1,1], "cols": [1,1], "tone": "b", "label": "head 5"}], "detail": "\`out[1][5][i] = (Σ_w out_smem[w][i]) / exp_sum\`: one store per channel, the only global write of the kernel."}
     ]}
   ],
   "arrows": [
@@ -224,15 +224,19 @@ design decision in the kernels is about bytes and parallelism:
   (head, sequence) is enough for a large batch and too few for one long sequence, which is the whole case
   for v2.
 
-GQA helps for free: the 4 query heads that share a KV head are 4 thread blocks reading the same rows, and
-when they run close together the repeats come from L2 rather than HBM.
+GQA raises the intensity only if the 4 query heads of a KV head share each load. Here they are 4 thread
+blocks reading the same rows, and when they run close together the repeats come from L2 rather than HBM.
+FlashInfer instead runs a group's query heads together on tensor cores: with 8 query heads per KV head
+(Llama-2 70B at tensor parallel 2), CUDA-core decode becomes compute-bound on an A100, and its tensor-core
+kernel is 3× faster than vLLM's PagedAttention at batch 64
+([FlashInfer, 2024](https://flashinfer.ai/2024/02/02/introduce-flashinfer.html)).
 
 :::quiz
 Q: Why do tensor cores not speed up paged_attention_v1?
 - [ ] The paged layout cannot be loaded into tensor-core fragments
 - [x] With one query per head the work is a matrix-vector product, and its time is set by reading K and V, not by arithmetic
 - [ ] Tensor cores do not support float accumulation
-> At about 2 FLOPs per byte the kernel waits on memory. Faster multiplies change nothing until more queries share each loaded row, as in prefill or speculative decoding.
+> At about 2 FLOPs per byte the kernel waits on memory. Faster multiplies change nothing until more queries share each loaded row: prefill, speculative decoding, or a GQA group handled in one block, which is how FlashInfer's decode uses tensor cores.
 :::
 
 # Inside paged_attention_v1
@@ -272,9 +276,9 @@ Step through the butterfly the reductions use, lane by lane:
 **V and the output.** The warps walk their blocks again; lane \`l\` owns channels \`l\`, \`l + 32\`, \`l + 64\` and
 \`l + 96\` and adds \`p × v\` for each token. Each warp now holds a partial output over a quarter of the
 context: the four meet in \`out_smem[4][128]\`, and after a barrier thread \`i\` adds channel \`i\` and
-multiplies by \`1 / exp_sum\`. Splitting warps over keys like this is the "split-K" partitioning that
-FlashAttention-2's paper moves away from for training, where there are many query rows to hand out; with
-one query there are none, so decode keeps it and pays with this one exchange.
+multiplies by \`1 / exp_sum\`. Splitting warps over keys like this is what FlashAttention-2's paper calls the
+"split-K" scheme, and replaces by splitting Q across warps, which needs no exchange when a block holds many
+query rows. With one query there are no rows to split, so decode keeps split-K and pays with this one exchange.
 
 Each of these lines has a tempting wrong version:
 
@@ -287,11 +291,11 @@ Each of these lines has a tempting wrong version:
 | No barrier between the exponentials and the V pass | a warp reads \`logits[t]\` before the thread that owns \`t\` has exponentiated it | wrong weights for a few tokens |
 
 :::details Why q sits in registers here and in shared memory in vLLM
-vLLM loads the query into a \`__shared__\` array of vectors (\`q_vecs\`) once per block, and each lane reads its
-vectors from there inside the dot product, which keeps register pressure down across the head sizes it
-supports. In float with a 128-float head, a lane's half is 64 registers, which still fits, so this
-project keeps it in registers and the inner loop does no shared-memory reads. Each lane loads its 16
-\`float4\`s straight from global memory; 512 bytes are unique, and the repeats are served from cache.
+vLLM's threads load the query once, cooperatively, into a \`__shared__\` array of vectors (\`q_vecs\`), so each
+element leaves global memory once per block, and every lane reads its vectors from there inside the dot
+product. In float with a 128-float head, a lane's half is 64 registers, which fits, so this project keeps it
+in registers and the inner loop does no shared-memory reads. Each lane loads its 16 \`float4\`s straight from
+global memory; 512 bytes are unique, and the repeats are served from cache.
 :::
 
 :::quiz
@@ -342,18 +346,18 @@ to FlashAttention for the same reason.
       {"id": "v2-max", "array": "max_logits[12]", "sub": "m_p", "cols": 12, "cells": "index", "detail": "Each partition’s max score. The reduce takes their max \`m\`."},
       {"id": "v2-sums", "array": "exp_sums[12]", "sub": "l_p = Σ exp(s − m_p)", "cols": 12, "cells": "index", "detail": "Each partition’s sum, against its own max: not comparable across partitions until rescaled."},
       {"id": "v2-tmp", "array": "tmp_out[12][128]", "sub": "o_p / l_p · a cell = 8 channels", "cols": 16, "rows": 12, "detail": "Each partition’s output, normalised by its own \`l_p\`: a weighted mean of its V rows."},
-      {"id": "v2-out", "array": "out[128]", "sub": "one row per (seq, head)", "cols": 16, "marks": [{"cols": [0,15], "tone": "register", "label": "written once"}], "detail": "\`out[i] = Σ_p tmp_out[p][i] × weights[p] / Σ_p weights[p]\`: exactly v1’s answer, up to float rounding."}
+      {"id": "v2-out", "array": "out[128]", "sub": "one row per (seq, head)", "cols": 16, "marks": [{"cols": [0,15], "tone": "b", "label": "written once"}], "detail": "\`out[i] = Σ_p tmp_out[p][i] × weights[p] / Σ_p weights[p]\`: exactly v1’s answer, up to float rounding."}
     ]},
-    {"id": "v2-reduce", "label": "paged_attention_v2_reduce", "sub": "<<<(32, 1), 128>>> · 48 B of shared memory", "count": "32 blocks", "layout": "row", "align": "end", "detail": "One block per (head, sequence). A sequence with one partition copies its row; this one has twelve.", "items": [
+    {"id": "v2-reduce", "label": "paged_attention_v2_reduce", "sub": "<<<(32, 1), 128>>> · weights: 48 B of shared memory", "count": "32 blocks", "layout": "row", "align": "end", "detail": "One block per (head, sequence). A sequence with one partition copies its row; this one has twelve.", "items": [
       {"threads": 8, "continues": true, "label": "128 threads"},
       {"id": "v2-weights", "array": "weights[12]", "sub": "l_p · exp(m_p − m)", "cols": 12, "cells": "index", "tone": "shared", "detail": "\`m = max_p m_p\` (block reduction), then \`weights[p] = exp_sums[p] × expf(max_logits[p] − m)\`: each partition’s share of the global softmax denominator."}
     ]}
   ],
   "arrows": [
-    {"from": "v2-p0", "to": "v2-hbm", "label": "m_0, l_0, o_0"},
-    {"from": "v2-plast", "to": "v2-hbm", "label": "m_11, l_11, o_11"},
+    {"from": "v2-p0", "to": "v2-hbm", "label": "m_0, l_0, o_0 / l_0"},
+    {"from": "v2-plast", "to": "v2-hbm", "label": "m_11, l_11, o_11 / l_11"},
     {"from": "v2-sums", "to": "v2-weights", "label": "m_p, l_p"},
-    {"from": "v2-reduce", "to": "v2-out", "label": "Σ w_p o_p / Σ w_p"}
+    {"from": "v2-reduce", "to": "v2-out", "label": "Σ w_p (o_p / l_p) / Σ w_p"}
   ]
 }
 :::
@@ -420,8 +424,10 @@ The three kernels here are vLLM's in structure and simplified in arithmetic. The
   few batch sizes, which is where the padding slots of step 1 come from.
 - **Other kernels, same contract.** vLLM's FlashAttention backend writes the cache with
   \`reshape_and_cache_flash\` in this project's layout and passes the block table to FlashAttention's paged
-  KV kernels; FlashInfer's paged kernels take each sequence's list of pages in the same spirit. A table of
-  blocks in, one output row per query head out: the interface outlived the kernels that introduced it.
+  KV kernels; FlashInfer's paged kernels take each sequence's list of pages in the same spirit. vLLM itself
+  deleted \`paged_attention_v1\` and \`v2\` in July 2026 ([#47361](https://github.com/vllm-project/vllm/pull/47361),
+  absent from v0.25 on) and kept \`reshape_and_cache\`. A table of blocks in, one output row per query head
+  out: the interface outlived the kernels that introduced it.
 
 :::quiz
 Q: Two beam-search candidates share their first 30 blocks. What must the attention kernel do differently?

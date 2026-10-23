@@ -114,6 +114,12 @@ The last line is the point: after rotation, the score between a query at \`m\` a
 port permutes \`wq\` and \`wk\` so it can rotate halves instead, which is why loading weights into the wrong
 rotation silently produces garbage.
 
+Multiplying a complex number \`a + ib\` by \`e^(iφ) = cos φ + i sin φ\` is the 2-D rotation
+\`(a cos φ − b sin φ, a sin φ + b cos φ)\`, so \`view_as_complex\` and one multiply rotate all 64 pairs at
+once. A worked pair with \`freq = 0.5\`: put \`q = (1, 0)\` at \`m = 3\` and \`k = (1, 0)\` at \`n = 1\`. They turn by
+1.5 and 0.5 rad, and their dot product is \`cos(1.5 − 0.5) = cos 1 ≈ 0.540\`. Move both 10 positions later
+(angles 6.5 and 5.5) and it is still \`cos 1\`.
+
 :::widget rope-rotation
 
 Llama 2 used θ = 10,000, whose slowest pair completes a turn every 54,000 tokens. Llama 3 raised θ to 500,000,
@@ -171,8 +177,10 @@ hidden = multiple_of * ((hidden + multiple_of - 1) // multiple_of)
 | 70B | 32,768 | 21,845 | × 1.3 = 28,398 | 4,096 | **28,672** |
 | 405B | 65,536 | 43,690 | × 1.2 = 52,428 | 4,096 | **53,248** |
 
-The two \`int(...)\` truncations matter: rounding instead of truncating could cross a multiple and change
-the matrix shapes, and then Meta's checkpoint would not load.
+For every Llama 3 size the two \`int(...)\` truncations change nothing (8B untruncated is 14,199.5, which still
+rounds up to 14,336), but copy the rule exactly: a product just above a multiple stays in its block when
+truncated and gains a whole \`multiple_of\` under \`math.ceil\`, and a shape one block off will not load
+Meta's checkpoint.
 
 :::quiz
 Q: A SwiGLU block at width 2/3 · 4d has how many parameters compared with a GELU MLP at width 4d (no biases)?
@@ -185,11 +193,13 @@ Q: A SwiGLU block at width 2/3 · 4d has how many parameters compared with a GEL
 
 # Grouped-query attention and the KV cache
 
-Decoding one token reads every cached key and value of every layer. With multi-head attention, Llama 3 8B
-would store 32 heads of K and V per layer, 512 KiB per token in bf16, 64 GiB for one 128K-token sequence: more
-than the 16 GB of weights. [Multi-query attention](https://arxiv.org/abs/1911.02150) keeps one KV head for all
-query heads and loses quality; [GQA](https://arxiv.org/abs/2305.13245) sits between them with \`n_kv_heads\`
-groups. Llama 3 uses 8 KV heads in every size.
+Decoding one token reads every cached key and value of every layer. GPT-2's cache holds
+\`2 · n_layer · n_embd\` numbers per token because every head is cached (\`n_embd = n_heads · head_dim\`). With
+that multi-head attention, Llama 3 8B would store 32 heads of K and V per layer, 512 KiB per token in bf16,
+64 GiB for one 128K-token sequence: more than the 16 GB of weights.
+[Multi-query attention](https://arxiv.org/abs/1911.02150) keeps one KV head for all query heads and loses
+quality; [GQA](https://arxiv.org/abs/2305.13245) sits between them with \`n_kv_heads\` groups, so the cache
+holds \`2 · n_layers · n_kv_heads · head_dim\` numbers per token. Llama 3 uses 8 KV heads in every size.
 
 :::gpu
 {
@@ -249,7 +259,7 @@ the cache slice written, and the mask.
     {"tone": "block", "repeat": "max_new_tokens ×", "label": "Decode step", "items": [
       {"id": "g-sample", "label": "Sample the last row", "sub": "softmax(logits / 0.6) · top-p 0.9", "detail": "Sort, cumulative mass, drop tokens whose preceding mass exceeds p, renormalise, multinomial, gather back to ids."},
       {"id": "g-append", "label": "Append", "kind": "io", "sub": "torch.cat([tokens, next], 1)"},
-      {"id": "g-decode", "label": "Decode one token", "kind": "attention", "sub": "model(tokens[:, cur:cur + 1], cur)", "detail": "seqlen = 1: no mask, one query over cur + 1 cached keys."}
+      {"id": "g-decode", "label": "Decode one token", "kind": "attention", "sub": "model(tokens[:, cur:cur + 1], cur)", "detail": "seqlen = 1: no mask, one query over cur + 1 cached keys. The last sampled token needs no forward."}
     ]}
   ],
   "notes": [

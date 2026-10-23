@@ -39,7 +39,7 @@ Nesterov damps the overshoot.
 
 - \`__init__\` validates (\`lr\`, \`momentum\`, \`weight_decay\` ≥ 0; \`nesterov\` needs \`momentum > 0\`), builds
   \`defaults = dict(lr=…, momentum=…, nesterov=…, weight_decay=…)\` and calls \`super().__init__(params, defaults)\`.
-  Everything else — \`param_groups\`, \`state\`, \`zero_grad\`, \`state_dict\` — is inherited.
+  Everything else (\`param_groups\`, \`state\`, \`zero_grad\`, \`state_dict\`) is inherited.
 - \`step\` is decorated \`@torch.no_grad()\`. If a \`closure\` is given, call it under \`with torch.enable_grad():\`
   and return its loss; otherwise return \`None\`.
 - Read \`lr\`, \`momentum\`, \`nesterov\`, \`weight_decay\` from each \`group\` of \`self.param_groups\`; a parameter
@@ -56,22 +56,22 @@ The self-test at the end of the file (keep it) builds a quadratic \`0.5 · ‖A 
 that never receives a gradient, runs 25 steps for \`momentum ∈ {0, 0.9}\` and \`nesterov\`, and compares every
 parameter after every step with \`torch.optim.SGD\` under the same settings (\`weight_decay=0\`, where the two
 agree) with \`torch.allclose(rtol=1e-5, atol=1e-6)\`; runs 10 steps through a closure; then checks one decayed
-step by hand — \`w1 = w0 · (1 − lr · wd) − lr · g\`, buffer equal to \`g\` — and that two steps of coupled
+step by hand (\`w1 = w0 · (1 − lr · wd) − lr · g\`, buffer equal to \`g\`) and that two steps of coupled
 \`torch.optim.SGD(weight_decay=wd)\` land elsewhere. It prints \`PASS\`.
 
 > The optimizer is a loop over \`param_groups\` that mutates \`p\` and \`state[p]\` in place under \`no_grad\`;
 > decoupling the decay means it multiplies the *weight*, so the momentum buffer only ever carries gradients.`,
   hints: [
-    'The skeleton is three loops deep: `for group in self.param_groups` → `for p in group["params"]` → `if p.grad is None: continue`. Read `lr`, `momentum`, `nesterov`, `weight_decay` from `group`, and the buffer from `self.state[p]`, a dict that starts empty.',
-    'First step: `buf = state["momentum_buffer"] = torch.clone(g).detach()`; later: `buf.mul_(momentum).add_(g)`. Then `d = g.add(buf, alpha=momentum) if nesterov else buf` and `p.add_(d, alpha=-lr)`. With `momentum == 0` skip the buffer entirely and use `d = g`.',
-    'Decay is one line before the update, on the parameter: `p.mul_(1 - lr * weight_decay)`. Decorate `step` with `@torch.no_grad()` and evaluate the closure inside `with torch.enable_grad():` — the closure runs `backward()`, which needs the graph the decorator turned off.',
+    'The skeleton is two loops and a skip: `for group in self.param_groups:` → `for p in group["params"]:` → `if p.grad is None: continue`. Read `lr`, `momentum`, `nesterov`, `weight_decay` from `group` (not from `self.defaults`, which a scheduler never updates), and keep the buffer in `self.state[p]`, a dict that starts empty.',
+    'Per parameter, with `g = p.grad`: if `weight_decay != 0`, `p.mul_(1 - lr * weight_decay)`. If `momentum != 0`: `buf = state.get("momentum_buffer")`; if it is `None`, `buf = state["momentum_buffer"] = torch.clone(g).detach()`, else `buf.mul_(momentum).add_(g)`; then `d = g.add(buf, alpha=momentum) if nesterov else buf`. With `momentum == 0`, `d = g` and no buffer. Last, `p.add_(d, alpha=-lr)`.',
+    'Around the loops: decorate `step` with `@torch.no_grad()`, start with `loss = None`, then `if closure is not None:` → `with torch.enable_grad(): loss = closure()` (the closure runs `backward()`, which needs the grad mode the decorator turned off), and end with `return loss`.',
   ],
   checks: [
     {
       id: 'optimizer-subclass',
       title: 'An Optimizer subclass with the four hyper-parameters as defaults',
       detail:
-        '`class SGD(Optimizer)` (or `torch.optim.Optimizer`) whose `__init__` builds `defaults` with `lr`, `momentum`, `nesterov`, `weight_decay` and calls `super().__init__(params, defaults)` — that is what gives it `param_groups`, `state`, `zero_grad` and `state_dict` for free.',
+        '`class SGD(Optimizer)` (or `torch.optim.Optimizer`) whose `__init__` builds `defaults` with `lr`, `momentum`, `nesterov`, `weight_decay` and calls `super().__init__(params, defaults)`: that is what gives it `param_groups`, `state`, `zero_grad` and `state_dict` for free.',
       match: {
         python: {
           all: [
@@ -86,7 +86,7 @@ step by hand — \`w1 = w0 · (1 − lr · wd) − lr · g\`, buffer equal to \`
       id: 'no-grad-step',
       title: 'step runs under torch.no_grad()',
       detail:
-        '`@torch.no_grad()` directly above `def step(self, closure=None)`: the in-place writes to leaf tensors that require grad are an autograd error otherwise, and the buffer arithmetic must not build a graph.',
+        '`@torch.no_grad()` directly above `def step(self, closure=None)`: an in-place write to a leaf tensor that requires grad is an autograd error otherwise, and the update must not be recorded in any graph.',
       match: {
         python: {all: [/@torch\.no_grad\(\)\s*\n\s*def step\(\s*self\s*,\s*closure\s*=\s*None\s*\)/]},
       },
@@ -95,7 +95,7 @@ step by hand — \`w1 = w0 · (1 − lr · wd) − lr · g\`, buffer equal to \`
       id: 'closure',
       title: 'The closure is evaluated with grad enabled and its loss returned',
       detail:
-        '`with torch.enable_grad(): loss = closure()` inside the no-grad `step`, then `return loss` — a closure calls `backward()`, which needs the graph the decorator disabled; LBFGS-style callers and `torch.optim` conventions expect the loss back.',
+        '`with torch.enable_grad(): loss = closure()` inside the no-grad `step`, then `return loss`: a closure calls `backward()`, which needs the grad mode the decorator disabled, and LBFGS-style callers and `torch.optim` conventions expect the loss back.',
       match: {
         python: {
           all: [/with torch\.enable_grad\(\)\s*:\s*\n\s*loss\s*=\s*closure\(\)/, /return loss\b/],
@@ -113,7 +113,7 @@ step by hand — \`w1 = w0 · (1 − lr · wd) − lr · g\`, buffer equal to \`
       id: 'lazy-buffer',
       title: 'The momentum buffer is created lazily in self.state[p]',
       detail:
-        '`self.state[p]["momentum_buffer"]` set to a detached `clone` of the gradient on the first step that sees one, nothing allocated in `__init__` — so `state_dict()` carries it and a parameter that never gets a gradient never gets a buffer.',
+        '`self.state[p]["momentum_buffer"]` set to a detached `clone` of the gradient on the first step that sees one, nothing allocated in `__init__`, so `state_dict()` carries it and a parameter that never gets a gradient never gets a buffer.',
       match: {
         python: {
           all: [
@@ -127,7 +127,7 @@ step by hand — \`w1 = w0 · (1 − lr · wd) − lr · g\`, buffer equal to \`
       id: 'momentum-in-place',
       title: 'Buffer and parameter are updated in place',
       detail:
-        '`buf.mul_(momentum).add_(g)` and `p.add_(d, alpha=-lr)`: no fresh tensors, no `p = p - …`, no `.data`, no delegation to `torch.optim._functional` or `sgd(...)` — the buffer tensor must stay the one `state_dict()` saved.',
+        '`buf.mul_(momentum).add_(g)` and `p.add_(d, alpha=-lr)`: no fresh tensors, no `p = p - …`, no `.data`, no delegation to `torch.optim._functional` or `sgd(...)`. The buffer tensor must stay the one `state[p]` holds.',
       match: {
         python: {
           all: [new RegExp(String.raw`\.mul_\(\s*${MOMENTUM}\s*\)\s*\.add_\(`), PARAM_UPDATE],
@@ -139,7 +139,7 @@ step by hand — \`w1 = w0 · (1 − lr · wd) − lr · g\`, buffer equal to \`
       id: 'nesterov',
       title: 'Nesterov adds the look-ahead without touching the buffer',
       detail:
-        '`d = g.add(buf, alpha=momentum) if nesterov else buf`: with `nesterov` the step uses `g + momentum · buf` (an out-of-place `add`), while the buffer keeps `momentum · buf + g` — exactly `torch.optim.SGD(nesterov=True)`.',
+        '`d = g.add(buf, alpha=momentum) if nesterov else buf`: with `nesterov` the step uses `g + momentum · buf` (an out-of-place `add`), while the buffer keeps `momentum · buf + g`, exactly as in `torch.optim.SGD(nesterov=True)`.',
       match: {
         python: {
           all: [
@@ -402,5 +402,5 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `The whole optimizer is a loop over \`param_groups\` that mutates two things in place — the parameter and its entry in \`self.state\` — which is exactly why it is shaped the way it is. \`@torch.no_grad()\` is not a nicety: an in-place write to a leaf tensor that requires grad is an autograd error outside it, and without it every \`mul_\`/\`add_\` would try to record history. The closure gets \`enable_grad\` back because it has to call \`backward()\`. The buffer is created lazily and kept in \`self.state[p]\` rather than as an attribute so that \`state_dict()\` serialises it and \`load_state_dict()\` restores it; a parameter that never sees a gradient never costs a buffer. In-place \`mul_\`/\`add_\` keep the buffer the same tensor across steps (a saved checkpoint points at it) and avoid allocating per step. Nesterov is one extra out-of-place \`add\` — the buffer is identical to classical momentum, only the step direction differs — matching PyTorch's formulation rather than the textbook "evaluate the gradient at the look-ahead point". Decoupling the decay means multiplying the weight before the update: with the gradient-folded version the term \`wd · p\` enters the buffer and is replayed with a geometric tail of \`1 / (1 − momentum)\`, so the effective decay depends on the momentum and, in Adam, on the second-moment normalisation — the observation behind AdamW (Loshchilov & Hutter). Production optimizers differ in machinery, not maths: \`torch.optim.SGD\` dispatches to a \`foreach\` implementation that updates every tensor of a group with one multi-tensor kernel, and a \`fused\` CUDA kernel that reads each parameter once; \`torch.compile\` fuses the whole step; distributed trainers shard the optimizer state across ranks (ZeRO / FSDP) because at fp32 the buffer is another 4 bytes per parameter.`,
+  debrief: `The whole optimizer is a loop over \`param_groups\` that mutates two things in place, the parameter and its entry in \`self.state\`, and that is why it is shaped the way it is. \`@torch.no_grad()\` is not a nicety: an in-place write to a leaf tensor that requires grad is an autograd error outside it. The closure gets \`enable_grad\` back because it has to call \`backward()\`. The buffer is created lazily and kept in \`self.state[p]\` rather than as an attribute so that \`state_dict()\` serialises it and \`load_state_dict()\` restores it; a parameter that never sees a gradient never costs a buffer. In-place \`mul_\`/\`add_\` keep the buffer the same tensor across steps (\`state_dict()\` returns references to it, not copies) and avoid allocating per step. Nesterov is one extra out-of-place \`add\` (the buffer is identical to classical momentum, only the step direction differs), the change of variables of Bengio et al. that PyTorch uses instead of the textbook "evaluate the gradient at the look-ahead point". Decoupling the decay means multiplying the weight before the update: with the gradient-folded version the term \`wd · p\` enters the buffer and is replayed with a geometric tail of \`1 / (1 − momentum)\`, so the effective decay depends on the momentum and, in Adam, on the second-moment normalisation: the observation behind AdamW (Loshchilov & Hutter). Production optimizers differ in machinery, not maths: on CUDA, \`torch.optim.SGD\` defaults to a \`foreach\` implementation that updates every tensor of a group with multi-tensor kernels, and \`fused=True\` runs one kernel that reads each parameter once; \`torch.compile\` fuses the whole step; distributed trainers shard the optimizer state across ranks (ZeRO, FSDP) because at fp32 the buffer is another 4 bytes per parameter.`,
 };

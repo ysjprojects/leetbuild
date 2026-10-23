@@ -1,19 +1,37 @@
 /**
  * The learning guide for the SGD drill: what momentum does to a gradient step, how Nesterov's
  * look-ahead differs from it in PyTorch's formulation, why decoupled weight decay is not L2
- * regularisation once a buffer is involved, and the `torch.optim.Optimizer` contract (groups, lazy
- * state, in-place updates under no_grad, the closure) — figures where they say it faster than prose,
- * a pop quiz per section. Rendered at `/pt-sgd-momentum/learn`.
+ * regularisation once a buffer is involved, three steps worked by hand, and the
+ * `torch.optim.Optimizer` contract (groups, lazy state, in-place updates under no_grad, the
+ * closure), with figures where they say it faster than prose and a pop quiz per section. Rendered
+ * at `/pt-sgd-momentum/learn`.
  */
 export const learn = `# The mechanism at a glance
 
 A training step is \`loss.backward()\` followed by \`optimizer.step()\`. The first fills \`p.grad\` for
 every parameter; the second turns those gradients into new parameter values and is the only place the
-weights ever change. **SGD with momentum** keeps one extra tensor per parameter — a decaying sum of past
-gradients — and steps along it; **Nesterov** steps along the gradient plus that sum; **decoupled weight
+weights ever change. **SGD with momentum** keeps one extra tensor per parameter (a decaying sum of past
+gradients) and steps along it; **Nesterov** steps along the gradient plus that sum; **decoupled weight
 decay** shrinks the weight itself before the step. All three are a few lines inside one subclass of
-\`torch.optim.Optimizer\`, the base class that AdamW, Lion, Muon and every other optimizer share. One
-training step through it, read bottom to top:
+\`torch.optim.Optimizer\`, the base class that AdamW, Lion, Muon and every other PyTorch optimizer share.
+
+The words this guide uses, defined once:
+
+| Term | What it means here |
+| --- | --- |
+| Gradient \`g\` | \`p.grad\`: the derivative of the loss with respect to \`p\`, the same shape as \`p\`. It points uphill, so a step goes against it. |
+| Learning rate \`lr\` | The step size: how far the parameter moves along the chosen direction in one step. |
+| Momentum \`μ\` | A number in \`[0, 1)\` (\`momentum\` in code): how much of the previous direction survives into the next step. |
+| Momentum buffer \`buf\` | The decaying sum of past gradients, one tensor per parameter, kept in \`state[p]["momentum_buffer"]\`. |
+| Nesterov | A variant that steps along \`g + μ · buf\` instead of \`buf\`, so the newest gradient counts more. |
+| Weight decay \`wd\` | A pull of every weight toward zero, \`p ← p · (1 − lr · wd)\` per step, which keeps weights small. |
+| Param group | One dict in \`optimizer.param_groups\`: a list of parameters plus their own \`lr\`, \`momentum\`, \`weight_decay\`. |
+| Optimizer state | \`optimizer.state[p]\`: a dict per parameter for whatever the optimizer remembers between steps. |
+| \`Optimizer\` API | \`torch.optim.Optimizer\`: the base class builds the groups and the state; the subclass writes \`step()\`. |
+| Closure | A function that zeroes the gradients, recomputes the loss, calls \`backward()\` and returns the loss. |
+| In place | An op ending in \`_\` (\`mul_\`, \`add_\`) that overwrites its tensor instead of returning a new one. |
+
+One training step through the optimizer, read bottom to top:
 
 :::architecture
 {
@@ -66,14 +84,14 @@ p   ← p − lr · d                              p.add_(d, alpha=-lr), in plac
   \`torch.optim.Optimizer\`; \`param_groups\`, \`state\`, \`zero_grad()\` and \`state_dict()\` are inherited.
 - \`step(closure=None)\` runs under \`@torch.no_grad()\`, evaluates a closure under \`enable_grad\` and returns
   its loss, and skips any parameter whose \`grad is None\`.
-- With \`weight_decay=0\` the trajectory is bit-for-bit the one \`torch.optim.SGD\` produces; with it, the
-  two differ from the second step on — that difference is the point of the last two sections.
+- With \`weight_decay=0\` the trajectory is bit-for-bit the one \`torch.optim.SGD\` produces on CPU; with it,
+  the two differ from the second step on. The weight-decay section explains why.
 
 # Momentum: a heavy ball, not a bigger step
 
 Plain gradient descent, \`p ← p − lr · g\`, forgets everything between steps. On a loss surface shaped like
-a ravine — steep across, shallow along, which is what every deep net's loss looks like in most directions —
-the gradient points mostly across; the step zig-zags and the walk along the floor is slow. Polyak's
+a ravine (steep across, shallow along, which is what a deep net's loss looks like in many directions) the
+gradient points mostly across; the step zig-zags and the walk along the floor is slow. Polyak's
 [heavy-ball method](https://distill.pub/2017/momentum/) adds velocity:
 
 \`\`\`text
@@ -86,10 +104,21 @@ Run plain SGD, momentum and Nesterov down such a ravine and compare the paths:
 :::widget optimizer-paths
 
 Across the ravine the gradient flips sign every step and the sum cancels; along it the gradient keeps its
-sign and the sum grows. For a constant gradient the buffer converges to \`g / (1 − μ)\`, so the effective
-step is amplified by a factor that depends only on μ:
+sign and the sum grows. How much it grows follows from unrolling the buffer for a constant gradient \`g\`:
 
-| μ | Steady-state buffer | Effective step | Memory of the last k gradients |
+\`\`\`text
+step 1:  buf₁ = g
+step 2:  buf₂ = μ · buf₁ + g = g + μ g
+step 3:  buf₃ = μ · buf₂ + g = g + μ g + μ² g
+step t:  buf_t = g · (1 + μ + … + μ^(t−1)) = g · (1 − μ^t) / (1 − μ)
+t → ∞:   buf   → g / (1 − μ)                  because μ^t → 0 when μ < 1
+\`\`\`
+
+The closed form comes from multiplying the sum \`S = 1 + μ + … + μ^(t−1)\` by μ and subtracting: every
+term cancels except \`S − μ S = 1 − μ^t\`. So the effective step is amplified by a factor that depends only
+on μ:
+
+| μ | Steady-state buffer | Effective step | Memory of past gradients |
 | --- | --- | --- | --- |
 | 0 | \`g\` | \`lr · g\` | none |
 | 0.9 | \`10 · g\` | \`10 · lr · g\` | half the weight sits in the last ~7 steps |
@@ -100,27 +129,35 @@ Two consequences for the code:
 - \`lr\` and \`μ\` are not independent knobs: \`lr = 0.1, μ = 0.9\` moves like \`lr = 1.0\` without momentum
   on a smooth direction. Recipes that change μ mid-training rescale \`lr\` with it.
 - The buffer is *the* state. It is one tensor per parameter, the same shape and dtype as \`p\`, and the
-  update is elementwise — which is why the drill's \`buf.mul_(μ).add_(g)\` works unchanged for a
-  3-vector and for a 4096 × 4096 weight.
+  update is elementwise, which is why the drill's \`buf.mul_(μ).add_(g)\` works unchanged for a 3-vector
+  and for a 4096 × 4096 weight.
 
 PyTorch's \`torch.optim.SGD\` writes the buffer exactly this way (its \`dampening\` argument scales the
-\`g\` term and is 0 in the drill), and initialises it to \`g\` on the first step rather than to zero —
-otherwise the first \`μ\` steps would be scaled down by \`1 − μ^t\`, the bias Adam corrects explicitly.
+\`g\` term and is 0 in the drill). It initialises the buffer to a copy of \`g\` on the first step; with no
+dampening that is the same as starting from zero, since \`μ · 0 + g = g\`. Either way the amplification
+builds up over time: at μ = 0.9 the factor \`(1 − μ^t) / (1 − μ)\` is 6.5 after 10 steps and 9.0 after 22.
 
 :::quiz
 Q: With lr = 0.01 and μ = 0.9, the gradient is a constant g for a long time. How far does each step move?
-- [ ] 0.01 · g — momentum only smooths noise, it does not change the step size
-- [x] About 0.1 · g — the buffer converges to g / (1 − μ) = 10 g
-- [ ] 0.9 · g — the step is μ times the gradient
+- [ ] 0.01 · g: momentum only smooths noise, it does not change the step size
+- [x] About 0.1 · g: the buffer converges to g / (1 − μ) = 10 g
+- [ ] 0.9 · g: the step is μ times the gradient
 > The buffer is a geometric sum: g + μg + μ²g + … = g / (1 − μ). At μ = 0.9 that is 10 g, so the effective learning rate on a consistent direction is ten times lr. On a direction whose gradient flips sign every step the terms cancel instead.
 :::
 
 # Nesterov: look where the ball is going
 
-Nesterov's accelerated gradient evaluates the gradient *after* the momentum step rather than before it —
-at \`p + μ · buf\` instead of at \`p\`. For deep nets, [Sutskever et al. (2013)](https://proceedings.mlr.press/v28/sutskever13.html)
-showed that this look-ahead, with momentum well scheduled, closed much of the gap to second-order methods,
-and rewrote it so the gradient is still evaluated at the current parameters:
+Nesterov's accelerated gradient evaluates the gradient *after* the momentum step rather than before it:
+at the look-ahead point \`p − lr · μ · buf\`, where momentum alone would carry the parameters, instead of
+at \`p\`. [Sutskever et al. (2013)](https://proceedings.mlr.press/v28/sutskever13.html) brought it to deep
+learning: with a good initialisation and a slowly increasing momentum schedule, SGD with momentum trained
+deep and recurrent nets as well as Hessian-free second-order optimisation, and they argued that Nesterov
+behaves more stably than classical momentum at high μ.
+
+A gradient at a shifted point is awkward in a framework: the model holds \`p\`, and autograd computes
+\`p.grad\` at \`p\`. [Bengio et al. (2012)](https://arxiv.org/abs/1212.0901) changed variables so that the
+stored parameters *are* the look-ahead point. The gradient is then taken at the stored parameters as
+usual, and the update becomes:
 
 \`\`\`text
 buf ← μ · buf + g              the buffer is identical to classical momentum
@@ -128,10 +165,39 @@ d   ← g + μ · buf              classical: d ← buf
 p   ← p − lr · d
 \`\`\`
 
-That is the formulation in \`torch.optim.SGD\` and in the drill: the parameters it stores are the
-look-ahead point, and the only change from classical momentum is one out-of-place \`add\` —
-\`d = g.add(buf, alpha=μ)\`. Expand it and the difference is a term of \`μ · g\` added immediately, rather
-than only entering through the buffer one step later:
+:::details Deriving it from the look-ahead form
+Write the look-ahead form with a velocity \`v\` (the step itself) and parameters \`θ\`:
+
+\`\`\`text
+v_(t+1) = μ · v_t − lr · ∇f(θ_t + μ · v_t)        gradient at the look-ahead point
+θ_(t+1) = θ_t + v_(t+1)
+\`\`\`
+
+Store \`φ_t = θ_t + μ · v_t\` (the look-ahead point) instead of \`θ_t\`, and let \`g_t = ∇f(φ_t)\`, an ordinary
+gradient at the stored parameters. Since \`θ_t = φ_t − μ · v_t\`:
+
+\`\`\`text
+φ_(t+1) = θ_(t+1) + μ · v_(t+1)
+        = φ_t − μ · v_t + (1 + μ) · v_(t+1)
+        = φ_t − μ · v_t + (1 + μ) · (μ · v_t − lr · g_t)
+        = φ_t + μ² · v_t − (1 + μ) · lr · g_t
+\`\`\`
+
+Now set \`v_t = −lr · buf_t\`, so the velocity rule is the buffer rule \`buf_(t+1) = μ · buf_t + g_t\`. The
+drill's step gives the same line:
+
+\`\`\`text
+φ_t − lr · (g_t + μ · buf_(t+1)) = φ_t − lr · (g_t + μ² · buf_t + μ · g_t)
+                                 = φ_t − μ² · lr · buf_t − (1 + μ) · lr · g_t
+\`\`\`
+
+Run both forms for six steps on \`f(x) = 3x² − x\` from \`x = 1\` (lr = 0.05, μ = 0.9) and the stored
+points agree to ten digits.
+:::
+
+That is the formulation in \`torch.optim.SGD\` and in the drill: the only change from classical momentum
+is one out-of-place \`add\`, \`d = g.add(buf, alpha=μ)\`. Expand it and the difference is a term of \`μ · g\`
+added immediately, rather than only entering through the buffer one step later:
 
 | | Classical, \`d = buf\` | Nesterov, \`d = g + μ · buf\` |
 | --- | --- | --- |
@@ -141,16 +207,16 @@ than only entering through the buffer one step later:
 | Oldest gradient's weight | \`μ^(t−1)\` | \`μ^t\` |
 
 The newest gradient counts more and the oldest less: the correction arrives one step earlier, which is
-what damps the overshoot at the bottom of a ravine. The buffer must stay the classical one — adding the
-look-ahead *into* the buffer compounds it every step and the trajectory leaves \`torch.optim.SGD\`'s at
-step 2.
+what damps the overshoot at the bottom of a ravine. The buffer must stay the classical one: write the
+look-ahead *into* the buffer and the parameters still match \`torch.optim.SGD\` after step 1, then leave
+its trajectory at step 2.
 
 :::quiz
 Q: Where does Nesterov differ from classical momentum in the drill's code?
 - [ ] The buffer update: buf.mul_(μ).add_(g, alpha=1 + μ)
 - [x] Only the step direction: d = g + μ · buf instead of d = buf; the buffer is the same
-- [ ] The gradient is recomputed at p + μ · buf before the update
-> PyTorch's formulation keeps the buffer as the classical momentum sum and changes only what is subtracted from p. Recomputing the gradient at a look-ahead point is the textbook form; it is equivalent after a change of variables but needs a second forward/backward, which nobody pays for.
+- [ ] The gradient is recomputed at p − lr · μ · buf before the update
+> PyTorch's formulation keeps the buffer as the classical momentum sum and changes only what is subtracted from p. Taking the gradient at a look-ahead point is the textbook form; it is equivalent after the change of variables above, but it would need the model evaluated at parameters it does not hold.
 :::
 
 # Weight decay, coupled and decoupled
@@ -167,12 +233,12 @@ buffer it is not, because \`wd · p\` goes *into the buffer* and is replayed:
 | Buffer after step 2 | \`μ·(g₁ + wd·p₀) + g₂ + wd·p₁\` | \`μ·g₁ + g₂\` |
 | Parameter after step 2 | \`p₁ − lr·buf\`: carries \`μ·wd·p₀\`, the decay replayed | \`p₁·(1 − lr·wd) − lr·(μ·g₁ + g₂)\`: each decay applied once |
 
-The two agree on step 1 — \`p₀ − lr · wd · p₀ − lr · g₁\` either way, which is why the drill's hand check
+The two agree on step 1 (\`p₀ − lr · wd · p₀ − lr · g₁\` either way), which is why the drill's hand check
 looks at the *buffer* after step 1 and at the parameters after step 2. From then on the coupled version
 applies each step's decay again and again with weights \`μ, μ², …\`, a total of \`1 / (1 − μ)\` times, one
 step late each time. In SGD that is a rescaling of \`wd\` by about 10 at μ = 0.9 plus a lag; in Adam the
 buffered decay term is also divided by the running RMS of the gradient, so weights with large gradients
-are decayed *less* — the observation of
+are decayed *less*. That is the observation of
 [Loshchilov & Hutter, *Decoupled Weight Decay Regularization*](https://arxiv.org/abs/1711.05101), who
 introduced SGDW and AdamW. Decoupled decay is one line on the parameter, before the update:
 
@@ -181,8 +247,9 @@ p.mul_(1 - lr * weight_decay)   # then the momentum update, then p.add_(d, alpha
 \`\`\`
 
 - The gradient and the buffer carry only gradients; \`wd\` and \`lr\` can be tuned independently.
-- It still scales with \`lr\`: a scheduler that decays the learning rate decays the decay too, which is
-  what the paper's AdamW does (and what \`torch.optim.AdamW\` does with \`param.mul_(1 - lr * weight_decay)\`).
+- The shrink still follows the learning-rate schedule. The paper writes it \`η_t · λ · θ\`, with \`η_t\` the
+  schedule multiplier; \`torch.optim.AdamW\` and the drill use \`param.mul_(1 - lr * weight_decay)\`, so
+  there it scales with the base \`lr\` too.
 - \`torch.optim.SGD\`'s \`weight_decay\` argument is the *coupled* kind, which is why the drill compares
   trajectories at \`weight_decay=0\` only. Production recipes also exclude biases and normalisation
   gains from decay by putting them in a second param group with \`weight_decay=0\`.
@@ -190,7 +257,7 @@ p.mul_(1 - lr * weight_decay)   # then the momentum update, then p.add_(d, alpha
 :::details Why "equals L2" is only true for plain SGD
 With no momentum, \`p − lr · (g + wd · p) = p · (1 − lr · wd) − lr · g\` exactly: the gradient of
 \`wd/2 · ‖p‖²\` and a multiplicative shrink are the same step. Any optimizer that transforms the gradient
-before applying it — a momentum buffer, Adam's per-coordinate normalisation, Shampoo's preconditioner —
+before applying it (a momentum buffer, Adam's per-coordinate normalisation, Shampoo's preconditioner)
 transforms the decay term with it, and the equivalence breaks. The transformation is the whole point of
 those optimizers, so the fix is to keep the decay outside it.
 :::
@@ -201,6 +268,69 @@ Q: After one step with lr = 0.1, μ = 0.9 and wd = 0.5, the decoupled optimizer 
 - [x] In the momentum buffer: one holds g, the other g + wd · p₀, so step 2 is different
 - [ ] In the learning rate: decoupled decay divides lr by (1 − μ)
 > Step 1 is identical because the buffer starts as a copy of whatever was fed in. The coupled version fed g + wd · p₀, and that term is replayed with weight μ on step 2, μ² on step 3, …; the decoupled version's buffer is the bare gradient and the decay is applied once per step, on the weight.
+:::
+
+# Three steps by hand
+
+Take one parameter, \`p₀ = 1\`, and the loss \`f(p) = p²\`, whose gradient is \`g = 2p\`. Use \`lr = 0.1\`,
+\`μ = 0.9\` and, for the decay rows, \`wd = 0.5\`. The gradient is always taken at the parameter as it was
+before the step. Classical momentum, line by line:
+
+\`\`\`text
+step 1:  g = 2 · 1.00 = 2.00    buf = 2.00 (a copy of g)          p = 1.00 − 0.1 · 2.00 = 0.80
+step 2:  g = 2 · 0.80 = 1.60    buf = 0.9 · 2.00 + 1.60 = 3.40    p = 0.80 − 0.1 · 3.40 = 0.46
+step 3:  g = 2 · 0.46 = 0.92    buf = 0.9 · 3.40 + 0.92 = 3.98    p = 0.46 − 0.1 · 3.98 = 0.062
+\`\`\`
+
+Nesterov keeps the same buffer rule but steps along \`d = g + μ · buf\`:
+
+\`\`\`text
+step 1:  g = 2.00   buf = 2.00                        d = 2.00 + 0.9 · 2.00 = 3.80
+         p = 1.00 − 0.1 · 3.80 = 0.62
+step 2:  g = 1.24   buf = 0.9 · 2.00 + 1.24 = 3.04    d = 1.24 + 0.9 · 3.04 = 3.976
+         p = 0.62 − 0.1 · 3.976 = 0.2224
+\`\`\`
+
+Decoupled decay shrinks first, then steps; coupled decay adds \`wd · p\` to the gradient:
+
+\`\`\`text
+decoupled  step 1:  p = 1.00 · 0.95 = 0.95                buf = 2.00
+                    p = 0.95 − 0.1 · 2.00 = 0.75
+           step 2:  g = 1.50   p = 0.75 · 0.95 = 0.7125   buf = 0.9 · 2.00 + 1.50 = 3.30
+                    p = 0.7125 − 0.1 · 3.30 = 0.3825
+coupled    step 1:  g + wd · p = 2.00 + 0.50 = 2.50       buf = 2.50
+                    p = 1.00 − 0.1 · 2.50 = 0.75
+           step 2:  g + wd · p = 1.50 + 0.375 = 1.875     buf = 0.9 · 2.50 + 1.875 = 4.125
+                    p = 0.75 − 0.1 · 4.125 = 0.3375
+\`\`\`
+
+All five side by side (\`p\` after each step, checked against \`torch.optim.SGD\` and the drill's solution
+in float64):
+
+| After step | Plain SGD | Momentum | Nesterov | Decoupled wd | Coupled wd |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 0.8 | 0.8 | 0.62 | 0.75 | 0.75 |
+| 2 | 0.64 | 0.46 | 0.2224 | 0.3825 | 0.3375 |
+| 3 | 0.512 | 0.062 | −0.1084 | −0.0101 | −0.1181 |
+
+What the numbers say:
+
+- **Momentum matches plain SGD on step 1** (the buffer is just \`g\`) and pulls ahead from step 2, when the
+  remembered 2.00 adds to the new 1.60.
+- **Nesterov moves furthest at once,** because the newest gradient counts \`1 + μ = 1.9\` times. Over a
+  longer run it also settles faster: in 30 steps classical momentum swings out to −0.71 and is still
+  at ±0.31 in steps 21 to 30, while Nesterov swings to −0.42 and stays within ±0.03.
+- **Coupled and decoupled agree after step 1** (0.75) and split at step 2: the coupled buffer, 4.125
+  against 3.30, holds this step's decay \`wd · p = 0.375\` (which decoupled applies to \`p\` directly) plus
+  \`0.9 · 0.5 = 0.45\` of step 1's decay replayed by momentum. That replay is the whole gap in \`p\`:
+  \`0.1 · 0.45 = 0.045\`, 0.3375 against 0.3825.
+
+:::quiz
+Q: Continue the classical momentum run one more step. What is p after step 4?
+- [ ] 0.0496: p = 0.062 − 0.1 · 0.124
+- [x] −0.3086: g = 0.124, buf = 0.9 · 3.98 + 0.124 = 3.706, p = 0.062 − 0.3706
+- [ ] 0.0558: p = 0.062 · 0.9
+> The gradient is small (0.124) but the buffer still remembers the earlier, larger gradients: 0.9 · 3.98 = 3.582 of it is history. Stepping along the buffer carries p well past the minimum at 0. The first option is plain SGD's step, which has no memory.
 :::
 
 # The Optimizer contract: groups, state, in place, under no_grad
@@ -222,15 +352,15 @@ group with \`weight_decay=0\` lives. Four details decide whether the loop is cor
 
 - **Skip** \`grad is None\`. A frozen parameter, or one the batch did not use, has no gradient; touching
   it would decay it for nothing and allocate a buffer it does not need.
-- **State is lazy** and lives in \`self.state\`. Nothing is allocated in \`__init__\`; the buffer appears the first
-  time a gradient does, as a detached clone of it. Keeping it in \`state[p]\` rather than on the module or
-  the optimizer object is what makes \`state_dict()\` save it and a resumed run continue the trajectory.
-- **In place.** \`buf.mul_(μ).add_(g)\` and \`p.add_(d, alpha=-lr)\` write into the existing tensors. A
-  checkpoint references those tensors; \`p = p - lr * d\` rebinds a local and the model never changes;
-  \`p.data\` escapes autograd's bookkeeping and is the pre-0.4 idiom the base class warns against.
-- **No autograd:** \`@torch.no_grad()\`. The parameters are leaf tensors that require grad; an in-place write to
-  one of them with grad mode on is a \`RuntimeError\`, and the buffer arithmetic would otherwise build a
-  graph that is never freed:
+- **State is lazy** and lives in \`self.state\`. Nothing is allocated in \`__init__\`; the buffer appears the
+  first time a gradient does, as a detached clone of it. Keeping it in \`state[p]\` rather than on the
+  module or the optimizer object is what makes \`state_dict()\` save it and a resumed run continue the
+  trajectory.
+- **In place.** \`buf.mul_(μ).add_(g)\` and \`p.add_(d, alpha=-lr)\` write into the existing tensors, the ones
+  the model and \`state[p]\` hold. \`p = p - lr * d\` rebinds a local and the model never changes; \`p.data\`
+  is the pre-0.4 idiom that writes behind autograd's back, so its version checks cannot catch a misuse.
+- **No autograd:** \`@torch.no_grad()\`. The parameters are leaf tensors that require grad, and an in-place
+  write to one of them with grad mode on is a \`RuntimeError\`:
 
 | Inside \`step()\` | Grad mode | What happens |
 | --- | --- | --- |
@@ -243,7 +373,7 @@ several times per step) receives a function that zeroes the gradients, runs forw
 returns the loss. \`step\` calls it inside \`with torch.enable_grad():\` and hands the loss back, so a
 training loop can write \`loss = opt.step(closure)\` for any optimizer.
 
-What the state costs, in fp32 and per parameter — the reason optimizer state is sharded across GPUs
+What the state costs, in fp32 and per parameter, and the reason optimizer state is sharded across GPUs
 (ZeRO, FSDP) before anything else is:
 
 | Optimizer | Parameter | Gradient | State | Total | For 7 B parameters |
@@ -260,13 +390,48 @@ Q: Why is the momentum buffer kept in self.state[p] instead of as an attribute o
 > The base class knows about param_groups and state and nothing else. Anything in state[p] is saved by state_dict(), remapped to the right parameter by load_state_dict(), and moved with the parameters; a private attribute is lost at the first checkpoint.
 :::
 
+# How to approach it, and the common mistakes
+
+Build \`step\` in four passes, running the file after each; the self-test checks the configurations in
+this order:
+
+1. **Plain SGD.** The two loops, the \`grad is None\` skip and \`p.add_(p.grad, alpha=-lr)\` under
+   \`@torch.no_grad()\`. The \`momentum=0\` configuration passes.
+2. **Momentum.** The lazy buffer (clone on the first step, \`mul_(μ).add_(g)\` after) and \`d = buf\`. The
+   \`momentum=0.9\` configuration passes.
+3. **Nesterov.** One line: \`d = g.add(buf, alpha=μ)\` when \`nesterov\`. Then the closure, which the next
+   block of the self-test drives.
+4. **Decoupled decay.** \`p.mul_(1 - lr * weight_decay)\` before the update. The hand check passes.
+
+The mistakes that are easy to make, and what each one does:
+
+| Mistake | What happens | Fix |
+| --- | --- | --- |
+| No \`@torch.no_grad()\` | \`RuntimeError\` on the first \`p.mul_\` or \`p.add_\`: a leaf that requires grad used in place | decorate \`step\` |
+| Closure called without \`enable_grad\` | \`backward()\` raises "element 0 of tensors does not require grad" | \`with torch.enable_grad(): loss = closure()\` |
+| \`p = p - lr * d\` | rebinds a local name; the model's tensor never changes | \`p.add_(d, alpha=-lr)\` |
+| \`buf = buf * μ + g\` | a new tensor; \`state[p]\` still holds the old one, so the run matches for two steps and leaves at step 3 | \`buf.mul_(μ).add_(g)\` |
+| The look-ahead written into \`buf\` | step 1 matches, step 2 does not | \`d = g.add(buf, alpha=μ)\`, out of place |
+| \`g + wd * p\` fed to the buffer | coupled decay: the buffer after step 1 is not \`g\`, and step 2 differs | \`p.mul_(1 - lr * wd)\` on the weight |
+| No \`grad is None\` skip | \`TypeError\` from \`torch.clone(None)\` or \`p.add_(None, …)\` on the unused parameter | \`if p.grad is None: continue\` |
+| Buffers made in \`__init__\` with \`zeros_like\` | same numbers, but every frozen parameter costs a buffer and \`state\` is not empty before step 1 | create it on the first step that sees a gradient |
+| Hyper-parameters read from \`self.defaults\` | a scheduler's new \`lr\` and a second group's \`weight_decay=0\` are ignored | read them from \`group\` |
+
+:::quiz
+Q: An implementation writes buf = buf * momentum + g on later steps. Which part of the self-test catches it, and when?
+- [ ] None: the arithmetic is the same as buf.mul_(momentum).add_(g)
+- [x] The trajectory comparison with torch.optim.SGD at momentum = 0.9: the parameters match for two steps and differ from step 3
+- [ ] The first step, because the buffer is created with the wrong shape
+> The arithmetic is right but it lands in a new tensor bound to a local name. state[p]["momentum_buffer"] keeps the step-1 copy of g, so step 2 is still correct (it uses the local) while step 3 starts again from the stale buffer.
+:::
+
 # What to take away
 
 - **Momentum is a geometric sum of gradients.** \`buf ← μ · buf + g\`; a constant gradient gives
   \`g / (1 − μ)\`, so μ = 0.9 is a tenfold step on consistent directions and cancellation on oscillating
   ones. One tensor per parameter, the same shape, updated elementwise in place.
-- **Nesterov changes the direction, not the buffer.** \`d = g + μ · buf\` instead of \`d = buf\` — one
-  out-of-place \`add\` — gives the newest gradient weight \`1 + μ\` and the correction one step earlier.
+- **Nesterov changes the direction, not the buffer.** \`d = g + μ · buf\` instead of \`d = buf\` (one
+  out-of-place \`add\`) gives the newest gradient weight \`1 + μ\` and the correction one step earlier.
 - **Decouple the decay.** \`p.mul_(1 − lr · wd)\` before the update keeps \`wd · p\` out of the buffer, where
   it would be replayed \`1 / (1 − μ)\` times; coupled and decoupled agree on step 1 and part on step 2.
   AdamW is this idea applied to Adam.
@@ -275,14 +440,14 @@ Q: Why is the momentum buffer kept in self.state[p] instead of as an attribute o
   None\` skipped; \`mul_\`/\`add_\` under \`@torch.no_grad()\`; the closure under \`enable_grad\`, its loss
   returned.
 - **Frameworks change the machinery, not the maths.** \`foreach\` and \`fused\` kernels update a whole
-  group at once, \`torch.compile\` fuses the step, and ZeRO/FSDP shard the 4–8 bytes of state per
+  group at once, \`torch.compile\` fuses the step, and ZeRO/FSDP shard the 4 to 8 bytes of state per
   parameter that this loop would otherwise keep on every rank.
 
 The primary reference is Loshchilov & Hutter,
 [*Decoupled Weight Decay Regularization*](https://arxiv.org/abs/1711.05101) (ICLR 2019), which
 introduced SGDW and AdamW; the update rules and the optimizer contract are documented on the
-[\`torch.optim.SGD\`](https://pytorch.org/docs/stable/generated/torch.optim.SGD.html) and
-[\`torch.optim\`](https://pytorch.org/docs/stable/optim.html) pages, and Goh's
+[\`torch.optim.SGD\`](https://docs.pytorch.org/docs/stable/generated/torch.optim.SGD.html) and
+[\`torch.optim\`](https://docs.pytorch.org/docs/stable/optim.html) pages, and Goh's
 [*Why Momentum Really Works*](https://distill.pub/2017/momentum/) is the picture of the heavy ball in a
 ravine.
 `;

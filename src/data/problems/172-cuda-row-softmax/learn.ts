@@ -2,7 +2,7 @@
  * The learning guide for the row-softmax drill: why softmax is computed as exp(x − max), how one block
  * per row turns the max and the sum into two block reductions (warp shuffles, then shared memory), the
  * fully masked row and the NaN it would produce, the online softmax that fuses both reductions into one
- * pass, and why the kernel is bound by memory bandwidth — a figure or a table where one says it faster
+ * pass, and why the kernel is bound by memory bandwidth; a figure or a table where one says it faster
  * than prose, a pop quiz per section. Rendered at \`/cuda-row-softmax/learn\`.
  */
 export const learn = `# The mechanism at a glance
@@ -34,8 +34,8 @@ read comes from DRAM, and the cells are tinted by where each read is served from
       ], "detail": "Recomputes the exponent instead of storing it; zeros for a fully masked row."}
     ]},
     {"id": "a-gmem", "label": "Global memory", "sub": "HBM · 16.4 MB per matrix", "tone": "global", "stretch": true, "items": [
-      {"id": "a-x", "array": "x · 4096 × 1000", "sub": "read once", "cols": 16, "rows": 4, "marks": [{"cols": [0, 15], "rows": [0, 0], "tone": "register", "label": "row r"}], "detail": "Read from DRAM once per row; the 32 lanes of a warp read 32 consecutive floats per round."},
-      {"id": "a-y", "array": "y · 4096 × 1000", "sub": "written once", "cols": 16, "rows": 4, "marks": [{"cols": [0, 15], "rows": [0, 0], "tone": "global", "label": "row r"}], "detail": "4 KB written per row: 8 bytes of DRAM traffic per element in all."}
+      {"id": "a-x", "array": "x · 4096 × 1000", "sub": "read once", "cols": 16, "rows": 4, "marks": [{"cols": [0, 15], "rows": [0, 0], "tone": "a", "label": "row r"}], "detail": "Read from DRAM once per row; the 32 lanes of a warp read 32 consecutive floats per round."},
+      {"id": "a-y", "array": "y · 4096 × 1000", "sub": "written once", "cols": 16, "rows": 4, "marks": [{"cols": [0, 15], "rows": [0, 0], "tone": "a", "label": "row r"}], "detail": "4 KB written per row: 8 bytes of DRAM traffic per element in all."}
     ]}
   ],
   "arrows": [
@@ -58,7 +58,7 @@ The contract the drill implements, in one file \`row_softmax.cu\`:
 
 # Why exp(x − max)
 
-Shifting every logit by the same constant does not change the result — the factor \`exp(−m)\` appears in the
+Shifting every logit by the same constant does not change the result: the factor \`exp(−m)\` appears in the
 numerator and in every term of the denominator, and cancels:
 
 \`\`\`text
@@ -66,7 +66,7 @@ exp(x_c − m) / Σ_k exp(x_k − m)  =  exp(−m)·exp(x_c) / (exp(−m)·Σ_k 
 \`\`\`
 
 Choosing \`m = max_k x_k\` makes the largest exponent exactly \`0\`. Every term lies in \`(0, 1]\`, at least one
-equals \`1\`, so the sum lies in \`[1, cols]\` — it can neither overflow nor underflow to zero. Unshifted, the
+equals \`1\`, so the sum lies in \`[1, cols]\`: it can neither overflow nor underflow to zero. Unshifted, the
 numbers break at modest magnitudes:
 
 | Input | \`expf(x)\` in fp32 | Unshifted softmax |
@@ -83,39 +83,66 @@ Row 0 of the self-test, both ways:
 | Before the first \`exp\` | nothing | pass 1 finds \`m ≈ 1e4\` |
 | Each term | \`inf\` for any \`x > 88.7\` | in \`(0, 1]\`, the max term exactly 1 |
 | Sum | \`inf\` | in \`[1, 1000]\` |
-| \`y\` | \`inf / inf = NaN\`, the rest \`0 / inf\`: row 0 is garbage | finite, sums to 1 |
+| \`y\` | \`inf / inf = NaN\` for the large terms, \`finite / inf = 0\` for the rest: row 0 is garbage | finite, sums to 1 |
+
+A row small enough to follow by hand, \`x = [1, 2, 3, -inf]\` (the last position masked):
+
+| Step | Value |
+| --- | --- |
+| Pass 1: \`m = max x\` | \`3\` |
+| \`x − m\` | \`[−2, −1, 0, -inf]\` |
+| \`exp(x − m)\` | \`[0.1353, 0.3679, 1, 0]\` |
+| Pass 2: \`sum\` | \`1.5032\` (in \`[1, 4]\`) |
+| Pass 3: \`y = exp(x − m) / sum\` | \`[0.0900, 0.2447, 0.6652, 0]\`, the same as \`torch.softmax\` |
+
+Each pass needs the previous one's result: the shift needs \`m\`, the division needs \`sum\`.
 
 The cost of the shift is ordering, not arithmetic: the max is a reduction over the whole row and must finish
 before any thread may take an \`exp\`. That is why softmax is two reductions rather than one. Frameworks
-compute it this way everywhere — the [PyTorch softmax](https://pytorch.org/docs/stable/generated/torch.nn.functional.softmax.html)
+compute it this way everywhere: the [PyTorch softmax](https://pytorch.org/docs/stable/generated/torch.nn.functional.softmax.html)
 kernels, cuDNN, and the \`logsumexp\` inside \`cross_entropy\`, which is \`m + log Σ exp(x − m)\` for the same reason.
 
 :::quiz
 Q: Row 0 of the self-test has magnitudes up to 1e4. After the shift, what is the range of the denominator?
-- [ ] (0, 1] — every term is at most 1
-- [x] [1, 1000] — the max element contributes exactly exp(0) = 1, and there are 1000 terms each at most 1
-- [ ] Unbounded — 1e4 still overflows after the shift
+- [ ] (0, 1]: every term is at most 1
+- [x] [1, 1000]: the max element contributes exactly exp(0) = 1, and there are 1000 terms each at most 1
+- [ ] Unbounded: 1e4 still overflows after the shift
 > The shift pins the largest exponent at 0, so one term is exactly 1 and none exceeds it. The denominator is therefore at least 1 (no division by a tiny number) and at most cols (no overflow), whatever the input scale.
 :::
 
 # One block per row, two block reductions
 
-A row of 1000 floats is 4 KB — one block of 256 threads covers it in four strided rounds. Mapping one block
+A row of 1000 floats is 4 KB, and one block of 256 threads covers it in four strided rounds. Mapping one block
 to one row means each reduction stays inside the block: no global atomics, no second launch, no other block
 to wait for. Threads stride by \`blockDim.x\`, so on each round the 32 lanes of a warp read 32 consecutive
-floats — one coalesced 128-byte transaction.
+floats, 128 bytes: coalesced into four 32-byte sectors when the address is 128-byte aligned, five when it is
+not. A row of 1000 floats starts at byte \`4000·r\`, so three rows in four are not; the extra sector is the
+neighbouring warp's, and the cache serves it.
 
 A block reduction has two levels:
 
-1. **Within a warp**, in registers. Five rounds of
-   [warp shuffles](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#warp-shuffle-functions)
-   halve the distance: \`v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, offset))\` for \`offset = 16, 8, 4, 2, 1\`.
+1. **Within a warp**, in registers. A warp is 32 threads that execute in lockstep, and a
+   [warp shuffle](https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cpp-language-extensions.html#warp-shuffle-functions)
+   lets a lane read another lane's register directly, with no memory: \`__shfl_xor_sync(mask, v, k)\` returns
+   the \`v\` of lane \`lane ^ k\`. Five rounds halve the distance:
+   \`v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, offset))\` for \`offset = 16, 8, 4, 2, 1\`.
    With \`xor\` the exchange is a butterfly and every lane ends holding the warp's result; with
-   \`__shfl_down_sync\` only lane 0 does, which is enough here.
+   \`__shfl_down_sync\` (lane \`i\` reads lane \`i + offset\`) only lane 0 does, which is enough here.
 2. **Across warps**, through shared memory. Lane 0 of each of the 8 warps writes its partial to
    \`shared[warp]\`, \`__syncthreads()\`, warp 0 loads the 8 partials (the identity, \`-INFINITY\` or \`0.f\`, for
    lanes 8–31), warp-reduces again, thread 0 writes \`shared[0]\`, a second \`__syncthreads()\`, and every thread
    reads the result.
+
+The warp level by hand, on 4 lanes holding \`[3, 1, 4, 1]\`: two rounds (offsets 2 and 1) instead of five.
+
+| Round | Lane 0 | Lane 1 | Lane 2 | Lane 3 |
+| --- | --- | --- | --- | --- |
+| start | 3 | 1 | 4 | 1 |
+| xor 2 (pairs 0↔2, 1↔3) | max(3, 4) = 4 | max(1, 1) = 1 | 4 | 1 |
+| xor 1 (pairs 0↔1, 2↔3) | 4 | 4 | 4 | 4 |
+| down 2, then down 1, instead | 4 | max of lanes 1–3 | max of lanes 2–3 | lane 3 only |
+
+With \`down\`, a lane whose source is past the end keeps its own value, so only lane 0 sees all four.
 
 The max inside one block, from the warps' registers through shared memory and back to every thread:
 
@@ -158,7 +185,7 @@ warp reads a slot before another warp has written it.
 | Block | \`__shared__\` slots + warp 0 | 1 write, 5 shuffles | two \`__syncthreads()\` |
 
 :::details Why the max and the sum get separate shared slots
-After the max reduction, every thread reads \`s_max[0]\` — but a fast warp that has finished reading may race
+After the max reduction, every thread reads \`s_max[0]\`, but a fast warp that has finished reading may race
 ahead into the sum reduction and its lane 0 may write its partial sum before a slow warp has read the max. If
 both reductions used the same array, warp 0's \`shared[0] = partial_sum\` could overwrite \`m\` under a reader
 that has not got there yet. Separate arrays (\`s_max\`, \`s_sum\`) remove the race at the cost of 32 bytes; the
@@ -167,16 +194,16 @@ alternative is a third \`__syncthreads()\` between the two reductions.
 
 :::quiz
 Q: Warp 0 reduces the 8 warp partials with a full 32-lane warp_max. What must lanes 8–31 load?
-- [ ] s_max[lane] — the array is zero-initialised
+- [ ] s_max[lane]: the array is zero-initialised
 - [x] -INFINITY, the identity of max (and 0 for the sum)
-- [ ] Nothing — they can skip the shuffle
+- [ ] Nothing: they can skip the shuffle
 > Shared memory is not initialised, and the shuffle with mask 0xffffffff needs all 32 lanes to participate. Lanes past the warp count must contribute a value that cannot change the result: fmaxf(v, -inf) = v and v + 0 = v.
 :::
 
 # The masked row
 
 Attention masks are written into the logits as \`-inf\`: \`exp(-inf) = 0\`, so masked positions get zero
-probability. A **partially masked** row — a causal mask cutting off the second half, as row 2 does — is
+probability. A **partially masked** row (a causal mask cutting off the second half, as row 2 does) is
 ordinary: \`m\` is finite, \`exp(-inf − m) = 0\`, the rest normalises. A **fully masked** row is not. Padding
 can mask every key for a query (an all-padding sequence, an empty segment), and then:
 
@@ -196,16 +223,16 @@ Over the three kinds of row:
 | fully masked (row 1) | \`-inf\` | NaN or 0 | NaN everywhere | zeros |
 
 Mathematically a fully masked softmax is undefined; zeros is the convention that keeps the rest of the
-network finite — the attention output for that query is a zero vector instead of NaN. Two guards are needed
+network finite: the attention output for that query is a zero vector instead of NaN. Two guards are needed
 because they cover different failures: the shift guard stops \`-inf − (-inf)\`, the division guard stops
 \`0 / 0\`. PyTorch's own \`softmax\` returns NaN here; FlashAttention's kernels special-case it the way this
 drill does, shifting by 0 when the running max is \`-inf\`.
 
 :::quiz
 Q: Row 2 has its second half set to -inf. Does it need the masked-row guard?
-- [ ] Yes — any -inf in the row produces NaN
-- [x] No — m is the max of the unmasked half, finite, so exp(-inf − m) = 0 and the sum is at least 1
-- [ ] Yes — the sum over the masked half is 0, so the division fails
+- [ ] Yes: any -inf in the row produces NaN
+- [x] No: m is the max of the unmasked half, finite, so exp(-inf − m) = 0 and the sum is at least 1
+- [ ] Yes: the sum over the masked half is 0, so the division fails
 > NaN needs -inf − (-inf), which only happens when m itself is -inf, i.e. when every element is masked. A partial mask leaves m finite, the masked entries become exact zeros, and the unmasked ones normalise as usual.
 :::
 
@@ -225,7 +252,7 @@ y_c = exp(x_c − m) / d
 \`\`\`
 
 The invariant is \`d = Σ_{k ≤ j} exp(x_k − m)\` after every step. Two partial states \`(m_a, d_a)\` and
-\`(m_b, d_b)\` combine associatively — \`m = max(m_a, m_b)\`, \`d = d_a·exp(m_a − m) + d_b·exp(m_b − m)\` — so the
+\`(m_b, d_b)\` combine associatively (\`m = max(m_a, m_b)\`, \`d = d_a·exp(m_a − m) + d_b·exp(m_b − m)\`), so the
 online version is still a single block reduction, of a pair instead of a scalar.
 
 | | Three-pass (this drill) | Online (two-pass) |
@@ -233,7 +260,7 @@ online version is still a single block reduction, of a pair instead of a scalar.
 | Reads of x | 3 (two hit L1/L2) | 2 |
 | Reductions | max, then sum | one, over (m, d) pairs |
 | \`exp\` per element | 2 | 3 (two in the fused pass, one in the write) |
-| Masked-row hazard | \`-inf − (-inf)\` once | the same, in every rescale — needs the same guard |
+| Masked-row hazard | \`-inf − (-inf)\` once | the same in every rescale, so it needs the same guard |
 
 For a 4 KB row that sits in cache the saving is small. The idea matters where the row does **not** fit:
 FlashAttention never materialises a row of \`QKᵀ\` at all, computing it tile by tile and keeping \`(m, d)\` and
@@ -255,7 +282,7 @@ Q: In the online update, why is d multiplied by exp(m − m_new)?
 # Memory-bound by construction
 
 Per element the kernel does a compare, two \`__expf\` (a hardware approximation on the special-function
-units), an add and a multiply — a handful of operations against 8 bytes of DRAM traffic (4 read, 4 written).
+units), an add and a multiply: a handful of operations against 8 bytes of DRAM traffic (4 read, 4 written).
 That is far below the arithmetic intensity at which an A100 or H100 becomes compute-bound, so the only number
 that matters is bytes moved per second.
 
@@ -267,13 +294,18 @@ that matters is bytes moved per second.
 | Ideal time at 3.35 TB/s (H100 SXM) | ≈ 10 µs |
 | Ideal time at 2.0 TB/s (A100 80 GB) | ≈ 16 µs |
 
-- The self-test reports \`2 · n · 4\` bytes over the measured time — the right denominator only because the
-  re-reads are cached. A 4 KB row per block, a few blocks per SM, fits comfortably in L1.
+- The self-test reports \`2 · n · 4\` bytes over the measured time, the right denominator only because the
+  re-reads are cached. A 4 KB row per block, a few blocks per SM, fits comfortably in L1. The whole 32.8 MB
+  working set also fits in an A100's 40 MB or an H100's 50 MB L2, so back-to-back launches on the same
+  buffers can be served partly from L2 and report more than the HBM bandwidth.
 - Coalescing is what makes the bound reachable: consecutive lanes read consecutive floats on every round.
 - 4096 blocks keep every SM busy; with a handful of rows (one block each) most SMs would idle, which is when
   libraries split a row across blocks or switch to a different mapping.
-- For short rows (\`cols ≤ 1024\`) PyTorch uses a variant that keeps the row in registers across all passes
-  and maps rows to warps; the [Triton fused-softmax tutorial](https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html)
+- PyTorch 2.9 sends rows of up to 2,048 elements and 8 KB to a
+  [warp-per-row kernel](https://github.com/pytorch/pytorch/blob/v2.9.0/aten/src/ATen/native/cuda/SoftMax.cu)
+  that keeps the row in registers across all passes (this drill's 1,000 columns would go there); wider rows get
+  one block per row, caching the row in registers or shared memory when it fits and re-reading it as here when
+  it does not. The [Triton fused-softmax tutorial](https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html)
   shows the same kernel in a few lines and benchmarks it against \`torch.softmax\`.
 
 The real win is fusion: softmax inside attention moves the \`rows × cols\` score matrix through DRAM twice
@@ -281,7 +313,7 @@ more than necessary, which is what FlashAttention removes.
 
 :::quiz
 Q: Pass 3 recomputes __expf(x − m) instead of storing the pass-2 values. Why is that the cheaper choice here?
-- [ ] __expf is free — it is computed at compile time
+- [ ] __expf is free: it is computed at compile time
 - [x] The kernel is memory-bound; recomputing re-reads x from L1/L2 and spends a few SFU cycles, whereas storing the values would need registers or extra DRAM traffic
 - [ ] Storing them would overflow the fp32 range
 > Arithmetic is idle capacity in a bandwidth-bound kernel. Recomputing the exponent costs cycles the GPU had to spare; keeping 1000 values per row would need either 4 registers per thread (fine for short rows, which is the register-resident variant) or a round trip through memory.
@@ -295,7 +327,7 @@ Q: Pass 3 recomputes __expf(x − m) instead of storing the pass-2 values. Why i
   warp in shared memory between two \`__syncthreads()\`, with separate slots for the two reductions.
 - A fully masked row gives \`-inf − (-inf) = NaN\`; shift by 0 when \`m == -INFINITY\` and multiply by 0 when the
   sum is 0, so the row is zeros.
-- Online softmax keeps \`(m, d)\` and rescales \`d\` by \`exp(m − m_new)\`, fusing the two reductions into one —
+- Online softmax keeps \`(m, d)\` and rescales \`d\` by \`exp(m − m_new)\`, fusing the two reductions into one:
   the recurrence FlashAttention runs over tiles.
 - The kernel is memory-bound: 8 bytes per element, coalesced, re-reads served from cache.
 

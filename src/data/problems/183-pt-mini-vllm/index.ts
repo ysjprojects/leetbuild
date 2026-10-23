@@ -32,7 +32,8 @@ computed. Three ideas carry it:
   mapping its logical blocks to physical ones, as an OS page table maps virtual pages to frames. Waste
   falls to less than one block per sequence, and sequences can share blocks.
 - **Continuous batching** (Orca, OSDI 2022). The batch is re-formed every forward pass: finished
-  requests leave, waiting ones join, and when blocks run out the newest request is preempted.
+  requests leave and waiting ones join. On paged memory vLLM admits greedily, so when blocks run out it
+  preempts the newest request.
 - **Automatic prefix caching.** A full block is named by a hash of its tokens and everything before them,
   so the next request with the same system prompt reuses the blocks instead of recomputing them.
 
@@ -70,7 +71,7 @@ You write four files, each importing the previous one:
 
 Put the four files in one directory and run \`python block_manager.py\`, \`python paged_attention.py\`,
 \`python scheduler.py\` and \`python prefix_cache.py\` (Python 3.10 or later, PyTorch 2, CPU only; each
-takes about a second). \`PASS\` means: the allocator's invariants hold through forks, copy-on-write and
+takes a few seconds). \`PASS\` means: the allocator's invariants hold through forks, copy-on-write and
 frees, with at most \`block_size - 1\` wasted slots per sequence; paged attention equals dense attention
 to 1e-12 in float64; the engine's tokens equal sequential greedy decoding with a contiguous cache, with
 and without preemption, and every block comes back; a second request with a cached system prompt
@@ -371,7 +372,7 @@ salts, speculative decoding, and the OpenAI-compatible HTTP server.`,
       date: '2023-06-22',
       venue: 'Anyscale blog',
       takes:
-        'Static against continuous batching, and the measured 8× (continuous batching) and 23× (with vLLM’s paged memory) throughput gains the scheduler step is about.',
+        'Static against continuous batching, and the measured 8× (continuous batching) and up to 23× (with vLLM’s paged memory) throughput gains over static batching that the scheduler step is about.',
     },
   ],
   steps: [blockManagerStep, pagedAttentionStep, schedulerStep, prefixCacheStep],

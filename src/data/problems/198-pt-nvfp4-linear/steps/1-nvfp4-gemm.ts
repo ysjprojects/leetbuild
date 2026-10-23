@@ -34,8 +34,9 @@ export const nvfp4GemmStep: Step = {
   ],
   task: `## Task
 
-A Blackwell tensor core never dequantizes an NVFP4 operand. It multiplies 4-bit values block by block and
-applies the block scales to the partial sums. Write that GEMM, then a linear layer built on it.
+A Blackwell tensor core never writes out a dequantized NVFP4 operand. It multiplies 4-bit values, and since a
+block's two scales are the same for all 16 products, they apply once to the block's partial sum. Write that
+GEMM, then a linear layer built on it.
 
 The file gives the canonical NVFP4 quantizer, already implemented:
 - \`e2m1_round(x)\`: the nearest of ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}, ties to the even mantissa, saturating at ±6.
@@ -91,9 +92,9 @@ Then it prints \`PASS\`.
 > A block-scaled GEMM does the 4-bit products exactly and spends the precision on the scales. One E4M3
 > number per 16 values, applied once per partial sum, and one FP32 number per tensor, applied once per output.`,
   hints: [
-    '`a.values()` and `b.values()` give `(M, nb, 16)` and `(N, nb, 16)`. `torch.einsum("mbk,nbk->mnb", qa, qb)` is every block’s dot product at once, `(M, N, nb)`.',
+    '`a.values()` and `b.values()` give `(M, nb, 16)` and `(N, nb, 16)`. One `torch.einsum` that contracts only the last axis and keeps the block axis gives every block’s dot product at once, `(M, N, nb)`.',
     'Broadcast the scales to the partial sums: `a.scales.float()[:, None, :]` is `(M, 1, nb)` and `b.scales.float()[None, :, :]` is `(1, N, nb)`. Sum over the last axis, then multiply by `a.s_global * b.s_global`.',
-    'In `forward`, `s_x = global_scale(self.act_amax) if self.act_amax > 0 else None` picks the scale. `nvfp4_quantize(x2, s_x)` handles both, and the weight is `NVFP4Tensor(self.w_codes, self.w_scales, self.w_global)`.',
+    'In `forward`, `self.act_amax > 0` tells a calibrated layer from a dynamic one, and `nvfp4_quantize` takes `None` for the dynamic case. `weight_nvfp4()` rebuilds the weight from its buffers.',
   ],
   checks: [
     {
@@ -575,5 +576,5 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `The GEMM has the shape of the hardware's. CUTLASS documents Blackwell's block-scaled MMA as \`D = C + Σ_k (A[i, k] · SFA[i, k/SV]) · (B[j, k] · SFB[j, k/SV])\`, with a scale-factor vector size \`SV\` of 16 for \`nv_float4_t\` (E4M3 scales) and 32 for \`mx_float4_t\` (E8M0 scales). Within a block, the products of two E2M1 values are small multiples of 1/4, so their sum is exact; the block scales are 4-bit-mantissa numbers whose product is exact too. The only rounding in \`nvfp4_matmul\` is the fp32 accumulation across blocks, which is why it agrees with a float64 loop to about 1e-7. **Why two global scales and not one per element**: they are one scalar per GEMM, applied to the fp32 result once. Folding them into the block scales would push the E4M3 values out of range, which is the reason the second level exists. **Why calibrate the activation scale**: a dynamic global scale needs \`amax(|x|)\` over the whole input before the first block can be quantized, a reduction across the tensor on every call. A calibrated one is a constant, so the previous kernel can write NVFP4 directly. The price is the clipping the self-test shows when an input exceeds the calibrated range: block scales stop at 448 and values saturate at 6. Production kernels add what this file leaves out. They store the scales in the swizzled tile layout the MMA reads, fuse the activation quantization into the producing kernel's epilogue, keep the accumulator on chip, and write bf16 outputs. ModelOpt computes the same two levels this file does: weights get \`amax / (6 · 448)\` per tensor and E4M3 scales per 16, activations a static per-tensor scale from calibration.`,
+  debrief: `The GEMM has the shape of the hardware's. CUTLASS documents Blackwell's block-scaled MMA as \`D = C + Σ_k (A[i, k] · SFA[i, k/SV]) · (B[j, k] · SFB[j, k/SV])\`, with a scale-factor vector size \`SV\` of 16 for \`nv_float4_t\` (unsigned E4M3 scales) and 32 for \`mx_float4_t\` (E8M0 scales). Within a block, the products of two E2M1 values are small multiples of 1/4, so their sum is exact; the block scales have 4-bit significands, so their product is exact too. What rounds in \`nvfp4_matmul\` is the fp32 accumulation across blocks and the final multiply by the global scales, which is why it agrees with a float64 loop to about 1e-7. The hardware's internal precision and order of operations are implementation-defined (the OCP MX specification says so for its formats); exact block sums, then scales, is the order that factoring the scales out of each block suggests. **Why the global scales come last**: they are one scalar per GEMM, applied to the fp32 result once. Folding them into the block scales would push the E4M3 values out of range, which is the reason the second level exists. **Why calibrate the activation scale**: a dynamic global scale needs \`amax(|x|)\` over the whole input before the first block can be quantized, an extra pass over the tensor on every call. A calibrated one is a constant, so the previous kernel can write NVFP4 directly. The price is the clipping the self-test shows when an input exceeds the calibrated range: block scales stop at 448 and values saturate at 6. Production kernels add what this file leaves out. They store the scales in the swizzled tile layout the MMA reads, fuse the activation quantization into the producing kernel's epilogue, keep the accumulator on chip, and write bf16 outputs. ModelOpt computes the same two levels this file does: weights get \`amax / (6 · 448)\` per tensor and E4M3 scales per 16; activations get a static per-tensor scale from calibration and E4M3 block scales computed on every forward.`,
 };

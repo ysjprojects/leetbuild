@@ -19,7 +19,7 @@ const laneGroups: GpuMark[] = [0, 1, 2, 3].map(s => ({
 }));
 
 /**
- * Drill: the smallest complete CUDA program — a grid-stride vector add, a launch helper that
+ * Drill: the smallest complete CUDA program: a grid-stride vector add, a launch helper that
  * computes a capped grid and checks the launch, every runtime call through an error macro, a
  * synchronise before the copy back, events around the timed launches and a CPU reference. The
  * host-side shape every custom kernel in a training stack sits inside.
@@ -38,23 +38,23 @@ export const cudaVectorAddProblem: Problem = {
 
 Every elementwise operation in a transformer is this kernel wearing a different function: the residual
 add \`x + attn(x)\`, a bias add, a dropout mask, the \`p -= lr * g\` of an optimizer step. PyTorch's \`a + b\`
-on CUDA tensors launches one, and every custom kernel you will ever write — a fused GELU, a LayerNorm, a
-softmax — sits inside the same host-side shape: allocate on the device, copy in, pick a grid, launch, check,
+on CUDA tensors launches one, and every custom kernel you will ever write (a fused GELU, a LayerNorm, a
+softmax) sits inside the same host-side shape: allocate on the device, copy in, pick a grid, launch, check,
 synchronise, copy out, compare, free. This drill is that shape, done right, on the simplest body there is.
 
 The surface is one file, \`vector_add.cu\`, compiled with \`nvcc\`:
 
-- \`__global__ void vector_add(const float* a, const float* b, float* c, int n)\` — a **grid-stride loop**:
-  each thread starts at \`blockIdx.x * blockDim.x + threadIdx.x\` and advances by \`gridDim.x * blockDim.x\`
+- \`__global__ void vector_add(const float* a, const float* b, float* c, int n)\`: a **grid-stride loop** in
+  which each thread starts at \`blockIdx.x * blockDim.x + threadIdx.x\` and advances by \`gridDim.x * blockDim.x\`
   until \`n\`, so any grid covers any \`n\` and nobody writes past the end.
-- \`CUDA_CHECK(call)\` — a macro that prints \`cudaGetErrorString\` with \`__FILE__:__LINE__\` and exits when a
+- \`CUDA_CHECK(call)\`: a macro that prints \`cudaGetErrorString\` with \`__FILE__:__LINE__\` and exits when a
   runtime call fails; every runtime call in the file goes through it.
-- \`launch_vector_add(d_a, d_b, d_c, n)\` — \`BLOCK_SIZE = 256\`, blocks = \`ceil(n / 256)\` capped at
+- \`launch_vector_add(d_a, d_b, d_c, n)\`: \`BLOCK_SIZE = 256\`, blocks = \`ceil(n / 256)\` capped at
   \`MAX_BLOCKS = 1024\`, the \`<<<blocks, BLOCK_SIZE>>>\` launch, and \`CUDA_CHECK(cudaGetLastError())\` right
   after it.
-- \`run_vector_add(h_a, h_b, h_c, n)\` → ms per launch — \`cudaMalloc\`, \`cudaMemcpy\` in, a warm-up, 20
+- \`run_vector_add(h_a, h_b, h_c, n)\` → ms per launch: \`cudaMalloc\`, \`cudaMemcpy\` in, a warm-up, 20
   launches between two \`cudaEvent\`s, \`cudaDeviceSynchronize\`, \`cudaMemcpy\` out, \`cudaFree\`.
-- \`main\` — \`n = 4,194,341\` floats (16 MiB per array, not a multiple of 256, more than the capped grid
+- \`main\`: \`n = 4,194,341\` floats (16 MiB per array, not a multiple of 256, more than the capped grid
   holds), a CPU reference, the max abs error, a bandwidth line and \`PASS\`.
 
 ## What you build here
@@ -72,13 +72,15 @@ nvcc -O2 -o vector_add vector_add.cu && ./vector_add
 A passing run prints one line of numbers and \`PASS\`, like this (illustrative figures, not from a measured run):
 
 \`\`\`text
-n=4194341  0.0412 ms/launch  1221.8 GB/s  max abs err 0.000e+00
+n=4194341  0.0412 ms/launch  1221.7 GB/s  max abs err 0.000e+00
 PASS
 \`\`\`
 
-The bandwidth depends on the GPU (a laptop part prints tens of GB/s, an H100 over 2000); the error is
-exactly 0 because a float add rounds the same way on both sides. The starter prints \`FAIL\` with a max abs
-error around 2, because \`c\` comes back as the zeros it was filled with.
+The bandwidth depends on the GPU: an RTX 4060 laptop GPU (256 GB/s peak) should print around 200 GB/s, an
+H100 SXM (3,350 GB/s peak) over 2,500. The error is exactly 0 because a float add rounds the same way on
+both sides. The starter prints \`FAIL\`
+with a max abs error of 1.5 (the largest reference value, 1.4995), because \`c\` comes back as the zeros it
+was filled with.
 
 ## Left out on purpose
 
@@ -249,7 +251,7 @@ track builds on.`,
                 threads: 32,
                 label: 'lane k handles element i + k',
                 detail:
-                  'Lane `k` of warp 0 is thread `k`: it starts at `i = k` and visits `k`, `k + 262,144`, `k + 524,288`, … while `i < n`, 16 or 17 times.',
+                  'Lane `k` of warp 0 is thread `k`: it starts at `i = k` and visits `k`, `k + 262,144`, `k + 524,288`, … while `i < n`. All 32 lanes make 17 passes: only threads 0 … 36 reach the 37-element tail, every later thread stops at 16.',
               },
               {
                 id: 'warp-regs',

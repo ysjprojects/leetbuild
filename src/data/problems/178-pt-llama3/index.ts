@@ -27,9 +27,10 @@ against, and the architecture many of them copy. Its 8B model is GPT-2's skeleto
 RMSNorm instead of LayerNorm, rotary position embeddings instead of a learned position table, a SwiGLU
 feed-forward instead of GELU, **grouped-query attention** (32 query heads sharing 8 key/value heads) instead
 of multi-head attention, no biases, and an untied output layer over a 128,256-token vocabulary. Llama 3.1
-stretched the context from 8K to 128K tokens by rescaling RoPE's frequencies. Inference engines (vLLM,
-llama.cpp, TensorRT-LLM) all implement this exact block; Meta's own reference is about 300 lines of
-PyTorch, \`models/llama3/model.py\` in [llama-models](https://github.com/meta-llama/llama-models).
+stretched the context from 8K to 128K tokens by rescaling RoPE's frequencies and continuing pretraining on
+long documents. Inference engines (vLLM, llama.cpp, TensorRT-LLM) all implement this exact block; Meta's own
+reference is about 300 lines of PyTorch, \`models/llama3/model.py\` in
+[llama-models](https://github.com/meta-llama/llama-models).
 
 You write that file, without fairscale, in three parts, each importing the previous one:
 
@@ -65,8 +66,8 @@ You write that file, without fairscale, in three parts, each importing the previ
 ## Run it on your machine
 
 Put the three files in one directory and run \`python llama_layers.py\`, \`python llama_attention.py\` and
-\`python llama_model.py\` (PyTorch 2.1 or later, CPU only, no downloads; each takes about a second on a
-laptop). Each prints \`PASS\`. The layers' test proves the formulas, that the rotation preserves norms and
+\`python llama_model.py\` (Python 3.10 and PyTorch 2.1 or later, CPU only, no downloads; each takes a few
+seconds on a laptop). Each prints \`PASS\`. The layers' test proves the formulas, that the rotation preserves norms and
 that \`q·k\` depends only on the distance; the attention's test proves GQA equals an explicit multi-head
 reference and that token-by-token decoding equals the full forward; the model's test proves cached
 greedy generation equals uncached and the closed-form count equals \`sum(p.numel())\`.
@@ -258,7 +259,7 @@ continuous batching, and the 3.2 vision adapters.`,
                   label: `kv ${g}`,
                 })),
                 detail:
-                  'Query head `h` reads key/value head `h // 4`. `repeat_kv` builds the 32-head view with `expand`, for the matmul only; nothing of it is stored.',
+                  'Query head `h` reads key/value head `h // 4`. `repeat_kv` builds the 32-head view (`expand`, then a `reshape` that copies) for the matmul only; the cache never holds it.',
               },
               {
                 id: 'kv-heads',

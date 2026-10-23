@@ -112,8 +112,8 @@ the self-test, with an 8,192-byte cap on a float64 MLP:
 | 2 | \`2.bias\`, \`2.weight\` | gradient 8 |
 | 3 | \`0.bias\`, \`0.weight\` | gradient 10 |
 
-The trigger is \`register_post_accumulate_grad_hook\`, which fires after \`.grad\` holds this backward's
-final value, also for a parameter used twice. The hook copies the gradient into the bucket's flat
+The trigger is \`register_post_accumulate_grad_hook\`, which fires once \`.grad\` holds this backward's
+value. The hook copies the gradient into the bucket's flat
 buffer and, when the bucket is complete, calls \`dist.all_reduce(buf, async_op=True)\`, which returns a
 work handle at once. \`finish()\` waits on all of them before the step.
 
@@ -122,10 +122,10 @@ What goes wrong without each piece:
 | Mistake | What happens |
 |---|---|
 | No broadcast at start | Replicas start apart and stay apart; averaged gradients cannot fix that |
-| Tensor \`register_hook\` instead of post-accumulate | The hook sees a gradient before it is accumulated into \`.grad\`; a shared parameter is sent twice, partially |
+| Tensor \`register_hook\` instead of post-accumulate | The hook runs before autograd writes \`.grad\`, so copying \`p.grad\` sends \`None\` or the previous step's gradient |
 | Launch whichever bucket completes first | Ranks may issue bucket 2 before bucket 1 in different orders; gloo pairs the wrong buffers, or hangs |
 | Read the buffer without \`wait()\` | The step uses a partially reduced gradient |
-| No division by N | The update uses N times the gradient; SGD diverges, Adam hides it until weight decay and eps matter |
+| No division by N | The gradient is N times the mean: SGD takes N times the step; Adam, nearly scale-invariant, hides it except through \`eps\` and any clipping threshold |
 
 Launch order is the subtle one. Every rank must issue the same collectives in the same order, because
 the backend matches the k-th call on one rank with the k-th call on the others. Launching strictly in
@@ -204,8 +204,9 @@ step:  flat_grad ── reduce to owners ──▶ g[r·S : (r+1)·S] / N
 
 The padding is harmless: its gradient is zero, so \`m = v = 0\`, the update is \`0 / (0 + eps) = 0\`, and
 decay keeps zero at zero. The traffic is a reduce-scatter of the gradients and an all-gather of the
-parameters, the two halves of DDP's all-reduce, so ZeRO-1 costs no extra bandwidth. Gloo in PyTorch 2.0
-has no reduce-scatter, so \`reduce_scatter_\` emulates it with one \`dist.reduce\` per shard, each to its
+parameters, the two halves of DDP's all-reduce, so ZeRO-1 costs no extra bandwidth. Gloo has no
+reduce-scatter through PyTorch 2.1 (2.2 adds \`reduce_scatter_tensor\`, 2.8 the list form), so
+\`reduce_scatter_\` emulates it with one \`dist.reduce\` per shard, each to its
 owner. The self-test checks equality with DDP and \`torch.optim.AdamW\` within 1e-6, and that
 \`state_numel() · N == 2 · padded\`.
 

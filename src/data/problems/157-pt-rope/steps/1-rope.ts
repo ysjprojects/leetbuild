@@ -26,17 +26,17 @@ proportional to the token's position.
 :::widget rope-rotation
 
 - \`precompute_rope_cache(head_dim, max_seq_len, base=10000.0) -> (cos, sin)\`: two float32 tensors of shape
-  \`[max_seq_len, head_dim // 2]\`. Pair \`i\` turns at \`theta_i = base ** (-2 i / head_dim)\` — build the
+  \`[max_seq_len, head_dim // 2]\`. Pair \`i\` turns at \`theta_i = base ** (-2 i / head_dim)\`: build the
   \`head_dim // 2\` inverse frequencies with \`torch.arange(0, head_dim, 2)\`, the angle table as the outer product
   of \`torch.arange(max_seq_len)\` with them, and return its \`.cos()\` and \`.sin()\`. Assert \`head_dim\` is even.
 - \`apply_rope(x, cos, sin, positions=None)\`: \`x\` is \`[batch, heads, seq, head_dim]\` in any float dtype;
   \`positions\` is \`[seq]\` int64 and defaults to \`torch.arange(seq)\`. Gather \`cos[positions]\` and
   \`sin[positions]\`, cast them to \`x.dtype\`, shape them \`[1, 1, seq, head_dim // 2]\`, split \`x\` into halves
-  \`x1, x2 = x.chunk(2, dim=-1)\` and return \`torch.cat((x1 * c - x2 * s, x2 * c + x1 * s), dim=-1)\` — same
+  \`x1, x2 = x.chunk(2, dim=-1)\` and return \`torch.cat((x1 * c - x2 * s, x2 * c + x1 * s), dim=-1)\`, same
   shape and dtype as \`x\`. Passing \`positions = torch.arange(offset, offset + seq)\` is how a decode step
   rotates its new tokens against a KV cache that already holds \`offset\` rotated keys.
 - \`RoPE(nn.Module)\`: \`__init__(head_dim, max_seq_len, base=10000.0)\` computes the cache once and registers
-  \`cos\` and \`sin\` with \`self.register_buffer(..., persistent=False)\` — they follow \`.to(device)\` but stay
+  \`cos\` and \`sin\` with \`self.register_buffer(..., persistent=False)\`: they follow \`.to(device)\` but stay
   out of \`state_dict\` and are never trained (no \`nn.Parameter\`). \`forward(x, positions=None)\` is
   \`apply_rope(x, self.cos, self.sin, positions)\`.
 - No third-party rotary module (\`rotary_embedding_torch\`, \`torchtune\`, \`flash_attn\`): the three pieces above
@@ -54,16 +54,16 @@ proportional to the token's position.
 > Rotate q by \`m·theta\` and k by \`n·theta\` and their dot product is a function of \`m − n\` alone: the
 > position reaches the attention score as a distance, with no table of pairs and no learned parameter.`,
   hints: [
-    '`inv_freq = base ** (-torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)` is `[head_dim // 2]`: 1, then falling geometrically to just above `1 / base`. `torch.outer(torch.arange(max_seq_len, dtype=torch.float32), inv_freq)` is the angle table `m · theta_i`; its `.cos()` and `.sin()` are the cache.',
-    'In `apply_rope`, `c = cos[positions].to(x.dtype)[None, None]` is `[1, 1, seq, head_dim // 2]` and broadcasts against each half of `x`. `x1, x2 = x.chunk(2, dim=-1)`; the output halves are `x1 * c - x2 * s` and `x2 * c + x1 * s`, concatenated in that order. Default `positions = torch.arange(seq, device=x.device)` when `None`.',
-    '`self.register_buffer("cos", cos, persistent=False)` and the same for `sin` in `__init__`; `forward` is one line. For the relative-position check, rotate `q.expand(1, 1, MAX, D)` and `k.expand(1, 1, MAX, D)` with the default positions, take `[0, 0]` of each, and `scores = qs @ ks.T` is `[MAX, MAX]`; shifting both indices by `d` must leave it unchanged.',
+    '`torch.arange(0, head_dim, 2)` is `0, 2, …, head_dim − 2`, so dividing it by `head_dim` gives the exponents `2i / head_dim` directly; pass `dtype=torch.float32` so the cache is float32 whatever the default dtype. In the angle table, positions run down the rows and frequencies across the columns.',
+    'Indexing the cache with the positions tensor gives `[seq, head_dim // 2]` rows; two leading singleton dimensions make them broadcast over batch and heads. Build the default positions on `x.device`. The half with the minus sign comes first: a flipped sign rotates the wrong way and swapped halves scramble the pairs, and the complex reference catches both.',
+    'Two `register_buffer(name, tensor, persistent=False)` calls in `__init__`, no `nn.Parameter`; `forward` is a single call to `apply_rope`.',
   ],
   checks: [
     {
       id: 'inverse-frequencies',
       title: 'Pair i turns at base^(−2i/d): the cache is [max_seq_len, head_dim // 2]',
       detail:
-        '`precompute_rope_cache` builds `inv_freq = base ** (-torch.arange(0, head_dim, 2) / head_dim)` — `head_dim // 2` geometrically spaced frequencies from 1 down to `base^(−1 + 2/head_dim)` — so `cos` and `sin` come out `[max_seq_len, head_dim // 2]`; the self-test checks the shape and that `cos² + sin² = 1`.',
+        '`precompute_rope_cache` builds `inv_freq = base ** (-torch.arange(0, head_dim, 2) / head_dim)` (`head_dim // 2` geometrically spaced frequencies from 1 down to `base^(−1 + 2/head_dim)`), so `cos` and `sin` come out `[max_seq_len, head_dim // 2]`; the self-test checks the shape and that `cos² + sin² = 1`.',
       match: {
         python: {
           all: [
@@ -92,7 +92,7 @@ proportional to the token's position.
       id: 'half-split-rotation',
       title: 'apply_rope rotates (x_i, x_{i + d/2}) into (x1 c − x2 s, x2 c + x1 s)',
       detail:
-        'Split `x` into halves along `head_dim`, form `x1 * cos − x2 * sin` and `x2 * cos + x1 * sin`, and concatenate them in that order — the half-split convention of Llama and GPT-NeoX. The self-test compares against a complex-number reference at `1e-5`, checks that position 0 is the identity and that norms are preserved. No third-party rotary module.',
+        'Split `x` into halves along `head_dim`, form `x1 * cos − x2 * sin` and `x2 * cos + x1 * sin`, and concatenate them in that order: the half-split convention of Llama and GPT-NeoX. The self-test compares against a complex-number reference at `1e-5`, checks that position 0 is the identity and that norms are preserved. No third-party rotary module.',
       match: {
         python: {
           all: [
@@ -124,7 +124,7 @@ proportional to the token's position.
       id: 'dtype-broadcast',
       title: "The gathered rows take x's dtype and broadcast over batch and heads",
       detail:
-        'The cache stays float32; the gathered `[seq, head_dim // 2]` rows are cast with `.to(x.dtype)` and shaped `[1, 1, seq, head_dim // 2]` so one table serves every batch row and head. The self-test rotates float32, bfloat16 and float64 inputs and expects each dtype back, and runs `gradcheck` in float64.',
+        'The cache stays float32; the gathered `[seq, head_dim // 2]` rows are cast with `.to(x.dtype)` and shaped `[1, 1, seq, head_dim // 2]` so one table serves every batch row and head. The self-test checks that float32 and bfloat16 inputs come back in their own dtype, and runs the relative-position check and `gradcheck` in float64.',
       match: {
         python: {
           all: [
@@ -141,7 +141,7 @@ proportional to the token's position.
       id: 'buffer',
       title: 'The cache is a non-persistent buffer of RoPE, not a Parameter',
       detail:
-        '`RoPE.__init__` computes the cache once and calls `self.register_buffer("cos", cos, persistent=False)` and the same for `sin`: buffers follow `.to(device)` like weights but are recomputable, so they stay out of `state_dict` (the self-test asserts `"cos"` is not in it) and are never trained — never `nn.Parameter`.',
+        '`RoPE.__init__` computes the cache once and calls `self.register_buffer("cos", cos, persistent=False)` and the same for `sin`: buffers follow `.to(device)` like weights but are recomputable, so they stay out of `state_dict` (the self-test asserts `"cos"` is not in it), and they are never trained: no `nn.Parameter`.',
       match: {
         python: {
           all: [
@@ -339,5 +339,5 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `RoPE is three small decisions. The **cache is computed once**, in float32, as a table of \`cos\` and \`sin\` over every position and every pair: a forward pass then does one gather, two multiplies and one subtraction or addition per element, and nothing transcendental. The angle for position \`m\` is \`m · theta_i\` with \`theta_i\` falling geometrically from 1 to just above \`1 / base\`, so the first pairs turn once every few tokens and the last once every tens of thousands — a clock with \`head_dim / 2\` hands, each at its own speed, which is what lets the model read both nearby order and distant position from the same vectors. The **rows are gathered by \`positions\`** rather than sliced from the front, so decoding a token against a KV cache is the same function with \`arange(offset, offset + 1)\`: the cached keys were rotated at their own positions, the new query at its own, and the score between them is still a function of the distance — the relative-position property the self-test checks numerically. Rotating by \`m·theta\` and \`n·theta\` and taking the dot product gives a rotation by \`(n − m)·theta\`, which is why no pair table and no learned parameter appear anywhere. The **half-split layout** (dimension \`i\` with \`i + head_dim // 2\`) is chosen because \`chunk\` and \`cat\` are contiguous views; the interleaved layout of the paper and of Meta's reference code (dimension \`2i\` with \`2i + 1\`) is the same rotation in a different basis, and Hugging Face permutes Llama's \`q\` and \`k\` projection weights at conversion so the two agree. Buffers rather than parameters because the table is a function of the config, not of the data: \`persistent=False\` keeps 64 MiB of cosines out of a 128K-context checkpoint. Production adds what this file leaves out: fused kernels in FlashAttention, vLLM and TensorRT-LLM rotate \`q\` and \`k\` in the epilogue of the QKV projection so the activations are never written unrotated, \`torch.compile\` fuses the gather and the four elementwise ops into one, Hugging Face keeps only \`inv_freq\` as a buffer and recomputes \`cos\`/\`sin\` in float32 with autocast disabled so a \`model.to(bfloat16)\` cannot degrade the angles, and context extension — position interpolation, NTK-aware scaling, YaRN, Llama 3's per-frequency smoothing — is a rescaling of \`inv_freq\` that touches nothing else.`,
+  debrief: `RoPE is three small decisions. The **cache is computed once**, in float32, as a table of \`cos\` and \`sin\` over every position and every pair: a forward pass then does one gather, two multiplies and one subtraction or addition per element, and nothing transcendental. The angle for position \`m\` is \`m · theta_i\` with \`theta_i\` falling geometrically from 1 to just above \`1 / base\`, so the first pairs turn once every few tokens and the last once every tens of thousands: a clock with \`head_dim / 2\` hands, each at its own speed, which is what lets the model read both nearby order and distant position from the same vectors. The **rows are gathered by \`positions\`** rather than sliced from the front, so decoding a token against a KV cache is the same function with \`arange(offset, offset + 1)\`: the cached keys were rotated at their own positions, the new query at its own, and the score between them is still a function of the distance, the relative-position property the self-test checks numerically. Rotating by \`m·theta\` and \`n·theta\` and taking the dot product gives a rotation by \`(n − m)·theta\`, which is why no pair table and no learned parameter appear anywhere. The **half-split layout** (dimension \`i\` with \`i + head_dim // 2\`) is GPT-NeoX's: \`chunk\` and \`cat\` on whole halves, no strided reshape into pairs. The interleaved layout of the paper and of Meta's reference code (dimension \`2i\` with \`2i + 1\`) is the same rotation in a different basis, and Hugging Face permutes Llama's \`q\` and \`k\` projection weights at conversion so the two agree. Buffers rather than parameters because the table is a function of the config, not of the data: \`persistent=False\` keeps 64 MiB of cos and sin out of a 128K-context checkpoint. Production adds what this file leaves out. vLLM rotates \`q\` and \`k\` in place with one kernel indexed by \`positions\` (an \`is_neox_style\` flag picks the layout); FlashAttention's \`flash_attn_with_kvcache\` and TensorRT-LLM's attention plugin rotate the new keys as they write them into the KV cache; \`torch.compile\` fuses the gather and the four elementwise ops into one kernel. Hugging Face keeps only \`inv_freq\` as a buffer and recomputes \`cos\`/\`sin\` from \`position_ids\` in float32 on every forward, and context extension (position interpolation, NTK-aware scaling, YaRN, Llama 3's per-frequency smoothing) is a rescaling of \`inv_freq\` that touches nothing else.`,
 };

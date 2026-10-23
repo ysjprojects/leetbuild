@@ -1,7 +1,7 @@
 /**
  * The learning guide for the FlashAttention drill: why attention is memory-bound (HBM vs SRAM,
  * IO-awareness), the online softmax and its rescale, tiling with two barriers and causal tile
- * skipping, recomputation in the backward pass, and what FlashAttention-2 and -3 add — a figure or
+ * skipping, recomputation in the backward pass, and what FlashAttention-2 and -3 add: a figure or
  * a table where one says it faster than prose, a pop quiz per section. Rendered at
  * \`/cuda-flash-attention/learn\`.
  */
@@ -10,8 +10,8 @@ export const learn = `# The mechanism at a glance
 FlashAttention (Dao, Fu, Ermon, Rudra, Ré, 2022) computes exact attention, \`O = softmax(Q Kᵀ / √d) V\`,
 without ever writing the \`T × T\` score matrix to GPU memory. It is not an approximation: it is the same
 arithmetic, reordered so that each byte of \`K\` and \`V\` is read from global memory once per block of
-queries and the softmax is finished one tile at a time. Every long-context model since 2022 trains and
-serves on a descendant of it; \`torch.nn.functional.scaled_dot_product_attention\` dispatches to one.
+queries and the softmax is finished one tile at a time. Most long-context models since 2022 train and
+serve on a descendant of it; \`torch.nn.functional.scaled_dot_product_attention\` dispatches to one.
 
 :::gpu
 {
@@ -59,7 +59,7 @@ address anywhere, and \`O\` is written once.
 The contract the drill implements, in one file \`flash_attention.cu\`:
 
 - \`__global__ void flash_attn_fwd(const float* Q, const float* K, const float* V, float* O, int T, int d,
-  float scale, bool causal)\` — row-major \`T × d\` arrays, \`scale = 1 / √d\`, \`causal\` masks keys \`j > i\`.
+  float scale, bool causal)\`: row-major \`T × d\` arrays, \`scale = 1 / √d\`, \`causal\` masks keys \`j > i\`.
 - \`BQ = 64\` query rows per block, one per thread; \`BK = 32\` key/value rows per tile in
   \`__shared__ float Ks[BK][D_MAX]\`, \`Vs[BK][D_MAX]\`; \`D_MAX = 64\`, \`d ≤ D_MAX\`.
 - Per thread, in registers: \`q[D_MAX]\` (pre-scaled), \`o[D_MAX]\`, \`s[BK]\`, the running max \`m\` and
@@ -96,7 +96,7 @@ big intermediate never leaves SRAM.
 | Standard attention | \`Θ(T d + T²)\` | \`T × T\` per head |
 | FlashAttention | \`Θ(T² d² / M)\` for SRAM size \`M\` | \`O(T)\` (the statistics) |
 
-With \`d\` in 64–128 and \`M\` around 100 KB, \`d² / M\` is well below 1, so traffic drops many-fold — and the
+With \`d\` in 64–128 and \`M\` around 100 KB, \`d² / M\` is well below 1, so traffic drops many-fold, and the
 paper proves no exact algorithm does asymptotically better across the range of \`M\`. In the drill the
 memory note makes the same point at \`T = 256\`: 16,384 bytes of shared memory per block against a score
 matrix of 262,144 bytes that is never allocated.
@@ -112,7 +112,7 @@ Q: Why does fusing attention into one kernel speed it up when it performs the sa
 # The online softmax and its rescale
 
 A softmax needs the row's maximum (for stability) and its sum (for normalisation) before any output is
-known — apparently the whole row at once. The [online softmax](https://arxiv.org/abs/1805.02867) of
+known: apparently the whole row at once. The [online softmax](https://arxiv.org/abs/1805.02867) of
 Milakov & Gimelshein removes that requirement with one identity:
 
 \`\`\`text
@@ -133,12 +133,16 @@ m = m_new;
 // after the last tile: O = o / l
 \`\`\`
 
-- **First tile.** \`m = -INFINITY\`, so \`alpha = __expf(-inf) = 0\` and the zero accumulator stays zero — no
+- **First tile.** \`m = -INFINITY\`, so \`alpha = __expf(-inf) = 0\` and the zero accumulator stays zero: no
   special case.
 - **Masked scores.** \`s[j] = -INFINITY\` gives \`p = 0\`; padding and the causal mask need no branches in the
   fold.
 - **Normalise once.** Dividing by \`l\` at the end instead of every tile saves \`d\` divides per tile and is
   exact: every term was scaled by the same \`exp(−m)\`.
+- **The all-masked row.** If a row's first tile were entirely masked, \`m\` and \`tile_max\` would both be
+  \`-INFINITY\` and \`m - m_new\` would be \`NaN\`. The drill cannot hit it (tile 0 holds key 0, visible to
+  every row), but kernels with arbitrary masks guard it: FlashAttention-2 substitutes 0 for a \`-INFINITY\`
+  max before subtracting.
 
 The failure the max avoids is overflow. A naive one-pass softmax that sums \`exp(s)\` directly works
 until a score passes about 88, where \`expf\` overflows float. Follow one row when a score of 95 arrives:
@@ -166,10 +170,12 @@ Q: A new tile raises the running max from 3 to 7. What must happen to the accumu
 :::
 
 :::details Why __expf rather than expf
-\`__expf\` maps to the hardware special-function unit (\`ex2.approx\` after a multiply by log₂e); \`expf\` is
-an accurate software sequence several times longer. Every argument here is ≤ 0, where \`__expf\`'s error
-is a few ulps — far inside the drill's \`1e-3\` tolerance. Once the matmuls move to tensor cores the
-exponentials become the bottleneck, which is why FlashAttention-3 works hard to overlap them.
+\`__expf\` is a multiply by log₂e and one special-function-unit instruction (\`ex2.approx\`); \`expf\` is an
+accurate software sequence several times longer. The Programming Guide bounds \`__expf\`'s error at
+\`2 + ⌊1.173 · |x|⌋\` ulps. In the drill \`|s| ≤ 64 · 1 · 1 / 8 = 8\`, so \`x ≥ −16\` and the bound is 20 ulps (a
+relative \`2.4e-6\`), far inside the \`1e-3\` tolerance. Here the 128 FMAs per score dominate, but once the
+matmuls move to tensor cores the exponentials become the bottleneck, which is why FlashAttention-3
+works hard to overlap them.
 :::
 
 # Tiles, barriers and the causal skip
@@ -190,10 +196,16 @@ plain matmul version to see the global loads it saves:
 | \`Ks\`, \`Vs\` | shared, per block | 32 × 64 floats = 8 KB each |
 
 - **Coalesced staging.** The load loop strides \`idx\` by \`BQ\` over \`BK × D_MAX\` with \`j = idx / D_MAX\`,
-  \`k = idx % D_MAX\`, so consecutive threads read consecutive floats of one row — see
-  [coalesced access](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory).
+  \`k = idx % D_MAX\`, so consecutive threads read consecutive floats of one row (see
+  [coalesced access](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#coalesced-access-to-global-memory)).
 - **Broadcast, not conflict.** In the score loop every thread of a warp reads the same \`Ks[j][k]\`, which
   shared memory serves as a broadcast.
+- **Registers only under constant indices.** \`q\`, \`o\` and \`s\` stay in registers because every loop
+  over them runs to \`D_MAX\` or \`BK\` under \`#pragma unroll\`. One loop bounded by the runtime \`d\`, such as
+  \`for (k = 0; k < d; ++k) O[…] = o[k] * inv\`, indexes \`o\` dynamically, and the compiler moves the whole
+  array to local memory (off-chip, cached): every \`o[k] +=\` becomes a load and a store. Hence the final
+  write loops to \`D_MAX\` with an \`if (k < d)\` guard. About 160 live floats is also why \`D_MAX\` stops at
+  64: at \`d = 128\` this layout would pass the 255-register limit and spill.
 - **Two barriers.** \`__syncthreads()\` after the load so no thread reads a half-filled tile, and again
   after the fold so no thread overwrites the tile a neighbour is still reading.
 
@@ -213,13 +225,16 @@ whole tiles can be dropped: with \`q_last = min(blockIdx.x × BQ + BQ, T) − 1\
 \`kv0 > q_last\` is entirely above the diagonal, so \`if (causal && kv0 > q_last) break;\` ends the loop.
 
 - The condition depends on \`blockIdx\` only, so every thread of the block breaks together and no
-  \`__syncthreads()\` is reached by half a block — which would be undefined behaviour.
+  \`__syncthreads()\` is reached by half a block, which hangs or corrupts the block.
 - Tiles straddling the diagonal keep the per-element test \`causal && key > row\` → \`-INFINITY\`.
-- Roughly half the tiles of a causal head are never loaded; the drill's causal timing reflects it.
+- Close to half the tiles of a long causal head are never loaded.
 - Threads with \`row ≥ T\` skip the arithmetic but still load and reach every barrier, for the same reason.
 
 At the drill's \`T = 256\` the grid has four blocks, and the break leaves block 0 with two tiles and block 3
-with eight: 20 of the 32 tiles are loaded. The share skipped approaches half as \`T\` grows.
+with eight: 20 of the 32 tiles are loaded, and the share skipped approaches half as \`T\` grows. The drill's
+causal *time* barely moves, though: four blocks run side by side, and the kernel lasts as long as block 3,
+which walks all eight tiles. The saving shows once the grid has more blocks than the GPU runs at once
+(long \`T\`, batch × heads), when a short block's slot goes to the next block.
 
 :::gpu
 {
@@ -264,10 +279,10 @@ backward pass **recomputes** \`S\` and \`P = exp(S − logsumexp)\` tile by tile
 |---|---|---|
 | Scores / probabilities | \`T × T\` | none |
 | Per-row statistics | none | \`T\` floats (\`logsumexp\`) |
-| Extra FLOPs | — | one more \`Q Kᵀ\` |
+| Extra FLOPs | none | one more \`Q Kᵀ\` |
 
 - The extra matmul costs less than the HBM traffic it replaces, so the backward is faster as well as
-  smaller — the same IO argument as the forward.
+  smaller: the same IO argument as the forward.
 - \`D_i = rowsum(dO_i ∘ O_i)\` replaces the softmax Jacobian's row sum, so no full row is needed.
 - The drill leaves this out; its kernel would need only to write \`m + logf(l)\` beside \`O\`.
 
@@ -300,7 +315,7 @@ which work:
   sequences; giving each warp its own query rows removes shared-memory reductions.
 - **Asynchrony.** FA-3 lets producer warps load the next tile with TMA while consumer warps compute, and
   ping-pongs the softmax of one warpgroup against the matmul of another.
-- **Frameworks.** PyTorch's [\`scaled_dot_product_attention\`](https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html)
+- **Frameworks.** PyTorch's [\`scaled_dot_product_attention\`](https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html)
   chooses a FlashAttention or memory-efficient backend; FlexAttention generates masked variants from a
   Python function; inference engines add paged KV-cache layouts.
 
@@ -309,7 +324,7 @@ Q: What is FlashAttention-2's main change relative to the original kernel?
 - [ ] It approximates the softmax to save FLOPs
 - [x] It parallelises over query blocks and splits work across warps by query rows, cutting non-matmul work
 - [ ] It stores the score matrix in L2 cache
-> FA-2 is the same exact algorithm with a better mapping: query blocks as an extra grid axis, warps that own rows so their reductions stay in registers, and one normalisation at the end.
+> FA-2 is the same exact algorithm with a better mapping: query blocks as an extra grid axis, warps that own rows so their row reductions stay inside the warp, and one normalisation at the end.
 :::
 
 # What to take away

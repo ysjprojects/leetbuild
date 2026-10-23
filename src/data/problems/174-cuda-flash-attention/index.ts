@@ -4,7 +4,7 @@ import {learn} from './learn';
 import {flashAttentionStep} from './steps/1-flash-attention';
 
 /**
- * Drill: the forward pass of FlashAttention for one head as one CUDA kernel — K/V tiles staged in
+ * Drill: the forward pass of FlashAttention for one head as one CUDA kernel: K/V tiles staged in
  * shared memory, scores in registers, softmax finished one tile at a time with a running max and
  * sum, the causal mask applied inside a tile and whole tiles above the diagonal skipped, the T × T
  * score matrix never written anywhere.
@@ -13,7 +13,7 @@ export const cudaFlashAttentionProblem: Problem = {
   id: 'cuda-flash-attention',
   title: 'A FlashAttention-style fused attention kernel',
   tagline:
-    'softmax(QKᵀ)V for one head in one kernel: K/V tiles in shared memory, scores in registers, online softmax with a running max and sum, causal tiles skipped — no T × T matrix ever hits global memory.',
+    'softmax(QKᵀ)V for one head in one kernel: K/V tiles in shared memory, scores in registers, online softmax with a running max and sum, causal tiles skipped, and no T × T matrix ever in global memory.',
   difficulty: 'hard',
   track: 'dllm',
   language: 'cuda',
@@ -22,11 +22,11 @@ export const cudaFlashAttentionProblem: Problem = {
   statement: `# A FlashAttention-style fused attention kernel
 
 Every transformer layer computes, per head, \`O = softmax(Q Kᵀ / √d) V\` over a sequence of \`T\` tokens.
-Written as three matrix operations it is \`T × T\` scores to global memory, a softmax that reads and
-rewrites them, and a second matmul that reads them again: for \`T = 8192\` that is 256 MB per head per
-layer travelling through HBM three times while the arithmetic is cheap. Attention on a GPU is
-memory-bound, and the fix — the kernel behind \`torch.nn.functional.scaled_dot_product_attention\`,
-vLLM, and every long-context model since 2022 — is **FlashAttention**: compute the scores one tile at
+Written as three matrix operations it is \`T × T\` scores written to global memory, a softmax that reads
+them and writes the probabilities, and a second matmul that reads those: for \`T = 8192\` that is
+256 MiB per head per layer crossing HBM four times while the arithmetic is cheap. Attention on a GPU
+is memory-bound, and the fix (the kernel behind \`torch.nn.functional.scaled_dot_product_attention\`,
+vLLM and most long-context models since 2022) is **FlashAttention**: compute the scores one tile at
 a time, finish the softmax incrementally with a running max and a running sum, and write only \`O\`.
 
 You write that kernel's forward pass for one head, in plain CUDA, for \`float\` inputs:
@@ -57,13 +57,16 @@ A passing run prints one line per case with the max absolute error against a dou
 reference (materialised softmax) and the kernel time from \`cudaEvent\`s, a memory note, and \`PASS\`, like this (illustrative figures, not from a measured run):
 
 \`\`\`text
-non-causal max|err| = 3.4e-07  kernel 0.052 ms
-causal     max|err| = 2.9e-07  kernel 0.031 ms
+non-causal max|err| = 3.400e-07  kernel 0.052 ms
+causal     max|err| = 2.900e-07  kernel 0.049 ms
 memory: Q K V O 65536 bytes each on the device, 16384 bytes of shared memory per block for the K/V tiles, scores in registers (a 256 x 256 score matrix would be 262144 bytes; none allocated)
 PASS
 \`\`\`
 
-The starter compiles and prints \`FAIL\` — the kernel writes nothing and \`O\` stays zero.
+The starter compiles and prints \`FAIL\`: the kernel writes nothing and \`O\` stays zero.
+
+At \`T = 256\` the causal case loads 20 of the 32 tiles, but its time barely moves: the grid has four
+blocks, and the last one still walks all eight tiles.
 
 ## Left out on purpose
 
@@ -367,7 +370,7 @@ dropout, ALiBi/sliding-window masks, and the KV-cache layout of inference.`,
               },
             ],
             detail:
-              'The skip `if (causal && kv0 > q_last) break;` depends on `blockIdx` only, so each block leaves its loop as a whole and no `__syncthreads()` is reached by half a block. Across the grid 20 of 32 tiles are loaded, which is the causal speed-up in the timing line.',
+              'The skip `if (causal && kv0 > q_last) break;` depends on `blockIdx` only, so each block leaves its loop as a whole and no `__syncthreads()` is reached by half a block. Across the grid 20 of 32 tiles are loaded, yet block 3 still walks all eight: with four blocks running side by side the kernel takes as long as that block, so the causal time at `T = 256` barely drops.',
           },
         ],
       },

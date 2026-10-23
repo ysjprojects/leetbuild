@@ -209,7 +209,7 @@ int main() {
 `;
 
 /** File header, CUDA_CHECK, constants and the Welford state: identical in starter and solution. */
-const HEADER = `// layernorm_kernels.cu — LayerNorm forward and backward on the GPU: one block per row, one-pass mean
+const HEADER = `// layernorm_kernels.cu: LayerNorm forward and backward on the GPU. One block per row, one-pass mean
 // and variance by Welford merged across threads with Chan's formula, the statistics saved for the
 // backward, and the backward's two row reductions plus per-column gamma/beta partials.
 //   nvcc -O2 -o layernorm_kernels layernorm_kernels.cu && ./layernorm_kernels
@@ -279,13 +279,13 @@ variance \`var = Σ (x − mean)² / cols\`, forward and backward. The header (\
 and the self-test are given; the device code is yours.
 
 - **\`welford_update(Welford& s, float v)\`.** One value into the running state: \`s.count += 1\`,
-  \`delta = v − s.mean\`, \`s.mean += delta / s.count\`, \`s.m2 += delta * (v − s.mean)\` — the deviation from the
+  \`delta = v − s.mean\`, \`s.mean += delta / s.count\`, \`s.m2 += delta * (v − s.mean)\`: the deviation from the
   old mean times the deviation from the new one. Each thread folds its columns \`threadIdx.x, + blockDim.x, …\`
   of the row in one pass over \`x\`.
 - **\`Welford welford_merge(const Welford& a, const Welford& b)\`.** Chan's parallel combination:
   \`count = a.count + b.count\`, \`delta = b.mean − a.mean\`, \`mean = a.mean + delta * b.count / count\`,
-  \`m2 = a.m2 + b.m2 + delta * delta * a.count * b.count / count\`. Two empty states (\`count == 0\`, threads
-  past the end of a short row) merge to an empty state, not to \`0 / 0\`.
+  \`m2 = a.m2 + b.m2 + delta * delta * a.count * b.count / count\`. Two empty states (\`count == 0\`: warp 0's
+  lanes 8–31 in the block-level merge, and threads past the end of a short row) merge to an empty state, not to \`0 / 0\`.
 
 One step of the warp tree: lane \`l\` receives lane \`l + offset\`'s state through three shuffles and merges it
 into its own, all in registers:
@@ -347,18 +347,18 @@ Why the naive formula is forbidden: the same variance in float32, both ways, as 
 :::widget variance-cancellation
 
 > A row's variance is not \`E[x²] − E[x]²\` on a GPU: in float that is two numbers near 10⁶ subtracted to find
-> one near 0.33. Welford keeps deviations small, and Chan's merge lets 256 threads combine theirs exactly.`,
+> one near 0.33. Welford keeps deviations small, and Chan's merge lets 256 threads combine theirs without a subtraction.`,
   hints: [
-    'Welford and Chan are five lines each: update `count += 1; delta = v - mean; mean += delta / count; m2 += delta * (v - mean);`, merge `delta = b.mean - a.mean; mean = a.mean + delta * b.count / count; m2 = a.m2 + b.m2 + delta * delta * a.count * b.count / count`. Return `a` when `a.count + b.count == 0` — empty lanes exist whenever `cols < blockDim.x` and the warp tree merges them.',
+    'The update and the merge are written out above; the trap is the empty state. `a.count + b.count == 0` happens on every row: warp 0’s lanes 8–31 load empty states for the block-level merge and merge each other (and threads past the end of the row, when `cols < blockDim.x`). Return `a` before dividing by `count`.',
     'The forward reduction: `warp_welford` shuffles the three fields with `__shfl_down_sync(FULL_MASK, s.count, offset)` and merges; lane 0 of warp `w` writes `s_warp[w]` (a `__shared__ Welford s_warp[32]`); `__syncthreads()`; warp 0 loads `s_warp[lane]` for `lane < 8` (an empty state otherwise) and runs `warp_welford` again; thread 0 writes `mean[row]`, `rstd[row] = rsqrtf(w.m2 / cols + eps)` and two `__shared__` floats; a second `__syncthreads()` before anyone reads them.',
-    'The backward from `y = γ·xhat + β`: with `g = dy·γ`, `dx = rstd · (g − mean(g) − xhat · mean(g·xhat))` — the two means are your two block reductions, done once per row before the loop that writes `dx`. Each backward block zeroes its own partial row first, then only thread `t` ever touches column `c ≡ t (mod 256)` of it, so `+=` needs no atomics; `layernorm_bwd_reduce` sums the 64 partial rows column by column (coalesced across threads).',
+    'The backward from `y = γ·xhat + β`: with `g = dy·γ`, `dx = rstd · (g − mean(g) − xhat · mean(g·xhat))`. The two means are your two block reductions, done once per row before the loop that writes `dx`. Each backward block zeroes its own partial row first, then only thread `t` ever touches column `c ≡ t (mod 256)` of it, so `+=` needs no atomics; `layernorm_bwd_reduce` sums the 64 partial rows column by column (coalesced across threads).',
   ],
   checks: [
     {
       id: 'welford-update',
       title: 'Each thread folds its columns with Welford’s one-pass update',
       detail:
-        'A `__device__` `welford_update` that does `s.mean += delta / s.count` and `s.m2 += delta * (v - s.mean)` — the deviation from the old mean times the deviation from the new one. One read of `x` per element, and `m2` only ever accumulates products of small deviations, never squares of values near 1000.',
+        'A `__device__` `welford_update` that does `s.mean += delta / s.count` and `s.m2 += delta * (v - s.mean)`: the deviation from the old mean times the deviation from the new one. One read of `x` per element, and `m2` only ever accumulates products of small deviations, never squares of values near 1000.',
       match: {
         cuda: {
           all: [
@@ -406,7 +406,7 @@ Why the naive formula is forbidden: the same variance in float32, both ways, as 
       id: 'rsqrtf',
       title: 'rstd = rsqrtf(m2 / cols + eps): biased variance, one hardware reciprocal square root',
       detail:
-        'The variance is `m2 / cols` (LayerNorm normalises by the population variance, not `count - 1`), and the reciprocal standard deviation is `rsqrtf(var + eps)` — one SFU instruction instead of `1.0f / sqrtf(...)`, a square root and a division.',
+        'The variance is `m2 / cols` (LayerNorm normalises by the population variance, not `count - 1`), and the reciprocal standard deviation is `rsqrtf(var + eps)`: one SFU instruction instead of `1.0f / sqrtf(...)`, a square root and a division.',
       match: {
         cuda: {
           all: [/\.m2\s*\/\s*[^;]*\bcols\b/, /\brsqrtf\s*\(\s*[\w.]+\s*\+\s*eps\s*\)/],
@@ -463,7 +463,7 @@ Why the naive formula is forbidden: the same variance in float32, both ways, as 
       id: 'no-naive-variance',
       title: 'No E[x²] − E[x]² anywhere',
       detail:
-        'The merge is used (`welford_merge(s, other)`), and nothing subtracts a squared mean (`... - mean * mean`), keeps a `sum_sq`, or calls `powf(..., 2)`. On a row at 1000 + U(−1, 1), `E[x²]` and `E[x]²` are both about 10⁶ and differ only in the seventh significant digit — the last one a float holds — so the variance that should be 0.328 comes out as 0.375 on row 0 and up to 31% off on the others, and on a flatter row as a negative number that `rsqrtf` turns into NaN.',
+        'The merge is used (`welford_merge(s, other)`), and nothing subtracts a squared mean (`... - mean * mean`), keeps a `sum_sq`, or calls `powf(..., 2)`. On a row at 1000 + U(−1, 1), `E[x²]` and `E[x]²` are both about 10⁶ and differ by 0.33, about five steps of the 0.0625 float grid there, so the variance that should be 0.328 comes out as 0.375 on row 0 and up to 31% off on the others, and on a flatter row as a negative number that `rsqrtf` turns into NaN.',
       match: {
         cuda: {
           all: [/\bwelford_merge\s*\(\s*\w+\s*,\s*\w+\s*\)/],
@@ -680,5 +680,5 @@ __global__ void layernorm_bwd_reduce(const float* __restrict__ dgamma_partial, c
 ${HOST}`,
     },
   },
-  debrief: `Three choices carry the kernel, and each one is there because the obvious version fails. **One block per row** keeps a row's statistics inside one SM: 256 threads read 1000 contiguous floats coalesced, reduce through shuffles and 32 slots of shared memory, and never talk to another block — LayerNorm rows are independent, so the grid is just \`rows\`. **Welford plus Chan** is the numerics: the textbook \`E[x²] − E[x]²\` reads \`x\` once too, but on a row at 1000 it subtracts two float sums near 10⁶ that differ only in their seventh digit, and the variance of 0.328 comes back as 0.375 — a 6% error in \`rstd\` on every element of the row, or a negative variance and a NaN on a flatter one. Welford's update only ever multiplies small deviations, and Chan's \`delta² · n_a · n_b / n\` term merges two partial states *exactly* in real arithmetic, so the tree of 256 → 8 → 1 merges adds only a few roundings to what the per-thread passes did; the two-pass alternative is as accurate but reads the row twice. **Saving \`mean\` and \`rstd\`** costs 2 KB for 256 rows and spares the backward a whole reduction; \`rsqrtf\` is the one SFU instruction that gives \`rstd\` directly. The backward is two more row reductions — \`Σ dy·γ\` and \`Σ dy·γ·xhat\`, the two terms the chain rule leaves after differentiating through the mean and the variance — and a column reduction for \`dγ\` and \`dβ\`, done as 64 partial rows then one thread per column so nothing is atomic and the sum is deterministic run to run. Production kernels keep this shape and add the rest: PyTorch's \`vectorized_layer_norm_kernel\` and Apex's \`FusedLayerNorm\` use the same Welford-and-Chan merge (Apex calls them \`cuWelfordOnlineSum\` and \`cuChanOnlineSum\`), load vectors of four floats or eight halves, and accumulate in float while reading bf16 or fp16; Apex's contrib \`FastLayerNorm\` keeps the whole row in registers for the hidden sizes it supports, and Apex's \`cuComputePartGradGammaBeta\` / \`cuComputeGradGammaBeta\` is the same partials-then-reduce split. Triton's LayerNorm tutorial loops over the row twice for the mean and the variance and a third time to normalise, and accumulates \`dγ\` in a lock-protected buffer of partial rows — another way to avoid \`atomicAdd\` on every column. And in a real model the residual add and the dropout before it are fused into the same kernel, because LayerNorm is bandwidth-bound: 8 bytes per element forward and 12 backward for a handful of FLOPs.`,
+  debrief: `Three choices carry the kernel, and each one is there because the obvious version fails. **One block per row** keeps a row's statistics inside one SM: 256 threads read 1000 contiguous floats coalesced, reduce through shuffles and 32 slots of shared memory, and never talk to another block. LayerNorm rows are independent, so the grid is just \`rows\`. **Welford plus Chan** is the numerics: the textbook \`E[x²] − E[x]²\` reads \`x\` once too, but on a row at 1000 it subtracts two float values near 10⁶ that differ by 0.33, and the variance of 0.328 comes back as 0.375: a 6% error in \`rstd\` on every element of the row, or a negative variance and a NaN on a flatter one. Welford's update only ever multiplies small deviations, and Chan's \`delta² · n_a · n_b / n\` term merges two partial states *exactly* in real arithmetic, so the tree of 256 → 8 → 1 merges adds only a few roundings to what the per-thread passes did; the two-pass alternative is as accurate but reads the row twice. **Saving \`mean\` and \`rstd\`** costs 2 KB for 256 rows and spares the backward a whole reduction; \`rsqrtf\` is the one SFU instruction that gives \`rstd\` directly. The backward is two more row reductions (\`Σ dy·γ\` and \`Σ dy·γ·xhat\`, the two terms the chain rule leaves after differentiating through the mean and the variance) and a column reduction for \`dγ\` and \`dβ\`, done as 64 partial rows then one thread per column so nothing is atomic and the sum is deterministic run to run. Production kernels keep this shape and add the rest. PyTorch's \`vectorized_layer_norm_kernel\` and Apex's \`FusedLayerNorm\` use the same Welford-and-Chan merge (PyTorch calls them \`cuWelfordOnlineSum\` and \`cuWelfordCombine\`, Apex \`cuWelfordOnlineSum\` and \`cuChanOnlineSum\`) and accumulate in float while reading bf16 or fp16; PyTorch loads four elements per vector whatever the dtype (\`vec_size = 4\`). Apex's contrib \`FastLayerNorm\` keeps the whole row in registers for the hidden sizes it supports, and Apex's \`cuComputePartGradGammaBeta\` / \`cuComputeGradGammaBeta\` is the same partials-then-reduce split. Triton's LayerNorm tutorial loops over the row twice for the mean and the variance and a third time to normalise, and accumulates \`dγ\` in a lock-protected buffer of partial rows, another way to avoid \`atomicAdd\` on every column. And in a real model the residual add and the dropout before it are fused into the same kernel, because LayerNorm is bandwidth-bound: 8 bytes per element forward and 12 backward for a handful of FLOPs.`,
 };

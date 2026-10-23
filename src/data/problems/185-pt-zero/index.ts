@@ -29,8 +29,8 @@ averaging with bucketed all-reduces that overlap backward. Replication has a pri
 keeps 16 bytes per parameter (fp16 weights and gradients, fp32 master weights and two moments), so a
 7.5B-parameter model needs 120 GB on every GPU however many GPUs there are. ZeRO (Rajbhandari et al.,
 Microsoft DeepSpeed, SC 2020) removes the redundancy in three stages: shard the optimizer states (ZeRO-1),
-the gradients too (ZeRO-2), and the parameters too (ZeRO-3), which PyTorch ships as FSDP. Every LLM
-pre-training stack today runs one of these, usually beside tensor and pipeline parallelism.
+the gradients too (ZeRO-2), and the parameters too (ZeRO-3), which PyTorch ships as FSDP. Large-model
+pre-training stacks run one of these, usually beside tensor and pipeline parallelism.
 
 You write three files, each importing the previous one. Everything runs as real processes:
 \`torch.multiprocessing.spawn\` with the \`gloo\` backend on CPU, world sizes 2 and 4.
@@ -76,8 +76,9 @@ examples split evenly across the ranks, and 5 AdamW steps at \`lr = 1e-2\`.
 python ddp.py && python zero1.py && python zero3.py
 \`\`\`
 
-PyTorch 2.1 or newer (for \`register_post_accumulate_grad_hook\`), CPU only, no GPU needed. Each file spawns
-2 and then 4 processes and finishes in about 5 to 10 s on a laptop. \`PASS\` means: the DDP parameters equal
+PyTorch 2.1 or newer (for \`register_post_accumulate_grad_hook\`), CPU only, no GPU needed. Each file runs at
+world sizes 2 and 4 (\`zero1.py\` and \`zero3.py\` also rerun DDP as their reference) and takes roughly 10 to 20 s
+on a laptop, most of it process start-up. \`PASS\` means: the DDP parameters equal
 the single-process ones within 1e-6, with exactly one all-reduce per bucket per step, the first one
 launched while backward is still running; ZeRO-1 equals DDP within 1e-6 with 2·padded/N moment numbers
 per rank; ZeRO-3 equals DDP within 1e-6, its gradients are shard-sized, and the gathered full weights alive

@@ -16,16 +16,16 @@ export const bpeStep: Step = {
   task: `## Task
 
 Implement \`BPETokenizer\` in \`bpe.py\`: a byte-level BPE tokenizer with the training loop, the
-rank-ordered encoder, the lossless-or-replaced decoder and a JSON merge file. Pure Python — no
+rank-ordered encoder, the lossless-or-replaced decoder and a JSON merge file. Pure Python: no
 \`tiktoken\`, \`tokenizers\` or \`sentencepiece\`.
 
-- **State.** \`merges: list[tuple[int, int]]\` in the order learned — the pair at index \`r\` has rank
+- **State.** \`merges: list[tuple[int, int]]\` in the order learned: the pair at index \`r\` has rank
   \`r\` and was merged into id \`256 + r\`. \`vocab: dict[int, bytes]\` starts as the 256 single bytes
   (\`{i: bytes([i]) for i in range(256)}\`) and gains \`vocab[256 + r] = vocab[a] + vocab[b]\` per merge.
 - **\`train(text, vocab_size) -> list[int]\`.** Reset the state, \`ids = list(text.encode("utf-8"))\`,
   then while \`len(vocab) < vocab_size\`: count every adjacent pair of \`ids\` across the whole corpus
-  (\`Counter(zip(ids, ids[1:]))\`), take the most frequent — **ties go to the pair seen first** in the
-  corpus, which is what \`max(counts, key=counts.get)\` gives — stop early if it occurs fewer than
+  (\`Counter(zip(ids, ids[1:]))\`), take the most frequent (**ties go to the pair seen first** in the
+  corpus, which is what \`max(counts, key=counts.get)\` gives), stop early if it occurs fewer than
   twice, otherwise append it to \`merges\`, add its bytes to \`vocab\` and replace every occurrence in
   \`ids\` by the new id. Return \`ids\` as the last merge left them.
 
@@ -46,10 +46,10 @@ rank-ordered encoder, the lossless-or-replaced decoder and a JSON merge file. Pu
   to 300, and a saved-then-loaded tokenizer must encode identically.
 
 > The merge list is the model. Training decides its order by frequency; encoding must replay that
-> order — lowest rank first — or it produces token sequences the network never saw.`,
+> order (lowest rank first) or it produces token sequences the network never saw.`,
   hints: [
     'Write `_merge(ids, pair, new_id)` first: walk `ids` left to right, emit `new_id` and skip two when `ids[i], ids[i+1] == pair`, else emit `ids[i]`. Both `train` and `encode` are loops around it.',
-    'In `train`, `Counter(zip(ids, ids[1:]))` counts pairs in corpus order, so `max(counts, key=counts.get)` returns the first-seen pair among equals — that is the tie-break. The new id is `256 + len(self.merges)` before you append.',
+    'In `train`, `Counter(zip(ids, ids[1:]))` counts pairs in corpus order, so `max(counts, key=counts.get)` returns the first-seen pair among equals: that is the tie-break. The new id is `256 + len(self.merges)` before you append.',
     'In `encode`, `min(zip(ids, ids[1:]), key=lambda p: ranks.get(p, float("inf")))` is the GPT-2 idiom: pairs without a rank sort last, and when the winner has no rank you are done. Build `ranks = {pair: r for r, pair in enumerate(self.merges)}` once per call.',
   ],
   checks: [
@@ -57,7 +57,7 @@ rank-ordered encoder, the lossless-or-replaced decoder and a JSON merge file. Pu
       id: 'byte-base',
       title: 'The base vocabulary is the 256 bytes and text enters as UTF-8',
       detail:
-        '`vocab` starts as `{i: bytes([i]) for i in range(256)}` and `encode` works on `text.encode("utf-8")`, so every string — any script, any emoji — is encodable with nothing out of vocabulary.',
+        '`vocab` starts as `{i: bytes([i]) for i in range(256)}` and `encode` works on `text.encode("utf-8")`, so every string (any script, any emoji) is encodable with nothing out of vocabulary.',
       match: {
         python: {
           all: [/range\(\s*256\s*\)/, /bytes\(\s*\[/, inMethod('encode', /\.encode\(\s*["']utf-8["']\s*\)/)],
@@ -203,7 +203,7 @@ if __name__ == "__main__":
     assert tok.encode(tok.decode(ids)) == ids
 
     # 3. Round trips: ASCII and multi-byte UTF-8 (2-, 3- and 4-byte characters), including text never seen in training.
-    for text in ["hello world", corpus, "naïve café — 日本語 🙂", "", "newest\\n\\tlowest"]:
+    for text in ["hello world", corpus, "naïve café €5 · 日本語 🙂", "", "newest\\n\\tlowest"]:
         assert tok.decode(tok.encode(text)) == text, text
     assert tok.encode("") == []
 
@@ -335,7 +335,7 @@ if __name__ == "__main__":
     assert tok.encode(tok.decode(ids)) == ids
 
     # 3. Round trips: ASCII and multi-byte UTF-8 (2-, 3- and 4-byte characters), including text never seen in training.
-    for text in ["hello world", corpus, "naïve café — 日本語 🙂", "", "newest\\n\\tlowest"]:
+    for text in ["hello world", corpus, "naïve café €5 · 日本語 🙂", "", "newest\\n\\tlowest"]:
         assert tok.decode(tok.encode(text)) == text, text
     assert tok.encode("") == []
 
@@ -366,5 +366,5 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `Three decisions give the tokenizer its shape. The base vocabulary is **bytes**, not characters: 256 ids cover every string in every script with no \`<unk>\`, and a character the corpus never contained still encodes — as its two to four bytes — which is why GPT-2 could drop the unknown token and why \`decode\` must tolerate a boundary inside a character (\`errors="replace"\`). The merge list is **ordered**, and the order is the model: training merges the most frequent pair of the moment, so a merge learned later may contain an id that only exists because of an earlier one, and \`encode\` replays them lowest rank first — the \`min(pairs, key=rank)\` loop in GPT-2's \`bpe()\` — because after rank \`r\` is applied no pair of lower rank can reappear (every new pair contains the new id), so "lowest rank present, repeat" is exactly "apply merge 0, then 1, then 2 …" and lands on the segmentation the corpus had during training; \`encode(corpus) == train_ids\` is that property. And ties break **deterministically** on the pair seen first, because a tokenizer trained twice must produce the same merge file or every checkpoint that used it is unreadable. The self-test corpus is small enough to memorise, which is why training stops when the best pair occurs once — a merge with support 1 is a quirk of the corpus, not a statistic. Production tokenizers keep this loop and change its surroundings: GPT-2 and tiktoken split text with a regex first (\`'s\`, \` word\`, digits in groups of three) so no merge crosses a word boundary; training on gigabytes keeps pair counts incrementally instead of recounting each round and runs in Rust across threads (Hugging Face \`tokenizers\`, tiktoken's \`_educational.py\` shows the same loop in Python); special tokens like \`<|endoftext|>\` are matched before BPE runs; and a model's embedding table has one row per id, which is why \`vocab_size\` is a hyperparameter of the model as much as of the tokenizer.`,
+  debrief: `Three decisions give the tokenizer its shape. The base vocabulary is **bytes**, not characters: 256 ids cover every string in every script with no \`<unk>\`, and a character the corpus never contained still encodes (as its one to four UTF-8 bytes), which is why GPT-2 could drop the unknown token and why \`decode\` must tolerate a boundary inside a character (\`errors="replace"\`, the default in GPT-2's \`Encoder\` and in tiktoken's \`decode\`). The merge list is **ordered**, and the order is the model: training merges the most frequent pair of the moment, so a merge learned later may contain an id that only exists because of an earlier one, and \`encode\` replays them lowest rank first (the \`min(pairs, key=rank)\` loop in GPT-2's \`bpe()\`). After rank \`r\` is applied no pair of lower rank can reappear (every new pair contains the new id), so "lowest rank present, repeat" is exactly "apply merge 0, then 1, then 2 …" and lands on the segmentation the corpus had during training; \`encode(corpus) == train_ids\` is that property. And ties break **deterministically** on the pair seen first, because a tokenizer trained twice must produce the same merge file, or a checkpoint trained through one file reads the wrong ids through the other. The self-test corpus is small enough to memorise, which is why training stops when the best pair occurs once: a merge with support 1 is a quirk of the corpus, not a statistic. Even so, without a pre-tokenizer it learns \`b"est newest new"\`, a phrase across three words. Production tokenizers keep this loop and change its surroundings: GPT-2 and tiktoken split text with a regex first (contractions like \`'s\`, a word with its leading space, digit runs, which GPT-4's pattern caps at three) so no merge crosses a word boundary; trainers for gigabytes update pair counts incrementally instead of recounting each round and run in Rust across threads (Hugging Face \`tokenizers\`), while tiktoken's \`_educational.py\` shows the same loop in plain Python; special tokens like \`<|endoftext|>\` are matched before BPE runs; and a model's embedding table has one row per id, which is why \`vocab_size\` is a hyperparameter of the model as much as of the tokenizer.`,
 };

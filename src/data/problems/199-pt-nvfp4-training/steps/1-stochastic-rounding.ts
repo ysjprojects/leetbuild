@@ -22,7 +22,7 @@ NVFP4 GEMM computes.
   below 2, 1 below 4, 2 up to 6) and \`lo = floor(a / step) · step\`, return \`sign(v) · (lo + step)\`
   with probability \`(a - lo) / step\` and \`sign(v) · lo\` otherwise. One
   \`torch.rand(v.shape, generator=generator)\` draw per element, so a seeded generator replays the
-  same roundings. Then \`E[q] = a\` for every \`|v| ≤ 6\`.
+  same roundings. Then \`E[q] = v\` for every \`|v| ≤ 6\`.
 - \`block=(16, 16)\`: \`x\` is 2-D with both dims multiples of 16. View it as
   \`(R // 16, 16, C // 16, 16)\` and take one \`amax\` per tile over dims 1 and 3 (\`keepdim=True\`, so
   it broadcasts); the rest of the pipeline is unchanged. Then
@@ -37,16 +37,16 @@ The self-test checks the given round-to-nearest-even against a brute force over 
 every stochastic draw is one of the two grid neighbours with the sign of \`v\`; the mean of 4,096
 draws of a heavy-tailed tensor lies within \`6 · gap / (2 √N)\` of \`sign(x) · min(|x|, 6 · scale)\` for
 both block shapes (a block maximum can sit up to 1/16 above 6 because E4M3 rounds the scale to
-nearest, and saturates: the one place SR is biased); round-to-nearest moves the values below half the
-smallest code by less than −20 % of their magnitude (it measures −41 %, flushing 85 % of them to 0)
-while 64 stochastic draws stay within 1 %; and 2-D blocks commute with the transpose while 1 × 16
+nearest, and saturates: the one place SR is biased); round-to-nearest shrinks the total magnitude of
+the values below the smallest non-zero code (0.5) by more than 20 % (it measures 41 %, flushing 85 % of
+them to 0) while the mean of 64 stochastic draws stays within 1 %; and 2-D blocks commute with the transpose while 1 × 16
 blocks change more than 10 % of the elements. Then it prints \`PASS\`.
 
 > Round-to-nearest is the best single guess and a biased average: a gradient whose values sit low in
 > their grid interval is shrunk every step, the same way. Stochastic rounding is a worse single guess
 > and an exact average, which is what an optimizer summing thousands of steps needs.`,
   hints: [
-    'For stochastic rounding, compute `lo` with `torch.floor(a / step) * step`, the probability `p_up = (a - lo) / step`, a draw `u = torch.rand(v.shape, generator=generator)`, and return `torch.sign(v) * (lo + step * (u < p_up))`. At `a = 6` the probability is 0, so nothing goes past the top of the grid.',
+    'Draw `u = torch.rand(v.shape, generator=generator)` once and add `step` where `u < (a - lo) / step`: a boolean tensor times a float is a float. At `a = 6`, `lo = 6` and the probability is 0, so nothing goes past the top of the grid.',
     'For the 2-D branch, `R, C = x.shape`, `xb = x.reshape(R // 16, 16, C // 16, 16)` puts a tile at `xb[i, :, j, :]`. `xb.abs().amax(dim=(1, 3), keepdim=True)` has shape `(R // 16, 1, C // 16, 1)` and broadcasts back over the tile.',
     'The final `reshape(x.shape)` works for both branches because both views are reshapes of a contiguous `x`. Check the transpose property on a random matrix: the tile at `(i, j)` of `W` is the transposed tile at `(j, i)` of `W.T`, so it has the same amax and the same scale.',
   ],
@@ -62,7 +62,7 @@ blocks change more than 10 % of the elements. Then it prints \`PASS\`.
       id: 'sr-probability',
       title: 'Up with probability (a − lo) / step',
       detail:
-        'The chance of rounding up is the distance from `lo` over the gap, so `E[q] = lo + step · (a − lo) / step = a`: the rounding is unbiased for every value inside the grid.',
+        'The chance of rounding up is the distance from `lo` over the gap, so `E[|q|] = lo + step · (a − lo) / step = a` and `E[q] = v`: the rounding is unbiased for every value inside the grid.',
       match: {python: {all: [/-\s*(?:lo|low)\b[^\n]*\/\s*(?:step|gap|spacing)\b/]}},
     },
     {
@@ -413,11 +413,11 @@ An optimizer adds thousands of quantized gradients into the same weights, so wha
 error of one rounding but its mean. Round-to-nearest-even has the smallest error per value and a mean
 that depends on where values sit inside their grid interval; gradients are heavy-tailed, most of a
 block sits far below its maximum, and below a quarter of the block scale everything rounds to 0. The
-self-test measures that: on a log-normal tensor 70 % of the values sit below half the smallest code,
-RNE flushes 85 % of them and shrinks their total magnitude by 41 %. Stochastic rounding (Gupta et al.,
+self-test measures that: on a heavy-tailed tensor 70 % of the values sit below the smallest non-zero
+code (0.5), RNE flushes 85 % of them and shrinks their total magnitude by 41 %. Stochastic rounding (Gupta et al.,
 2015) makes each rounding a coin weighted by distance, so the expectation is exact and the bias
-averages away; the price is variance (on a log-normal tensor one draw's RMS error is 0.41 of a grid gap against
-0.27 for RNE), which is why the NVFP4 recipe applies it to gradients only and keeps weights and
+averages away; the price is variance (on the same tensor one draw's RMS error is 0.34 of a grid gap against
+0.22 for RNE), which is why the NVFP4 recipe applies it to gradients only and keeps weights and
 activations on round-to-nearest. It is not perfectly unbiased: E4M3 rounds the block scale to nearest,
 so a block maximum can land up to 1/16 above 6 and saturate. 16 × 16 weight tiles solve a different
 problem: fprop blocks the weight along \`in_features\`, dgrad along \`out_features\`, and with 1 × 16

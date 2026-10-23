@@ -19,8 +19,8 @@ Implement the three functions that wrap one optimizer step of an LLM training lo
 implementation (the self-test uses it as the reference).
 
 - \`lr_at(step, warmup_steps, total_steps, max_lr, min_lr) -> float\`: **linear warmup** for
-  \`step < warmup_steps\` — \`max_lr × (step + 1) / warmup_steps\`, so step 0 is one warmup slice, never
-  0 — then **cosine decay**: \`progress = (step − warmup_steps) / (total_steps − warmup_steps)\`,
+  \`step < warmup_steps\`, \`max_lr × (step + 1) / warmup_steps\` (so step 0 is one warmup slice, never
+  0); then **cosine decay**: \`progress = (step − warmup_steps) / (total_steps − warmup_steps)\`,
   \`lr = min_lr + 0.5 × (1 + cos(π × progress)) × (max_lr − min_lr)\`; \`min_lr\` for every
   \`step >= total_steps\`. Pure \`math\`, no tensors.
 
@@ -29,7 +29,7 @@ implementation (the self-test uses it as the reference).
 - \`clip_grad_norm_(params, max_norm) -> Tensor\`: the **global** L2 norm of every \`.grad\` that is not
   \`None\` (the norm of the per-tensor norms); \`clip_coef = max_norm / (total_norm + 1e-6)\`; when
   \`clip_coef < 1\` scale every grad **in place** with \`mul_\`; return the norm **before** clipping. Under
-  \`torch.no_grad()\`. \`params\` may be a generator — read it once.
+  \`torch.no_grad()\`. \`params\` may be a generator: read it once.
 
 :::widget grad-clip
 
@@ -45,12 +45,12 @@ implementation (the self-test uses it as the reference).
   micro-batches of 4 against one batch of 16 with plain SGD: same loss, same gradient, same parameters
   after the update. Runs on CPU in a second.
 
-> The gradient of a mean over 16 examples is the mean of four gradients over 4 — only if each
+> The gradient of a mean over 16 examples is the mean of four gradients over 4, but only if each
 > micro-batch loss is divided by four before \`backward()\` and the \`.grad\` buffers are cleared once
 > per optimizer step, not once per micro-batch.`,
   hints: [
     'Three branches in `lr_at`: `step < warmup_steps` → `max_lr * (step + 1) / warmup_steps`; `step >= total_steps` → `min_lr`; otherwise `progress` in `[0, 1)` and `min_lr + 0.5 * (1.0 + math.cos(math.pi * progress)) * (max_lr - min_lr)`. Check it in your head: progress 0 gives `max_lr`, progress 1 gives `min_lr`.',
-    'In `clip_grad_norm_`: `grads = [p.grad for p in params if p.grad is not None]` (a generator is consumed once), `total_norm = torch.stack([g.norm(2.0) for g in grads]).norm(2.0)`, `clip_coef = max_norm / (total_norm + 1e-6)`, and `g.mul_(clip_coef)` for every grad only `if clip_coef < 1.0`. Decorate with `@torch.no_grad()` and return the norm you computed before scaling.',
+    'In `clip_grad_norm_`, first turn `params` into a list of the grads that are not `None` (a generator can be read only once). The global norm is the 2-norm of the vector of per-tensor 2-norms, so `torch.stack` them. Scale with `mul_` only when `max_norm / (total_norm + 1e-6)` is below 1, under `@torch.no_grad()`, and return the norm computed before scaling.',
     'In `train_step` the order is everything: `optimizer.zero_grad(set_to_none=True)` before the loop; `F.cross_entropy(logits, y) / accum_steps` then `.backward()` inside it; after the loop clip, compute `lr`, `for group in optimizer.param_groups: group["lr"] = lr`, and only then `optimizer.step()`. `loss.item()` on the scaled loss summed over the loop is the full-batch loss.',
   ],
   checks: [
@@ -58,14 +58,14 @@ implementation (the self-test uses it as the reference).
       id: 'warmup',
       title: 'Linear warmup to max_lr over warmup_steps',
       detail:
-        '`lr_at(0)` is `max_lr / warmup_steps`, `lr_at(warmup_steps - 1)` is `max_lr`, and the ramp is monotone — written by hand with `step < warmup_steps` and a division by `warmup_steps`, not with `torch.optim.lr_scheduler`.',
+        '`lr_at(0)` is `max_lr / warmup_steps`, `lr_at(warmup_steps - 1)` is `max_lr`, and the ramp is monotone: written by hand with `step < warmup_steps` and a division by `warmup_steps`, not with `torch.optim.lr_scheduler`.',
       match: {python: {all: [/step\s*<\s*warmup_steps/, /\/\s*warmup_steps/], none: [LIBRARY_SCHEDULE]}},
     },
     {
       id: 'cosine-decay',
       title: 'Cosine decay to min_lr, constant after total_steps',
       detail:
-        'Halfway through the decay the LR is exactly `(max_lr + min_lr) / 2`; at `total_steps` it is `min_lr`, and it stays there — `0.5 × (1 + cos(π × progress))` scaled between the two, with `step >= total_steps` answering `min_lr`.',
+        'Halfway through the decay the LR is exactly `(max_lr + min_lr) / 2`; at `total_steps` it is `min_lr`, and it stays there: `0.5 × (1 + cos(π × progress))` scaled between the two, with `step >= total_steps` answering `min_lr`.',
       match: {
         python: {
           all: [
@@ -133,7 +133,7 @@ implementation (the self-test uses it as the reference).
       id: 'report',
       title: 'Reports loss, pre-clip grad_norm and lr as floats',
       detail:
-        '`train_step` returns `{"loss", "grad_norm", "lr"}`: the summed scaled losses equal the big-batch loss, `grad_norm` equals the reference norm before clipping, `lr` equals `lr_at(step, …)` and the optimizer’s group LR — the three numbers every training log plots.',
+        '`train_step` returns `{"loss", "grad_norm", "lr"}`: the summed scaled losses equal the big-batch loss, `grad_norm` equals the reference norm before clipping, `lr` equals `lr_at(step, …)` and the optimizer’s group LR. These are the three numbers every training log plots.',
       match: {python: {all: [/["']loss["']\s*:/, /["']grad_norm["']\s*:/, /["']lr["']\s*:/]}},
     },
   ],
@@ -369,5 +369,5 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `Three small functions, and each is shaped by a failure it prevents. The schedule is a pure function of \`step\` rather than a stateful object because a run that restarts from a checkpoint must land on exactly the LR it had — \`lr_at(step)\` needs nothing but the step counter, and writing it into every \`param_groups\` entry is what makes it apply to the weight-decayed and the no-decay groups alike (nanoGPT's \`get_lr\` is this function; HuggingFace's \`get_cosine_schedule_with_warmup\` wraps it in a \`LambdaLR\`). Warmup starts at one slice rather than 0 because a step at LR 0 is a wasted forward-backward, and it exists at all because Adam's second-moment estimate is garbage for the first few hundred steps — a full-size LR then takes a few huge steps that the run never recovers from. Clipping takes the **global** norm, not a per-tensor one, so a spike scales the whole update down without changing its direction; the \`1e-6\` keeps a zero gradient from dividing by zero, the \`clip_coef < 1\` guard keeps a small gradient from being scaled *up*, and the pre-clip norm is returned because it is the single most useful health signal in a training log — loss spikes are preceded by grad-norm spikes, and a run whose norm is clipped on every step has an LR problem, not a clipping solution. Accumulation divides each micro-batch loss by \`accum_steps\` *before* \`backward()\` so the sum of the four gradients is the mean gradient of the whole batch (dividing afterwards would need a pass over \`.grad\`; not dividing gives a gradient four times too large, which the clipper would then silently hide); \`zero_grad(set_to_none=True)\` once per step, not per micro-batch, is what lets the buffers accumulate, and \`set_to_none\` makes the first \`backward\` *assign* rather than add to a zeroed tensor, saving a memset and a read of every gradient. Production loops keep this shape and bolt things on: \`torch.nn.utils.clip_grad_norm_\` with \`foreach=True\` computes the norm in a handful of fused kernels; under mixed precision \`scaler.unscale_(optimizer)\` must come before the clip so the norm is of the real gradients; DDP wraps the first \`accum_steps − 1\` micro-batches in \`no_sync()\` so the all-reduce happens once per step; FSDP's \`clip_grad_norm_\` all-reduces the per-shard norms before scaling; and Megatron logs exactly the three numbers this function returns on every step.`,
+  debrief: `Three small functions, each shaped by a failure it prevents. The schedule is a pure function of \`step\` rather than a stateful object because a run restarted from a checkpoint must land on exactly the LR it had: \`lr_at(step)\` needs nothing but the step counter, and writing it into every \`param_groups\` entry applies it to the weight-decayed and the no-decay groups alike (Karpathy's build-nanogpt \`get_lr\` is this function, nanoGPT's divides its ramp by \`warmup_iters + 1\`, and Hugging Face's \`get_cosine_schedule_with_warmup\` wraps a variant that warms up from 0 and decays to 0 in a \`LambdaLR\`). Warmup starts at one slice rather than 0 because a step at LR 0 is a wasted forward-backward, and it exists at all because Adam's second-moment estimate rests on a handful of gradients in the first steps: a full-size LR then takes a few oversized steps the run may never recover from. Clipping takes the **global** norm, not a per-tensor one, so a spike scales the whole update down without changing its direction; the \`1e-6\` keeps a zero gradient from dividing by zero, the \`clip_coef < 1\` guard keeps a small gradient from being scaled *up*, and the pre-clip norm is returned because it is the most useful health signal in a training log: loss spikes are usually preceded by grad-norm spikes, and a run whose norm is clipped on every step has an LR problem, not a clipping solution. Accumulation divides each micro-batch loss by \`accum_steps\` *before* \`backward()\` so the sum of the four gradients is the mean gradient of the whole batch (dividing afterwards would need a pass over \`.grad\`; not dividing gives a gradient four times too large, which the clipper then silently hides). \`zero_grad(set_to_none=True)\` once per step, not per micro-batch, is what lets the buffers accumulate, and \`set_to_none\` (the default since PyTorch 2.0) makes the first \`backward\` *assign* rather than add into a zeroed tensor, saving a memset and a read of every gradient. Production loops keep this shape and bolt things on: \`torch.nn.utils.clip_grad_norm_\` computes the norms with \`torch._foreach_norm\` in a few multi-tensor kernels and always multiplies by \`clamp(clip_coef, max=1.0)\`, because an \`if clip_coef < 1.0\` on a GPU tensor forces a GPU-to-CPU sync every step; under fp16 \`scaler.unscale_(optimizer)\` must come before the clip so the norm is of the real gradients; DDP skips the gradient all-reduce on the first \`accum_steps − 1\` micro-batches (\`no_sync()\`, or the \`require_backward_grad_sync\` flag nanoGPT toggles); FSDP's \`clip_grad_norm_\` all-reduces the per-shard squared norms before scaling; and Megatron-LM's log line carries the loss, the LR and the grad norm.`,
 };

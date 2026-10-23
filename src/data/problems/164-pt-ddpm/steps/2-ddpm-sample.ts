@@ -75,7 +75,7 @@ Turn the trained ε-predictor into a generator. \`ddpm_sample.py\` imports \`Noi
   posterior mean from the predicted noise, \`mean = (x_t − β_t / √(1 − ᾱ_t) · ε̂) / √α_t\`, reading
   \`schedule.betas[t]\`, \`schedule.sqrt_one_minus_alphas_cumprod[t]\` and \`schedule.alphas[t]\`. For \`t > 0\`
   return \`mean + √posterior_variance[t] · torch.randn_like(x_t)\`; at \`t == 0\` return \`mean\` with no noise.
-- \`sample(model, shape, schedule)\`: Algorithm 2 of the paper — \`x = torch.randn(shape, …)\` on the
+- \`sample(model, shape, schedule)\`: Algorithm 2 of the paper. Draw \`x = torch.randn(shape, …)\` on the
   schedule's device, then \`p_sample\` for \`t\` in \`reversed(range(schedule.T))\`. Returns \`(*shape)\` float32.
 - \`ddim_sample(model, shape, schedule, steps, eta=0.0)\`: Song et al.'s sampler on the strided subsequence
   \`timesteps = list(range(0, schedule.T, schedule.T // steps))[:steps]\`, walked from the last to the first.
@@ -104,7 +104,7 @@ The file ends with a self-test: train the toy model with \`train_toy\`; shapes a
 \`p_sample\` deterministic at \`t = 0\` and noisy at \`t = 500\`; \`ddim_sample(eta=0)\` reproducible under one
 seed and drawing no random numbers after \`x_T\`; \`ddim_sample(steps=T, eta=1)\` equal to \`sample\` under one
 seed (\`atol=1e-3\`); and 2 000 samples from each sampler (DDPM 1000 steps, DDIM 50) within a median
-distance of \`0.05\` of the two-moons data (75th percentile under \`0.1\`) — then \`PASS\`.
+distance of \`0.05\` of the two-moons data (75th percentile under \`0.1\`), then \`PASS\`.
 
 > The network only ever predicts noise; the sampler turns that prediction into an estimate of \`x_0\` and
 > walks back along the posterior. DDPM re-injects fresh noise at every one of the T steps; DDIM, at
@@ -119,7 +119,7 @@ distance of \`0.05\` of the two-moons data (75th percentile under \`0.1\`) — t
       id: 'posterior-mean',
       title: 'The reverse mean is computed from the predicted noise',
       detail:
-        '`p_sample` forms `(x_t − β_t / √(1 − ᾱ_t) · ε̂) / √α_t` from `betas[t]`, `sqrt_one_minus_alphas_cumprod[t]` and `alphas[t]` — the mean of q(x_{t−1} | x_t, x_0) with x_0 replaced by its ε-estimate; no `diffusers` scheduler supplies it.',
+        '`p_sample` forms `(x_t − β_t / √(1 − ᾱ_t) · ε̂) / √α_t` from `betas[t]`, `sqrt_one_minus_alphas_cumprod[t]` and `alphas[t]`: the mean of q(x_{t−1} | x_t, x_0) with x_0 replaced by its ε-estimate; no `diffusers` scheduler supplies it.',
       match: {
         python: {
           all: [
@@ -144,7 +144,7 @@ distance of \`0.05\` of the two-moons data (75th percentile under \`0.1\`) — t
       id: 'reverse-loop',
       title: 'Sampling starts from N(0, I) and runs t = T − 1 down to 0',
       detail:
-        '`sample` draws `x = torch.randn(shape, …)` and loops `for t in reversed(range(schedule.T))`, calling `p_sample` at every step — Algorithm 2 of the paper.',
+        '`sample` draws `x = torch.randn(shape, …)` and loops `for t in reversed(range(schedule.T))`, calling `p_sample` at every step: Algorithm 2 of the paper.',
       match: {
         python: {
           all: [/torch\.randn\(\s*\*?shape/, /reversed\(\s*range\(\s*\w+\.T\s*\)\s*\)/],
@@ -165,7 +165,7 @@ distance of \`0.05\` of the two-moons data (75th percentile under \`0.1\`) — t
       id: 'ddim-strided',
       title: 'DDIM walks a strided subsequence of the T timesteps',
       detail:
-        '`ddim_sample` builds `timesteps = list(range(0, schedule.T, schedule.T // steps))` and walks it backwards, with `ᾱ_prev = 1` after the first entry — 50 model calls instead of 1000.',
+        '`ddim_sample` builds `timesteps = list(range(0, schedule.T, schedule.T // steps))` and walks it backwards, with `ᾱ_prev = 1` after the first entry: 50 model calls instead of 1000.',
       match: {
         python: {
           all: [
@@ -179,7 +179,7 @@ distance of \`0.05\` of the two-moons data (75th percentile under \`0.1\`) — t
       id: 'ddim-update',
       title: 'DDIM predicts x_0, then steps to ᾱ_prev along the predicted noise',
       detail:
-        '`x0_pred = (x − √(1 − a_t) · ε̂) / √a_t` comes first, then `x = a_prev.sqrt() * x0_pred + √(1 − a_prev − σ²) · ε̂` — the non-Markovian update of Song et al. that keeps the same marginals as DDPM.',
+        '`x0_pred = (x − √(1 − a_t) · ε̂) / √a_t` comes first, then `x = a_prev.sqrt() * x0_pred + √(1 − a_prev − σ²) · ε̂`: the non-Markovian update of Song et al. that keeps the same marginals as DDPM.',
       match: {
         python: {
           order: [/x0_pred\s*=/, /a_prev\.sqrt\(\)\s*\*\s*x0_pred/],
@@ -190,7 +190,7 @@ distance of \`0.05\` of the two-moons data (75th percentile under \`0.1\`) — t
       id: 'ddim-eta',
       title: 'eta scales σ, and eta = 0 draws no noise after x_T',
       detail:
-        '`sigma = eta * √((1 − a_prev) / (1 − a_t) · (1 − a_t / a_prev))` and `torch.randn_like` is called only under `if eta > 0` — at `eta = 0` the sampler is a deterministic map from x_T, at `eta = 1` it is DDPM.',
+        '`sigma = eta * √((1 − a_prev) / (1 − a_t) · (1 − a_t / a_prev))` and `torch.randn_like` is called only under `if eta > 0`: at `eta = 0` the sampler is a deterministic map from x_T; at `eta = 1` and `steps = T` it is DDPM.',
       match: {
         python: {all: [/sigma\s*=\s*eta\s*\*/, /if\s+eta\s*>\s*0/]},
       },
@@ -297,5 +297,5 @@ def distance_to_data(points: torch.Tensor, data: torch.Tensor) -> torch.Tensor:
 ${SELF_TEST}`,
     },
   },
-  debrief: `The reverse step never asks the network for \`x_{t−1}\` directly. It asks for \`ε̂\`, and the posterior of the forward process does the rest: \`q(x_{t−1} | x_t, x_0)\` is Gaussian with a closed-form mean and the variance step 1 stored as \`posterior_variance\`, and substituting \`x_0 = (x_t − √(1 − ᾱ_t) ε̂) / √ᾱ_t\` into that mean gives \`(x_t − β_t / √(1 − ᾱ_t) · ε̂) / √α_t\`. The noise at \`t = 0\` is skipped because \`posterior_variance[0]\` is 0 by construction and because the last step should output the model's best estimate, not a noisy draw around it. \`torch.no_grad()\` is not decoration: a thousand calls of even a tiny MLP recorded for autograd keep every activation alive, and for an image U-Net that is the difference between sampling and running out of memory. DDIM keeps the trained network and changes only the sampler: the same \`ε̂\` defines an estimate of \`x_0\`, and the update moves to the noise level \`ᾱ_prev\` along the predicted noise direction, with \`eta\` deciding how much fresh noise to add. At \`eta = 0\` the map from \`x_T\` to \`x_0\` is deterministic — which is what lets DDIM skip from 1000 steps to 50, interpolate in latent space and invert an image back to its noise — and at \`steps = T, eta = 1\` it collapses to the DDPM sampler, which the self-test checks to \`1e-3\`. Production samplers go further along the same line: DPM-Solver and UniPC treat the deterministic path as an ODE and solve it with higher-order steps in 10–25 evaluations; Stable Diffusion runs the whole loop in a VAE's latent space, evaluates the U-Net twice per step for classifier-free guidance (\`ε̂ = ε̂_∅ + w · (ε̂_c − ε̂_∅)\`), and is often trained with v-prediction so the target stays well-scaled at both ends of the schedule; \`torch.compile\` or CUDA graphs remove the per-step launch overhead that dominates a loop of small calls.`,
+  debrief: `The reverse step never asks the network for \`x_{t−1}\` directly. It asks for \`ε̂\`, and the posterior of the forward process does the rest: \`q(x_{t−1} | x_t, x_0)\` is Gaussian with a closed-form mean and the variance step 1 stored as \`posterior_variance\`, and substituting \`x_0 = (x_t − √(1 − ᾱ_t) ε̂) / √ᾱ_t\` into that mean gives \`(x_t − β_t / √(1 − ᾱ_t) · ε̂) / √α_t\`. The noise at \`t = 0\` is skipped because the last step should output the model's best estimate, not a noisy draw around it; \`posterior_variance[0]\` is 0 here, but the authors' code clips the log-variance at \`t = 0\` to its \`t = 1\` value, and only the explicit \`t == 0\` mask keeps that noise out. \`torch.no_grad()\` is not decoration: a thousand calls of even a tiny MLP recorded for autograd keep every activation alive, and for an image U-Net that is the difference between sampling and running out of memory. DDIM keeps the trained network and changes only the sampler: the same \`ε̂\` defines an estimate of \`x_0\`, and the update moves to the noise level \`ᾱ_prev\` along the predicted noise direction, with \`eta\` deciding how much fresh noise to add. At \`eta = 0\` the map from \`x_T\` to \`x_0\` is deterministic, which lets DDIM interpolate in latent space and invert an image back to its noise, and it is the setting that degrades least when steps are skipped (Song et al.'s Table 1). At \`steps = T, eta = 1\` it collapses to the DDPM sampler, which the self-test checks to \`1e-3\`. Production samplers go further along the same line: DPM-Solver and UniPC treat the deterministic path as an ODE and solve it with higher-order steps in 10–25 evaluations; Stable Diffusion runs the whole loop in a VAE's latent space and evaluates the U-Net twice per step for classifier-free guidance (\`ε̂ = ε̂_∅ + w · (ε̂_c − ε̂_∅)\`), and its 768-pixel SD 2 models are trained with v-prediction so the target stays well-scaled at both ends of the schedule; \`torch.compile\` or CUDA graphs remove the per-step launch overhead that dominates a loop of small calls.`,
 };

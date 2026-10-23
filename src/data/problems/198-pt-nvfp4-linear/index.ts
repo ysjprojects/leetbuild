@@ -15,7 +15,7 @@ export const ptNvfp4LinearProblem: Problem = {
   id: 'pt-nvfp4-linear',
   title: 'NVFP4 inference: block-scaled GEMM and PTQ',
   tagline:
-    'Multiply two NVFP4 tensors the way a Blackwell tensor core does, wrap it in a calibrated W4A4 linear layer, and quantize a small LM against MXFP4 and INT4 at the same 4.5 bits.',
+    'Multiply two NVFP4 tensors the way a Blackwell tensor core does, wrap it in a calibrated W4A4 linear layer, and quantize a small LM against MXFP4 and INT4 at about 4.5 bits.',
   difficulty: 'medium',
   track: 'dllm',
   language: 'python',
@@ -26,8 +26,8 @@ export const ptNvfp4LinearProblem: Problem = {
 NVFP4 is the 4-bit floating-point format NVIDIA introduced with the Blackwell architecture. Every value
 is an E2M1 number, one of ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}. Every 16 consecutive values along the reduction
 dimension share one FP8 E4M3 scale, and one FP32 scale covers the whole tensor. That is 4.5 bits per value.
-Blackwell tensor cores multiply such operands directly: they form the 4-bit products of a block exactly,
-apply the two block scales to the partial sum and accumulate in FP32. In a modern stack, a post-training
+Blackwell tensor cores multiply such operands directly: each K block's 4-bit products are scaled by the two
+operands' block scales and accumulated in FP32. In a modern stack, a post-training
 quantization tool (NVIDIA Model Optimizer, LLM Compressor) turns a bf16 checkpoint into NVFP4 weights plus
 calibrated activation scales. TensorRT-LLM or vLLM then serve it with the weights and the activations of
 every linear layer in 4 bits (W4A4). NVIDIA reports 1% or less accuracy loss against FP8 on DeepSeek-R1-0528
@@ -70,7 +70,7 @@ with \`float8_e4m3fn\` and \`float8_e8m0fnu\`, CPU only). The first takes about 
   loop to 1e-6. It also proves that it differs from the fp32 product only by quantization error, and that
   the layer stores 4.5 bits per weight.
 - The second proves the orderings it measured: output error NVFP4 < INT4 < MXFP4, and held-out perplexity
-  fp32 < NVFP4 < INT4 < MXFP4 (8.41, 8.96, 9.22, 9.57). Block weights take 216 KiB in NVFP4 against 1,536
+  fp32 < NVFP4 < INT4 < MXFP4 (one run: 8.41, 8.96, 9.22, 9.57). Block weights take 216 KiB in NVFP4 against 1,536
   KiB in fp32.
 
 ## Left out on purpose
@@ -136,7 +136,7 @@ training and training in NVFP4; per-layer format search; checkpoint export.`,
                 label: 'Block scales',
                 sub: 'acc += P · s_x[t, b] · s_w[o, b]',
                 detail:
-                  'The E4M3 scales of the same K block of the input row and the weight row. Their product is exact in fp32; the only rounding is the fp32 accumulation across blocks.',
+                  'The E4M3 scales of the same K block of the input row and the weight row. Their product is exact in fp32; what rounds is the fp32 accumulation across blocks and the final multiply by the global scales.',
               },
             ],
           },
@@ -416,7 +416,7 @@ training and training in NVFP4; per-layer format search; checkpoint export.`,
       url: 'https://docs.nvidia.com/cutlass/latest/media/docs/cpp/blackwell_functionality.html',
       venue: 'NVIDIA CUTLASS Documentation',
       takes:
-        'The block-scaled GEMM `nvfp4_matmul` computes, `D = C + Σ_k (A · SFA[i, k/SV]) (B · SFB[j, k/SV])`, with `SV = 16` and E4M3 scales for `nv_float4_t`, 32 and E8M0 for `mx_float4_t`.',
+        'The block-scaled GEMM `nvfp4_matmul` computes, `D = C + Σ_k (A[i, k] · SFA[i, k/SV]) · (B[j, k] · SFB[j, k/SV])`, with `SV = 16` and unsigned E4M3 (`float_ue4m3_t`) scales for `nv_float4_t`, 32 and E8M0 for `mx_float4_t`.',
     },
   ],
   steps: [nvfp4GemmStep, nvfp4PtqStep],

@@ -39,8 +39,9 @@ in one preallocated pool, and a **block table** per sequence that maps its logic
 ones, as a page table maps pages to frames. Paging ends the fragmentation of per-request contiguous
 reservations, so more sequences fit in a batch; the cost is that attention can no longer read a
 sequence's keys as one array. Three kernels pay it, between the scheduler (which hands out slots and
-block tables) and the attention layer, at every decode step of vLLM's original CUDA backend; newer
-backends pass the same block tables to FlashAttention or FlashInfer kernels.
+block tables) and the attention layer, at every decode step of vLLM's original CUDA backend. Newer
+backends pass the same block tables to FlashAttention or FlashInfer kernels, and vLLM deleted its two
+PagedAttention kernels in July 2026 (v0.25); \`reshape_and_cache\` remains.
 
 You write the three in CUDA C++ 12, in float, for Llama-3 8B's attention shape (32 query heads, 8 KV
 heads, head size 128), with blocks of 16 tokens and 128 threads per attention block. Each file is a
@@ -103,7 +104,8 @@ the CPU reference.
 fp16, bf16 and fp8 KV storage and their scales; vLLM's \`x\`-split K layout and transposed V; the block
 manager itself (allocation, freeing, reference counts, copy-on-write, prefix caching); attention over
 paged KV during prefill; ALiBi, sliding-window and block-sparse masks; several queries per sequence, as
-speculative decoding needs; tensor cores (one query is a matrix-vector product); CUDA graphs; ROCm.`,
+speculative decoding needs; tensor cores (one query per head is a matrix-vector product; FlashInfer puts a
+GQA group's query heads on them); CUDA graphs; ROCm.`,
   figures: [
     {
       title: 'Writing new tokens into their slots',
@@ -300,7 +302,7 @@ speculative decoding needs; tensor cores (one query is a matrix-vector product);
                     tone: 'shared',
                     marks: [{rows: [4, 4], cols: [6, 15], tone: 'muted', label: 'past seq_len'}],
                     detail:
-                      'Dynamic shared memory, `⌈70 / 16⌉ × 16 × 4 = 320` bytes here. Scores first, then `__expf(logit − qk_max)` in place. Slots 70 … 79 of the last block are never stored or read.',
+                      '`⌈70 / 16⌉ × 16 = 80` floats (320 bytes) of the dynamic shared memory, which the host sizes for the batch’s longest sequence. Scores first, then `__expf(logit − qk_max)` in place. Slots 70 … 79 of the last block are never stored or read.',
                   },
                   {
                     id: 'v1-red',
@@ -364,7 +366,7 @@ speculative decoding needs; tensor cores (one query is a matrix-vector product);
               {
                 id: 'v1-out',
                 array: 'out [8][32][128]',
-                sub: 'a row = one sequence',
+                sub: 'a row = one sequence · a cell = 4 heads',
                 cols: 8,
                 rows: 8,
                 marks: [{rows: [1, 1], cols: [1, 1], tone: 'b', label: 'head 5'}],
@@ -478,7 +480,7 @@ speculative decoding needs; tensor cores (one query is a matrix-vector product);
                 array: 'out[128]',
                 sub: 'one row per (seq, head)',
                 cols: 16,
-                marks: [{cols: [0, 15], tone: 'register', label: 'written once'}],
+                marks: [{cols: [0, 15], tone: 'b', label: 'written once'}],
                 detail:
                   '`out[i] = Σ_p tmp_out[p][i] × weights[p] / Σ_p weights[p]`: exactly v1’s answer, up to float rounding.',
               },
@@ -487,7 +489,7 @@ speculative decoding needs; tensor cores (one query is a matrix-vector product);
           {
             id: 'v2-reduce',
             label: 'paged_attention_v2_reduce',
-            sub: '<<<(32, 1), 128>>> · 48 B of shared memory',
+            sub: '<<<(32, 1), 128>>> · weights: 48 B of shared memory',
             count: '32 blocks',
             layout: 'row',
             align: 'end',
@@ -509,10 +511,10 @@ speculative decoding needs; tensor cores (one query is a matrix-vector product);
           },
         ],
         arrows: [
-          {from: 'v2-p0', to: 'v2-hbm', label: 'm_0, l_0, o_0'},
-          {from: 'v2-plast', to: 'v2-hbm', label: 'm_11, l_11, o_11'},
+          {from: 'v2-p0', to: 'v2-hbm', label: 'm_0, l_0, o_0 / l_0'},
+          {from: 'v2-plast', to: 'v2-hbm', label: 'm_11, l_11, o_11 / l_11'},
           {from: 'v2-sums', to: 'v2-weights', label: 'm_p, l_p'},
-          {from: 'v2-reduce', to: 'v2-out', label: 'Σ w_p o_p / Σ w_p'},
+          {from: 'v2-reduce', to: 'v2-out', label: 'Σ w_p (o_p / l_p) / Σ w_p'},
         ],
       },
     },
@@ -546,7 +548,7 @@ speculative decoding needs; tensor cores (one query is a matrix-vector product);
       date: '2023-02-09',
       venue: 'GitHub',
       takes:
-        '`reshape_and_cache` in `csrc/cache_kernels.cu`, and `paged_attention_v1`, `paged_attention_v2` and `paged_attention_v2_reduce` in `csrc/attention/` with `PARTITION_SIZE = 512` and the v1/v2 heuristic, rebuilt here in float.',
+        '`reshape_and_cache` in `csrc/cache_kernels.cu`, and `paged_attention_v1`, `paged_attention_v2` and `paged_attention_v2_reduce` in `csrc/attention/` (deleted in v0.25) with `PARTITION_SIZE = 512` and the v1/v2 heuristic, rebuilt here in float.',
     },
     {
       kind: 'post',

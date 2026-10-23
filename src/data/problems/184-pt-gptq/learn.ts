@@ -79,6 +79,10 @@ code  = clamp(round(w / scale) + zero, 0, 15)  stored as an integer
 | 128 | 24 / 128 | 4.1875 |
 | whole row of 4,096 | 24 / 4,096 | 4.006 |
 
+AutoGPTQ checkpoints pack the zero point into 4 bits too, so they store \`4 + 20/128 = 4.156\` bits per
+weight at g = 128. The paper's "about 0.15 extra bits" for g = 128 at 3 bits matches \`(16 + 3)/128 = 0.148\`:
+an fp16 scale and a 3-bit zero point, the layout it spells out for its 2-bit groups.
+
 The step is set by the extremes, so the error of every other weight grows with the group's range.
 Move the sliders: a larger group almost always has a wider range and therefore coarser levels, and each
 bit removed doubles the step. The toggle is the subject of the rest of this guide.
@@ -92,10 +96,10 @@ errors of neighbouring weights add up on the output instead of averaging out.
 :::quiz
 Q: A group of 128 weights lies in [−0.05, 0.05] except one weight of 0.8. What does that weight do to round-to-nearest at 4 bits?
 - [ ] Nothing: it is rounded like any other weight and only its own error grows
-- [x] The step becomes about 0.057, larger than the range of the other 127 weights, so most of them round to a level or two around 0
+- [x] The step becomes about 0.057, more than the magnitude of any other weight, so all 127 of them round to −s, 0 or +s
 - [ ] The zero point overflows and the group cannot be stored
 > The scale is (0.8 + 0.05) / 15 ≈ 0.057: the other weights all lie within one step of 0 and collapse
-> onto two or three codes. Smaller groups confine the damage; activation-aware methods such as AWQ
+> onto at most three codes. Smaller groups confine the damage; activation-aware methods such as AWQ
 > rescale the important channels before quantizing.
 :::
 
@@ -133,7 +137,7 @@ for one call it materialises the float weight. The speed comes from kernels that
 | implementation | weight bytes read per decode step (7B) | where dequantization happens |
 |---|---|---|
 | fp16 \`nn.Linear\` | about 14 GB | nowhere |
-| dequantize, then matmul (this project) | 3.7 GB read, 14 GB written and read again | a separate pass in memory |
+| dequantize, then matmul (this project's \`forward\`) | 3.7 GB read, 14 GB of fp16 weight written and read again | a separate pass in memory |
 | fused W4A16 kernel (ExLlama, Marlin) | about 3.7 GB | in registers, per tile, before the tensor-core MMA |
 
 At batch size 1 a decoder step multiplies each weight once per token, so its time is the time to
@@ -143,13 +147,12 @@ batch sizes the matmuls become compute bound and the dequantization is overhead,
 with fp16 at small batches and warns about slowdowns at larger ones.
 
 :::quiz
-Q: Why does \`QuantLinear\` store its codes, scales and zeros as buffers rather than parameters?
-- [ ] Buffers are stored in fp16 automatically
-- [x] They are state that must move with the module and be saved in the \`state_dict\`, but no optimizer should ever update them
-- [ ] \`nn.Parameter\` cannot hold integer tensors, and that is the only reason
-> Integer codes have no gradient, and a quantized layer is not trained further (adapters such as LoRA
-> are trained beside it). Buffers follow \`.to(device)\` and serialisation like parameters do, and stay
-> invisible to \`model.parameters()\`.
+Q: At batch size 1, why does the project's \`QuantLinear\` save memory but not decode time?
+- [ ] Unpacking nibbles costs more arithmetic than the matmul itself
+- [x] It writes the dequantized float weight to memory and reads it back for the matmul, so the matmul streams at least as many bytes as an fp16 layer
+- [ ] A decode step at batch size 1 is compute bound, so fewer weight bytes cannot help
+> A decode step is memory bound: its time is the bytes it moves. Only a kernel that dequantizes in
+> registers, tile by tile, keeps the weight at 4 bits all the way from HBM to the tensor cores.
 :::
 
 # The layer objective and its Hessian
@@ -172,9 +175,9 @@ Three properties make this tractable:
   a running average \`H ← H · m/(m + n) + (2/(m + n)) Σ x xᵀ\` in float32 never grows with the
   calibration size. The paper uses 128 random segments of 2,048 tokens from C4.
 
-\`H\` must be inverted, and two things break that. An input feature that is always 0 (a dead ReLU unit,
-padding) gives a zero row and column; and thousands of tokens of a 4,096-wide layer are close to rank
-deficient. The fixes, and what happens without them:
+\`H\` must be inverted, and two things break that. An input feature that is always 0 (a ReLU unit that
+never fires) gives a zero row and column; and real activations are so correlated that \`H\` of a
+4,096-wide layer is badly conditioned. The fixes, and what happens without them:
 
 | situation | without the fix | with it |
 |---|---|---|
@@ -266,15 +269,19 @@ for i1 in range(0, d_col, 128):
 | cost, \`d_row = d_col = 4,096\` | about \`d⁴\` = 2.8 × 10¹⁴ | about \`d³\` = 6.9 × 10¹⁰ | the same FLOPs, as matmuls |
 | update of later columns | rank 1 per weight | rank 1 per column, memory bound | rank 128 per block, compute bound |
 
-The lazy batch only regroups additions, so it gives the same codes as updating everything after every
-column; the self-test checks that block sizes 32 and 128 agree, and that the fast solver agrees with a
-slow float64 version that applies the OBS update and the explicit downdate one column at a time.
+The lazy batch only regroups additions, so it gives the same codes, up to float rounding, as updating
+everything after every column; the self-test checks that block sizes 32 and 128 agree, and that the
+fast solver agrees with a slow float64 version that applies the OBS update and the explicit downdate
+one column at a time.
 
 There is one subtlety with groups. A group's grid is chosen at its first column, from the weights as
-they are **then**, after the earlier columns have pushed their errors onto them. A grid fixed from the
-original weights would miss values the updates pushed outside it. The reference's \`--act-order\`
-option quantizes columns by decreasing \`diag(H)\` instead, the most sensitive inputs first while the
-most columns remain to absorb their error, and \`--static-groups\` then fixes all grids up front so that
+they are **then**, after the earlier columns have pushed their errors onto them: the paper uses "the
+most current updated weights". A grid fixed from the original weights would miss values the updates
+pushed outside it. The reference code reads the grid from \`W\`, which inside a block still lacks the
+block's own updates; that matches the paper only when each group starts a block (g = 128 with blocks
+of 128), so \`gptq_quantize\` reads \`W1\`. The reference's \`--act-order\` option quantizes columns by
+decreasing \`diag(H)\` instead, the most sensitive inputs first while the most columns remain to absorb
+their error, and \`--static-groups\` then fixes all grids up front so that
 the groups stay contiguous in memory.
 
 :::quiz
@@ -324,7 +331,7 @@ calibration tokens), one run printed:
 | round to nearest, 4 bits, g = 128 | 201 KiB | 8.445 | 0.304 |
 | GPTQ, 4 bits, g = 128 | 201 KiB | 8.285 | 0.143 |
 
-GPTQ keeps about half of what rounding loses on this tiny model. On large models the gap is far wider.
+GPTQ loses about half of what rounding loses on this tiny model. On large models the gap is far wider.
 On WikiText-2 the paper reports for OPT-175B:
 
 | OPT-175B | bits | WikiText-2 perplexity |
@@ -336,9 +343,9 @@ On WikiText-2 the paper reports for OPT-175B:
 | GPTQ | 3 | 8.68 |
 
 The order matters less on a two-block model: calibrating every layer on the float model's activations
-instead lands within 0.02 perplexity of the sequential pass here. The paper finds that the sequential
-pass brings noticeable improvements at negligible extra cost on its large models, where many more
-layers of error accumulate below the last ones.
+instead lands within 0.02 perplexity of the sequential pass here (one run: 8.272 against 8.285). The
+paper finds that the sequential pass brings noticeable improvements at negligible extra cost on its
+large models, where many more layers of error accumulate below the last ones.
 
 What production adds around the same loop: [AutoGPTQ](https://github.com/AutoGPTQ/AutoGPTQ) and its
 successor GPTQModel wrap it for every \`transformers\` architecture, with act-order, symmetric or
@@ -360,7 +367,7 @@ Q: Why does the quantization loop run each layer again after quantizing it?
 
 # What to take away
 
-- **Objective**: GPTQ minimises the layer's output error \`‖WX − ŴX‖²\`, not the weights' error; on
+- **Objective**: GPTQ minimises the layer's output error \`‖WXᵀ − ŴXᵀ‖²\`, not the weights' error; on
   correlated inputs the two disagree, and the output is what the model uses.
 - **Hessian**: that error is \`tr(ΔW H ΔWᵀ)\` with \`H = (2/n) XᵀX\`, one matrix per layer shared by all
   rows, collected by a hook and made invertible by dead-column handling and 1% damping.

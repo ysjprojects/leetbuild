@@ -4,9 +4,9 @@ import {learn} from './learn';
 import {fusedGeluStep} from './steps/1-fused-gelu';
 
 /**
- * Drill: the bias add and the GELU of a transformer MLP fused into one memory-bound kernel — one
+ * Drill: the bias add and the GELU of a transformer MLP fused into one memory-bound kernel (one
  * 16-byte float4 load of the activation, one of the bias, four tanh-approximation GELUs, one
- * 16-byte store — plus a scalar kernel for the n % 4 tail, __restrict__ pointers, and a self-test
+ * 16-byte store), plus a scalar kernel for the n % 4 tail, __restrict__ pointers, and a self-test
  * that reports GB/s against a double-precision CPU reference.
  */
 export const cudaFusedGeluProblem: Problem = {
@@ -23,24 +23,24 @@ export const cudaFusedGeluProblem: Problem = {
 
 Every transformer MLP is \`W₂ · gelu(W₁x + b₁) + b₂\`, and between the two matrix multiplies sits an
 elementwise step: add the bias, apply the GELU. GPT-2 and BERT use the **tanh approximation** of GELU from
-Hendrycks & Gimpel, \`0.5 v (1 + tanh(√(2/π) (v + 0.044715 v³)))\`. In eager PyTorch that step is two kernels —
-\`x + b\` and \`F.gelu(..., approximate="tanh")\` — and each reads and writes the whole activation through HBM.
-The arithmetic is a dozen instructions per element; the bytes are what cost. This drill writes the step the
+Hendrycks & Gimpel, \`0.5 v (1 + tanh(√(2/π) (v + 0.044715 v³)))\`. Written as \`x + b\` and then
+\`F.gelu(..., approximate="tanh")\`, eager PyTorch runs that step as two kernels, and each reads and writes the
+whole activation through HBM. The arithmetic is about 20 FLOPs per element; the bytes are what cost. This drill writes the step the
 way \`torch.compile\` and the fused-epilogue libraries do: one pass, the bias added in registers, sixteen bytes
 per load.
 
 The surface is one file, \`fused_gelu.cu\`, compiled with \`nvcc\`:
 
-- \`__device__ __forceinline__ float gelu_tanh(float v)\` — \`0.5f * v * (1.0f + tanhf(0.79788456f * (v + 0.044715f * v * v * v)))\`,
+- \`__device__ __forceinline__ float gelu_tanh(float v)\`: \`0.5f * v * (1.0f + tanhf(0.79788456f * (v + 0.044715f * v * v * v)))\`,
   single precision throughout.
-- \`__global__ void gelu_bias_kernel(const float4* __restrict__ x, const float4* __restrict__ bias, float4* __restrict__ y, int n4, int cols4)\`
-  — one thread per \`float4\`: one load of \`x[i]\`, one of \`bias[i % cols4]\`, four \`gelu_tanh\` calls, one store.
-- \`__global__ void gelu_bias_tail_kernel(const float* __restrict__ x, const float* __restrict__ bias, float* __restrict__ y, int start, int n, int cols)\`
-  — the scalar version for the last \`n % 4\` elements.
-- \`void gelu_bias(const float* x, const float* bias, float* y, int n, int cols)\` — \`n4 = n / 4\`, the vector
+- \`__global__ void gelu_bias_kernel(const float4* __restrict__ x, const float4* __restrict__ bias, float4* __restrict__ y, int n4, int cols4)\`:
+  one thread per \`float4\`, one load of \`x[i]\`, one of \`bias[i % cols4]\`, four \`gelu_tanh\` calls, one store.
+- \`__global__ void gelu_bias_tail_kernel(const float* __restrict__ x, const float* __restrict__ bias, float* __restrict__ y, int start, int n, int cols)\`:
+  the scalar version for the last \`n % 4\` elements.
+- \`void gelu_bias(const float* x, const float* bias, float* y, int n, int cols)\`: \`n4 = n / 4\`, the vector
   launch over \`reinterpret_cast\` buffers (256 threads per block), the tail launch when \`n % 4 > 0\`,
   \`cudaGetLastError()\` after each. Precondition: \`cols % 4 == 0\` and \`cudaMalloc\`'d pointers.
-- \`main\` — \`n = 4096 × 3072\` (GPT-2 small's MLP activation: 4096 tokens, \`4 × d_model = 3072\` columns)
+- \`main\`: \`n = 4096 × 3072\` (GPT-2 small's MLP activation: 4096 tokens, \`4 × d_model = 3072\` columns)
   timed over 20 launches, then \`n = 1,000,003\` (a tail of 3); both against a double-precision CPU reference,
   max abs error below \`1e-5\`, \`PASS\`.
 
@@ -64,7 +64,7 @@ n=1000003 cols=3072  max abs err 4.77e-07
 PASS
 \`\`\`
 
-The bandwidth depends on the GPU — compare it with the card's peak HBM/GDDR bandwidth (about 3.35 TB/s on an
+The bandwidth depends on the GPU: compare it with the card's peak HBM/GDDR bandwidth (about 3.35 TB/s on an
 H100 SXM, 1 TB/s on an RTX 4090, a few hundred GB/s on a laptop part); a good elementwise kernel reaches
 80–90 % of it. The error is a few float ulps. The starter prints \`FAIL\` with a max abs error near 4, because
 \`y\` comes back as the zeros it was filled with.
@@ -177,7 +177,7 @@ emits when it cannot reach into the matmul.`,
                 count: '3,145,728 threads',
                 layout: 'column',
                 detail:
-                  'One thread per `float4`; it returns at once when `i >= n4`. `__restrict__` on all three pointers lets the compiler issue both 16-byte loads before any arithmetic.',
+                  'One thread per `float4`; it returns at once when `i >= n4`. `const __restrict__` on `x` and `bias` lets the compiler load them through the read-only data path.',
                 items: [
                   {
                     id: 'regs',
@@ -403,10 +403,10 @@ emits when it cannot reach into the matmul.`,
       title: 'Roofline: an insightful visual performance model for multicore architectures',
       url: 'https://dl.acm.org/doi/10.1145/1498765.1498785',
       by: 'Samuel Williams, Andrew Waterman and David Patterson',
-      date: '2009-04-01',
+      date: '2009-04',
       venue: 'Communications of the ACM',
       takes:
-        'Arithmetic intensity: a dozen FLOPs per 8 bytes moved puts GELU far left of the ridge point, so fusing the bias add to save a round trip through HBM is the whole speedup.',
+        'Arithmetic intensity: about 20 FLOPs per 8 bytes moved puts GELU far left of the ridge point, so fusing the bias add to save a round trip through HBM is the whole speedup.',
     },
     {
       kind: 'post',

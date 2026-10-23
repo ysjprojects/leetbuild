@@ -7,7 +7,7 @@ import {blellochScanStep} from './steps/1-blelloch-scan';
 const TILE_CELLS = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '…', '976'];
 
 /**
- * Drill: a work-efficient (Blelloch) exclusive scan of any length — an up-sweep and a down-sweep
+ * Drill: a work-efficient (Blelloch) exclusive scan of any length: an up-sweep and a down-sweep
  * over a bank-conflict-free shared tile per block, the block totals scanned recursively and added
  * back, an inclusive variant on top, a CPU reference and PASS. The kernel behind MoE expert offsets,
  * cu_seqlens and stream compaction.
@@ -28,24 +28,24 @@ A **prefix sum** (scan) turns \`[3, 1, 7, 0, 4]\` into \`[0, 3, 4, 11, 11]\` (ex
 \`[3, 4, 11, 11, 15]\` (inclusive). It is the primitive that turns counts into offsets, and a GPU model
 stack runs it everywhere: the token-to-expert offsets a mixture-of-experts layer scatters by, the
 \`cu_seqlens\` of a variable-length FlashAttention batch, the compaction of kept tokens in a sampling
-loop, radix sort, \`torch.cumsum\`. It looks sequential — every output depends on every input before it —
+loop, radix sort, \`torch.cumsum\`. It looks sequential (every output depends on every input before it),
 but addition is associative, so two trees over the array do it in 2·log₂n parallel levels and 2n adds.
-This drill writes the GPU Gems 3 version of that scan, extended to any length.
+This drill writes the GPU Gems 3 version of that scan, block sums and all.
 
 The surface is one file, \`prefix_scan.cu\`, compiled with \`nvcc\`. \`BLOCK_THREADS = 512\` and
 \`ELEMS_PER_BLOCK = 2 * BLOCK_THREADS = 1024\` are given:
 
-- \`__global__ void scan_block(const int* in, int* out, int* block_sums, int n)\` — one block scans 1024
+- \`__global__ void scan_block(const int* in, int* out, int* block_sums, int n)\`: one block scans 1024
   consecutive \`int\`s (zero past \`n\`) in a padded \`__shared__\` tile: up-sweep, the root saved to
   \`block_sums[blockIdx.x]\` (unless \`nullptr\`) and cleared, down-sweep, guarded store. Shared indices go
   through \`CONFLICT_FREE_OFFSET(i) = i >> LOG_NUM_BANKS\` with \`LOG_NUM_BANKS = 5\`.
-- \`__global__ void add_block_offsets(int* out, const int* offsets, int n)\` — adds the scanned total of the
+- \`__global__ void add_block_offsets(int* out, const int* offsets, int n)\`: adds the scanned total of the
   blocks before it to every element of block \`b\`.
-- \`__global__ void to_inclusive(const int* in, const int* excl, int* incl, int n)\` — \`incl[i] = excl[i] + in[i]\`.
-- \`static void exclusive_scan(const int* d_in, int* d_out, int n)\` — one \`scan_block\` launch when
+- \`__global__ void to_inclusive(const int* in, const int* excl, int* incl, int n)\`: \`incl[i] = excl[i] + in[i]\`.
+- \`static void exclusive_scan(const int* d_in, int* d_out, int n)\`: one \`scan_block\` launch when
   \`n ≤ 1024\`; otherwise \`scan_block\` over \`⌈n / 1024⌉\` blocks, \`exclusive_scan\` of the block sums by
   calling itself, then \`add_block_offsets\`. \`LAUNCH_CHECK()\` after every launch.
-- \`main\` (given) — \`n = 1, 1023, 1024, 1000003\` against a CPU loop for both variants, the max abs error
+- \`main\` (given): \`n = 1, 1023, 1024, 1000003\` against a CPU loop for both variants, the max abs error
   (must be 0), the \`cudaEvent\` time of each exclusive scan, \`PASS\`.
 
 ## What you build here
@@ -70,7 +70,7 @@ n=1000003  blocks=977  max abs error 0  exclusive scan 0.110 ms  (72.7 GB/s)
 PASS
 \`\`\`
 
-The times depend on the GPU and include the \`cudaMalloc\`/\`cudaFree\` of the block sums; the error is
+The times depend on the GPU, and the multi-block one includes the \`cudaMalloc\`/\`cudaFree\` of the block sums; the error is
 exactly 0 because integer addition is associative and the inputs are small enough never to overflow. The
 starter prints \`FAIL\`: \`d_out\` comes back as the zeros it was set to.
 
@@ -145,7 +145,7 @@ segmented scans, operators other than \`+\`, 64-bit sums and \`n\` beyond \`int\
                 cells: TILE_CELLS,
                 marks: [
                   {cols: [2, 2], tone: 'shared', label: 'tile 2'},
-                  {cols: [11, 11], tone: 'bad', label: '579'},
+                  {cols: [11, 11], tone: 'muted', label: '579'},
                 ],
                 detail:
                   'Block `b` loads elements `b · 1024 … b · 1024 + 1023`. The last tile holds only 579 elements; its block loads zeros past `n`, the identity of `+`, and guards its stores.',
@@ -240,8 +240,8 @@ segmented scans, operators other than \`+\`, 64-bit sums and \`n\` beyond \`int\
                 cols: TILE_CELLS.length,
                 cells: TILE_CELLS,
                 marks: [
-                  {cols: [0, 0], tone: 'register', label: 's0'},
-                  {cols: [1, 1], tone: 'register', label: 's1'},
+                  {cols: [0, 0], tone: 'a', label: 's0'},
+                  {cols: [1, 1], tone: 'a', label: 's1'},
                 ],
                 detail: '`block_sums[b]`, written `s_b` here, is the total of tile `b`: the root of its up-sweep.',
               },
@@ -251,7 +251,7 @@ segmented scans, operators other than \`+\`, 64-bit sums and \`n\` beyond \`int\
                 sub: 'scan of the sums',
                 cols: TILE_CELLS.length,
                 cells: TILE_CELLS,
-                marks: [{cols: [2, 2], tone: 'register', label: 's0 + s1'}],
+                marks: [{cols: [2, 2], tone: 'a', label: 's0 + s1'}],
                 detail:
                   '`offsets[b] = s0 + … + s(b − 1)`: the total of every tile before `b`, the carry tile `b` is missing.',
               },
@@ -261,7 +261,7 @@ segmented scans, operators other than \`+\`, 64-bit sums and \`n\` beyond \`int\
                 sub: 'after launch 3 · final',
                 cols: TILE_CELLS.length,
                 cells: TILE_CELLS,
-                marks: [{cols: [2, 2], tone: 'register', label: '+ (s0 + s1)'}],
+                marks: [{cols: [2, 2], tone: 'a', label: '+ (s0 + s1)'}],
                 detail:
                   'The exclusive scan of the whole array. About `4n` ints of traffic in all: `scan_block` reads and writes `n`, `add_block_offsets` does it again.',
               },
@@ -310,7 +310,7 @@ segmented scans, operators other than \`+\`, 64-bit sums and \`n\` beyond \`int\
       date: '2016-03',
       venue: 'NVIDIA technical report NVR-2016-002',
       takes:
-        'What replaces the recursive carry of `exclusive_scan` in production: one pass in which each block looks back at its predecessors’ published aggregates, about 2n data movement instead of 3n.',
+        'What replaces the recursive carry of `exclusive_scan` in production: one pass in which each block looks back at its predecessors’ published aggregates, about 2n words of traffic instead of the ~4n of this scan-then-propagate.',
     },
     {
       kind: 'code',

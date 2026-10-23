@@ -140,7 +140,7 @@ const SELF_TEST = `if __name__ == "__main__":
     print("PASS")
 `;
 
-const HEADER = `"""LoRA: low-rank adapters on frozen linear layers — zero-init, scaled forward, merge/unmerge, adapter-only training."""
+const HEADER = `"""LoRA: low-rank adapters on frozen linear layers: zero-init, scaled forward, merge/unmerge, adapter-only training."""
 
 import copy
 import math
@@ -176,11 +176,11 @@ can be folded into the weight for inference and unfolded again.
   \`unmerge()\` must return \`base.weight\` to its original values within \`1e-12\`.
 - \`apply_lora(model, target_names, r, alpha, dropout=0.0)\`: walk \`model.named_modules()\`, and for every
   \`nn.Linear\` whose attribute name (the last dotted component, e.g. \`q_proj\`) is in \`target_names\`,
-  \`setattr\` a \`LoRALinear\` wrapping *that same module* onto its parent — **in place**, no copy of the model,
+  \`setattr\` a \`LoRALinear\` wrapping *that same module* onto its parent, **in place**: no copy of the model,
   no re-initialised weights. Return \`model\`.
 - \`mark_only_lora_trainable(model)\`: set \`requires_grad\` to \`True\` on every parameter whose name contains
   \`lora_\` and \`False\` on every other; return the number of trainable scalars.
-- \`lora_state_dict(model)\`: the entries of \`model.state_dict()\` whose key contains \`lora_\` — the adapter
+- \`lora_state_dict(model)\`: the entries of \`model.state_dict()\` whose key contains \`lora_\`, i.e. the adapter
   checkpoint, loadable with \`load_state_dict(…, strict=False)\` into a freshly \`apply_lora\`'d copy of the
   base model.
 - No \`peft\`, no \`loralib\`; \`torch\` only.
@@ -197,12 +197,12 @@ transformer with \`r = 4\` trains \`4096\` of \`462336\` parameters (0.89 %, mus
 reproduces the adapted model; merged whole-model inference matches within \`1e-5\`. It prints \`PASS\`.
 
 > Fine-tuning a layer is adding a matrix to its weight. LoRA bets that matrix is low-rank, writes it as
-> \`B @ A\` with \`B = 0\` at the start, trains only \`A\` and \`B\`, and folds them into \`W\` when training ends —
+> \`B @ A\` with \`B = 0\` at the start, trains only \`A\` and \`B\`, and folds them into \`W\` when training ends,
 > so training touches 1 % of the parameters and inference pays nothing.`,
   hints: [
     'The adapter is two small parameters next to the frozen layer: `lora_A` of shape `(r, in)` with a Kaiming init and `lora_B` of shape `(out, r)` all zeros, so `x @ A.T @ B.T` is zero at step 0 and the wrapped layer answers exactly what the original did. `base.requires_grad_(False)` freezes both weight and bias in one call.',
-    'Forward is `base(x) + (dropout(x) @ lora_A.T @ lora_B.T) * scaling` — two thin matmuls `(…, in) → (…, r) → (…, out)`. `merge()` is the dense version of the same product: `base.weight += (lora_B @ lora_A) * scaling` under `torch.no_grad()`, guarded by a `merged` flag so it cannot be applied twice; `unmerge()` subtracts it.',
-    'To replace a submodule in place, collect `(name, module)` pairs from `named_modules()` first, then for each `name.rpartition(".")` gives the parent path and the attribute: `setattr(model.get_submodule(parent_path), attr, LoRALinear(module, r, alpha, dropout))`. Parameter names then look like `blocks.0.q_proj.lora_A`, so `"lora_" in name` picks out the adapters for `requires_grad_` and for the state dict.',
+    'Forward is `base(x) + (dropout(x) @ lora_A.T @ lora_B.T) * scaling`: two thin matmuls `(…, in) → (…, r) → (…, out)`. `merge()` is the dense version of the same product, `base.weight += (lora_B @ lora_A) * scaling` under `torch.no_grad()`, guarded by a `merged` flag so it cannot be applied twice; `unmerge()` subtracts it.',
+    'Finish the walk before you mutate: collect the `(name, module)` hits from `named_modules()` first, then resolve each parent from `name.rpartition(".")` with `get_submodule` and `setattr` the wrapper onto it. The new parameter names (`blocks.0.q_proj.lora_A`) carry `"lora_"`, which is all `mark_only_lora_trainable` and `lora_state_dict` need to filter on.',
   ],
   checks: [
     {
@@ -232,7 +232,7 @@ reproduces the adapted model; merged whole-model inference matches within \`1e-5
       id: 'scaled-low-rank-forward',
       title: 'forward adds dropout(x) @ Aᵀ @ Bᵀ scaled by alpha / r, A first',
       detail:
-        '`self.scaling = alpha / r` and the forward path multiplies through `lora_A` then `lora_B` on the activations — two thin matmuls — never forming `lora_B @ lora_A` (or calling `delta_weight()`) inside `forward`.',
+        '`self.scaling = alpha / r` and the forward path multiplies through `lora_A` then `lora_B` on the activations (two thin matmuls), never forming `lora_B @ lora_A` (or calling `delta_weight()`) inside `forward`.',
       match: {
         python: {
           all: [
@@ -281,7 +281,7 @@ reproduces the adapted model; merged whole-model inference matches within \`1e-5
       id: 'apply-in-place',
       title: 'apply_lora swaps the named nn.Linear modules in place',
       detail:
-        '`apply_lora` walks `model.named_modules()`, matches `nn.Linear` instances by attribute name, and `setattr`s a `LoRALinear(module, r, alpha, …)` wrapping that same module onto its parent — the model’s weights are untouched and `k_proj` stays a plain `nn.Linear`.',
+        '`apply_lora` walks `model.named_modules()`, matches `nn.Linear` instances by attribute name, and `setattr`s a `LoRALinear(module, r, alpha, …)` wrapping that same module onto its parent: the model’s weights are untouched and `k_proj` stays a plain `nn.Linear`.',
       match: {
         python: {
           all: [
@@ -357,7 +357,7 @@ def mark_only_lora_trainable(model: nn.Module) -> int:
 
 
 def lora_state_dict(model: nn.Module) -> dict:
-    """Only the adapter tensors — what a LoRA checkpoint ships."""
+    """Only the adapter tensors: what a LoRA checkpoint ships."""
     raise NotImplementedError("TODO")
 
 
@@ -441,7 +441,7 @@ def mark_only_lora_trainable(model: nn.Module) -> int:
 
 
 def lora_state_dict(model: nn.Module) -> dict:
-    """Only the adapter tensors — what a LoRA checkpoint ships."""
+    """Only the adapter tensors: what a LoRA checkpoint ships."""
     return {k: v.detach().clone() for k, v in model.state_dict().items() if "lora_" in k}
 
 
@@ -450,5 +450,5 @@ ${TINY_TRANSFORMER}
 ${SELF_TEST}`,
     },
   },
-  debrief: `The whole design follows from one equation: a fine-tuned weight is \`W + ΔW\`, and LoRA writes \`ΔW = B @ A · alpha / r\` with \`A\` of shape \`(r, in)\` and \`B\` of shape \`(out, r)\`. Three consequences shape the code. **Zero-init \`B\`** makes the adapter the identity at step 0 — the model starts exactly where pre-training left it, and \`A\`'s Kaiming init is what gives \`B\` a well-scaled first gradient (two zero matrices would never move, because \`∂L/∂A ∝ B\` and \`∂L/∂B ∝ A\`). **The forward path never forms \`ΔW\`**: \`x @ A.T\` is \`(…, r)\`, then \`@ B.T\` is \`(…, out)\` — \`r · (in + out)\` multiply-adds per token instead of \`in · out\`, and the only extra memory is the two small matrices plus their Adam moments, which is why a 7B model adapts on one 24 GB card while full fine-tuning needs 16 bytes per parameter. **Merging is exact**: because \`ΔW\` is a plain matrix, \`W += ΔW\` under \`no_grad\` turns the adapted layer back into a single \`nn.Linear\` with zero inference overhead, and \`W -= ΔW\` returns it (float64 to \`1e-12\`, float32 to a few ulps — which is why production merges happen once, in the checkpoint, not on every request). The surgery is done **in place** by \`setattr\` on the parent module so the base weights are the base weights — reused across adapters, never re-initialised — and the parameter names (\`blocks.0.q_proj.lora_A\`) carry the \`lora_\` substring that selects what trains and what ships: an adapter checkpoint for a 7B model is tens of megabytes, not 14 GB. What frameworks add: Hugging Face PEFT wraps exactly this (\`LoraConfig(r, lora_alpha, lora_dropout, target_modules)\`, \`merge_and_unload()\`), QLoRA keeps the frozen base in 4-bit NF4 and dequantises on the fly so \`W\` costs half a byte per weight, rsLoRA scales by \`alpha / sqrt(r)\` so large ranks train stably, DoRA splits the update into magnitude and direction, and serving systems (S-LoRA, Punica, vLLM's multi-LoRA) keep one base model resident and batch requests across hundreds of unmerged adapters with a custom gather-matmul kernel — the one case where *not* merging is the point.`,
+  debrief: `The whole design follows from one equation: a fine-tuned weight is \`W + ΔW\`, and LoRA writes \`ΔW = B @ A · alpha / r\` with \`A\` of shape \`(r, in)\` and \`B\` of shape \`(out, r)\`. Three consequences shape the code. **Zero-init \`B\`** makes the adapter the identity at step 0: the model starts exactly where pre-training left it, and \`A\`'s Kaiming init is what gives \`B\` a well-scaled first gradient (two zero matrices would never move, because \`∂L/∂A ∝ B\` and \`∂L/∂B ∝ A\`). **The forward path never forms \`ΔW\`**: \`x @ A.T\` is \`(…, r)\`, then \`@ B.T\` is \`(…, out)\`, so the adapter path costs \`r · (in + out)\` multiply-adds per token instead of \`in · out\`, and the only extra memory is the two small matrices plus their gradients and Adam moments, which is why a 7B model adapts on one 24 GB card while full fine-tuning needs 16 bytes per parameter. **Merging is exact**: because \`ΔW\` is a plain matrix, \`W += ΔW\` under \`no_grad\` turns the adapted layer back into a single \`nn.Linear\` with zero inference overhead, and \`W -= ΔW\` returns it (float64 to \`1e-12\`, float32 to rounding error, bf16 not at all, which is why production merges once, into the checkpoint, not on every request). The surgery is done **in place** by \`setattr\` on the parent module so the base weights are the base weights (reused across adapters, never re-initialised), and the parameter names (\`blocks.0.q_proj.lora_A\`) carry the \`lora_\` substring that selects what trains and what ships: an adapter checkpoint for a 7B model is tens of megabytes, not 14 GB. What frameworks add: Hugging Face PEFT wraps exactly this (\`LoraConfig(r, lora_alpha, lora_dropout, target_modules)\`, \`merge_and_unload()\`), QLoRA keeps the frozen base in 4-bit NF4 and dequantises on the fly so \`W\` costs half a byte per weight, rsLoRA scales by \`alpha / sqrt(r)\` so large ranks train stably, DoRA splits the update into magnitude and direction, and serving systems (S-LoRA, Punica, vLLM's multi-LoRA) keep one base model resident and batch requests across thousands of unmerged adapters with a custom gather-matmul kernel: the one case where *not* merging is the point.`,
 };

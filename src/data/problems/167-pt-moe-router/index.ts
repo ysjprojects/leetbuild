@@ -5,7 +5,7 @@ import {moeStep} from './steps/1-moe';
 
 /**
  * Drill: the sparse mixture-of-experts feed-forward layer of Switch Transformer, Mixtral and
- * DeepSeek — a top-k router with the load-balancing loss that keeps it from collapsing, a dispatch
+ * DeepSeek: a top-k router with the load-balancing loss that keeps it from collapsing, a dispatch
  * that runs each expert once on the tokens it won, a capacity that bounds what each expert takes,
  * and a gate-weighted combine.
  */
@@ -23,8 +23,8 @@ export const ptMoeRouterProblem: Problem = {
 
 A dense transformer runs the same feed-forward network on every token. A **mixture of experts** keeps
 \`E\` feed-forward networks and a small **router** that sends each token to the \`k\` it scores highest, so
-the model holds many more parameters than any token touches — Switch Transformer's 1.6 T parameters at
-the compute of a 1 B dense model, Mixtral 8×7B activating 2 of 8 experts, DeepSeek-V3 activating 8 of 256.
+the model holds many more parameters than any token touches: Switch-Base holds 7 B parameters at the FLOPs of
+the 0.2 B T5-Base, Mixtral 8×7B activates 2 of 8 experts, DeepSeek-V3 8 of its 256 routed experts.
 The whole trick lives in three places: how the router chooses, what stops it from sending
 everything to one expert, and how the tokens reach their experts without a Python loop per token.
 
@@ -90,7 +90,7 @@ production trainers add to the token-level one built here.`,
                     sub: 'nn.Linear 32 → 4 · float32',
                     shape: 'logits (32, 4)',
                     detail:
-                      '`TopKRouter.gate`, `bias=False`: one score per expert. The logits are upcast with `.float()` so bf16 rounding never flips a choice.',
+                      '`TopKRouter.gate`, `bias=False`: one score per expert. Input and weight are cast to float32 before the matmul, so the router stays float32 in a bf16 model (Switch’s selective precision).',
                   },
                   {
                     id: 'softmax',
@@ -161,10 +161,10 @@ production trainers add to the token-level one built here.`,
               label: 'Load-balancing aux',
               sub: 'E · Σ_e f_e · P_e',
               detail:
-                'The router returns `aux`: `f_e` (hard share of the `T·k` slots, no gradient) times `P_e` (mean probability, soft). Optional z-loss `z_loss_coef · mean(logsumexp(logits)²)`.',
+                'The router returns `aux`: `f_e` (hard share of the `T·k` slots, no gradient) times `P_e` (mean probability, soft). Optional z-loss `z_loss_coef · mean(logsumexp(logits)²)`, folded into the same `aux`.',
             },
             detail:
-              'The drill returns `aux` unscaled; the training loop adds `α · aux` from every MoE layer to the language-modelling loss.',
+              'The drill returns `aux` unscaled; the training loop adds `α · aux` from every MoE layer to the language-modelling loss. Because the z-loss is folded in, α scales it too.',
           },
         ],
         notes: [
@@ -198,7 +198,7 @@ production trainers add to the token-level one built here.`,
       date: '2017-01-23',
       venue: 'ICLR 2017',
       takes:
-        'The layer itself: a trainable gate that keeps the top `k` of `E` experts per token, softmax over the kept scores, and an auxiliary loss against expert imbalance.',
+        'The layer itself: top-`k` gating with a softmax over the kept scores (the drill drops the noise), and the self-reinforcing imbalance its auxiliary losses counter.',
     },
     {
       kind: 'paper',
@@ -208,7 +208,7 @@ production trainers add to the token-level one built here.`,
       date: '2020-06-30',
       venue: 'ICLR 2021',
       takes:
-        'Top-2 routing under an expert capacity: tokens past the capacity are dropped and carried on by the residual, as `MoE` does.',
+        'Top-2 gates renormalised over the two chosen, and an expert capacity: tokens past it are dropped and carried on by the residual, as `MoE` does.',
     },
     {
       kind: 'paper',
@@ -218,7 +218,7 @@ production trainers add to the token-level one built here.`,
       date: '2021-01-11',
       venue: 'JMLR 2022',
       takes:
-        'The load-balancing loss `n_experts · Σ_e f_e · P_e`, the `capacity_factor` of 1.25, and the router computed in float32.',
+        'The load-balancing loss `n_experts · Σ_e f_e · P_e` with α = 0.01, the expert capacity and its `capacity_factor`, dropped tokens riding the residual, and the router computed in float32.',
     },
     {
       kind: 'paper',
@@ -228,7 +228,7 @@ production trainers add to the token-level one built here.`,
       date: '2022-02-17',
       venue: 'arXiv',
       takes:
-        'The router z-loss `z_loss_coef` weights: the mean squared logsumexp of the gate logits, which keeps them small and the router stable.',
+        'The router z-loss `z_loss_coef` weights (the mean squared logsumexp of the gate logits, coefficient 0.001), and the 1.25 train and 2.0 eval capacity factors.',
     },
     {
       kind: 'paper',

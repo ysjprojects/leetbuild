@@ -4,15 +4,15 @@ import {learn} from './learn';
 import {sgdMomentumStep} from './steps/1-sgd-momentum';
 
 /**
- * Drill: SGD with momentum, Nesterov and decoupled weight decay as a `torch.optim.Optimizer` — the
+ * Drill: SGD with momentum, Nesterov and decoupled weight decay as a `torch.optim.Optimizer`: the
  * loop over `param_groups`, the lazily created `state[p]` buffer, in-place `mul_`/`add_` under
- * `no_grad`, the closure — checked step by step against `torch.optim.SGD` and by hand.
+ * `no_grad`, the closure, checked step by step against `torch.optim.SGD` and by hand.
  */
 export const ptSgdMomentumProblem: Problem = {
   id: 'pt-sgd-momentum',
   title: 'SGD with momentum, Nesterov and decoupled weight decay',
   tagline:
-    'A torch.optim.Optimizer from scratch: param groups, a lazy momentum buffer in state[p], in-place updates under no_grad, a closure — matching torch.optim.SGD step for step.',
+    'A torch.optim.Optimizer from scratch: param groups, a lazy momentum buffer in state[p], in-place updates under no_grad and a closure, matching torch.optim.SGD step for step.',
   difficulty: 'easy',
   track: 'dllm',
   language: 'python',
@@ -21,12 +21,12 @@ export const ptSgdMomentumProblem: Problem = {
   statement: `# SGD with momentum, Nesterov and decoupled weight decay
 
 Every training loop ends the same way: \`loss.backward()\` fills \`p.grad\`, and an optimizer turns those
-gradients into new parameters. Stochastic gradient descent with **momentum** — keep a running sum of
-gradients and step along it — trained every ResNet and still trains vision and speech models; the
+gradients into new parameters. Stochastic gradient descent with **momentum** (keep a running sum of
+gradients and step along it) trained every ResNet and still trains vision and speech models; the
 **Nesterov** variant steps along the gradient plus the momentum, a look-ahead that Sutskever et al. showed
-matters for deep nets. **Decoupled weight decay** — shrink the weight directly instead of adding \`wd · p\`
-to the gradient — is the "W" of AdamW, the optimizer behind GPT, Llama and nearly every LLM; it was
-introduced on SGD first (SGDW) and is cleanest to see there.
+matters for deep nets. **Decoupled weight decay** (shrink the weight directly instead of adding \`wd · p\`
+to the gradient) is the "W" of AdamW, the optimizer behind GPT, Llama and nearly every LLM; the paper that
+introduced it presents SGDW alongside AdamW, and SGD is where it is cleanest to see.
 
 All of them, and Adam, Lion, Muon and Shampoo, share one contract: \`torch.optim.Optimizer\`. It owns the
 \`param_groups\` (each with its own hyper-parameters), a \`state\` dict keyed by parameter that
@@ -39,12 +39,12 @@ The surface is one class:
 - \`step(closure=None)\` under \`@torch.no_grad()\`: for every parameter \`p\` with a gradient \`g\`, in place,
   \`p ← p · (1 − lr · wd)\`; \`buf ← momentum · buf + g\` with \`buf = state[p]["momentum_buffer"]\` created on
   first use as a clone of \`g\`; \`d = g + momentum · buf\` if Nesterov else \`buf\`; \`p ← p − lr · d\`. A
-  parameter with \`grad is None\` is skipped. Any dtype, any shape — the update is elementwise.
+  parameter with \`grad is None\` is skipped. Any dtype, any shape: the update is elementwise.
 
 ## What you build here
 
 1. \`SGD.step()\`: the decoupled decay, the lazy in-place momentum buffer, the Nesterov look-ahead, the
-   in-place update with \`add_(…, alpha=-lr)\`, the closure — matching \`torch.optim.SGD\` (\`weight_decay=0\`)
+   in-place update with \`add_(…, alpha=-lr)\` and the closure, matching \`torch.optim.SGD\` (\`weight_decay=0\`)
    after every one of 25 steps, and the decoupled step checked by hand.
 
 ## Run it on your machine
@@ -175,7 +175,17 @@ optimizer state across devices.`,
       date: '2013-05-26',
       venue: 'ICML 2013',
       takes:
-        'Nesterov momentum as a gradient taken after the momentum step, the look-ahead that `nesterov=True` turns into `g + μ · buf`.',
+        'Nesterov momentum as a gradient taken at the look-ahead point after the momentum step, and the case that well-tuned momentum trains deep nets without second-order methods.',
+    },
+    {
+      kind: 'paper',
+      title: 'Advances in Optimizing Recurrent Networks',
+      url: 'https://arxiv.org/abs/1212.0901',
+      by: 'Yoshua Bengio, Nicolas Boulanger-Lewandowski and Razvan Pascanu',
+      date: '2012-12-04',
+      venue: 'ICASSP 2013',
+      takes:
+        'The change of variables that stores the look-ahead point, so `nesterov=True` needs only `d = g + μ · buf` with the gradient at the current parameters.',
     },
     {
       kind: 'paper',
@@ -185,7 +195,7 @@ optimizer state across devices.`,
       date: '2017-11-14',
       venue: 'ICLR 2019',
       takes:
-        'SGDW: the weight shrunk by `p ← p · (1 − lr · wd)` before the update instead of `wd · p` added to the gradient and fed through the momentum buffer.',
+        'SGDW: the weight shrunk directly (`p ← p · (1 − lr · wd)` here, `η_t · λ · θ` in the paper) instead of `wd · p` added to the gradient and fed through the momentum buffer.',
     },
     {
       kind: 'code',

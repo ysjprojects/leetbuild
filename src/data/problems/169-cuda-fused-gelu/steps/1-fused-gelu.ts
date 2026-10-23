@@ -12,8 +12,8 @@ Implement \`y[i] = gelu(x[i] + bias[i % cols])\` for \`0 ≤ i < n\` as one fuse
 scalar tail, with the **tanh approximation** of GELU that GPT-2 and BERT use.
 
 - \`__device__ __forceinline__ float gelu_tanh(float v)\`:
-  \`0.5f * v * (1.0f + tanhf(0.79788456f * (v + 0.044715f * v * v * v)))\`. Single precision, \`tanhf\` — not
-  \`tanh\`, not \`erff\`.
+  \`0.5f * v * (1.0f + tanhf(0.79788456f * (v + 0.044715f * v * v * v)))\`. Single precision: \`tanhf\` (not
+  \`erff\`) and an \`f\` on every literal, since an unsuffixed \`0.044715\` is a \`double\` and drags the math into double.
 - \`__global__ void gelu_bias_kernel(const float4* __restrict__ x, const float4* __restrict__ bias, float4* __restrict__ y, int n4, int cols4)\`:
   thread \`i = blockIdx.x * blockDim.x + threadIdx.x\` returns when \`i >= n4\`; otherwise **one** \`float4\`
   load of \`x[i]\`, one of \`bias[i % cols4]\`, four \`gelu_tanh\` calls on \`v.x + b.x … v.w + b.w\`, **one**
@@ -26,7 +26,7 @@ scalar tail, with the **tanh approximation** of GELU that GPT-2 and BERT use.
   non-zero, \`gelu_bias_tail_kernel<<<1, tail>>>(x, bias, y, 4 * n4, n, cols)\`. \`cudaGetLastError()\` after
   each launch. Precondition: \`cols % 4 == 0\` and \`cudaMalloc\`'d pointers (256-byte aligned).
 - Forbidden: a \`gelu_bias_kernel\` that takes \`const float*\` (scalar-only), \`erff\`/\`normcdff\` (the exact
-  GELU — different numbers), double-precision math on the device.
+  GELU, different numbers), double-precision math on the device.
 - The file ends with \`main()\`: \`n = 4096 × 3072\` (GPT-2 small's MLP activation, no tail) timed over 20
   launches between \`cudaEvent\`s and reported in GB/s as \`8 × n\` bytes per launch, then \`n = 1 000 003\`
   (a tail of 3); both compared against a double-precision CPU reference with **max abs error < 1e-5**;
@@ -37,11 +37,11 @@ the \`float4\` one. Every fetched byte is still used, and each load instruction 
 
 :::widget coalescing
 
-> A GELU is a dozen instructions per element against eight bytes of HBM traffic. The kernel is bound by
-> bytes, so the whole design is about touching them once — and sixteen at a time.`,
+> A GELU is about 20 FLOPs per element against eight bytes of HBM traffic. The kernel is bound by
+> bytes, so the whole design is about touching them once, and sixteen at a time.`,
   hints: [
-    'Cast the buffers once on the host: `reinterpret_cast<const float4*>(x)`. `cudaMalloc` memory is 256-byte aligned, so every `float4` index is a legal 16-byte load. With `cols % 4 == 0`, the four lanes of `x[i]` sit in columns `4 · (i % cols4) … + 3` — exactly the four lanes of `bias[i % cols4]`.',
-    'Write `gelu_tanh` once as `__device__ __forceinline__ float` and call it four times on `v.x + b.x … v.w + b.w`; build a local `float4 r` and store it with one `y[i] = r`. Use `tanhf`: `tanh` is the double routine, a different and far slower instruction sequence.',
+    'Cast the buffers once on the host: `reinterpret_cast<const float4*>(x)`. `cudaMalloc` memory is 256-byte aligned, so every `float4` index is a legal 16-byte load. With `cols % 4 == 0`, the four lanes of `x[i]` sit in columns `4 · (i % cols4) … + 3`: exactly the four lanes of `bias[i % cols4]`.',
+    'Write `gelu_tanh` once as `__device__ __forceinline__ float` and call it four times on `v.x + b.x … v.w + b.w`; build a local `float4 r` and store it with one `y[i] = r`. Use `tanhf` and `f`-suffixed literals (`0.5f`, `1.0f`): one unsuffixed literal is a `double` and promotes the expression, `tanh` included, to double precision.',
     'On the host: `n4 = n / 4`, `tail = n % 4`. Launch the vector kernel over `n4` threads (256 per block, guard `i >= n4`); then, only `if (tail > 0)`, `gelu_bias_tail_kernel<<<1, tail>>>(x, bias, y, 4 * n4, n, cols)`. Follow each launch with `CUDA_CHECK(cudaGetLastError())`.',
   ],
   checks: [
@@ -49,7 +49,7 @@ the \`float4\` one. Every fetched byte is still used, and each load instruction 
       id: 'vector-kernel',
       title: 'The main kernel loads and stores float4s',
       detail:
-        '`gelu_bias_kernel` takes `const float4*` and reads `x[i]` and `bias[i % cols4]` as whole `float4`s — one 16-byte load each, four elements per thread. A scalar `const float*` kernel issues four times the memory instructions for the same bytes.',
+        '`gelu_bias_kernel` takes `const float4*` and reads `x[i]` and `bias[i % cols4]` as whole `float4`s: one 16-byte load each, four elements per thread. A scalar `const float*` kernel issues four times the memory instructions for the same bytes.',
       match: {
         cuda: {
           all: [
@@ -82,7 +82,7 @@ the \`float4\` one. Every fetched byte is still used, and each load instruction 
       id: 'restrict',
       title: 'The pointers are __restrict__',
       detail:
-        '`x`, `bias` and `y` are declared `__restrict__` in `gelu_bias_kernel`: the compiler may then assume the store to `y` never aliases the loads and can issue both loads up front and route them through the read-only path.',
+        '`x`, `bias` and `y` are declared `__restrict__` in `gelu_bias_kernel`: the compiler may then assume the store to `y` never aliases the loads, and the `const __restrict__` inputs may go through the read-only data path.',
       match: {
         cuda: {
           all: [
@@ -97,7 +97,7 @@ the \`float4\` one. Every fetched byte is still used, and each load instruction 
       id: 'tanh-formula',
       title: 'GELU is the single-precision tanh approximation',
       detail:
-        'The device formula is `0.5f * v * (1.0f + tanhf(0.79788456f * (v + 0.044715f * v³)))` — `tanhf` with the `sqrt(2/π)` and `0.044715` constants as `float` literals. `erff` is the exact GELU (other numbers); `tanh` without the `f` is the double routine.',
+        'The device formula is `0.5f * v * (1.0f + tanhf(0.79788456f * (v + 0.044715f * v³)))`: `tanhf` with the `sqrt(2/π)` and `0.044715` constants as `float` literals. `erff` is the exact GELU (other numbers); an unsuffixed literal would promote the math to double.',
       match: {
         cuda: {
           all: [/tanhf\s*\(/, /0\.79788456f/, /0\.044715f/, /0\.5f\s*\*/],
@@ -109,7 +109,7 @@ the \`float4\` one. Every fetched byte is still used, and each load instruction 
       id: 'bounds',
       title: 'Threads past the end do nothing',
       detail:
-        'The last block is partial: the vector kernel returns when `i >= n4` and the tail kernel when `i >= n`. Without the guards the last threads read and write past the buffers — silently, or as an illegal-address error at the next synchronisation.',
+        'The last block is partial: the vector kernel returns when `i >= n4` and the tail kernel when `i >= n`. Without the guards the last threads read and write past the buffers, silently or as an illegal-address error at the next synchronisation.',
       match: {
         cuda: {
           all: [/if\s*\(\s*\w+\s*>=\s*n4\s*\)/, /if\s*\(\s*\w+\s*>=\s*n\s*\)/],
@@ -146,7 +146,7 @@ the \`float4\` one. Every fetched byte is still used, and each load instruction 
   ],
   code: {
     cuda: {
-      starter: `// fused_gelu.cu — bias + GELU (tanh approximation) in one pass over float4s.
+      starter: `// fused_gelu.cu: bias + GELU (tanh approximation) in one pass over float4s.
 // nvcc -O2 -o fused_gelu fused_gelu.cu && ./fused_gelu
 #include <cuda_runtime.h>
 
@@ -266,7 +266,7 @@ int main() {
   return 1;
 }
 `,
-      solution: `// fused_gelu.cu — bias + GELU (tanh approximation) in one pass over float4s.
+      solution: `// fused_gelu.cu: bias + GELU (tanh approximation) in one pass over float4s.
 // nvcc -O2 -o fused_gelu fused_gelu.cu && ./fused_gelu
 #include <cuda_runtime.h>
 
@@ -291,7 +291,7 @@ __device__ __forceinline__ float gelu_tanh(float v) {
 }
 
 // One thread per float4: y[i] = gelu(x[i] + bias[i % cols4]), lane by lane. n4 = n / 4, cols4 = cols / 4.
-// cols % 4 == 0 puts the four lanes of x[i] in columns 4 * (i % cols4) .. + 3 — the four lanes of one bias float4.
+// cols % 4 == 0 puts the four lanes of x[i] in columns 4 * (i % cols4) .. + 3: the four lanes of one bias float4.
 __global__ void gelu_bias_kernel(const float4* __restrict__ x, const float4* __restrict__ bias,
                                  float4* __restrict__ y, int n4, int cols4) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -407,5 +407,5 @@ int main() {
 `,
     },
   },
-  debrief: `The kernel is shaped by one number: its arithmetic intensity. Per element it reads four bytes, writes four, and spends a dozen instructions on \`tanhf\` and a few multiplies — far below the flop-per-byte ratio at which a GPU stops waiting on memory, so the only lever is bytes. **Fusing** the bias add into the GELU removes a whole round trip of the activation through HBM: eager PyTorch's \`x + b\` then \`F.gelu(...)\` reads and writes the 48 MiB tensor twice, this kernel once. **Vectorising** does not change the byte count but changes how it is requested: one \`LDG.E.128\` per thread instead of four \`LDG.E.32\`, four elements of work per load instruction, more bytes in flight per warp, fewer instructions to issue — the difference between a kernel that approaches HBM bandwidth and one that sits at a fraction of it. The price is alignment: \`reinterpret_cast<float4*>\` is only legal because \`cudaMalloc\` hands back 256-byte-aligned memory, and the \`n % 4\` tail is the honest way to vectorise a buffer whose length is not a multiple of four — the aligned prefix goes wide, the last one to three floats go scalar. \`__restrict__\` tells the compiler the store to \`y\` cannot alias the loads, so both loads can be issued before any arithmetic and \`x\`/\`bias\` can go through the read-only data path. The CPU reference runs in double with the long form of \`sqrt(2/π)\`; the max abs error is set by \`tanhf\`'s few ulps and the float rounding of the cubic, well inside 1e-5. Production stacks move this epilogue into the GEMM itself — cuBLASLt's \`CUBLASLT_EPILOGUE_GELU_BIAS\`, CUTLASS epilogue functors, Triton's fused \`matmul + gelu\` — so the activation is never written un-GELU'd at all; \`torch.compile\` generates exactly this kind of vectorised, fused elementwise kernel for whatever chain of pointwise ops it finds; and on Turing and later a hardware \`tanh.approx.f32\` (MUFU) is available through inline PTX when the last ulp does not matter.`,
+  debrief: `The kernel is shaped by one number: its arithmetic intensity. Per element it reads four bytes, writes four, and spends about 20 FLOPs on \`tanhf\` and a few multiplies: about 2.5 FLOP/byte, far below the ridge (about 20 FLOP/byte on an H100) at which a GPU stops waiting on memory, so the only lever is bytes. **Fusing** the bias add into the GELU removes a whole round trip of the activation through HBM: written as \`x + b\` then \`F.gelu(...)\`, eager PyTorch reads and writes the 48 MiB tensor twice, this kernel once. **Vectorising** does not change the byte count but changes how it is requested: one \`LDG.E.128\` per thread instead of four \`LDG.E.32\`, four elements of work per load instruction, more bytes in flight per warp, fewer instructions to issue. On a large array the gain is modest; it grows when few warps are resident to hide memory latency. The price is alignment: \`reinterpret_cast<float4*>\` is only legal because \`cudaMalloc\` hands back 256-byte-aligned memory, and the \`n % 4\` tail is the honest way to vectorise a buffer whose length is not a multiple of four: the aligned prefix goes wide, the last one to three floats go scalar. \`const __restrict__\` tells the compiler the inputs are read-only and unaliased, so the loads may go through the read-only data path. The CPU reference runs in double with the long form of \`sqrt(2/π)\`; the max abs error is set by \`tanhf\`'s few ulps and the float rounding of the cubic, well inside 1e-5. Production stacks move this epilogue into the GEMM itself (cuBLASLt's \`CUBLASLT_EPILOGUE_GELU_BIAS\`, CUTLASS epilogue functors, Triton's fused \`matmul + gelu\`), so the activation is never written un-GELU'd at all; \`torch.compile\` generates exactly this kind of vectorised, fused elementwise kernel for whatever chain of pointwise ops it finds; and on Turing and later a hardware \`tanh.approx.f32\` (MUFU) is available through inline PTX when the last ulp does not matter.`,
 };

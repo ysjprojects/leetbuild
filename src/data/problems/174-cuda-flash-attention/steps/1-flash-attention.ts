@@ -179,7 +179,9 @@ and \`d ≤ D_MAX\`.
   tile with \`kv0 > q_last\` lies entirely above the diagonal: \`if (causal && kv0 > q_last) break;\` before
   loading it. Inside a tile, the mask is per element.
 - **Write \`O\` once**: after the loop, \`inv = 1.f / l\` and \`O[row · d + k] = o[k] * inv\` for \`k < d\`,
-  only for \`row < T\`. Threads with \`row ≥ T\` still help load tiles and reach every barrier.
+  only for \`row < T\`. Loop \`k\` to \`D_MAX\` under \`#pragma unroll\` with an \`if (k < d)\` guard: a loop
+  bounded by the runtime \`d\` indexes \`o\` dynamically and pushes the whole array to local memory.
+  Threads with \`row ≥ T\` still help load tiles and reach every barrier.
 - **Forbidden**: any device allocation of \`T × T\` floats (the score matrix never leaves registers),
   cuBLAS, cuDNN.
 - The file ends with the given \`main()\`: \`T = 256\`, \`d = 64\`, deterministic inputs in \`[−1, 1]\`, a
@@ -190,7 +192,7 @@ and \`d ≤ D_MAX\`.
 > row's softmax be finished one tile at a time, so the \`T × T\` matrix is never written anywhere.`,
   hints: [
     'Lay the kernel out as two loops and a tail: `for (kv0 …) { stage tile; __syncthreads(); if (row < T) { score; fold; } __syncthreads(); }` then normalise. The stage loop is `for (idx = threadIdx.x; idx < BK * D_MAX; idx += BQ)` with `j = idx / D_MAX`, `k = idx % D_MAX`, so consecutive threads read consecutive floats of one K row.',
-    'The fold is three statements around the `j` loop: `m_new = fmaxf(m, tile_max)`, `alpha = __expf(m - m_new)`, `o[k] *= alpha`; inside, `p = __expf(s[j] - m_new)` accumulates `p_sum` and `o[k] += p * Vs[j][k]`; after, `l = l * alpha + p_sum; m = m_new;`. The first tile has `m = -INFINITY`, so `alpha` is 0 and a masked `s[j] = -INFINITY` gives `p = 0` — no special cases.',
+    'The fold is three statements around the `j` loop: `m_new = fmaxf(m, tile_max)`, `alpha = __expf(m - m_new)`, `o[k] *= alpha`; inside, `p = __expf(s[j] - m_new)` accumulates `p_sum` and `o[k] += p * Vs[j][k]`; after, `l = l * alpha + p_sum; m = m_new;`. The first tile has `m = -INFINITY`, so `alpha` is 0, and a masked `s[j] = -INFINITY` gives `p = 0`: no special cases, because tile 0 holds key 0 and no row starts on an all-masked tile.',
     'Causal has two levels: `if (causal && kv0 > q_last) break;` at the top of the tile loop is block-uniform (it depends on `blockIdx` only), so every thread leaves together and no barrier is skipped by half a block; inside the tile, `key > row` is per thread and only poisons that score.',
   ],
   checks: [
@@ -214,7 +216,7 @@ and \`d ≤ D_MAX\`.
       id: 'barrier-each-side',
       title: 'A barrier after the tile load and another before the next load',
       detail:
-        'Expected `Ks[j][k] = …`, then `__syncthreads()`, then the dot products `q[k] * Ks[j][k]`, then `__syncthreads()` again — without the second barrier a fast thread overwrites `Ks`/`Vs` with the next tile while a slower neighbour still multiplies by the old one.',
+        'Expected `Ks[j][k] = …`, then `__syncthreads()`, then the dot products `q[k] * Ks[j][k]`, then `__syncthreads()` again. Without the second barrier a fast thread overwrites `Ks`/`Vs` with the next tile while a slower neighbour still multiplies by the old one.',
       match: {
         cuda: {
           order: [
@@ -230,7 +232,7 @@ and \`d ≤ D_MAX\`.
       id: 'online-max-sum',
       title: 'Running max and running sum are updated per tile',
       detail:
-        'Expected `m_new = fmaxf(m, tile_max)`, probabilities `__expf(s[j] - m_new)` against the new max, `l = l * alpha + p_sum` and `m = m_new` at the end of the tile — softmax finished one tile at a time without ever seeing the whole row.',
+        'Expected `m_new = fmaxf(m, tile_max)`, probabilities `__expf(s[j] - m_new)` against the new max, `l = l * alpha + p_sum` and `m = m_new` at the end of the tile: softmax finished one tile at a time without ever seeing the whole row.',
       match: {
         cuda: {
           all: [
@@ -258,7 +260,7 @@ and \`d ≤ D_MAX\`.
       id: 'causal-mask-and-skip',
       title: 'Causal masking inside a tile, whole tiles above the diagonal skipped',
       detail:
-        'Expected `if (causal && kv0 > q_last) break;` before a tile is loaded (block-uniform: every thread leaves the loop together) and `causal && key > row` → `-INFINITY` for the elements of a tile that straddles the diagonal. Half the tiles of a causal head are never read.',
+        'Expected `if (causal && kv0 > q_last) break;` before a tile is loaded (block-uniform: every thread leaves the loop together) and `causal && key > row` → `-INFINITY` for the elements of a tile that straddles the diagonal. Close to half the tiles of a long causal head are never read (12 of 32 at `T = 256`).',
       match: {
         cuda: {
           all: [
@@ -391,11 +393,15 @@ __global__ void __launch_bounds__(BQ) flash_attn_fwd(const float* __restrict__ Q
 
   if (row < T) {
     const float inv = 1.f / l;
-    for (int k = 0; k < d; ++k) O[(size_t)row * d + k] = o[k] * inv;
+    // Unrolled to D_MAX with a guard: a loop bounded by the runtime d would index o dynamically and
+    // force the whole accumulator into local memory.
+#pragma unroll
+    for (int k = 0; k < D_MAX; ++k)
+      if (k < d) O[(size_t)row * d + k] = o[k] * inv;
   }
 }
 ${HOST}`,
     },
   },
-  debrief: `The kernel is shaped by one identity and one memory hierarchy. The identity is \`exp(s − m_new) = exp(s − m_old) · exp(m_old − m_new)\`: it lets the numerator \`Σ exp(s_j − m) v_j\` and the denominator \`Σ exp(s_j − m)\` of a softmax be accumulated under whatever maximum has been seen so far and corrected by one multiply when a larger one arrives — the online softmax of Milakov & Gimelshein that FlashAttention builds on. Because of it the row never needs all \`T\` scores at once, so \`s\` is \`BK\` floats in registers and the \`T × T\` matrix a naïve implementation writes to and reads back from global memory (\`T² · 4\` bytes, twice, before \`PV\` even starts) never exists. The hierarchy decides the rest: \`Q\` rows are read once into registers; each \`K\`/\`V\` tile is read once from global memory into shared memory and reused by all \`BQ\` rows of the block, which is the reuse that makes the kernel bandwidth-efficient; the two \`__syncthreads()\` fence the tile's lifetime, because shared memory is a buffer the whole block writes and the whole block reads. Causality is two decisions at two granularities — a block-uniform \`break\` that halves the work of a causal head, and a per-element \`-INFINITY\` that \`__expf\` turns into a clean zero — and \`__expf\` rather than \`expf\` because the kernel is MUFU-bound once the matmuls are tensor-core work. Production kernels keep every one of these choices and change the arithmetic around them: FlashAttention-2 gives each warp its own query rows so the reductions never cross warps, keeps \`O\` unnormalised and stores only \`logsumexp = m + log l\` for the backward pass, and feeds \`QKᵀ\` and \`PV\` to tensor cores through \`wmma\`/\`mma.sync\` in bf16; FlashAttention-3 overlaps the softmax of one tile with the matmul of the next on Hopper's asynchronous units; \`torch.nn.functional.scaled_dot_product_attention\` dispatches to one of them, and \`torch.compile\`'s FlexAttention generates the masked variants from a Python predicate.`,
+  debrief: `The kernel is shaped by one identity and one memory hierarchy. The identity is \`exp(s − m_new) = exp(s − m_old) · exp(m_old − m_new)\`: it lets the numerator \`Σ exp(s_j − m) v_j\` and the denominator \`Σ exp(s_j − m)\` of a softmax be accumulated under whatever maximum has been seen so far and corrected by one multiply when a larger one arrives. That is the online softmax of Milakov & Gimelshein that FlashAttention builds on. Because of it the row never needs all \`T\` scores at once, so \`s\` is \`BK\` floats in registers, and the \`T × T\` matrix a naïve implementation writes to global memory and reads back (\`T² · 4\` bytes for \`S\`, then again for \`P\`) never exists. The hierarchy decides the rest: \`Q\` rows are read once into registers; each \`K\`/\`V\` tile is read once from global memory into shared memory and reused by all \`BQ\` rows of the block, which is the reuse that makes the kernel bandwidth-efficient; the two \`__syncthreads()\` fence the tile's lifetime, because shared memory is a buffer the whole block writes and the whole block reads. The registers hold only because every index into \`q\`, \`o\` and \`s\` is a constant after unrolling; one runtime-indexed loop moves an array to local memory. Causality is two decisions at two granularities: a block-uniform \`break\` that skips close to half the tiles of a long causal head, and a per-element \`-INFINITY\` that \`__expf\` turns into a clean zero. \`__expf\` is a multiply and one special-function-unit instruction (\`ex2.approx\`) where \`expf\` is a longer accurate sequence; here the 128 FMAs per score dominate, but once the matmuls move to tensor cores the exponentials become the bottleneck. Production kernels keep every one of these choices and change the arithmetic around them: FlashAttention-2 gives each warp its own query rows so the reductions never cross warps, keeps \`O\` unnormalised and stores only \`logsumexp = m + log l\` for the backward pass, and feeds \`QKᵀ\` and \`PV\` to tensor cores through \`mma.sync\` in fp16/bf16; FlashAttention-3 overlaps the softmax of one tile with the matmul of the next on Hopper's asynchronous units; \`torch.nn.functional.scaled_dot_product_attention\` dispatches to one of them, and FlexAttention compiles masked variants from a Python predicate with \`torch.compile\`.`,
 };

@@ -12,9 +12,9 @@ one FP32 scale for the whole tensor. The [NVIDIA blog post that introduced it](h
 compares it with MXFP4, the open standard it builds on, which has blocks of 32 and a power-of-two scale.
 
 For inference, both operands of every linear layer can be NVFP4: the weights, quantized once, and the
-activations, quantized as they arrive (W4A4). The tensor core never turns either back into floats. It
+activations, quantized as they arrive (W4A4). The GEMM never turns either back into floats in memory. It
 multiplies the 4-bit values block by block, applies the two block scales to each partial sum, accumulates
-in FP32 and applies the two tensor scales once at the end.
+in FP32 and applies the two tensor scales once to the result.
 
 :::architecture
 {
@@ -61,9 +61,10 @@ code   0000 0001 0010 0011 0100 0101 0110 0111     sign is bit 3: 1xxx is negati
 value  0    0.5  1    1.5  2    3    4    6
 \`\`\`
 
-Half the levels sit in the lowest quarter of the range, and the spacing doubles with each binade. Rounding
-is to the nearest value with ties to the even mantissa (2.5 → 2, 3.5 → 4, 5 → 4), and anything beyond 6
-saturates to 6. Two codes share a byte, the even element in the low nibble.
+Half the levels sit in the lowest quarter of the range, and the spacing doubles with each binade (the span
+from one power of two to the next). Rounding is to the nearest value with ties to the even mantissa
+(2.5 → 2, 3.5 → 4, 5 → 4), and anything beyond 6 saturates to 6. Two codes share a byte, the even element
+in the low nibble.
 
 Eight magnitudes cannot cover the range of real tensors, so every block of 16 gets a scale. NVFP4 stores
 that scale in E4M3, an FP8 format with 3 mantissa bits whose largest value is 448. E4M3 alone spans about
@@ -88,11 +89,11 @@ One block, from a tensor whose largest value is 10:
 
 | quantity | value |
 |---|---|
-| block values | 0.12, −0.40, 0.95, 2.90, −1.30, … (16 values, amax 2.90) |
+| block values | 0.12, −0.40, 0.95, 2.90, −1.30, −0.11, 1.25, 0.18, 1.92, 0.83, −0.11, 0.73, −0.71, 2.05, 0.05, 1.05 (amax 2.90) |
 | \`s_global\` | 10 / 2,688 = 0.003720 |
 | \`amax_block / 6 / s_global\` | 129.92 → E4M3 **128** |
 | decode scale \`s_block · s_global\` | 0.4762 |
-| codes | 0.5, −1, 2, 6, −3, … (2.90 / 0.4762 = 6.09 saturates to 6) |
+| codes | 0.5, −1, 2, 6, −3, 0, 3, 0.5, 4, 1.5, 0, 1.5, −1.5, 4, 0, 2 (2.90 / 0.4762 = 6.09 saturates to 6) |
 | mean squared error | 0.0090 |
 
 The FP8 layouts, and how a value rounds in each, are in the widget below. E4M3 is the row the block
@@ -114,16 +115,17 @@ Q: Why does NVFP4 need the per-tensor FP32 scale at all, when every block alread
 
 MXFP4, the [OCP Microscaling](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf/)
 format, makes two different choices. Its blocks have 32 values, and its scale is E8M0: an 8-bit exponent with
-no mantissa, so it is always a power of two. The specification sets it to the largest power of two not
-above the block's amax, divided by the largest power of two in E2M1 (4):
+no mantissa, so it is always a power of two. The specification's reference conversion sets it to the
+largest power of two not above the block's amax, divided by the largest power of two in E2M1 (4):
 
 \`\`\`text
 X = 2^(floor(log2(amax)) − 2)        E8M0, one per 32 values
 q = e2m1(x / X)                      values past 6 saturate
 \`\`\`
 
-Then \`amax / X\` lands anywhere in \`[4, 8)\`. Below 6, the top of the grid is wasted; above 6, the block's
-largest values are clipped. NVFP4's fractional scale puts every block's amax within a few percent of 6.
+Then \`amax / X\` lands anywhere in \`[4, 8)\`. From 4 to 5 the largest value rounds to 4 and the code for 6
+goes unused; from 6 to 8 the block's largest values clip to 6. NVFP4's fractional scale puts every block's
+amax within a few percent of 6.
 
 The smaller block matters at least as much. A block mixes whatever 16 or 32 values happen to be adjacent
 along K, and one large value sets the scale for all of them. Below, the 16 values of the example above and
@@ -133,8 +135,8 @@ along K, and one large value sets the scale for all of them. Below, the 16 value
 |---|---|---|
 | scale of the large half | 128 · s_global = 0.476 | 0.5 |
 | scale of the small half | 13 · s_global = 0.048 | 0.5, shared |
-| MSE, large half | 0.0090 | 0.0124 |
-| MSE, small half | 0.000095 | 0.0041, 43× worse |
+| MSE, large half | 0.0090 | 0.0119 |
+| MSE, small half | 0.000092 | 0.0048, 52× worse |
 
 The failure is in the last row: under MXFP4 the small half shares a scale with values ten times larger, and
 12 of its 16 values round to 0, the other 4 to ±0.25. Toggle the outlier in the widget to see one value stretch a whole
@@ -161,7 +163,10 @@ To multiply \`A (M × K)\` by \`Bᵀ (K × N)\` with both in NVFP4, nothing need
 K block, the scales are constants that factor out of the dot product, so the core works on raw E2M1
 values and touches the scales once per block. The [CUTLASS documentation](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/blackwell_functionality.html)
 writes Blackwell's block-scaled MMA as \`D = C + Σ_k (A[i,k] · SFA[i, k/SV]) · (B[j,k] · SFB[j, k/SV])\`,
-with a scale-factor vector size \`SV\` of 16 for NVFP4 and 32 for MXFP4.
+with a scale-factor vector size \`SV\` of 16 for NVFP4 and 32 for MXFP4. It types the NVFP4 scale as
+\`float_ue4m3_t\`, E4M3 without the sign bit, since a scale is never negative. The MX specification leaves
+the internal precision and order of operations of a block dot product implementation-defined; exact block
+sums first, then the scales, is the order the factoring suggests.
 
 :::gpu
 {
@@ -203,6 +208,7 @@ about 1e-7:
 | \`s_a · s_b\`, both E4M3 | 4-bit significands | yes, 8 bits |
 | \`P · s_a · s_b\` | 12 + 8 significant bits | yes, 20 of fp32's 24 |
 | sum over K/16 blocks | | rounded, like any fp32 GEMM |
+| \`acc · g_a · g_b\` | | rounded once more |
 
 Dequantizing first and calling a float matmul gives the same numbers to fp32 rounding (the self-test checks
 both), but it writes a full-precision copy of each operand and multiplies at float speed. That is the
@@ -221,14 +227,15 @@ Q: Where do the per-tensor global scales enter the block-scaled GEMM?
 
 Weights are known in advance and quantized once. Activations arrive with every request, and their global
 scale needs \`amax(|x|)\` over the whole input. Computing it on the fly (a dynamic scale) means a reduction
-over the tensor before the first block can be quantized. A calibrated (static) scale removes it: run the
-float model on a few hundred representative inputs, record each layer's largest input, and freeze
-\`s_x = amax / (6 · 448)\`. NVIDIA Model Optimizer's NVFP4 recipe works this way: \`max\` calibration
-records each input quantizer's amax, and the exported activation scale is that amax over \`6 · 448\`.
+over the tensor before the first block can be quantized: an extra pass through device memory, as the NVFP4
+paper notes. A calibrated (static) scale removes it: run the float model on a few hundred representative
+inputs, record each layer's largest input, and freeze \`s_x = amax / (6 · 448)\`. NVIDIA Model Optimizer's
+NVFP4 recipe works this way: \`max\` calibration records each input quantizer's amax, and the exported
+activation scale is that amax over \`6 · 448\`.
 
-Only the global scale is frozen. The block scales are still computed from each block of each input, so a
-calibrated layer adapts to small inputs as well as a dynamic one. It only breaks when an input exceeds the
-range calibration saw:
+Only the global scale is frozen. The block scales are still computed from each block of each input
+(ModelOpt's NVFP4 input quantizer declares its block scales \`type: dynamic\`), so a calibrated layer adapts
+to small inputs as well as a dynamic one. It only breaks when an input exceeds the range calibration saw:
 
 | input to \`NVFP4Linear(256, 96)\` | relative output error |
 |---|---|
@@ -293,11 +300,20 @@ The measured comparison, one run (orderings held on all eight seeds tried):
 | INT4, g = 32 | 4.5 | 216 KiB | 0.113 | 9.219 |
 | MXFP4 | 4.25 | 204 KiB | 0.138 | 9.565 |
 
-At equal bits NVFP4 beats INT4. INT4's fp16 scale is just as fine, but its 16 evenly spaced levels fit
-bell-shaped data worse than E2M1's, which crowd near zero. MXFP4 is a quarter bit cheaper and clearly
-worse: 32-value blocks and power-of-two scales. The gaps depend on the model. Large LLMs have outlier
-channels this one lacks, which is why production recipes add rotations or smoothing before 4-bit
-activations.
+At equal bits NVFP4 beats INT4, and the comparison is like for like. Both have a fine scale per group (E4M3
+per 16, fp16 per 32) and 15 distinct levels: E2M1's ±0 coincide, and with a scale of \`amax / 7\` INT4's −8
+is never reached. What differs is the spacing. INT4's levels are even; E2M1's crowd near zero, where
+bell-shaped data has most of its mass. NVFP4 alone gets a calibrated global scale, but its dynamic version
+stayed within 0.05 perplexity of it and ahead of INT4 on all eight seeds. INT4 in deployment is mostly
+weight-only (W4A16, as with GPTQ or AWQ); W4A4 INT4 here is the equal-budget baseline, not a common recipe.
+
+MXFP4 is a quarter bit cheaper and clearly worse: 32-value blocks and power-of-two scales. The OCP rule's
+clipping is a small part of it. Rounding X up instead, \`2^ceil(log2(amax / 6))\`, never clips (the NVFP4
+paper cites Mishra et al. (2025) for preferring it). In the same run it moved MXFP4 from 0.138 to 0.136 in
+error and from 9.565 to 9.449 in perplexity, still behind INT4 on all eight seeds.
+
+The gaps depend on the model. Large LLMs have outlier channels this one lacks, which is why production
+recipes add rotations or smoothing before 4-bit activations.
 
 :::quiz
 Q: Why is the layer output error measured with each quantized layer fed the float model's own inputs?

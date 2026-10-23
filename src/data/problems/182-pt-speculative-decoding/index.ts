@@ -24,9 +24,9 @@ export const ptSpeculativeDecodingProblem: Problem = {
   statement: `# Speculative decoding from scratch
 
 Decoding a large model is memory-bound: every token reads all the weights once, and the arithmetic units
-mostly wait. Speculative decoding, published at the same time by Leviathan, Kalman and Matias at Google
-(ICML 2023) and by Chen et al. at DeepMind (2023), spends that idle compute. A small **draft** model
-guesses the next γ tokens one by one; the large **target** model scores all of them in **one** forward
+mostly wait. Speculative decoding, found independently by Leviathan, Kalman and Matias at Google (arXiv,
+November 2022; ICML 2023) and by Chen et al. at DeepMind (February 2023), spends that idle compute. A
+small **draft** model guesses the next γ tokens one by one; the large **target** model scores all of them in **one** forward
 pass; a rejection-sampling rule keeps the longest acceptable prefix and replaces the first rejected
 token. The output is distributed **exactly** as if the target had sampled every token itself, and each
 target forward now emits between 1 and γ + 1 tokens. Hugging Face ships it as assisted generation,

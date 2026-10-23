@@ -1,6 +1,6 @@
 import type {Step} from '@/lib/types';
 
-/** A runtime call that is not wrapped in CUDA_CHECK — the error it returns is silently dropped. */
+/** A runtime call that is not wrapped in CUDA_CHECK: the error it returns is silently dropped. */
 const UNCHECKED_CALL = /(?<!CUDA_CHECK\s*\(\s*)\bcuda(Malloc|Memcpy|Free|DeviceSynchronize|GetLastError|Event\w+)\s*\(/;
 
 export const vectorAddStep: Step = {
@@ -35,7 +35,7 @@ computing \`c[i] = a[i] + b[i]\` for every \`i < n\`, the host code around it, a
   \`MAX_BLOCKS × BLOCK_SIZE\`), \`h_a[i] = 0.001f · (i mod 1000)\`, \`h_b[i] = 1 − 0.0005f · (i mod 2000)\`, a CPU
   reference \`h_ref[i] = h_a[i] + h_b[i]\`, the max abs error over all \`n\` (must be \`≤ 1e-6\`; a float add is
   the same on both sides, so it is 0), a line with ms per launch and GB/s (\`3 · n · 4\` bytes per launch), and
-  \`PASS\` — or \`FAIL\` and exit code 1.
+  \`PASS\`, or \`FAIL\` and exit code 1.
 - No Thrust, no cuBLAS, no unified memory: the point is the plain runtime API.
 
 Who handles which element, on a small array: with fewer blocks than \`⌈n / block⌉\` the loop takes extra
@@ -43,11 +43,11 @@ passes, and the last pass stops at the bounds.
 
 :::widget cuda-grid {"n": 50, "block": 8}
 
-> A grid is a finite resource and \`n\` is not: the loop, not the grid, covers the data — and every call
+> A grid is a finite resource and \`n\` is not: the loop, not the grid, covers the data, and every call
 > that can fail is checked at the line where it failed.`,
   hints: [
     'The kernel is four lines: `int start = blockIdx.x * blockDim.x + threadIdx.x; int stride = gridDim.x * blockDim.x; for (int i = start; i < n; i += stride) c[i] = a[i] + b[i];`. With 1024 × 256 = 262,144 threads and n = 4,194,341, each thread does 16 or 17 elements.',
-    'The macro is a `do { cudaError_t err_ = (call); if (err_ != cudaSuccess) { fprintf(stderr, "... %s:%d: %s\\n", __FILE__, __LINE__, cudaGetErrorString(err_)); exit(EXIT_FAILURE); } } while (0)` — every line of it ending in a backslash. A kernel launch is a statement, not a call: check it with `CUDA_CHECK(cudaGetLastError())` on the next line.',
+    'The macro is a `do { cudaError_t err_ = (call); if (err_ != cudaSuccess) { fprintf(stderr, "... %s:%d: %s\\n", __FILE__, __LINE__, cudaGetErrorString(err_)); exit(EXIT_FAILURE); } } while (0)`, every line of it ending in a backslash. A kernel launch is a statement, not a call: check it with `CUDA_CHECK(cudaGetLastError())` on the next line.',
     'Timing: `cudaEventRecord(start)` goes on the stream before the launches and `cudaEventRecord(stop)` after; `cudaEventSynchronize(stop)` waits, `cudaEventElapsedTime(&ms, start, stop)` reads milliseconds. Divide by ITERS. Warm up with one unmeasured launch first or the first number includes module loading.',
   ],
   checks: [
@@ -70,7 +70,7 @@ passes, and the last pass stops at the bounds.
       id: 'bounds-check',
       title: 'No thread writes past n',
       detail:
-        'The kernel body compares its index with `n` before touching memory. A one-thread-per-element kernel that writes `c[blockIdx.x * blockDim.x + threadIdx.x]` unconditionally writes 219 floats past the end when n = 4,194,341 is padded to 4,194,560 threads — an illegal address or silent corruption — and covers nothing when the grid is capped.',
+        'The kernel body compares its index with `n` before touching memory. A one-thread-per-element kernel that writes `c[blockIdx.x * blockDim.x + threadIdx.x]` unconditionally writes 219 floats past the end when n = 4,194,341 is padded to 4,194,560 threads (an illegal address or silent corruption), and leaves everything from `c[262,144]` on unwritten when the grid is capped.',
       match: {
         cuda: {
           all: [/__global__\s+void\s+vector_add\s*\([^)]*\)\s*\{[^}]*\b\w+\s*<\s*n\b/],
@@ -117,7 +117,7 @@ passes, and the last pass stops at the bounds.
       id: 'launch-checked',
       title: 'cudaGetLastError right after the launch',
       detail:
-        'A `<<<...>>>` launch returns nothing; a block of 2048 threads or a grid of 0 blocks is reported by `cudaGetLastError()` on the next line. Expected `CUDA_CHECK(cudaGetLastError())` after the launch statement — not before, and not only at the end of the program.',
+        'A `<<<...>>>` launch returns nothing; a block of 2048 threads or a grid of 0 blocks is reported by `cudaGetLastError()` on the next line. Expected `CUDA_CHECK(cudaGetLastError())` after the launch statement: not before, and not only at the end of the program.',
       match: {
         cuda: {
           all: [/CUDA_CHECK\s*\(\s*cudaGetLastError\s*\(\s*\)\s*\)/],
@@ -129,7 +129,7 @@ passes, and the last pass stops at the bounds.
       id: 'launch-geometry',
       title: 'Blocks computed from n with a ceiling division, capped at MAX_BLOCKS',
       detail:
-        '`BLOCK_SIZE = 256`, `blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE` capped at `MAX_BLOCKS = 1024`, and the launch uses `<<<blocks, BLOCK_SIZE>>>`. `n / BLOCK_SIZE` drops the last partial block; an uncapped grid of 16,385 blocks works here but makes the loop pointless and hides a grid-dimension overflow at larger n.',
+        '`BLOCK_SIZE = 256`, `blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE` capped at `MAX_BLOCKS = 1024`, and the launch uses `<<<blocks, BLOCK_SIZE>>>`. `n / BLOCK_SIZE` drops the last partial block; an uncapped grid of 16,385 blocks works here but ties the grid to the data again and makes the loop pointless.',
       match: {
         cuda: {
           all: [
@@ -161,7 +161,7 @@ passes, and the last pass stops at the bounds.
       id: 'events-timing',
       title: 'Launches timed with cudaEvents, start before and stop after',
       detail:
-        'Two `cudaEvent_t`s created, `cudaEventRecord(start)` before the timed launches, `cudaEventRecord(stop)` after, `cudaEventSynchronize(stop)`, `cudaEventElapsedTime` — events are recorded on the stream, so the interval is GPU time between the two markers, not host wall-clock around an asynchronous launch.',
+        'Two `cudaEvent_t`s created, `cudaEventRecord(start)` before the timed launches, `cudaEventRecord(stop)` after, `cudaEventSynchronize(stop)`, `cudaEventElapsedTime`. Events are recorded on the stream, so the interval is GPU time between the two markers, not host wall-clock around an asynchronous launch.',
       match: {
         cuda: {
           all: [/cudaEventCreate\s*\(/, /cudaEventSynchronize\s*\(/, /cudaEventElapsedTime\s*\(/],
@@ -177,7 +177,7 @@ passes, and the last pass stops at the bounds.
   ],
   code: {
     cuda: {
-      starter: `// vector_add.cu — the smallest complete CUDA program: launch geometry, a grid-stride loop,
+      starter: `// vector_add.cu, the smallest complete CUDA program: launch geometry, a grid-stride loop,
 // checked API calls, a timed launch and a CPU reference.
 //   nvcc -O2 -o vector_add vector_add.cu && ./vector_add
 #include <cuda_runtime.h>
@@ -247,7 +247,7 @@ int main() {
   return 0;
 }
 `,
-      solution: `// vector_add.cu — the smallest complete CUDA program: launch geometry, a grid-stride loop,
+      solution: `// vector_add.cu, the smallest complete CUDA program: launch geometry, a grid-stride loop,
 // checked API calls, a timed launch and a CPU reference.
 //   nvcc -O2 -o vector_add vector_add.cu && ./vector_add
 #include <cuda_runtime.h>
@@ -349,5 +349,5 @@ int main() {
 `,
     },
   },
-  debrief: `Fifty lines of host code around a four-line kernel, and the ratio is honest: the kernel is the easy part. The **grid-stride loop** decouples the grid from the data — a launch of 1024 × 256 threads handles 4 M elements, 4 G elements, or 37, with one bounds test per iteration and the same code; it is also what lets the host cap the grid at a multiple of the SM count rather than at \`n / 256\`, which for a 2 G-element tensor would overflow \`gridDim.x\` on one axis. **Every call checked** is a discipline, not a style: the runtime API returns \`cudaError_t\` from everything and a dropped one turns a failed 16 MiB \`cudaMalloc\` into an illegal address fault three calls later with no line number. The launch itself returns nothing, so \`cudaGetLastError()\` right after it is the only place a bad block size is reported, while an error *inside* the kernel is asynchronous and surfaces at the next synchronising call — the \`cudaDeviceSynchronize\` before the copy back, which is why that call is checked too and sits before any read of \`c\`. The **timing** uses events because a launch returns to the host before the GPU has started: a wall clock around it measures the launch overhead, not the kernel. The number itself — about 50 MB moved per launch — tells you vector add is bandwidth-bound: a few microseconds on a datacentre GPU, nowhere near its FLOP peak, which is the reason frameworks fuse elementwise work into the kernels around it. PyTorch's \`a + b\` is this kernel with vectorised \`float4\` loads and a \`TensorIterator\` that handles strides, broadcasting and dtypes; its launches are followed by \`C10_CUDA_KERNEL_LAUNCH_CHECK()\`, the same \`cudaGetLastError\` under a macro; its allocator caches \`cudaMalloc\` because the call is slow; and \`torch.compile\` and Triton fuse the residual add into the LayerNorm or the GELU so the 16 MiB never makes a round trip to HBM on its own.`,
+  debrief: `Fifty lines of host code around a four-line kernel, and the ratio is honest: the kernel is the easy part. The **grid-stride loop** decouples the grid from the data: a launch of 1024 × 256 threads handles 4 M elements or 37 with the same code and one bounds test per iteration, and the host is free to size the grid from the SM count (a few waves of resident blocks) instead of from \`n / 256\`. **Every call checked** is a discipline, not a style: the runtime API returns \`cudaError_t\` from everything, and a dropped one turns a failed 16 MiB \`cudaMalloc\` into an illegal-address fault three calls later with no line number. The launch itself returns nothing, so \`cudaGetLastError()\` right after it is where a bad block size is reported, while an error *inside* the kernel is asynchronous and surfaces at the next synchronising call: the \`cudaDeviceSynchronize\` before the copy back, which is why that call is checked too and sits before any read of \`c\`. The **timing** uses events because a launch returns to the host before the GPU has started: a wall clock around it measures the launch overhead, not the kernel. The number itself (about 50 MB moved per launch, tens of microseconds on a datacentre GPU, nowhere near its FLOP peak) says vector add is bandwidth-bound, which is the reason frameworks fuse elementwise work into the kernels around it. PyTorch's \`a + b\` is this kernel with vectorised loads and a \`TensorIterator\` that handles strides, broadcasting and dtypes; its launches are followed by \`C10_CUDA_KERNEL_LAUNCH_CHECK()\`, the same \`cudaGetLastError\` under a macro; its caching allocator avoids \`cudaMalloc\` because the call is slow; and \`torch.compile\` and Triton fuse the residual add into the LayerNorm or the GELU so the 16 MiB never makes a round trip to HBM on its own.`,
 };

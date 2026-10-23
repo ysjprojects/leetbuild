@@ -5,7 +5,7 @@
  */
 export const learn = `# The mechanism at a glance
 
-Mixed precision runs the expensive part of training — the matmuls of the forward and backward — in a
+Mixed precision runs the expensive part of training (the matmuls of the forward and backward) in a
 16-bit float, and everything that accumulates small changes in float32. Micikevicius et al.,
 [*Mixed Precision Training*](https://arxiv.org/abs/1710.03740) (Baidu and NVIDIA, ICLR 2018), gave the
 recipe every framework still follows: an fp32 **master copy** of the weights, 16-bit products accumulated
@@ -72,18 +72,19 @@ them differently:
 
 | format | exp / mantissa bits | largest | smallest normal | smallest subnormal | spacing at 1.0 |
 |---|---|---|---|---|---|
-| float32 | 8 / 23 | 3.4e38 | 1.2e-38 | 1.4e-45 | 2⁻²³ ≈ 1.2e-7 |
+| float32 | 8 / 23 | 3.40e38 | 1.2e-38 | 1.4e-45 | 2⁻²³ ≈ 1.2e-7 |
 | float16 | 5 / 10 | 65504 | 2⁻¹⁴ ≈ 6.1e-5 | 2⁻²⁴ ≈ 6.0e-8 | 2⁻¹⁰ ≈ 9.8e-4 |
-| bfloat16 | 8 / 7 | 3.4e38 | 1.2e-38 | 9.2e-41 | 2⁻⁷ ≈ 7.8e-3 |
+| bfloat16 | 8 / 7 | 3.39e38 | 1.2e-38 | 2⁻¹³³ ≈ 9.2e-41 | 2⁻⁷ ≈ 7.8e-3 |
 
-- **fp16** (IEEE half) has more precision but a range of about 2⁻²⁴ to 2¹⁶. Activations fit; many
-  gradients do not.
+- **fp16** (IEEE half) has more precision but a range of about 2⁻²⁴ to 2¹⁶: magnitudes up to 2⁻²⁵ round to
+  zero and from 65520 up to \`inf\`. Activations fit; many gradients do not.
 - **bf16** (Google Brain's "brain float") is float32 with the mantissa cut to 7 bits: the same exponent,
-  so the same range, and about three significant decimal digits. Converting fp32 → bf16 is a truncation of
-  the low 16 bits (with rounding).
-- Both run at the same tensor-core rate on A100/H100; V100 and earlier have fp16 tensor cores only. That
-  hardware history is why fp16 plus a loss scaler came first and why recent pretraining runs (Llama,
-  GPT-NeoX) use bf16 without one.
+  so the same range, and 8 significant bits (between two and three decimal digits). Converting fp32 → bf16
+  drops the low 16 bits, rounding to nearest even.
+- Both run at the same tensor-core rate on A100/H100 (312 TFLOPS dense on an A100); V100's tensor cores
+  take fp16 only. That hardware history is why fp16 plus a loss scaler came first. BLOOM's 104B trial
+  runs in fp16 on V100s diverged irreversibly, so the final run used bf16 on A100s; Llama 3 trained in
+  bf16 too.
 
 :::quiz
 Q: Why does bf16 training usually work without a loss scaler while fp16 training does not?
@@ -98,8 +99,8 @@ Q: Why does bf16 training usually work without a loss scaler while fp16 training
 
 Gradients of a deep network are small and get smaller with depth and over training. The paper's
 histograms show it: in a Mandarin speech model about 5% of weight-gradient values had exponents below
--24 — zero in fp16 — and in an SSD detector most activation gradients sat below fp16's range while the
-top of the range went unused.
+-24 (zero in fp16), and in the SSD detector much of fp16's range went unused while many activation
+gradients fell below it. Unscaled, SSD diverged in fp16; scaled by 8, it matched fp32.
 
 The widget draws the same picture. At a loss scale of 1 the left tail of the gradient histogram sits below
 fp16's smallest subnormal, \`2**-24\`: a true gradient of \`2**-30\` rounds to \`0.0\` and the weight it belongs
@@ -108,8 +109,8 @@ to never moves, silently. Raise the scale and the tail lifts into range:
 :::widget float-formats
 
 Backpropagation is linear in the loss, so multiplying the loss by \`S\` multiplies every gradient of the
-chain rule by \`S\`. Choose \`S\` a power of two and the multiplication and the later division are exact —
-only the exponent changes:
+chain rule by \`S\`. Choose \`S\` a power of two and the multiplication and the later division are exact:
+only the exponent changes.
 
 \`\`\`text
 scaled = scaler.scale(loss)            # loss * S, S = 2**16
@@ -117,11 +118,13 @@ scaled.backward()                      # every grad is S * g:  2**-30 * 2**16 = 
 grads /= S   (in place, in fp32)       # unscale_: the optimizer and the clipper see g
 \`\`\`
 
-- The paper used a constant \`S\` (8 was enough for SSD to match fp32); any value works as long as the
-  largest scaled gradient stays below 65504.
+- The paper used constant factors (8 to 32K across its networks; bigLSTM needed 128) and only sketched
+  the dynamic scaler as future work. Any value works as long as the largest scaled gradient stays below
+  65504.
 - Division happens on fp32 gradients, so nothing underflows on the way back down.
-- Clipping, logging the gradient norm and the optimizer all need true gradients — so all of them come after
-  \`unscale_\`.
+- Clipping, logging the gradient norm and the optimizer all need true gradients, so all of them come after
+  \`unscale_\`. The paper puts unscaling at the same spot, so no clipping threshold or weight decay needs
+  retuning.
 
 :::quiz
 Q: Why is the scale a power of two rather than, say, 50000?
@@ -189,8 +192,9 @@ The self-test's trajectory with \`growth_interval=4\`:
 \`bool(t)\` or \`t.item()\` on a GPU tensor waits for every queued kernel to finish. A 7B model has hundreds
 of parameter tensors; an \`.item()\` per tensor would drain the GPU queue hundreds of times a step. Stacking
 the per-tensor \`isfinite(g).all()\` results and reducing once costs one sync per group. \`GradScaler\`
-goes further: it keeps \`found_inf\` and the scale on the device and lets \`optimizer.step\` be skipped
-without the host ever looking.
+goes further: its fused kernel accumulates \`found_inf\` on the device across every group, so the only
+sync is one \`.item()\` per device inside \`step\`; a fused optimizer (\`fused=True\`) takes \`found_inf\` and
+the scale as tensors and skips the update on the device, so the host never looks.
 :::
 
 :::quiz
@@ -204,31 +208,31 @@ Q: The scaler sees an inf gradient on step 2 of a run with growth_interval=4, af
 
 # Master weights, and what autocast casts
 
-The second failure is in the update, not the gradient. bf16 has about three significant digits: the
-spacing between representable values near 1.0 is 2⁻⁷ ≈ 0.0078. An SGD update of \`1e-4\` to a weight of
-\`1.0\` stored in bf16 (or fp16, spacing 9.8e-4) rounds back to \`1.0\` — every step. The paper puts the
+The second failure is in the update, not the gradient. bf16 keeps 8 significant bits: the spacing between
+representable values just above 1.0 is 2⁻⁷ ≈ 0.0078. An SGD update of \`1e-4\` to a weight of \`1.0\` stored
+in bf16 (or fp16, spacing 9.8e-4) rounds back to \`1.0\`, every step. The paper puts the
 limit at an update-to-weight ratio of 2⁻¹¹ for fp16. Hence the master copy: the optimizer updates fp32
 weights, and only the forward sees 16-bit copies. Casting the model with \`.half()\` or \`.bfloat16()\`
 throws that away.
 
-\`torch.autocast\` ([docs](https://pytorch.org/docs/stable/amp.html)) does the casting per op, inside the
+\`torch.autocast\` ([docs](https://docs.pytorch.org/docs/stable/amp.html)) does the casting per op, inside the
 \`with\` block only:
 
-| op class | examples | runs in |
+| op class (CUDA lists) | examples | runs in |
 |---|---|---|
 | matmul-like, tensor-core friendly | \`linear\`, \`matmul\`, \`mm\`, \`bmm\`, \`addmm\`, \`conv2d\` | the autocast dtype |
-| range- or accumulation-sensitive | \`softmax\`, \`log_softmax\`, \`layer_norm\`, \`exp\`, \`log\`, \`pow\`, \`sum\`, \`nll_loss\` | float32 (on CUDA) |
-| multi-input | \`cat\`, \`stack\`, \`addcmul\`, \`index_put\` | the widest input dtype |
-| everything else | \`relu\`, \`gelu\`, \`add\`, \`dropout\` | whatever comes in |
+| range- or accumulation-sensitive | \`softmax\`, \`log_softmax\`, \`layer_norm\`, \`exp\`, \`log\`, \`pow\`, \`sum\`, \`nll_loss\` | float32 |
+| multi-input | \`addcmul\`, \`atan2\`, \`cross\`, \`index_put\`, \`scatter_add\` | the widest input dtype |
+| everything else | \`relu\`, \`gelu\`, \`add\`, \`dropout\` | whatever comes in (\`add\` of fp16 and fp32 promotes natively) |
 
 - The fp32 parameter is cast once per region and cached; its bf16 copy feeds the matmul, and the backward
   of the cast delivers an fp32 \`.grad\` to the parameter.
-- The lists differ between devices (CPU autocast has its own); the drill computes the loss on
-  \`logits.float()\` so it is fp32 everywhere.
+- The lists differ between devices: CPU autocast (bf16) has its own, whose widest-input ops are \`cat\`,
+  \`stack\` and \`index_copy\`. The drill computes the loss on \`logits.float()\` so it is fp32 everywhere.
 - The backward runs outside the \`with\` block: autograd replays each op in the dtype its forward used.
 - Memory per parameter with Adam is 16 bytes either way: fp32 weight, fp32 gradient and two fp32 moments
-  here; fp16 weight and gradient plus fp32 master, \`m\` and \`v\` in the paper's layout. The saving is in
-  activations, which dominate at long sequence lengths.
+  here; fp16 weight and gradient plus fp32 master, \`m\` and \`v\` in the classic fp16 layout (2 + 2 + 12
+  bytes, as ZeRO counts it). The saving is in activations, which dominate at long sequence lengths.
 
 :::quiz
 Q: A model is cast with model.bfloat16() and trained with AdamW at lr=1e-5. What goes wrong first?
@@ -243,9 +247,10 @@ Q: A model is cast with model.bfloat16() and trained with AdamW at lr=1e-5. What
 
 - **On-device scale.** \`torch.amp.GradScaler\` keeps the scale and \`found_inf\` as tensors, unscales and
   checks in one fused kernel (\`_amp_foreach_non_finite_check_and_unscale_\`), and its \`update()\` resizes
-  the scale on the device: no host sync at all.
+  the scale on the device. Its one host sync is the \`.item()\` that decides whether to call
+  \`optimizer.step\`; fused Adam, AdamW and SGD take \`found_inf\` and skip on the device, removing it.
 - **Sharded master weights.** FSDP's \`MixedPrecision\` policy keeps each rank's shard of the fp32
-  weights and all-gathers bf16 copies for the forward; ZeRO does the same for the optimizer state.
+  weights and all-gathers bf16 copies for the forward; ZeRO shards the fp32 optimizer state the same way.
 - **fp8.** Hopper tensor cores multiply 8-bit floats at twice the bf16 rate. Two formats
   ([Micikevicius et al., 2022](https://arxiv.org/abs/2209.05433)): E4M3 (max 448) for weights and
   activations, E5M2 (max 57344) for gradients. Their range is so narrow that one loss scale is not enough:
@@ -273,7 +278,7 @@ Q: Why does fp8 training need a scale per tensor rather than the loss scaler's s
 - fp16 has the range of about 2⁻²⁴ to 65504; gradients below it flush to zero. bf16 has fp32's range and
   rarely needs scaling.
 - Loss scaling multiplies the loss by a power of two before \`backward\` and divides the gradients in place
-  before clipping and the step — exact, because only exponents change.
+  before clipping and the step: exact, because only exponents change.
 - A dynamic scaler treats \`inf\`/\`nan\` as a signal: skip the step, multiply by \`backoff_factor\`, reset
   the counter; grow by \`growth_factor\` after \`growth_interval\` clean steps.
 - Weights and their gradients stay fp32; \`torch.autocast\` casts per op, matmuls to 16 bits, reductions

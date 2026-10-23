@@ -4,7 +4,7 @@ import {learn} from './learn';
 import {tiledMatmulStep} from './steps/1-tiled-matmul';
 
 /**
- * Drill: the shared-memory tiled GEMM — one block per 32 × 32 output tile, the K dimension walked
+ * Drill: the shared-memory tiled GEMM: one block per 32 × 32 output tile, the K dimension walked
  * in 32-wide slabs staged in shared memory, two barriers per slab, one coalesced load per thread
  * per slab and one store per output. The kernel every dense layer, attention projection and LM
  * head reduces to, and the one cuBLAS and CUTLASS start from.
@@ -13,7 +13,7 @@ export const cudaTiledMatmulProblem: Problem = {
   id: 'cuda-tiled-matmul',
   title: 'Tiled matrix multiply with shared memory',
   tagline:
-    'C = A · B with 32 × 32 tiles staged in shared memory: coalesced loads, zero padding at the edges, two __syncthreads() per tile, 32× less global traffic than the naive kernel.',
+    'C = A · B with 32 × 32 tiles staged in shared memory: coalesced loads, zero padding at the edges, two __syncthreads() per tile, 32× fewer global loads than the naive kernel.',
   difficulty: 'medium',
   track: 'dllm',
   language: 'cuda',
@@ -38,7 +38,7 @@ second \`__syncthreads()\` protects the slab until everyone has finished with it
 
 The surface is one kernel plus the host that proves it:
 
-- \`__global__ void matmul_tiled(const float* A, const float* B, float* C, int M, int N, int K)\` —
+- \`__global__ void matmul_tiled(const float* A, const float* B, float* C, int M, int N, int K)\`:
   row-major float32, \`A[M×K]\`, \`B[K×N]\`, \`C[M×N]\`, \`constexpr int TILE = 32\`, launched with
   \`dim3 block(TILE, TILE)\` and \`dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE)\`.
 - \`matmul_naive\` with the same signature, kept as the baseline.
@@ -49,7 +49,7 @@ The surface is one kernel plus the host that proves it:
 ## What you build here
 
 1. \`matmul_tiled\`: the two shared tiles, the slab loop over \`K\` with bounds-checked, zero-padded,
-   coalesced loads, the two barriers, a register accumulator and one guarded store per output — and
+   coalesced loads, the two barriers, a register accumulator and one guarded store per output, and
    the \`dim3\` geometry that launches it.
 
 ## Run it on your machine
@@ -63,20 +63,21 @@ case, the GFLOP/s of both kernels on \`1024³\` and the tiled-vs-naive discrepan
 
 \`\`\`text
 correctness 97x75x131: tiled max|err| 3.8e-06  naive max|err| 3.8e-06  (tol 1e-03)
-bench 1024x1024x1024: naive 1830.2 GFLOP/s  tiled 5912.7 GFLOP/s (3.2x)  max|tiled - naive| 0.0e+00
+bench 1024x1024x1024: naive 1830.2 GFLOP/s  tiled 2745.6 GFLOP/s (1.5x)  max|tiled - naive| 0.0e+00
 PASS
 \`\`\`
 
-The GFLOP/s depend on the GPU; the ratio should be comfortably above 1. With the starter the tiled
-kernel writes nothing, the error on the small case is the size of the reference, and the last line is
-\`FAIL\`.
+The GFLOP/s depend on the GPU. Expect the tiled kernel to win by well under 32×: the naive kernel's
+loads are already coalesced and mostly hit the L1 cache, so Boehm measured this same pair at 1.5× on an
+RTX A6000. With the starter the tiled kernel writes nothing, the error on the small case is the size of
+the reference, and the last line is \`FAIL\`.
 
 ## Left out on purpose
 
 Register tiling (each thread computing a 4 × 4 or 8 × 8 micro-tile), larger block tiles with warp
 tiling, double-buffered loads (\`cp.async\`, TMA), tensor cores (\`mma.sync\`, \`wmma\`), swizzled
-shared-memory layouts, split-K, transposed and batched layouts, half precision — everything that takes
-this kernel from a few times the naive one to cuBLAS. Each of those sits on top of exactly the tile
+shared-memory layouts, split-K, transposed and batched layouts, half precision: everything that takes
+this kernel from about 1.5× the naive one to cuBLAS, another 8× in Boehm's worklog. Each of those sits on top of exactly the tile
 loop and the two barriers you write here.`,
   figures: [
     {
@@ -167,7 +168,7 @@ loop and the two barriers you write here.`,
                   },
                 ],
                 detail:
-                  'On-chip, per block. Every float staged here is read by 32 threads, so global traffic per output drops from `2K` to `2K / 32` floats.',
+                  'On-chip, per block. Every float staged here is read by 32 threads, so global loads per output drop from `2K` to `2K / 32` floats.',
               },
               {
                 id: 'warp',
@@ -292,7 +293,7 @@ loop and the two barriers you write here.`,
       title: 'Roofline: an insightful visual performance model for multicore architectures',
       url: 'https://dl.acm.org/doi/10.1145/1498765.1498785',
       by: 'Samuel Williams, Andrew Waterman and David Patterson',
-      date: '2009-04-01',
+      date: '2009-04',
       venue: 'Communications of the ACM',
       takes:
         'Why tiling pays: reusing each staged float `TILE` times raises the arithmetic intensity from the naive kernel’s memory-bound corner towards the compute roof.',

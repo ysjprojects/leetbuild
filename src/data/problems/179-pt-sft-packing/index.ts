@@ -337,7 +337,7 @@ Put the three files in one directory and run \`python sft_template.py\`, \`pytho
       date: '2021-06-29',
       venue: 'arXiv',
       takes:
-        'Packing as bin packing and the cross-contamination a plain causal mask causes, which `pack` and `document_causal_mask` avoid with restarted positions and a block-diagonal mask.',
+        'Packing as bin packing, and the cross-contamination between sequences that share a row, which `pack` and `document_causal_mask` avoid with restarted positions and a block-diagonal mask.',
     },
     {
       kind: 'paper',

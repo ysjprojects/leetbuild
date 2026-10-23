@@ -3,7 +3,7 @@ import type {Step} from '@/lib/types';
 /** `__expf(a - b)` / `expf(a - b)`: the exponent is taken of a difference, one level of parentheses allowed inside. */
 const EXP_OF_DIFFERENCE = /_{0,2}expf\(\s*[^()\s](?:[^()]|\([^()]*\))*?\s*-\s*(?:[^()]|\([^()]*\))+\)/;
 
-/** `exp` of a bare element load — the row max was not subtracted. */
+/** `exp` of a bare element load: the row max was not subtracted. */
 const RAW_EXP = /_{0,2}expf\(\s*\w+\s*\[[^\]]*\]\s*\)/;
 
 /** A warp shuffle, butterfly or tree. */
@@ -37,8 +37,8 @@ The warp level in its \`__shfl_down_sync\` tree form, stepped through as a sum; 
 
 :::widget warp-reduce
 
-- **Pass 2, the sum**: each thread accumulates \`__expf(x − m)\` (or \`expf\`) over its elements — write the
-  subtraction *inside* the call — then a second block reduction, \`+\` instead of \`fmaxf\`, through its own
+- **Pass 2, the sum**: each thread accumulates \`__expf(x − m)\` (or \`expf\`) over its elements (write the
+  subtraction *inside* the call), then a second block reduction, \`+\` instead of \`fmaxf\`, through its own
   shared slots.
 - **Pass 3, the write**: \`y = __expf(x − m) / sum\`. Recompute the exponent (the row sits in L1/L2 by now) or
   keep the values in registers when \`cols\` fits a per-thread budget; either is accepted.
@@ -53,20 +53,20 @@ The warp level in its \`__shfl_down_sync\` tree form, stepped through as a sum; 
   (\`max |gpu − cpu| < 1e-5\`, \`max |row sum − 1| < 1e-4\`, masked row all zeros, no NaN), times 50 launches
   with \`cudaEvent\`s and prints \`PASS\`.
 
-> \`exp(x − m) / Σ exp(x − m)\` is the same number as \`exp(x) / Σ exp(x)\` — the shift cancels — but its largest
+> \`exp(x − m) / Σ exp(x − m)\` is the same number as \`exp(x) / Σ exp(x)\` (the shift cancels), but its largest
 > exponent is \`0\`, so nothing overflows and the sum sits in \`[1, cols]\`. That one subtraction is why the
 > row max has to be known before the first \`exp\`, and why softmax is two reductions, not one.`,
   hints: [
     'Write `warp_max(v)` and `warp_sum(v)` first: five rounds of `v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, offset))` (or `v +=`) for `offset = 16, 8, 4, 2, 1`. After the loop every lane holds the warp’s result, so lane 0 can write it to `shared[warp]` with no further exchange.',
     'A block reduction is: warp reduce → `if (lane == 0) shared[warp] = v` → `__syncthreads()` → warp 0 loads `shared[lane]` (or the identity, `-INFINITY` / `0.f`, for lanes past the warp count) and warp-reduces again → thread 0 writes `shared[0]` → `__syncthreads()` → everyone returns `shared[0]`. Give the max and the sum separate shared arrays so the second never races the first.',
-    'Handle the masked row with two guards after the reductions: `if (m == -INFINITY) m = 0.f;` so `exp(-inf − m)` is `0`, and `inv = sum > 0.f ? 1.f / sum : 0.f;` so the write is `0 × 0`, not `0 / 0`. Then `y = __expf(x − m) * inv`.',
+    'Handle the fully masked row with two guards after the reductions, one per failure: when the row max is still `-INFINITY`, shift by `0` instead, so every term is `__expf(-inf) = 0` rather than `-inf − (-inf) = NaN`; and take a reciprocal of the sum that is `0` when the sum is `0`, so the write multiplies `0 × 0` instead of dividing `0 / 0`.',
   ],
   checks: [
     {
       id: 'one-block-per-row',
       title: 'One block owns one row; threads stride the row',
       detail:
-        'The row index is `blockIdx.x`, each thread visits `c = threadIdx.x, threadIdx.x + blockDim.x, …` below `cols`, and the launch is `LAUNCH(softmax_rows, rows, THREADS, …)` — any `cols` works, including 1000 with 256 threads, and no two blocks share a row.',
+        'The row index is `blockIdx.x`, each thread visits `c = threadIdx.x, threadIdx.x + blockDim.x, …` below `cols`, and the launch is `LAUNCH(softmax_rows, rows, THREADS, …)`: any `cols` works, including 1000 with 256 threads, and no two blocks share a row.',
       match: {
         cuda: {all: [/=\s*blockIdx\.x\s*;/, /\+=\s*blockDim\.x\b/, /LAUNCH\(\s*softmax_rows\s*,\s*rows\b/]},
       },
@@ -75,7 +75,7 @@ The warp level in its \`__shfl_down_sync\` tree form, stepped through as a sum; 
       id: 'max-before-exp',
       title: 'exp is taken of x − m, after the row max is known',
       detail:
-        'Every `__expf`/`expf` call takes a difference, `x[c] − m`, and the block-wide `fmaxf` reduction appears before the first `exp` — `exp` of a raw element overflows at 88.7 (row 0 reaches 1e4), and double `exp(` is forbidden in the kernel.',
+        'Every `__expf`/`expf` call takes a difference, `x[c] − m`, and the block-wide `fmaxf` reduction appears before the first `exp`: `exp` of a raw element overflows above 88.7 (row 0 reaches 1e4), and double `exp(` is forbidden in the kernel.',
       match: {
         cuda: {
           all: [EXP_OF_DIFFERENCE],
@@ -88,7 +88,7 @@ The warp level in its \`__shfl_down_sync\` tree form, stepped through as a sum; 
       id: 'warp-shuffles',
       title: 'Both reductions go through warp shuffles',
       detail:
-        'The max is reduced with `fmaxf` over `__shfl_xor_sync`/`__shfl_down_sync` and the sum with `+` over the same — no `cub::BlockReduce`, `thrust::`, cuDNN or cuBLAS. Shuffles keep the first 5 rounds of each reduction in registers, no shared memory and no barrier.',
+        'The max is reduced with `fmaxf` over `__shfl_xor_sync`/`__shfl_down_sync` and the sum with `+` over the same, with no `cub::BlockReduce`, `thrust::`, cuDNN or cuBLAS. Shuffles keep the first 5 rounds of each reduction in registers, no shared memory and no barrier.',
       match: {
         cuda: {all: [SHUFFLE, MAX_SHUFFLE, SUM_SHUFFLE], none: [/cub::|thrust::|cudnn|cublas/i]},
       },
@@ -97,7 +97,7 @@ The warp level in its \`__shfl_down_sync\` tree form, stepped through as a sum; 
       id: 'block-reduce-shared',
       title: 'Warp partials cross the block through shared memory and barriers',
       detail:
-        'Lane 0 of each warp writes its partial to `__shared__ float` slots, a `__syncthreads()` separates the write from the read, and a second barrier publishes the final value — at least two barriers in the file, one per hand-off. Without them a warp reads a slot another warp has not written yet.',
+        'Lane 0 of each warp writes its partial to `__shared__ float` slots, a `__syncthreads()` separates the write from the read, and a second barrier publishes the final value: at least two barriers in the file, one per hand-off. Without them a warp reads a slot another warp has not written yet.',
       match: {
         cuda: {all: [/__shared__\s+float/, /__syncthreads\(\)[\s\S]*__syncthreads\(\)/]},
       },
@@ -106,7 +106,7 @@ The warp level in its \`__shfl_down_sync\` tree form, stepped through as a sum; 
       id: 'masked-row',
       title: 'A fully masked row gives zeros, not NaN',
       detail:
-        'The local max starts at `-INFINITY` and the kernel guards the all-`-inf` case: `m == -INFINITY`, `isinf(m)`, or a test of the sum against zero before the division — row 1 of the self-test must come back as zeros and the output must contain no NaN.',
+        'The local max starts at `-INFINITY` and the kernel guards the all-`-inf` case (`m == -INFINITY`, `isinf(m)`, or a test of the sum against zero before the division): row 1 of the self-test must come back as zeros and the output must contain no NaN.',
       match: {
         cuda: {
           all: [
@@ -131,7 +131,7 @@ The warp level in its \`__shfl_down_sync\` tree form, stepped through as a sum; 
   ],
   code: {
     cuda: {
-      starter: `// row_softmax.cu — row-wise softmax: one block per row, two block reductions, exp(x - max) so nothing overflows.
+      starter: `// row_softmax.cu: row-wise softmax, one block per row, two block reductions, exp(x - max) so nothing overflows.
 //   nvcc -O2 -o row_softmax row_softmax.cu && ./row_softmax
 #include <cuda_runtime.h>
 
@@ -162,11 +162,11 @@ constexpr int THREADS = 256;  // threads per block = per row; a multiple of 32
 // y[r][c] = exp(x[r][c] - m_r) / sum_c exp(x[r][c] - m_r), m_r = max_c x[r][c]. One block per row.
 __global__ void softmax_rows(const float* __restrict__ x, float* __restrict__ y, int rows, int cols) {
   // TODO: row = blockIdx.x; threads stride the row: c = threadIdx.x; c < cols; c += blockDim.x.
-  // TODO: pass 1 — local max from -INFINITY, warp max with fmaxf + __shfl_xor_sync, lane 0 of each warp
+  // TODO: pass 1: local max from -INFINITY, warp max with fmaxf + __shfl_xor_sync, lane 0 of each warp
   //       into __shared__ memory, __syncthreads, warp 0 reduces the partials, every thread reads m back.
-  // TODO: pass 2 — local sum of __expf(x - m), a second block reduction with + through its own shared slots.
+  // TODO: pass 2: local sum of __expf(x - m), a second block reduction with + through its own shared slots.
   // TODO: a fully masked row (m == -INFINITY, sum == 0) must come out as zeros, not NaN.
-  // TODO: pass 3 — y = __expf(x - m) / sum.
+  // TODO: pass 3: y = __expf(x - m) / sum.
 }
 
 // ---- self-test: do not change below this line ----------------------------------------------------
@@ -197,7 +197,7 @@ int main() {
   std::vector<double> ref(n);
   std::srand(0);
   for (size_t i = 0; i < n; ++i) h_x[i] = 6.f * std::rand() / RAND_MAX - 3.f;  // U(-3, 3)
-  // Row 0: magnitudes of 1e4 — exp(1e4) is inf in fp32; only exp(x - max) survives.
+  // Row 0: magnitudes of 1e4; exp(1e4) is inf in fp32, only exp(x - max) survives.
   for (int c = 0; c < cols; ++c) h_x[c] = 1e4f * (2.f * std::rand() / RAND_MAX - 1.f);
   // Row 1: fully masked, as a padding mask leaves it; must come out as zeros, not NaN.
   std::fill(h_x.begin() + (size_t)1 * cols, h_x.begin() + (size_t)2 * cols, -INFINITY);
@@ -256,7 +256,7 @@ int main() {
   return ok ? 0 : 1;
 }
 `,
-      solution: `// row_softmax.cu — row-wise softmax: one block per row, two block reductions, exp(x - max) so nothing overflows.
+      solution: `// row_softmax.cu: row-wise softmax, one block per row, two block reductions, exp(x - max) so nothing overflows.
 //   nvcc -O2 -o row_softmax row_softmax.cu && ./row_softmax
 #include <cuda_runtime.h>
 
@@ -379,7 +379,7 @@ int main() {
   std::vector<double> ref(n);
   std::srand(0);
   for (size_t i = 0; i < n; ++i) h_x[i] = 6.f * std::rand() / RAND_MAX - 3.f;  // U(-3, 3)
-  // Row 0: magnitudes of 1e4 — exp(1e4) is inf in fp32; only exp(x - max) survives.
+  // Row 0: magnitudes of 1e4; exp(1e4) is inf in fp32, only exp(x - max) survives.
   for (int c = 0; c < cols; ++c) h_x[c] = 1e4f * (2.f * std::rand() / RAND_MAX - 1.f);
   // Row 1: fully masked, as a padding mask leaves it; must come out as zeros, not NaN.
   std::fill(h_x.begin() + (size_t)1 * cols, h_x.begin() + (size_t)2 * cols, -INFINITY);
@@ -440,5 +440,5 @@ int main() {
 `,
     },
   },
-  debrief: `Softmax is two reductions and a map, and the whole design follows from the order they must run in. \`exp(x)\` overflows fp32 at \`x > 88.7\`, and attention logits, output-head logits and loss inputs routinely exceed that; \`exp(x − m) / Σ exp(x − m)\` is algebraically the same number with its largest exponent pinned at \`0\`, so the max has to be known before the first \`exp\` can be taken — pass 1 is the max, pass 2 the sum, pass 3 the write. **One block per row** makes each reduction a block reduction with no global atomics and no second launch: the threads of the block stride the row so consecutive threads read consecutive floats (coalesced), the first five rounds of each reduction stay in registers through \`__shfl_xor_sync\` — a butterfly, so every lane ends with the result and lane 0 needs no extra exchange — and the eight warp partials cross through shared memory with a \`__syncthreads()\` on each side. The two reductions get **separate shared slots** because the sum's first write would otherwise race the max's last read; the alternative is a third barrier. Reading the row three times costs almost nothing: 4 KB per row sits in L1/L2 after pass 1, so the kernel moves 8 bytes per element through HBM and runs at memory bandwidth. The **masked row** is the edge every attention kernel meets — a padding mask sets a whole row to \`-inf\`, \`fmaxf\` gives \`m = -inf\`, and \`-inf − (-inf)\` is NaN — so the kernel shifts by \`0\` instead and writes \`0 × 0\` rather than \`0 / 0\`. \`__expf\` is the SFU's \`ex2.approx\` with a multiply, a few ulp off \`expf\` but five times cheaper; the self-test's \`1e-5\` tolerance is loose enough for it. PyTorch's \`torch.softmax\` runs this shape (\`cunn_SoftMaxForward\`) for wide rows and a **persistent** variant for \`dim ≤ 1024\` that keeps the row in registers across all three passes; Triton's fused-softmax tutorial is the same kernel in a dozen lines. FlashAttention never materialises the row at all: the **online softmax** of Milakov and Gimelshein keeps a running max and rescales the running sum by \`exp(m_old − m_new)\` each time the max moves, folding both reductions into one pass over the tiles of \`QKᵀ\`.`,
+  debrief: `Softmax is two reductions and a map, and the whole design follows from the order they must run in. \`expf(x)\` overflows fp32 above \`x ≈ 88.72\` (\`ln FLT_MAX\`), and attention logits, output-head logits and loss inputs routinely exceed that; \`exp(x − m) / Σ exp(x − m)\` is algebraically the same number with its largest exponent pinned at \`0\`, so the max has to be known before the first \`exp\` can be taken: pass 1 is the max, pass 2 the sum, pass 3 the write. **One block per row** makes each reduction a block reduction with no global atomics and no second launch: the threads of the block stride the row so consecutive threads read consecutive floats (coalesced), the first five rounds of each reduction stay in registers through \`__shfl_xor_sync\` (a butterfly, so every lane ends with the result; \`__shfl_down_sync\` leaves it only in lane 0, which is all this kernel needs, since the final value is broadcast through shared memory anyway), and the eight warp partials cross through shared memory with a \`__syncthreads()\` on each side. The two reductions get **separate shared slots** because the sum's first write would otherwise race the max's last read; the alternative is a third barrier. Reading the row three times costs almost nothing: 4 KB per row sits in L1/L2 after pass 1, so the kernel moves 8 bytes per element through HBM and runs at memory bandwidth. The **masked row** is the edge every attention kernel meets (a padding mask sets a whole row to \`-inf\`, \`fmaxf\` gives \`m = -inf\`, and \`-inf − (-inf)\` is NaN), so the kernel shifts by \`0\` instead and writes \`0 × 0\` rather than \`0 / 0\`; FlashAttention's \`softmax.h\` has the same \`max == -INFINITY ? 0\` guard. \`__expf\` is the fast intrinsic (a multiply by \`log2 e\` and the SFU's \`ex2.approx\`), with a maximum error of \`2 + ⌊|1.173·x|⌋\` ulp against \`expf\`'s 2; over the \`[−6, 0]\` exponents of the uniform rows that is at most 9 ulp, and where \`x − m\` is very negative the term is too small to matter, so the self-test's \`1e-5\` tolerance holds. PyTorch's \`torch.softmax\` (2.9) runs a warp-per-row **persistent** kernel that keeps the row in registers for rows up to 2,048 elements and 8 KB, so this drill's 1,000-column rows would take that path; wider rows get one block per row, with the row cached in registers (\`cunn_SoftMaxForwardReg\`), in shared memory (\`cunn_SoftMaxForwardSmem\`) or re-read from global memory as here (\`cunn_SoftMaxForward\`). Triton's fused-softmax tutorial is the same row-per-program kernel in a dozen lines. FlashAttention never materialises the row at all: the **online softmax** of Milakov and Gimelshein keeps a running max and rescales the running sum by \`exp(m_old − m_new)\` each time the max moves, folding both reductions into one pass over the tiles of \`QKᵀ\`.`,
 };

@@ -6,15 +6,28 @@
  */
 export const learn = `# The mechanism at a glance
 
-A transformer MLP is \`W₂ · gelu(W₁x + b₁) + b₂\`. Between the two matrix multiplies sits an elementwise
-step — add the bias, apply the GELU — over an activation of \`tokens × 4·d_model\` floats. For GPT-2 small at
-4096 tokens that is 4096 × 3072 = 12,582,912 elements, 48 MiB. The step does almost no arithmetic per byte,
-so its speed is set by how many bytes it moves and how it asks for them.
+A transformer MLP is \`W₂ · gelu(W₁x + b₁) + b₂\`. Between the two matrix multiplies sits an **elementwise**
+step (each output element depends only on the inputs at its own position): add the bias, apply
+the GELU. It runs over an activation of \`tokens × 4·d_model\` floats. For GPT-2 small at 4096 tokens that is
+4096 × 3072 = 12,582,912 elements, 48 MiB. The step does almost no arithmetic per byte, so its speed is set
+by how many bytes it moves through **HBM** (the GPU's main memory, the gigabytes of DRAM beside the chip)
+and how it asks for them.
 
-One launch over the activation: a grid of 12,288 blocks of 256 threads, each thread one \`float4\` of \`x\`,
+The terms this guide uses:
+
+| Term | Meaning here |
+|---|---|
+| \`float4\` | CUDA's built-in struct of four floats, \`.x .y .z .w\`, 16 bytes. One \`float4\` access moves four floats with one instruction. |
+| lane | one of the four floats inside a \`float4\` |
+| warp | 32 threads of a block that execute each instruction together; their memory requests are served together |
+| alignment | an address is 16-byte aligned when it is a multiple of 16; a \`float4\` load needs that |
+| tail | the last \`n % 4\` elements, too few to fill a \`float4\`, handled by scalar code |
+| \`__restrict__\` | a promise to the compiler that no other pointer in the kernel touches the same memory |
+
+One launch covers the activation: a grid of 12,288 blocks of 256 threads, each thread one \`float4\` of \`x\`,
 three blocks to a row of 3072 floats. Every thread adds the bias lanes that sit over its four columns and
-applies the GELU in registers, so \`x\` is read once and \`y\` written once. A scalar kernel picks up the last
-\`n % 4\` elements when there are any.
+applies the GELU in registers, so \`x\` is read once and \`y\` written once. A scalar kernel picks up the tail
+when there is one.
 
 :::gpu
 {
@@ -61,10 +74,21 @@ GELU(v) ≈ 0.5 · v · (1 + tanh(√(2/π) · (v + 0.044715 · v³)))          
 √(2/π) = 0.7978845608…   →   0.79788456f in the kernel
 \`\`\`
 
-Unlike ReLU it is smooth and slightly negative left of zero. GPT-2 and BERT shipped with the tanh form
-because \`erf\` was slow in their frameworks; the checkpoints were trained with it, so inference has to match
-it — which is why PyTorch's [\`nn.GELU\`](https://pytorch.org/docs/stable/generated/torch.nn.GELU.html) takes
-\`approximate="tanh"\`.
+Unlike ReLU it is smooth and slightly negative left of zero. The paper offers the tanh form as a faster
+stand-in for \`erf\`; the original GPT-2 and BERT code use it, the checkpoints were trained with it, and so
+inference has to match it. That is why PyTorch's
+[\`nn.GELU\`](https://pytorch.org/docs/stable/generated/torch.nn.GELU.html) takes \`approximate="tanh"\`.
+
+One value by hand, \`v = 1\`, in the order the kernel computes it:
+
+\`\`\`text
+cube term   0.044715 · 1³                 = 0.044715
+inner       0.79788456 · (1 + 0.044715)   = 0.833562
+tanh        tanh(0.833562)                = 0.682384
+GELU        0.5 · 1 · (1 + 0.682384)      = 0.841192
+\`\`\`
+
+The exact GELU gives \`Φ(1) = 0.841345\`, so the two forms already differ in the fourth decimal:
 
 | v | exact (erf) | tanh form | difference |
 |---|---|---|---|
@@ -74,42 +98,66 @@ it — which is why PyTorch's [\`nn.GELU\`](https://pytorch.org/docs/stable/gene
 | 1 | 0.84134 | 0.84119 | 1.5e-4 |
 | 3 | 2.99595 | 2.99636 | 4.1e-4 |
 
-- The two forms differ by up to about 4.7e-4 — fifty times the drill's 1e-5 tolerance. Swapping in \`erff\` or
-  \`normcdff\` is not a faster equivalent; it is a different function.
-- \`tanhf\`, not \`tanh\`: on a \`float\` argument in device code, \`tanh\` may resolve to the double routine. Double
-  throughput on consumer GPUs is 1/32 or 1/64 of float.
-- \`__forceinline__\` puts the body inline in all four lanes, so nothing is a call; the cube is two multiplies,
-  the polynomial an FMA.
+- The largest gap is about 4.7e-4, at \`|v| ≈ 2.7\`: 47 times the drill's 1e-5 tolerance. Swapping in \`erff\`
+  or \`normcdff\` is not a faster equivalent; it is a different function.
+- Stay in \`float\`: write \`tanhf\` and put an \`f\` on every literal. An unsuffixed \`0.044715\` is a \`double\`,
+  so \`0.044715 * v\` is computed in double and the whole expression, \`tanh\` included, follows it
+  ([Best Practices Guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#promotions-to-doubles-and-truncations-to-floats)).
+  Double throughput on consumer GPUs is 1/32 or 1/64 of float.
+- \`__forceinline__\` pastes the body into each of the four lanes' code, so there is no function call; the cube
+  is two multiplies and \`v + 0.044715f · v³\` one FMA (fused multiply-add).
 
 :::quiz
 Q: A colleague replaces tanhf with erff "because it is the exact GELU". What happens to the self-test?
-- [ ] Nothing — erff is more accurate, so the error shrinks
-- [x] It fails — the reference is the tanh form, and the two differ by up to ~4.7e-4
+- [ ] Nothing: erff is more accurate, so the error shrinks
+- [x] It fails: the reference is the tanh form, and the two differ by up to ~4.7e-4
 - [ ] It passes but runs slower
-> The CPU reference is 0.5·v·(1 + tanh(…)) in double. The exact GELU is a different curve; near |v| = 2–3 it is off the reference by about forty times the 1e-5 bound. Models trained with one form expect that form.
+> The CPU reference is 0.5·v·(1 + tanh(…)) in double. The exact GELU is a different curve; near |v| = 2.7 it is off the reference by about 47 times the 1e-5 bound. Models trained with one form expect that form.
 :::
 
-# Memory-bound: arithmetic intensity and the roofline
+# Memory-bound or compute-bound: arithmetic intensity and the roofline
 
-The [roofline model](https://dl.acm.org/doi/10.1145/1498765.1498785) bounds a kernel's speed by the smaller
-of two ceilings: peak FLOP/s, and peak bandwidth × **arithmetic intensity** (FLOPs per byte moved). The
-crossover — the ridge point — is peak FLOP/s ÷ peak bandwidth.
+A kernel spends time on two things: moving bytes between HBM and the chip, and doing arithmetic. The GPU
+overlaps them, so the run time is roughly the larger of the two:
 
-| Quantity | fused GELU | H100 SXM |
-|---|---|---|
-| bytes per element (HBM) | 4 read + 4 written = 8 | — |
-| FLOPs per element | ~20 (cube, FMA, \`tanhf\`, scale) | — |
-| arithmetic intensity | ~2.5 FLOP/byte | — |
-| peak FP32 / peak bandwidth | — | ~67 TFLOP/s / 3.35 TB/s |
-| ridge point | — | ~20 FLOP/byte |
+\`\`\`text
+time_memory  = bytes moved ÷ peak bandwidth
+time_compute = FLOPs ÷ peak FLOP/s
+time         ≈ max(time_memory, time_compute)
+\`\`\`
 
-- At 2.5 FLOP/byte the kernel sits far left of the ridge: the ALUs are idle most of the time, waiting on
-  memory. Making \`gelu_tanh\` cheaper would not change the run time; moving fewer bytes, or moving them
-  more efficiently, would.
+A kernel is **memory-bound** when \`time_memory\` is the larger: its ALUs wait on data, and only fewer bytes
+(or bytes requested more efficiently) make it faster. It is **compute-bound** when \`time_compute\` is the
+larger: only fewer FLOPs, or faster ones, help. Which one wins depends on the ratio
+**arithmetic intensity** = FLOPs ÷ bytes moved. Dividing the two times shows the switch happens at
+intensity = peak FLOP/s ÷ peak bandwidth, the **ridge point**. The
+[roofline model](https://dl.acm.org/doi/10.1145/1498765.1498785) draws exactly this: attainable FLOP/s is
+the smaller of peak FLOP/s and bandwidth × intensity.
+
+| Quantity | Value |
+|---|---|
+| bytes per element (HBM), fused GELU | 4 read + 4 written = 8 |
+| FLOPs per element | ~20 (bias add, cube, FMA, scale, \`tanhf\`, \`1 +\`, two multiplies) |
+| arithmetic intensity | 20 ÷ 8 ≈ 2.5 FLOP/byte |
+| H100 SXM peak FP32 · peak bandwidth | ~67 TFLOP/s · 3.35 TB/s |
+| H100 SXM ridge point | 67 ÷ 3.35 = 20 FLOP/byte |
+
+Worked through for the full activation on an H100 SXM, \`n = 12,582,912\`:
+
+\`\`\`text
+time_memory  = 8 B × 12,582,912 ÷ 3.35e12 B/s    = 100,663,296 B ÷ 3.35e12 ≈ 30 µs
+time_compute = 20 × 12,582,912 ÷ 67e12 FLOP/s    = 251,658,240 ÷ 67e12     ≈ 3.8 µs
+\`\`\`
+
+- Memory takes eight times longer than arithmetic: the kernel is memory-bound, sitting at 2.5 FLOP/byte,
+  far left of the ridge at 20. Making \`gelu_tanh\` cheaper would not change the run time; moving fewer
+  bytes, or moving them more efficiently, would.
 - The bias is 3072 floats, 12 KiB. Every row reads the same 12 KiB, so after the first row it is served
-  from L1/L2 and its HBM cost rounds to zero — which is why the drill counts \`8 × n\` bytes, not 12.
-- A GEMM sits at the opposite end: hundreds of FLOP/byte. That is why the MLP's time goes to the matmuls
-  and why the elementwise step between them must not add a second or third pass over the activation.
+  from the on-chip caches (L1/L2) and its HBM cost rounds to zero. That is why the drill counts
+  \`8 × n\` bytes, not 12.
+- A GEMM sits at the opposite end: hundreds of FLOP/byte, compute-bound. That is why the MLP's time goes
+  to the matmuls and why the elementwise step between them must not add a second or third pass over the
+  activation.
 
 The kernels of this track on one roofline; pick a GPU and see how far left of the ridge an elementwise
 op sits next to a matmul:
@@ -118,18 +166,19 @@ op sits next to a matmul:
 
 :::quiz
 Q: You replace tanhf with a cheaper polynomial and halve the FLOPs per element. Roughly how much faster does the kernel get on an H100?
-- [ ] About 2× — half the work
-- [x] Barely at all — it was waiting on HBM, not on arithmetic
-- [ ] Slower — polynomials diverge
-> At ~2.5 FLOP/byte against a ridge of ~20, the run time is bytes ÷ bandwidth. Halving FLOPs moves the kernel further left on the roofline but leaves the bandwidth ceiling where it was.
+- [ ] About 2×: half the work
+- [x] Barely at all: it was waiting on HBM, not on arithmetic
+- [ ] Slower: polynomials diverge
+> time_compute drops from ~3.8 µs to ~1.9 µs, but time_memory stays ~30 µs and the larger one sets the run time. Halving FLOPs moves the kernel further left on the roofline; the bandwidth ceiling is where it was.
 :::
 
 # Fusion: one read, one write
 
-Eager PyTorch runs \`x + b\` and \`F.gelu\` as two kernels. The intermediate \`x + b\` is a full activation
-that has to be written to HBM by the first and read back by the second. Side by side, from the same \`x\`
-to the same \`y\`: above, every arrow is a 48 MiB pass over HBM; below, the sum lives in the four lanes of
-a \`float4\` register and only \`x\` and \`y\` cross the memory boundary.
+Written as \`x + b\` and then \`F.gelu(t, approximate="tanh")\`, eager PyTorch runs two kernels, each a full
+pass over the activation. The intermediate \`t = x + b\` is written to HBM by the first and read back by the
+second. Side by side, from the same \`x\` to the same \`y\`: above, every arrow is a 48 MiB pass over HBM;
+below, the sum lives in the four lanes of a \`float4\` register and only \`x\` and \`y\` cross the memory
+boundary.
 
 :::gpu
 {
@@ -172,14 +221,27 @@ a \`float4\` register and only \`x\` and \`y\` cross the memory boundary.
 }
 :::
 
-| Implementation | kernels | HBM bytes per element | for 4096 × 3072 |
-|---|---|---|---|
-| GELU spelled out op by op (\`v**3\`, \`*\`, \`+\`, \`tanh\`, …) plus bias | ~8 | ~64 | ~768 MiB |
-| \`x + b\` then \`F.gelu(approximate="tanh")\` | 2 | 16 | 192 MiB |
-| fused \`gelu_bias_kernel\` | 1 | 8 | 96 MiB |
+Count the bytes for one element, kernel by kernel:
 
-On a memory-bound op, bytes are time: the fused kernel is about twice as fast as the two-kernel version
-without any change to the arithmetic.
+\`\`\`text
+unfused   add kernel    read x[i] 4 B + write t[i] 4 B   =  8 B
+          gelu kernel   read t[i] 4 B + write y[i] 4 B   =  8 B
+          total                                         = 16 B
+fused     one kernel    read x[i] 4 B + write y[i] 4 B   =  8 B
+\`\`\`
+
+Multiply by \`n = 12,582,912\` and divide by the H100's 3.35 TB/s:
+
+| Implementation | kernels | HBM bytes per element | for 4096 × 3072 | time at 3.35 TB/s |
+|---|---|---|---|---|
+| GELU spelled out op by op (\`x + b\`, \`t**3\`, \`*\`, \`+\`, \`*\`, \`tanh\`, \`1 +\`, \`0.5 *\`, \`*\`) | 9 | ~80 | ~960 MiB | ~300 µs |
+| \`x + b\` then \`F.gelu(approximate="tanh")\` | 2 | 16 | 192 MiB (201,326,592 B) | ~60 µs |
+| fused \`gelu_bias_kernel\` | 1 | 8 | 96 MiB (100,663,296 B) | ~30 µs |
+
+The bias adds 12 KiB per kernel at most, 0.01 % of the total, so it is left out. On a memory-bound op,
+bytes are time: the fused kernel is about twice as fast as the two-kernel version without any change to the
+arithmetic. (In a real \`nn.Linear\` the bias is usually folded into the matmul call; the point here is the
+round trip of any intermediate.)
 
 :::quiz
 Q: Why does fusing the bias add into the GELU halve the run time even though the arithmetic is unchanged?
@@ -191,19 +253,33 @@ Q: Why does fusing the bias add into the GELU halve the run time even though the
 
 # float4, alignment and the tail
 
-Fusion fixes how many bytes move; vectorising fixes how they are requested.
-[Vectorised loads](https://developer.nvidia.com/blog/cuda-pro-tip-increase-performance-with-vectorized-memory-access/)
-make each thread fetch a \`float4\` — one 128-bit \`LDG.E.128\` instead of four 32-bit loads. The bytes are
-the same; the instructions issued per byte drop by four, and each warp keeps 512 bytes in flight per load
-instead of 128, which is what it takes to saturate HBM.
+Fusion fixes how many bytes move; vectorising fixes how they are requested. A scalar kernel has each
+thread load one \`float\`, a 4-byte load instruction; the 32 threads of a warp together ask for 128
+contiguous bytes. [Vectorised loads](https://developer.nvidia.com/blog/cuda-pro-tip-increase-performance-with-vectorized-memory-access/)
+make each thread fetch a \`float4\` instead: one 128-bit load (\`LDG.E.128\` in the machine code) in place of
+four 32-bit ones, so a warp asks for 512 bytes per instruction. The bytes are the same; the load
+instructions per byte drop by four, and each warp keeps more bytes in flight while it waits. The gain is
+usually modest on a large array (many resident warps already hide the wait) and grows when few warps fit.
 
-The rules that make \`reinterpret_cast<const float4*>(x)\` legal:
+In code, the cast happens once on the host and the kernel indexes whole vectors:
 
-- **Alignment.** A 16-byte load needs a 16-byte-aligned address, or the kernel dies with a misaligned
-  address error. \`cudaMalloc\` returns 256-byte-aligned memory; \`x + 1\` is not 16-aligned.
+\`\`\`cpp
+const float4* x4 = reinterpret_cast<const float4*>(x);   // same bytes, viewed 16 at a time
+float4 v = x4[i];                                         // floats 4i, 4i+1, 4i+2, 4i+3
+\`\`\`
+
+Three rules make that cast legal:
+
+- **Alignment.** The hardware serves a 16-byte load from one 16-byte slot of memory, so the address must
+  be a multiple of 16, or the kernel dies with a misaligned-address error. \`cudaMalloc\` returns memory
+  aligned to at least 256 bytes; \`x + 1\` (4 bytes further) is not 16-aligned.
 - **The bias lanes line up.** With \`cols % 4 == 0\`, the four lanes of \`x[i]\` are columns
-  \`4·(i % cols4)\` … \`+3\` of one row — exactly the four lanes of \`bias[i % cols4]\`.
-- **The tail.** \`n / 4\` vectors cover \`4 · n4\` elements; the last \`n % 4\` need scalar code.
+  \`4·(i % cols4)\` … \`+3\` of one row: exactly the four lanes of \`bias[i % cols4]\`. With \`cols = 3072\`,
+  \`cols4 = 768\`; vector \`i = 770\` is row 1, columns 8 … 11, and \`bias[770 % 768] = bias[2]\` holds
+  \`bias\` columns 8 … 11.
+- **The tail.** \`n4 = n / 4\` vectors cover \`4 · n4\` elements; the last \`n % 4\` (zero to three) need scalar
+  code. Here that is a second, tiny kernel. A loop over the leftovers at the end of the main kernel, run by
+  one thread, is the other common form.
 
 For \`n = 1,000,003\` the split is two launches over two ranges of \`y\`. The last block of the vector
 kernel has 112 threads past \`n4\` (dimmed): without the guard they would load past the end. The tail
@@ -237,23 +313,28 @@ self-test fails.
 :::
 
 The correct host code launches the guarded vector kernel over 250,000 threads and then
-\`gelu_bias_tail_kernel<<<1, 3>>>\` from \`start = 1,000,000\`. The alternative — padding the buffer to a
-multiple of four — moves the problem to every allocator in the stack.
+\`gelu_bias_tail_kernel<<<1, 3>>>\` from \`start = 1,000,000\`. The alternative, padding the buffer to a
+multiple of four, moves the problem to every allocator in the stack.
 
-:::details What __restrict__ buys
-Without it, the compiler must assume \`y\` might alias \`x\` or \`bias\`: a store to \`y[i]\` could change a later
-load, so loads cannot be hoisted above stores, and \`x\` cannot be routed through the read-only (non-coherent)
-data path. Marking all three pointers \`__restrict__\` is a promise that they do not overlap; the compiler can
-issue both 16-byte loads before any arithmetic and use \`LDG.E.128.CONSTANT\`. Break the promise — call
-\`gelu_bias(x, b, x + 4, …)\` — and the result is undefined.
-:::
+## What __restrict__ promises
+
+\`__restrict__\` on a pointer promises the compiler that, inside this kernel, the memory it points to is
+reached through no other pointer. Without it the compiler must assume \`y\` might overlap \`x\` or \`bias\`, so a
+store to \`y\` could change what a later load returns. Two things follow from the promise:
+
+- \`const float4* __restrict__\` tells the compiler the data is read-only for the whole kernel, so it may
+  route the loads through the read-only (non-coherent) data path (\`ld.global.nc\` in PTX).
+- In kernels with several stores or a loop, loads may move above earlier stores. Here each thread does
+  its two loads before its one store anyway, so this part buys little; the read-only path is the gain.
+
+Break the promise (call \`gelu_bias(x, b, x + 4, …)\`) and the result is undefined.
 
 :::quiz
 Q: The host calls gelu_bias(d_x + 2, d_b, d_y, n - 2, cols). What goes wrong?
-- [ ] Nothing — the tail kernel absorbs the offset
-- [x] d_x + 2 is 8-byte aligned, so the float4 loads are misaligned and the launch faults
+- [ ] Nothing: the tail kernel absorbs the offset
+- [x] d_x + 2 is 8-byte aligned, so the float4 loads are misaligned and the kernel faults
 - [ ] Only the bias lanes are shifted
-> A float4 load requires a 16-byte-aligned address. cudaMalloc guarantees it for the base pointer; an offset of two floats breaks it. Real libraries check alignment and fall back to the scalar path.
+> A float4 load requires a 16-byte-aligned address. cudaMalloc guarantees it for the base pointer; an offset of two floats (8 bytes) breaks it, and the next synchronising call returns a misaligned-address error. Real libraries check alignment and fall back to the scalar path.
 :::
 
 # Measuring GB/s against peak
@@ -275,20 +356,49 @@ GB/s    = bytes / (ms × 1e6)
 
 - Count the bytes the algorithm needs, not what the hardware did. The bias is excluded because it is
   cache-resident; including it would inflate the number.
-- Time many launches between two events and divide. One launch of a 40 µs kernel is too short for the
-  event resolution to mean much.
+- Time many launches between two events and divide. A single 40 µs launch is noisy: launch overhead and
+  run-to-run jitter are a visible fraction of it.
 - The correctness launch runs first, so the timed loop is warm.
 - Use a buffer bigger than L2. H100's L2 is 50 MB; \`x\` and \`y\` together are 100 MB. A small \`n\` measures
   the cache, not HBM, and can exceed the "peak".
-- 80–90 % of peak is the ceiling for a streaming kernel. A scalar version of the same kernel typically
-  lands well below that because it cannot keep enough bytes in flight.
+- 80–90 % of peak is the practical ceiling for a streaming kernel; DRAM refresh and read/write turnarounds
+  take the rest.
 
 :::quiz
 Q: The kernel reports 4,100 GB/s on an H100 SXM whose HBM peak is 3,350 GB/s. Most likely?
 - [ ] The float4 loads double the effective bandwidth
 - [x] The buffers fit in L2, or the byte count includes traffic that never reached HBM
 - [ ] cudaEventElapsedTime is in microseconds, not milliseconds
-> No kernel beats the DRAM ceiling. Numbers above it mean the data came from cache or the bytes were miscounted — the reason the drill uses a 48 MiB activation and counts only x and y.
+> No kernel beats the DRAM ceiling. Numbers above it mean the data came from cache or the bytes were miscounted: the reason the drill uses a 48 MiB activation and counts only x and y.
+:::
+
+# How to approach it, and common mistakes
+
+An order that keeps every step testable:
+
+1. Write \`gelu_tanh\` and check it by hand against the \`v = 1\` example: 0.841192.
+2. Write the tail kernel. It is the scalar version of the vector kernel (same formula, one \`float\` per
+   thread), so it doubles as the shape to copy.
+3. Write the vector kernel: index, guard, two \`float4\` loads, four lanes, one store.
+4. Write \`gelu_bias\`: \`n4\`, \`tail\`, the two launches, \`cudaGetLastError()\` after each.
+5. Run both cases. The ragged \`n = 1,000,003\` is the one that catches tail and guard bugs.
+
+| Mistake | What you see | Fix |
+|---|---|---|
+| \`0.044715\` or \`0.5\` without \`f\` | passes, but the math runs in double; at 1/64 rate on consumer GPUs that can turn the kernel compute-bound | \`f\` on every literal, \`tanhf\` |
+| \`erff\` instead of \`tanhf\` | max abs err ~4.7e-4, \`FAIL\` | the tanh form |
+| missing \`if (i >= n4) return;\` | reads and writes past the buffer: an illegal-address error, or silent corruption | guard before the loads |
+| no tail launch | ragged case \`FAIL\`: the last 3 outputs stay 0 | launch \`gelu_bias_tail_kernel\` when \`n % 4 > 0\` |
+| tail kernel indexes from 0, not \`start\` | it rewrites \`y[0 … 2]\` and leaves the tail at 0 | \`i = start + …\` |
+| \`bias[i % cols]\` in the vector kernel | row 0 is right; later rows get the wrong lanes or read past the 768-vector \`bias\` | \`bias[i % cols4]\`: both indices count \`float4\`s |
+| bias counted in the GB/s | a slightly inflated number | count only \`x\` and \`y\` |
+
+:::quiz
+Q: The full case passes but the ragged case (n = 1,000,003) prints FAIL with a max abs err far above 1e-5. Most likely cause?
+- [ ] tanhf is too inaccurate for large n
+- [x] The tail is not written: either no tail launch, or the tail kernel starts at 0 instead of 4 · n4
+- [ ] The bias is read from L2 instead of HBM
+> The full case has n % 4 = 0, so it never exercises the tail. In the ragged case the last three outputs still hold the zeros y was filled with, so the error is |gelu| of those three inputs, nowhere near 1e-5.
 :::
 
 # What to take away
@@ -299,8 +409,8 @@ Q: The kernel reports 4,100 GB/s on an H100 SXM whose HBM peak is 3,350 GB/s. Mo
   more.
 - \`float4\` loads move the same bytes in a quarter of the instructions. They need 16-byte alignment,
   \`cols % 4 == 0\` for the bias lanes, and a scalar tail for \`n % 4\`.
-- \`__restrict__\` lets the compiler issue the loads early and use the read-only path. The tanh form, in
-  \`float\` with \`tanhf\`, is the GELU GPT-2 was trained with.
+- \`const __restrict__\` lets the compiler use the read-only data path. The tanh form, in \`float\` with
+  \`tanhf\` and \`f\` literals, is the GELU GPT-2 was trained with.
 - Report GB/s as needed bytes ÷ time and compare with the card's peak. Production stacks go one step
   further and fuse the GELU into the GEMM epilogue (cuBLASLt \`EPILOGUE_GELU_BIAS\`, CUTLASS, Triton).
 

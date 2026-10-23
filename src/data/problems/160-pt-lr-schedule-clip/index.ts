@@ -4,7 +4,7 @@ import {learn} from './learn';
 import {trainStepStep} from './steps/1-train-step';
 
 /**
- * Drill: the plumbing around one optimizer step of an LLM run — a warmup-then-cosine learning-rate
+ * Drill: the plumbing around one optimizer step of an LLM run: a warmup-then-cosine learning-rate
  * schedule as a pure function of the step, gradient clipping by the global norm written by hand,
  * and gradient accumulation over micro-batches that reproduces the big-batch gradient exactly.
  */
@@ -20,13 +20,14 @@ export const ptLrScheduleClipProblem: Problem = {
   minutes: 45,
   statement: `# Warmup, cosine decay, gradient clipping and accumulation
 
-Every LLM training loop — GPT-2, Llama, nanoGPT, Megatron — has the same twenty lines wrapped around
-\`optimizer.step()\`, and they decide whether the run converges or dies in its first thousand steps.
+Every LLM training loop (nanoGPT, Megatron-LM, Hugging Face's \`Trainer\`) has the same twenty lines
+wrapped around \`optimizer.step()\`, and they decide whether the run converges or dies in its first
+thousand steps.
 The **learning rate** is not a constant: it ramps linearly from near zero for a few hundred steps
 (Adam's moment estimates are noise at the start; a full-size step then is a step off a cliff), peaks,
 and decays along a half cosine to a floor by the end of the run. The **gradient** is not applied as
 it comes: its global L2 norm is measured, and if it exceeds a bound (1.0 in almost every published
-config) the whole gradient is scaled down — the direction kept, the spike removed — and the norm before
+config) the whole gradient is scaled down (the direction kept, the spike removed) and the norm before
 clipping is logged, because grad-norm spikes are the earliest sign of a run going wrong. And the
 **batch** does not fit on one device: a batch of 0.5M tokens is run as many micro-batches whose
 gradients add up in the \`.grad\` buffers before one optimizer step, which is only correct if each
@@ -47,10 +48,10 @@ implementation; the self-test uses the latter as its reference.
 
 ## What you build here
 
-1. \`lr_at\` — linear warmup \`max_lr × (step + 1) / warmup_steps\`, then
+1. \`lr_at\`: linear warmup \`max_lr × (step + 1) / warmup_steps\`, then
    \`min_lr + ½(1 + cos(π · progress))(max_lr − min_lr)\` until \`total_steps\`, \`min_lr\` after;
-   \`clip_grad_norm_\` — the norm of every parameter's gradient norm, scaled in place by
-   \`max_norm / (norm + 1e-6)\` only when that is below 1, the pre-clip norm returned; \`train_step\` —
+   \`clip_grad_norm_\`: the norm of every parameter's gradient norm, scaled in place by
+   \`max_norm / (norm + 1e-6)\` only when that is below 1, the pre-clip norm returned; \`train_step\`:
    \`zero_grad(set_to_none=True)\` once, \`accum_steps\` forward-backward passes with the loss divided by
    \`accum_steps\`, clip, the LR from \`lr_at\` written into every \`param_groups\` entry, \`optimizer.step()\`,
    and the three numbers every training log plots.
@@ -68,7 +69,7 @@ pre- and post-clip norm beside \`torch.nn.utils.clip_grad_norm_\`'s (\`0.6876\` 
 
 ## Left out on purpose
 
-Weight-decay parameter groups (decay on matrices, none on biases and norms — the reason the LR is
+Weight-decay parameter groups (decay on matrices, none on biases and norms: the reason the LR is
 written into *every* group), the \`GradScaler.unscale_\` that must precede clipping under fp16, DDP's
 \`no_sync()\` around the first \`accum_steps − 1\` micro-batches, FSDP's sharded norm all-reduce,
 checkpoint-and-resume of the step counter, and the token-based (rather than step-based) schedules of
@@ -236,7 +237,7 @@ recent runs. The schedule, the norm and the accumulation arithmetic are the same
       date: '2022-12-28',
       venue: 'GitHub',
       takes:
-        '`train.py`: `get_lr` with linear warmup and cosine decay to `min_lr`, the loss divided by `gradient_accumulation_steps`, and `grad_clip = 1.0`, the loop `train_step` rebuilds.',
+        "`train.py`, the loop `train_step` rebuilds: `get_lr`'s three branches (its ramp divides by `warmup_iters + 1`), the loss divided by `gradient_accumulation_steps`, `grad_clip = 1.0`, and the GPT-2 defaults of 6e-4 decaying to 6e-5 after 2,000 warmup iterations.",
     },
     {
       kind: 'docs',

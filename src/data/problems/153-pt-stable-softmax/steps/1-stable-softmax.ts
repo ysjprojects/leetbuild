@@ -16,21 +16,21 @@ export const stableSoftmaxStep: Step = {
   focus: ['shift', 'exp', 'sum', 'log', 'logp', 'softmax', 'gather', 'smooth', 'mix', 'mask', 'loss'],
   task: `## Task
 
-Implement three functions in \`stable_softmax.py\`, with plain tensor ops only — none of
+Implement three functions in \`stable_softmax.py\`, with plain tensor ops only: none of
 \`torch.nn.functional.log_softmax\` / \`softmax\` / \`cross_entropy\` / \`nll_loss\`, no \`torch.logsumexp\`,
 no \`nn.CrossEntropyLoss\`. They are what the self-test at the bottom compares you against.
 
 - \`log_softmax(x, dim=-1)\`: \`x - m - log(sum(exp(x - m), dim))\` with \`m = x.amax(dim, keepdim=True)\`.
   Any shape, any \`dim\`, float32 or float64 in, same dtype out. A row of logits around \`1e4\` must come
   out finite: \`exp(1e4)\` is \`inf\` in both dtypes, \`exp(x - m)\` is in \`(0, 1]\`.
-- \`softmax(x, dim=-1)\`: \`log_softmax(x, dim).exp()\`. Not a second formula — one place to get the
+- \`softmax(x, dim=-1)\`: \`log_softmax(x, dim).exp()\`. Not a second formula: one place to get the
   numerics right.
 - \`cross_entropy(logits, targets, label_smoothing=0.0, ignore_index=-100)\`: \`logits\` is \`(N, C)\`,
   \`targets\` is \`(N,)\` of \`int64\` class ids, or \`ignore_index\` for a position that must not count.
   One \`log_softmax\` over \`dim=-1\`, then **gather** the target column (\`logp.gather(1, …)\`): no one-hot,
   no \`.exp()\` of the whole \`(N, C)\` tensor. Per row,
   \`loss = (1 - label_smoothing) * nll + label_smoothing * (-logp.mean(dim=-1))\`. Ignored rows contribute
-  \`0\` (mask them — replace the \`-100\` by a valid index for the gather, then \`masked_fill\` the loss) and
+  \`0\` (mask them: replace the \`-100\` by a valid index for the gather, then \`masked_fill\` the loss) and
   the result is the **sum over kept rows divided by their count**: a plain \`.mean()\` over \`N\` is wrong.
 - Everything differentiable: the self-test runs \`torch.autograd.gradcheck\` in float64 on both
   \`log_softmax\` and \`cross_entropy\` (with smoothing and an ignored row).
@@ -46,9 +46,9 @@ to \`1\`. Switch to small logits and the two agree.
 
 :::widget softmax-stability {"preset": "huge"}`,
   hints: [
-    'Write `log_softmax` first and make `softmax` and `cross_entropy` call it. `m = x.amax(dim=dim, keepdim=True)` broadcasts back over the row; `m.detach()` is fine — the gradient through the max cancels exactly — and saves autograd a node.',
-    'For the gather, `targets` must be `(N, 1)` and `int64`: `logp.gather(1, targets.unsqueeze(1)).squeeze(1)`. Ignored rows hold `-100`, which is not a valid column: build `valid = targets != ignore_index`, gather with `targets.masked_fill(~valid, 0)`, and zero those rows afterwards.',
-    'Label smoothing mixes two targets — the one-hot (`nll`) and the uniform distribution (`-logp.mean(dim=-1)`, i.e. `-logp.sum(-1) / C`). The reduction is `loss.sum() / valid.sum().clamp(min=1)`, which is what `reduction="mean"` does when rows are ignored.',
+    'Write `log_softmax` first and make `softmax` and `cross_entropy` call it. Three lines: `m = x.amax(dim=dim, keepdim=True).detach()` (keepdim makes `m` shape `(N, 1)` so it broadcasts back over the row; detaching is safe because the gradient through the max cancels exactly), `shifted = x - m`, then `return shifted - shifted.exp().sum(dim=dim, keepdim=True).log()`. `softmax` is `return log_softmax(x, dim).exp()`.',
+    'For the gather, the index must be `(N, 1)`: `logp.gather(1, targets.unsqueeze(1)).squeeze(1)`. Ignored rows hold `-100`, which is not a valid column: build `valid = targets != ignore_index`, gather with `safe = targets.masked_fill(~valid, 0)`, and zero those rows afterwards. So `nll = -logp.gather(1, safe.unsqueeze(1)).squeeze(1)`.',
+    'Label smoothing mixes two targets: the one-hot (`nll`) and the uniform distribution (`smooth = -logp.mean(dim=-1)`, i.e. `-logp.sum(-1) / C`). Then `loss = (1 - label_smoothing) * nll + label_smoothing * smooth`, `loss = loss.masked_fill(~valid, 0.0)`, and `return loss.sum() / valid.sum().clamp(min=1)`, which is what `reduction="mean"` does when rows are ignored.',
   ],
   checks: [
     {
@@ -258,5 +258,5 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `Three functions, one formula. \`log_softmax\` is the primitive because it is the one whose numerics matter: \`x - m\` makes every exponent non-positive, so \`exp\` cannot overflow and the sum lies in \`[1, C]\`, whose log is small and finite. \`softmax\` is its exponential and \`cross_entropy\` reads one column of it — the probability tensor is never formed for the loss, which is what \`torch.nn.functional.cross_entropy\` does too (it is \`nll_loss(log_softmax(x))\`, fused). The max is detached because its gradient contribution is identically zero (\`-1 + Σ softmax = 0\`); \`gradcheck\` passes either way, the detached graph is just smaller. Label smoothing is a different target distribution, \`(1 - ε) · onehot + ε / C\`, and because cross-entropy is linear in the target the loss splits into the NLL term and \`-mean(logp)\`, which is why the whole \`logp\` row is still needed. \`ignore_index = -100\` is the convention padding tokens carry through every Hugging Face data collator; the rows are masked *after* the gather (the index is replaced, not the loss) and the mean is over the rows that remain, exactly \`reduction="mean"\` with ignored targets. Production code does not run these three ops: cuDNN and Triton fuse the max, the exp and the sum into one pass over the row, FlashAttention never materialises the softmax at all (it carries a running max and a rescaled running sum across tiles — "online softmax"), and because the vocabulary is 128k wide the \`(tokens, vocab)\` logit tensor in float32 is the largest activation in an LLM: chunked and fused cross-entropy kernels (Liger, \`torch.compile\`) compute the loss and its gradient per chunk and never allocate it whole. In bf16 training the logits are upcast to float32 before the softmax for the same reason this step shifts by the max: the mantissa is the scarce resource, and a sum of exponentials spends it fast.`,
+  debrief: `Three functions, one formula. \`log_softmax\` is the primitive because it is the one whose numerics matter: \`x - m\` makes every exponent non-positive, so \`exp\` cannot overflow and the sum lies in \`[1, C]\`, whose log is small and finite. \`softmax\` is its exponential and \`cross_entropy\` reads one column of it: the probability tensor is never formed for the loss, which is what \`torch.nn.functional.cross_entropy\` does too (its docs define it as \`log_softmax\` followed by \`nll_loss\`). The max is detached because its gradient contribution is identically zero (\`-1 + Σ softmax = 0\`); \`gradcheck\` passes either way, the detached graph is just smaller. Label smoothing is a different target distribution, \`(1 - ε) · onehot + ε / C\`, and because cross-entropy is linear in the target the loss splits into the NLL term and \`-mean(logp)\`, which is why the whole \`logp\` row is still needed. \`ignore_index = -100\` is the label Hugging Face's data collators give padding positions; those rows get a stand-in index so the gather is legal, their loss is zeroed after it, and the mean is over the rows that remain, exactly \`reduction="mean"\` with ignored targets. Production code does not run these as six separate ops: a fused kernel (PyTorch's own softmax, Triton, \`torch.compile\`) does the max, the exp and the sum in one launch, and the online normaliser (Milakov and Gimelshein) folds the max and the sum into one pass. FlashAttention never materialises the attention softmax at all: it carries a running max and a rescaled running sum across tiles. With a 128k vocabulary the \`(tokens, vocab)\` float32 logits are the largest activation in training, so chunked, fused cross-entropy kernels (Liger Kernel) compute the loss and its gradient per chunk and never allocate the tensor whole. In bf16 training the logits are upcast to float32 before the softmax for a different reason than the shift: the shift fixes the exponent range, but bf16's 7 mantissa bits cannot accumulate a sum of many small exponentials.`,
 };

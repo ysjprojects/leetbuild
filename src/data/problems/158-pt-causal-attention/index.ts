@@ -4,16 +4,16 @@ import {learn} from './learn';
 import {causalAttentionStep} from './steps/1-causal-attention';
 
 /**
- * Deep-learning drill: the attention layer of a decoder-only transformer written out in PyTorch —
- * one fused qkv projection, heads as a reshape, scaled dot-product scores, a tril buffer applied as
- * -inf before a float32 softmax, dropout, output projection — checked against
+ * Deep-learning drill: the attention layer of a decoder-only transformer written out in PyTorch (one fused
+ * qkv projection, heads as a reshape, scaled dot-product scores, a tril buffer applied as -inf before a
+ * float32 softmax, dropout, output projection), checked against
  * F.scaled_dot_product_attention(is_causal=True) and gradcheck.
  */
 export const ptCausalAttentionProblem: Problem = {
   id: 'pt-causal-attention',
   title: 'Causal multi-head self-attention from scratch',
   tagline:
-    'One fused qkv GEMM, heads as a view, q·kᵀ/√hd, a tril buffer as -inf before a float32 softmax, dropout, proj — equal to SDPA(is_causal=True) to 1e-5, gradchecked in float64.',
+    'One fused qkv GEMM, heads as a view, q·kᵀ/√hd, a tril buffer as -inf before a float32 softmax, dropout, proj: equal to SDPA(is_causal=True) to 1e-5, gradchecked in float64.',
   difficulty: 'medium',
   track: 'dllm',
   language: 'python',
@@ -21,7 +21,7 @@ export const ptCausalAttentionProblem: Problem = {
   minutes: 45,
   statement: `# Causal multi-head self-attention from scratch
 
-Every decoder-only language model — GPT-2, LLaMA, Mistral, the model answering your prompt — is a stack of
+Every decoder-only language model (GPT-2, LLaMA, Mistral, the model answering your prompt) is a stack of
 blocks whose first half is this layer. For each position \`t\` it builds a query from the token there,
 scores it against the keys of positions \`0..t\`, and returns a weighted sum of their values: the token
 reads the past and nothing after it, so one forward pass over a sequence teaches the model every
@@ -42,18 +42,18 @@ Inside: \`qkv = nn.Linear(d_model, 3 * d_model)\`, \`proj = nn.Linear(d_model, d
 
 ## Run it on your machine
 
-\`python causal_attention.py\` with PyTorch 2.x on CPU. A passing run prints \`PASS\`: the output equals
-\`F.scaled_dot_product_attention(q, k, v, is_causal=True)\` through the same weights to \`1e-5\`, a change at
-token 5 leaves positions \`0..4\` untouched, a right-padded sample matches SDPA with an explicit mask,
-\`torch.autograd.gradcheck\` passes in float64 on a \`(d_model=8, n_heads=2)\` instance, and dropout is a
-no-op in \`eval()\`. The starter raises \`NotImplementedError\` at the first assertion.
+\`python causal_attention.py\` with PyTorch 2.x on CPU, about a second. A passing run prints \`PASS\`: the
+output equals \`F.scaled_dot_product_attention(q, k, v, is_causal=True)\` through the same weights to \`1e-5\`,
+a change at token 5 leaves positions \`0..4\` untouched, a right-padded sample matches SDPA with an explicit
+mask, \`torch.autograd.gradcheck\` passes in float64 on a \`(d_model=8, n_heads=2)\` instance, and dropout is
+a no-op in \`eval()\`. The starter raises \`NotImplementedError\` as soon as the module is constructed.
 
 ## Left out on purpose
 
 Rotary or learned position embeddings (they belong to the block around this layer), the KV cache and the
 one-query-row decode step, grouped-query attention, the FlashAttention tiling that keeps the \`[T, T]\`
-scores out of memory, and \`torch.compile\`. This file materialises the full score matrix on purpose — that
-is the thing the fused kernels exist to avoid, and you should see it once.`,
+scores out of memory, and \`torch.compile\`. This file materialises the full score matrix on purpose: that is
+the thing the fused kernels exist to avoid, and you should see it once.`,
   figures: [
     {
       title: 'Causal self-attention',
@@ -68,7 +68,7 @@ is the thing the fused kernels exist to avoid, and you should see it once.`,
             sub: 'x · [B, T, 32]',
             shape: '[B, T, 32]',
             detail:
-              'The residual stream entering the layer. The self-test runs `B, T, D, H = 2, 8, 32, 4`, in float32, bfloat16 or float64.',
+              'The residual stream entering the layer. The self-test runs `B, T, D, H = 2, 8, 32, 4` in float32; `gradcheck` runs a `(8, 2)` instance in float64.',
           },
           {
             tone: 'model',

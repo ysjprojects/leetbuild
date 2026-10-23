@@ -4,16 +4,16 @@ import {learn} from './learn';
 import {ropeStep} from './steps/1-rope';
 
 /**
- * Deep-learning drill: rotary position embeddings in the half-split (Llama / GPT-NeoX) layout — a
+ * Deep-learning drill: rotary position embeddings in the half-split (Llama / GPT-NeoX) layout: a
  * float32 cos/sin cache over positions × frequency pairs, a rotation gathered by explicit positions so a
- * decode step can offset into a KV cache, and a module holding the cache as non-persistent buffers —
+ * decode step can offset into a KV cache, and a module holding the cache as non-persistent buffers,
  * checked against a complex-number reference and the relative-position property.
  */
 export const ptRopeProblem: Problem = {
   id: 'pt-rope',
   title: 'Rotary position embeddings',
   tagline:
-    'Precompute cos/sin over positions × frequency pairs, rotate q and k in halves, gather by position for the KV cache — and watch q·k come out a function of the distance alone.',
+    'Precompute cos/sin over positions × frequency pairs, rotate q and k in halves, gather by position for the KV cache, and watch q·k come out a function of the distance alone.',
   difficulty: 'medium',
   track: 'dllm',
   language: 'python',
@@ -27,17 +27,17 @@ and most open models since 2022 use **rotary position embeddings** instead (Su e
 inside every attention layer, just before the scores, each query and key is split into pairs of dimensions
 and each pair is rotated by an angle proportional to the token's position \`m\`, pair \`i\` at its own
 frequency \`theta_i = base^(−2i / head_dim)\`. Rotations compose, so the dot product of a query rotated by
-\`m·theta\` and a key rotated by \`n·theta\` depends only on \`m − n\` — relative position, with no learned
+\`m·theta\` and a key rotated by \`n·theta\` depends only on \`m − n\`: relative position, with no learned
 parameter and nothing added to the residual stream.
 
 The surface is two functions and a module in \`rope.py\`, in the half-split convention (dimension \`i\` pairs
 with \`i + head_dim // 2\`):
 
-- \`precompute_rope_cache(head_dim, max_seq_len, base=10000.0) -> (cos, sin)\` — float32, each
+- \`precompute_rope_cache(head_dim, max_seq_len, base=10000.0) -> (cos, sin)\`: float32, each
   \`[max_seq_len, head_dim // 2]\`.
-- \`apply_rope(x, cos, sin, positions=None) -> Tensor\` — \`x\` is \`[batch, heads, seq, head_dim]\` in any float
+- \`apply_rope(x, cos, sin, positions=None) -> Tensor\`: \`x\` is \`[batch, heads, seq, head_dim]\` in any float
   dtype; \`positions\` is \`[seq]\` int64 and defaults to \`0..seq−1\`; the result has \`x\`'s shape and dtype.
-- \`RoPE(nn.Module)\` — \`RoPE(head_dim, max_seq_len, base=10000.0)\` holds \`cos\` and \`sin\` as non-persistent
+- \`RoPE(nn.Module)\`: \`RoPE(head_dim, max_seq_len, base=10000.0)\` holds \`cos\` and \`sin\` as non-persistent
   buffers; \`forward(x, positions=None)\` rotates with them.
 
 ## What you build here
@@ -48,7 +48,7 @@ with \`i + head_dim // 2\`):
 
 ## Run it on your machine
 
-\`python rope.py\` — with \`torch.manual_seed(0)\` the self-test checks the cache's shape, dtype and
+\`python rope.py\`: with \`torch.manual_seed(0)\` the self-test checks the cache's shape, dtype and
 \`cos² + sin² = 1\`; that the module equals \`apply_rope\` with explicit positions; that position 0 is the
 identity, norms are preserved, bfloat16 stays bfloat16, and a complex-number reference agrees to \`1e-5\`;
 that \`scores[m, n] = q_m · k_n\` is unchanged by shifting both positions by 1, 7 or 40; that a token rotated
@@ -61,7 +61,7 @@ The attention layer around it (projections, scores, softmax, the KV cache itself
 \`(2i, 2i + 1)\` layout of the paper and Meta's reference code, partial rotary (rotating only a fraction of
 \`head_dim\`, as GPT-NeoX and Phi do), context extension by rescaling the frequencies (position
 interpolation, NTK-aware scaling, YaRN, Llama 3's smoothing), multimodal RoPE over 2-D or 3-D positions,
-and fused kernels that rotate \`q\` and \`k\` inside the QKV projection.`,
+and fused kernels that apply the rotation inside the attention kernel or the KV-cache write.`,
   figures: [
     {
       title: 'Attention with rotary embeddings',

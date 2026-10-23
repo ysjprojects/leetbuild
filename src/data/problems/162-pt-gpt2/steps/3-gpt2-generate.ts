@@ -15,7 +15,7 @@ re-running the whole context for every token, then with a per-block KV cache tha
 - \`filter_logits(logits, temperature=1.0, top_k=None, top_p=None)\`: \`logits\` is \`(B, V)\`; divide by
   \`temperature\` (assert \`> 0\`); top-k sets everything below the k-th largest (\`torch.topk\`) to \`-inf\`;
   top-p sorts descending, takes \`torch.cumsum\` of the softmax and drops a token when the mass **before**
-  it already exceeds \`top_p\` (the crossing token stays), then \`scatter\`s back to vocabulary order.
+  it already reaches \`top_p\` (the crossing token stays), then \`scatter\`s back to vocabulary order.
 - \`sample_next(logits, temperature, top_k, top_p) -> (B, 1)\`: \`F.softmax\` of the filtered logits, then
   \`torch.multinomial(probs, num_samples=1)\`.
 - \`@torch.no_grad() generate(model, idx, max_new_tokens, temperature=1.0, top_k=None, top_p=None)\`:
@@ -30,7 +30,7 @@ re-running the whole context for every token, then with a per-block KV cache tha
   through \`attn_cached\` and its MLP, \`cache.pos += T\`, the logits of the last position only.
 - \`@torch.no_grad() generate_cached(…)\` with \`generate\`'s signature: prefill with the prompt's last
   \`block_size\` tokens, then feed only the sampled token \`forward_cached(model, idx_next, cache)\`; when
-  \`cache.pos == block_size\` the learned positions are exhausted — reset \`pos\` to 0 and re-encode the last
+  \`cache.pos == block_size\` the learned positions are exhausted: reset \`pos\` to 0 and re-encode the last
   \`block_size\` tokens, exactly what the uncached crop computes.
 
 The self-test (float64, \`eval()\`, \`GPTConfig(32, 16, 2, 2, 16)\`) checks the filters on a known
@@ -40,18 +40,18 @@ identical tokens under \`torch.manual_seed(42)\` for three filter settings with 
 the cache size \`2 · n_layer · B · block_size · n_embd · 8\` bytes, then prints \`PASS\`.
 
 > Decoding is a loop of one-row matmuls: with the cache, token *t* costs one position of compute and *t*
-> rows of reading keys and values — the bottleneck moves from FLOPs to memory bandwidth.`,
+> rows of reading keys and values, so the bottleneck moves from FLOPs to memory bandwidth.`,
   hints: [
-    'Top-k in two lines: `v, _ = torch.topk(logits, k)` then `logits.masked_fill(logits < v[:, [-1]], float("-inf"))`. For top-p, `remove = torch.cumsum(probs, -1) - probs > top_p` on the sorted probabilities keeps the token that crosses the threshold; `torch.full_like(logits, -inf).scatter(-1, sorted_idx, sorted_logits)` undoes the sort.',
-    'The cached attention is the step-1 attention with offsets: queries are the T new rows, keys and values are the first `pos + T` rows of the cache, and the causal mask is the slice `mask[:, :, pos : pos + T, : pos + T]` — for a single decode token that row is all ones.',
-    'Same tokens means the same random draws: call `torch.multinomial` exactly once per new token in both paths, and do not run a forward after the last token. GPT-2’s positions are a learned table of `block_size` rows, so a sliding window cannot reuse cached keys — when the cache is full, re-encode the cropped window from position 0.',
+    'Top-k in two lines: `v, _ = torch.topk(logits, k)` then `logits.masked_fill(logits < v[:, [-1]], float("-inf"))`. For top-p, `remove = torch.cumsum(probs, -1) - probs >= top_p` on the sorted probabilities keeps the token that crosses the threshold; `torch.full_like(logits, -inf).scatter(-1, sorted_idx, sorted_logits)` undoes the sort.',
+    'The cached attention is the step-1 attention with offsets: queries are the T new rows, keys and values are the first `pos + T` rows of the cache, and the causal mask is the slice `mask[:, :, pos : pos + T, : pos + T]` (for a single decode token that row is all ones).',
+    'Same tokens means the same random draws: call `torch.multinomial` exactly once per new token in both paths, and do not run a forward after the last token. GPT-2’s positions are a learned table of `block_size` rows, so a sliding window cannot reuse cached keys: when the cache is full, re-encode the cropped window from position 0.',
   ],
   checks: [
     {
       id: 'no-grad-crop',
       title: 'No graph, context cropped to block_size',
       detail:
-        '`generate` is `@torch.no_grad()` and feeds `idx[:, -block_size:]` once the sequence outgrows the position table — the model cannot see more than `block_size` tokens.',
+        '`generate` is `@torch.no_grad()` and feeds `idx[:, -block_size:]` once the sequence outgrows the position table: the model cannot see more than `block_size` tokens.',
       match: {
         python: {
           all: [
@@ -95,7 +95,7 @@ the cache size \`2 · n_layer · B · block_size · n_embd · 8\` bytes, then pr
       id: 'kv-write',
       title: 'Preallocated cache, written at pos, read up to pos + T',
       detail:
-        '`torch.zeros` buffers of `block_size` rows per block; new keys go to `k_cache[:, :, pos : pos + T]` (values likewise) and attention reads `[:, :, : pos + T]` — no `torch.cat` reallocation per token.',
+        '`torch.zeros` buffers of `block_size` rows per block; new keys go to `k_cache[:, :, pos : pos + T]` (values likewise) and attention reads `[:, :, : pos + T]`, with no `torch.cat` reallocation per token.',
       match: {
         python: {
           all: [
@@ -111,7 +111,7 @@ the cache size \`2 · n_layer · B · block_size · n_embd · 8\` bytes, then pr
       id: 'offset-positions',
       title: 'Positions and mask rows continue from the cache',
       detail:
-        'New tokens are embedded at `torch.arange(pos, pos + T)` and masked with rows `mask[:, :, pos : pos + T, : pos + T]` — starting from 0 would give every decoded token position 0.',
+        'New tokens are embedded at `torch.arange(pos, pos + T)` and masked with rows `mask[:, :, pos : pos + T, : pos + T]`; starting from 0 would give every decoded token position 0.',
       match: {
         python: {
           all: [
@@ -125,7 +125,7 @@ the cache size \`2 · n_layer · B · block_size · n_embd · 8\` bytes, then pr
       id: 'decode-one',
       title: 'Decode feeds one token; a full cache re-encodes the window',
       detail:
-        'After the prefill only the sampled token goes in — `forward_cached(model, idx_next, cache)` — and `cache.pos == block_size` triggers a reset and re-encoding of `idx[:, -block_size:]`.',
+        'After the prefill only the sampled token goes in (`forward_cached(model, idx_next, cache)`), and `cache.pos == block_size` triggers a reset and re-encoding of `idx[:, -block_size:]`.',
       match: {
         python: {all: [/forward_cached\(\s*model\s*,\s*idx_next\s*,\s*cache\s*\)/, /cache\.pos\s*==\s*block_size/]},
       },
@@ -206,6 +206,9 @@ if __name__ == "__main__":
     assert kept == [True, True, False, False], kept  # 0.5 < 0.7, 0.5 + 0.3 crosses: both stay
     kept = torch.isfinite(filter_logits(logits, top_p=0.4))[0].tolist()
     assert kept == [True, False, False, False], kept
+    halves = torch.tensor([[0.5, 0.25, 0.125, 0.125]], dtype=torch.float64).log()
+    kept = torch.isfinite(filter_logits(halves, top_p=0.5))[0].tolist()
+    assert kept == [True, False, False, False], kept  # 0.5 already reaches p: the smallest such set
     cold = F.softmax(filter_logits(logits, temperature=0.5), dim=-1)
     assert cold[0, 0] > 0.5 and torch.allclose(F.softmax(filter_logits(logits), dim=-1), probs)
     shuffled = torch.tensor([[0.1, 2.0, -1.0, 1.0]])
@@ -230,7 +233,7 @@ if __name__ == "__main__":
     assert torch.allclose(forward_cached(model, out[:, 8:9], cache), full[:, -1], atol=1e-10)
     assert cache.pos == 9
 
-    # Cached and uncached sampling draw the same tokens under the same seed — inside and past block_size.
+    # Cached and uncached sampling draw the same tokens under the same seed, inside and past block_size.
     for kwargs in [dict(), dict(temperature=0.8, top_k=10), dict(temperature=1.2, top_p=0.9)]:
         for n_new in (10, 30):
             torch.manual_seed(42)
@@ -263,8 +266,9 @@ def filter_logits(logits: torch.Tensor, temperature: float = 1.0, top_k: int | N
     if top_p is not None:
         sorted_logits, sorted_idx = torch.sort(logits, descending=True)
         probs = F.softmax(sorted_logits, dim=-1)
-        # Drop a token once the mass *before* it already exceeds top_p: the token that crosses stays.
-        remove = torch.cumsum(probs, dim=-1) - probs > top_p
+        # Drop a token once the mass *before* it already reaches top_p: the token that crosses stays.
+        remove = torch.cumsum(probs, dim=-1) - probs >= top_p
+        remove[:, 0] = False  # the most likely token always survives, even for top_p <= 0
         sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
         logits = torch.full_like(logits, float("-inf")).scatter(-1, sorted_idx, sorted_logits)
     return logits
@@ -368,6 +372,9 @@ if __name__ == "__main__":
     assert kept == [True, True, False, False], kept  # 0.5 < 0.7, 0.5 + 0.3 crosses: both stay
     kept = torch.isfinite(filter_logits(logits, top_p=0.4))[0].tolist()
     assert kept == [True, False, False, False], kept
+    halves = torch.tensor([[0.5, 0.25, 0.125, 0.125]], dtype=torch.float64).log()
+    kept = torch.isfinite(filter_logits(halves, top_p=0.5))[0].tolist()
+    assert kept == [True, False, False, False], kept  # 0.5 already reaches p: the smallest such set
     cold = F.softmax(filter_logits(logits, temperature=0.5), dim=-1)
     assert cold[0, 0] > 0.5 and torch.allclose(F.softmax(filter_logits(logits), dim=-1), probs)
     shuffled = torch.tensor([[0.1, 2.0, -1.0, 1.0]])
@@ -392,7 +399,7 @@ if __name__ == "__main__":
     assert torch.allclose(forward_cached(model, out[:, 8:9], cache), full[:, -1], atol=1e-10)
     assert cache.pos == 9
 
-    # Cached and uncached sampling draw the same tokens under the same seed — inside and past block_size.
+    # Cached and uncached sampling draw the same tokens under the same seed, inside and past block_size.
     for kwargs in [dict(), dict(temperature=0.8, top_k=10), dict(temperature=1.2, top_p=0.9)]:
         for n_new in (10, 30):
             torch.manual_seed(42)
@@ -407,5 +414,5 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `\`generate\` is nanoGPT's, and it is quadratic: token *t* re-runs all *t* positions through every block, so 1,000 tokens cost about 500,000 position-forwards. The cache removes the redundancy. Keys and values of past positions never change — causal masking means position *i* only ever sees positions ≤ *i* — so each block stores them once, and a decode step embeds one token, computes one row of q, k, v per block, appends k, v at \`pos\`, and attends one query over \`pos + 1\` keys. The price is memory: \`2 · n_layer · B · T · n_embd\` numbers, which for GPT-2 small at \`T = 1024\` in fp16 is 36 MiB per sequence, and for a 70B model with 80 layers and 8,192-wide keys it is 2.5 MiB per token — the reason grouped-query attention shares one k, v head among several query heads and vLLM pages the cache in blocks. Preallocating to \`block_size\` and writing into a slice avoids \`torch.cat\`'s per-token reallocation; the mask slice \`[pos : pos + T, : pos + T]\` makes one function serve both the prefill (a triangle) and decode (a full row). GPT-2's learned absolute positions are why a full cache must be re-encoded: rotary embeddings (LLaMA) rotate q and k by their own positions, so a rolling cache can keep old keys. The samplers are the standard trio: temperature rescales, top-k drops a fixed-size tail, nucleus (Holtzman et al.) drops a tail sized by probability mass so a confident step keeps few tokens and an uncertain one keeps many. Production servers add continuous batching, paged and quantised caches, \`F.scaled_dot_product_attention\` with FlashAttention / FlashDecoding kernels, CUDA graphs for the decode step and speculative decoding.`,
+  debrief: `\`generate\` is nanoGPT's, and it is quadratic: token *t* re-runs all *t* positions through every block, so 1,000 tokens cost about 500,000 position-forwards. The cache removes the redundancy. Keys and values of past positions never change (causal masking means position *i* only ever sees positions ≤ *i*), so each block stores them once, and a decode step embeds one token, computes one row of q, k, v per block, appends k, v at \`pos\`, and attends one query over \`pos + 1\` keys. The price is memory: \`2 · n_layer · B · T · n_embd\` numbers, which for GPT-2 small at \`T = 1024\` in fp16 is 36 MiB per sequence, and for a 70B model with 80 layers and 8,192-wide keys it is 2.5 MiB per token. That is why grouped-query attention shares one k, v head among several query heads (Llama 2 70B: 8 KV heads, 320 KiB per token) and vLLM pages the cache in blocks. Preallocating to \`block_size\` and writing into a slice avoids \`torch.cat\`'s per-token reallocation; the mask slice \`[pos : pos + T, : pos + T]\` makes one function serve both the prefill (a triangle) and decode (a full row). GPT-2's learned absolute positions are why a full cache must be re-encoded: rotary embeddings (LLaMA) rotate q and k by their own positions so scores depend only on offsets, and a rolling cache can keep old keys. The samplers are the standard trio: temperature rescales, top-k drops a fixed-size tail, nucleus (Holtzman et al.) drops a tail sized by probability mass so a confident step keeps few tokens and an uncertain one keeps many. Production servers add continuous batching, paged and quantised caches, \`F.scaled_dot_product_attention\` with FlashAttention / FlashDecoding kernels, CUDA graphs for the decode step and speculative decoding.`,
 };

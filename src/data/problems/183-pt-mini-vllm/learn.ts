@@ -106,8 +106,9 @@ waste stays under one block per sequence however long the maximum is. Step throu
 :::widget paged-kv {"blockSize": 4}
 
 Smaller blocks waste less, but every block is one more table entry and one more scattered read in the
-attention kernel; vLLM defaults to 16 tokens per block, which keeps the average waste near 7.5 slots per
-sequence.
+attention kernel. The paper's ablation found 16 to 128 tokens per block best on ShareGPT, while on Alpaca,
+whose sequences are short, blocks above 32 hurt; vLLM defaults to 16, an average waste of about 7.5 slots
+per sequence when lengths fall evenly across a block.
 
 :::quiz
 Q: A server reserves contiguous buffers of 2,048 tokens. Its requests average 400 tokens. What limits its batch size?
@@ -218,9 +219,10 @@ With static batching, a batch runs until its longest request finishes: a request
 tokens idles for the other 480 steps, and new arrivals wait for the whole batch. Orca schedules one
 iteration at a time instead: after every forward pass the batch is rebuilt from whatever is running and
 whatever fits. [Anyscale measured](https://www.anyscale.com/blog/continuous-batching-llm-inference) 8× the
-throughput of static batching from continuous batching alone and 23× with vLLM's paged memory on top.
+throughput of static batching from continuous batching alone and up to 23× with vLLM's paged memory on top.
 
-The scheduler's policy, as vLLM's paper states it and \`scheduler.py\` implements it:
+The policy of vLLM's paper (FCFS, preempt the latest arrival) and of its v0 scheduler (prefills before
+decodes), which \`scheduler.py\` implements:
 
 - **First come, first served.** \`waiting\` is a queue; \`running\` is ordered by admission.
 - **Prefill first.** A waiting request is admitted while a seat, the token budget and the blocks allow;
@@ -235,8 +237,11 @@ prompt plus everything it generated, and its next token is exactly what it would
 
 | recovery after preemption | cost | used by |
 |---|---|---|
-| recompute: free the blocks, prefill prompt + output again | one prefill of the whole sequence (parallel, fast) | vLLM's default, this project |
-| swap: copy the blocks to CPU memory, copy back later | PCIe traffic both ways, CPU memory for the blocks | vLLM v0 (optional) |
+| recompute: free the blocks, prefill prompt + output again | one prefill of the whole sequence (parallel), independent of block size | vLLM v0 for single-sequence requests, v1 always, this project |
+| swap: copy the blocks to CPU memory, copy back later | PCIe traffic both ways, CPU memory for the blocks | vLLM v0 for parallel samples and beams, which it could not recompute; dropped in v1 |
+
+The paper's ablation found swapping slow at small block sizes (many small PCIe transfers) and the two about
+equal from 16 to 64 tokens per block; vLLM's code defaults to recompute because it costs less than swapping.
 
 Without preemption the scheduler can deadlock: every running request needs a new block, none is free,
 and none can finish. Preempting the newest guarantees that the oldest request always progresses. Watch the widget's pool as sequence C
@@ -268,8 +273,10 @@ The [vLLM design](https://docs.vllm.ai/en/stable/design/prefix_caching/) that \`
   with one more reference each, and their tokens count as computed, so only the suffix is prefilled.
 - **At least one token is computed**: the lookup covers \`(len - 1) // block_size\` blocks, because the last
   prompt token's logits are the next token's distribution.
-- **Publish after compute**: a block is hashed and registered only once the forward pass has written it,
-  prefill or decode.
+- **Publish after compute** (this project): a block is hashed and registered once the forward pass has
+  written it, prefill or decode. vLLM v1 registers a block as soon as it is allocated full of scheduled
+  tokens, so a request scheduled later in the same step can already hit it: every layer writes the
+  batch's keys before any row reads them.
 - **Freed is not forgotten**: a block whose count reaches 0 goes to the tail of the free queue with its
   hash. A hit on it pulls it back out; allocating it evicts the hash.
 - **LRU with a twist**: requests free their blocks last block first, so a prompt's specific tail is

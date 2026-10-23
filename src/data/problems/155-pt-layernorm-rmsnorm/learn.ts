@@ -2,18 +2,37 @@
  * The learning guide for the LayerNorm / RMSNorm drill: why a transformer normalises its residual
  * stream before every sublayer, the LayerNorm statistics and their small print (biased variance, eps
  * under the root, rsqrt), what RMSNorm drops and why, the float32 upcast that keeps a half-precision
- * row from overflowing, and what fused kernels add — a figure or a table where one says it faster
+ * row from overflowing, and what fused kernels add: a figure or a table where one says it faster
  * than prose, a pop quiz per section. Rendered at \`/pt-layernorm-rmsnorm/learn\`.
  */
 export const learn = `# The mechanism at a glance
 
 A transformer keeps a **residual stream**: one vector of \`D\` features per token, shape \`(B, T, D)\`,
-that every block reads from and adds into. Before each sublayer — attention, then the MLP — the row is
+that every block reads from and adds into. Before each sublayer (attention, then the MLP) the row is
 **normalised** so the sublayer sees inputs of a fixed magnitude whatever the stream has accumulated.
 Two normalisations cover every modern LLM: **LayerNorm** (GPT-2, BERT, ViT) centres the row and divides
 by its standard deviation; **RMSNorm** (Llama, Mistral, Gemma, Qwen) skips the centring and divides by
 the root mean square. Each is a reduction over the feature axis, a per-row scale, and a learned
-per-feature affine map. Here are both inside one pre-norm sublayer, read bottom to top:
+per-feature affine map.
+
+The words this guide uses, for one row \`x\` of \`D\` numbers:
+
+| Term | Meaning |
+| --- | --- |
+| row | the \`D\` features of one token, \`x[b, t, :]\`; a norm treats every row on its own |
+| reduction | an operation that collapses an axis to one number per row, such as a sum or a mean |
+| mean \`μ\` | \`sum(x) / D\`, the row's average |
+| variance \`σ²\` | \`mean((x − μ)²)\`, the average squared distance from the mean. **Biased** divides by \`D\`; **unbiased** (Bessel's correction) divides by \`D − 1\` |
+| standard deviation \`σ\` | \`sqrt(σ²)\`, the row's typical spread |
+| root mean square (RMS) | \`sqrt(mean(x²))\`: square, average, square root. It equals \`σ\` when \`μ = 0\` |
+| \`eps\` | a small constant (1e-5 or 1e-6) added under the square root so a row with \`σ² = 0\` never divides by zero |
+| \`rsqrt(v)\` | \`1 / sqrt(v)\`, the reciprocal square root, one call: \`torch.rsqrt\` |
+| affine parameters | the learned per-feature \`weight\` (a scale, often written γ) and \`bias\` (a shift, β): \`y · weight + bias\` |
+| broadcasting | PyTorch stretches a size-1 axis to match: \`(B, T, D) − (B, T, 1)\` subtracts each row's one mean from all its \`D\` features |
+| \`float16\`, \`bfloat16\` | 16-bit floats. float16 tops out at 65 504 with 10 mantissa bits; bfloat16 ("brain float") keeps float32's range with only 7 |
+| upcast | convert to a wider dtype (\`x.float()\` gives float32) before the arithmetic, then cast the result back |
+
+Here are both norms inside one pre-norm sublayer, read bottom to top:
 
 :::architecture
 {
@@ -41,8 +60,8 @@ per-feature affine map. Here are both inside one pre-norm sublayer, read bottom 
   ],
   "notes": [
     {"at": "ln-var", "text": "Divide by **D**, not D − 1", "side": "left"},
-    {"at": "ln-scale", "text": "eps **inside** the root: a flat row gives bias, not NaN", "side": "left"},
-    {"at": "rms-up", "text": "fp16 x² overflows at **|x| > 256**"},
+    {"at": "ln-scale", "text": "**eps** under the root: a flat row gives bias, not NaN", "side": "left"},
+    {"at": "rms-up", "text": "fp16 x² overflows at **|x| ≥ 256**"},
     {"at": "rms-ms", "text": "**1** reduction instead of 2"},
     {"at": "add", "text": "Pre-norm: the stream itself is never normalised"}
   ]
@@ -65,7 +84,7 @@ The contract the drill implements, in \`norms.py\`:
 [Layer normalization](https://arxiv.org/abs/1607.06450) (Ba, Kiros and Hinton, 2016) was proposed
 as a batch-size-free alternative to batch normalization: the statistics come from one example's own
 features, so they are identical in training and inference and need no running averages. In a
-transformer the residual stream grows with depth — each block *adds* to it — and without a norm the
+transformer the residual stream grows with depth (each block *adds* to it), and without a norm the
 logits of block 40 would be scaled by whatever the first 39 blocks happened to add.
 
 Where the norm sits matters as much as what it computes:
@@ -75,8 +94,9 @@ Where the norm sits matters as much as what it computes:
 | post-norm | \`x = norm(x + attn(x))\` | the original Transformer, BERT | gradients flow through every norm; deep stacks need warm-up and small learning rates |
 | pre-norm | \`x = x + attn(norm(x))\` | GPT-2, Llama, every current LLM | the residual path is an identity; the norm only shapes what each sublayer *reads* |
 
-- [Xiong et al. (2020)](https://arxiv.org/abs/2002.04745) show the pre-norm gradient at
-  initialisation is well behaved at any depth, while post-norm's grows with the number of layers.
+- [Xiong et al. (2020)](https://arxiv.org/abs/2002.04745) show that at initialisation post-norm's
+  gradients are large for the parameters near the output, which is why it needs a learning-rate
+  warm-up; pre-norm's are well behaved, and pre-norm models can train without one.
 - Pre-norm leaves the stream itself un-normalised, so a final norm is applied before the output
   projection: GPT-2's \`ln_f\`, Llama's \`norm\`.
 - A norm is per token: the \`B × T\` rows are independent and the reduction is only over \`D\`. Nothing
@@ -102,6 +122,34 @@ r  = rsqrt(σ² + eps)                eps inside the root
 y  = (x − μ) · r · weight + bias    weight, bias: shape (D,), broadcast over rows
 \`\`\`
 
+Why each line is there:
+
+1. Subtracting \`μ\` moves the row's average to 0. That is the **re-centring**.
+2. \`σ²\` measures the spread of the centred row. It must be the biased one, \`sum / D\`, because the
+   next line wants the mean square of exactly these \`D\` numbers to come out as 1.
+3. Multiplying the centred row by \`r = 1 / sqrt(σ²)\` divides every deviation by the typical deviation,
+   so the new mean of squares is \`σ² · r² = 1\`. That is the **re-scaling**. \`eps\` changes it to
+   \`σ² / (σ² + eps)\`, a hair under 1 for any ordinary row.
+4. \`weight\` and \`bias\` let training undo either step per feature if that helps; at ones and zeros
+   they do nothing.
+
+**One row by hand.** Take \`x = [1, 2, 3, 6]\` (\`D = 4\`), \`weight\` ones, \`bias\` zeros, \`eps = 1e-5\`:
+
+| Step | Computation | Result |
+| --- | --- | --- |
+| 1. mean | \`(1 + 2 + 3 + 6) / 4\` | \`μ = 3\` |
+| 2. centre | \`x − μ\` | \`[−2, −1, 0, 3]\` |
+| 3. square | \`(x − μ)²\` | \`[4, 1, 0, 9]\`, sum 14 |
+| 4. biased variance | \`14 / 4\` | \`σ² = 3.5\` |
+| 5. reciprocal root | \`rsqrt(3.5 + 1e-5)\` | \`r = 0.53452\` |
+| 6. scale | \`(x − μ) · r\` | \`[−1.069, −0.535, 0, 1.604]\` |
+| 7. affine | \`· 1 + 0\` | unchanged |
+
+Check the result: it sums to 0, and its squares \`1.143 + 0.286 + 0 + 2.571\` average to 1.
+\`F.layer_norm\` returns the same four numbers. Now the classic bug: \`x.var(-1)\` divides by \`D − 1\` by
+default, giving \`σ² = 14 / 3 = 4.667\`, \`r = 0.4629\` and \`[−0.926, −0.463, 0, 1.389]\`, every value
+13% too small (a factor \`sqrt(3 / 4) = 0.866\`). At \`D = 4\` the bug is loud; at \`D = 64\` it is 0.8%.
+
 With the self-test's \`(2, 5, 64)\` input, the two statistics are reductions that keep a size-1 axis, and
 everything after them is a broadcast:
 
@@ -124,19 +172,21 @@ everything after them is a broadcast:
 }
 :::
 
-Three details decide whether the module agrees with
-[\`torch.nn.LayerNorm\`](https://pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html):
+Four details decide whether the module agrees with
+[\`torch.nn.LayerNorm\`](https://docs.pytorch.org/docs/stable/generated/torch.nn.LayerNorm.html):
 
 - **Biased variance.** \`torch.var\` defaults to Bessel's correction (divide by D − 1); every
-  normalisation kernel divides by D. The difference is a factor of \`sqrt(D / (D − 1))\` on the whole
-  output — 0.8% at D = 64, 0.01% at D = 4096 — small enough to pass a loose tolerance and wrong in
-  every layer. \`unbiased=False\` (or \`correction=0\`) makes the two agree to float32 precision.
-- **eps inside the root.** A row of identical values has σ² = 0. With \`eps\` added before the root the
-  row normalises to \`0 · weight + bias\`; added after, it is \`0 / 0\`. The default 1e-5 is a floor on
-  the variance, not a nudge on the result.
-- \`rsqrt\`, **not** \`1 / sqrt\`. One reciprocal square root per row, then a multiply per element,
-  instead of a square root and a division per element. The arithmetic is the same; the instruction
-  count and the rounding are not, and it is the form the fused kernels and the reference use.
+  normalisation kernel divides by D. The normalised row comes out a factor \`sqrt(D / (D − 1))\` too
+  small: 0.8% at D = 64, 0.01% at D = 4096, small enough to pass a loose tolerance and wrong in every
+  layer. \`unbiased=False\` (or \`correction=0\`) makes the two agree to float32 precision.
+- **eps inside the root.** A row of identical values (a padding token, say) has \`σ² = 0\` and
+  \`x − μ = 0\`. With no \`eps\` the module computes \`0 · rsqrt(0) = 0 · ∞ = NaN\`; with it, the row
+  normalises to \`0 · weight + bias = bias\`. Where \`eps\` goes decides agreement with the reference, not
+  finiteness: under the root it floors \`σ\` at \`√eps ≈ 0.003\`, while \`/ (sqrt(σ²) + eps)\` floors it at
+  1e-5. On a near-flat row with \`σ = 1e-4\` the reference gives ±0.032 and the eps-outside version ±0.909.
+- \`rsqrt\`, **not** \`1 / sqrt\` per element. One reciprocal square root per row, then a multiply per
+  element, instead of a division per element (a division costs several multiplies). The two agree to
+  rounding; \`rsqrt\` is the form Llama's code and the CUDA kernels use.
 - \`keepdim=True\` keeps the reduced axis as size 1, \`(B, T, 1)\`, so \`x − mean\` broadcasts back over
   the row without a \`reshape\`.
 
@@ -148,16 +198,16 @@ dx = r · (h − mean(h) − x̂ · mean(h · x̂))
 dweight = Σ_rows g · x̂          dbias = Σ_rows g
 \`\`\`
 
-The gradient of a row is the gradient projected away from the two directions the norm removed — the
+The gradient of a row is the gradient projected away from the two directions the norm removed: the
 row's mean and its scale. \`gradcheck\` in float64 confirms the forward written above produces exactly
 this.
 
 :::quiz
 Q: A hand-written LayerNorm passes allclose against F.layer_norm at rtol 1e-2 and fails at 1e-5. The most likely cause?
-- [x] torch.var's default Bessel correction: the output is scaled by sqrt(D / (D − 1))
+- [x] torch.var's default Bessel correction: the normalised row is shrunk by sqrt(D / (D − 1))
 - [ ] eps was added after the square root instead of inside it
 - [ ] weight and bias were initialised to zeros and ones instead of ones and zeros
-> A uniform factor of sqrt(64 / 63) ≈ 1.008 is a 0.8% error on every element — inside 1e-2, outside 1e-5. eps placement only shows on near-constant rows, and swapped initialisation would zero the output entirely.
+> A uniform factor of sqrt(64 / 63) ≈ 1.008 is a 0.8% error on every element: inside 1e-2, outside 1e-5. eps placement only shows on near-constant rows, and swapped initialisation would make every output equal the bias, 1.
 :::
 
 # RMSNorm: scale without centring
@@ -170,6 +220,19 @@ stabilises training; the **re-centring** is dispensable. Drop it and the module 
 rms = sqrt(mean(x²) + eps)
 y   = x / rms · weight             no mean, no bias
 \`\`\`
+
+**The same row by hand.** \`x = [1, 2, 3, 6]\`, \`weight\` ones, \`eps = 1e-6\`:
+
+| Step | Computation | Result |
+| --- | --- | --- |
+| 1. square | \`x²\` | \`[1, 4, 9, 36]\`, sum 50 |
+| 2. mean of squares | \`50 / 4\` | \`12.5\` (RMS \`= sqrt(12.5) = 3.536\`) |
+| 3. reciprocal root | \`rsqrt(12.5 + 1e-6)\` | \`r = 0.28284\` |
+| 4. scale | \`x · r\` | \`[0.283, 0.566, 0.849, 1.697]\` |
+
+The squares of the result average to 1, as with LayerNorm, but the result does not sum to 0: its mean
+is \`0.849 = μ · r = 3 · 0.283\`. RMSNorm kept the row's offset and scaled it with everything else. The
+two statistics are linked: \`mean(x²) = σ² + μ² = 3.5 + 9 = 12.5\`.
 
 Llama's module is the form the drill uses, and the one \`torch.nn.functional.rms_norm\` (PyTorch 2.4)
 reproduces:
@@ -186,8 +249,8 @@ def forward(self, x):
 | --- | --- | --- |
 | reductions per row | 2 (mean, then variance) | 1 (mean of squares) |
 | element-wise passes | subtract, scale, affine ×2 | scale, affine ×1 |
-| parameters per layer | 2D (\`weight\`, \`bias\`) | D (\`weight\`) |
-| default \`eps\` | 1e-5 | 1e-6 (Llama 2), 1e-5 (Llama 3) |
+| parameters per layer | 2·D (\`weight\`, \`bias\`) | D (\`weight\`) |
+| default \`eps\` | 1e-5 (\`nn.LayerNorm\`) | 1e-6 in Llama's \`RMSNorm\` class and LLaMA 1; Llama 2 and 3 pass 1e-5 |
 | invariant to | adding a constant to the row, scaling the row | scaling the row |
 | used by | GPT-2, BERT, OPT, ViT | Llama, Mistral, Gemma, Qwen, T5 |
 
@@ -197,7 +260,7 @@ def forward(self, x):
   difference is immaterial to quality.
 - No bias: a learned per-feature shift would re-introduce the offset the norm is indifferent to, and
   the next linear layer has a bias of its own if it wants one.
-- The saving is small per layer — one reduction and D parameters — and real in aggregate: a 7B Llama
+- The saving is small per layer (one reduction and D parameters) and real in aggregate: a 7B Llama
   runs 65 norms per token, and every reduction is a pass over a 4096-wide row held in memory
   bandwidth, not FLOPs.
 
@@ -211,30 +274,32 @@ Q: A row of all 3.0 (D = 64) goes through RMSNorm with weight = ones. What comes
 - [ ] All zeros: the row has no variance
 - [x] All 1.0: 3 / sqrt(mean(9)) = 1
 - [ ] NaN: the statistic is 0 and the division fails
-> RMSNorm divides by the root mean square, not the standard deviation. The row's RMS is 3, so every element becomes 1. LayerNorm on the same row would subtract the mean and give bias (zeros); only an eps *outside* the root would reach a NaN.
+> RMSNorm divides by the root mean square, not the standard deviation. The row's RMS is 3, so every element becomes 1. LayerNorm on the same row would subtract the mean and return bias (zeros); it is LayerNorm *without* eps that would reach 0 · ∞ = NaN.
 :::
 
 # The upcast rule: where overflow is allowed
 
 Models train and serve in \`bfloat16\`, and some in \`float16\`. The residual stream's activations grow
-with depth — rows of magnitude in the hundreds are ordinary in a large model — and the norm squares
+with depth (rows of magnitude in the hundreds are ordinary in a large model), and the norm squares
 them:
 
 | dtype | exponent bits | mantissa bits | largest finite | \`x²\` overflows at |
 | --- | --- | --- | --- | --- |
-| float16 | 5 | 10 | 65 504 | \`\\|x\\| > 256\` |
-| bfloat16 | 8 | 7 | 3.4 × 10³⁸ | \`\\|x\\| > 1.8 × 10¹⁹\` — never in practice |
+| float16 | 5 | 10 | 65 504 | \`\\|x\\| ≥ 256\` |
+| bfloat16 | 8 | 7 | 3.4 × 10³⁸ | \`\\|x\\| > 1.8 × 10¹⁹\`, never in practice |
 | float32 | 8 | 23 | 3.4 × 10³⁸ | never |
 
-The naive module squares in the input dtype:
+\`256² = 65 536\` is just past float16's 65 504, and float16's next value below 256 is 255.875, whose
+square 65 472 still fits. Follow the four-element row \`x = [300, −20, 5, 100]\` through RMSNorm both
+ways:
 
-| Stage, all in float16 | Value |
-| --- | --- |
-| \`x\` | magnitudes up to 600 |
-| \`x.pow(2)\` | \`inf\` wherever a magnitude exceeds 256 |
-| \`mean(x²)\` | \`inf\`: one overflow poisons the row |
-| \`rsqrt(inf + eps)\` | \`0\` |
-| \`x · 0 · weight\` | zeros: finite, silent, wrong |
+| Stage | Squared in float16 | Upcast to float32 first |
+| --- | --- | --- |
+| \`x²\` | \`[inf, 400, 25, 10 000]\` | \`[90 000, 400, 25, 10 000]\` |
+| \`mean(x²)\` | \`inf\`: one overflow poisons the row | \`25 106.25\` (RMS 158.4) |
+| \`rsqrt(ms + eps)\` | \`0\` | \`0.006311\` |
+| \`x · r\` | \`[0, 0, 0, 0]\`: finite, silent, wrong | \`[1.893, −0.126, 0.032, 0.631]\` |
+| cast to float16 | zeros | \`[1.894, −0.1262, 0.03156, 0.6313]\` |
 
 Nothing raises. The row is replaced by zeros, the block's attention sees a blank token, and the loss
 moves a little. Llama's module takes the statistic in float32 and casts the *normalised* row back:
@@ -265,8 +330,8 @@ moves a little. Llama's module takes the statistic in float32 and casts the *nor
   run in the wrong dtype. \`.type_as(x) * self.weight\` keeps the output in \`x\`'s dtype.
 - **Leave float32 and float64 alone.** \`x.float()\` on a float64 tensor *downcasts*. A module that
   does so unconditionally still passes every float32 test and fails \`gradcheck\`: the numerical
-  Jacobian is taken with float64 perturbations of 1e-6 that vanish in float32. The rule is "at least
-  float32", not "exactly float32".
+  Jacobian divides float32 rounding noise (about 6e-8 of each value) by a perturbation of 1e-6, an
+  error of several percent. The rule is "at least float32", not "exactly float32".
 - \`bfloat16\` cannot overflow here, but its 7-bit mantissa makes a sum of 4096 squares lose precision;
   PyTorch's reductions accumulate in float32 internally, the upcast makes it explicit and covers the
   element-wise steps too.
@@ -274,9 +339,10 @@ moves a little. Llama's module takes the statistic in float32 and casts the *nor
 :::details Why eps differs between the two modules
 LayerNorm's \`eps\` is added to a variance; RMSNorm's to a mean of squares, which for a zero-mean row is
 the same quantity. The defaults differ by convention, not by mathematics: PyTorch chose 1e-5 for
-\`nn.LayerNorm\`; Llama 2 ships 1e-6 for its RMSNorm and Llama 3 raised it to 1e-5. In half-precision
-models the value matters slightly more than it looks: a float16 \`eps\` of 1e-6 is representable (the
-smallest subnormal is 6e-8) but 1e-8 would round to zero, which is one more reason to add it in float32.
+\`nn.LayerNorm\`; Llama's \`RMSNorm\` class defaults to 1e-6, the value LLaMA 1 shipped, and Llama 2 and 3
+pass 1e-5. In half-precision models the value matters slightly more than it looks: a float16 \`eps\` of
+1e-6 is representable (the smallest subnormal is 6e-8) but 1e-8 would round to zero, which is one more
+reason to add it in float32.
 :::
 
 :::quiz
@@ -285,6 +351,37 @@ Q: RMSNorm on a float16 row containing a 300 returns a row of zeros, no error. W
 - [x] x.pow(2) in float16: 300² = 90 000 exceeds 65 504, the mean is inf and rsqrt(inf) is 0
 - [ ] .type_as(x): the cast back truncated the result
 > 300 squared overflows float16's range; one inf in the row makes the mean inf and the scale 0. Squaring in float32 (x.float() first) keeps the statistic finite; the cast back then only touches values of order 1.
+:::
+
+# How to approach it, and the common mistakes
+
+Build the file in this order, testing as you go:
+
+1. Work the row \`[1, 2, 3, 6]\` by hand (the two tables above) and keep the numbers.
+2. Write \`LayerNorm.forward\` for one trailing dim, run it on that row, and match
+   \`[−1.069, −0.535, 0, 1.604]\`. Then compare against \`F.layer_norm\` at \`atol=rtol=1e-5\`: a loose
+   tolerance hides the Bessel bug.
+3. Generalise \`dims\` to a tuple and test \`normalized_shape=(5, 64)\`.
+4. Write \`RMSNorm\` in float32 and match \`[0.283, 0.566, 0.849, 1.697]\`, then \`F.rms_norm\`.
+5. Add the upcast and feed it a float16 row with entries above 256.
+6. Run \`gradcheck\` in float64 last; it is the test that catches an unconditional \`x.float()\`.
+
+| Mistake | What you see | Fix |
+| --- | --- | --- |
+| \`x.var(-1)\` with its default | 0.8% off at D = 64; passes \`rtol=1e-2\`, fails \`1e-5\` | \`unbiased=False\` or \`correction=0\` |
+| \`x.mean(-1)\` without \`keepdim\` | \`(2, 5, 64) − (2, 5)\` raises a size mismatch; with a square \`(D, D)\` input it broadcasts silently and wrong | \`keepdim=True\` |
+| no \`eps\` | NaN on a constant row, such as padding | \`rsqrt(var + eps)\` |
+| squaring in float16 | a row of zeros, no error | \`x.float()\` before the square |
+| \`x.float()\` on every input | float32 tests pass, float64 \`gradcheck\` fails | upcast only \`float16\`/\`bfloat16\` |
+| \`* weight\` before \`.type_as(x)\` | a bfloat16 model gets a float32 output | cast back, then multiply |
+| \`F.rms_norm(x, (D,), w)\` as the reference | \`eps\` defaults to float32's machine epsilon (1.2e-7), not 1e-6 | pass \`eps\` explicitly |
+
+:::quiz
+Q: Your RMSNorm passes every float32 and bfloat16 test but fails gradcheck in float64. What is the likely cause?
+- [ ] The variance is unbiased
+- [x] x.float() runs on every input, so float64 is downcast to float32
+- [ ] .type_as(x) comes before the weight multiply
+> gradcheck compares autograd's Jacobian with finite differences of 1e-6. A float32 detour adds rounding noise of about 6e-8 per value, a several-percent error once divided by 1e-6. Upcast only float16 and bfloat16. RMSNorm has no variance, and casting before the weight multiply is the correct order.
 :::
 
 # What production systems add
@@ -296,13 +393,15 @@ batch is 32 MB per pass:
 | Implementation | Passes over the row | What moves |
 | --- | --- | --- |
 | eager \`x.mean\`, \`x.var\`, \`x − mean\`, \`· rsqrt\`, \`· weight\`, \`+ bias\` | 2 reads + 4 read-writes | ~10 × the tensor |
-| \`F.layer_norm\` / \`F.rms_norm\` (one fused kernel) | 1 read + 1 write | 2 × the tensor |
-| fused residual-add + norm (vLLM, TensorRT-LLM) | 1 read of two inputs + 2 writes | the add's traffic disappears |
+| \`F.layer_norm\`, \`F.rms_norm\` on CUDA (one fused kernel) | 1 read + 1 write | 2 × the tensor |
+| fused residual-add + norm (vLLM, TensorRT-LLM) | 2 reads + 2 writes, instead of 3 + 2 | the sum is never read back |
 
-- **Fused kernels.** \`F.layer_norm\` and \`F.rms_norm\` compute the statistic with a single pass that
-  keeps the running sum and sum of squares in registers (Welford's algorithm for the variance),
-  then write the row once. Apex's \`FusedLayerNorm\`, Triton's layer-norm tutorial and
-  \`torch.compile\` generate the same shape, with the backward fused too.
+- **Fused kernels.** \`F.layer_norm\` computes its statistics in one pass over the row, keeping a
+  running mean and sum of squared deviations in registers (Welford's algorithm), then writes the row
+  once. \`F.rms_norm\` arrived in PyTorch 2.4 as a chain of separate ops and gained a fused CUDA kernel
+  in July 2025 ([pytorch#153666](https://github.com/pytorch/pytorch/pull/153666)). Apex's
+  \`FusedLayerNorm\`, Triton's layer-norm tutorial and \`torch.compile\` generate the same shape, with
+  the backward fused too.
 - **Fused into the residual add.** In a pre-norm block the row that enters the norm is the one the
   previous residual add just produced. Inference engines compute \`x + h\` and \`norm(x + h)\` in one
   kernel, writing both.
@@ -320,12 +419,20 @@ offset up and watch the shortcut fall apart:
 
 :::widget variance-cancellation
 
+:::quiz
+Q: A fused norm kernel reads a 4096-wide bfloat16 row once and writes it once. What limits its speed?
+- [ ] FLOPs: the rsqrt is expensive
+- [x] Memory bandwidth: a few FLOPs per element against 16 KB of traffic per row
+- [ ] The reduction's synchronisation across the batch
+> A norm does a handful of FLOPs per element, far below what a GPU can do per byte moved, so the time is the bytes: 8 KB in and 8 KB out per row. Rows are independent, so nothing synchronises across the batch; the one rsqrt per row is negligible.
+:::
+
 # What to take away
 
 - **A norm is a reduction, a scale and an affine map per token.** The statistic is over the feature
   axis only; \`B × T\` rows are independent, in training and in a single-token decode.
 - **LayerNorm's small print is where the bugs are.** Biased variance (\`unbiased=False\`), \`eps\` under the
-  root, \`torch.rsqrt\`, \`keepdim=True\` — each one separates "agrees with \`F.layer_norm\`" from "close".
+  root, \`torch.rsqrt\`, \`keepdim=True\`: each one separates "agrees with \`F.layer_norm\`" from "close".
 - **RMSNorm drops the centring, not the scaling.** One reduction, one parameter, the same stabilising
   invariance; it is the norm of every Llama-family model.
 - **Take the statistic in float32 and cast the normalised row back.** A float16 square overflows at
@@ -337,6 +444,6 @@ offset up and watch the shortcut fall apart:
 The primary references are Ba, Kiros and Hinton's
 [*Layer Normalization*](https://arxiv.org/abs/1607.06450) and Zhang and Sennrich's
 [*Root Mean Square Layer Normalization*](https://arxiv.org/abs/1910.07467); Meta's
-[\`llama/model.py\`](https://github.com/meta-llama/llama/blob/main/llama/model.py) is the \`RMSNorm\` the
+[\`llama/model.py\`](https://github.com/meta-llama/llama/blob/v2/llama/model.py) is the \`RMSNorm\` the
 drill reproduces, upcast included.
 `;

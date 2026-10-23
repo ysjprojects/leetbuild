@@ -47,7 +47,7 @@ You write one file, \`nvfp4.py\`:
 
 ## Run it on your machine
 
-Run \`python nvfp4.py\` (a PyTorch recent enough to have \`torch.float8_e8m0fnu\`, CPU only; about a second).
+Run \`python nvfp4.py\` (a PyTorch recent enough to have \`torch.float8_e8m0fnu\`, CPU only; a few seconds).
 It prints \`PASS\` once it has checked:
 - the ties, saturation and signs, and the rounding against a brute-force nearest-even search;
 - every code and the packing round trip;
@@ -185,7 +185,7 @@ calibrated or MSE-searched scales; serialisation to a checkpoint.`,
                   {cols: [14, 15], tone: 'c', label: 'b7'},
                 ],
                 detail:
-                  'The codes of the block x = [−0.08, 0.36, −0.78, 0.07, 0.66, …, 1.62, −1.60, …] in a tensor whose amax is 10. Code 7 is +6 (the block amax), F is −6, 9 is −0.5, 0 is 0. A device tensor in global memory, one byte per code before packing.',
+                  'The codes of the block x = [−0.08, 0.36, −0.78, 0.07, 0.66, −0.25, 1.62, −1.60, 0.03, −0.31, 0.29, −0.22, 0.85, 0.11, 0.55, 0.43] in a tensor whose amax is 10. Code 7 is +6 (the block amax), F is −6, 9 is −0.5, 0 is 0. An intermediate tensor, one byte per code before packing.',
               },
             ],
           },
@@ -236,7 +236,7 @@ calibrated or MSE-searched scales; serialisation to a checkpoint.`,
             sub: 'E2M1[code] · 72.0 · s_g → float32',
             tone: 'compute',
             detail:
-              'Code 3 decodes to 1.5 · 72 · 0.00372 = 0.402 (from 0.36); code 7 to 6 · 72 · 0.00372 = 1.607 (from 1.62). Block MSE 0.0031.',
+              'Code 3 decodes to 1.5 · 72 · 0.00372 = 0.402 (from 0.36); code 7 to 6 · 72 · 0.00372 = 1.607 (from 1.62). Block MSE 0.0022, against 0.0038 for MXFP4’s `X = 0.25` on the same 16 values.',
           },
         ],
         arrows: [

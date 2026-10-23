@@ -5,7 +5,7 @@
  */
 export const learn = `# The system at a glance
 
-Supervised fine-tuning turns a base model, which continues any text, into an assistant, which answers a turn and stops. The recipe has been stable since [InstructGPT](https://arxiv.org/abs/2203.02155): collect conversations whose assistant turns are what you want, and train on them with the pretraining objective, next-token cross-entropy. Every frontier post-training pipeline starts here; Llama 3 alternates rounds of SFT and DPO, and RL stages begin from the SFT checkpoint.
+Supervised fine-tuning turns a base model, which continues any text, into an assistant, which answers a turn and stops. The recipe has been stable since [InstructGPT](https://arxiv.org/abs/2203.02155): collect conversations whose assistant turns are what you want, and train on them with the pretraining objective, next-token cross-entropy. Most post-training pipelines start here (DeepSeek-R1-Zero, trained by RL straight from the base model, is the well-known exception); Llama 3 alternates rounds of SFT and DPO, and RL stages usually begin from an SFT checkpoint.
 
 The objective is old. The data path in front of it is where SFT goes wrong, and none of its mistakes raises an error:
 
@@ -185,10 +185,10 @@ The positions are fixed by \`position_ids\`, which restart at 0 for every chat. 
 | chat 2 of a packed row, run | keys it sees | positions | per-token losses against the chat alone |
 |---|---|---|---|
 | alone | its own | 0 … L − 1 | (the reference) |
-| packed, one causal mask, positions running on | chat 1 and its own | offset … offset + L − 1 | off by up to 1.81 nats |
+| packed, one causal mask, positions running on | chat 1 and its own | offset … offset + L − 1 | off by up to 1.81 nats (natural-log units of cross-entropy) |
 | packed, document mask, positions restarted | its own | 0 … L − 1 | equal (difference 0.0 in float64) |
 
-Krell et al. call the middle row cross-contamination: the model is trained on contexts that never occur at inference. The [Llama 3 paper](https://arxiv.org/abs/2407.21783) uses a document mask in pretraining for the same reason, and reports that it matters little for standard pretraining but is important for continued pretraining on very long sequences. The labels need one more fix for the same leak: the first label of every chat is ignored, so the last logit of chat 1 is never graded on chat 2's first token.
+Krell et al. call the middle row cross-contamination: the model is trained on contexts that never occur at inference. The [Llama 3 paper](https://arxiv.org/abs/2407.21783) uses a document mask in pretraining for the same reason, and reports that it matters little for standard pretraining but is important for continued pretraining on very long sequences. The labels need one more fix for the same leak: the first label of every chat is ignored, so the last logit of chat 1 is never graded on chat 2's first token. With \`render\` that label is the BOS and already \`-100\`; \`pack\` enforces it anyway, for data whose first token is labelled, such as pretraining documents.
 
 How much the restart of positions matters depends on the position encoding. With a learned absolute table, as in the tiny model, a chat at offset 300 would read rows 300 and up and compute different logits. With RoPE and a document mask, scores depend only on distances inside one chat, so the restart changes nothing in exact arithmetic. It still matters in practice, because Hugging Face's FlashAttention 2 path uses it as the boundary signal: wherever \`position_ids\` returns to 0, a new sequence starts, and \`cu_seqlens\` is computed from that ([the packing post](https://huggingface.co/blog/packing-with-FA2) measures up to 2× throughput from it).
 
@@ -230,7 +230,7 @@ In the self-test the 8 packed rows split into micro-batches of 1, 2 and 5 rows h
 
 A token in the small micro-batch counts four times as much as one in the large micro-batch. The self-test measures the result: the accumulated gradient equals the full-batch gradient to 4e-16, and the mean of means is 12.1 % of the gradient's norm away from it.
 
-This was a real bug. In October 2024 Unsloth reported that losses changed when gradient accumulation was switched on in the Hugging Face Trainer, and [Hugging Face's fix](https://huggingface.co/blog/gradient_accumulation) passes \`num_items_in_batch\`, the target count of the whole accumulation window, into the loss, which divides a summed cross-entropy by it. Two details of the loop follow from the formula:
+This was a real bug. In the Hugging Face Trainer, losses changed when gradient accumulation was switched on: first reported in 2021, rediscovered by Benjamin Marie in October 2024. Unsloth traced it to the mean of means and shipped a fix in its own trainer on 15 October; [Hugging Face's fix](https://huggingface.co/blog/gradient_accumulation) to \`transformers\` followed the next day. It passes \`num_items_in_batch\`, the target count of the whole accumulation window, into the loss, which divides a summed cross-entropy by it. Two details of the loop follow from the formula:
 
 - The count is taken **before** the first backward. The first micro-batch's gradient is already in \`.grad\` when the last runs, so its divisor must already be final.
 - The clip runs **once**, on the summed gradient. Clipping each micro-batch would bound pieces of a gradient whose norm nobody computed.
@@ -258,7 +258,7 @@ Every piece of this project has a production counterpart that does the same thin
 | \`position_ids\` restarting at 0 | the boundary signal of padding-free batches (\`DataCollatorWithFlattening\`, TRL's \`padding_free\`) |
 | \`num_items_in_batch\` over micro-batches | the same name in the Trainer, all-reduced across data-parallel ranks |
 
-[TRL](https://github.com/huggingface/trl)'s \`SFTTrainer\` puts these together: give it a conversational dataset and it applies the template, masks to the assistant, packs with best-fit decreasing and goes padding-free, and its Trainer normalises by \`num_items_in_batch\`.
+[TRL](https://github.com/huggingface/trl)'s \`SFTTrainer\` puts these together: give it a conversational dataset and it applies the template, masks to the assistant with \`assistant_only_loss=True\`, packs with best-fit decreasing and goes padding-free with \`packing=True\` (both flags off by default), and its Trainer normalises by \`num_items_in_batch\`.
 
 What it adds beyond them is bookkeeping: on-the-fly packing of streamed datasets, truncation policies for chats longer than a row (truncate, split, or drop), LoRA adapters for memory, bf16 autocast, and evaluation on held-out chats with the same mask.
 

@@ -14,7 +14,7 @@ export const flashAttentionStep: Step = {
 
 Implement \`flash_attention(q, k, v, block_q, block_k, causal=True) -> out\` for \`q\`, \`k\`, \`v\` of shape
 \`[B, H, T, hd]\`: exactly \`softmax(q kᵀ / √hd) v\` (causally masked when \`causal\`), computed **without ever
-holding a \`[T, T]\` score matrix** — one \`[block_q, block_k]\` tile of scores at a time.
+holding a \`[T, T]\` score matrix**: one \`[block_q, block_k]\` tile of scores at a time.
 
 - **Two loops.** Query tiles \`q0 = 0, block_q, 2·block_q, …\` (the last one shorter when \`T\` is not a
   multiple), and for each, key/value tiles \`k0 = 0, block_k, …\`. Scores of one tile:
@@ -23,7 +23,7 @@ holding a \`[T, T]\` score matrix** — one \`[block_q, block_k]\` tile of score
   \`o\` (unnormalised output, \`[B, H, bq, hd]\`, starts 0). For each key tile:
   \`m_new = max(m, s.amax(-1))\`, \`alpha = exp(m - m_new)\`, \`p = exp(s - m_new)\`,
   \`l = alpha · l + p.sum(-1)\`, \`o = alpha · o + p @ v[:, :, k0:k1]\`, \`m = m_new\`. The query tile's
-  output is \`o / l\` — divide **once**, after the last key tile. Keep \`m\`, \`l\` and \`o\` as the names
+  output is \`o / l\`: divide **once**, after the last key tile. Keep \`m\`, \`l\` and \`o\` as the names
   (\`m_new\` / \`m_i\` style suffixes are fine).
 
 :::widget online-softmax {"tile": 4}
@@ -37,18 +37,19 @@ holding a \`[T, T]\` score matrix** — one \`[block_q, block_k]\` tile of score
   tensor (a full \`tril\` mask included) inside \`flash_attention\`. The reference is used only by the
   self-test.
 - **Self-test** (keep it): \`torch.manual_seed(0)\`, \`B, H, T, hd = 2, 3, 37, 16\`; causal tiles
-  \`(8, 8)\`, \`(16, 4)\`, \`(5, 7)\`, \`(32, 16)\` run under \`NoFullScores(T)\` — a \`TorchFunctionMode\` that
-  raises if any op returns a tensor ending in \`[T, T]\` — and must \`allclose\` the reference with
+  \`(8, 8)\`, \`(16, 4)\`, \`(5, 7)\`, \`(32, 16)\` run under \`NoFullScores(T)\` (a \`TorchFunctionMode\` that
+  raises if any op returns a tensor ending in \`[T, T]\`) and must \`allclose\` the reference with
   \`atol=1e-5\`; \`(64, 64)\` degenerates to one tile; \`causal=False\` against the unmasked reference;
+  \`q * 30\` (scores up to 126, past float32 \`exp\`'s overflow at 88.7) with \`atol=1e-4\`;
   \`torch.autograd.gradcheck\` in float64 on \`[1, 2, 7, 4]\` with tiles \`(3, 2)\`; then \`PASS\`.
 
-> The softmax over a row needs the row's max before any exponential is taken — unless every partial
+> The softmax over a row needs the row's max before any exponential is taken, unless every partial
 > result is tagged with the max it was computed under and rescaled by \`exp(m_old - m_new)\` when a
 > later tile raises it. That rescaling is what lets attention stream over keys without the \`[T, T]\`.`,
   hints: [
-    'Shape the stats as `[B, H, bq, 1]` so they broadcast against `s` (`[B, H, bq, bk]`) and `o` (`[B, H, bq, hd]`): `m = torch.full((B, H, bq, 1), float("-inf"))`, `l = torch.zeros((B, H, bq, 1))`. With `m = -inf`, the first tile gives `alpha = exp(-inf) = 0`, so no special case for the first iteration.',
-    'Within a tile the diagonal sits at absolute positions: `rows = torch.arange(q0, q1)[:, None]`, `cols = torch.arange(k0, k1)[None, :]`, `s = s.masked_fill(cols > rows, float("-inf"))`. Only tiles with `k1 > q0 + 1` can contain a masked entry; `k0 >= q1` means the whole tile is in the future — `break`, since later tiles are too.',
-    '`exp(-inf - m_new)` is 0 and `exp(s - m_new)` is 0 on masked entries, so neither `l` nor `o` ever sees a NaN as long as every row has at least one unmasked key in its first tile — true for causal self-attention (key 0 is visible to every query). Collect `o / l` per query tile and `torch.cat` on `dim=2`.',
+    "Shape the statistics `[B, H, bq, 1]` so they broadcast against `s` (`[B, H, bq, bk]`) and `o` (`[B, H, bq, hd]`). Starting `m` at `-inf` makes the first tile's `alpha = exp(-inf) = 0`: no first-iteration branch.",
+    'The mask compares absolute positions: `torch.arange(q0, q1)` as a column against `torch.arange(k0, k1)` as a row. A tile with `k1 <= q0 + 1` needs no mask; the first tile with `k0 >= q1` lies wholly in the future, and so does every later one.',
+    'A row with no visible key in the first tile it meets gets `alpha = exp(-inf + inf) = NaN`. Causal self-attention never has one (key 0 is visible to every query), so no guard is needed here.',
   ],
   checks: [
     {
@@ -108,7 +109,7 @@ holding a \`[T, T]\` score matrix** — one \`[block_q, block_k]\` tile of score
       id: 'running-sum',
       title: 'A running sum and accumulator rescaled by alpha, normalised once at the end',
       detail:
-        '`l = alpha * l + p.sum(-1, keepdim=True)`, `o = alpha * o + p @ v_tile`, and the tile’s output is `o / l` after the last key tile — not a division per tile.',
+        '`l = alpha * l + p.sum(-1, keepdim=True)`, `o = alpha * o + p @ v_tile`, and the tile’s output is `o / l` after the last key tile, not a division per tile.',
       match: {
         python: {
           all: [
@@ -218,6 +219,8 @@ if __name__ == "__main__":
     assert torch.allclose(flash_attention(q, k, v, 64, 64), ref, atol=1e-5), "tiles larger than T: one tile"
     full = F.scaled_dot_product_attention(q, k, v)
     assert torch.allclose(flash_attention(q, k, v, 8, 8, causal=False), full, atol=1e-5), "non-causal"
+    big = F.scaled_dot_product_attention(q * 30, k, v, is_causal=True)  # scores up to 126: exp(s) overflows
+    assert torch.allclose(flash_attention(q * 30, k, v, 8, 8), big, atol=1e-4), "large logits: running max"
     q64, k64, v64 = (torch.randn(1, 2, 7, 4, dtype=torch.float64, requires_grad=True) for _ in range(3))
     assert torch.autograd.gradcheck(lambda a, b, c: flash_attention(a, b, c, 3, 2), (q64, k64, v64))
     print("PASS")
@@ -302,11 +305,13 @@ if __name__ == "__main__":
     assert torch.allclose(flash_attention(q, k, v, 64, 64), ref, atol=1e-5), "tiles larger than T: one tile"
     full = F.scaled_dot_product_attention(q, k, v)
     assert torch.allclose(flash_attention(q, k, v, 8, 8, causal=False), full, atol=1e-5), "non-causal"
+    big = F.scaled_dot_product_attention(q * 30, k, v, is_causal=True)  # scores up to 126: exp(s) overflows
+    assert torch.allclose(flash_attention(q * 30, k, v, 8, 8), big, atol=1e-4), "large logits: running max"
     q64, k64, v64 = (torch.randn(1, 2, 7, 4, dtype=torch.float64, requires_grad=True) for _ in range(3))
     assert torch.autograd.gradcheck(lambda a, b, c: flash_attention(a, b, c, 3, 2), (q64, k64, v64))
     print("PASS")
 `,
     },
   },
-  debrief: `The loop is FlashAttention's algorithm with PyTorch ops in place of a kernel. Three decisions carry it. The **running max** \`m\` is what makes streaming exact: a softmax needs the row max before any exponential, so every tile's exponentials are taken against the max seen so far and, when a later tile raises it, the old sum and accumulator are multiplied by \`exp(m_old - m_new)\` — a factor at most 1, so nothing overflows and the final \`o / l\` is the softmax to rounding. The **division happens once**: \`l\` and \`o\` are unnormalised partial sums, which is why they rescale by the same \`alpha\` and why a per-tile division would be both wrong and slower. The **causal mask lives inside the tile**: absolute row and column indices from \`torch.arange\`, so only tiles crossing the diagonal pay for a mask and tiles past it are never computed — half the work for a causal model. What this version leaves on the table is memory for the backward pass: autograd saves every \`p\` tile, so training still holds \`O(T²)\` activations; the real kernel stores only \`m\` and \`l\` per row (as one logsumexp) and **recomputes** \`p\` tile by tile in the backward, trading FLOPs for bytes. The kernel also keeps \`q\`, \`k\`, \`v\` tiles and \`o\` in SRAM for the whole inner loop, which is where the speed comes from; FlashAttention-2 reorders the loops so a thread block owns a query tile and reduces non-matmul work; \`F.scaled_dot_product_attention\` dispatches to that kernel on CUDA, and Triton or \`torch.compile\` let you write this same loop and get a fused kernel out.`,
+  debrief: `The loop is FlashAttention's algorithm with PyTorch ops in place of a kernel. Three decisions carry it. The **running max** \`m\` is what makes streaming safe: a softmax needs the row max before any exponential, so every tile's exponentials are taken against the max seen so far and, when a later tile raises it, the old sum and accumulator are multiplied by \`exp(m_old - m_new)\`, a factor at most 1, so nothing overflows (the \`q * 30\` case) and the final \`o / l\` is the softmax to rounding. The **division happens once**: \`l\` and \`o\` are unnormalised partial sums, which is why they rescale by the same \`alpha\`. FlashAttention-1 normalised \`O\` every step and undid it with \`l_old / l_new\` on the next; FlashAttention-2 moved to this form because those extra non-matmul FLOPs cost 16 times a tensor-core FLOP on an A100. The **causal mask lives inside the tile**: absolute row and column indices from \`torch.arange\`, so only tiles crossing the diagonal pay for a mask and tiles past it are never computed: half the work for a causal model. What this version leaves on the table is memory for the backward pass: autograd saves every \`p\` tile, so training still holds \`O(T²)\` activations; the real kernel saves the output and one logsumexp per row (FlashAttention-1 kept \`m\` and \`l\`) and **recomputes** \`p\` tile by tile in the backward, trading FLOPs for bytes. The kernel also keeps the Q tile in shared memory and \`s\`, \`o\`, \`m\`, \`l\` in registers for the whole inner loop, so HBM sees Q once, K and V once per query tile, and the output once; FlashAttention-2 runs query tiles in the outer loop, as here, so each thread block owns one, and \`F.scaled_dot_product_attention\` dispatches to that kernel on CUDA. Triton or \`torch.compile\` let you write this same loop and get a fused kernel out.`,
 };

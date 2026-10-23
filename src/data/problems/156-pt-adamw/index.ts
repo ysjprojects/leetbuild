@@ -4,15 +4,15 @@ import {learn} from './learn';
 import {adamwStep} from './steps/1-adamw';
 
 /**
- * Deep-learning drill: AdamW as a `torch.optim.Optimizer` subclass — lazily created per-parameter
+ * Deep-learning drill: AdamW as a `torch.optim.Optimizer` subclass (lazily created per-parameter
  * state, bias-corrected first and second moments, decoupled weight decay applied to the parameter
- * rather than the gradient, optional AMSGrad — matched step by step against `torch.optim.AdamW`.
+ * rather than the gradient, optional AMSGrad), matched step by step against `torch.optim.AdamW`.
  */
 export const ptAdamwProblem: Problem = {
   id: 'pt-adamw',
   title: 'AdamW: bias-corrected moments and decoupled weight decay',
   tagline:
-    'Subclass torch.optim.Optimizer: lazy state, EMAs of g and g², bias correction from the step count, weight decay on the parameter — and match torch.optim.AdamW to 1e-7.',
+    'Subclass torch.optim.Optimizer: lazy state, EMAs of g and g², bias correction from the step count, weight decay on the parameter, and match torch.optim.AdamW to 1e-7.',
   difficulty: 'medium',
   track: 'dllm',
   language: 'python',
@@ -20,13 +20,13 @@ export const ptAdamwProblem: Problem = {
   minutes: 45,
   statement: `# AdamW: bias-corrected moments and decoupled weight decay
 
-Every frontier language model — GPT, LLaMA, Mistral, Gemma — is trained with AdamW. Adam keeps two
-exponential moving averages per parameter: the gradient \`m\` and the squared gradient \`v\`, and moves
-each weight by \`m / (√v + ε)\`, so every coordinate gets its own step size. Both averages start at zero
-and are biased towards zero for the first few hundred steps; dividing by \`1 − β^t\` corrects that. AdamW
-(Loshchilov & Hutter, 2019) changes one thing: weight decay is **decoupled** — the parameter is shrunk
-by \`lr × wd\` directly, instead of adding \`wd × p\` to the gradient where Adam's normalisation would
-scale it away for weights with large gradients.
+Most large language models are trained with AdamW (LLaMA, for one, with \`betas=(0.9, 0.95)\` and
+\`weight_decay=0.1\`). Adam keeps two exponential moving averages per parameter, of the gradient \`m\`
+and of the squared gradient \`v\`, and moves each weight by \`m / (√v + ε)\`, so every coordinate gets its
+own step size. Both averages start at zero and are biased towards it, \`v\` for the first few thousand
+steps; dividing by \`1 − β^t\` corrects that. AdamW (Loshchilov & Hutter, 2019) changes one thing: weight
+decay is **decoupled**. The parameter is shrunk by \`lr × wd\` directly, instead of adding \`wd × p\` to
+the gradient, where Adam's normalisation would scale it away for weights with large gradients.
 
 The surface is one class, \`AdamW(torch.optim.Optimizer)\`, with the reference's signature:
 \`AdamW(params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, amsgrad=False)\` and
@@ -44,7 +44,7 @@ when \`amsgrad\`. Parameters are updated **in place** under \`@torch.no_grad()\`
 
 ## Run it on your machine
 
-\`python adamw.py\` — the self-test trains two copies of a small \`float64\` MLP for 25 steps, one with
+\`python adamw.py\` (about 2 s on a laptop CPU): the self-test trains two copies of a small \`float64\` MLP for 25 steps, one with
 your optimizer and one with \`torch.optim.AdamW\`, with and without \`amsgrad\`, and asserts every
 parameter and every moment agrees after every step (\`torch.allclose(atol=1e-7)\`). It then checks that a
 frozen parameter is skipped and gets no state, that \`step(closure)\` returns the loss, and that a sparse
@@ -130,7 +130,7 @@ state across devices.`,
                           sub: 'only when amsgrad=True',
                           kind: 'memory',
                           detail:
-                            '`torch.maximum(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)`, then used in place of `exp_avg_sq`: the per-coordinate step can only shrink.',
+                            '`torch.maximum(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)`, then used in place of `exp_avg_sq`: the denominator never forgets a large `v`, so a rare large gradient keeps damping the steps after it.',
                         },
                       ],
                     ],
@@ -140,7 +140,7 @@ state across devices.`,
                     label: 'Bias correction',
                     sub: 'bc1 = 1 − β₁ᵗ · bc2 = 1 − β₂ᵗ',
                     detail:
-                      'Both moments start at zero and are biased towards it. `step_size = lr / bc1`; `bc2` divides `v` under the root. Without it step 1 moves about 3.2 × too far.',
+                      'Both moments start at zero and are biased towards it. `step_size = lr / bc1`; `bc2` divides `v` under the root. Without it step 1 moves 3.2 × too far, and step 12 about 6.6 × (for a constant gradient).',
                   },
                   {
                     id: 'denom',
@@ -155,7 +155,7 @@ state across devices.`,
                     sub: 'p.mul_(1 − lr·wd)',
                     kind: 'attention',
                     detail:
-                      'The one change from Adam: the weight shrinks by `lr · wd` directly, outside `m / √v`. The reference does it first, before the moments; neither moment reads `p`, so the result is the same.',
+                      'The one change from Adam: the weight shrinks by `lr · wd` directly, outside `m / √v`. The reference does it first; neither moment reads `p`, so any point before `addcdiv_` gives the same result.',
                   },
                   {
                     id: 'update',

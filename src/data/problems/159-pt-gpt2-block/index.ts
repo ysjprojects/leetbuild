@@ -4,7 +4,7 @@ import {learn} from './learn';
 import {gpt2BlockStep} from './steps/1-gpt2-block';
 
 /**
- * Deep-learning drill: the layer GPT-2 stacks twelve to forty-eight times — pre-LayerNorm, a residual
+ * Deep-learning drill: the layer GPT-2 stacks twelve to forty-eight times: pre-LayerNorm, a residual
  * around causal attention and around a 4× GELU MLP, and the initialisation (N(0, 0.02), zero biases,
  * unit LayerNorms, residual projections scaled by 1/√(2·n_layer)) that lets the stack train.
  */
@@ -12,7 +12,7 @@ export const ptGpt2BlockProblem: Problem = {
   id: 'pt-gpt2-block',
   title: 'A GPT-2 transformer block',
   tagline:
-    'Pre-LN, two residuals, a 4× MLP with the tanh GELU, and the init GPT-2 ships with — one Block that a model repeats n_layer times.',
+    'Pre-LN, two residuals, a 4× MLP with the tanh GELU, and the init GPT-2 ships with: one Block that a model repeats n_layer times.',
   difficulty: 'medium',
   track: 'dllm',
   language: 'python',
@@ -21,12 +21,13 @@ export const ptGpt2BlockProblem: Problem = {
   statement: `# A GPT-2 transformer block
 
 A decoder-only language model is an embedding, \`n_layer\` copies of one block, a final LayerNorm and an
-unembedding. Everything the model learns about language lives in the blocks, and every block is the same
-two sentences: *read the context* (causal self-attention) and *think about each position* (a two-layer
-MLP), each applied to a normalised copy of the residual stream and added back. GPT-2 (2019) fixed the
-form that Llama, Mistral and the GPT-4 family still use: **pre-LayerNorm**, a **4× hidden MLP** with
-**GELU**, and an initialisation whose one non-obvious rule — shrink the projections that write into the
-residual stream by \`1/√(2·n_layer)\` — is what lets forty-eight of them train in a stack.
+unembedding. Between the embedding and the unembedding, all the computation happens in the blocks, and every
+block does the same two things: *read the context* (causal self-attention) and *think about each position*
+(a two-layer MLP), each applied to a normalised copy of the residual stream and added back. GPT-2 (2019)
+fixed the **pre-LayerNorm** form that Llama and Mistral keep (they swap in RMSNorm and a gated MLP for
+GPT-2's **4× hidden MLP** with **GELU**), and an initialisation whose one non-obvious rule, shrinking the
+projections that write into the residual stream by \`1/√(2·n_layer)\`, keeps the stream's scale from growing
+with depth.
 
 The surface, over a \`GPTConfig(n_embd, n_head, n_layer, block_size, dropout)\`:
 
@@ -50,9 +51,9 @@ Float32 throughout; the gradient check runs the MLP in float64.
 ## Run it on your machine
 
 \`python gpt2_block.py\` with PyTorch 2.x (CPU is enough; it takes a second). A passing run prints \`PASS\`;
-the starter raises \`NotImplementedError\` at the first assertion, and each wrong piece trips the assertion
-named after it (\`"reference"\` for post-LN, \`"residual identity"\` for adding the normalised stream,
-\`"c_proj std"\` for a missing or overwritten scaling).
+the starter raises \`NotImplementedError\` at the first assertion. A wrong \`forward\` (post-LN, or adding to
+the normalised stream instead of the raw one) trips \`"reference"\`; a missing or overwritten scaling trips
+\`"c_proj std"\`.
 
 ## Left out on purpose
 
@@ -181,7 +182,7 @@ unembedding, weight decay groups and the optimiser, the KV cache, FlashAttention
       date: '2019-02-14',
       venue: 'OpenAI technical report',
       takes:
-        "GPT-2's block: LayerNorm moved to the input of each sub-block, and residual-layer weights scaled at initialisation by `1/√N`, the `0.02 / √(2·n_layer)` on every `c_proj`.",
+        "GPT-2's block: LayerNorm moved to the input of each sub-block, and residual-layer weights scaled at initialisation by `1/√N` with `N` the number of residual layers, which nanoGPT reads as `0.02 / √(2·n_layer)` on every `c_proj`.",
     },
     {
       kind: 'paper',

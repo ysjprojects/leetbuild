@@ -112,7 +112,7 @@ activations (LLM.int8()); calibration on C4 or WikiText and checkpoint serialisa
             sub: 'U = chol(H⁻¹), upper',
             shape: '[d_in, d_in] upper',
             detail:
-              '`cholesky`, `cholesky_inverse`, `cholesky(upper=True)`. Row `i` of `U` holds what column `i`’s error does to the columns after it, once columns `0..i−1` are fixed: every inverse downdate of OBQ, computed once.',
+              '`cholesky`, `cholesky_inverse`, `cholesky(upper=True)`. Row `i` of `U`, divided by `U[i, i]`, is how column `i`’s error moves the columns after it once columns `0..i−1` are fixed: every inverse downdate of the fixed column order, computed once.',
           },
           {
             tone: 'block',

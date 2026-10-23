@@ -311,7 +311,7 @@ Step through three sequences filling a pool of blocks through their block tables
 > A slot is an address the scheduler computed once, on the host. The kernel only splits it into
 > (block, offset) and copies; after it, no kernel ever sees a sequence as contiguous memory.`,
   hints: [
-    'The kernel is about ten lines: read the slot, `if (slot < 0) return;`, divide, then one loop `for (int i = threadIdx.x; i < num_kv_heads * head_size; i += blockDim.x)` with two stores.',
+    'The kernel is about ten lines: read the slot, return if it is negative, split it into block and offset, then one block-stride loop over the token’s `num_kv_heads * head_size` floats with two stores.',
     'Inside the loop, `head = i / head_size` and `d = i % head_size`. The source is `(token_idx * num_kv_heads + head) * head_size + d` and the destination `((block_idx * block_size + block_offset) * num_kv_heads + head) * head_size + d`. Keep `token_idx`, `slot`, `block_idx` and `block_offset` as `int64_t` so every product is 64-bit.',
     'The guard blocks in `main()` are there for the classic bug: without the early return a padding token computes `block_idx = 0` and `block_offset = -1`, and its 1,024 floats land in the slot just before block 0, which is the last slot of the first guard block.',
   ],

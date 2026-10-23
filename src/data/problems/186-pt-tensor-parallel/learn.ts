@@ -45,7 +45,7 @@ shard a model over several GPUs run the same layers at inference time.
 }
 :::
 
-What each rank holds and sends, per piece of one layer (\`p\` ranks, \`d\` the model width, \`B · T\` tokens):
+What each rank holds and sends, piece by piece (\`p\` ranks, \`d\` the model width, \`B · T\` tokens):
 
 | piece | dense weight | per rank | forward | backward |
 |---|---|---|---|---|
@@ -59,8 +59,8 @@ What each rank holds and sends, per piece of one layer (\`p\` ranks, \`d\` the m
 | cross-entropy | B·T·V logits | B·T·V/p logits | 3 all-reduces of B·T | none |
 
 At GPT-3 175B's width (\`d = 12,288\`, 96 layers) a layer's \`12d²\` weights are 1.81 B parameters; at
-\`p = 8\` a rank keeps 226 M of them, 453 MB in bf16, and the whole model's 174 B weights become 21.7 B
-per rank.
+\`p = 8\` a rank keeps 226 M of them, 453 MB in bf16, and the 96 layers' 174 B weights become 21.7 B per
+rank.
 
 # f and g: two conjugate operators
 
@@ -116,14 +116,15 @@ figure 3, for the MLP:
 }
 :::
 
-What goes wrong when one piece is missing, each caught by the step-1 self-test:
+What goes wrong when one piece is wrong. The first three fail the step-1 self-test; the fourth raises in
+backward:
 
 | mistake | what you see | why |
 |---|---|---|
 | f is the identity in backward too | \`x.grad\` differs across ranks, each \`1/p\`-ish of the truth | each rank keeps only its shard's partial dL/dX |
 | bias inside the row-parallel matmul | output off by \`(p − 1) · b\` | g sums the bias \`p\` times |
-| g all-reduces its input in place | wrong gradients elsewhere in the graph | autograd saved that tensor for another backward |
-| row layer bias sharded | output missing \`(p − 1)/p\` of the bias | the bias belongs after the sum, whole |
+| g all-reduces in backward too | input gradients \`p\` times too large | the incoming gradient is already whole and the same on every rank |
+| an in-place all-reduce on a tensor autograd saved | "modified by an inplace operation" at \`backward()\` | the version counter catches it; the \`.clone()\` makes f and g safe anywhere |
 
 :::quiz
 Q: A column-parallel layer's f is accidentally the identity in both directions. Forward outputs are exact. What breaks?
@@ -183,9 +184,10 @@ Attention is column then row too, and the unit of the split is the head. \`qkv\`
 \`r\` computes q, k and v for heads \`r · n/p … (r+1) · n/p − 1\`, runs causal attention on those heads alone
 (a head's softmax only ever looks at its own q and k), and the output projection \`W_o\` is row-parallel
 over the same heads' columns. One all-reduce forward, one backward, exactly like the MLP. It requires
-\`n_heads % p == 0\`: GPT-3's 96 heads allow \`p\` of 1, 2, 3, 4, 6 or 8.
+\`n_heads % p == 0\`: GPT-3's 96 heads allow any divisor of 96, which inside an 8-GPU node means 1, 2, 3, 4, 6
+or 8.
 
-The trap is the fused weight. A GPT-2 or Hugging Face checkpoint stores \`qkv\` as \`[Q; K; V]\`, each block
+The trap is the fused weight. GPT-2's checkpoint stores \`qkv\` (\`c_attn\`) as \`[Q; K; V]\`, each block
 ordered by head. Rank \`r\` needs **its** heads' rows from each of the three blocks, not a contiguous third:
 
 :::gpu
@@ -201,8 +203,8 @@ ordered by head. Rank \`r\` needs **its** heads' rows from each of the three blo
 
 Megatron avoids the regrouping by storing its \`linear_qkv\` interleaved per head group, so a plain chunk is
 correct for its own checkpoints; converting a checkpoint between the two layouts is a common source of
-silently wrong models. With grouped-query attention the number of KV heads must divide \`p\` as well, or
-the KV heads are replicated.
+silently wrong models. With grouped-query attention \`p\` must divide the number of KV heads as well; with
+fewer KV heads than ranks, each KV head is replicated on \`p / n_kv\` ranks.
 
 :::quiz
 Q: Why does tensor-parallel attention need no communication between the qkv projection and the output projection?
@@ -215,10 +217,13 @@ Q: Why does tensor-parallel attention need no communication between the qkv proj
 
 # The vocabulary: embedding and loss without the full logits
 
-The two ends of the model are split by vocabulary. \`VocabParallelEmbedding\` gives rank \`r\` the table rows
-\`[r · V/p, (r+1) · V/p)\`; an id outside that range looks up a dummy row whose output is then zeroed, and g
-sums the \`p\` vectors, of which exactly one is non-zero. The head is tied to that shard, so each rank
-produces \`(B, T, V/p)\` logits for the ids it owns. Gathering them would cost \`V\` floats per token and a
+The two ends of the model are split by vocabulary, the paper's column split of the \`h × V\` table \`E\`. For
+the lookup that dimension is contracted (a one-hot \`(B, T, V)\` times the table), so
+\`VocabParallelEmbedding\` acts as a row-parallel layer: rank \`r\` holds ids \`[r · V/p, (r+1) · V/p)\`, rows of
+the \`(V, d)\` \`nn.Embedding\` weight.
+An id outside that range looks up a dummy row whose output is then zeroed, and g
+sums the \`p\` vectors, of which exactly one is non-zero. The head, tied to that shard, is column-parallel
+behind f: each rank produces \`(B, T, V/p)\` logits for the ids it owns. Gathering them would cost \`V\` floats per token and a
 \`B · T · V\` buffer on every rank, which at Llama 3's 128,256-token vocabulary is the largest tensor in the
 model. The loss needs only two global numbers per token, plus the target logit from its owner:
 
@@ -276,7 +281,8 @@ on the critical path: no rank can start the next sublayer until the sum arrives.
 inside a server. [Narayanan et al., 2021](https://arxiv.org/abs/2104.04473) quantify it and compose TP
 with pipeline and data parallelism (PTD-P): TP up to the 8 GPUs that share NVLink, pipeline stages across
 nodes, data parallelism over the rest, reaching 502 petaFLOP/s on 3,072 GPUs for a one-trillion-parameter
-model. Across InfiniBand the same all-reduces would cost several times more per byte.
+model. Across servers the same all-reduces would be far slower: in that paper's DGX A100 cluster a GPU has
+300 GB/s of NVLink each way and one 200 Gb/s (25 GB/s) InfiniBand card, 12× less.
 
 | concern | this problem | Megatron-LM in production |
 |---|---|---|
@@ -284,7 +290,7 @@ model. Across InfiniBand the same all-reduces would cost several times more per 
 | rendezvous | a file store in a temp dir | TCP store, \`torchrun\` |
 | overlap | none | input-gradient all-reduce overlapped with the weight-gradient GEMM |
 | replicated LayerNorm and dropout | \`p\` copies of their activations | sequence parallelism: split along T |
-| init | sharded from a dense model | master weight drawn whole, then split, so \`p\` does not change it |
+| init | sharded from a dense model | each shard drawn on its GPU from a tracked RNG (depends on \`p\`), or with \`use_cpu_initialization\` a master weight drawn whole, then split |
 | dropout | none | a per-rank CUDA RNG state for split regions |
 
 Sequence parallelism ([Korthikanti et al., 2022](https://arxiv.org/abs/2205.05198)) attacks the replicated

@@ -2,15 +2,15 @@
  * The learning guide for the tiled-matmul drill: arithmetic intensity and why the naive kernel is
  * memory-bound, tiling through shared memory and the 32× reuse it buys, coalesced loads from the
  * `[ty][tx]` index map, the two barriers (and the race the second one prevents), and what cuBLAS adds
- * on top — a figure or a table where one says it faster than prose, a pop quiz per section. Rendered
+ * on top: a figure or a table where one says it faster than prose, a pop quiz per section. Rendered
  * at \`/cuda-tiled-matmul/learn\`.
  */
 export const learn = `# The mechanism at a glance
 
 A matrix multiply \`C = A · B\` is the operation a transformer spends almost all of its FLOPs on: the Q, K, V
 and output projections, the two MLP matrices, the LM head, and \`Q · Kᵀ\` and \`P · V\` inside attention.
-The tiled kernel is the textbook GPU version — the one in the CUDA Programming Guide's
-[shared-memory section](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory) —
+The tiled kernel is the textbook GPU version (the one the CUDA C++ Best Practices Guide walks through in
+[Shared Memory in Matrix Multiplication](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#shared-memory-in-matrix-multiplication-c-ab))
 and the ancestor of every cuBLAS and CUTLASS kernel. It keeps the naive mapping (one thread, one output
 element) and changes only where the operands come from: a block stages slabs of \`A\` and \`B\` in shared
 memory and reuses each float 32 times.
@@ -25,9 +25,9 @@ every float it fetched. Both write \`C\` once per output.
     {"id": "naive", "label": "matmul_naive", "sub": "block 32 × 32 · no shared memory", "layout": "column", "items": [
       {"id": "n-acc", "label": "Registers", "sub": "acc, one per thread", "tone": "register", "stretch": true, "detail": "Every multiply-add brings two fresh floats from global memory into registers: 8 bytes for 2 FLOPs."},
       {"threads": 12, "continues": true, "label": "1,024 threads · one output each"}
-    ], "detail": "The baseline: one thread, one output, every operand straight from global memory. Caches catch some repeats; it stays a memory benchmark."},
+    ], "detail": "The baseline: one thread, one output, every operand straight from global memory. Caches catch most repeats, but every load still crosses the memory pipeline: it stays memory-bound."},
     {"id": "gmem", "label": "Global memory", "sub": "HBM · off-chip, large, slow", "tone": "global", "layout": "column", "items": [
-      {"id": "g-ab", "array": "A, B", "sub": "float32 · read", "cols": 10, "continues": true, "detail": "DRAM: tens of TFLOP/s of arithmetic against 2 to 3 TB/s of bandwidth, so a kernel needs about 10 FLOPs per byte fetched to be compute-bound."},
+      {"id": "g-ab", "array": "A, B", "sub": "float32 · read", "cols": 10, "continues": true, "detail": "DRAM: an H100 SXM does 67 TFLOP/s of float32 against 3.35 TB/s, so a kernel needs about 20 FLOPs per byte fetched to be compute-bound."},
       {"id": "g-c", "array": "C", "sub": "written once", "cols": 10, "continues": true, "detail": "One guarded store per output from each kernel."}
     ]},
     {"id": "tiled", "label": "matmul_tiled", "sub": "block 32 × 32 · ⌈K/32⌉ slabs", "layout": "column", "items": [
@@ -46,7 +46,7 @@ every float it fetched. Both write \`C\` once per output.
 
 The contract, in one file \`tiled_matmul.cu\`:
 
-- \`__global__ void matmul_tiled(const float* A, const float* B, float* C, int M, int N, int K)\` — row-major
+- \`__global__ void matmul_tiled(const float* A, const float* B, float* C, int M, int N, int K)\`: row-major
   float32, \`A[M×K]\`, \`B[K×N]\`, \`C[M×N]\`, \`constexpr int TILE = 32\`.
 - Launched with \`dim3 block(TILE, TILE)\` and \`dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE)\`:
   \`x\` along columns, \`y\` along rows; \`row = blockIdx.y * TILE + ty\`, \`col = blockIdx.x * TILE + tx\`.
@@ -57,9 +57,9 @@ The contract, in one file \`tiled_matmul.cu\`:
 # Arithmetic intensity: why the naive kernel is memory-bound
 
 A GPU has two budgets: how many FLOPs it can issue per second and how many bytes it can move from DRAM
-per second. **Arithmetic intensity** — FLOPs per byte fetched — decides which one a kernel runs into; the
-[roofline model](https://en.wikipedia.org/wiki/Roofline_model) draws the line. A modern data-centre GPU does
-tens of TFLOP/s of float32 against 2–3 TB/s of bandwidth, so a kernel needs roughly 10 or more FLOPs per byte
+per second. **Arithmetic intensity** (FLOPs per byte fetched) decides which one a kernel runs into; the
+[roofline model](https://en.wikipedia.org/wiki/Roofline_model) draws the line. An H100 SXM does 67 TFLOP/s of
+float32 (without tensor cores) against 3.35 TB/s of HBM bandwidth, so a kernel needs about 20 FLOPs per byte
 before the arithmetic, not the memory, is the limit.
 
 A GEMM on its own has plenty: \`2MNK\` FLOPs over \`MK + KN + MN\` floats. The naive kernel throws that away.
@@ -71,15 +71,16 @@ for (int k = 0; k < K; ++k) acc += A[row * K + k] * B[k * N + col];
 C[row * N + col] = acc;
 \`\`\`
 
-| Kernel | Global floats per output | FLOPs per output | FLOPs per byte | 1024³ global traffic |
+| Kernel | Global floats per output | FLOPs per output | FLOPs per byte | 1024³ global loads |
 | --- | --- | --- | --- | --- |
-| Whole GEMM, ideal (each float once) | (MK + KN + MN) / MN = 3 at 1024³ | 2K | ≈ 170 | 12 MB |
+| Whole GEMM, ideal (each float once) | (MK + KN + MN) / MN = 3 at 1024³ | 2K | ≈ 170 | 12.6 MB |
 | \`matmul_naive\` | 2K | 2K | 0.25 | ≈ 8.6 GB requested |
-| \`matmul_tiled\`, TILE 32 | 2K / 32 | 2K | 8 | ≈ 270 MB |
+| \`matmul_tiled\`, TILE 32 | 2K / 32 | 2K | 8 | ≈ 270 MB requested |
 
 - In the naive kernel every multiply-add needs two fresh 4-byte loads: 2 FLOPs per 8 bytes. Caches catch
-  some of the repeats (neighbouring threads read the same row of \`A\`), which is why it is not even slower,
-  but it stays a memory benchmark.
+  most of the repeats (a warp's 32 threads read the same float of \`A\`, and neighbouring warps the same
+  floats of \`B\`), so DRAM sees far less than 8.6 GB. Every load still goes through the L1/L2 pipeline, and
+  that is where the naive kernel runs out of bandwidth.
 - The data is reused \`N\` times (each element of \`A\`) and \`M\` times (each element of \`B\`) across the
   whole product. The naive kernel leaves that reuse to the cache; tiling makes it explicit.
 
@@ -90,10 +91,10 @@ right, toward the compute roof.
 
 :::quiz
 Q: The naive kernel reaches a small fraction of the GPU's peak FLOP/s on 1024³. What is the bottleneck?
-- [ ] The 2K multiply-adds per thread — the arithmetic is too long
-- [x] Global memory bandwidth — every FMA needs two fresh loads, so it does 0.25 FLOP per byte
-- [ ] Too few threads — one per output is not enough parallelism
-> 1024² outputs is over a million threads, and the FLOP count is the same for every kernel. What differs is bytes fetched per FLOP: at 0.25 FLOP/byte the kernel runs out of DRAM bandwidth long before it runs out of arithmetic.
+- [ ] The 2K multiply-adds per thread: the arithmetic is too long
+- [x] Memory bandwidth: every FMA needs two fresh loads, so it does 0.25 FLOP per byte requested
+- [ ] Too few threads: one per output is not enough parallelism
+> 1024² outputs is over a million threads, and the FLOP count is the same for every kernel. What differs is bytes loaded per FLOP: at 0.25 FLOP/byte the kernel runs out of memory bandwidth (the L1 and L2 that serve most repeats, then DRAM) long before it runs out of arithmetic.
 :::
 
 # Tiling: stage once, reuse 32 times
@@ -118,9 +119,15 @@ if (row < M && col < N) C[row * N + col] = acc;
 \`\`\`
 
 - **Reuse.** Each float loaded into \`As\` is read by the 32 threads of its row; each in \`Bs\` by the 32
-  threads of its column. Global traffic per output drops from \`2K\` to \`2K / 32\`: the whole speedup.
-- **Shared memory** is on-chip, per block, roughly register-speed when access is conflict-free. Two
-  32 × 32 float tiles are 8 KB, small enough for several blocks per SM.
+  threads of its column. Global loads per output drop from \`2K\` to \`2K / 32\`. The measured gain is far
+  smaller than 32×: Boehm's worklog has this kernel at 1.5× the coalesced naive one on an RTX A6000,
+  because the naive kernel's loads already hit L1 often.
+- **Shared memory** is on-chip, per block, with much higher bandwidth and lower latency than global memory
+  when access is free of bank conflicts. Two 32 × 32 float tiles are 8 KB.
+- **Occupancy.** 8 KB is not the limit (an SM has 100 to 228 KB); the 1,024-thread block is. An SM holds at
+  most 1,536 resident threads on RTX 30/40 GPUs and 2,048 on A100/H100, and its 64 K registers fit two such
+  blocks only at ≤ 32 registers per thread (Boehm's build uses 37). So one block runs per SM, and at each
+  \`__syncthreads()\` all its warps stall with no other block to switch to.
 - **Edges by padding.** \`97 × 75 × 131\` has no dimension divisible by 32: the grid is 3 × 4 = 12 blocks and
   \`K = 131\` takes 5 slabs, the last with 3 valid columns. Out-of-range slots load \`0.0f\`, which adds nothing
   to \`acc\`, so the inner loop needs no branch.
@@ -146,9 +153,9 @@ Q: Why does the tiled kernel load zeros past the matrix edges instead of skippin
 
 # Coalescing: which thread loads which float
 
-Global memory is read by the warp, not by the thread. When the 32 threads of a warp touch 32 consecutive
-floats, the hardware serves them in one 128-byte transaction; when they touch 32 scattered addresses, it
-takes up to 32 — see the
+Global memory is read by the warp, not by the thread, in 32-byte sectors. When the 32 threads of a warp touch
+32 consecutive aligned floats, the hardware serves them with four sectors, 128 bytes, all used; when each
+touches an address 32 bytes or more from the others, it takes 32 sectors, 1,024 bytes for 128 useful. See the
 [coalescing post](https://developer.nvidia.com/blog/how-access-global-memory-efficiently-cuda-c-kernels/).
 The \`[ty][tx]\` map is chosen for exactly this.
 
@@ -157,12 +164,31 @@ The \`[ty][tx]\` map is chosen for exactly this.
 | \`A[row * K + t * TILE + tx]\` | 32 consecutive floats of one row of A | coalesced |
 | \`B[(t * TILE + ty) * N + col]\` | 32 consecutive floats of one row of B | coalesced |
 | \`C[row * N + col]\` | 32 consecutive floats of one row of C | coalesced |
-| naive with \`x\` along rows | 32 floats \`K\` apart in A | 32 transactions |
+| naive with \`x\` along rows | 32 floats \`K\` apart in A | 32 sectors |
+
+:::gpu
+{
+  "items": [
+    {"id": "coal-good", "label": "x along columns", "sub": "col = blockIdx.x * 32 + tx", "layout": "column", "items": [
+      {"id": "good-a", "array": "A · row-major", "sub": "a cell = 1 float", "rows": 4, "cols": 12, "continues": true, "marks": [{"cols": [0, 11], "rows": [1, 1], "tone": "shared", "label": "lanes 0 … 31"}], "detail": "Warp \`ty\` reads \`A[row * K + t * 32 + tx]\`: 32 neighbours in one row, 128 bytes in four 32-byte sectors."},
+      {"threads": 12, "continues": true, "label": "one warp · 4 sectors"}
+    ], "detail": "The drill's map: \`tx\` picks the column, so a warp's load of \`A\`, of \`B\` and its store of \`C\` are each one contiguous run."},
+    {"id": "coal-bad", "label": "x along rows", "sub": "row = blockIdx.x * 32 + tx", "layout": "column", "items": [
+      {"id": "bad-a", "array": "A · row-major", "sub": "a cell = 1 float", "rows": 4, "cols": 12, "continues": true, "marks": [{"cols": [0, 0], "rows": [0, 3], "tone": "bad", "label": "lanes"}], "detail": "Lane \`tx\` reads \`A[(… + tx) * K + k]\`: 32 floats a whole row (\`4K\` bytes) apart, one 32-byte sector each."},
+      {"threads": 12, "continues": true, "label": "one warp · 32 sectors"}
+    ], "detail": "Boehm's first kernel: the same arithmetic, 8× the sectors for \`A\` and a strided store of \`C\`; fixing the map alone took it from 309 to 1,987 GFLOP/s."}
+  ]
+}
+:::
 
 - \`x\` along columns is the decision. Swap the roles (\`row\` from \`threadIdx.x\`) and every warp's load of
-  \`A\` and store of \`C\` strides by a whole row — Boehm measures this alone as a several-fold slowdown.
-- The shared reads are conflict-free too: \`As[ty][k]\` is one address per warp (a broadcast), \`Bs[k][tx]\`
-  spans 32 consecutive banks. Storing \`Bs\` transposed would make it a 32-way bank conflict.
+  \`A\` and store of \`C\` strides by a whole row: Boehm measures this alone as a 6× slowdown.
+- **Banks, in brief.** Shared memory is split into 32 banks of 4-byte words; word \`i\` lives in bank
+  \`i mod 32\`. A warp's access takes one pass when its lanes hit 32 different banks, or the same word
+  (broadcast); \`n\` lanes on different words of one bank take \`n\` passes, an \`n\`-way conflict.
+- The shared reads here are conflict-free: \`As[ty][k]\` is one address per warp (a broadcast), \`Bs[k][tx]\`
+  spans 32 consecutive banks. Storing \`Bs\` transposed would make the read \`Bs[tx][k]\`, words 32 apart, all
+  in one bank: a 32-way conflict.
 
 Set the stride to 1 for \`Bs[k][tx]\` and to 32 for a transposed read, then toggle the padding that removes the
 conflict:
@@ -183,7 +209,7 @@ Q: In a warp, ty is fixed and tx runs 0…31. Which load of A is coalesced?
 writes visible to each other. The slab loop needs it twice, for two different hazards:
 
 - **After the loads** (read-after-write): no thread may multiply until every thread has written its slot of
-  \`As\` and \`Bs\` — otherwise it reads a neighbour's slot from the previous slab, or garbage.
+  \`As\` and \`Bs\`, otherwise it reads a neighbour's slot from the previous slab, or garbage.
 - **After the products** (write-after-read): no thread may start loading slab \`t + 1\` into \`As\`/\`Bs\` until
   every thread has finished reading slab \`t\`.
 
@@ -201,11 +227,11 @@ the second barrier missing:
 
 With the second barrier, warp 0 waits after its products until warp 7 has finished slab \`t\`; only then does
 anyone overwrite the tiles. The failure is timing-dependent: on one GPU, one size or one run the warps may
-happen to stay in step, which is why the self-test compares every element on a \`K\` that is not a multiple
-of 32, not just a checksum.
+happen to stay in step, which is why the self-test compares every element, on the small shape and again on
+\`1024³\` (32 slabs of 32 warps) against the naive kernel, not just a checksum.
 
 :::details Why not one barrier and two sets of tiles?
-Alternating between two pairs of tiles — load slab \`t + 1\` into buffer B while multiplying buffer A — removes
+Alternating between two pairs of tiles (load slab \`t + 1\` into buffer B while multiplying buffer A) removes
 the write-after-read hazard on the same buffer, so one barrier per slab suffices. That is **double
 buffering**, and production kernels do it with asynchronous copies (\`cp.async\`, TMA) so the next load
 overlaps the current arithmetic. It costs twice the shared memory; the drill keeps one pair and two barriers.
@@ -221,7 +247,7 @@ Q: A kernel with only the first __syncthreads() passes on 64 × 64 × 64 and fai
 
 # What cuBLAS adds
 
-The tiled kernel cuts global traffic 32×, but every FMA still reads two floats from shared memory: its
+The tiled kernel cuts global loads 32×, but every FMA still reads two floats from shared memory: its
 intensity against shared memory is still 0.25 FLOP per byte. Simon Boehm's
 [How to Optimize a CUDA Matmul Kernel](https://siboehm.com/articles/22/CUDA-MMM) walks the steps from here to
 near-cuBLAS, each built on the same slab loop and barriers:
@@ -235,16 +261,16 @@ near-cuBLAS, each built on the same slab loop and barriers:
 | Tensor cores | \`mma.sync\` / \`wmma\` on half or tf32 fragments | an order of magnitude more FLOP/s |
 | Split-K | several blocks share one C tile, reduce at the end | parallelism for thin shapes |
 
-- \`torch.matmul\` reaches these kernels through cuBLASLt; Triton's \`tl.dot\` generates the same block
-  structure from a few lines of Python.
+- \`torch.matmul\` reaches these kernels through cuBLAS by default (\`torch.backends.cuda.preferred_blas_library\`
+  can switch it to cuBLASLt); Triton's \`tl.dot\` generates the same block structure from a few lines of Python.
 - FlashAttention is this idea applied to attention: \`Q · Kᵀ\` and \`P · V\` are tiled through shared memory so
   the \`N × N\` score matrix never reaches global memory.
 
 :::quiz
 Q: After tiling, what is the next limit the tiled kernel runs into, and which technique addresses it?
-- [ ] Global bandwidth again — fix with a larger TILE of 64 × 64 threads
-- [x] Shared-memory bandwidth — each FMA still reads two floats from shared memory; register blocking reuses each in several FMAs
-- [ ] Barrier cost — remove both __syncthreads()
+- [ ] Global bandwidth again: fix with a larger TILE of 64 × 64 threads
+- [x] Shared-memory bandwidth: each FMA still reads two floats from shared memory; register blocking reuses each in several FMAs
+- [ ] Barrier cost: remove both __syncthreads()
 > A block cannot have 64 × 64 = 4096 threads, and the barriers are needed for correctness. The inner loop does one FMA per two shared loads; computing a micro-tile per thread keeps values in registers and multiplies the FLOPs per shared load.
 :::
 
@@ -253,13 +279,13 @@ Q: After tiling, what is the next limit the tiled kernel runs into, and which te
 - Arithmetic intensity, not FLOP count, decides a kernel's speed: the naive GEMM does 0.25 FLOP per byte and
   is a memory benchmark.
 - Tiling makes reuse explicit: a block stages a 32 × 32 slab of \`A\` and \`B\` in shared memory and each float
-  is used 32 times, cutting global traffic from \`2K\` to \`2K / 32\` per output.
+  is used 32 times, cutting global loads from \`2K\` to \`2K / 32\` per output.
 - The \`[ty][tx]\` map with \`x\` along columns makes every global load and store coalesced and the shared reads
   conflict-free.
 - Two barriers per slab: one before reading (the slab is complete), one before overwriting (everyone is done);
   edges are zero-padded so every thread reaches both.
 - cuBLAS adds register blocking, double buffering and tensor cores on top of exactly this loop.
 
-Primary reference: the CUDA C++ Programming Guide,
-[Shared Memory](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory).
+Primary reference: the CUDA C++ Best Practices Guide,
+[Shared Memory in Matrix Multiplication](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#shared-memory-in-matrix-multiplication-c-ab).
 `;

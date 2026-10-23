@@ -49,9 +49,9 @@ matrices, then prints \`PASS\`.
 > attention as a relative offset, and the 3.1 scaling only slows the rotations whose period is longer
 > than the 8K context Llama 3 was pretrained on.`,
   hints: [
-    'RMSNorm is two lines: `self._norm(x.float()).type_as(x) * self.weight`, with `_norm` the `rsqrt` of the mean square plus `eps`. Upcasting first matters in bf16: the mean of 4,096 squares in 7 mantissa bits is far off.',
+    'RMSNorm is two lines: `self._norm(x.float()).type_as(x) * self.weight`, with `_norm` the `rsqrt` of the mean square plus `eps`. Upcasting first matters in bf16: the squares, their mean and its root would each be rounded to 8 significant bits, and the scale comes out up to about 0.6 % off over 4,096 dims.',
     'The scaling is two `torch.where` calls on `wavelen = 2 * math.pi / freqs`: first divide where `wavelen > 8192`, then replace the band `2048 <= wavelen <= 8192` with the blend. For `apply_rope`, `xq.float().reshape(*xq.shape[:-1], -1, 2)` turns the last axis into pairs; `freqs_cis.view(1, T, 1, hd // 2)` broadcasts over batch and heads.',
-    'Rounding up to a multiple: `multiple_of * ((h + multiple_of - 1) // multiple_of)`. Apply `int(...)` after the 2/3 and again after the multiplier, as Meta does, or 8B comes out one block off.',
+    'Rounding up to a multiple: `multiple_of * ((h + multiple_of - 1) // multiple_of)`. Apply `int(...)` after the 2/3 and again after the multiplier, as Meta does: for 8B both truncations land in the same block (14,199.5 untruncated still rounds up to 14,336), but copying the rule exactly is what guarantees every config matches its checkpoint.',
   ],
   checks: [
     {
@@ -493,17 +493,20 @@ if __name__ == "__main__":
   debrief: `Each of the three is a stability or efficiency choice the LLaMA line made in 2023 and Llama 3 kept.
 **RMSNorm** drops LayerNorm's mean and bias: one reduction instead of two, and the
 [RMSNorm paper](https://arxiv.org/abs/1910.07467) found re-centring added nothing. The float32 upcast is
-the part people forget: a bf16 mean of 4,096 squares has 7 mantissa bits, so the reference code takes the
-statistics in float32 and only the scaled result goes back to bf16.
+the part people forget: in bf16 the squares, their mean and its root are each rounded to 8 significant bits,
+so the reference code takes the statistics in float32 and only the scaled result goes back to bf16.
 
 **RoPE** stores no position table. Each pair of dims turns by \`m · freq_j\`, so the dot product of a query
 at \`m\` and a key at \`n\` sees only \`m − n\`, and the cache can hold keys already rotated. Llama 3 raised
-\`theta\` from 10,000 to 500,000 so the slowest pairs barely turn within 8K tokens; Llama 3.1 then
-extended the context to 128K without retraining from scratch by dividing the long-wavelength frequencies
-by 8 (position interpolation for the pairs that would otherwise see angles never met in training) and
-leaving the short ones, which carry local order, alone. vLLM and Hugging Face call this
-\`rope_type: "llama3"\`; production kernels fuse the rotation into the QKV projection and keep the table
-in cos/sin form instead of complex numbers.
+\`theta\` from 10,000 to 500,000 to support longer contexts (the slowest pair's period grows from 54K to
+2.56M tokens); Llama 3.1 then extended the context to 128K without retraining from scratch by dividing the
+long-wavelength frequencies by 8 (position interpolation for the pairs that would otherwise see angles never
+met in training) and leaving the short ones, which carry local order, alone. vLLM and Hugging Face call this
+\`rope_type: "llama3"\`. Production kernels rotate in real cos/sin form instead of complex numbers: vLLM's
+[rotary kernel](https://github.com/vllm-project/vllm/blob/v0.32.0/csrc/pos_encoding_kernels.cu) reads a cached
+cos/sin table, and TensorRT-LLM's
+[\`applyBiasRopeUpdateKVCache\`](https://github.com/NVIDIA/TensorRT-LLM/blob/v1.2.1/cpp/tensorrt_llm/kernels/unfusedAttentionKernels/unfusedAttentionKernels_2_template.h)
+rotates q and k and writes k and v into the KV cache in one kernel.
 
 **SwiGLU** replaces GELU's one up-projection with a gate and an up-projection. Three matrices instead
 of two would cost 50 % more, so the width shrinks to 2/3 · 4d; the multiplier and the rounding to 1,024

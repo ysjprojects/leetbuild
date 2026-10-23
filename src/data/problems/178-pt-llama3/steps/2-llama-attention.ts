@@ -49,8 +49,8 @@ Then it prints \`PASS\`.
 > context costs 128 KiB instead of 512 KiB, and \`repeat_kv\` restores the shapes only for the matmul.`,
   hints: [
     'Shapes first: `xq` is `(bsz, seqlen, n_heads, hd)` and `xk`, `xv` are `(bsz, seqlen, n_kv_heads, hd)`. The cache is indexed `[batch, position, kv_head, dim]`, so the write is a slice on the first two axes: `self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk`.',
-    'The mask is `torch.hstack([torch.zeros(seqlen, start_pos), torch.triu(torch.full((seqlen, seqlen), float("-inf")), diagonal=1)])`. A mask built for `start_pos = 0` would be `(seqlen, seqlen)` and either fail to broadcast or, padded on the wrong side, hide cached keys and show future ones.',
-    'Softmax in float32 (`scores.float()`), then `.type_as(xq)`, as Meta does: in bf16 the exponentials of large scores lose the small weights. Register the caches with `register_buffer(..., persistent=False)` so `.to(device)` and `.half()` move them and `state_dict()` does not save them.',
+    'The mask is two blocks side by side (`torch.hstack`): a `(seqlen, start_pos)` block of zeros for the cached keys, then the `triu(..., diagonal=1)` of a `(seqlen, seqlen)` `-inf` square. A mask built for `start_pos = 0` would be `(seqlen, seqlen)` and either fail to broadcast or, padded on the wrong side, hide cached keys and show future ones.',
+    'Softmax in float32 (`scores.float()`), then `.type_as(xq)`, as Meta does: the max, the exponentials and the normalising sum run at full precision and only the final weights are rounded to the model dtype. Register the caches with `register_buffer(..., persistent=False)` so `.to(device)` and `.half()` move them and `state_dict()` does not save them.',
   ],
   checks: [
     {

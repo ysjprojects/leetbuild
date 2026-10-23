@@ -8,7 +8,7 @@ export const hessianStep: Step = {
   focus: ['calib', 'hessian', 'damp'],
   task: `## Task
 
-GPTQ minimises one layer's output error \`‖WX − ŴX‖²\` over a few thousand calibration tokens. That
+GPTQ minimises one layer's output error \`‖WXᵀ − ŴXᵀ‖²\` over a few thousand calibration tokens (\`X\` is \`(n, in)\`). That
 loss is a quadratic form in the weight error, and its matrix is the Hessian \`H = (2/n) Σ x xᵀ\`: build it
 from the layer's real inputs and make it safe to factor (\`from quant_int4 import dequantize, quantize_rtn\`).
 
@@ -37,7 +37,7 @@ modified. Then it prints \`PASS\`.
 > their main direction costs the most.`,
   hints: [
     'In the hook, `x = args[0].detach().reshape(-1, in_features).float()`; `n = x.shape[0]` counts tokens, not sequences.',
-    'Scale before you add: `self.H *= self.nsamples / (self.nsamples + n)`, `self.nsamples += n`, `x = math.sqrt(2 / self.nsamples) * x`, `self.H += x.t() @ x`. Check it by hand for two batches of one token each.',
+    'Rescale before you add: shrink the old `H` by `nsamples / (nsamples + n)`, update the count, then add the batch’s `xᵀx` with the factor `2 / nsamples` folded into `x` as its square root. Check it by hand for two batches of one token each.',
     'With a boolean mask `dead = torch.diag(H) == 0`, `H[dead, dead] = 1` sets only diagonal entries (the two masks pair up index by index) and `W[:, dead] = 0` zeroes the columns. Then `H += damp * torch.eye(d)`.',
   ],
   checks: [
@@ -286,5 +286,5 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `This is \`GPTQ.add_batch\` from the reference implementation, with one deliberate difference: it counts tokens where the reference counts sequences (\`inp.shape[0]\` before flattening), which scales \`H\` by the sequence length. GPTQ does not care about a constant factor (the update \`err / U[i, i]\` and \`err · U[i, i:]\` cancel it, and the damping is relative), so both are right; counting tokens makes \`H\` the textbook \`(2/n) XᵀX\`. **Why the Hessian is enough**: the layer's loss \`‖(W − Ŵ)X‖²\` is exactly quadratic in the weights, so its second derivative is the whole story, and it is the same \`d × d\` matrix for every output row. That is what makes GPTQ cheap: one \`H\` per layer, shared by 4,096 rows of a 7B model's projection. **The running average** keeps \`H\` at the scale of one token whatever the calibration size, so float32 stays accurate across 128 sequences × 2,048 tokens. **Dead columns** happen in real models: some input features of \`fc2\` are always 0 after a ReLU, and padded positions contribute nothing. **Damping** at 1% is the reference default (\`--percdamp .01\`); AutoGPTQ exposes the same knob as \`damp_percent\`. Production code adds device placement (one decoder layer on the GPU at a time, its inputs cached) and calibrates on 128 random sequences of 2,048 tokens from C4 or WikiText.`,
+  debrief: `This is \`GPTQ.add_batch\` from the reference implementation, with one deliberate difference: it counts tokens where the reference counts sequences (\`inp.shape[0]\` before flattening), which scales \`H\` by the sequence length; the paper writes \`2XXᵀ\` with no average at all. GPTQ does not care about a constant factor (the update \`err / U[i, i]\` and \`err · U[i, i:]\` cancel it, and the damping is relative), so all three are right; counting tokens makes \`H\` the textbook \`(2/n) XᵀX\`. **Why the Hessian is enough**: the layer's loss \`‖(W − Ŵ)Xᵀ‖²\` is exactly quadratic in the weights, so its second derivative is the whole story, and it is the same \`d × d\` matrix for every output row. That is what makes GPTQ cheap: one \`H\` per layer, shared by 4,096 rows of a 7B model's projection. **The running average** keeps \`H\` at the scale of one token whatever the calibration size, so float32 stays accurate across 128 sequences × 2,048 tokens. **Dead columns** happen in real models: OPT's \`fc2\` reads a ReLU output, and a unit that never fires on the calibration set is an input that is always 0 (the paper links OPT-66B's poor results to a large fraction of dead units in its early layers). **Damping** at 1% is the reference default (\`--percdamp .01\`); AutoGPTQ exposes the same knob as \`damp_percent\`. Production code adds device placement (one decoder layer on the GPU at a time, its inputs cached) and calibrates on 128 random sequences of 2,048 tokens from C4 or WikiText.`,
 };

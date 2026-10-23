@@ -85,7 +85,7 @@ import torch.nn as nn
 
 
 class AdamW(torch.optim.Optimizer):
-    """Adam with decoupled weight decay (Loshchilov & Hutter, 2019): the optimizer under GPT, LLaMA and ViT training."""
+    """Adam with decoupled weight decay (Loshchilov & Hutter, 2019): the optimizer under GPT and LLaMA training."""
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, amsgrad=False):
         if lr < 0.0:
@@ -123,7 +123,7 @@ reads them from \`group\` while looping over \`self.param_groups\` and \`group["
   \`exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)\`.
 - **Bias correction** from the step count: \`bias_correction1 = 1 - beta1**step\`,
   \`bias_correction2 = 1 - beta2**step\`, \`step_size = lr / bias_correction1\`.
-- **Denominator**: \`denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)\` — \`eps\` goes in
+- **Denominator**: \`denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)\`; \`eps\` goes in
   **after** the square root. With \`amsgrad\`, first \`torch.maximum(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)\`
   and use \`max_exp_avg_sq\` in place of \`exp_avg_sq\`.
 - **Update** in place: \`p.addcdiv_(exp_avg, denom, value=-step_size)\`. No \`p.data\`, no reassignment of \`p\`.
@@ -132,16 +132,16 @@ reads them from \`group\` while looping over \`self.param_groups\` and \`group["
   untouched and stateless; \`step(closure)\` returning the loss; a sparse gradient rejected. It prints \`PASS\`.
 
 > Adam normalises each coordinate's step by its own gradient scale. Weight decay added to the gradient
-> goes through that normalisation too and all but vanishes for weights with large gradients; applied to
-> the parameter directly, it shrinks every weight by the same \`lr × wd\` — that one move is AdamW.
+> goes through that normalisation too and all but vanishes for weights with large gradients. Applied to
+> the parameter directly, it shrinks every weight by the same factor \`1 − lr × wd\`: that one move is AdamW.
 
 Turn the weight decay up below and compare Adam's path with AdamW's on an ill-conditioned loss:
 
 :::widget optimizer-paths`,
   hints: [
-    'Shape of the loop: `for group in self.param_groups:` unpack `lr`, `beta1, beta2 = group["betas"]`, `eps`, `weight_decay`, `amsgrad`; then `for p in group["params"]:` with `if p.grad is None: continue` and `grad = p.grad`. `state = self.state[p]` is a dict that is empty the first time — fill it then.',
-    'Order inside the parameter loop: `state["step"] += 1` → `p.mul_(1 - lr * weight_decay)` → the two moments in place → `bias_correction1 = 1 - beta1**step`, `bias_correction2 = 1 - beta2**step` → `denom` → `p.addcdiv_(exp_avg, denom, value=-lr / bias_correction1)`. The reference applies decay before the moments, so match that order.',
-    'The denominator is `(exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)` — `sqrt(v / bc2)` equals `sqrt(v) / sqrt(bc2)`, and `eps` is added last. For `amsgrad`, `torch.maximum(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)` updates the running maximum in place; then use it where `exp_avg_sq` would go.',
+    'Shape of the loop: `for group in self.param_groups:` unpack `lr`, `beta1, beta2 = group["betas"]`, `eps`, `weight_decay`, `amsgrad`; then `for p in group["params"]:` with `if p.grad is None: continue` and `grad = p.grad`. `state = self.state[p]` is a dict that is empty the first time: fill it then.',
+    'Order inside the parameter loop: `state["step"] += 1`, then `p.mul_(1 - lr * weight_decay)`, then the two moments in place, then `bias_correction1` and `bias_correction2` from the new step count, then `denom`, then `p.addcdiv_`. Incrementing first means step 1 uses `t = 1` and never divides by `1 - beta1**0 = 0`.',
+    'Reading a failure: off at step 1 by about `lr · wd · p` means the decay went into the gradient (or was skipped); off by a factor near 3 means a missing bias correction; differences only where gradients are tiny mean `eps` sits inside the square root; a mismatch that appears only in the `amsgrad=True` run means the maximum was taken over the corrected `v` or not stored in state.',
   ],
   checks: [
     {
@@ -164,7 +164,7 @@ Turn the weight decay up below and compare Adam's path with AdamW's on an ill-co
       id: 'moments',
       title: 'Running averages of the gradient and its square, in place',
       detail:
-        '`exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)` and `exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)` — the state tensors are updated in place, never replaced, so `exp_avg` and `exp_avg_sq` agree with the reference’s within 1e-7 after 25 steps.',
+        '`exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)` and `exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)`: the state tensors are updated in place, never replaced, so `exp_avg` and `exp_avg_sq` agree with the reference’s within 1e-7 after 25 steps.',
       match: {
         python: {
           all: [
@@ -179,7 +179,7 @@ Turn the weight decay up below and compare Adam's path with AdamW's on an ill-co
       id: 'bias-correction',
       title: 'Both moments are bias-corrected from the step count',
       detail:
-        '`1 - beta1**step` and `1 - beta2**step` from `state["step"]`; the step size is `lr / bias_correction1` and the second moment is divided by `bias_correction2` before the square root is taken — step 1 then moves every coordinate by about `lr`, not by `lr × (1 − β1) / √(1 − β2)`.',
+        '`1 - beta1**step` and `1 - beta2**step` from `state["step"]`; the step size is `lr / bias_correction1` and the second moment is divided by `bias_correction2` before the square root is taken. Step 1 then moves every coordinate by about `lr`, not by `lr × (1 − β1) / √(1 − β2) ≈ 3.2 lr`.',
       match: {
         python: {
           all: [
@@ -195,7 +195,7 @@ Turn the weight decay up below and compare Adam's path with AdamW's on an ill-co
       id: 'decoupled-decay',
       title: 'Weight decay shrinks the parameter, before the update, never the gradient',
       detail:
-        '`p.mul_(1 - lr * weight_decay)` runs before `p.addcdiv_`, and `weight_decay * p` is never added to `grad` — that would be L2-regularised Adam, which the reference’s `weight_decay=0.1` run would catch at the first step.',
+        '`p.mul_(1 - lr * weight_decay)` runs before `p.addcdiv_`, and `weight_decay * p` is never added to `grad`: that would be L2-regularised Adam, which the reference’s `weight_decay=0.1` run would catch at the first step.',
       match: {
         python: {
           all: [/p\.mul_\(\s*1\s*-\s*lr\s*\*\s*weight_decay\s*\)/],
@@ -253,7 +253,7 @@ Turn the weight decay up below and compare Adam's path with AdamW's on an ill-co
       id: 'closure',
       title: 'A closure runs with grad enabled and its loss is returned',
       detail:
-        '`step(closure)` calls `closure()` inside `with torch.enable_grad():` — `step` itself is under `no_grad`, and the closure has to build a graph and call `backward` — and returns what it returned (`None` when there is no closure).',
+        '`step(closure)` calls `closure()` inside `with torch.enable_grad():` (`step` itself is under `no_grad`, and the closure has to build a graph and call `backward`) and returns what it returned (`None` when there is no closure).',
       match: {
         python: {
           all: [/with torch\.enable_grad\(\):\s*\n\s*loss = closure\(\)/, /return loss\b/],
@@ -341,5 +341,5 @@ ${SELF_TEST}`,
 ${SELF_TEST}`,
     },
   },
-  debrief: `The whole optimizer is forty lines because \`torch.optim.Optimizer\` already owns the two things that are not arithmetic: \`param_groups\` (each a dict of parameters plus hyper-parameters, filled from \`defaults\`) and \`state\`, a per-parameter dict that is empty until \`step\` first meets the parameter — which is why the moments are created lazily inside the loop and why a frozen parameter never acquires any. The order inside the loop is the reference's: the decoupled decay \`p.mul_(1 - lr * wd)\` **before** the Adam update, so the shrink is on the parameter the gradient was computed from; then the two moments as in-place EMAs; then bias correction, which matters only for the first few hundred steps (\`1 - 0.999**t\` is 0.63 at \`t = 1000\`) but without it the first update would be \`(1 − β1) / √(1 − β2) ≈ 3.2×\` too large per unit of \`lr\`... and \`eps\` after the square root, where it is a floor on the denominator rather than a perturbation of the variance. \`@torch.no_grad()\` is what makes the in-place \`mul_\`/\`addcdiv_\` on leaf tensors legal, and \`torch.enable_grad()\` re-enables autograd just for the closure, the LBFGS-style contract every optimizer honours. The self-test compares in \`float64\` so the arithmetic rather than rounding-order decides: in \`float32\` the reference's \`lerp_\` and your \`mul_().add_()\` differ in the last ulp. What PyTorch adds on top: \`state["step"]\` as a tensor so a \`capturable\` optimizer can be recorded into a CUDA graph; \`foreach\` (one kernel launch per op over all parameters, the default on CUDA) and \`fused\` (one kernel for the whole update) implementations that are 2–10× faster than this per-parameter loop; \`maximize\`; and, in distributed training, ZeRO/FSDP sharding of \`exp_avg\`/\`exp_avg_sq\`, which weigh twice the model in \`float32\` — 8 bytes per parameter on top of the 2 or 4 the weight takes.`,
+  debrief: `The whole optimizer is about forty lines because \`torch.optim.Optimizer\` already owns the two things that are not arithmetic: \`param_groups\` (each a dict of parameters plus hyper-parameters, filled from \`defaults\`) and \`state\`, a per-parameter dict that is empty until \`step\` first meets the parameter. That is why the moments are created lazily inside the loop and why a frozen parameter never acquires any. The order inside the loop is the reference's: the decoupled decay \`p.mul_(1 - lr * wd)\` **before** the Adam update, so the shrink is on the parameter the gradient was computed from (as in Algorithm 2 of the paper); then the two moments as in-place EMAs; then bias correction, which with \`β2 = 0.999\` matters for the first few thousand steps (\`1 - 0.999**t\` is still 0.63 at \`t = 1000\`) and without which the first update would be \`(1 − β1) / √(1 − β2) ≈ 3.2×\` too large per unit of \`lr\`; and \`eps\` after the square root, where it is a floor on the denominator rather than a perturbation of the variance. \`@torch.no_grad()\` is what makes the in-place \`mul_\`/\`addcdiv_\` on leaf tensors legal, and \`torch.enable_grad()\` re-enables autograd just for the closure, the LBFGS-style contract every optimizer honours. The self-test compares in \`float64\` so the arithmetic rather than rounding order decides: in \`float32\` the reference's \`lerp_\` and your \`mul_().add_()\` differ in the last ulp. What PyTorch adds on top: \`state["step"]\` as a tensor (on the device with \`capturable\`, so the step can be recorded into a CUDA graph); \`foreach\` (one kernel launch per op over all parameters, the default on CUDA) and \`fused\` (one kernel for the whole update) implementations, which its docs call typically faster than this per-parameter loop; \`maximize\`; and, in distributed training, ZeRO/FSDP sharding of \`exp_avg\`/\`exp_avg_sq\`, which weigh twice a \`float32\` model: 8 bytes per parameter on top of the 2 or 4 the weight takes. In current PyTorch, \`AdamW\` is a thin subclass of \`Adam\` that passes \`decoupled_weight_decay=True\`; apart from that flag, only the default \`weight_decay\` differs (\`1e-2\` against \`0\`).`,
 };

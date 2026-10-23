@@ -5,7 +5,7 @@
  */
 export const learn = `# The mechanism at a glance
 
-LoRA — *Low-Rank Adaptation* (Hu et al., Microsoft, 2021) — fine-tunes a pre-trained model without touching
+LoRA (*Low-Rank Adaptation*, Hu et al., Microsoft, 2021) fine-tunes a pre-trained model without touching
 its weights. A selected \`nn.Linear\` keeps its weight \`W\` of shape \`(out, in)\` frozen, and next to it sit
 two small trainable matrices: \`A\` of shape \`(r, in)\` and \`B\` of shape \`(out, r)\`, with the rank \`r\`
 between 1 and 64. The layer computes
@@ -77,8 +77,9 @@ Writing \`ΔW = B @ A\` caps its rank at \`r\` by construction and cuts the para
   462,336 parameters: 0.89 %.
 - The paper adapts only \`W_q\` and \`W_v\` of GPT-3 and finds very small ranks (1 to 8) match full
   fine-tuning on its benchmarks; a larger \`r\` buys little because the useful update lives in a few
-  directions.
-- It also reports that the learned \`ΔW\` amplifies directions already present but weak in \`W\` — the update
+  directions. [QLoRA](https://arxiv.org/abs/2305.14314) later found that adapting every linear layer of
+  the block, MLP included, is what matches full fine-tuning; most recipes now do that.
+- It also reports that the learned \`ΔW\` amplifies directions already present but weak in \`W\`: the update
   re-weights features pre-training learned rather than adding new ones.
 - The rank cap is a real constraint: tasks far from pre-training (a new language, a new modality) want
   larger \`r\` or full fine-tuning.
@@ -116,7 +117,7 @@ output untouched at step 0:
 - The paper initialises \`A\` with a random Gaussian; the drill uses \`nn.init.kaiming_uniform_(a=math.sqrt(5))\`,
   the same init \`nn.Linear\` gives its weight and Hugging Face PEFT's default. Either works: what matters
   is that \`A\` is random and \`B\` is zero.
-- Zero \`B\` makes \`apply_lora\` a no-op on the model's function — the drill asserts \`torch.equal\` on the
+- Zero \`B\` makes \`apply_lora\` a no-op on the model's function: the drill asserts \`torch.equal\` on the
   logits before and after wrapping. Training starts from the pre-trained loss, not from a perturbed one.
 - The roles could be swapped (\`A = 0\`, \`B\` random); the convention is \`B = 0\` so that \`A\` acts as a
   random projection of the input into \`r\` dimensions from the first step.
@@ -146,12 +147,13 @@ independent of the rank, and a learning rate found at one \`r\` carries to anoth
 | 64 | 0.25 | 524,288 |
 
 - In the drill \`r = 8, alpha = 16\` gives \`scaling == 2.0\`; the self-test asserts it.
-- With \`B = 0\`, \`alpha\` does not change the output at step 0 — it changes how fast \`ΔW\` grows, which is
+- With \`B = 0\`, \`alpha\` does not change the output at step 0; it changes how fast \`ΔW\` grows, which is
   why it behaves like a second learning rate.
 - At large ranks \`1/r\` over-shrinks: rsLoRA (Kalajdzievski, 2023) shows the stable choice is
   \`alpha / sqrt(r)\`, which PEFT exposes as \`use_rslora=True\`.
-- Dropout on the adapter's input — \`self.dropout(x)\` before \`lora_A\` — regularises only the adapter path;
-  the frozen path sees the clean \`x\`.
+- Dropout on the adapter's input (\`self.dropout(x)\` before \`lora_A\`, as in loralib and PEFT) regularises
+  only the adapter path; the frozen path sees the clean \`x\`. Merging is exact only in eval mode, where
+  dropout is the identity.
 
 :::quiz
 Q: You double r from 8 to 16 and keep alpha = 16. What happens to the scaling, and why is that intended?
@@ -212,8 +214,11 @@ The fold is guarded by the \`merged\` flag, and \`unmerge()\` is its exact inver
   a training operation.
 - **Precision.** In float64 the round trip is exact to \`1e-12\` and the merged output matches to \`1e-6\`; in
   float32 the whole drill model matches to \`1e-5\`. In bf16, \`W += ΔW\` rounds the small update to \`W\`'s
-  coarse grid (8 significant bits) and unmerge no longer restores \`W\` — merge once, in higher precision,
+  coarse grid (8 significant bits) and unmerge no longer restores \`W\`: merge once, in higher precision,
   when writing the final checkpoint.
+- **In production.** loralib merges on \`.eval()\` and unmerges on \`.train()\` (\`merge_weights=True\`), so
+  evaluation runs at merged speed; PEFT's \`merge(safe_merge=True)\` adds \`ΔW\` to a copy and refuses
+  to commit it if it holds NaNs or infinities.
 - **When not to merge.** A server hosting many adapters on one base cannot merge them all into one \`W\`;
   it keeps them separate and pays the two thin matmuls per request (see below).
 
@@ -222,7 +227,7 @@ Q: Why does a merged LoRA model cost nothing extra at inference?
 - [ ] Because the adapter matmuls run in parallel with the base matmul
 - [x] Because B @ A · alpha / r is a plain (out, in) matrix added into W, so the layer is a single nn.Linear again
 - [ ] Because r is small, so the extra work is negligible
-> Unmerged, every call pays x @ Aᵀ @ Bᵀ on top of W x — small, but extra kernels and latency. Merged, the
+> Unmerged, every call pays x @ Aᵀ @ Bᵀ on top of W x: small, but extra kernels and latency. Merged, the
 > update lives inside W and the model is architecturally identical to the base.
 :::
 
@@ -236,12 +241,14 @@ adapter parameters):
 | per parameter | full fine-tune | LoRA, frozen base | LoRA, per adapter parameter |
 |---|---|---|---|
 | weight | 2 B (bf16) | 2 B (bf16) | 2 B |
-| gradient | 2 B | — | 2 B |
-| fp32 master + two Adam moments | 12 B | — | 12 B |
+| gradient | 2 B | none | 2 B |
+| fp32 master + two Adam moments | 12 B | none | 12 B |
 | total for 7B | ≈ 112 GB | ≈ 14 GB | ≈ 134 MB |
 
-- Activations are not saved: the backward pass still runs through the frozen layers to reach earlier
-  adapters, so it computes input gradients everywhere and skips only the weight gradients.
+- Activation memory mostly stays: the backward pass still runs through the frozen layers to reach earlier
+  adapters, so it computes input gradients everywhere above the lowest adapter and skips only the weight
+  gradients. A frozen \`nn.Linear\` no longer saves its input (autograd keeps \`x\` only to form \`∂L/∂W\`),
+  but norms, attention and the MLP nonlinearity still save theirs.
 - The checkpoint shrinks the same way. The paper reports GPT-3's 350 GB checkpoint becoming about 35 MB of
   adapter and a 3× drop in training VRAM; the drill's adapter checkpoint is eight tensors that
   \`load_state_dict(…, strict=False)\` puts back into a fresh \`apply_lora\`'d model.
@@ -252,7 +259,7 @@ adapter parameters):
   direction, apply LoRA to the direction and train the magnitude separately; it closes much of the gap to
   full fine-tuning at the same rank and still merges.
 - **Serving many adapters.** S-LoRA, Punica and vLLM keep one base model resident and batch requests for
-  hundreds of unmerged adapters with a gather-matmul kernel — the case where not merging is the point.
+  thousands of unmerged adapters with a gather-matmul kernel: the case where not merging is the point.
 - **Libraries.** [Hugging Face PEFT](https://huggingface.co/docs/peft/main/en/conceptual_guides/lora)
   implements exactly this surgery: \`LoraConfig(r, lora_alpha, lora_dropout, target_modules)\`,
   \`get_peft_model\`, \`merge_and_unload()\`.
@@ -260,15 +267,15 @@ adapter parameters):
 :::quiz
 Q: LoRA cuts training memory for a 7B model from about 112 GB to about 14 GB plus activations. What does it remove?
 - [ ] The activations, because frozen layers do not need them
-- [x] The gradients, fp32 master weights and Adam moments of the frozen weights — 14 of every 16 bytes per base parameter
+- [x] The gradients, fp32 master weights and Adam moments of the frozen weights: 14 of every 16 bytes per base parameter
 - [ ] Nothing at training time; the savings are only in the checkpoint
 > A frozen parameter needs only its bf16 copy. Gradients and optimizer state exist for the 8 M adapter
-> parameters alone. Activations still have to be kept, because backpropagation passes through the frozen layers.
+> parameters alone. Most activations still have to be kept, because backpropagation passes through the frozen layers.
 :::
 
 # What to take away
 
-- Freeze \`W\`; learn \`ΔW = B @ A · alpha / r\` with \`A\` \`(r, in)\` and \`B\` \`(out, r)\` — \`r · (in + out)\`
+- Freeze \`W\`; learn \`ΔW = B @ A · alpha / r\` with \`A\` \`(r, in)\` and \`B\` \`(out, r)\`: \`r · (in + out)\`
   parameters instead of \`in · out\`, because fine-tuning updates have low intrinsic rank.
 - \`B = 0\` and random \`A\`: the adapter is the identity at step 0 and the product's symmetry is broken; two
   zero factors never train.

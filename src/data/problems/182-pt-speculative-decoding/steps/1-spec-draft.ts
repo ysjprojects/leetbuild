@@ -43,8 +43,8 @@ loop of full forwards drawing from the same generator, with the cache \`gamma\` 
 > preallocated buffer with a length: rewinding is one integer.`,
   hints: [
     'Without a cache, the same code runs with `pos = 0` and the keys of this call only: `tril(diagonal=0)` is the usual causal mask. With a cache, the mask is `T` rows by `pos + T` columns, and the first `pos` columns are all visible to every row.',
-    'The truncation test passes only if attention reads `[: pos + T]` and never the whole buffer: the stale rows past `pos` are still there after `truncate`, holding the old continuation.',
-    '`draft_tokens` keeps a Python int `token`, starting at `last_token`: `logits = draft(torch.tensor([[token]]), cache)[0, -1]`, `q[i] = to_probs(logits, temperature)`, `token = int(torch.multinomial(q[i], 1, generator=generator))`. A one-hot `q` makes `multinomial` return the argmax.',
+    'The truncation test fails if attention reads past `pos + T`: after `truncate`, the rows beyond `pos` still hold the old continuation, and before the buffer fills they hold zeros.',
+    '`draft_tokens` carries one Python int from call to call: feed it as a `(1, 1)` tensor, take the last logits row, record `q[i]` and draw the next int from it. A one-hot `q[i]` makes `multinomial` return the argmax, so greedy needs no branch.',
   ],
   checks: [
     {

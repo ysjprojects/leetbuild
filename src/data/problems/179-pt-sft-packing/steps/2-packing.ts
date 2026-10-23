@@ -26,7 +26,7 @@ Write \`sft_packing.py\` (\`from sft_template import IGNORE_INDEX, PAD_ID, VOCAB
   hints: [
     'Sort indices, not examples: `sorted(range(len(examples)), key=lambda i: len(examples[i][0]), reverse=True)`. Keep a list of free slots per row; `next((r for r in range(len(rows)) if room[r] >= n), None)` finds the first fit.',
     "Allocate with `torch.full((R, seq_len), PAD_ID, dtype=torch.long)` and the same with `IGNORE_INDEX`, then slice-assign per document: `input_ids[r, a:b] = ids`, `position_ids[r, a:b] = torch.arange(b - a)`, and append `b` to the row's boundaries.",
-    'For the mask: lengths `cu[1:] - cu[:-1]`, a segment id per position from `torch.repeat_interleave(torch.arange(n_segments), lengths)`, then `(seg[:, None] == seg[None, :]) & torch.tril(torch.ones(S, S, dtype=torch.bool))`.',
+    'For the mask: segment lengths are `cu[1:] - cu[:-1]`, and `torch.repeat_interleave` turns them into a segment id per position. Query `i` may see key `j` when their ids are equal and `j ≤ i`: one broadcast comparison, and `torch.tril` for the second condition.',
   ],
   checks: [
     {
@@ -457,7 +457,7 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `Packing is bin packing: rows are bins of \`seq_len\` slots, documents are items, and the goal is the fewest rows. It is NP-hard, and first-fit decreasing is the textbook baseline, never worse than 11/9 of the optimal row count plus a constant. Krell et al. treat SFT and pretraining data this way and give histogram-based variants that pack millions of sequences in seconds. On this test the gain is 16 rows to 8; on real SFT mixes, where most chats are short and a few are long, padded batches are often more than half padding.
+  debrief: `Packing is bin packing: rows are bins of \`seq_len\` slots, documents are items, and the goal is the fewest rows. It is NP-hard, and first-fit decreasing is the textbook baseline, never worse than 11/9 of the optimal row count plus a constant. Krell et al. treat BERT's pretraining and fine-tuning data this way and give histogram-based variants that pack millions of sequences in seconds. On this test the gain is 16 rows to 8; Krell et al. measure 50 % padding in BERT's Wikipedia data at 512 tokens, and up to 89 % on GLUE's CoLA at 128.
 
 The mask and the positions are what make the packing invisible. With one causal mask over the row, document 2 attends to all of document 1: the model is trained on a context that never happens at inference, and its losses change (by up to 1.8 nats per token in this test). Krell et al. call this cross-contamination; the Llama 3 paper uses a document mask for the same reason and found it matters most when training on long sequences. **Restarting positions** matters for a learned absolute table like \`TinyCausalLM\`'s. Under RoPE and a document mask the scores depend only on distances inside one document, so the restart changes nothing mathematically, but Hugging Face's FlashAttention 2 path uses it as the signal: a \`position_ids\` that returns to 0 marks a new sequence, and \`cu_seqlens\` is computed from it. **The first label of each document is ignored** for the same leak in the loss: logit \`t\` at the end of document 1 would otherwise be graded on document 2's first token.
 

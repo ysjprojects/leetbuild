@@ -333,7 +333,7 @@ initialising the master weight whole so a fresh model is independent of \`p\`, a
       date: '2019-03-21',
       venue: 'GitHub',
       takes:
-        'The reference implementation in `megatron/core/tensor_parallel`: `_CopyToModelParallelRegion`, `ColumnParallelLinear`, `RowParallelLinear`, `VocabParallelEmbedding` and `_VocabParallelCrossEntropy`, which the three files follow name for name.',
+        'The reference implementation in `megatron/core/tensor_parallel`: `_CopyToModelParallelRegion`, `ColumnParallelLinear`, `RowParallelLinear`, `VocabParallelEmbedding` and `_VocabParallelCrossEntropy`, which the three files follow (f and g as `CopyToTP` and `ReduceFromTP`).',
     },
     {
       kind: 'docs',

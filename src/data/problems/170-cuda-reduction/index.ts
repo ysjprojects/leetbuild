@@ -5,20 +5,20 @@ import {reduceSumStep} from './steps/1-reduce-sum';
 
 /**
  * Deep-learning drill, in CUDA: the parallel sum every normalisation, softmax, loss and gradient
- * norm rests on — a grid-stride partial per thread, a warp reduced with shuffles, one shared slot
- * per warp, one atomic per block — checked against a Kahan reference and timed against the bus.
+ * norm rests on: a grid-stride partial per thread, a warp reduced with shuffles, one shared slot
+ * per warp, one atomic per block, checked against a Kahan reference and timed against the bus.
  */
 export const cudaReductionProblem: Problem = {
   id: 'cuda-reduction',
-  title: 'Parallel reduction: shared memory, warp shuffles, two stages',
+  title: 'Parallel reduction: grid-stride, warp shuffles, one atomic',
   tagline:
-    'Sum 16 M floats at memory bandwidth: a grid-stride partial per thread, __shfl_down_sync across the warp, one shared slot per warp, one atomicAdd per block — checked against a Kahan sum.',
+    'Sum 16 M floats at memory bandwidth: a grid-stride partial per thread, __shfl_down_sync across the warp, one shared slot per warp, one atomicAdd per block, checked against a Kahan sum.',
   difficulty: 'medium',
   track: 'dllm',
   language: 'cuda',
   concepts: ['cuda'],
   minutes: 45,
-  statement: `# Parallel reduction: shared memory, warp shuffles, two stages
+  statement: `# Parallel reduction: grid-stride, warp shuffles, one atomic
 
 A **reduction** folds \`n\` values into one with an associative operator: a sum, a max, a dot product.
 It is the inner loop of almost every non-matmul kernel in a transformer: the mean and variance of
@@ -35,9 +35,9 @@ the next.
 
 The surface is one kernel and one helper, in \`reduce_sum.cu\`:
 
-- \`__device__ float warp_reduce_sum(float v)\` — \`__shfl_down_sync(0xffffffff, v, offset)\` for
+- \`__device__ float warp_reduce_sum(float v)\`: \`__shfl_down_sync(0xffffffff, v, offset)\` for
   \`offset = 16, 8, 4, 2, 1\`; lane 0 ends with the sum of the 32 lanes.
-- \`__global__ void reduce_sum(const float* in, float* out, int n)\` — \`*out\` is 0 on entry and the sum
+- \`__global__ void reduce_sum(const float* in, float* out, int n)\`: \`*out\` is 0 on entry and the sum
   of \`in[0..n)\` on exit; \`blockDim.x\` is a multiple of 32, at most 1024; any grid size works.
 
 ## What you build here
@@ -315,7 +315,7 @@ multi-GPU (all-reduce) forms.`,
       date: '2010-03',
       venue: 'NVIDIA CUDA webinar',
       takes:
-        'The seven-kernel walk from divergent interleaved addressing to sequential addressing, first add during load and many elements per thread, the shared-memory tree under the shuffle version.',
+        'The seven-kernel walk (divergent interleaved addressing, bank conflicts, sequential addressing, first add during load, unrolling, many elements per thread) and the G80 timings the guide quotes.',
     },
     {
       kind: 'post',
@@ -325,7 +325,17 @@ multi-GPU (all-reduce) forms.`,
       date: '2014-02-13',
       venue: 'NVIDIA Technical Blog',
       takes:
-        'The exact design of `reduce_sum`: a grid-stride register sum, `warp_reduce_sum` with `__shfl_down_sync`, one shared slot per warp, warp 0 reducing the slots and one `atomicAdd` per block.',
+        'The exact design of `reduce_sum`, written with the pre-Volta `__shfl_down`: a grid-stride register sum, a shuffle warp reduction, one shared slot per warp, warp 0 reducing the slots, and one `atomicAdd` per block.',
+    },
+    {
+      kind: 'post',
+      title: 'Controlling Floating-Point Determinism in NVIDIA CCCL',
+      url: 'https://developer.nvidia.com/blog/controlling-floating-point-determinism-in-nvidia-cccl/',
+      by: 'Nader Al Awar',
+      date: '2026-03-05',
+      venue: 'NVIDIA Technical Blog',
+      takes:
+        "`cub::DeviceReduce`'s determinism levels: the default two-launch tree, the single-launch atomic form `reduce_sum` builds (`not_guaranteed`), and the reproducible `gpu_to_gpu` accumulator.",
     },
     {
       kind: 'docs',
@@ -333,7 +343,7 @@ multi-GPU (all-reduce) forms.`,
       url: 'https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/cpp-language-extensions.html#warp-shuffle-functions',
       venue: 'CUDA Programming Guide',
       takes:
-        'The semantics of `__shfl_down_sync(0xffffffff, v, offset)`: the full-warp mask, and why lanes whose source is out of range keep their own value so only lane 0 holds the sum.',
+        'The semantics of `__shfl_down_sync(0xffffffff, v, offset)`: the full-warp mask, and why a lane whose source is out of range gets its own value back, so only lane 0 ends with the sum.',
     },
   ],
   steps: [reduceSumStep],

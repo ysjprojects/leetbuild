@@ -1,15 +1,15 @@
 /**
  * The learning guide for the AdamW drill: Adam's two moments and their bias correction, why L2 added to
  * the gradient is not weight decay under Adam, the decoupled decay of Loshchilov & Hutter, where eps
- * goes, AMSGrad, and the memory the optimizer state costs — plus what foreach/fused kernels and
- * sharding add. Rendered at `/pt-adamw/learn`.
+ * goes, AMSGrad, a worked two-step example, and the memory the optimizer state costs, plus what
+ * foreach/fused kernels and sharding add. Rendered at `/pt-adamw/learn`.
  */
 export const learn = `# The mechanism at a glance
 
-AdamW is the optimizer under GPT, LLaMA and ViT training. It is Adam — a per-coordinate step size from
-running averages of the gradient and its square — with one change from Loshchilov & Hutter's
-*Decoupled Weight Decay Regularization*: weight decay shrinks the parameter directly instead of being
-added to the gradient. The drill implements \`AdamW.step(self, closure=None)\` on a
+AdamW is the default optimizer for transformer training (GPT-1 and LLaMA, among many). It is Adam, a
+per-coordinate step size from running averages of the gradient and its square, with one change from
+Loshchilov & Hutter's *Decoupled Weight Decay Regularization*: weight decay shrinks the parameter
+directly instead of being added to the gradient. The drill implements \`AdamW.step(self, closure=None)\` on a
 \`torch.optim.Optimizer\` subclass whose constructor already stores \`lr\`, \`betas\`, \`eps\`,
 \`weight_decay\` and \`amsgrad\` as group defaults. One training step through it, read bottom to top, with
 what AdamW changes in the accent colour:
@@ -86,34 +86,44 @@ What \`self.state[p]\` holds over a run:
 # Two moments and why they need correcting
 
 [Adam](https://arxiv.org/abs/1412.6980) (Kingma & Ba) keeps two exponential moving averages per
-coordinate. \`m\` estimates the gradient's mean — momentum. \`v\` estimates its uncentred second
-moment, so \`√v\` is the typical size of that coordinate's gradient. The step \`m / √v\` is then roughly
-unit-sized whatever the gradient's scale: a coordinate with tiny gradients moves as far as one with huge
-ones, and \`lr\` becomes a step length in parameter units. Compare Adam's path with plain SGD's and
-momentum's on an ill-conditioned loss:
+coordinate.
+
+**Refresher: an exponential moving average (EMA).** \`a ← β · a + (1 − β) · x\` blends each new sample
+\`x\` into a running value. A sample's weight decays by \`β\` per step, so the average remembers roughly the
+last \`1 / (1 − β)\` samples: 10 steps for \`β1 = 0.9\`, 1,000 for \`β2 = 0.999\`.
+
+\`m\` estimates the gradient's mean (momentum). \`v\` estimates its uncentred second moment, so \`√v\` is
+the typical size of that coordinate's gradient. The step \`m / √v\` is then roughly unit-sized whatever
+the gradient's scale: a coordinate with tiny gradients moves as far as one with huge ones, and \`lr\`
+becomes a step length in parameter units. Compare Adam's path with plain SGD's and momentum's on an
+ill-conditioned loss:
 
 :::widget optimizer-paths
 
 Both averages start at zero, so early on they are biased towards zero. After \`t\` steps of a constant
-gradient \`g\`, \`m = (1 − β1^t) · g\` and \`v = (1 − β2^t) · g²\`. Dividing by those factors removes the
-bias exactly:
+gradient \`g\`, \`m = (1 − β1^t) · g\` and \`v = (1 − β2^t) · g²\` (the missing weight \`β^t\` is still on
+the zero start). Dividing by those factors removes the bias exactly. Without it, the step for a constant
+gradient is \`bc1 / √bc2\` times too large:
 
-| step t | bc1 = 1 − 0.9^t | bc2 = 1 − 0.999^t | uncorrected first step per unit lr |
+| step t | bc1 = 1 − 0.9^t | bc2 = 1 − 0.999^t | uncorrected step ÷ corrected = bc1 / √bc2 |
 |---|---|---|---|
-| 1 | 0.1 | 0.001 | (1 − β1) / √(1 − β2) ≈ 3.2× too large |
-| 10 | 0.65 | 0.010 | still far off |
-| 100 | ≈ 1.0 | 0.095 | v still under-estimated ~10× |
-| 1000 | 1.0 | 0.63 | close |
+| 1 | 0.1 | 0.001 | 3.2 |
+| 12 | 0.72 | 0.012 | 6.6 (the peak) |
+| 100 | ≈ 1.0 | 0.095 | 3.2 |
+| 1000 | 1.0 | 0.63 | 1.26 |
+| 5000 | 1.0 | 0.993 | 1.003 |
 
 - \`bc1\` folds into the step size: \`step_size = lr / bias_correction1\`.
 - \`bc2\` divides the second moment before the root: \`√(v / bc2) = √v / √bc2\`, written as
   \`exp_avg_sq.sqrt() / math.sqrt(bias_correction2)\`.
-- With correction, step 1 moves every coordinate by about \`lr\` — exactly \`lr · sign(g)\` up to eps.
-- Correction matters for the first few hundred steps only, which is also why warm-up schedules exist:
-  even corrected, \`v\` from a handful of samples is a noisy scale estimate.
+- With correction, step 1 moves every coordinate by about \`lr\`: exactly \`lr · g / (|g| + eps)\`, so
+  \`lr · sign(g)\` up to eps.
+- \`m\` is unbiased within a few dozen steps, \`v\` only after a few thousand (its memory is 1,000 steps).
+  Even corrected, \`v\` from a handful of samples is a noisy scale estimate, one reason LLM runs warm
+  the learning rate up (LLaMA: 2,000 steps).
 
-The moments are updated in place — \`exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)\` and
-\`exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)\` — never rebound to new tensors, so the
+The moments are updated in place (\`exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)\` and
+\`exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)\`), never rebound to new tensors, so the
 state dict keeps pointing at the same storage and no step allocates.
 
 :::quiz
@@ -127,11 +137,12 @@ Q: Without bias correction, what happens on the very first step with the default
 
 # Why L2 in the gradient is not weight decay under Adam
 
-For plain SGD, adding \`wd · p\` to the gradient and shrinking \`p\` by \`lr · wd\` are the same thing.
+**Refresher: L2 regularisation.** Adding \`wd/2 · ‖p‖²\` to the loss adds \`wd · p\` to the gradient. For
+plain SGD (no momentum), that gradient term and shrinking \`p\` by \`lr · wd\` per step are the same thing.
 Under Adam they are not: whatever is added to the gradient also passes through \`m / √v\`. The decay
-term is divided by the coordinate's gradient scale, so weights with large gradients — the ones that
-most need regularising — are barely decayed, and weights with tiny gradients are decayed hard. That is
-L2-regularised Adam, \`torch.optim.Adam(weight_decay=…)\`; set it beside the AdamW figure at the top:
+term is divided by the coordinate's gradient scale, so weights with large gradients are barely decayed
+and weights with tiny gradients are decayed hard. That is L2-regularised Adam,
+\`torch.optim.Adam(weight_decay=…)\`; set it beside the AdamW figure at the top:
 
 :::architecture
 {
@@ -167,21 +178,70 @@ L2-regularised Adam, \`torch.optim.Adam(weight_decay=…)\`; set it beside the A
 - The decay runs **before** the moment updates and \`addcdiv_\`, as in \`torch.optim.AdamW\`: the shrink
   applies to the parameter the gradient was computed from.
 - The decay is scaled by \`lr\`, so a cosine or warm-up schedule anneals decay together with the step.
+  The paper's Algorithm 2 scales \`λ\` by the schedule multiplier \`η_t\` but not by the base rate \`α\`;
+  PyTorch multiplies by the full \`lr = α · η_t\`, so its \`weight_decay\` is the paper's \`λ / α\`.
 - Never add \`weight_decay * p\` to \`grad\`: with \`weight_decay=0.1\` the trajectories split at step 1.
 
 :::details Then what does torch.optim.Adam's weight_decay do?
-\`torch.optim.Adam(weight_decay=…)\` is the L2 form: it adds \`wd · p\` to the gradient. That is why
-AdamW exists as a separate class rather than a flag, and why swapping one for the other at the same
-\`weight_decay\` changes training: the useful values differ by orders of magnitude.
+\`torch.optim.Adam(weight_decay=…)\` is the L2 form: it adds \`wd · p\` to the gradient. Since PyTorch
+2.7, \`Adam\` also takes \`decoupled_weight_decay=True\`, and \`AdamW\` is that subclass with a
+default \`weight_decay\` of \`1e-2\` instead of \`0\`. Swapping L2 for decoupled decay at the same
+\`weight_decay\` changes training: one is divided by \`√v\` and the other is not, so the useful values
+differ by orders of magnitude.
 :::
 
 :::quiz
-Q: A weight's gradient is consistently 100× larger than its neighbour's. Under L2-regularised Adam, how does its decay compare?
+Q: A weight's gradient is consistently 100× larger than its neighbour's, and the two weights are equal. Under L2-regularised Adam, how does its decay compare?
 - [ ] Equal: the decay term wd·p does not depend on the gradient
 - [x] About 100× weaker, because the decay term is divided by √v, which is dominated by the large gradient
 - [ ] About 100× stronger, because the decay term is multiplied by the gradient scale
 > Adam normalises each coordinate by its own √v. Once wd·p is part of the gradient it is normalised too,
 > so large-gradient weights get almost no decay. AdamW applies lr·wd to the parameter directly.
+:::
+
+# Two steps by hand
+
+One scalar weight, \`p = 1.0\`, with \`lr = 0.1\`, \`wd = 0.1\` and the default betas and eps. The gradient
+is \`0.5\` at step 1 and \`−0.1\` at step 2.
+
+| line | step 1 (g = 0.5) | step 2 (g = −0.1) |
+|---|---|---|
+| decay \`p ← p · (1 − lr · wd)\` | 1.0 · 0.99 = 0.99 | 0.89 · 0.99 = 0.8811 |
+| \`m ← 0.9 m + 0.1 g\` | 0.05 | 0.045 − 0.01 = 0.035 |
+| \`v ← 0.999 v + 0.001 g²\` | 0.00025 | 0.00024975 + 0.00001 = 0.00025975 |
+| \`bc1\`, \`bc2\` | 0.1, 0.001 | 0.19, 0.001999 |
+| \`m̂ = m / bc1\` | 0.5 | 0.1842 |
+| \`denom = √v / √bc2 + eps\` | 0.5 | 0.3605 |
+| \`p ← p − lr · m̂ / denom\` | 0.99 − 0.1 = **0.89** | 0.8811 − 0.0511 = **0.8300** |
+
+\`torch.optim.AdamW(lr=0.1, weight_decay=0.1)\` gives \`0.890000\` and \`0.829997\`. Three things to read
+off the table:
+
+- **Step 1 is exactly \`lr\`** (plus the decay): \`m̂ = g\` and \`√v̂ = |g|\`, whatever the size of \`g\`.
+- **Momentum outlasts a sign flip.** At step 2 the gradient points the other way, yet \`m\` is still
+  positive and \`p\` keeps falling. The step shrinks to 0.051: \`m̂\` has fallen to 0.18 while \`v̂\` still
+  remembers the larger gradient of step 1.
+- **The decay is visible.** Each step removes 1% of \`p\` on top of the Adam move.
+
+The same two steps with L2 instead (\`torch.optim.Adam(lr=0.1, weight_decay=0.1)\`) feed \`g + wd · p\`
+into the moments:
+
+| | step 1 | step 2 |
+|---|---|---|
+| gradient seen | 0.5 + 0.1 · 1.0 = 0.6 | −0.1 + 0.1 · 0.9 = −0.01 |
+| \`p\` after the step | 1.0 − 0.1 = **0.9** | **0.8342** |
+
+At step 1 the decay disappears completely: \`m̂ / √v̂ = 0.6 / 0.6 = 1\`, the same unit step as without any
+decay. Normalisation divides out whatever entered the gradient, decay included. Without bias correction,
+step 1 would instead have been \`0.99 − 0.1 · 0.05 / √0.00025 = 0.99 − 0.316 = 0.674\`, the 3.2× overshoot.
+
+:::quiz
+Q: In the AdamW table, why is the step-2 move (0.051) smaller than lr = 0.1?
+- [ ] Weight decay subtracted part of the step
+- [x] m̂ has shrunk (the gradient changed sign) while v̂ still remembers the larger step-1 gradient
+- [ ] Bias correction divides by a smaller bc1 at step 2
+> m̂ = 0.035 / 0.19 = 0.184 and √v̂ = 0.36: the mean of the recent gradients is small but their scale is not.
+> The decay is a separate 1% shrink, and bc1 grows from 0.1 to 0.19, which makes m̂ smaller, not the step larger.
 :::
 
 # Where eps goes, and AMSGrad
@@ -194,23 +254,28 @@ denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)   # √v̂ +
 
 | form | eps acts as | effect with eps = 1e-8 |
 |---|---|---|
-| \`√v̂ + eps\` (Adam, PyTorch) | a floor on the denominator | invisible unless the gradient scale is ≲ 1e-8 |
-| \`√(v̂ + eps)\` | a perturbation of the variance | a floor of 1e-4 on the denominator — a different optimizer |
+| \`√v̂ + eps\` (Adam's Algorithm 1, PyTorch) | a floor on the denominator | invisible unless the gradient scale is ≲ 1e-8 |
+| \`√v + ε̂\` (Adam's "efficient" form, Keras's \`epsilon\`) | the same floor, on the uncorrected \`√v\` | like PyTorch eps = ε̂ / √bc2: 32× larger at step 1, the same once bc2 ≈ 1 |
+| \`√(v̂ + eps)\` | a perturbation of the variance | a floor of 1e-4 on the denominator: a different optimizer |
 
 - \`sqrt(v + eps)\` does not match the reference, and \`eps\` there behaves like a much larger constant.
 - Large \`eps\` (1e-6 to 1e-3) is a real tuning knob: it caps the step for near-zero-gradient coordinates
-  and turns Adam towards momentum SGD. Low-precision training often raises it because \`v\` underflows.
+  and turns Adam towards momentum SGD (\`denom ≈ eps\`). With half-precision optimizer state it has to
+  rise anyway: \`1e-8\` rounds to \`0\` in fp16, whose smallest subnormal is about 6e-8.
 
 [AMSGrad](https://openreview.net/forum?id=ryQu7f-RZ) (Reddi et al., *On the Convergence of Adam and
-Beyond*) showed Adam can fail to converge when a rare large gradient is forgotten too fast: \`v\`
-decays, the effective step grows again. The fix keeps the running maximum of \`v\`:
+Beyond*) built a simple convex problem on which Adam does not converge to the optimum: a rare large
+gradient is forgotten too fast, \`v\` decays and the effective step grows again.
+The fix keeps the running maximum of \`v\`:
 
 \`\`\`python
 torch.maximum(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
 denom = (max_exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(eps)
 \`\`\`
 
-- The per-coordinate step can then only shrink over time, which restores the convergence proof.
+- In the paper, which drops bias correction, the per-coordinate rate \`lr / √v̂\` can then only shrink,
+  which gives back a convergence guarantee. PyTorch keeps the maximum of the raw \`v\` and still divides
+  by \`bc2\`, so the rate can still grow while \`bc2\` climbs towards 1.
 - \`max_exp_avg_sq\` exists in state only when \`amsgrad=True\`: \`("max_exp_avg_sq" in state) == amsgrad\`.
 - In practice it is rarely enabled for LLM training; it costs a third state tensor.
 
@@ -226,7 +291,7 @@ Q: Why is sqrt(exp_avg_sq + eps) not a harmless rewrite of sqrt(exp_avg_sq) + ep
 # The Optimizer contract and the state it costs
 
 \`torch.optim.Optimizer\` owns the parts that are not arithmetic: \`param_groups\` (lists of parameters
-with their own \`lr\`, \`betas\`, \`weight_decay\` — e.g. no decay for norms and biases) and \`state\`, a
+with their own \`lr\`, \`betas\`, \`weight_decay\`, e.g. no decay for norms and biases) and \`state\`, a
 dict keyed by parameter. The step loops over \`self.param_groups\` and \`group["params"]\`.
 
 - \`@torch.no_grad()\` makes \`p.mul_\` and \`p.addcdiv_\` on leaf tensors legal and untracked.
@@ -243,9 +308,11 @@ The memory is the real cost:
 | \`exp_avg_sq\` | 4 bytes | 28 GB |
 | \`max_exp_avg_sq\` (amsgrad) | 4 bytes | 28 GB |
 
-The two moments weigh twice the model in \`float32\` — 8 bytes per parameter on top of the 2 or 4 the
-weight takes. That is why [ZeRO](https://arxiv.org/abs/1910.02054) and FSDP shard \`exp_avg\` and
-\`exp_avg_sq\` across data-parallel ranks first, and why 8-bit and factored optimizers exist.
+The two moments weigh twice a \`float32\` model: 8 bytes per parameter on top of the 2 or 4 the weight
+takes. Mixed-precision training usually adds an fp32 master copy of bf16 or fp16 weights (4 more bytes),
+which is how [ZeRO](https://arxiv.org/abs/1910.02054) counts 16 bytes per parameter for mixed-precision
+Adam with fp16 weights and gradients. That is why ZeRO and FSDP shard the optimizer state across
+data-parallel ranks first, and why 8-bit and factored optimizers exist.
 
 :::quiz
 Q: For a 7B-parameter model with bf16 weights, how does AdamW's state compare with the weights?
@@ -259,21 +326,28 @@ Q: For a 7B-parameter model with bf16 weights, how does AdamW's state compare wi
 # What production implementations add
 
 The drill's per-parameter Python loop launches several small kernels per tensor. \`torch.optim.AdamW\`
-([docs](https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html)) has faster paths with the
+([docs](https://docs.pytorch.org/docs/stable/generated/torch.optim.AdamW.html)) has faster paths with the
 same arithmetic:
 
 | implementation | what it does | why it is faster |
 |---|---|---|
-| for-loop (this drill) | one op at a time per parameter | — |
-| \`foreach\` (default on CUDA) | each op once over the list of all parameters | one launch per op instead of per tensor |
+| for-loop (this drill) | one op at a time per parameter | baseline |
+| \`foreach\` (default on CUDA) | each op once over the list of all parameters | a few launches per op instead of one per tensor |
 | \`fused\` | the whole update in one kernel | one read and write of p, m, v per step |
 
-- Together these are 2–10× faster than the per-parameter loop.
+- The docs call both "typically faster" than the for-loop, with \`fused\` theoretically fastest;
+  \`foreach\` costs about one extra parameter-sized buffer of peak memory.
 - \`capturable\` keeps \`state["step"]\` as a tensor on device so the step can be recorded into a CUDA graph
   (here it is a Python \`int\`).
 - The reference uses \`lerp_\` for \`m\`; in \`float32\` that differs from \`mul_().add_()\` in the last ulp,
   which is why the drill compares in \`float64\`.
 - \`maximize\` flips the sign for gradient ascent; distributed training shards the state (ZeRO/FSDP).
+
+LLM recipes change the hyper-parameters, not the algorithm. [LLaMA](https://arxiv.org/abs/2302.13971)
+trains with \`betas=(0.9, 0.95)\`, \`weight_decay=0.1\`, gradient clipping at 1.0 and 2,000 warm-up steps;
+the lower \`β2\` shortens \`v\`'s memory from about 1,000 steps to 20, so it follows a sudden change in
+gradient scale within tens of steps. Codebases such as nanoGPT put matrices and embeddings in a decayed
+group and biases and norm gains in a \`weight_decay=0\` group.
 
 :::quiz
 Q: Why is the foreach implementation faster when the arithmetic is identical?
@@ -287,10 +361,10 @@ Q: Why is the foreach implementation faster when the arithmetic is identical?
 # What to take away
 
 - Adam divides an EMA of the gradient by the root of an EMA of its square: a unit-sized step per coordinate.
-- Bias correction (\`1 − β1^t\`, \`1 − β2^t\`) fixes the zero-initialised moments; without it step 1 is ~3.2× too large.
+- Bias correction (\`1 − β1^t\`, \`1 − β2^t\`) fixes the zero-initialised moments; without it step 1 is 3.2× too large, and \`v\` stays biased for thousands of steps.
 - L2 added to the gradient is divided by \`√v\` and stops being decay; AdamW shrinks \`p\` by \`lr · wd\` directly.
 - \`eps\` goes after the square root; AMSGrad keeps a running maximum of \`v\` in state.
-- The state costs two fp32 tensors per parameter; foreach/fused kernels and ZeRO sharding are what make it cheap.
+- The state costs two fp32 tensors per parameter: ZeRO sharding makes it fit, foreach/fused kernels make the update fast.
 
 Primary reference: Loshchilov & Hutter, [Decoupled Weight Decay Regularization](https://arxiv.org/abs/1711.05101) (ICLR 2019).
 `;

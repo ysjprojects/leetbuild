@@ -48,7 +48,7 @@ that ordering, then prints \`PASS\`. About 15 s on a laptop CPU.
 > recipe chooses each one so the backward still differentiates the forward: one weight for both
 > passes, gradients unbiased in expectation, and the rotation only where both operands can take it.`,
   hints: [
-    'Forward: `xq = quantize_nvfp4(x, "nearest", block=(1, 16))`, `wq = quantize_nvfp4(weight, "nearest", block=(16, 16) if recipe.weights_2d else (1, 16))`, `ctx.save_for_backward(x, weight, wq)`, `return xq @ wq.T`. Non-tensor arguments go on `ctx` as attributes, and `backward` returns `None` for each of them.',
+    'Forward: quantize `x` and `weight` once each and return their product. Save the quantized weight `wq` with `ctx.save_for_backward` too: with 2-D tiles dgrad reuses it instead of quantizing again. Non-tensor arguments (`recipe`, `generator`) go on `ctx` as attributes, and `backward` returns `None` for each of them.',
     'Dgrad: `rounding = "stochastic" if r.stochastic_grads else "nearest"`; `w_dgrad = wq if r.weights_2d else quantize_nvfp4(weight.T, "nearest", block=(1, 16)).T`; `dx = quantize_nvfp4(dy, rounding, gen, block=(1, 16)) @ w_dgrad`. The 1 × 16 blocks of `wq` run along `in`, the wrong dimension for a product over `out`.',
     'Wgrad: `a, b = dy.T, x.T`, then `a, b = rht(a, RHT), rht(b, RHT)` when the recipe says so; `dw = quantize_nvfp4(a, rounding, gen, block=(1, 16)) @ quantize_nvfp4(b, "nearest", block=(1, 16)).T`. Because `(dYᵀH)(XᵀH)ᵀ = dYᵀX`, the rotation needs no inverse.',
   ],
@@ -612,8 +612,8 @@ activations or gradients quantized fresh each step and can both be rotated along
 dimension; rotating a weight would break the 2-D consistency. At this scale the loss gap is 0.003 nats,
 and turning off SR, the rotation or the 2-D tiles moves the validation loss by under 0.005 nats
 (measured 1.281, 1.276 and 1.279 against 1.277): too little to assert on, so the self-test measures the
-gradient bias directly. The paper's case for every technique is its 12B, 10T-token run, where removing
-any one of them raises the loss. Production adds what the toy leaves out: real FP4 storage (two codes
+gradient bias directly. The paper's case for every technique is its 12B run: in ablations branched
+from it at 3.43T tokens, removing any one of them raises the loss. Production adds what the toy leaves out: real FP4 storage (two codes
 per byte and a swizzled E4M3 scale layout), GEMMs that read NVFP4 operands on Blackwell tensor cores
 and write BF16 or FP32, an extra pass over each tensor for its global amax, amax reduction across
 ranks for gathered tensors, BF16 rather than FP32 for the high-precision parts, and the option to switch

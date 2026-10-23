@@ -21,14 +21,14 @@ provided and must stay as they are.
 - From \`betas\` derive \`alphas = 1 − betas\`, \`alphas_cumprod = torch.cumprod(alphas, dim=0)\`,
   \`alphas_cumprod_prev\` (a leading \`1\`, then \`alphas_cumprod[:-1]\`), \`sqrt_alphas_cumprod\`,
   \`sqrt_one_minus_alphas_cumprod\`, and \`posterior_variance = betas * (1 − alphas_cumprod_prev) / (1 −
-  alphas_cumprod)\`. Compute in float64, store each with \`self.register_buffer(name, value.float())\` —
+  alphas_cumprod)\`. Compute in float64, store each with \`self.register_buffer(name, value.float())\`:
   all seven are \`(T,)\` float32 and move with \`.to(device)\`. Keep \`self.T\`.
 - \`q_sample(x0, t, noise)\`: \`x0\` and \`noise\` are \`(B, …)\`, \`t\` is \`(B,)\` long in \`[0, T)\`. Return
-  \`sqrt_alphas_cumprod[t] · x0 + sqrt_one_minus_alphas_cumprod[t] · noise\` — the marginal in one step,
+  \`sqrt_alphas_cumprod[t] · x0 + sqrt_one_minus_alphas_cumprod[t] · noise\`, the marginal in one step,
   never a loop over the chain. \`broadcast_to(values, like)\` reshapes a \`(B,)\` vector to \`(B, 1, …)\`.
 - \`ddpm_loss(model, x0, t=None)\`: when \`t\` is \`None\` draw \`t = torch.randint(0, self.T, (B,))\`
   uniformly; draw \`noise = torch.randn_like(x0)\`; form \`x_t = self.q_sample(x0, t, noise)\`; return
-  \`F.mse_loss(model(x_t, t), noise)\` — the network predicts the noise, not \`x0\`, and the loss is the
+  \`F.mse_loss(model(x_t, t), noise)\`. The network predicts the noise, not \`x0\`, and the loss is the
   unweighted MSE of the paper's Algorithm 1.
 - No \`diffusers\` and no scheduler classes; the constants are yours.
 
@@ -39,14 +39,14 @@ The schedule decides how fast the signal fades. Drag the timestep and compare th
 The file ends with a self-test: \`alphas_cumprod\` strictly decreasing in \`(0, 1]\` for both kinds,
 \`posterior_variance[0] == 0\` and \`≤ betas\`, \`q_sample\` marginal statistics over 200 000 draws (mean
 \`√ᾱ_t · x0\`, variance \`1 − ᾱ_t\`, both to \`1e-2\`), and the loss falling to under 70 % of its first
-twenty steps after \`train_toy\` — then \`PASS\`.
+twenty steps after \`train_toy\`, then \`PASS\`.
 
 > One formula replaces the chain: because every step adds independent Gaussian noise, \`x_t\` given \`x_0\`
 > is itself Gaussian with mean \`√ᾱ_t x_0\` and variance \`1 − ᾱ_t\`, so training picks any \`t\` at random
 > and never simulates the \`t − 1\` steps before it.`,
   hints: [
     'Build everything in float64 from `betas`: `alphas = 1 - betas`, `alphas_cumprod = torch.cumprod(alphas, dim=0)`, `alphas_cumprod_prev = torch.cat([torch.ones(1, dtype=torch.float64), alphas_cumprod[:-1]])`. Put the seven tensors in a dict and loop `self.register_buffer(name, value.float())`.',
-    'The cosine schedule is defined through ᾱ, not β: compute `f` on `T + 1` grid points, normalise by `f[0]`, and take `betas = 1 - alphas_bar[1:] / alphas_bar[:-1]`; the clamp at 0.999 keeps the last steps from being pure noise.',
+    'The cosine schedule is defined through ᾱ, not β: compute `f` on `T + 1` grid points, normalise by `f[0]`, and take `betas = 1 - alphas_bar[1:] / alphas_bar[:-1]`. The last ratio is `f(T) / f(T - 1)` with `f(T) = cos²(π/2) ≈ 0`, hence the clamp at 0.999.',
     'In `q_sample`, index the buffers with the `(B,)` tensor `t` and reshape with `broadcast_to(self.sqrt_alphas_cumprod[t], x0)` before multiplying. `ddpm_loss` is four lines: sample `t` if missing, sample `noise`, `q_sample`, `F.mse_loss(model(x_t, t), noise)`.',
   ],
   checks: [
@@ -54,7 +54,7 @@ twenty steps after \`train_toy\` — then \`PASS\`.
       id: 'linear-betas',
       title: 'Linear betas run from beta_start to beta_end over T steps',
       detail:
-        'The linear schedule is `torch.linspace(beta_start, beta_end, T, …)` — 1e-4 to 0.02 over 1000 steps in the paper; no `diffusers` scheduler supplies it.',
+        'The linear schedule is `torch.linspace(beta_start, beta_end, T, …)`: 1e-4 to 0.02 over 1000 steps in the paper; no `diffusers` scheduler supplies it.',
       match: {
         python: {
           all: [/torch\.linspace\(\s*beta_start\s*,\s*beta_end\s*,\s*T\b/],
@@ -66,7 +66,7 @@ twenty steps after \`train_toy\` — then \`PASS\`.
       id: 'cosine-betas',
       title: 'Cosine betas come from the ratio of consecutive ᾱ, clamped at 0.999',
       detail:
-        'The cosine schedule defines `alphas_bar = cos²(…) / f[0]` and derives `betas = 1 − alphas_bar[1:] / alphas_bar[:-1]`, clamped with `.clamp(max=0.999)` so the final steps keep a little signal.',
+        "The cosine schedule defines `alphas_bar = cos²(…) / f[0]` and derives `betas = 1 − alphas_bar[1:] / alphas_bar[:-1]`, clamped with `.clamp(max=0.999)`: the last ratio would give β = 1, so α = 0 and the reverse step's 1/√α_t would be singular.",
       match: {
         python: {all: [/torch\.cos\(/, /\[1:\]\s*\/\s*\w+\[:-1\]/, /\.clamp\(\s*max\s*=\s*0\.999\s*\)/]},
       },
@@ -84,7 +84,7 @@ twenty steps after \`train_toy\` — then \`PASS\`.
       id: 'posterior-variance',
       title: 'Posterior variance is β_t (1 − ᾱ_{t−1}) / (1 − ᾱ_t)',
       detail:
-        '`alphas_cumprod_prev` starts with a 1 and `posterior_variance = betas * (1 - alphas_cumprod_prev) / (1 - alphas_cumprod)` — the variance of q(x_{t−1} | x_t, x_0) the sampler in step 2 uses; it is 0 at t = 0.',
+        '`alphas_cumprod_prev` starts with a 1 and `posterior_variance = betas * (1 - alphas_cumprod_prev) / (1 - alphas_cumprod)`: the variance of q(x_{t−1} | x_t, x_0) the sampler in step 2 uses; it is 0 at t = 0.',
       match: {
         python: {
           all: [
@@ -110,7 +110,7 @@ twenty steps after \`train_toy\` — then \`PASS\`.
       id: 'epsilon-mse',
       title: 'The loss is the MSE between the drawn noise and the predicted noise',
       detail:
-        '`ddpm_loss` samples `t` with `torch.randint(0, self.T, …)` when none is given, draws `noise = torch.randn_like(x0)`, forms `x_t` with `self.q_sample`, and returns `F.mse_loss(model(x_t, t), noise)` — predicting ε, not x_0, with no per-timestep weight.',
+        '`ddpm_loss` samples `t` with `torch.randint(0, self.T, …)` when none is given, draws `noise = torch.randn_like(x0)`, forms `x_t` with `self.q_sample`, and returns `F.mse_loss(model(x_t, t), noise)`: predicting ε, not x_0, with no per-timestep weight.',
       match: {
         python: {
           all: [/torch\.randint\(\s*0\s*,\s*self\.T\s*,/, /torch\.randn_like\(\s*x0\s*\)/, /mse_loss\(/],
@@ -185,7 +185,7 @@ class TinyDenoiser(nn.Module):
 
 
 def two_moons(n: int, noise: float = 0.05, seed: int = 0) -> torch.Tensor:
-    """n points on two interleaving half-circles, standardised to zero mean and unit scale, (n, 2)."""
+    """n points on two interleaving half-circles, centred and scaled by 1 / 0.6, (n, 2)."""
     g = torch.Generator().manual_seed(seed)
     half = n // 2
     theta = torch.rand(half, generator=g) * math.pi
@@ -342,7 +342,7 @@ class TinyDenoiser(nn.Module):
 
 
 def two_moons(n: int, noise: float = 0.05, seed: int = 0) -> torch.Tensor:
-    """n points on two interleaving half-circles, standardised to zero mean and unit scale, (n, 2)."""
+    """n points on two interleaving half-circles, centred and scaled by 1 / 0.6, (n, 2)."""
     g = torch.Generator().manual_seed(seed)
     half = n // 2
     theta = torch.rand(half, generator=g) * math.pi
@@ -410,5 +410,5 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `The schedule is a module with **buffers**, not a dict of Python floats, for two reasons the paper does not spell out: the constants must sit on the same device as the batch (\`schedule.to("cuda")\` moves all seven; indexing with a CUDA \`t\` then costs one gather, no host sync), and the derived quantities are computed **once** in float64 — a cumulative product of a thousand numbers below 1 loses precision in float32, and \`1 − ᾱ_t\` near \`t = 0\` is a difference of nearly equal numbers. The forward process is a single formula because Gaussian noise composes: \`x_t | x_0\` is \`N(√ᾱ_t x_0, (1 − ᾱ_t) I)\`, which is why training can draw \`t\` uniformly and never simulate the chain, and why one batch sees every noise level at once. The loss is the paper's \`L_simple\`: the ELBO's per-step weights are dropped, the network predicts \`ε\` rather than \`x_0\` or the posterior mean (the three are affine in each other, but ε-prediction is the best-conditioned target at high noise), and the result is plain MSE. Production stacks keep exactly this shape — \`diffusers\`' \`DDPMScheduler\` holds the same buffers under the same names — and add what the toy leaves out: a U-Net or a DiT in place of the MLP, an EMA copy of the weights for sampling, v-prediction or the min-SNR weighting that re-weights the loss by timestep, and the cosine schedule for low-resolution images where the linear one wastes its last steps on pure noise.`,
+  debrief: `The schedule is a module with **buffers**, not a dict of Python floats, for two reasons the paper does not spell out: the constants must sit on the same device as the batch (\`schedule.to("cuda")\` moves all seven; indexing with a CUDA \`t\` then costs one gather, no host sync), and they are computed **once** in float64, as the authors' code does. The cumulative product is not the risk (float32 gets it to 4e-7 relative error here); the cancellation in \`1 − ᾱ_t\` near \`t = 0\` is (2e-4 relative error at \`t = 0\`, carried into \`posterior_variance\`). The forward process is a single formula because Gaussian noise composes: \`x_t | x_0\` is \`N(√ᾱ_t x_0, (1 − ᾱ_t) I)\`, which is why training can draw \`t\` uniformly and never simulate the chain, and why one batch sees every noise level at once. The loss is the paper's \`L_simple\`: the bound's per-step weights \`β_t² / (2σ_t² α_t (1 − ᾱ_t))\` are dropped, which down-weights the easy small-\`t\` terms; the network predicts \`ε\` rather than \`x_0\` or the posterior mean (the three are affine in each other, and Ho et al. found ε gave the best samples under the unweighted loss); and the result is plain MSE. Production stacks keep this shape (\`diffusers\`' \`DDPMScheduler\` keeps \`betas\`, \`alphas\` and \`alphas_cumprod\` under the same names, as float32 tensors moved to the sample's device on use) and add what the toy leaves out: a U-Net or a DiT in place of the MLP, an EMA copy of the weights for sampling, v-prediction or the min-SNR weighting that re-weights the loss by timestep, and the cosine schedule for low-resolution images where the linear one wastes its last steps on pure noise.`,
 };

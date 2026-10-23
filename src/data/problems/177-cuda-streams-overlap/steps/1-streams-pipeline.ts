@@ -1,6 +1,6 @@
 import type {Step} from '@/lib/types';
 
-/** A four-argument launch: `name<<<grid, block, smem, stream>>>` — the kernel is bound to a stream. */
+/** A four-argument launch, `name<<<grid, block, smem, stream>>>`, which binds the kernel to a stream. */
 const launchOnStream = (kernel: string): RegExp => new RegExp(`${kernel}<<<[^>]*,[^>]*,[^>]*,[^>]*>>>`);
 
 /** `cudaMemcpyAsync(…, kind, stream)` with an explicit fifth argument; without it the copy lands on stream 0. */
@@ -43,11 +43,11 @@ copy-heavy ratio against a compute-heavy one):
 - **Kernels.** \`heavy(const float* in, float* out, int n)\`: for each element solve Kepler's equation
   \`E = M + ECC · sin E\` by \`ITERS = 64\` fixed-point iterations of \`e = m + ECC * sinf(e)\` starting from
   \`e = m\` (\`ECC = 0.5f\`), and write \`e\`. \`add_carry(float* out, const float* carry, int n)\`: add
-  \`*carry\` to every element when \`carry\` is not null — the carry is the **last output of the previous
+  \`*carry\` to every element when \`carry\` is not null. The carry is the **last output of the previous
   chunk** (\`d_out + off − 1\`), null for chunk 0. Launch both with \`BLOCK = 256\` threads and
   \`GRID = (CHUNK + BLOCK − 1) / BLOCK\` blocks.
 - **Pinned host memory.** \`h_in\` and \`h_out\` come from \`cudaMallocHost\` (or \`cudaHostAlloc\`) and go
-  back with \`cudaFreeHost\`; no \`malloc\`/\`new\` for them — a copy from pageable memory is staged
+  back with \`cudaFreeHost\`; no \`malloc\`/\`new\` for them: a copy from pageable memory is staged
   through a driver buffer and is **not** asynchronous.
 - **\`run_baseline(h_in, h_out, d_in, d_out) → ms\`** (given): for each chunk, synchronous \`cudaMemcpy\`
   H2D, \`heavy\`, \`add_carry\`, synchronous \`cudaMemcpy\` D2H, on the default stream; timed between two
@@ -62,18 +62,19 @@ copy-heavy ratio against a compute-heavy one):
   and destroy every stream and event. No synchronous \`cudaMemcpy\` and no host-side synchronisation
   inside the loop.
 - **Self-test** (kept in the file): fills \`h_in[i] = (i % 1000) · 0.00628 − 3.14\`, computes the CPU
-  reference, warms both kernels up once, runs each version \`REPS = 3\` times and keeps the fastest,
-  prints both times, the per-chunk landing times, the speedup, and \`PASS\` when both max abs errors are
-  below \`1e-4\` (a speedup at or below \`1.2×\` prints a warning: it depends on the GPU's copy engines and link); the host output is zeroed between the two versions so a
-  pipeline that never copies back cannot pass.
+  reference, warms both kernels up once, runs each version \`REPS = 3\` times and keeps the fastest (and
+  that run's landing times), prints both times, the per-chunk landing times and the speedup, and prints
+  \`PASS\` when both max abs errors are below \`1e-4\`. A speedup at or below \`1.2×\` prints a warning, not
+  a failure: it depends on the GPU's copy engines and link. The host output is zeroed between the two
+  versions so a pipeline that never copies back cannot pass.
 
 > One stream serialises copies and kernels; several streams let the copy engines and the SMs work on
-> different chunks at once — and an event, not a host sync, is how chunk \`c\` learns that chunk \`c − 1\`
+> different chunks at once, and an event, not a host sync, is how chunk \`c\` learns that chunk \`c − 1\`
 > is done.`,
   hints: [
     'The pinned buffers are the precondition: `cudaMallocHost(&h_in, bytes)` for both host arrays, `cudaFreeHost` at the end. With pageable memory `cudaMemcpyAsync` silently degrades to a staged, host-blocking copy and nothing overlaps.',
-    'Per chunk, everything goes on `streams[c]`: `cudaMemcpyAsync(d_in + off, h_in + off, bytes, cudaMemcpyHostToDevice, s)`, `heavy<<<GRID, BLOCK, 0, s>>>`, `add_carry<<<GRID, BLOCK, 0, s>>>`, `cudaMemcpyAsync(h_out + off, d_out + off, bytes, cudaMemcpyDeviceToHost, s)`. A launch without the fourth `<<<>>>` argument goes to stream 0, which the other streams wait for.',
-    'The dependency is two calls: `cudaEventRecord(computed[c], s)` right after `add_carry` of chunk `c`, and `cudaStreamWaitEvent(s, computed[c - 1], 0)` right before `add_carry` of chunk `c + 1` — after `heavy`, so `heavy` still overlaps. Record `landed[c]` after the D2H copy and `cudaEventElapsedTime(&chunk_ms[c], start, landed[c])` gives the timeline.',
+    'Per chunk, everything goes on `streams[c]`: `cudaMemcpyAsync(d_in + off, h_in + off, bytes, cudaMemcpyHostToDevice, s)`, `heavy<<<GRID, BLOCK, 0, s>>>`, `add_carry<<<GRID, BLOCK, 0, s>>>`, `cudaMemcpyAsync(h_out + off, d_out + off, bytes, cudaMemcpyDeviceToHost, s)`. A launch without the fourth `<<<>>>` argument goes to the legacy default stream, which synchronises with every blocking stream in both directions.',
+    'The dependency is two calls: `cudaEventRecord(computed[c], s)` right after `add_carry` of chunk `c`, and `cudaStreamWaitEvent(s, computed[c - 1], 0)` right before `add_carry` of chunk `c`, after `heavy`, so `heavy` still overlaps. Record `landed[c]` after the D2H copy, and `cudaEventElapsedTime(&chunk_ms[c], start, landed[c])` gives the timeline.',
   ],
   checks: [
     {
@@ -101,7 +102,7 @@ copy-heavy ratio against a compute-heavy one):
       id: 'kernel-on-stream',
       title: 'Both kernels launch on the chunk’s stream',
       detail:
-        '`heavy<<<GRID, BLOCK, 0, s>>>` and `add_carry<<<GRID, BLOCK, 0, s>>>` with the stream as the fourth launch argument. A two-argument launch goes to the default stream, which the copy streams synchronise with — the pipeline collapses to the baseline.',
+        '`heavy<<<GRID, BLOCK, 0, s>>>` and `add_carry<<<GRID, BLOCK, 0, s>>>` with the stream as the fourth launch argument. A two-argument launch goes to the legacy default stream, which the blocking streams from `cudaStreamCreate` synchronise with: the pipeline collapses to the baseline.',
       match: {cuda: {all: [launchOnStream('heavy'), launchOnStream('add_carry')]}},
     },
     {
@@ -120,7 +121,7 @@ copy-heavy ratio against a compute-heavy one):
       id: 'event-timing',
       title: 'Timed with events, per chunk and in total, and the speedup is printed',
       detail:
-        'A `landed[c]` event recorded after each chunk’s D2H copy, `cudaEventElapsedTime(&chunk_ms[c], start, landed[c])` for the timeline, `start → stop` for the total of each version, and a printed `speedup` — the evidence that the copies hid under the kernels.',
+        'A `landed[c]` event recorded after each chunk’s D2H copy, `cudaEventElapsedTime(&chunk_ms[c], start, landed[c])` for the timeline, `start → stop` for the total of each version, and a printed `speedup`: the evidence that copies and kernels overlapped.',
       match: {
         cuda: {
           all: [
@@ -148,7 +149,7 @@ copy-heavy ratio against a compute-heavy one):
   ],
   code: {
     cuda: {
-      starter: `// streams_pipeline.cu — process a large array in NSTREAMS chunks, overlapping H2D copies, compute and
+      starter: `// streams_pipeline.cu: process a large array in NSTREAMS chunks, overlapping H2D copies, compute and
 // D2H copies across streams, with an event-carried dependency between chunks and a synchronous
 // single-stream baseline timed the same way.
 //
@@ -183,13 +184,13 @@ constexpr float TOL = 1e-4f;
 constexpr float MIN_SPEEDUP = 1.2f;
 static_assert(N % NSTREAMS == 0, "N must split into equal chunks");
 
-// Stage 1 — compute-heavy: solve Kepler's equation E = M + ECC * sin E by fixed-point iteration,
-// ITERS sinf per element. Long enough that a chunk's copies can hide under another chunk's compute.
+// Stage 1, compute-heavy: solve Kepler's equation E = M + ECC * sin E by fixed-point iteration,
+// ITERS sinf per element. Long enough that a chunk's compute and its copies take the same order of time.
 __global__ void heavy(const float* __restrict__ in, float* __restrict__ out, int n) {
   // TODO: e = m; ITERS times e = m + ECC * sinf(e); out[i] = e
 }
 
-// Stage 2 — the carried dependency: every element of a chunk is shifted by the previous chunk's last
+// Stage 2, the carried dependency: every element of a chunk is shifted by the previous chunk's last
 // output (the carry-in of a chunked scan). carry is null for chunk 0. It reads memory another stream
 // wrote, so it may only run once that stream's add_carry has finished.
 __global__ void add_carry(float* out, const float* carry, int n) {
@@ -257,7 +258,7 @@ static float run_pipelined(const float* h_in, float* h_out, float* d_in, float* 
 
 int main() {
   const size_t bytes = static_cast<size_t>(N) * sizeof(float);
-  // TODO: pinned (page-locked) host buffers — cudaMallocHost — so the copies can be truly asynchronous.
+  // TODO: pinned (page-locked) host buffers from cudaMallocHost, so the copies can be truly asynchronous.
   float* h_in = static_cast<float*>(malloc(bytes));
   float* h_out = static_cast<float*>(malloc(bytes));
   for (int i = 0; i < N; ++i) h_in[i] = static_cast<float>(i % 1000) * 0.00628f - 3.14f;  // mean anomalies in [-pi, pi)
@@ -282,9 +283,15 @@ int main() {
 
   std::memset(h_out, 0, bytes);  // a pipeline that never copies back must not inherit the baseline's answer
   CUDA_CHECK(cudaMemset(d_out, 0, bytes));
-  float chunk_ms[NSTREAMS];
+  float chunk_ms[NSTREAMS], rep_ms[NSTREAMS];
   float pipe_ms = 1e30f;
-  for (int r = 0; r < REPS; ++r) pipe_ms = std::min(pipe_ms, run_pipelined(h_in, h_out, d_in, d_out, chunk_ms));
+  for (int r = 0; r < REPS; ++r) {
+    const float ms = run_pipelined(h_in, h_out, d_in, d_out, rep_ms);
+    if (ms < pipe_ms) {  // keep the fastest run's landing times with its total
+      pipe_ms = ms;
+      std::copy(rep_ms, rep_ms + NSTREAMS, chunk_ms);
+    }
+  }
   const float pipe_err = max_abs_err(h_out, ref.data());
   std::printf("pipelined (%d streams, cudaMemcpyAsync) %8.3f ms   max abs err %.2e\\n", NSTREAMS, pipe_ms, pipe_err);
   for (int c = 0; c < NSTREAMS; ++c) std::printf("  chunk %d landed at %8.3f ms\\n", c, chunk_ms[c]);
@@ -310,7 +317,7 @@ int main() {
   return 1;
 }
 `,
-      solution: `// streams_pipeline.cu — process a large array in NSTREAMS chunks, overlapping H2D copies, compute and
+      solution: `// streams_pipeline.cu: process a large array in NSTREAMS chunks, overlapping H2D copies, compute and
 // D2H copies across streams, with an event-carried dependency between chunks and a synchronous
 // single-stream baseline timed the same way.
 //
@@ -345,8 +352,8 @@ constexpr float TOL = 1e-4f;
 constexpr float MIN_SPEEDUP = 1.2f;
 static_assert(N % NSTREAMS == 0, "N must split into equal chunks");
 
-// Stage 1 — compute-heavy: solve Kepler's equation E = M + ECC * sin E by fixed-point iteration,
-// ITERS sinf per element. Long enough that a chunk's copies can hide under another chunk's compute.
+// Stage 1, compute-heavy: solve Kepler's equation E = M + ECC * sin E by fixed-point iteration,
+// ITERS sinf per element. Long enough that a chunk's compute and its copies take the same order of time.
 __global__ void heavy(const float* __restrict__ in, float* __restrict__ out, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
@@ -356,7 +363,7 @@ __global__ void heavy(const float* __restrict__ in, float* __restrict__ out, int
   out[i] = e;
 }
 
-// Stage 2 — the carried dependency: every element of a chunk is shifted by the previous chunk's last
+// Stage 2, the carried dependency: every element of a chunk is shifted by the previous chunk's last
 // output (the carry-in of a chunked scan). carry is null for chunk 0. It reads memory another stream
 // wrote, so it may only run once that stream's add_carry has finished.
 __global__ void add_carry(float* out, const float* carry, int n) {
@@ -443,7 +450,7 @@ static float run_pipelined(const float* h_in, float* h_out, float* d_in, float* 
     CUDA_CHECK(cudaMemcpyAsync(h_out + off, d_out + off, CHUNK * sizeof(float), cudaMemcpyDeviceToHost, s));
     CUDA_CHECK(cudaEventRecord(landed[c], s));
   }
-  // The host enqueued 4 x 5 operations in microseconds; now it waits for all of them.
+  // The host enqueued 27 operations in microseconds (7 per chunk, no wait for chunk 0); now it waits.
   for (int c = 0; c < NSTREAMS; ++c) CUDA_CHECK(cudaStreamSynchronize(streams[c]));
   CUDA_CHECK(cudaEventRecord(stop, 0));
   CUDA_CHECK(cudaEventSynchronize(stop));
@@ -491,9 +498,15 @@ int main() {
 
   std::memset(h_out, 0, bytes);  // a pipeline that never copies back must not inherit the baseline's answer
   CUDA_CHECK(cudaMemset(d_out, 0, bytes));
-  float chunk_ms[NSTREAMS];
+  float chunk_ms[NSTREAMS], rep_ms[NSTREAMS];
   float pipe_ms = 1e30f;
-  for (int r = 0; r < REPS; ++r) pipe_ms = std::min(pipe_ms, run_pipelined(h_in, h_out, d_in, d_out, chunk_ms));
+  for (int r = 0; r < REPS; ++r) {
+    const float ms = run_pipelined(h_in, h_out, d_in, d_out, rep_ms);
+    if (ms < pipe_ms) {  // keep the fastest run's landing times with its total
+      pipe_ms = ms;
+      std::copy(rep_ms, rep_ms + NSTREAMS, chunk_ms);
+    }
+  }
   const float pipe_err = max_abs_err(h_out, ref.data());
   std::printf("pipelined (%d streams, cudaMemcpyAsync) %8.3f ms   max abs err %.2e\\n", NSTREAMS, pipe_ms, pipe_err);
   for (int c = 0; c < NSTREAMS; ++c) std::printf("  chunk %d landed at %8.3f ms\\n", c, chunk_ms[c]);
@@ -520,5 +533,5 @@ int main() {
 `,
     },
   },
-  debrief: `Three things make the overlap real, and each one is a line a learner tends to skip. **Pinned memory** first: \`cudaMemcpyAsync\` from pageable memory is legal and returns the same error-free status, but the driver has to stage the pages through its own locked buffer and the call blocks the host while it does — the pipeline silently becomes the baseline. **The stream argument everywhere**: a \`cudaMemcpyAsync\` without its fifth argument and a kernel without its fourth launch argument both land on stream 0, and because streams made by \`cudaStreamCreate\` are *blocking* streams, every one of them waits for stream 0 and stream 0 waits for all of them. One forgotten argument serialises the whole schedule, which is why the checks pin both. **An event, not a sync, for the dependency**: \`cudaStreamWaitEvent\` is a GPU-side barrier — the host records it in a microsecond and moves on to enqueue the next chunk, while \`cudaStreamSynchronize\` in the loop would drain stream \`c\` before stream \`c + 1\` is even submitted. The wait is placed after \`heavy\`, not at the top of the chunk, so only the kernel that actually reads the other stream's output waits for it. The timeline the program prints is the proof: with four streams the chunks land staggered by roughly one chunk's compute, and the last lands long before four times the baseline's chunk time. Production code keeps the same three ingredients and adds machinery around them: PyTorch's \`DataLoader(pin_memory=True)\` with \`tensor.to(device, non_blocking=True)\` is exactly this H2D half of the pipeline, \`torch.cuda.Stream\` and \`torch.cuda.Event\` are these objects with Python names, NCCL runs collectives on their own streams so that the all-reduce of layer *l*'s gradients overlaps the backward pass of layer *l − 1*, and CUDA Graphs capture a whole multi-stream schedule like this one so it can be replayed without the host enqueueing twenty calls each iteration.`,
+  debrief: `Three things make the overlap real, and each one is a line a learner tends to skip. **Pinned memory** first: \`cudaMemcpyAsync\` from pageable memory is legal and returns the same error-free status, but the driver stages the pages through its own pinned buffer, so an H2D call returns only once the data is staged and a D2H call only once the copy is done (after that chunk's kernels): the pipeline silently becomes the baseline. **The stream argument everywhere**: a \`cudaMemcpyAsync\` without its fifth argument and a kernel without its fourth launch argument both land on the legacy default stream, and because streams made by \`cudaStreamCreate\` are *blocking* streams, every one of them waits for stream 0 and stream 0 waits for all of them. One forgotten argument serialises the whole schedule, which is why the checks pin both. **An event, not a sync, for the dependency**: \`cudaStreamWaitEvent\` is a GPU-side barrier. The host enqueues it in a microsecond and moves on to the next chunk, while \`cudaStreamSynchronize\` in the loop would drain stream \`c\` before stream \`c + 1\` is even submitted. The wait is placed after \`heavy\`, not at the top of the chunk, so only the kernel that actually reads the other stream's output waits for it. The timeline the program prints is the proof: with four streams the chunks land staggered by roughly one chunk's slowest stage, and the last lands well before the baseline's total. Production code keeps the same three ingredients and adds machinery around them: PyTorch's \`DataLoader(pin_memory=True)\` with \`tensor.to(device, non_blocking=True)\` is this H2D half of the pipeline, \`torch.cuda.Stream\` and \`torch.cuda.Event\` are these objects with Python names (PyTorch creates its streams with \`cudaStreamNonBlocking\`), NCCL runs collectives on their own streams so that the all-reduce of layer *l*'s gradients overlaps the backward pass of layer *l − 1*, and CUDA Graphs capture a whole multi-stream schedule like this one so it can be replayed without the host enqueueing 27 calls each iteration.`,
 };

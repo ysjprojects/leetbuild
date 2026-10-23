@@ -49,9 +49,9 @@ with one at 1,000, where a naive \`exp\` overflows float32, and compares the per
 > The softmax needs only two numbers from the whole vocabulary, a max and a sum, plus the target's
 > logit from its one owner. Three all-reduces of one float per token replace a gather of \`V\` floats.`,
   hints: [
-    'The embedding is the column-parallel idea along the vocabulary: a foreign id looks up row 0 (any valid row) and then has its output zeroed, so the all-reduce sums exactly one non-zero row per token. Zeroing the output, not just the index, is what makes it correct.',
+    'The embedding is a row-parallel layer along the vocabulary (a one-hot `(…, V)` times the table, with `V` split): a foreign id looks up row 0 (any valid row) and then has its output zeroed, so the all-reduce sums exactly one non-zero row per token. Zeroing the output, not just the index, is what makes it correct.',
     'In the loss, compute the mask and `local = (target - start).masked_fill(mask, 0)` once: forward uses it to `gather(-1, local.unsqueeze(-1))` the target logit (then zeroes it where masked), backward uses it to subtract 1 at the same place. Do the MAX all-reduce before shifting; the two SUMs can go in either order.',
-    'Backward: `grad = softmax.clone()`; `grad.scatter_add_(-1, local.unsqueeze(-1), -(~mask).to(grad.dtype).unsqueeze(-1))`; `return grad * grad_loss.unsqueeze(-1), None`.',
+    'Backward: clone the saved softmax, subtract 1 at `local` only where this rank owns the target (`scatter_add_` of `-(~mask)` as a float), scale by `grad_loss.unsqueeze(-1)`, and return `None` for the target.',
   ],
   checks: [
     {
@@ -530,7 +530,7 @@ if __name__ == "__main__":
     },
   },
   debrief: `This is Megatron's \`VocabParallelEmbedding\` and \`_VocabParallelCrossEntropy\` in about sixty lines.
-The embedding is column parallelism along the vocabulary: one all-reduce of \`B · T · d\` assembles each
+The embedding is row parallelism along the vocabulary (a one-hot times the table, the contracted \`V\` split): one all-reduce of \`B · T · d\` assembles each
 token's vector from its one owner, and its backward needs nothing, because the gradient of a sum with
 respect to each term is the identity and a foreign row's gradient is zero by construction. The loss is
 the log-sum-exp trick distributed: the max and the sum are the only global facts the softmax needs, so
@@ -542,7 +542,7 @@ shard is what makes the two ends line up: the rows a rank looks up are the rows 
 gradient accumulates both uses with no communication. Megatron adds label smoothing
 (\`label_smoothing\` in \`VocabParallelCrossEntropy\`), computes \`exp\` in place on the logits to save one
 \`B · T · V / p\` buffer, pads the vocabulary so it divides \`p\` (\`make_vocab_size_divisible_by\`), and with
-sequence parallelism gathers the sequence before the head instead of reducing after it. Fused,
-chunked cross-entropy kernels (Liger, Apple's cut cross-entropy) go one step further and never
-materialise even the \`V / p\` shard of logits.`,
+sequence parallelism all-gathers the sequence-split hidden states in front of the head in place of f. Fused
+cross-entropy kernels (Liger's chunked one, Apple's cut cross-entropy) go one step further: they fuse the
+head matmul into the loss and never hold even the whole \`V / p\` shard of logits at once.`,
 };

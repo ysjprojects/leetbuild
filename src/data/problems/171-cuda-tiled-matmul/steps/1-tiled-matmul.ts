@@ -47,12 +47,13 @@ static void matmul_cpu(const std::vector<float>& A, const std::vector<float>& B,
     }
 }
 
-// Largest |x - y|; a NaN anywhere is kept so that it fails the tolerance test.
+// Largest |x - y|; a NaN anywhere is returned as is so that it fails the tolerance test.
 static float max_abs_error(const std::vector<float>& x, const std::vector<float>& y) {
   float worst = 0.0f;
   for (size_t i = 0; i < x.size(); ++i) {
     float d = std::fabs(x[i] - y[i]);
-    if (!(d <= worst)) worst = d;
+    if (std::isnan(d)) return d;
+    if (d > worst) worst = d;
   }
   return worst;
 }
@@ -176,8 +177,8 @@ Implement \`__global__ void matmul_tiled(const float* A, const float* B, float* 
 \`constexpr int TILE = 32\`. The host (\`launch\`, the timing, the CPU reference, \`main\`) and the baseline
 \`matmul_naive\` are given; only the kernel body is missing.
 
-- **Geometry.** \`dim3 block(TILE, TILE)\` and \`dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE)\`
-  — \`x\` runs along columns, \`y\` along rows. In the kernel \`tx = threadIdx.x\`, \`ty = threadIdx.y\`,
+- **Geometry.** \`dim3 block(TILE, TILE)\` and \`dim3 grid((N + TILE - 1) / TILE, (M + TILE - 1) / TILE)\`:
+  \`x\` runs along columns, \`y\` along rows. In the kernel \`tx = threadIdx.x\`, \`ty = threadIdx.y\`,
   \`row = blockIdx.y * TILE + ty\`, \`col = blockIdx.x * TILE + tx\`.
 - **Tiles.** \`__shared__ float As[TILE][TILE]\` and \`__shared__ float Bs[TILE][TILE]\`; 8 KB per block.
 - **Slab loop.** \`for (int t = 0; t < (K + TILE - 1) / TILE; ++t)\`. Each thread loads **one** element
@@ -191,7 +192,7 @@ Implement \`__global__ void matmul_tiled(const float* A, const float* B, float* 
   the next slab overwrites the tiles.
 - **One store.** After the loop, \`if (row < M && col < N) C[row * N + col] = acc;\`. No early
   \`return\` for out-of-range threads: they load zeros and take part in both barriers like everyone else.
-- **Forbidden:** cuBLAS, cuBLASLt, CUTLASS or any library GEMM — the tiles are the point.
+- **Forbidden:** cuBLAS, cuBLASLt, CUTLASS or any library GEMM: the tiles are the point.
 - **Self-test** (given): both kernels on \`97 × 75 × 131\` against the CPU reference with max abs error
   \`< 1e-3\`; \`1024³\` timed with \`cudaEvent\`s for 20 iterations, GFLOP/s \`= 2MNK / s\`, tiled and naive
   results within \`1e-2\` of each other; prints \`PASS\`. Build with
@@ -204,18 +205,18 @@ tiled.
 :::widget tiled-matmul
 
 > The naive kernel fetches \`2K\` floats from global memory per output; the tiled one fetches \`2K / TILE\`.
-> That 32× cut in traffic is the whole speedup, and the two barriers are what make sharing a slab safe.`,
+> That 32× cut in global loads is where the speedup comes from, and the two barriers are what make sharing a slab safe.`,
   hints: [
     'Index math first: `row = blockIdx.y * TILE + ty`, `col = blockIdx.x * TILE + tx`; in slab `t` the element this thread fetches of `A` is column `t * TILE + tx` of its own `row`, and of `B` is row `t * TILE + ty` of its own `col`. Both land in the same slot `[ty][tx]` of their tile; a ternary with `0.0f` handles the edges.',
     'Two barriers per slab, not one: the first so nobody multiplies before every thread has written its element, the second so nobody overwrites the tiles for slab `t + 1` while a slower warp is still reading slab `t`. Dropping the second one gives results that are wrong only sometimes.',
-    'Keep `acc` in a register and write `C` exactly once, after the loop, guarded by `row < M && col < N`. Threads outside the matrix must still reach every `__syncthreads()` — load zeros, loop, barrier — so there is no early `return` in this kernel.',
+    'Keep `acc` in a register and write `C` exactly once, after the loop, guarded by `row < M && col < N`. Threads outside the matrix must still reach every `__syncthreads()` (load zeros, loop, barrier), so there is no early `return` in this kernel.',
   ],
   checks: [
     {
       id: 'shared-tiles',
       title: 'Two 32 × 32 float tiles in shared memory, no library GEMM',
       detail:
-        '`constexpr int TILE = 32` and `__shared__ float As[TILE][TILE]`, `__shared__ float Bs[TILE][TILE]` inside the kernel — one slab of `A` and one of `B` staged per block, 8 KB in all. No cuBLAS, cuBLASLt or CUTLASS: the product is computed from these tiles.',
+        '`constexpr int TILE = 32` and `__shared__ float As[TILE][TILE]`, `__shared__ float Bs[TILE][TILE]` inside the kernel: one slab of `A` and one of `B` staged per block, 8 KB in all. No cuBLAS, cuBLASLt or CUTLASS: the product is computed from these tiles.',
       match: {
         cuda: {
           all: [
@@ -231,13 +232,13 @@ tiled.
       id: 'slab-loop',
       title: 'K is walked in ⌈K / TILE⌉ slabs, one element per thread per operand',
       detail:
-        'A loop `for (int t = 0; t < (K + TILE - 1) / TILE; ++t)` — 5 slabs for `K = 131` — and per slab the load column `t * TILE + tx` of `A` and the load row `t * TILE + ty` of `B`: every thread fetches exactly one float of each operand per slab, so a block fetches each slab once.',
+        'A loop `for (int t = 0; t < (K + TILE - 1) / TILE; ++t)` (5 slabs for `K = 131`) and per slab the load column `t * TILE + tx` of `A` and the load row `t * TILE + ty` of `B`: every thread fetches exactly one float of each operand per slab, so a block fetches each slab once.',
       match: {
         cuda: {
           all: [
             /for\s*\(\s*int\s+\w+\s*=\s*0\s*;\s*\w+\s*<\s*\(\s*K\s*\+\s*TILE\s*-\s*1\s*\)\s*\/\s*TILE\s*;/,
-            /\w+\s*\*\s*TILE\s*\+\s*(?:tx|threadIdx\.x)\b/,
-            /\w+\s*\*\s*TILE\s*\+\s*(?:ty|threadIdx\.y)\b/,
+            /(?<!\.)\b\w+\s*\*\s*TILE\s*\+\s*(?:tx|threadIdx\.x)\b/,
+            /(?<!\.)\b\w+\s*\*\s*TILE\s*\+\s*(?:ty|threadIdx\.y)\b/,
           ],
         },
       },
@@ -276,7 +277,7 @@ tiled.
       id: 'store-once',
       title: 'Register accumulator, one guarded store, no early return',
       detail:
-        '`row = blockIdx.y * TILE + ty`, `col = blockIdx.x * TILE + tx`, and after the loop `if (row < M && col < N) C[row * N + col] = acc;` — `acc` lives in a register and global memory is written once per output. No `return;` before the barriers: an out-of-range thread that skips a `__syncthreads()` its block-mates wait on is undefined behaviour.',
+        '`row = blockIdx.y * TILE + ty`, `col = blockIdx.x * TILE + tx`, and after the loop `if (row < M && col < N) C[row * N + col] = acc;`: `acc` lives in a register and global memory is written once per output. No `return;` before the barriers: an out-of-range thread that skips a `__syncthreads()` its block-mates wait on is undefined behaviour.',
       match: {
         cuda: {
           all: [
@@ -361,5 +362,5 @@ __global__ void matmul_tiled(const float* A, const float* B, float* C, int M, in
 ${HOST}`,
     },
   },
-  debrief: `The kernel keeps the naive mapping — one thread, one output — and changes only where the operands come from. A block of 32 × 32 threads owns a 32 × 32 tile of \`C\`; to produce it the block needs a 32 × K strip of \`A\` and a K × 32 strip of \`B\`, and it fetches them 32 columns (rows) at a time. Each thread loads one float of each strip into the slot \`[ty][tx]\` of \`As\` and \`Bs\`, which makes the warp's 32 loads 32 consecutive addresses — one 128-byte transaction — and then multiplies its row of \`As\` by its column of \`Bs\` 32 times from shared memory. Every float that crosses from DRAM is used 32 times instead of once; that is the entire speedup. Two details decide correctness. The barriers come in pairs: without the first, a thread multiplies slots its neighbours have not written; without the second, a fast warp loads slab \`t + 1\` over a slab a slow warp is still reading — a race that produces wrong values only sometimes, which is why the self-test uses a \`K\` that is not a multiple of 32 and compares every element. And the edges are handled by padding, not by branching: out-of-range threads load \`0.0f\`, stay in the loop and reach both barriers, and are only excluded at the store, because a \`__syncthreads()\` that part of the block skips is undefined behaviour. The shared reads are bank-conflict-free as written — \`As[ty][k]\` is one broadcast address per warp, \`Bs[k][tx]\` spans 32 consecutive banks — and would become a 32-way conflict if \`Bs\` were stored transposed. cuBLAS and CUTLASS start from this kernel and add register tiling (each thread computes a 4 × 4 to 8 × 8 micro-tile, multiplying the FLOPs per shared load), 128 × 128 block tiles split among warps, double-buffered slabs loaded with \`cp.async\` or TMA while the current one is multiplied, tensor cores through \`mma.sync\`, swizzled tile layouts, and split-K for thin shapes; \`torch.matmul\` reaches them through cuBLASLt, and Triton's \`tl.dot\` generates the same structure from a few lines. FlashAttention is the same idea applied twice over: \`Q · Kᵀ\` and \`P · V\` are tiled through shared memory so the \`N × N\` score matrix is never written to global memory at all.`,
+  debrief: `The kernel keeps the naive mapping (one thread, one output) and changes only where the operands come from. A block of 32 × 32 threads owns a 32 × 32 tile of \`C\`; to produce it the block needs a 32 × K strip of \`A\` and a K × 32 strip of \`B\`, and it fetches them 32 columns (rows) at a time. Each thread loads one float of each strip into the slot \`[ty][tx]\` of \`As\` and \`Bs\`, which makes the warp's 32 loads 32 consecutive addresses (four 32-byte sectors, 128 bytes) and then multiplies its row of \`As\` by its column of \`Bs\` 32 times from shared memory. Every float loaded from global memory is used by 32 threads instead of one: 32× fewer global loads. The measured gain is far smaller (1.5× in Boehm's worklog) because the naive kernel's loads are already coalesced and mostly hit L1; the tiled kernel's limit moves to shared memory. Two details decide correctness. The barriers come in pairs: without the first, a thread multiplies slots its neighbours have not written; without the second, a fast warp loads slab \`t + 1\` over a slab a slow warp is still reading, a race that produces wrong values only sometimes, which is why the self-test compares every element on the small shape and again on \`1024³\` (32 slabs) against the naive kernel. And the edges are handled by padding, not by branching: out-of-range threads load \`0.0f\`, stay in the loop and reach both barriers, and are only excluded at the store, because a \`__syncthreads()\` that part of the block skips is undefined behaviour. The shared reads are bank-conflict-free as written (\`As[ty][k]\` is one broadcast address per warp, \`Bs[k][tx]\` spans 32 consecutive banks) and would become a 32-way conflict if \`Bs\` were stored transposed. cuBLAS and CUTLASS start from this kernel and add register tiling (each thread computes a 4 × 4 to 8 × 8 micro-tile, multiplying the FLOPs per shared load), 128 × 128 block tiles computed by 128 to 256 threads, double-buffered slabs loaded with \`cp.async\` or TMA while the current one is multiplied, tensor cores through \`mma.sync\`, swizzled tile layouts, and split-K for thin shapes. \`torch.matmul\` reaches them through cuBLAS by default (\`torch.backends.cuda.preferred_blas_library\` can switch it to cuBLASLt), and Triton's \`tl.dot\` generates the same structure from a few lines. FlashAttention is the same idea applied twice over: \`Q · Kᵀ\` and \`P · V\` are tiled through shared memory so the \`N × N\` score matrix is never written to global memory at all.`,
 };

@@ -9,9 +9,11 @@ Speculative decoding makes a large language model produce several tokens per for
 changing what it produces. A small **draft** model guesses the next γ tokens one at a time; the large
 **target** model scores all of them in one forward pass; a rejection-sampling rule keeps the longest
 acceptable prefix and replaces the first rejected token with a sample from a corrected distribution. It
-was published twice within weeks: by Leviathan, Kalman and Matias at Google as *speculative decoding*
-(ICML 2023), and by Chen et al. at DeepMind as *speculative sampling*. Both prove the same thing: the
-output is distributed **exactly** as the target's own samples.
+was found twice, independently: by Leviathan, Kalman and Matias at Google as *speculative decoding*
+(arXiv November 2022, ICML 2023), and by Chen et al. at DeepMind as *speculative sampling* (February
+2023). Both prove the same thing: the output is distributed **exactly** as the target's own samples.
+Chen et al. swap the letters (their \`q\` is the target, \`p\` the draft); this project follows Leviathan
+et al.: \`p\` is the target, \`q\` the draft.
 
 The project builds it in three files. \`draft_tokens\` proposes γ tokens through a KV cache that can be
 rewound; \`verify(target_probs, draft_probs, draft_tokens, generator)\` returns how many proposals to keep
@@ -54,7 +56,7 @@ target forward.
 | \`p_i\` | the target's next-token distribution after the context plus \`i\` drafts | rows of \`to_probs(target(…))\`, shape \`(γ + 1, V)\` |
 | \`q_i\` | the draft's distribution that proposal \`i\` was drawn from | \`draft_tokens\`'s second output, \`(γ, V)\` |
 | γ | proposals per round | \`gamma\`, clipped near the end |
-| α | \`Σ_x min(p(x), q(x))\`, the chance one proposal is accepted | measured by \`acceptance_rate\` |
+| α | \`Σ_x min(p(x), q(x))\` averaged over contexts, the chance one proposal is accepted | accepts over drafts reached (through the first rejection); \`acceptance_rate\` (accepted / proposed = E[n] / γ) is lower |
 | c | draft forward time over target forward time | not measured on a CPU |
 
 # Why decoding leaves compute idle
@@ -161,9 +163,11 @@ expected number of tokens a round emits is
 E[tokens per target call] = 1 + α + α² + … + α^γ = (1 − α^(γ+1)) / (1 − α)
 \`\`\`
 
-and α itself is \`Σ_x min(p(x), q(x)) = 1 − TV(p, q)\`: one minus the total variation distance between the
-two models' next-token distributions. A round also costs γ draft forwards. With c the time of a draft
-forward over a target forward, Leviathan et al.'s walltime improvement is
+(Leviathan et al., eq. 1). For one context the acceptance probability is \`β = Σ_x min(p(x), q(x)) = 1 −
+TV(p, q)\`, one minus the total variation distance between the two models' next-token distributions; α is
+β averaged over contexts, and the formula treats the βs as i.i.d. A round also costs γ draft forwards.
+With c the time of a draft forward over a target forward, and assuming the γ + 1-position target pass
+takes as long as a one-token step, Leviathan et al.'s walltime improvement (Theorem 3.8) is
 
 \`\`\`text
 speedup = (1 − α^(γ+1)) / ((1 − α)(γc + 1))
@@ -179,8 +183,10 @@ Each cell is tokens per target call, then the speedup at c = 0.1. Three things s
 saturate at \`1 / (1 − α)\`: at α = 0.6 no γ ever gives more than 2.5. Long drafts pay γc per round for
 proposals that are almost never reached, so the speedup has a best γ, and it falls as c grows. And the
 gain is far more sensitive to α than to γ, which is why so much later work goes into better drafts
-rather than longer ones. Slide α, γ and c, and step through a run under the same independence
-assumption:
+rather than longer ones. Some γ beats plain decoding exactly when α > c (γ = 1 gives \`(1 + α) / (1 + c)\`,
+and if γ = 1 loses, every longer γ loses too); Leviathan et al. measured c below 0.05 for drafts about
+two orders of magnitude smaller than the target. Slide α, γ and c, and step through a run under the same
+independence assumption:
 
 :::widget speculative-decoding {"alpha": 0.8, "gamma": 4, "cost": 0.1}
 
@@ -230,8 +236,8 @@ by \`n + 1\` and each cache must hold exactly \`len(out) − 1\` positions befor
 :::
 
 With a preallocated buffer and a length, rewinding is \`self.pos = n\`. The rows past \`n\` still hold the
-rejected drafts' keys and values; that is harmless as long as attention reads \`k[…, : pos + T]\` and never
-the whole buffer, and the next forward overwrites them. A cache grown with \`torch.cat\` would instead need
+rejected drafts' keys and values; that is harmless as long as attention reads \`k[…, : pos + T]\` and no
+row past it, and the next forward overwrites them. A cache grown with \`torch.cat\` would instead need
 a slice-and-copy per rollback, and a cache that is never truncated silently attends to tokens the output
 does not contain.
 
@@ -240,7 +246,7 @@ does not contain.
 | correct, n < γ | \`truncate(len(out) − 1)\` | \`truncate(min(pos, len(out) − 1))\` | both caches match the output |
 | correct, n = γ | \`truncate(len(out) − 1)\`, a no-op | one short: \`x̃_γ\` was never fed | feed it, then draft |
 | no truncation | keeps rejected keys | keeps rejected keys | positions shifted; tokens fluent, distribution wrong |
-| attention over the whole buffer | reads stale rows | reads stale rows | the same, and only after the first rejection |
+| whole buffer read, no mask past \`pos + T\` | reads zero and stale rows | reads zero and stale rows | wrong from the first forward, not only after a rejection |
 | full accept, no catch-up | correct | a gap at \`x̃_γ\` | every later \`q\` is wrong; still exact, only slower |
 
 The last row is worth a second look. A wrong draft cache does not break exactness, because the
@@ -264,10 +270,10 @@ Q: A round accepts all γ drafts. Which cache is behind, and why?
 At temperature 0 the target's distribution is a one-hot on its argmax. Put that into the rule:
 \`min(1, p(x)/q(x))\` is 1 if the draft guessed the argmax and 0 otherwise, and the residual is the one-hot
 itself. Speculative decoding reduces to: keep drafts while they equal the target's argmax, then emit the
-target's argmax. That is exactly the earlier
+target's argmax. That is the verification rule of the earlier
 [Blockwise Parallel Decoding](https://arxiv.org/abs/1811.03115) of Stern, Shazeer and Uszkoreit (2018),
-which proposed blocks with extra heads and kept the longest prefix the model agreed with, and it is the
-\`greedy=True\` path in \`verify\`.
+which predicted a block with extra output heads and kept the longest prefix matching the model's own
+greedy choices, and it is the \`greedy=True\` path in \`verify\`.
 
 The self-tests are designed so a wrong implementation cannot pass by producing plausible tokens:
 
@@ -279,8 +285,9 @@ The self-tests are designed so a wrong implementation cannot pass by producing p
 - **Accepted length.** The mean of \`n_accepted\` against \`Σ_k α_0 ⋯ α_(k−1)\`, and the closed form
   \`(1 − α^(γ+1)) / (1 − α)\` when all positions share \`p\` and \`q\`.
 - **End to end.** \`spec_decode.py\` computes the trained target's exact distribution of each of the next
-  four tokens by enumerating all 16³ prefixes in one batched forward, then checks 3,000 speculative runs
-  against it with γ = 2, so most runs span two or three rounds and their rollbacks.
+  four tokens by enumerating every prefix (up to 16³ = 4,096 of them, one batched forward per position),
+  then checks 3,000 speculative runs against it with γ = 2, so every run spans two to four rounds and
+  their rollbacks.
 
 :::details Why compare marginals rather than whole sequences
 The joint distribution of four tokens over a 16-token vocabulary has 65,536 outcomes; 3,000 samples say
@@ -303,16 +310,19 @@ Q: With temperature 0, what does the acceptance rule reduce to?
 The project's loop is the whole algorithm for one sequence. Serving engines change the parts around it.
 
 - **Drafts without a second model.** [Medusa](https://arxiv.org/abs/2401.10774) adds extra decoding heads
-  to the target that predict several tokens ahead from its last hidden state; [EAGLE](https://arxiv.org/abs/2401.15077)
-  drafts at the feature level with a one-layer head. Prompt lookup drafts by copying an n-gram that already
-  appeared in the context, which works well for editing and retrieval.
+  to the target: head \`k\` predicts the token \`k + 1\` positions ahead from the last hidden state, and the
+  heads' top candidates form a tree. [EAGLE](https://arxiv.org/abs/2401.15077) drafts autoregressively at
+  the feature level: one transformer decoder layer predicts the target's next second-to-top-layer
+  feature from the current features and the sampled tokens, and the target's own LM head turns it into
+  \`q\`. Prompt lookup drafts by copying an n-gram that already appeared in the context, which works well
+  for editing and retrieval.
 - **Trees instead of chains.** Several candidate continuations are verified in one target pass with an
   attention mask that lets each branch see only its own ancestors; the longest accepted path wins.
 - **Batching.** Sequences in a batch accept different numbers of tokens, so cache lengths, positions and
   the next round's inputs become ragged, and paged caches free the blocks of rejected slots.
-- **Sampling filters.** Top-k and top-p must be applied to both \`p\` and \`q\` before the test; the
-  guarantee holds for whatever distributions go in. Medusa's typical acceptance relaxes exactness for
-  longer accepted runs.
+- **Sampling filters.** Top-k and top-p define the law you want, so they go into \`p\`; \`q\` only has to
+  be the distribution the draft really sampled from. Leviathan et al. filter both the same way, which
+  keeps α high. Medusa's typical acceptance relaxes exactness for longer accepted runs.
 - **The reference implementation.** Hugging Face's
   [\`_speculative_sampling\`](https://github.com/huggingface/transformers/blob/v4.46.0/src/transformers/generation/utils.py)
   is the same ratio test, a \`cumsum\` to the first rejection and the clamped residual, and its
@@ -335,8 +345,8 @@ Q: Why do serving engines use tree-structured drafts?
   speculative decoding spends that headroom on checking guesses.
 - Accept with probability \`min(1, p/q)\`, resample a rejection from \`norm(max(0, p − q))\`, take a bonus
   from \`p_γ\` when all pass: the output is exactly the target's, for any draft.
-- A round emits \`(1 − α^(γ+1)) / (1 − α)\` tokens on average, with α = 1 − TV(p, q); the speedup divides
-  that by \`γc + 1\` and has a best γ.
+- A round emits \`(1 − α^(γ+1)) / (1 − α)\` tokens on average, with α the mean of 1 − TV(p, q) over
+  contexts; the speedup divides that by \`γc + 1\`, has a best γ, and exists only when α > c.
 - Rollbacks must be free and exact: a preallocated cache with a length, reads limited to \`[: pos + T]\`,
   both caches truncated every round, and the draft fed its last proposal after a full accept.
 - Test it on distributions, not samples: greedy identity, per-position total variation, and the accepted

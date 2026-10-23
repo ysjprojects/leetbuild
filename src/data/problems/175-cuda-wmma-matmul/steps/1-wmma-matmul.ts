@@ -17,46 +17,45 @@ export const wmmaMatmulStep: Step = {
 Implement \`C = A · B\` on tensor cores with \`nvcuda::wmma\` (\`#include <mma.h>\`): \`A\` is \`M × K\` and \`B\` is
 \`K × N\`, both \`half\` and **row-major**; \`C\` is \`M × N\` \`float\`. Two kernels and the host code that pads for them.
 
-- \`__global__ void wmma_matmul(const half* A, const half* B, float* C, int M, int N, int K)\` — **one warp per
+- \`__global__ void wmma_matmul(const half* A, const half* B, float* C, int M, int N, int K)\`: **one warp per
   16 × 16 output tile**, fragments loaded straight from global memory. The block is 128 threads = 4 warps side by
   side along a row of tiles; \`warpId = threadIdx.x / warpSize\`, \`tileRow = blockIdx.y\`,
   \`tileCol = blockIdx.x * 4 + warpId\`; a warp whose tile is past \`N\` returns as a whole. Declare
   \`wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major>\`, the same for \`matrix_b\`
   (\`row_major\`, since \`B\` is row-major) and \`wmma::fragment<wmma::accumulator, 16, 16, 16, float>\`;
-  \`fill_fragment(acc, 0.0f)\`; then \`for (k = 0; k < K; k += 16)\`: \`load_matrix_sync\` the A tile at
-  \`A + tileRow·16·K + k\` with leading dimension \`K\` and the B tile at \`B + k·N + tileCol·16\` with leading
-  dimension \`N\`, \`mma_sync(acc, a, b, acc)\`; finally \`store_matrix_sync(C + tileRow·16·N + tileCol·16, acc, N,
-  wmma::mem_row_major)\`.
-- \`__global__ void wmma_matmul_smem(…same signature…)\` — a **64 × 64 block tile** staged through shared memory
+  \`fill_fragment(acc, 0.0f)\`; then \`for (k = 0; k < K; k += 16)\`: \`load_matrix_sync\` the A tile with leading
+  dimension \`K\` and the B tile with leading dimension \`N\`, \`mma_sync(acc, a, b, acc)\`; finally one
+  \`store_matrix_sync(…, acc, N, wmma::mem_row_major)\`. The tile pointers are yours to work out.
+- \`__global__ void wmma_matmul_smem(…same signature…)\`: a **64 × 64 block tile** staged through shared memory
   in steps of \`BK = 32\` along K: \`__shared__ __align__(32) half As[64][32 + 8]\` and \`Bs[32][64 + 8]\` (the 8
   halves of skew keep every row stride a multiple of 16 bytes and spread bank traffic), filled cooperatively by
   the 128 threads with rows past \`M\`/\`K\` and columns past \`N\` zero-filled, \`__syncthreads()\`, then each of the
-  2 × 2 warps consumes its 32 × 32 quarter as 2 × 2 accumulators (\`load_matrix_sync\` from \`&As[row][kk]\` with
-  \`ldm = 40\` and \`&Bs[kk][col]\` with \`ldm = 72\`, four \`mma_sync\`), \`__syncthreads()\` again before the next
-  \`k0\` overwrites the tiles. Store each accumulator whose tile origin lies inside \`M × N\`.
+  2 × 2 warps consumes its 32 × 32 quarter as 2 × 2 accumulators (four \`mma_sync\` per 16 of K), and
+  \`__syncthreads()\` again before the next \`k0\` overwrites the tiles. Store each accumulator whose tile origin
+  lies inside \`M × N\`.
 - Every \`load_matrix_sync\`/\`store_matrix_sync\` pointer must be **32-byte aligned** and every \`ldm\` a multiple of
   8 halves (4 floats): that is why the kernels take only multiples of 16 and the host pads. \`pad16(x)\` rounds
   up to a multiple of 16; \`upload_padded\` allocates \`Mp × Kp\`, \`Kp × Np\` and \`Mp × Np\`, zeroes the inputs and
   copies the real rows in with \`cudaMemcpy2D\`; \`download\` copies the \`M × N\` corner back the same way.
 - Inputs are fp16: \`__float2half\` on the way in, \`__half2float\` for the fp32 CPU reference, which therefore
-  sees exactly the rounded values the tensor cores see — the only difference left is accumulation order.
+  sees exactly the rounded values the tensor cores see; what is left is the order and rounding of the fp32 sum.
 - Tolerance: \`max |C − ref| ≤ 2e-5 × K\` (1e-2 at K = 512, 2e-2 at K = 1024): fp16 products are exact in fp32,
-  so the error is K-proportional accumulation noise, two orders below that bound.
+  so the error is K-proportional accumulation noise, about 3e-5 at K = 512, over two orders below that bound.
 - No cuBLAS, no CUTLASS. Keep the plain fp32 tiled kernel: the self-test times all three at 1024³ and prints
   TFLOP/s and the speed-up.
 - The self-test runs \`256 × 384 × 512\` and \`250 × 375 × 500\` (the padded path) against the CPU for both
   kernels, then the benchmark, and prints \`PASS\`. Build: \`nvcc -O2 -arch=sm_80 -o wmma_matmul wmma_matmul.cu\`
-  (\`sm_70\` or later works).
+  (with your GPU's \`sm_XY\`, 70 or later).
 
 fp16 keeps 11 significant bits against fp32's 24: slide a value through both formats below to see the rounding
 the inputs take on the way in, and why the accumulator has to stay \`float\`.
 
 :::widget float-formats
 
-> A fragment is the warp's share of a 16 × 16 tile in an undocumented register layout; the only things you may
-> do with it are \`load\`, \`mma\`, \`store\` — and all 32 lanes must do them together.`,
+> A fragment is the warp's share of a 16 × 16 tile in an unspecified register layout; the only things you may
+> do with it are \`load\`, \`fill\`, \`mma\` and \`store\`, and all 32 lanes must do them together.`,
   hints: [
-    'Three fragment declarations and four calls carry the direct kernel: `fill_fragment(acc, 0.0f)`, then per 16 of K `load_matrix_sync(a, A + tileRow * 16 * K + k, K)`, `load_matrix_sync(b, B + k * N + tileCol * 16, N)`, `mma_sync(acc, a, b, acc)`, and once at the end `store_matrix_sync(C + tileRow * 16 * N + tileCol * 16, acc, N, wmma::mem_row_major)`. The pointer is the tile’s top-left element; `ldm` is the full row length of the matrix it sits in.',
+    'The pointer is the tile’s top-left element and `ldm` the full row length of the matrix it sits in. Three fragment declarations and four calls carry the direct kernel: `fill_fragment(acc, 0.0f)`, then per 16 of K `load_matrix_sync(a, A + tileRow * 16 * K + k, K)`, `load_matrix_sync(b, B + k * N + tileCol * 16, N)`, `mma_sync(acc, a, b, acc)`, and once at the end `store_matrix_sync(C + tileRow * 16 * N + tileCol * 16, acc, N, wmma::mem_row_major)`.',
     'In the staged kernel the leading dimension is the padded row length of the shared array (`BK + 8 = 40` for `As`, `BN + 8 = 72` for `Bs`), not `K` or `N`. Each warp loads two `a` fragments (`&As[warpRow * 32 + i * 16][kk]`) and two `b` fragments (`&Bs[kk][warpCol * 32 + j * 16]`) and does four `mma_sync` into `acc[i][j]`.',
     'Two `__syncthreads()` per `k0` step: one after the cooperative fill so no warp reads a half-written tile, one after the `mma_sync` loop so no thread starts the next fill while a warp is still reading. `pad16` is `(x + 15) / 16 * 16`; `cudaMemcpy2D(dst, dstPitch, src, srcPitch, widthBytes, rows, kind)` copies a strided block in one call.',
   ],
@@ -96,7 +95,7 @@ the inputs take on the way in, and why the accumulator has to stay \`float\`.
       id: 'k-loop-ldm',
       title: 'The K loop steps by 16 with the right leading dimensions',
       detail:
-        '`for (k = 0; k < K; k += 16)` and, in the direct kernel, `load_matrix_sync(a, A + …, K)` and `load_matrix_sync(b, B + …, N)`: `ldm` is the row length of the matrix the tile sits in, not the tile width — with `16` in its place the second row of every fragment comes from the wrong place and the result is silently wrong.',
+        '`for (k = 0; k < K; k += 16)` and, in the direct kernel, `load_matrix_sync(a, A + …, K)` and `load_matrix_sync(b, B + …, N)`: `ldm` is the row length of the matrix the tile sits in, not the tile width. With `16` in its place the second row of every fragment comes from the wrong place and the result is silently wrong.',
       match: {
         cuda: {
           all: [
@@ -122,7 +121,7 @@ the inputs take on the way in, and why the accumulator has to stay \`float\`.
       id: 'warp-per-tile',
       title: 'A warp, not a thread, owns a tile',
       detail:
-        '`warpId = threadIdx.x / warpSize` (or `/ 32`) chooses the tile and is computed before any fragment is loaded; the tile index never depends on the lane. Every WMMA call is warp-collective — a thread-per-element mapping, or a lane-dependent `if` around `mma_sync`, is undefined behaviour.',
+        '`warpId = threadIdx.x / warpSize` (or `/ 32`) chooses the tile and is computed before any fragment is loaded; the tile index never depends on the lane. Every WMMA call is warp-collective: a thread-per-element mapping, or a lane-dependent `if` around `mma_sync`, is undefined behaviour.',
       match: {
         cuda: {
           all: [/\bwarpId\s*=\s*threadIdx\.x\s*\/\s*(?:warpSize|32)\b/],
@@ -171,8 +170,8 @@ the inputs take on the way in, and why the accumulator has to stay \`float\`.
   ],
   code: {
     cuda: {
-      starter: `// wmma_matmul.cu — C[M×N] = A[M×K] · B[K×N] on tensor cores: fp16 inputs, fp32 accumulation, one warp per 16×16 tile.
-// Build and run:  nvcc -O2 -arch=sm_80 -o wmma_matmul wmma_matmul.cu && ./wmma_matmul    (sm_70 or later)
+      starter: `// wmma_matmul.cu: C[M×N] = A[M×K] · B[K×N] on tensor cores, fp16 inputs, fp32 accumulation, one warp per 16×16 tile.
+// Build and run:  nvcc -O2 -arch=sm_80 -o wmma_matmul wmma_matmul.cu && ./wmma_matmul    (your GPU's sm_XY, 70 or later)
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -239,7 +238,7 @@ __global__ void wmma_matmul_smem(const half* A, const half* B, float* C, int M, 
 
 // ---- host side -----------------------------------------------------------------------------
 static int pad16(int x) {
-  return x;  // TODO: round up to a multiple of 16 — every WMMA tile is 16 × 16
+  return x;  // TODO: round up to a multiple of 16 (every WMMA tile is 16 × 16)
 }
 
 // A, B, C on the device, zero-padded to multiples of 16 so every kernel sees whole, aligned tiles.
@@ -306,7 +305,7 @@ static std::vector<float> to_float(const std::vector<half>& v) {
   return f;
 }
 
-// fp32 CPU reference over the fp16-rounded inputs: the GPU differs only in accumulation order.
+// fp32 CPU reference over the fp16-rounded inputs: the GPU differs only in the order and rounding of the sum.
 static std::vector<float> cpu_matmul(const std::vector<float>& A, const std::vector<float>& B, int M, int N, int K) {
   std::vector<float> C((size_t)M * N, 0.0f);
   for (int i = 0; i < M; ++i)
@@ -425,8 +424,8 @@ int main() {
   return ok ? 0 : 1;
 }
 `,
-      solution: `// wmma_matmul.cu — C[M×N] = A[M×K] · B[K×N] on tensor cores: fp16 inputs, fp32 accumulation, one warp per 16×16 tile.
-// Build and run:  nvcc -O2 -arch=sm_80 -o wmma_matmul wmma_matmul.cu && ./wmma_matmul    (sm_70 or later)
+      solution: `// wmma_matmul.cu: C[M×N] = A[M×K] · B[K×N] on tensor cores, fp16 inputs, fp32 accumulation, one warp per 16×16 tile.
+// Build and run:  nvcc -O2 -arch=sm_80 -o wmma_matmul wmma_matmul.cu && ./wmma_matmul    (your GPU's sm_XY, 70 or later)
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -607,7 +606,7 @@ static std::vector<float> to_float(const std::vector<half>& v) {
   return f;
 }
 
-// fp32 CPU reference over the fp16-rounded inputs: the GPU differs only in accumulation order.
+// fp32 CPU reference over the fp16-rounded inputs: the GPU differs only in the order and rounding of the sum.
 static std::vector<float> cpu_matmul(const std::vector<float>& A, const std::vector<float>& B, int M, int N, int K) {
   std::vector<float> C((size_t)M * N, 0.0f);
   for (int i = 0; i < M; ++i)
@@ -728,5 +727,5 @@ int main() {
 `,
     },
   },
-  debrief: `The kernel is shaped by one contract: a \`wmma::fragment\` is a warp's share of a 16 × 16 tile in a register layout the hardware chooses, and the only operations on it — \`load_matrix_sync\`, \`mma_sync\`, \`store_matrix_sync\`, \`fill_fragment\` — are warp-collective. That is why the unit of work is a warp (\`warpId = threadIdx.x / warpSize\`), why a tile past the edge exits as a whole warp rather than lane by lane, and why the host pads to multiples of 16 and keeps every pointer 32-byte aligned and every \`ldm\` a multiple of 8 halves: the instructions have no bounds checks and no unaligned path, only undefined results. \`mma_sync(acc, a, b, acc)\` is \`D = A·B + C\` with \`C\` and \`D\` the same fragment, so the K/16 partial products accumulate in fp32 registers and touch memory once at the store. The direct kernel already beats the fp32 tiled baseline by a wide margin because the tensor core does 16 × 16 × 16 = 4096 multiply-adds per instruction; it is still bound by global loads, and the staged version is the first step toward fixing that: each A and B element enters the SM once per 64 × 64 block and four warps share it, with the two barriers separating *fill* from *consume* and the skew of 8 halves keeping \`ldm\` legal and the loads conflict-free. Production GEMMs — cuBLAS, CUTLASS, the \`torch.matmul\` behind every linear layer — keep the same structure and add what this file leaves out: 128 × 128 or larger block tiles, vectorised 16-byte global loads via \`cp.async\` with a multi-stage pipeline that loads tile k+2 while k is multiplied, software-swizzled shared memory in place of the skew, split-K for skinny shapes, fused epilogues (bias, GELU, residual), and on Hopper the \`wgmma\` instructions that read operands straight from shared memory through TMA. The tolerance also tells a story: the inputs are fp16 and the reference uses the same rounded values, so what remains is fp32 accumulation order — which is why mixed-precision training keeps the accumulator, the master weights and the optimizer state in fp32 while the multiplies run in half precision.`,
+  debrief: `The kernel is shaped by one contract: a \`wmma::fragment\` is a warp's share of a 16 × 16 tile in a register layout the hardware chooses, and the only operations on it (\`load_matrix_sync\`, \`mma_sync\`, \`store_matrix_sync\`, \`fill_fragment\`) are warp-collective. That is why the unit of work is a warp (\`warpId = threadIdx.x / warpSize\`), why a tile past the edge exits as a whole warp rather than lane by lane, and why the host pads to multiples of 16 and keeps every pointer 32-byte aligned and every \`ldm\` a multiple of 8 halves: the instructions have no bounds checks and no unaligned path, only undefined results. \`mma_sync(acc, a, b, acc)\` is \`D = A·B + C\` with \`C\` and \`D\` the same fragment, so the K/16 partial products accumulate in fp32 registers and touch memory once at the store. The direct kernel already beats the fp32 tiled baseline by a wide margin because one \`mma_sync\` does 16 × 16 × 16 = 4096 multiply-adds for the warp; it is still bound by global loads, and the staged version is the first step toward fixing that: each A and B element enters the SM once per 64 × 64 block and the four warps share the tiles, with the two barriers separating *fill* from *consume* and the skew of 8 halves keeping \`ldm\` legal and spreading the loads across banks. Production GEMMs (cuBLAS, CUTLASS, the \`torch.matmul\` behind every linear layer) keep the same structure and add what this file leaves out: 128 × 128 or larger block tiles, 16-byte \`cp.async\` copies with a multi-stage pipeline that loads tile k+2 while k is multiplied, swizzled shared memory in place of the skew, split-K for skinny shapes, fused epilogues (bias, GELU, residual), and on Hopper the \`wgmma\` instructions that read operands straight from shared memory, filled by TMA. The tolerance also tells a story: the inputs are fp16 and the reference uses the same rounded values, so what remains is the order and rounding of the fp32 sum, which is why mixed-precision training keeps the accumulator, the master weights and the optimizer state in fp32 while the multiplies run in half precision.`,
 };

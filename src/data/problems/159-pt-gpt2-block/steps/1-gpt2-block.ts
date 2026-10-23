@@ -9,10 +9,10 @@ export const gpt2BlockStep: Step = {
   task: `## Task
 
 Implement the layer GPT-2 stacks \`n_layer\` times: \`MLP(cfg)\` and \`Block(cfg)\` over a \`GPTConfig\`
-(\`n_embd\`, \`n_head\`, \`n_layer\`, \`block_size\`, \`dropout\`). \`CausalSelfAttention\` is given — it is the
-sibling problem — and so is the self-test; everything else in the file is yours.
+(\`n_embd\`, \`n_head\`, \`n_layer\`, \`block_size\`, \`dropout\`). \`CausalSelfAttention\` is given (it is the
+sibling problem), and so is the self-test; everything else in the file is yours.
 
-- \`gelu_tanh(x)\`: GPT-2's activation, written out — \`0.5 · x · (1 + tanh(√(2/π) · (x + 0.044715 · x³)))\`
+- \`gelu_tanh(x)\`: GPT-2's activation, written out: \`0.5 · x · (1 + tanh(√(2/π) · (x + 0.044715 · x³)))\`
   with \`torch.tanh\` and \`math.sqrt(2 / math.pi)\`. \`nn.GELU\` is forbidden; \`F.gelu(…, approximate="tanh")\`
   is the reference the self-test compares against (\`atol = 1e-12\` in float64).
 - \`MLP\`: \`c_fc = nn.Linear(n_embd, 4 · n_embd)\`, \`c_proj = nn.Linear(4 · n_embd, n_embd)\`,
@@ -37,16 +37,16 @@ sibling problem — and so is the self-test; everything else in the file is your
 > A block is the identity plus two small corrections. Pre-LN keeps the corrections small at init, and
 > scaling \`c_proj\` by \`1/√(2·n_layer)\` keeps the sum of \`2·n_layer\` corrections from outgrowing the stream.`,
   hints: [
-    'The MLP is two `nn.Linear`s and the formula: `0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))`. Write `gelu_tanh` first and run the file — the first assertion checks only that.',
+    'Write `gelu_tanh` first, straight from the task’s formula (`torch.pow(x, 3.0)` or `x * x * x` for the cube), and run the file: the first assertion checks only that. The MLP is then two `nn.Linear`s around it.',
     '`self.apply(fn)` calls `fn` on every submodule, including the attention’s linears. Branch on `isinstance(module, nn.Linear)` / `nn.LayerNorm`; `nn.Linear` has a bias here, but guard `module.bias is not None` anyway. The `c_proj` rescale is a loop over `self.named_parameters()` placed *after* `apply`, or `apply` overwrites it.',
-    '`forward` is two lines, and neither line calls a LayerNorm on a sum. If the self-test’s reference disagrees, you have post-LN; if the residual-identity assertion fails, you added the normalised `x` instead of the original.',
+    '`forward` is two lines, and neither line calls a LayerNorm on a sum or assigns its output to `x`. If the `"reference"` assertion fails, you have post-LN or you added to the normalised stream instead of the raw one.',
   ],
   checks: [
     {
       id: 'mlp-widths',
       title: 'The MLP expands 4× and projects back',
       detail:
-        '`c_fc` is `nn.Linear(n_embd, 4 * n_embd)` and `c_proj` is `nn.Linear(4 * n_embd, n_embd)` — the hidden width GPT-2 uses, and where two thirds of a block’s parameters live.',
+        '`c_fc` is `nn.Linear(n_embd, 4 * n_embd)` and `c_proj` is `nn.Linear(4 * n_embd, n_embd)`: the hidden width GPT-2 uses, and where two thirds of a block’s parameters live.',
       match: {
         python: {
           all: [
@@ -84,7 +84,7 @@ sibling problem — and so is the self-test; everything else in the file is your
       id: 'pre-ln',
       title: 'Two LayerNorms, each before its sublayer',
       detail:
-        '`ln_1` and `ln_2` are `nn.LayerNorm(n_embd)` and normalise the *input* of attention and of the MLP. A LayerNorm applied to `x + …` is post-LN — the original Transformer’s order, not GPT-2’s.',
+        '`ln_1` and `ln_2` are `nn.LayerNorm(n_embd)` and normalise the *input* of attention and of the MLP. A LayerNorm applied to `x + …` is post-LN: the original Transformer’s order, not GPT-2’s.',
       match: {
         python: {
           all: [/self\.ln_1\s*=\s*nn\.LayerNorm\(/, /self\.ln_2\s*=\s*nn\.LayerNorm\(/],
@@ -136,7 +136,7 @@ sibling problem — and so is the self-test; everything else in the file is your
       id: 'resid-scaling',
       title: 'Residual projections are scaled by 1/√(2·n_layer), after apply',
       detail:
-        'Every parameter named `…c_proj.weight` — the attention’s and the MLP’s — is re-drawn with `std = 0.02 / math.sqrt(2 * n_layer)`, and that loop runs *after* `self.apply(...)`, which would otherwise overwrite it with `0.02`.',
+        'Every parameter named `…c_proj.weight` (the attention’s and the MLP’s) is re-drawn with `std = 0.02 / math.sqrt(2 * n_layer)`, and that loop runs *after* `self.apply(...)`, which would otherwise overwrite it with `0.02`.',
       match: {
         python: {
           all: [/endswith\(\s*["']c_proj\.weight["']\s*\)/, /0\.02\s*\/\s*math\.sqrt\(\s*2\s*\*\s*[\w.]*n_layer\s*\)/],
@@ -457,5 +457,5 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `The block is \`x + f(x) + g(x + f(x))\`: an identity path with two additive corrections, which is why gradients reach layer 1 of a 48-layer GPT-2 XL at all. Three choices are GPT-2's own. **Pre-LN** (normalise the sublayer's *input*, add to the raw stream) rather than the original Transformer's post-LN (\`ln(x + f(x))\`): with post-LN the stream is re-standardised after every block and the gradient through the LayerNorm at init is large and depth-dependent, so training needs a warm-up; with pre-LN the stream is never rescaled, each block adds a small correction, and the gradient to every block is roughly equal from step 0 (Xiong et al. 2020). **The tanh GELU** is the formula GPT-2's TensorFlow code shipped — \`erf\` was slow then — and every checkpoint since is trained on it; \`F.gelu\` without \`approximate="tanh"\` differs by up to \`~1e-3\`, enough to drift a pretrained model. **The init** is \`N(0, 0.02)\` everywhere except the two projections that write into the residual stream, which are scaled by \`1/√(2·n_layer)\`: the stream receives \`2·n_layer\` such writes, and without the scaling its variance grows linearly with depth, so a 48-layer stream is \`√48\` wider than a 1-layer one before any training. Zeroing \`c_proj\` is the limit of this idea (the block starts as the exact identity, which the self-test uses), and some later models do exactly that. What frameworks add: \`torch.compile\` fuses LayerNorm, the GELU and the bias into the surrounding matmuls (the MLP is two cuBLAS GEMMs with one fused epilogue); FlashAttention-2 replaces the \`(T, T)\` score tensor in the attention; Megatron splits \`c_fc\` by columns and \`c_proj\` by rows across GPUs so the 4× hidden layer never materialises on one device, with one all-reduce per MLP; Hugging Face's \`GPT2Block\` keeps these exact names (\`ln_1\`, \`attn.c_attn\`, \`attn.c_proj\`, \`ln_2\`, \`mlp.c_fc\`, \`mlp.c_proj\`) but stores the linears as \`Conv1D\` with transposed weights, which is why loading the OpenAI checkpoint into this file needs a \`.t()\` per matrix.`,
+  debrief: `The block is \`x + f(x) + g(x + f(x))\`: an identity path with two additive corrections, which is why gradients reach layer 1 of a 48-layer GPT-2 XL at all. Three choices are GPT-2's own. **Pre-LN** (normalise the sublayer's *input*, add to the raw stream) rather than the original Transformer's post-LN (\`ln(x + f(x))\`): with post-LN the stream is re-standardised after every block and, at init, the gradients of the layers near the output are large, so training needs a warm-up; with pre-LN the stream is never rescaled, each block adds a small correction, and the gradient norm is roughly equal across blocks from step 0 (Xiong et al. 2020). **The tanh GELU** is the faster approximation from the GELU paper, the formula GPT-2's TensorFlow code shipped, and every GPT-2 checkpoint is trained on it; exact \`F.gelu\` differs from it by at most \`4.7e-4\` (near \`|x| ≈ 2.7\`), small enough that nanoGPT loads the OpenAI weights under exact \`nn.GELU()\`, but enough that the outputs no longer match the checkpoint's own. **The init** is \`N(0, 0.02)\` everywhere except the two projections that write into the residual stream, which are scaled by \`1/√(2·n_layer)\`: the stream receives \`2·n_layer\` such writes, and without the scaling the variance they add grows linearly with depth, so after 48 layers the stream is about \`√48\` wider than after one, before any training. Zeroing \`c_proj\` is the limit of this idea (the block starts as the exact identity, which the self-test uses), and some later recipes do exactly that. What frameworks add: \`torch.compile\` fuses each LayerNorm into one kernel and the bias and GELU into one pass after the \`c_fc\` GEMM (into the GEMM's epilogue under \`mode="max-autotune"\`); FlashAttention-2 replaces the \`(T, T)\` score tensor in the attention; Megatron splits \`c_fc\` by columns and \`c_proj\` by rows across GPUs so the 4× hidden layer never materialises whole on one device, with one all-reduce per MLP; Hugging Face's \`GPT2Block\` keeps these exact names (\`ln_1\`, \`attn.c_attn\`, \`attn.c_proj\`, \`ln_2\`, \`mlp.c_fc\`, \`mlp.c_proj\`) but stores the linears as \`Conv1D\` with transposed weights, which is why loading the OpenAI checkpoint into this file needs a \`.t()\` per matrix.`,
 };

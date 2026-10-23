@@ -9,10 +9,10 @@ export const gpt2TrainStep: Step = {
   task: `## Task
 
 Train the step-1 model the way nanoGPT trains GPT-2 small (\`from gpt2_model import GPT, GPTConfig\`).
-Use \`torch.optim.AdamW\` itself — the optimizer is not the point here; how it is fed is.
+Use \`torch.optim.AdamW\` itself: the optimizer is not the point here; how it is fed is.
 
 - \`configure_optimizers(model, weight_decay, lr, betas) -> torch.optim.AdamW\`: two parameter groups
-  from \`model.parameters()\` (the tied \`wte\`/\`lm_head\` tensor appears once) — every parameter with
+  from \`model.parameters()\` (the tied \`wte\`/\`lm_head\` tensor appears once): every parameter with
   \`p.dim() >= 2\` (Linear weights, both embedding tables) gets \`weight_decay\`, every \`p.dim() < 2\`
   (biases, LayerNorm gains and shifts) gets \`0.0\`. \`fused=True\` when every parameter is on CUDA.
 - \`get_batch(data, block_size, batch_size, device="cpu") -> (x, y)\`: \`data\` is a 1-D \`long\` token
@@ -42,11 +42,11 @@ endpoints and midpoint, then overfits a periodic token stream (\`randperm(16)\` 
 32-wide model for 300 iterations: the first loss is above 2.0 (≈ ln 16), the final validation loss below
 0.05. It reloads the checkpoint with \`torch.load(…, weights_only=True)\` into a fresh \`GPT\` and prints \`PASS\`.
 
-> A training loop is mostly bookkeeping around three lines — forward, backward, step — and each piece of
+> A training loop is mostly bookkeeping around three lines (forward, backward, step), and each piece of
 > bookkeeping (which tensors decay, how big a step may be, how fast the learning rate moves) is a
 > stability decision made once for every run.`,
   hints: [
-    'The groups are a list of dicts — `[{"params": decay, "weight_decay": wd}, {"params": no_decay, "weight_decay": 0.0}]` — passed as AdamW\'s first argument; `model.parameters()` already yields the tied tensor once, so no de-duplication is needed.',
+    'The groups are a list of dicts, `[{"params": decay, "weight_decay": wd}, {"params": no_decay, "weight_decay": 0.0}]`, passed as AdamW\'s first argument; `model.parameters()` already yields the tied tensor once, so no de-duplication is needed.',
     'Shift by slicing the stream, not the batch: `y` is `data[i + 1 : i + 1 + block_size]`. The schedule is set by hand each iteration (`for group in optimizer.param_groups: group["lr"] = lr`), which is why `torch.optim.lr_scheduler` is not needed.',
     'Clip after `backward` and before `step`, on all parameters at once (one global norm). Save `asdict(model.config)` rather than the dataclass: `torch.load(weights_only=True)`, the default since PyTorch 2.6, refuses arbitrary classes.',
   ],
@@ -62,14 +62,14 @@ endpoints and midpoint, then overfits a periodic token stream (\`randperm(16)\` 
       id: 'adamw',
       title: 'torch.optim.AdamW over the groups',
       detail:
-        '`torch.optim.AdamW(groups, lr=lr, betas=betas, …)` — decoupled decay, GPT-2’s `betas=(0.9, 0.95)` passed through. Plain `Adam` (L2 in the gradient) or SGD is not the recipe.',
+        '`torch.optim.AdamW(groups, lr=lr, betas=betas, …)`: decoupled decay, GPT-2’s `betas=(0.9, 0.95)` passed through. Plain `Adam` (L2 in the gradient) or SGD is not the recipe.',
       match: {python: {all: [/torch\.optim\.AdamW\(/], none: [/torch\.optim\.Adam\(/, /torch\.optim\.SGD\(/]}},
     },
     {
       id: 'windows',
       title: 'Random contiguous windows, targets shifted by one',
       detail:
-        'Offsets from `torch.randint(len(data) - block_size, (batch_size,))`; `x` stacks `data[i : i + block_size]` and `y` stacks `data[i + 1 : i + 1 + block_size]` — every position of every window is a training example.',
+        'Offsets from `torch.randint(len(data) - block_size, (batch_size,))`; `x` stacks `data[i : i + block_size]` and `y` stacks `data[i + 1 : i + 1 + block_size]`, so every position of every window is a training example.',
       match: {
         python: {
           all: [
@@ -91,7 +91,7 @@ endpoints and midpoint, then overfits a periodic token stream (\`randperm(16)\` 
       id: 'clip-order',
       title: 'zero_grad → backward → clip at 1.0 → step',
       detail:
-        '`clip_grad_norm_(model.parameters(), grad_clip)` with `grad_clip: float = 1.0`, after `loss.backward()` and before `optimizer.step()` — clipping before backward clips nothing, after step is too late.',
+        '`clip_grad_norm_(model.parameters(), grad_clip)` with `grad_clip: float = 1.0`, after `loss.backward()` and before `optimizer.step()`: before backward there is no gradient to clip, after step it is too late.',
       match: {
         python: {
           all: [/clip_grad_norm_\(\s*model\.parameters\(\)\s*,\s*grad_clip\s*\)/, /grad_clip:\s*float\s*=\s*1\.0/],
@@ -126,7 +126,7 @@ endpoints and midpoint, then overfits a periodic token stream (\`randperm(16)\` 
       id: 'checkpoint',
       title: 'Checkpoint holds model, optimizer, config and step',
       detail:
-        '`torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "config": …, "step": it}, ckpt_path)` — without the optimizer’s moments a resumed run restarts AdamW cold; without the config the weights cannot be rebuilt.',
+        '`torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(), "config": …, "step": it}, ckpt_path)`: without the optimizer’s moments a resumed run restarts AdamW cold; without the config the weights cannot be rebuilt.',
       match: {
         python: {
           all: [
@@ -429,5 +429,5 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `Every line of this loop is in nanoGPT's \`train.py\`, and each is there because a GPT-2 run fails without it. **Decay groups**: weight decay is a prior that weights should be small; it makes sense for the matrices that do the work and for the embedding tables, not for LayerNorm gains (whose natural value is 1) or biases — splitting by \`p.dim()\` gets this right without naming modules, and the tied \`wte\`/\`lm_head\` tensor, being one \`Parameter\`, lands in the decay group once. **Warmup + cosine**: Adam's second-moment estimate is noise for the first few hundred steps, so a full-size step then can throw the model into a region it never leaves; the warmup holds the step small until \`v\` means something, and the cosine tail anneals into a minimum (\`min_lr = max_lr / 10\` as in Chinchilla). **Clipping at 1.0**: one bad batch can produce a gradient norm hundreds of times the typical one; clipping the global norm bounds the step's length without changing its direction. **bf16 autocast**: matmuls run in bfloat16 on tensor cores while the weights, the optimizer state and reductions such as the softmax and the loss stay in fp32; bf16's 8-bit exponent matches fp32's, so gradients do not underflow and fp16's \`GradScaler\` is unnecessary. **Checkpoints** carry the optimizer state — two fp32 tensors per parameter, twice the model — because resuming AdamW with zeroed moments repeats the warmup's instability without its small learning rate. What production adds: \`torch.compile(model)\` (nanoGPT's ~2× speed-up), gradient accumulation to reach a 0.5M-token batch on small GPUs, \`DistributedDataParallel\` or FSDP/ZeRO to shard the optimizer state, a memory-mapped \`uint16\` token file instead of an in-memory tensor, and \`fused=True\` AdamW, which updates every parameter in one kernel.`,
+  debrief: `Every piece of this loop comes from nanoGPT's \`train.py\` (its warmup divides by \`warmup_iters + 1\`, a cosmetic difference). **Decay groups**: weight decay is a prior that weights should be small; it makes sense for the matrices that do the work and for the embedding tables, not for LayerNorm gains (whose natural value is 1) or biases. Splitting by \`p.dim()\` gets this right without naming modules, and the tied \`wte\`/\`lm_head\` tensor, being one \`Parameter\`, lands in the decay group once. **Warmup + cosine**: Adam normalises each coordinate by \`√v\`, so its first updates are about \`lr\` per coordinate whatever the gradient's size (on step 1, exactly \`lr · sign(g)\`); the warmup is what keeps those early steps small while \`v\` is built from a few batches, and the cosine tail anneals into a minimum (\`min_lr = max_lr / 10\`, the Chinchilla convention nanoGPT cites). **Clipping at 1.0**: one bad batch can produce a gradient norm many times the typical one; clipping rescales the whole gradient to norm 1.0 without changing its direction, so the spike enters \`m\` and \`v\` bounded instead of inflating \`v\` (time constant \`1 / (1 − β2)\` = 20 steps) and distorting the steps that follow. **bf16 autocast**: matmuls run in bfloat16 on tensor cores while the weights, the optimizer state and the ops autocast lists as fp32 (softmax, LayerNorm, the loss) stay in fp32; bf16's 8-bit exponent matches fp32's, so gradients do not underflow and fp16's \`GradScaler\` is unnecessary. **Checkpoints** carry the optimizer state (two fp32 tensors per parameter, twice the model), because resuming AdamW with zeroed moments repeats the first steps' noisy normalisation without the warmup's small learning rate. What production adds: \`torch.compile(model)\` (nanoGPT's ~2× speed-up), gradient accumulation to reach a 0.5M-token batch on small GPUs, \`DistributedDataParallel\` or FSDP/ZeRO to shard the optimizer state, a memory-mapped \`uint16\` token file instead of an in-memory tensor, and \`fused=True\` AdamW, which updates all parameters in a few multi-tensor kernels instead of a loop of small ones.`,
 };

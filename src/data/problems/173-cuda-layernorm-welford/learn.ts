@@ -2,14 +2,14 @@
  * The learning guide for the LayerNorm-kernels problem: LayerNorm as a row reduction and where it
  * sits in a transformer, why E[x²] − E[x]² fails in float (drawn as a failure), Welford's update and
  * Chan's parallel merge across a block, the backward's two row reductions and the column sums for
- * gamma and beta, and what fused production kernels add — a figure or a table where one says it
+ * gamma and beta, and what fused production kernels add. A figure or a table where one says it
  * faster than prose, a pop quiz per section. Rendered at \`/cuda-layernorm-welford/learn\`.
  */
 export const learn = `# The mechanism at a glance
 
 LayerNorm normalises each row of activations to zero mean and unit variance, then rescales it with two
-learned vectors. A transformer applies it before every attention and every MLP, so a 32-layer model runs
-it 64 times per token forward and 64 times backward. On a GPU it is one block per row: a reduction for the
+learned vectors. A pre-LN transformer applies it before every attention and every MLP, so a 32-layer model runs
+it 64 times per token forward (65 with the final norm) and as many backward. On a GPU it is one block per row: a reduction for the
 row's statistics, then an elementwise pass.
 
 Three kernels, bottom to top:
@@ -52,7 +52,7 @@ The contract, in one file \`layernorm_kernels.cu\`, row-major \`float\`, \`eps =
 
 [Ba, Kiros and Hinton (2016)](https://arxiv.org/abs/1607.06450) normalise over the features of one example
 instead of over the batch, so the statistics need no batch, behave the same at training and inference, and
-work at batch size 1 — the reason every transformer uses it (or its mean-free cousin RMSNorm). Per row of
+work at batch size 1. That is why every transformer uses it (or its mean-free cousin RMSNorm). Per row of
 \`cols\` features:
 
 \`\`\`text
@@ -103,6 +103,10 @@ the naive kernel goes through it like this:
 | Result | var = 0.375 against a true 0.328: \`rstd\` 6% off on every element |
 | A flatter row, 1000 ± 0.01 | var = −0.125, and \`rsqrtf\` returns NaN |
 
+The table rounds every operation as written. nvcc contracts \`ex2 - mean * mean\` into one FMA by default
+(\`-fmad=true\`), which skips the rounding of \`mean²\`: row 0 then gives 0.358, the four rows at 1000 are up
+to 28% off, and the flat row is still −0.125. The FMA moves the error; it cannot remove it.
+
 This is catastrophic cancellation:
 two large numbers that agree in most of their digits are subtracted, and what is left is the rounding error
 of each. A float carries 24 bits, about seven decimal digits; near 10⁶ adjacent floats are 0.0625 apart, so
@@ -116,14 +120,14 @@ counted. The two float32 formulas, side by side as the offset grows:
 | \`2 · U(−1, 1)\`, mean ≈ 0 | 1.33 | correct to ~1e-6 | correct to ~1e-6 |
 | \`1000 + U(−1, 1)\` (row 0) | 0.328432 | 0.375 | 0.328432 |
 | \`1000 + U(−1, 1)\`, all four such rows | 0.33 | up to 31% off | ≤ 6e-6 relative |
-| \`1000 + 0.01 · U(−1, 1)\` | 3.3e-5 | −0.125, so \`rstd\` is NaN | 0.1% off |
+| \`1000 + 0.01 · U(−1, 1)\` | 3.3e-5 | −0.125, so \`rstd\` is NaN | < 0.1% off |
 
 - **It is not a corner case.** Activations drift, and a residual stream with a large per-row offset puts
   the mean far from zero next to a small spread. The kernel must be right for any row, not for the test's.
 - **Doubles only postpone it.** In double the grid near 10⁶ is 1e-10 apart; the same failure returns once
   the mean nears 10⁸ (its square near 10¹⁶, where adjacent doubles are 2 apart), and a GPU's double
   throughput is a fraction of its float throughput.
-- **Two passes fix it** — reduce the mean, then \`Σ (x − mean)²\` — at the price of reading the row twice.
+- **Two passes fix it** (reduce the mean, then \`Σ (x − mean)²\`) at the price of reading the row twice.
   Welford fixes it in one.
 
 :::quiz
@@ -131,14 +135,15 @@ Q: A row has mean 1000 and variance 0.33. Why does accumulating Σx² in double,
 - [ ] Because double sums are slower
 - [x] E[x²] and E[x]² are both ≈ 999 989; rounded to float they sit on a grid 0.0625 apart, so their difference has almost no correct digits
 - [ ] Because the variance must be computed with N − 1
-> The information is lost at the subtraction: two numbers near 10⁶ stored in 24 bits keep only the first seven digits, and the variance lives in the seventh and beyond. Only keeping deviations from the mean small — Welford, or two passes — avoids it.
+> The information is lost at the subtraction: two numbers near 10⁶ stored in 24 bits keep only the first seven digits, and the variance lives in the seventh and beyond. Only keeping deviations from the mean small (Welford, or two passes) avoids it.
 :::
 
 # Welford's update and Chan's merge
 
-[Welford (1962)](https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance)
-keeps three numbers — the count, the running mean and \`m2\`, the sum of squared deviations from it — and
-updates them one value at a time:
+[Welford (1962)](https://doi.org/10.1080/00401706.1962.10490022)
+keeps three numbers (the count, the running mean and \`m2\`, the sum of squared deviations from it) and
+updates them one value at a time. He wrote the last line as \`m2 += (n − 1)/n · delta²\`; the product of the
+old and new deviations below is the same quantity:
 
 \`\`\`cuda
 s.count += 1.0f;
@@ -148,8 +153,8 @@ s.m2 += delta * (v - s.mean);            // times the deviation from the new mea
 \`\`\`
 
 Every product is of two small deviations, never of two values near 1000, and \`m2\` only grows. That is a
-per-thread loop; 256 threads end with 256 states over disjoint sets of columns. Chan, Golub and LeVeque
-(1979) give the **exact** combination of two such states:
+per-thread loop; 256 threads end with 256 states over disjoint sets of columns.
+[Chan, Golub and LeVeque (1979)](https://purl.stanford.edu/mw925sv9975) give the **exact** combination of two such states:
 
 \`\`\`cuda
 count = a.count + b.count;
@@ -158,9 +163,12 @@ mean  = a.mean + delta * b.count / count;
 m2    = a.m2 + b.m2 + delta * delta * a.count * b.count / count;   // the spread between the halves
 \`\`\`
 
-The last term is what a naive "add the two variances" misses: two halves with the same spread but
-different means have a larger combined variance. The merge is associative in real arithmetic, so any
-tree of merges gives the same answer, which is what lets a block reduce it like a sum. Inside one warp of
+They write it with sums (\`T = n · mean\`) as \`S = S_a + S_b + n_a/(n_b · n) · (n_b/n_a · T_a − T_b)²\`;
+\`n_b/n_a · T_a − T_b\` is \`−n_b · delta\`, so the last term is the \`delta² · n_a · n_b / n\` above. It is what a
+naive "add the two variances" misses: two halves with the same spread but different means have a larger
+combined variance. The merge is associative in real arithmetic, so any tree of merges gives the same
+answer, which is what lets a block reduce it like a sum. In float the tree is also the better order: as with
+pairwise summation, the relative error grows like log₂ n instead of n. Inside one warp of
 the self-test's 1000-column row, each cell is the count \`n\` a lane's state covers after each shuffle and
 merge; lane 0 of every warp then hands its state to shared memory:
 
@@ -176,7 +184,7 @@ merge; lane 0 of every warp then hands its state to shared memory:
         {"id": "w-n8", "array": "offset 8", "cols": 32, "tone": "register", "cells": ["16", "16", "16", "16", "16", "16", "16", "16"], "marks": [{"cols": [8, 31], "tone": "muted"}]},
         {"id": "w-n4", "array": "offset 4", "cols": 32, "tone": "register", "cells": ["32", "32", "32", "32"], "marks": [{"cols": [4, 31], "tone": "muted"}]},
         {"id": "w-n2", "array": "offset 2", "cols": 32, "tone": "register", "cells": ["64", "64"], "marks": [{"cols": [2, 31], "tone": "muted"}]},
-        {"id": "w-n1", "array": "offset 1", "sub": "lane 0: the warp's 128 values", "cols": 32, "tone": "register", "cells": ["128"], "marks": [{"cols": [1, 31], "tone": "muted"}], "detail": "Chan's merge is exact, so lane 0 holds the count, mean and m2 of all 128 values the warp read."}
+        {"id": "w-n1", "array": "offset 1", "sub": "lane 0: the warp's 128 values", "cols": 32, "tone": "register", "cells": ["128"], "marks": [{"cols": [1, 31], "tone": "muted"}], "detail": "Chan's merge is exact in real arithmetic, so lane 0 holds the count, mean and m2 of all 128 values the warp read."}
       ]},
       {"id": "w-right", "label": "Across the warps", "sub": "2 barriers per row", "layout": "column", "items": [
         {"id": "w-slots", "label": "Shared memory", "sub": "__shared__ Welford s_warp[32]", "tone": "shared", "layout": "column", "items": [
@@ -205,21 +213,21 @@ merge; lane 0 of every warp then hands its state to shared memory:
 
 The shuffles are the [warp shuffle functions](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#warp-shuffle-functions):
 \`__shfl_down_sync(FULL_MASK, v, offset)\` hands each lane the value of lane \`+ offset\` without touching
-shared memory, and a lane whose source is out of range gets its own value back — which only the lanes
-whose result is discarded ever see.
+shared memory, and a lane whose source is out of range gets its own value back. Only lanes whose result
+is discarded ever see that.
 
 :::quiz
 Q: Two halves of a row each have m2 = 10 over 500 values, one with mean 999 and one with mean 1001. What is the combined m2?
-- [ ] 20 — the two m2 values add
-- [x] 1020 — 10 + 10 + 2² · 500 · 500 / 1000
-- [ ] 10 — the halves have the same spread
+- [ ] 20: the two m2 values add
+- [x] 1020: 10 + 10 + 2² · 500 · 500 / 1000
+- [ ] 10: the halves have the same spread
 > The δ² · n_a · n_b / n term is the squared distance between the halves' means, weighted by how many values sit on each side. Dropping it reports the spread within each half and forgets the gap between them.
 :::
 
 # The backward: two reductions and the column sums
 
-With \`g = dy · γ\` (the gradient reaching \`x̂\`), differentiating through \`x̂ = (x − mean) · rstd\` — where
-\`mean\` and \`rstd\` depend on every element of the row — leaves two row-wide terms:
+With \`g = dy · γ\` (the gradient reaching \`x̂\`), differentiating through \`x̂ = (x − mean) · rstd\`, where
+\`mean\` and \`rstd\` depend on every element of the row, leaves two row-wide terms:
 
 \`\`\`text
 sum_g  = Σ_j g_j                    sum_gx = Σ_j g_j · x̂_j
@@ -244,7 +252,7 @@ reduce that sums them:
         {"id": "k-load", "label": "Per row: x̂ and g", "sub": "x̂ = (x − mean)·rstd · g = dy·γ", "layout": "column", "items": [
           {"threads": 12, "continues": true, "label": "sum_g, sum_gx per thread"}
         ], "detail": "Each thread reads dy and x for its columns plus the saved mean[row] and rstd[row], and accumulates sum_g += g and sum_gx += g · x̂ in registers."},
-        {"id": "k-sum", "label": "block_reduce_sum2", "sub": "barrier · totals to every thread", "tone": "shared", "stretch": true, "detail": "Shuffles within each warp, a shared slot per warp, warp 0 over the slots. dx needs the row totals, so this barrier separates the sums from their use."},
+        {"id": "k-sum", "label": "block_reduce_sum2", "sub": "barrier · totals to every thread", "tone": "shared", "stretch": true, "detail": "Shuffles within each warp, a shared slot per warp, then every warp sums the slots. dx needs the row totals, so this barrier separates the sums from their use."},
         {"id": "k-dx", "label": "Then dx, and partial row 0", "sub": "a second loop over the columns", "layout": "column", "items": [
           {"threads": 12, "continues": true, "label": "thread t owns c ≡ t (mod 256)"}
         ], "detail": "dx = rstd · (g − (sum_g + x̂ · sum_gx) / N), then dy · x̂ and dy added to the block's own partial row, which only this thread touches at these columns."}
@@ -277,14 +285,14 @@ reduce that sums them:
 | reduce both sums, then write \`dx\` | write \`dx\` in the same loop | \`dx_i\` needs the row totals; a barrier must separate the sums from their use |
 | read saved \`mean\`, \`rstd\` | recompute them | one load per row instead of a Welford reduction |
 | 64 partial rows + a column reduce | \`atomicAdd(&dgamma[c], …)\` from 256 rows | atomics on 1000 addresses serialise, and float atomics sum in arrival order, so \`dγ\` changes run to run |
-| \`block_reduce_sum2\` syncs before writing its slots | reuse the slots straight away | the previous row's readers may still be reading \`s_a\` — a write-after-read race |
+| \`block_reduce_sum2\` syncs before writing its slots | reuse the slots straight away | the previous row's readers may still be reading \`s_a\`: a write-after-read race |
 
 :::quiz
 Q: The backward writes dx[i] inside the same loop that accumulates sum_g and sum_gx. What goes wrong?
-- [ ] Nothing — the sums are only needed for dγ
+- [ ] Nothing: the sums are only needed for dγ
 - [x] dx[i] uses partial sums from one thread's columns instead of the row totals, so it is the gradient of a different function
 - [ ] Only the last row is wrong
-> Every dx_i depends on Σ over the whole row of g and g·x̂. Those totals exist only after the block reduction — after a __syncthreads() inside block_reduce_sum2 — so dx needs a second loop.
+> Every dx_i depends on Σ over the whole row of g and g·x̂. Those totals exist only after the block reduction (after a __syncthreads() inside block_reduce_sum2), so dx needs a second loop.
 :::
 
 # What fused production kernels add
@@ -294,10 +302,10 @@ handling around the same Welford-and-Chan reduction.
 
 | System | What it adds |
 | --- | --- |
-| PyTorch \`layer_norm_kernel.cu\` | \`vectorized_layer_norm_kernel\`: vector loads, bf16/fp16 in with float accumulation, Welford merge across the block; a separate kernel for \`dγ\`, \`dβ\` |
+| PyTorch \`layer_norm_kernel.cu\` | \`vectorized_layer_norm_kernel\`: loads of 4 elements whatever the dtype, bf16/fp16 in with float accumulation, \`cuWelfordCombine\` across the block; a separate kernel for \`dγ\`, \`dβ\` |
 | Apex \`FusedLayerNorm\` | \`cuWelfordOnlineSum\` / \`cuChanOnlineSum\` are this update and merge; \`cuComputePartGradGammaBeta\` then \`cuComputeGradGammaBeta\` is the partials-then-reduce split |
 | Apex contrib \`FastLayerNorm\` | the whole row in registers for the hidden sizes it supports, so the backward reads \`x\` once |
-| [Triton tutorial](https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html) | forward in a few dozen lines with two passes over the row; \`dγ\` accumulated in a lock-protected buffer of partial rows |
+| [Triton tutorial](https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html) | forward in a few dozen lines: two passes over the row for the statistics, a third to normalise; \`dγ\` accumulated in a lock-protected buffer of partial rows |
 | Fused residual LayerNorm | the residual add and dropout before it computed in the same kernel, so the summed row never round-trips to HBM |
 
 :::quiz
@@ -313,13 +321,13 @@ Q: RMSNorm computes rstd = 1 / sqrt(mean(x²) + eps) with a plain sum of squares
 - **LayerNorm is a row reduction plus an elementwise pass.** One block per row, statistics through warp
   shuffles and shared memory, \`rstd = rsqrtf(m2 / cols + eps)\`, \`mean\` and \`rstd\` saved.
 - **Never the naive formula in float.** Near a mean of 1000, \`E[x²]\` and \`E[x]²\` sit on a grid 0.0625 apart and the
-  variance of 0.33 comes back 0.375 — or negative.
+  variance of 0.33 comes back 0.375, or negative.
 - **Welford per thread, Chan across threads.** Small deviations only, and
   \`m2 = a.m2 + b.m2 + δ² · n_a · n_b / n\` merges any two states exactly, so a tree of merges is a reduction.
 - **The backward is two more reductions.** \`Σ dy·γ\` and \`Σ dy·γ·x̂\` per row before \`dx\`; \`dγ\`, \`dβ\` as
   per-block partial rows and a column reduce, with no atomics and a deterministic sum.
 - **Production kernels add bandwidth, not math.** Vector loads, half-precision inputs, the row held in
-  registers, the residual fused in — around the same merge.
+  registers, the residual fused in, all around the same merge.
 
 The primary reference is [Ba, Kiros and Hinton, *Layer Normalization*](https://arxiv.org/abs/1607.06450); the
 variance algorithms are collected in

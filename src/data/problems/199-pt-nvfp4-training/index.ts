@@ -27,8 +27,8 @@ NVFP4 is NVIDIA's 4-bit floating-point format for Blackwell tensor cores: E2M1 v
 Inference only has to round each tensor once. Training rounds every operand of every GEMM again on
 every step, in the forward and in the backward pass, and sums the results into FP32 master weights,
 so a small systematic error compounds. NVIDIA's "Pretraining Large Language Models with NVFP4" (2025)
-trained a 12B hybrid Mamba-Transformer on 10T tokens in NVFP4 to within FP8's loss with four
-additions: a few sensitive layers kept in BF16, **16 × 16 random Hadamard transforms** on the inputs of
+trained a 12B hybrid Mamba-Transformer on 10T tokens in NVFP4 within about 1.5 % of its FP8 baseline's
+loss with four additions: a few sensitive layers kept in BF16, **16 × 16 random Hadamard transforms** on the inputs of
 the weight-gradient GEMM, **16 × 16 blocks for weights** so the forward and the backward see one
 quantized weight, and **stochastic rounding for gradients**. Transformer Engine ships the recipe as
 \`NVFP4BlockScaling\`. It sits under every linear layer of a model: attention, softmax, norms,
@@ -66,8 +66,8 @@ Put the three files in one directory and run \`python nvfp4_sr.py\`, \`python nv
 first two take about a second each, the third about 15 s. \`PASS\` means: stochastic rounding is
 unbiased within a stated statistical bound while round-to-nearest shrinks small gradients by over 20 %,
 2-D blocks commute with the transpose; the transform is orthogonal, keeps GEMMs exact, lowers the
-crest factor and the share of values flushed to zero on heavy-tailed data (and, honestly, does not
-lower the relative error at block size 16); and the NVFP4 LM ends within 0.05 nats of FP32 while
+crest factor and the share of values flushed to zero on heavy-tailed data (but does not lower the
+relative error at block size 16); and the NVFP4 LM ends within 0.05 nats of FP32 while
 dgrad's bias falls with averaging only when SR and 2-D weights are both on.
 
 ## Left out on purpose

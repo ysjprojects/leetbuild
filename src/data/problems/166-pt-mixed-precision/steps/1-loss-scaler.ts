@@ -6,12 +6,12 @@ const GRAD_SCALER_IN_IMPLEMENTATION = [
   /class DynamicLossScaler\b[\s\S]*GradScaler[\s\S]*\nif __name__/,
 ];
 
-/** Casting the model or its parameters to half precision — the master weights must stay float32. */
+/** Casting the model or its parameters to half precision: the master weights must stay float32. */
 const HALF_MODEL = [/\.half\(\)/, /\.bfloat16\(\)/, /\.to\(\s*(dtype\s*=\s*)?torch\.(bfloat16|float16|half)\s*\)/];
 
 export const lossScalerStep: Step = {
   id: 'loss-scaler',
-  title: 'autocast forward, scaled backward, unscale, clip, step — or skip',
+  title: 'autocast forward, scaled backward, unscale, clip, step (or skip)',
   concept: 'pytorch',
   file: 'mixed_precision',
   focus: ['zero', 'forward', 'loss', 'scale', 'backward', 'unscale', 'check', 'clip', 'skip', 'step', 'update'],
@@ -71,8 +71,8 @@ in \`mixed_precision.py\`. The parameters are float32 throughout; only the forwa
   weights and the same scale. It prints \`PASS\`.
 
 > Multiply the loss by a large power of two so no gradient underflows in half precision, divide the
-> gradients by it before the optimizer sees them, and let an overflow — a gradient that is \`inf\` or \`nan\`
-> — skip the step and shrink the scale: that is all mixed precision adds to a training loop.
+> gradients by it before the optimizer sees them, and let an overflow (a gradient that is \`inf\` or \`nan\`)
+> skip the step and shrink the scale: that is all mixed precision adds to a training loop.
 
 Slide a value down through fp16's range to see where it flushes to zero, then move the loss scale and
 watch the gradient histogram lift clear of the underflow cliff:
@@ -80,15 +80,15 @@ watch the gradient histogram lift clear of the underflow cliff:
 :::widget float-formats`,
   hints: [
     'Keep three numbers: the scale, the count of consecutive good steps, and whether the current step overflowed (`None` until `unscale_` ran). `scale(loss)` is `loss * self._scale`; `step` consults the flag, acts, and sets it back to `None`.',
-    'In `unscale_`, per group: `grads = [p.grad for p in group["params"] if p.grad is not None]`, then `torch._foreach_div_(grads, self._scale)` (or `g.div_` in a loop) and one reduction: `torch.stack([torch.isfinite(g).all() for g in grads]).all()` — `bool(...)` of that is the group\'s single host sync.',
-    'The order in `train_step` is fixed by what each stage needs: `zero_grad` → autocast forward → `scaler.scale(loss).backward()` → `scaler.unscale_(optimizer)` → `clip_grad_norm_` (the norm of scaled gradients would be 65536× too large) → `scaler.step(optimizer)`. Loss in float32: `F.cross_entropy(logits.float(), y)`.',
+    "In `unscale_`, per group: divide the group's gradients in place (`torch._foreach_div_`, or `g.div_` in a loop), then fold `torch.isfinite(g).all()` over all of them into one 0-d tensor and call `bool()` on it once: that is the group's single host sync.",
+    'Two invariants the self-test catches: the counter resets both on overflow and after a growth, so the scale doubles exactly four clean steps after the skip; and `step` clears the flag on both branches, or the next `unscale_` raises. The loss goes inside the autocast block, on `logits.float()`.',
   ],
   checks: [
     {
       id: 'autocast-forward',
       title: 'The forward runs under torch.autocast in the requested dtype; the parameters stay float32',
       detail:
-        'A forward hook on the last Linear sees bfloat16 output and every parameter is float32 after the step. `torch.autocast(device_type=..., dtype=dtype)` wraps the forward only — `zero_grad` before it, `backward` after it — and nothing calls `.half()`, `.bfloat16()` or `.to(torch.bfloat16)` on the model.',
+        'A forward hook on the last Linear sees bfloat16 output and every parameter is float32 after the step. `torch.autocast(device_type=..., dtype=dtype)` wraps the forward only (`zero_grad` before it, `backward` after it), and nothing calls `.half()`, `.bfloat16()` or `.to(torch.bfloat16)` on the model.',
       match: {
         python: {
           all: [/torch\.autocast\(/, /device_type\s*=/, /dtype\s*=\s*dtype/],
@@ -101,7 +101,7 @@ watch the gradient histogram lift clear of the underflow cliff:
       id: 'scaled-backward',
       title: 'backward() runs on the loss multiplied by the scale',
       detail:
-        'Every gradient comes out of `.backward()` multiplied by 65536, which is what keeps small fp16 gradients above the subnormal range. `train_step` calls `scaler.scale(loss).backward()` — never `loss.backward()`.',
+        'Every gradient comes out of `.backward()` multiplied by 65536, which is what keeps small fp16 gradients above the subnormal range. `train_step` calls `scaler.scale(loss).backward()`, never `loss.backward()`.',
       match: {
         python: {
           all: [/scaler\.scale\(\s*loss\s*\)/, /def scale\(self, loss/],
@@ -126,7 +126,7 @@ watch the gradient histogram lift clear of the underflow cliff:
       id: 'overflow-check',
       title: 'Non-finite gradients are found with one torch.isfinite reduction per parameter group',
       detail:
-        "An `inf` in one gradient makes `unscale_` return `True`. The check walks `optimizer.param_groups`, reduces `torch.isfinite(...)` over all of a group's gradients and syncs once — not `.item()` per tensor, which would stall the GPU once per parameter.",
+        "An `inf` in one gradient makes `unscale_` return `True`. The check walks `optimizer.param_groups`, reduces `torch.isfinite(...)` over all of a group's gradients and syncs once, not `.item()` per tensor, which would stall the GPU once per parameter.",
       match: {
         python: {
           all: [/torch\.isfinite\(/, /optimizer\.param_groups/],
@@ -150,7 +150,7 @@ watch the gradient histogram lift clear of the underflow cliff:
       id: 'growth',
       title: 'growth_interval consecutive good steps double the scale',
       detail:
-        'With `growth_interval=4`, four good steps after the skipped one bring the scale from 32768 back to 65536 — and the overflow had reset the counter, so the two good steps before it do not count.',
+        'With `growth_interval=4`, four good steps after the skipped one bring the scale from 32768 back to 65536. The overflow had reset the counter, so the good step before it does not count.',
       match: {
         python: {
           all: [/\*=?\s*self\.growth_factor\b/, /(>=|==)\s*self\.growth_interval\b|self\.growth_interval\s*(<=|==)/],
@@ -161,7 +161,7 @@ watch the gradient histogram lift clear of the underflow cliff:
       id: 'state-dict',
       title: 'state_dict / load_state_dict round-trip the scale and the good-step counter',
       detail:
-        'A fresh scaler loaded from `scaler.state_dict()` reports the same scale and the same dict — a checkpoint resumed mid-run must not restart at 2**16 and overflow its first 20 steps. Keys: `scale`, `growth_factor`, `backoff_factor`, `growth_interval`, `growth_tracker`.',
+        'A fresh scaler loaded from `scaler.state_dict()` reports the same scale and the same dict: a checkpoint resumed mid-run must not restart at 2**16 and overflow its first few steps. Keys: `scale`, `growth_factor`, `backoff_factor`, `growth_interval`, `growth_tracker` (PyTorch names the last `_growth_tracker`).',
       match: {
         python: {
           all: [/["']scale["']\s*:/, /["']growth_tracker["']\s*:/, /def load_state_dict\(self, /],
@@ -548,5 +548,5 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `The scaler is three numbers — the scale, a count of consecutive good steps, and whether the current step overflowed — and the whole of mixed precision is where the three touch the loop. The loss is multiplied *before* \`backward\` so every gradient of the chain rule carries the factor and none of the small ones underflows in fp16 (\`2**16\` lifts \`2**-30\` into range); the gradients are divided *before* clipping and the step, so the optimizer and the clipper only ever see true gradients. A \`.grad\` that is \`inf\` or \`nan\` is not a bug to raise on but a signal: the scale is too high, so the step is dropped and the scale halves — a lost batch costs nothing, a poisoned weight costs the run. The growth schedule (×2 after 2000 clean steps) pushes the scale back up as the gradients shrink over training, which is why it is *dynamic*: a fixed scale is either too small at the start or overflows at the end. The parameters never leave float32 — \`torch.autocast\` casts a bf16 *copy* of each weight for the matmul and the fp32 master copy takes the update, so an update of \`1e-4\` on a weight of \`1.0\` is not rounded away (bf16 has three significant digits). Two engineering details are what \`torch.amp.GradScaler\` also does: the overflow check is one reduction and one host sync per parameter group, not an \`.item()\` per tensor (a 7B model has hundreds of tensors and each sync drains the GPU queue), and \`unscale_\` runs at most once per step so clipping cannot be applied to doubly unscaled gradients. Note what the self-test quietly shows: with bfloat16 the overflow has to be injected, because bf16 shares fp32's exponent range and almost never needs loss scaling — which is why Llama, GPT-NeoX and most recent pretraining runs use bf16 without a scaler, while fp16 on V100-era hardware cannot do without one. Production stacks go further: \`GradScaler\` fuses the unscale and the check into one kernel (\`_amp_foreach_non_finite_check_and_unscale_\`) and keeps the scale on the device so nothing syncs at all; FSDP's \`MixedPrecision\` policy keeps the sharded master weights in fp32 and all-gathers bf16; Transformer Engine does the matmuls in fp8 with per-tensor scaling that plays the same game at the level of individual activations.`,
+  debrief: `The scaler is three numbers (the scale, a count of consecutive good steps, and whether the current step overflowed), and the whole of mixed precision is where the three touch the loop. The loss is multiplied *before* \`backward\` so every gradient of the chain rule carries the factor and none of the small ones underflows in fp16 (\`2**16\` lifts \`2**-30\` to \`2**-14\`, the smallest normal); the gradients are divided *before* clipping and the step, so the optimizer and the clipper only ever see true gradients. A \`.grad\` that is \`inf\` or \`nan\` is not a bug to raise on but a signal: the scale is too high, so the step is dropped and the scale halves. A lost batch costs nothing; a poisoned weight costs the run. The growth schedule (×2 after 2000 clean steps) pushes the scale back up as the gradients shrink over training, which is why it is *dynamic*: a fixed scale safe for the large early gradients is too small for the late ones, and one sized for the late ones overflows early. The parameters never leave float32: \`torch.autocast\` casts a bf16 *copy* of each weight for the matmul and the fp32 master copy takes the update, so an update of \`1e-4\` on a weight of \`1.0\` is not rounded away (bf16 keeps 8 significant bits, under three decimal digits). The overflow check is one reduction and one host sync per parameter group, not an \`.item()\` per tensor (a 7B model has hundreds of tensors and each sync drains the GPU queue), and \`unscale_\` runs at most once per step, as in \`torch.amp.GradScaler\`, so clipping cannot see doubly unscaled gradients. Note what the self-test quietly shows: with bfloat16 the overflow has to be injected, because bf16 shares fp32's exponent range and almost never needs loss scaling. BLOOM moved to bf16 after its fp16 trial runs on V100s diverged, and Llama 3 trained in bf16; fp16 cannot do without a scaler (GPT-NeoX-20B ran DeepSpeed's dynamic one). Production stacks go further: \`GradScaler\` fuses the unscale and the check into one kernel (\`_amp_foreach_non_finite_check_and_unscale_\`) that accumulates \`found_inf\` on the device across every group, so its only sync is one \`.item()\` per device in \`step\`, and fused optimizers (\`torch.optim.AdamW(..., fused=True)\`) read \`found_inf\` and the scale as tensors and skip on the device without even that; FSDP's \`MixedPrecision\` policy keeps the sharded master weights in fp32 and all-gathers bf16; Transformer Engine does the matmuls in fp8 with per-tensor scaling that plays the same game for each tensor separately.`,
 };

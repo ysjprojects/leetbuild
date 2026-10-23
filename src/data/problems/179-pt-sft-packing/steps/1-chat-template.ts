@@ -10,7 +10,7 @@ export const chatTemplateStep: Step = {
 
 Write \`sft_template.py\`: a byte-level tokenizer and the Llama 3 chat format, with the labels that let the loss see only what the assistant says.
 
-- **Vocabulary** (given as constants, \`VOCAB_SIZE = 262\`): ids 0 to 255 are the UTF-8 bytes, and Llama 3's special tokens follow. \`BOS_ID = 256\` is \`<|begin_of_text|>\` (128000 in Llama 3), \`EOS_ID = 257\` is \`<|end_of_text|>\` (128001), \`START_HEADER_ID = 258\` and \`END_HEADER_ID = 259\` are \`<|start_header_id|>\` and \`<|end_header_id|>\` (128006, 128007), \`EOT_ID = 260\` is \`<|eot_id|>\` (128009) and \`PAD_ID = 261\` is \`<|finetune_right_pad_id|>\` (128004). \`IGNORE_INDEX = -100\` is the label \`F.cross_entropy\` skips by default.
+- **Vocabulary** (given as constants, \`VOCAB_SIZE = 262\`): ids 0 to 255 are the UTF-8 bytes, and Llama 3's special tokens follow. \`BOS_ID = 256\` is \`<|begin_of_text|>\` (128000 in Llama 3), \`EOS_ID = 257\` is \`<|end_of_text|>\` (128001), \`START_HEADER_ID = 258\` and \`END_HEADER_ID = 259\` are \`<|start_header_id|>\` and \`<|end_header_id|>\` (128006, 128007), \`EOT_ID = 260\` is \`<|eot_id|>\` (128009) and \`PAD_ID = 261\` is \`<|finetune_right_pad_id|>\` (128004, named in Llama 3.1). \`IGNORE_INDEX = -100\` is the label \`F.cross_entropy\` skips by default.
 - \`encode(text) -> list[int]\`: the UTF-8 bytes of \`text\`. A special-token string typed inside text stays bytes (\`"<|eot_id|>"\` is 10 ids, never 260): only the template emits special ids.
 - \`decode(ids) -> str\`: the inverse; ids ≥ 256 come back as their strings, byte runs decode with \`errors="replace"\`.
 - \`header(role) -> list[int]\`: \`START_HEADER_ID\`, the role's bytes, \`END_HEADER_ID\`, then \`"\\n\\n"\`.
@@ -23,7 +23,7 @@ Write \`sft_template.py\`: a byte-level tokenizer and the Llama 3 chat format, w
 > The ids decide what the model reads; the labels decide what it is graded on. The \`<|eot_id|>\` it is graded on is how it learns to stop.`,
   hints: [
     'Build two Python lists side by side, `ids` and `labels`, and extend both by the same length for every piece. They stay aligned without any index arithmetic.',
-    'For each message: `head = header(m["role"])` and `body = encode(m["content"]) + [EOT_ID]`. Labels get `[IGNORE_INDEX] * len(head)`, then `body` for an assistant and `[IGNORE_INDEX] * len(body)` for anyone else.',
+    'Split each message into a head, `header(role)`, and a body, its content bytes plus `EOT_ID`. The head is always ignored; the body is copied into the labels for an assistant and ignored for anyone else.',
     'Truncate once, at the end, both lists with `[:max_len]`, then `torch.tensor(ids, dtype=torch.long)`. To decode, collect byte ids in a run and flush it with `bytes(run).decode("utf-8", errors="replace")` at every special id.',
   ],
   checks: [
@@ -321,7 +321,7 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `The labels are the whole of SFT's difference from pretraining. The objective is the same next-token cross-entropy; what changes is which positions count. InstructGPT's SFT stage fine-tuned GPT-3 on labeler-written demonstrations, and every SFT recipe since computes the loss on the response only: a loss on the user turns spends capacity on modelling users and teaches the model to continue a conversation as either side. \`-100\` is not a convention of this file: it is \`F.cross_entropy\`'s default \`ignore_index\`, so the ignored positions add nothing to the loss sum, nothing to the gradient, and nothing to the count of the mean.
+  debrief: `The labels are the whole of SFT's difference from pretraining. The objective is the same next-token cross-entropy; what changes is which positions count. InstructGPT's SFT stage fine-tuned GPT-3 on labeler-written demonstrations, and most chat SFT recipes compute the loss on the responses only (TRL offers it as \`assistant_only_loss\`): a loss on the user turns spends capacity on modelling users and teaches the model to continue a conversation as either side. \`-100\` is not a convention of this file: it is \`F.cross_entropy\`'s default \`ignore_index\`, so the ignored positions add nothing to the loss sum, nothing to the gradient, and nothing to the count of the mean.
 
 **The eot is labelled, the header is not.** The header is fixed by the template, so there is nothing to learn about it, and at inference the generation prompt supplies it. The \`<|eot_id|>\` after an answer is the one token that tells the serving loop to stop; a model never trained on it rambles into a fake user turn. **Specials are never parsed from text**: if a user can type \`<|eot_id|>\` and have it become id 128009, they can close the assistant's turn and write their own. tiktoken refuses special strings in \`encode\` unless they are allowed explicitly, for that reason. **Truncation keeps the beginning** because the BOS, the system prompt and the first exchange are what every later label is conditioned on; a cut answer still trains on the tokens it keeps.
 

@@ -4,7 +4,7 @@ import {learn} from './learn';
 import {wmmaMatmulStep} from './steps/1-wmma-matmul';
 
 /**
- * Drill: a matmul on tensor cores through `nvcuda::wmma` — fp16 inputs, fp32 accumulation, one warp
+ * Drill: a matmul on tensor cores through `nvcuda::wmma`: fp16 inputs, fp32 accumulation, one warp
  * per 16 × 16 output tile, the leading dimensions and alignment the fragment loads demand, a
  * shared-memory-staged variant with 64 × 64 block tiles, host-side padding to multiples of 16, and a
  * benchmark against a plain tiled fp32 kernel. The warp-level contract cuBLAS and CUTLASS are built on.
@@ -21,27 +21,27 @@ export const cudaWmmaMatmulProblem: Problem = {
   minutes: 75,
   statement: `# Matmul on tensor cores with WMMA
 
-Almost every FLOP a transformer spends is a matrix multiply — the Q/K/V and output projections, the two MLP
-matrices, the logits — and since Volta those FLOPs run on **tensor cores**: units that multiply small fp16
-(later bf16, tf32, fp8) tiles and accumulate in fp32, an order of magnitude faster than the ordinary fp32
-pipeline. \`torch.matmul\` reaches them through cuBLAS; the lowest level of CUDA C++ that reaches them
+Almost every FLOP a transformer spends is a matrix multiply (the Q/K/V and output projections, the two MLP
+matrices, the logits), and since Volta those FLOPs run on **tensor cores**: units that multiply small fp16
+(later bf16, tf32, fp8) tiles and accumulate in fp32, at 8 to 16 times the peak of the ordinary fp32
+pipeline on data-center GPUs. \`torch.matmul\` reaches them through cuBLAS; the lowest level of CUDA C++ that reaches them
 directly is \`nvcuda::wmma\` (\`#include <mma.h>\`), the *warp matrix* API: a warp loads a 16 × 16 tile of A and
 of B into **fragments**, issues \`mma_sync\`, and stores a 16 × 16 tile of C. This drill writes that kernel,
 then stages it through shared memory, and measures both against a plain tiled fp32 kernel.
 
-The surface is one file, \`wmma_matmul.cu\`, compiled with \`nvcc -arch=sm_80\` (\`sm_70\` or later). \`A\` is
+The surface is one file, \`wmma_matmul.cu\`, compiled with \`nvcc -arch=sm_80\` (use your GPU's \`sm_XY\`, 70 or later). \`A\` is
 \`M × K\`, \`B\` is \`K × N\`, both \`half\` and row-major; \`C\` is \`M × N\` \`float\`:
 
-- \`__global__ void wmma_matmul(const half* A, const half* B, float* C, int M, int N, int K)\` — one warp per
+- \`__global__ void wmma_matmul(const half* A, const half* B, float* C, int M, int N, int K)\`: one warp per
   16 × 16 tile of \`C\`, 4 warps per 128-thread block along a row of tiles, fragments loaded straight from
   global memory with \`ldm = K\` for \`A\` and \`ldm = N\` for \`B\`, \`K / 16\` calls of \`mma_sync(acc, a, b, acc)\`,
   one \`store_matrix_sync(…, N, wmma::mem_row_major)\`.
-- \`__global__ void wmma_matmul_smem(…same signature…)\` — a 64 × 64 block tile: the 128 threads fill
+- \`__global__ void wmma_matmul_smem(…same signature…)\`: a 64 × 64 block tile; the 128 threads fill
   \`__shared__ __align__(32) half As[64][40]\` and \`Bs[32][72]\` in steps of 32 along K, each of the 2 × 2 warps
   multiplies its 32 × 32 quarter as 2 × 2 accumulators, two \`__syncthreads()\` per step.
-- \`pad16\`, \`upload_padded\`, \`download\` — every dimension rounded up to a multiple of 16, the inputs copied into
+- \`pad16\`, \`upload_padded\`, \`download\`: every dimension rounded up to a multiple of 16, the inputs copied into
   zeroed padded buffers with \`cudaMemcpy2D\` and the \`M × N\` corner of \`C\` copied back.
-- \`main\` — fp16 inputs from a fixed-seed generator, an fp32 CPU reference over the same rounded values, the
+- \`main\`: fp16 inputs from a fixed-seed generator, an fp32 CPU reference over the same rounded values, the
   max abs error against \`2e-5 × K\` for both kernels at 256 × 384 × 512 and 250 × 375 × 500, a 1024³ timing of
   the tiled fp32 kernel and both WMMA kernels in TFLOP/s, and \`PASS\`.
 
@@ -72,8 +72,8 @@ wmma_matmul_smem  M=250 N=375 K=500  max|C - ref| = <error>  (tol 1.0e-02)  ok
 PASS
 \`\`\`
 
-The errors are fp32 accumulation-order noise, far below the tolerance; the timings and speed-ups depend on the
-GPU (the WMMA kernels should be several times faster than tiled fp32 on any tensor-core part). The starter
+The errors are fp32 accumulation noise, far below the tolerance; the timings and speed-ups depend on the
+GPU (expect the WMMA kernels to run several times faster than tiled fp32). The starter
 compiles and runs but its kernels write nothing, so \`C\` comes back as zeros, every line says \`FAIL\`, and so
 does the last one.
 
@@ -330,11 +330,11 @@ CUTLASS add on top of the warp-level contract written here.`,
                     cols: 8,
                     marks: [{cols: [5, 5], rows: [2, 2], tone: 'register'}],
                     detail:
-                      'The running sum from the previous steps of K, zeroed once by `fill_fragment(acc, 0.0f)`. Accumulating in fp32 leaves summation order as the only error.',
+                      'The running sum from the previous steps of K, zeroed once by `fill_fragment(acc, 0.0f)`. Accumulating in fp32 leaves the order and rounding of the sum as the only error.',
                   },
                 ],
                 detail:
-                  'One warp-collective instruction: 16 · 16 · 16 = 4,096 multiply-adds, against 32 for an fp32 FMA across a warp. A lane-dependent `if` around it is undefined behaviour.',
+                  'One warp-collective `mma_sync`: 16 · 16 · 16 = 4,096 multiply-adds, against 32 for an fp32 FMA instruction across a warp. A lane-dependent `if` around it is undefined behaviour.',
               },
             ],
             detail:
@@ -379,7 +379,7 @@ CUTLASS add on top of the warp-level contract written here.`,
       kind: 'post',
       title: 'CUTLASS: Fast Linear Algebra in CUDA C++',
       url: 'https://developer.nvidia.com/blog/cutlass-linear-algebra-cuda/',
-      by: 'Andrew Kerr, Duane Merrill and Julien Demouth',
+      by: 'Andrew Kerr et al.',
       date: '2017-12-05',
       venue: 'NVIDIA Technical Blog',
       takes:

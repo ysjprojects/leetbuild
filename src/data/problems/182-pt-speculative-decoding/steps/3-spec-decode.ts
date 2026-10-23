@@ -31,7 +31,7 @@ verify\`). No \`transformers\`, no \`assistant_model\`.
   7. after a fully accepted round the draft cache is **one short** (the last proposal was never fed):
      feed the missing token before the next round's drafts, and count that forward.
 - \`exact_marginals\` is given: a model's exact distribution of each of the next few tokens, by
-  enumerating every prefix in one batched forward.
+  enumerating every prefix, one batched forward per position.
 
 The self-test trains a target (2 layers, 48 wide) and a draft (1 layer, 24 wide) on the same order-2
 Markov chain over 16 tokens, converts both to float64, and checks:
@@ -53,8 +53,8 @@ draft forward costs next to a target forward.
 > tokens. Memory-bound decoding makes the γ + 1-token target pass cost about the same as a 1-token one.`,
   hints: [
     'Keep the invariant "each cache holds `len(out) - 1` positions" at the top of every round. The target gets exactly `g + 1` new positions per round and gives back the rejected ones with `truncate`; the draft gets `g` and may need one more.',
-    'Build the verification input as `torch.tensor([[out[-1]] + drafted.tolist()])`: its logits row `i` is `p_i`, the target after `out` plus the first `i` drafts, which is exactly what `verify` compares with `q_i`.',
-    'For the draft cache: `if g > 0 and dcache.pos < len(out) - 1: draft(torch.tensor([out[dcache.pos : -1]]), dcache)`. After the round, `min(dcache.pos, len(out) - 1)` because the draft may hold fewer positions than the target.',
+    'Feed the target `out[-1]` followed by the drafts as one `(1, g + 1)` sequence: logits row `i` is then `p_i`, the target after `out` plus the first `i` drafts, which is exactly what `verify` compares with `q_i`.',
+    'Catch-up: when the draft cache holds fewer than `len(out) - 1` positions at the start of a round, feed it the missing tokens `out[dcache.pos : -1]` in one forward. At the end of a round, cut it to `min(dcache.pos, len(out) - 1)`: it may already be shorter than the target cache.',
   ],
   checks: [
     {

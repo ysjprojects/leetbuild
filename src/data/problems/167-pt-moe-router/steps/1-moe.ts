@@ -24,7 +24,8 @@ class TopKRouter(nn.Module):
 
     def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """tokens (T, D) → (idx (T, k) int64, weights (T, k) summing to 1 per token, aux scalar)."""
-        logits = self.gate(tokens).float()  # (T, E): the router runs in float32 whatever the model dtype
+        # (T, E): input and weight are cast before the matmul, so the router is float32 even in a bf16 model
+        logits = F.linear(tokens.float(), self.gate.weight.float())
         probs = F.softmax(logits, dim=-1)  # (T, E)
         topk_probs, idx = torch.topk(probs, self.k, dim=-1)  # (T, k) each
         weights = topk_probs / topk_probs.sum(dim=-1, keepdim=True)  # renormalise over the k chosen
@@ -163,10 +164,10 @@ if __name__ == "__main__":
 
 const starter = solution
   .replace(
-    / {8}logits = self\.gate\(tokens\)\.float\(\)[\s\S]*? {8}return idx, weights, aux\n/,
-    `        # TODO: logits = gate(tokens) in float32 → softmax → top-k → renormalise the k weights;
-        # TODO: aux = n_experts · Σ_e f_e · P_e (f_e from a one-hot of idx, P_e = probs.mean(0)),
-        # TODO: plus z_loss_coef · mean(logsumexp(logits)²) when z_loss_coef > 0.
+    / {8}# \(T, E\): input and weight are cast before the matmul[\s\S]*? {8}return idx, weights, aux\n/,
+    `        # TODO: logits in float32 (cast the input and the gate weight before the matmul) → softmax → top-k →
+        # TODO: renormalise the k weights; aux = n_experts · Σ_e f_e · P_e (f_e from a one-hot of idx,
+        # TODO: P_e = probs.mean(0)), plus z_loss_coef · mean(logsumexp(logits)²) when z_loss_coef > 0.
         raise NotImplementedError("TODO")
 `,
   )
@@ -198,8 +199,9 @@ Implement a sparse mixture-of-experts feed-forward sub-layer in PyTorch: the rou
 - \`TopKRouter(d_model, n_experts, k, z_loss_coef=0.0)\` holds one \`nn.Linear(d_model, n_experts, bias=False)\`
   gate. \`forward(tokens)\` with \`tokens\` of shape \`(T, D)\` returns \`(idx, weights, aux)\`: \`idx\` \`(T, k)\`
   int64 expert ids, \`weights\` \`(T, k)\` the top-k softmax probabilities **renormalised to sum to 1 per
-  token**, and \`aux\` a float32 scalar. Compute the logits in float32 (\`.float()\`), \`F.softmax\` over the
-  expert axis, then \`torch.topk\`.
+  token**, and \`aux\` a float32 scalar. The router runs in float32 whatever the model dtype: cast the input and
+  the gate weight before the matmul (\`F.linear(tokens.float(), self.gate.weight.float())\`), then \`F.softmax\`
+  over the expert axis and \`torch.topk\`.
 - The **load-balancing loss** is the Switch Transformer's: \`aux = n_experts · Σ_e f_e · P_e\` where \`f_e\`
   is the fraction of the \`T·k\` routing slots that went to expert \`e\` (from a one-hot of \`idx\`, no
   gradient) and \`P_e = probs.mean(dim=0)\` (soft, carries the gradient). Uniform routing gives exactly 1;
@@ -215,7 +217,7 @@ Implement a sparse mixture-of-experts feed-forward sub-layer in PyTorch: the rou
   \`y.index_add_(0, tok, out * weights[tok, slot].unsqueeze(-1))\`. No per-token Python loop, no running
   every expert on every token and masking.
 - A token whose slot overflowed the capacity gets nothing from that expert; a token that lost all its
-  slots leaves \`y\` as a zero row. \`y\` is the expert mix only — the block's residual \`h + moe(norm(h))\`
+  slots leaves \`y\` as a zero row. \`y\` is the expert mix only: the block's residual \`h + moe(norm(h))\`
   carries a dropped token through unchanged. Never add \`x\` inside \`forward\`.
 - Keep the graph intact: no \`.detach()\`, no \`torch.no_grad()\` around the router, so the gate receives
   gradients through both the combine weights and \`aux\`.
@@ -231,19 +233,19 @@ climbs from 1 toward \`E\`:
 :::widget moe-routing {"experts": 4, "k": 2}
 
 > A router is a classifier that nobody labels: the hard choice \`f_e\` has no gradient, so the balancing
-> loss multiplies it by the soft \`P_e\` — pushing probability away from crowded experts is the only
-> signal that keeps the gate from collapsing onto one.`,
+> loss multiplies it by the soft \`P_e\`. Pushing probability away from crowded experts is the only signal
+> that keeps the gate from collapsing onto one.`,
   hints: [
-    'Router first, in float32: `probs = F.softmax(self.gate(tokens).float(), -1)`, `topk_probs, idx = torch.topk(probs, self.k, -1)`, `weights = topk_probs / topk_probs.sum(-1, keepdim=True)`. For the loss build `mask = F.one_hot(idx, E).sum(1).float()` of shape `(T, E)`; `f = mask.sum(0) / (T * k)`, `P = probs.mean(0)`.',
-    '`torch.where(idx == e)` on the `(T, k)` index tensor gives two vectors in row-major order: the token ids that chose `e` and which of their `k` slots did. Slicing both with `[:capacity]` keeps the earliest tokens — the same tokens a per-token loop with a counter would keep.',
-    'The combine is one `index_add_` per expert: `y.index_add_(0, tok, out * weights[tok, slot].unsqueeze(-1))` scatters each weighted output row back to its token; two slots of one token add into the same row. Return `y.reshape(B, S, D)` without adding `x`.',
+    'For `f_e`, `F.one_hot(idx, E)` is `(T, k, E)`; summing over the `k` axis gives a `(T, E)` 0/1 mask whose column sums, divided by `T·k`, are the slot shares. `P_e` is the column mean of the full softmax, not of the top-k weights: only the full softmax has a gradient for every expert.',
+    '`torch.where(idx == e)` on the `(T, k)` index tensor returns two index vectors in row-major order: the tokens that chose `e` and which of their `k` slots did. Slicing both with `[:capacity]` admits exactly the tokens a per-token loop with a counter admits.',
+    'A token with two slots gets two `index_add_` writes into the same row, which is the combine. `weights[tok, slot]` needs a trailing axis to scale `(n_e, D)` rows. Return `y.reshape(B, S, D)` without adding `x`.',
   ],
   checks: [
     {
       id: 'softmax-topk',
       title: 'Softmax over experts, top-k, weights renormalised per token',
       detail:
-        'Gate logits go through `F.softmax` over the expert axis, then `torch.topk(probs, k)`, and the k probabilities are divided by their sum so each token’s weights add to 1 — with a zeroed gate every token’s weights are `1/k`.',
+        'Gate logits go through `F.softmax` over the expert axis, then `torch.topk(probs, k)`, and the k probabilities are divided by their sum so each token’s weights add to 1: with a zeroed gate every token’s weights are `1/k`.',
       match: {
         python: {
           all: [
@@ -259,7 +261,7 @@ climbs from 1 toward \`E\`:
       id: 'aux-loss',
       title: 'Load-balancing loss is n_experts · Σ f_e · P_e',
       detail:
-        '`f_e` comes from a one-hot of the chosen indices summed over tokens, `P_e` is the mean softmax probability, and the loss scales their dot product by `n_experts` — exactly 1 under uniform routing, `n_experts` when every token picks one expert.',
+        '`f_e` comes from a one-hot of the chosen indices summed over tokens, `P_e` is the mean softmax probability, and the loss scales their dot product by `n_experts`: exactly 1 under uniform routing, `n_experts` when every token picks one expert.',
       match: {
         python: {
           all: [
@@ -283,7 +285,7 @@ climbs from 1 toward \`E\`:
       id: 'capacity',
       title: 'Capacity is ceil(capacity_factor · T · k / n_experts) and truncates each expert’s list',
       detail:
-        '`capacity()` uses `math.ceil` on the factor times tokens times k over experts, and the dispatch keeps only the first `capacity` tokens of each expert (`[:capacity]`) — 32 tokens, k = 1, factor 0.5 and 4 experts give a capacity of 4.',
+        '`capacity()` uses `math.ceil` on the factor times tokens times k over experts, and the dispatch keeps only the first `capacity` tokens of each expert (`[:capacity]`): 32 tokens, k = 1, factor 0.5 and 4 experts give a capacity of 4.',
       match: {
         python: {all: [/math\.ceil\(\s*self\.capacity_factor\s*\*/, /\[\s*:\s*capacity\s*\]/]},
       },
@@ -292,7 +294,7 @@ climbs from 1 toward \`E\`:
       id: 'expert-loop',
       title: 'Dispatches in one loop over experts with index gathers',
       detail:
-        'The layer iterates `enumerate(self.experts)`, finds each expert’s tokens with `torch.where(idx == e)`, runs the expert once on the gathered rows and scatters back with `index_add_` — not a Python loop over tokens and not every expert over every token with a mask.',
+        'The layer iterates `enumerate(self.experts)`, finds each expert’s tokens with `torch.where(idx == e)`, runs the expert once on the gathered rows and scatters back with `index_add_`, not a Python loop over tokens and not every expert over every token with a mask.',
       match: {
         python: {
           all: [
@@ -308,7 +310,7 @@ climbs from 1 toward \`E\`:
       id: 'dropped-zero',
       title: 'Dropped tokens leave a zero row; the residual is the block’s, not the layer’s',
       detail:
-        '`y` starts as `torch.zeros_like(tokens)` and only routed slots add to it, so a token that overflowed every expert it chose comes out as zeros and the block’s `h + moe(norm(h))` carries it unchanged — the layer must not add `x` itself.',
+        '`y` starts as `torch.zeros_like(tokens)` and only routed slots add to it, so a token that overflowed every expert it chose comes out as zeros and the block’s `h + moe(norm(h))` carries it unchanged; the layer must not add `x` itself.',
       match: {
         python: {
           all: [/torch\.zeros_like\(/, /\.reshape\(B, S, D\)/],
@@ -330,5 +332,5 @@ climbs from 1 toward \`E\`:
     },
   ],
   code: {python: {starter, solution}},
-  debrief: `The layer is two loops' worth of ideas and one loop of code. Routing is a softmax over experts — a classifier with no labels — and the only things that train it are the gradient through the combine weights (a token's expert did well, so send more probability there) and the auxiliary loss. The balancing loss is shaped the way it is because the hard assignment \`f_e\` has no gradient: multiplying it by the soft \`P_e\` turns "expert 0 took 80 % of the tokens" into a push on the probabilities themselves, and the \`n_experts\` factor makes the loss 1 at the optimum regardless of \`E\` so one coefficient works across model sizes. The z-loss is the same medicine for a different disease — logits that drift large make the softmax a step function and the router stops learning. Dispatching per expert rather than per token is what makes an MoE a real speed-up: each expert sees one \`(n_e, D)\` matmul instead of \`n_e\` row-by-row calls, and \`index_add_\` is the scatter that puts the rows back; \`torch.where\` returning tokens in order is what lets a capacity cut agree with the slow reference. Capacity exists because experts live on different devices in a real model: every device must know its buffer size before the all-to-all, so overflow is dropped rather than queued and the residual carries the token on. Frameworks go further — Megatron-Core and DeepSpeed-MoE fuse the permute/unpermute into one sort and all-to-all, MegaBlocks turns dropless MoE into a block-sparse matmul so no capacity is needed, Mixtral and DeepSeek-V3 ship the same top-k router with \`k = 2\` and \`k = 8\`, and DeepSeek replaces the aux loss with a per-expert bias nudged by a load counter so the balancing never fights the language loss.`,
+  debrief: `The layer is two loops' worth of ideas and one loop of code. Routing is a softmax over experts (a classifier with no labels), and only two things train it: the gradient through the combine weights (a token's expert did well, so send more probability there) and the auxiliary loss. The balancing loss is shaped the way it is because the hard assignment \`f_e\` has no gradient: multiplying it by the soft \`P_e\` turns "expert 0 took 80 % of the tokens" into a push on the probabilities themselves, and the \`n_experts\` factor makes a balanced load score exactly 1 whatever \`E\` is, so one coefficient (Switch's α = 0.01) works across model sizes. The z-loss treats a different disease: large router logits magnify bf16 roundoff inside the exponential, which ST-MoE found destabilises the largest models. Dispatching per expert rather than per token is what makes an MoE a real speed-up: each expert sees one \`(n_e, D)\` matmul instead of \`n_e\` row-by-row calls, and \`index_add_\` is the scatter that puts the rows back; \`torch.where\` returning tokens in order is what lets a capacity cut agree with the slow reference. Capacity exists because the experts sit on different devices behind an all-to-all with statically sized buffers (on TPUs every shape is fixed at compile time), so overflow is dropped rather than queued and the residual carries the token on. Production goes further: Megatron-Core sorts tokens by expert so the gathers become one permute before the all-to-all, MegaBlocks makes MoE dropless with a block-sparse matmul so no capacity is needed, Mixtral ships this softmax top-2 router, and DeepSeek-V3 routes 8 of 256 experts on sigmoid scores and balances them with a per-expert bias nudged by a load counter, keeping only a tiny sequence-wise aux loss (α = 0.0001).`,
 };

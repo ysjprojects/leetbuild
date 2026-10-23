@@ -48,15 +48,16 @@ files: \`GPT.forward(idx, targets=None) -> (logits, loss)\`, \`train(…)\` arou
 Training reads every row of the logits with cross-entropy against the next token; generation reads the
 last row, samples one id, appends it and runs again. The family:
 
-| model | n_layer | n_embd | n_head | parameters |
+| model | n_layer | n_embd | n_head | parameters (with wpe) |
 |---|---|---|---|---|
 | GPT-2 small | 12 | 768 | 12 | 124M |
-| GPT-2 medium | 24 | 1024 | 16 | 350M |
+| GPT-2 medium | 24 | 1024 | 16 | 355M |
 | GPT-2 large | 36 | 1280 | 20 | 774M |
-| GPT-2 XL | 48 | 1600 | 25 | 1558M |
+| GPT-2 XL | 48 | 1600 | 25 | 1,558M |
 
 All four share \`vocab_size = 50257\` (byte-level BPE) and \`block_size = 1024\`. Nothing in the design
-changes with size except these three numbers. The calculator splits any of them by component, with the
+changes with size except these three numbers. The counts are exact sums of the released shapes; the
+paper's table says 117M, 345M, 762M and 1542M. The calculator splits any of them by component, with the
 weight and KV-cache memory:
 
 :::widget model-size {"preset": "gpt2"}
@@ -81,6 +82,9 @@ x = x + c_proj(gelu(c_fc(ln_2(x))))     c_fc: d → 4d, c_proj: 4d → d
 - **Causal mask.** A \`tril\` buffer of shape \`(1, 1, block_size, block_size)\`, sliced to \`[:T, :T]\`,
   sets future scores to \`−inf\` before the softmax; that is the only thing that makes the model
   autoregressive.
+- **GELU.** nanoGPT's \`nn.GELU()\` is the exact erf form; OpenAI's GPT-2 code used the tanh
+  approximation (\`nn.GELU(approximate="tanh")\`). They differ by under 1e-3 per activation, which
+  matters only when you compare logits against the released checkpoint.
 - **Weight tying.** \`lm_head = nn.Linear(d, V, bias=False)\` and then
   \`self.lm_head.weight = self.transformer.wte.weight\`: one \`(50257, 768)\` parameter, 38.6M numbers,
   used to embed ids on the way in and to score every vocabulary entry on the way out
@@ -98,17 +102,18 @@ Parameter count for GPT-2 small, with biases:
 | total | | 124,439,808 |
 | without wpe | what \`num_params()\` reports | 123,653,376 |
 
-The init is \`N(0, 0.02)\` for every Linear and Embedding weight, zero biases — and one GPT-2 addition:
-the two projections per block that write into the residual stream (\`attn.c_proj\`, \`mlp.c_proj\`) get
-\`std = 0.02 / √(2 · n_layer)\`. Each block adds two terms to the stream; with \`2 · n_layer\` roughly
-independent additions the stream's variance would grow linearly with depth, and the rescale keeps it of
-order one at the last layer. A fresh model therefore predicts nearly uniformly: its loss is close to
-\`ln 50257 ≈ 10.8\`.
+The init is \`N(0, 0.02)\` for every Linear and Embedding weight and zero biases, plus one GPT-2
+addition: the two projections per block that write into the residual stream (\`attn.c_proj\`,
+\`mlp.c_proj\`) get \`std = 0.02 / √(2 · n_layer)\`. Each block adds two terms to the stream; with
+\`2 · n_layer\` roughly independent additions the stream's variance would grow linearly with depth, and
+the rescale keeps it of order one at the last layer. The head is small too: \`ln_f\` emits unit-variance
+vectors and the tied rows have std 0.02, so the logits have std about \`0.02 · √768 ≈ 0.55\`. A fresh
+model predicts nearly uniformly, with a loss near \`ln 50257 + 0.55² / 2 ≈ 11.0\` (10.96 measured).
 
 :::quiz
 Q: After \`self.lm_head.weight = self.transformer.wte.weight\`, what does \`model.parameters()\` yield for the two names?
 - [ ] Two tensors that are copied into each other after every optimizer step
-- [x] One tensor, once — the optimizer updates it once with the sum of both gradients
+- [x] One tensor, once: the optimizer updates it once with the sum of both gradients
 - [ ] Two tensors, so the optimizer state for the table is stored twice
 > The assignment rebinds the head's \`weight\` attribute to the same \`nn.Parameter\`. \`parameters()\`
 > de-duplicates by identity, autograd accumulates the embedding's and the head's gradients into one
@@ -120,8 +125,9 @@ Q: After \`self.lm_head.weight = self.transformer.wte.weight\`, what does \`mode
 A window of \`block_size + 1\` tokens gives \`block_size\` training examples at once: \`x\` is the first
 \`block_size\` tokens, \`y\` the same window shifted by one, and the causal mask guarantees position *t*
 saw only \`x[:t+1]\`. The loss is \`F.cross_entropy(logits.view(-1, V), y.view(-1))\`, the mean over all
-\`B · T\` positions. The training recipe GPT-3 published and nanoGPT reuses is a set of stability
-decisions around that one line:
+\`B · T\` positions. The recipe around that one line comes from the
+[GPT-3 paper](https://arxiv.org/abs/2005.14165) (its appendix B and Table 2.1, whose 125M model trains at
+6e-4 with 0.5M-token batches), as nanoGPT configures it for GPT-2 small:
 
 | knob | value (GPT-2 small in nanoGPT) | why |
 |---|---|---|
@@ -166,18 +172,24 @@ Each piece answers one way an early step goes wrong:
 | --- | --- | --- |
 | learning rate | full from the first step | \`6e-4 · (it + 1) / warmup\`: tiny |
 | Adam's \`v\` | a handful of steps old, so the step is near full \`lr\` in every coordinate | still noisy, but the step is scaled down |
-| gradient | used as is | rescaled to norm 1.0, direction kept |
-| outcome | weights jump, logits saturate, the loss spikes to 10+ | a small step; \`v\` keeps learning the scale |
+| gradient | used as is; the spike enters \`m\` and \`v\` at full size | rescaled to norm 1.0, direction kept |
+| outcome | every weight moves by about \`lr\` at once; the loss can spike and not recover | a small step; \`v\` keeps learning the scale |
 
-The schedule with the drill's defaults (100 warmup iterations of a 300-iteration overfit run):
+Adam's normalisation is why both are needed. On step 1 the update is exactly \`lr · sign(g)\` whatever
+the gradient's norm, so clipping cannot shrink the earliest steps: only the warmup does. Later, once \`v\`
+holds the typical scale, a spike 40× the norm adds \`(1 − β2) · 40² = 80\` times the typical \`g²\` to
+\`v\` and keeps it inflated for tens of steps (its time constant is \`1 / (1 − β2) = 20\`); clipping stops
+that.
 
-:::widget lr-schedule {"warmup": 100, "total": 300}
+The schedule of the step-2 self-test (20 warmup iterations of a 300-iteration overfit run):
+
+:::widget lr-schedule {"warmup": 20, "total": 300}
 
 Two details matter for resuming. A checkpoint stores \`{model, optimizer, config, step}\`: without the
 optimizer's two moments per parameter a resumed run is a cold start at full learning rate, and without
 \`step\` the schedule restarts its warmup. And \`config\` is saved as a plain dict (\`asdict\`), because
 \`torch.load\` defaults to \`weights_only=True\` since PyTorch 2.6 and refuses arbitrary classes. The
-autocast rules are in the [PyTorch AMP documentation](https://pytorch.org/docs/stable/amp.html).
+autocast rules are in the [PyTorch AMP documentation](https://docs.pytorch.org/docs/stable/amp.html).
 
 :::quiz
 Q: Why does the bf16 training loop need no \`GradScaler\`, while fp16 does?
@@ -205,7 +217,7 @@ a token decides the text's character. With logits \`[2, 1, 0, −1]\`:
 \`\`\`python
 logits = logits / temperature
 v, _ = torch.topk(logits, k);  logits[logits < v[:, [-1]]] = -inf          # top-k
-p = softmax(sorted logits); remove = cumsum(p) - p > top_p                  # nucleus, crossing token kept
+p = softmax(sorted logits); remove = cumsum(p) - p >= top_p                 # nucleus, crossing token kept
 next_id = torch.multinomial(softmax(logits), num_samples=1)
 \`\`\`
 
@@ -215,9 +227,9 @@ Try the three knobs on a toy next-token distribution, and sample from what survi
 
 Top-k's weakness is that *k* is fixed: when the model is confident, k = 40 still admits 39 bad tokens;
 when it is uncertain, 40 may cut real options. [Nucleus sampling](https://arxiv.org/abs/1904.09751)
-(Holtzman et al.) sizes the head by probability mass instead, which is why it became the default in
-most APIs. Greedy decoding (\`top_k=1\`) is deterministic but loops on repetitions — the degeneration
-that paper documents.
+(Holtzman et al.) sizes the head by probability mass instead: the smallest set whose probability
+reaches p. That is why most sampling APIs expose \`top_p\`. Greedy decoding (\`top_k=1\`) is
+deterministic but loops on repetitions, the degeneration that paper documents.
 
 :::quiz
 Q: The model is 97 % sure of the next token. What do top_k = 40 and top_p = 0.9 keep?
@@ -225,14 +237,14 @@ Q: The model is 97 % sure of the next token. What do top_k = 40 and top_p = 0.9 
 - [x] top-k keeps 40 tokens; top-p keeps only the one, since it alone covers 90 % of the mass
 - [ ] top-k keeps one token; top-p keeps 40
 > Top-k ignores the shape of the distribution and always keeps k candidates. Top-p keeps the smallest
-> set whose cumulative probability reaches p — here the first token already exceeds 0.9.
+> set whose cumulative probability reaches p, and here the first token alone already exceeds 0.9.
 :::
 
 # The KV cache and its memory
 
 The uncached loop re-runs the whole context for every new token: token *t* costs *t* positions through
-every block, so *n* tokens cost about n²/2 position-forwards. Yet nothing about past positions changes —
-the causal mask means position *i* never sees anything after *i* — so their keys and values can be
+every block, so *n* tokens cost about n²/2 position-forwards. Yet nothing about past positions changes
+(the causal mask means position *i* never sees anything after *i*), so their keys and values can be
 stored per block and reused. A decode step then embeds one token at position \`pos\`, computes one row of
 q, k, v per block, writes k and v into the cache at \`pos\`, and attends one query over \`pos + 1\` keys.
 
@@ -241,7 +253,7 @@ Step through decoding with and without the cache, and watch the work and the mem
 :::widget kv-cache
 
 The obvious cached version gets the positions wrong. Feeding one token through the unmodified
-\`forward\` embeds it with \`wpe(arange(1))\` — position 0 — and slices the mask's row 0:
+\`forward\` embeds it with \`wpe(arange(1))\` (position 0) and slices the mask's row 0:
 
 | decode step | positions embedded | mask rows | result |
 | --- | --- | --- | --- |
@@ -257,13 +269,15 @@ The cost is memory, \`2 · n_layer · T · n_embd\` numbers per sequence:
 | 70B, 80 layers × 8192, no GQA | 2.5 MiB | 10 GiB at 4096 |
 | 70B with 8 KV heads (GQA) | 320 KiB | 1.25 GiB at 4096 |
 
-At serving batch sizes the cache, not the weights, fills the GPU. Hence grouped-query attention (fewer
-k, v heads), paged caches in vLLM, and quantised caches. Decoding also turns compute-bound matmuls into
-memory-bound reads of the whole cache per token.
+Multiply by the batch and the cache rivals the weights: serving a 13B model on a 40 GB A100, vLLM's
+[PagedAttention paper](https://arxiv.org/abs/2309.06180) puts about 65 % of memory in weights and close
+to 30 % in KV cache. Hence grouped-query attention (fewer k, v heads), paged caches in vLLM, and
+quantised caches. Decoding also turns compute-bound matmuls into memory-bound reads of the whole cache
+per token.
 
 :::details Why a full cache is re-encoded
 GPT-2's positions are a learned table of \`block_size\` rows. Once 1024 tokens are cached, the next token
-has no row, and sliding the window shifts every remaining token's position by one — their cached keys,
+has no row, and sliding the window shifts every remaining token's position by one, so their cached keys,
 computed with the old positions, are stale. The only exact answer is to re-encode the cropped window,
 which is what the uncached loop does every step. Rotary embeddings (LLaMA) encode position inside q and
 k by rotation, which is why later models can keep rolling caches.
@@ -274,8 +288,8 @@ Q: Generating 1,000 tokens from a short prompt, how does per-token attention wor
 - [ ] Constant with the cache, linear without
 - [x] Linear in the position with the cache (one query over t keys), quadratic without (t queries over t keys)
 - [ ] The same in both: attention is O(t²) either way
-> With the cache one new query attends over the t cached keys — O(t) per token. Without it every step
-> recomputes all t queries against t keys — O(t²) per token, plus t positions through every MLP.
+> With the cache one new query attends over the t cached keys: O(t) per token. Without it every step
+> recomputes all t queries against t keys, O(t²) per token, plus t positions through every MLP.
 :::
 
 # What to take away
@@ -285,8 +299,8 @@ Q: Generating 1,000 tokens from a short prompt, how does per-token attention wor
 - Weight tying makes the token table the output projection: one tensor, both gradients, 38.6M
   parameters saved at small scale.
 - \`0.02 / √(2 · n_layer)\` on the residual projections keeps the stream's variance flat with depth.
-- The loss is cross-entropy at every position; the recipe around it — decay on matrices, warmup +
-  cosine, clipping at 1.0, bf16 — is what keeps it from diverging.
+- The loss is cross-entropy at every position; the recipe around it (decay on matrices, warmup +
+  cosine, clipping at 1.0, bf16) is what keeps it from diverging.
 - Sampling is temperature, then top-k or nucleus, then \`multinomial\`; the KV cache makes each token
   O(t) and costs \`2 · n_layer · n_embd\` numbers per token of context.
 

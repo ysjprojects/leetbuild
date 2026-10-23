@@ -10,8 +10,8 @@ NVFP4 stores a tensor as 4-bit E2M1 values, ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}, in b
 FP8 E4M3 scale, under one FP32 scale per tensor. Blackwell tensor cores multiply such operands
 directly. NVIDIA's [Pretraining Large Language Models with NVFP4](https://arxiv.org/abs/2509.25149)
 (2025) is the recipe for doing that during training rather than only at inference: a 12B hybrid
-Mamba-Transformer trained on 10T tokens with every eligible linear layer in NVFP4 matched its FP8
-baseline. The problem builds the recipe at toy scale in three files: \`quantize_nvfp4\` with stochastic
+Mamba-Transformer trained on 10T tokens with 84 % of its linear layers in NVFP4 stayed within about
+1.5 % (relative) of its FP8 baseline's loss, with comparable downstream accuracy. The problem builds the recipe at toy scale in three files: \`quantize_nvfp4\` with stochastic
 rounding and 16 × 16 blocks, the 16 × 16 random Hadamard transform \`rht\`, and \`NVFP4LinearFn\`, an
 autograd function whose three GEMMs all run on NVFP4 operands.
 
@@ -104,20 +104,21 @@ step = 0.5 if a < 2, 1 if a < 4, else 2
 lo = floor(a / step) · step
 q = sign(v) · (lo + step)  with probability (a − lo) / step
 q = sign(v) · lo           otherwise
-E[q] = lo + step · (a − lo) / step = a
+E[q] = sign(v) · (lo + step · (a − lo) / step) = sign(v) · a = v      for |v| ≤ 6
 \`\`\`
 
-The expectation is the value itself, for every value inside the grid. RNE's error, by contrast, is a
+The expectation is the value itself, for every value inside the grid: the two outcomes sit \`step\`
+apart and the chance of the upper one is the fraction of \`step\` already covered. RNE's error, by contrast, is a
 deterministic function of where the value sits in its interval, and gradients do not sit uniformly:
 they are heavy-tailed, so most of a block lies far below the block maximum that sets the scale. Below
-a quarter of a code, RNE stores 0. The step-1 self-test measures this on a log-normal tensor:
+0.25 E2M1 units, RNE stores 0. On the step-1 self-test's heavy-tailed tensor (Gaussian times log-normal):
 
 | measurement | round to nearest even | stochastic rounding |
 |---|---|---|
-| values below half the smallest code | 70 % of the tensor | 70 % of the tensor |
-| of those, stored as 0 by one draw | 85 % | about 79 %, the rest round up to half a code |
+| values below the smallest non-zero code, 0.5 | 70 % of the tensor | 70 % of the tensor |
+| of those, stored as 0 by one draw | 85 % | about 79 %, the rest round up to 0.5 |
 | total magnitude of those values after rounding | −41 % | +0.07 % (mean of 64 draws) |
-| RMS error of one draw, in grid gaps | 0.27 | 0.41 |
+| RMS error of one draw, in grid gaps | 0.22 | 0.34 |
 
 The widget runs the same experiment on 2,048 values. The dots are the mean error per bin of |x|: RNE's
 follow the sawtooth (negative just above every grid point, positive just below the next), SR's sit on
@@ -132,18 +133,18 @@ Two consequences shape the recipe:
   finds SR on activations or weights makes training diverge, and SR on all backward tensors no better
   than SR on the gradients alone; for the 12B model it is needed on the gradients entering both dgrad
   and wgrad.
-- **Not quite exact.** The E4M3 block scale is rounded to nearest, so it can land up to 1/16 below
-  \`amax / 6\`, which puts the block maximum up to 1/16 above 6, where it saturates. Those few values
-  (3.4 % of the step-1 test tensor) are the one place SR is biased.
+- **Not quite exact.** The E4M3 block scale is rounded to nearest, so it can land just below
+  \`amax / 6\`, which puts the block maximum up to 1/16 above 6 (for a normal E4M3 scale), where it
+  saturates. Those few values (3.4 % of the step-1 test tensor) are the one place SR is biased.
 
 :::quiz
-Q: A weight receives the same tiny gradient g every step, 0.2 of a code in its block. After 1,000 steps, what has each rounding added to it?
+Q: A weight receives the same tiny gradient g every step, 0.2 E2M1 units after scaling. After 1,000 steps, what has each rounding added to it?
 - [ ] Both about 1,000 g, since rounding errors cancel over many steps
-- [x] RNE adds 0 every step; SR adds a code with probability 0.2, about 1,000 g in total
+- [x] RNE adds 0 every step; SR adds 0.5 units with probability 0.4, about 1,000 g in total
 - [ ] RNE adds 1,000 g exactly; SR adds 1,000 g plus noise that grows without bound
-> 0.2 of a code is below the 0.25 tie, so round-to-nearest stores 0 every time and the update is lost
-> for good. SR rounds up to one code with probability 0.2, so its expected sum is exactly 1,000 g; its
-> noise grows only as the square root of the number of steps.
+> 0.2 is below the 0.25 tie between 0 and 0.5, so round-to-nearest stores 0 every time and the update
+> is lost for good. SR picks 0.5 with probability 0.2 / 0.5 = 0.4, so each draw is g in expectation and
+> the sum is 1,000 g; its noise grows only as the square root of the number of steps.
 :::
 
 # One weight for both passes: 16 × 16 blocks
@@ -151,7 +152,7 @@ Q: A weight receives the same tiny gradient g every step, 0.2 of a code in its b
 With 1 × 16 blocks, fprop quantizes the weight along \`in\` and dgrad along \`out\`: two matrices,
 \`W_fprop ≠ W_bprop\`. The backward then computes \`dX = dY · W_bprop\`, the gradient of
 the product with \`W_bprop\`, a function the forward never evaluated. The paper calls this a chain-rule violation
-and blames it for part of the accuracy loss. The fix is to give the weight one scale per 16 × 16 tile,
+and hypothesises that it costs accuracy. The fix is to give the weight one scale per 16 × 16 tile,
 16 input channels by 16 output channels: a tile and its transpose have the same amax, the same scale
 and the same codes, so \`Q(W)ᵀ = Q(Wᵀ)\` bit for bit and one quantized weight serves both GEMMs.
 
@@ -182,7 +183,8 @@ and the same codes, so \`Q(W)ᵀ = Q(Wᵀ)\` bit for bit and one quantized weigh
 :::
 
 The cost is a coarser block: one scale for 256 values instead of 16, so a tile holding one large weight
-squeezes 255 others. Weights pay it; activations and gradients keep 1 × 16 blocks because finer scaling is more accurate and
+squeezes 255 others. Weights pay it, and the paper notes they tolerate it because training adapts them
+to the FP4 grid. Activations and gradients keep 1 × 16 blocks because finer scaling is more accurate and
 because, the paper finds, training is less sensitive to their inconsistency. The table is the step-3
 ablation: the relative gap between the mean of K dgrad draws and \`dY · W_fwd\`, the true gradient of
 what the forward computed, on a layer of the trained toy model.
@@ -246,11 +248,12 @@ Why keep it, then, and why only on wgrad?
 - **Wgrad only.** Both wgrad operands are quantized fresh from activations and gradients, so both can be
   rotated along tokens and the rotation cancels. A weight cannot be rotated without breaking the 2-D
   consistency of the last section, and in the paper's ablations rotating the fprop or dgrad inputs made
-  a 1.2B model worse.
+  a 1.2B model worse: the paper's guess is that the extra quantization error the rotation adds outweighs
+  the outliers it removes, the effect Egiazarian et al. measure.
 - **For the sum, not the norm.** Rotating the wgrad inputs lowered the 1.2B model's validation loss, and
-  removing it raised the 12B run's loss; the random signs and larger matrices only paid off at 12B over
-  10T tokens. The paper reads it as bounding block-level outliers in the tensors the weight gradient
-  sums over tokens, which a tensor's error norm does not capture.
+  removing it raised the 12B run's loss; the random signs and the matrix size made no measurable
+  difference at 1.2B and only mattered at 12B. The paper credits the transform with bounding
+  block-level outliers; the evidence is in the training loss, not in a tensor's error norm.
 
 :::quiz
 Q: The step-2 test asserts that rotating a Student-t tensor does not lower its NVFP4 relative error. What does the rotation lower?
@@ -258,7 +261,7 @@ Q: The step-2 test asserts that rotating a Student-t tensor does not lower its N
 - [ ] The relative error of the block maxima
 - [x] The crest factor of each block and the share of values stored as 0
 > The rotation makes each block Gaussian-like, so its maximum is less extreme relative to the rest
-> and far fewer small values fall below a quarter of a code. The maxima themselves get worse: their
+> and far fewer small values fall below 0.25 E2M1 units. The maxima themselves get worse: their
 > energy is spread over 16 coarsely rounded entries.
 :::
 

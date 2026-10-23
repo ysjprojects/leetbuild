@@ -8,7 +8,7 @@
 export const learn = `# The mechanism at a glance
 
 A discrete GPU has separate engines that can run at the same time: the **SMs** that execute kernels and
-one or two **copy engines** (DMA units) that move bytes across PCIe or NVLink without the SMs or the host
+one or more **copy engines** (DMA units) that move bytes across PCIe or NVLink without the SMs or the host
 CPU. A program that does \`cudaMemcpy\` in, kernel, \`cudaMemcpy\` out keeps one of them busy at a time.
 Overlapping them needs three things together: host memory the copy engine can read directly
 (**pinned**), work split into independent queues (**streams**), and markers that time the work and order
@@ -21,25 +21,25 @@ events: chunk \`c\`'s \`add_carry\` waits for \`computed[c − 1]\`, recorded af
 :::gpu
 {
   "items": [
-    {"id": "stream-0", "label": "Stream 0", "sub": "chunk 0 · streams[0]", "layout": "column", "detail": "A FIFO: its operations run in issue order. Different streams have no order between them except the events they wait on.", "items": [
+    {"id": "stream-0", "label": "streams[0]", "sub": "chunk 0 · s0", "layout": "column", "detail": "A FIFO: its operations run in issue order. Different streams have no order between them except the events they wait on.", "items": [
       {"id": "h2d-0", "label": "H2D chunk 0", "sub": "cudaMemcpyAsync", "tone": "compute", "detail": "On the H2D copy engine; the call returns in microseconds."},
       {"id": "heavy-0", "label": "heavy", "sub": "<<<4096, 256, 0, s0>>>", "tone": "compute", "detail": "On the SMs: 64 sinf iterations per element of chunk 0."},
       {"id": "carry-0", "label": "add_carry", "sub": "carry = null", "tone": "compute", "detail": "No carry for chunk 0; cudaEventRecord(computed[0], s0) right after."},
       {"id": "d2h-0", "label": "D2H chunk 0", "sub": "then record landed[0]", "tone": "compute", "detail": "On the D2H copy engine, then the landing-time event."}
     ]},
-    {"id": "stream-1", "label": "Stream 1", "sub": "chunk 1 · streams[1]", "layout": "column", "items": [
+    {"id": "stream-1", "label": "streams[1]", "sub": "chunk 1 · s1", "layout": "column", "items": [
       {"id": "h2d-1", "label": "H2D chunk 1", "sub": "cudaMemcpyAsync", "tone": "compute"},
       {"id": "heavy-1", "label": "heavy", "sub": "<<<4096, 256, 0, s1>>>", "tone": "compute", "detail": "Touches only chunk 1, so it waits for nothing but its own copy."},
       {"id": "carry-1", "label": "add_carry", "sub": "after wait computed[0]", "tone": "compute", "detail": "cudaStreamWaitEvent(s1, computed[0], 0) first, then adds d_out[off − 1], the last output of chunk 0."},
       {"id": "d2h-1", "label": "D2H chunk 1", "sub": "then record landed[1]", "tone": "compute"}
     ]},
-    {"id": "stream-2", "label": "Stream 2", "sub": "chunk 2 · streams[2]", "layout": "column", "items": [
+    {"id": "stream-2", "label": "streams[2]", "sub": "chunk 2 · s2", "layout": "column", "items": [
       {"id": "h2d-2", "label": "H2D chunk 2", "sub": "cudaMemcpyAsync", "tone": "compute"},
       {"id": "heavy-2", "label": "heavy", "sub": "<<<4096, 256, 0, s2>>>", "tone": "compute"},
       {"id": "carry-2", "label": "add_carry", "sub": "after wait computed[1]", "tone": "compute"},
       {"id": "d2h-2", "label": "D2H chunk 2", "sub": "then record landed[2]", "tone": "compute"}
     ]},
-    {"id": "stream-3", "label": "Stream 3", "sub": "chunk 3 · streams[3]", "layout": "column", "items": [
+    {"id": "stream-3", "label": "streams[3]", "sub": "chunk 3 · s3", "layout": "column", "items": [
       {"id": "h2d-3", "label": "H2D chunk 3", "sub": "cudaMemcpyAsync", "tone": "compute"},
       {"id": "heavy-3", "label": "heavy", "sub": "<<<4096, 256, 0, s3>>>", "tone": "compute"},
       {"id": "carry-3", "label": "add_carry", "sub": "after wait computed[2]", "tone": "compute"},
@@ -58,15 +58,16 @@ The contract, in one file \`streams_pipeline.cu\`:
 
 - \`N = 1 << 22\` floats (16 MiB) in \`NSTREAMS = 4\` chunks of \`CHUNK = N / NSTREAMS\`, \`BLOCK = 256\`,
   \`GRID = (CHUNK + BLOCK − 1) / BLOCK\`.
-- \`heavy(in, out, n)\`: \`ITERS = 64\` iterations of \`e = m + ECC * sinf(e)\` per element (\`ECC = 0.5f\`) —
-  compute-heavy on purpose, so a chunk's copies have something to hide under.
-- \`add_carry(out, carry, n)\`: adds the previous chunk's last output \`d_out[off − 1]\` (null for chunk 0) —
+- \`heavy(in, out, n)\`: \`ITERS = 64\` iterations of \`e = m + ECC * sinf(e)\` per element (\`ECC = 0.5f\`),
+  compute of the same order as the copies on purpose, so one has something to hide under the other.
+- \`add_carry(out, carry, n)\`: adds the previous chunk's last output \`d_out[off − 1]\` (null for chunk 0),
   the one read that crosses streams.
 - \`run_pipelined(h_in, h_out, d_in, d_out, chunk_ms)\`: per chunk on its own stream, \`cudaMemcpyAsync\` H2D,
   \`heavy\`, \`cudaStreamWaitEvent(s, computed[c − 1], 0)\`, \`add_carry\`, \`cudaEventRecord(computed[c], s)\`,
   \`cudaMemcpyAsync\` D2H, \`cudaEventRecord(landed[c], s)\`; then synchronise, time, destroy.
 - \`main\`: \`h_in\`/\`h_out\` from \`cudaMallocHost\`, a synchronous single-stream \`run_baseline\` timed the same
-  way, \`PASS\` when both max abs errors are below \`1e-4\` and the speedup exceeds 1.2×.
+  way, \`PASS\` when both max abs errors are below \`1e-4\`, and a warning (not a failure) when the speedup
+  is 1.2× or less.
 
 The same shape is under PyTorch's \`DataLoader(pin_memory=True)\` with \`.to(device, non_blocking=True)\`,
 under CPU offload of optimizer states and KV-cache pages, and under NCCL overlapping the all-reduce of one
@@ -75,14 +76,14 @@ layer's gradients with the backward pass of the next.
 # Pageable memory, pinned memory and the copy engine
 
 A copy engine does DMA: it reads physical pages directly. Ordinary \`malloc\`/\`new\` memory is
-**pageable** — the OS may move or swap a page at any time — so the driver cannot hand its address to the
+**pageable** (the OS may move or swap a page at any time), so the driver cannot hand its address to the
 DMA unit. It copies the data with the CPU into a small pinned staging buffer of its own, DMAs that, and
 repeats. The [Best Practices Guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#asynchronous-and-overlapping-transfers-with-computation)
 puts the consequence plainly: \`cudaMemcpyAsync\` needs pinned host memory to be asynchronous.
 
 | Host buffer | Allocated with | What \`cudaMemcpyAsync\` does | Overlap with a kernel |
 | --- | --- | --- | --- |
-| pageable | \`malloc\`, \`new\`, \`std::vector\` | CPU stages through a driver buffer; the call returns only once the data is staged (D2H: once it has arrived) | none — the host is busy, the next chunk is not enqueued |
+| pageable | \`malloc\`, \`new\`, \`std::vector\` | CPU stages through a driver buffer; H2D returns only once the data is staged, D2H only once the copy has completed | almost none: the host is busy staging or waiting, and the next chunk is enqueued late |
 | pinned | \`cudaMallocHost\`, \`cudaHostAlloc\` | queues a DMA on the stream and returns in microseconds | yes, with the other stream's kernel |
 | registered | \`cudaHostRegister\` on existing memory | as pinned, after pinning the pages in place | yes |
 
@@ -91,7 +92,7 @@ puts the consequence plainly: \`cudaMemcpyAsync\` needs pinned host memory to be
 - The call from pageable memory still returns \`cudaSuccess\`. Nothing reports that the overlap was lost;
   only the timeline shows it, which is why the program times both versions.
 - Pinned pages cannot be swapped. Pinning gigabytes starves the OS, so allocate pinned buffers once, reuse
-  them, and release them with \`cudaFreeHost\` — never \`free\`.
+  them, and release them with \`cudaFreeHost\`, never \`free\`.
 
 With pinned buffers on both sides, one moment of the pipeline looks like this: the H2D engine moves chunk
 2 in, the SMs compute chunk 1, the D2H engine moves chunk 0 out, and the CPU is idle.
@@ -112,7 +113,7 @@ With pinned buffers on both sides, one moment of the pipeline looks like this: t
         {"id": "d-in", "array": "d_in", "cols": 4, "cells": ["0", "1", "2", "3"], "marks": [{"cols": [1, 1], "tone": "register", "label": "heavy now"}]},
         {"id": "d-out", "array": "d_out", "cols": 4, "cells": ["0", "1", "2", "3"], "marks": [{"cols": [0, 0], "tone": "host", "label": "D2H now"}]}
       ]},
-      {"id": "sms", "label": "SMs", "sub": "chunk 1, on stream 1", "tone": "compute", "layout": "column", "items": [
+      {"id": "sms", "label": "SMs", "sub": "chunk 1, on streams[1]", "tone": "compute", "layout": "column", "items": [
         {"id": "sm-heavy", "label": "heavy", "sub": "64 sinf per element"},
         {"id": "sm-carry", "label": "add_carry", "sub": "+ d_out[off − 1]"}
       ]}
@@ -134,31 +135,32 @@ enqueue the next chunk until it had.
 
 :::quiz
 Q: h_in comes from malloc and every call is cudaMemcpyAsync on its own stream. What does the timeline look like?
-- [ ] Fully overlapped — the Async suffix is what makes a copy asynchronous
-- [x] Close to the baseline: each H2D call blocks the host while the driver stages the pages, so the next chunk is enqueued late and the copy engine sits behind the CPU
+- [ ] Fully overlapped: the Async suffix is what makes a copy asynchronous
+- [x] Close to the baseline: each H2D call blocks while the CPU stages the pages, and each D2H call returns only once the copy is done, after that chunk's kernels, so the host never runs ahead
 - [ ] An error at the first cudaMemcpyAsync, because pageable memory is not allowed
-> Pageable memory is legal for cudaMemcpyAsync but the driver has to copy it through a pinned staging buffer with the CPU first. The call does not return until that is done, so the host cannot run ahead and fill the other streams. The suffix promises asynchrony only for pinned memory.
+> Pageable memory is legal for cudaMemcpyAsync, but the driver has to stage it through a pinned buffer with the CPU. An H2D call returns once its data is staged; a D2H call returns only when the copy has completed, which waits for the kernels before it in the stream. The host cannot run ahead and fill the other streams. The suffix promises asynchrony only for pinned memory.
 :::
 
 # Streams are ordered queues; the default stream is a barrier
 
-A [stream](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#streams) is a FIFO of GPU
-work. Operations in one stream run in the order they were issued; operations in different streams have
-no order between them and may run at the same time on different engines. Every async call names its
-stream — the fifth argument of \`cudaMemcpyAsync\`, the fourth of \`<<<grid, block, smem, stream>>>\`. Leave
-it out and the work goes to **stream 0**, the legacy default stream, with its implicit synchronisation:
-an operation on stream 0 waits for all earlier work in every blocking stream (every stream made by
-\`cudaStreamCreate\`), and later work in those streams waits for it. One forgotten argument puts a barrier
-in the middle of the schedule:
+A [stream](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/asynchronous-execution.html) is a
+FIFO of GPU work. Operations in one stream run in the order they were issued; operations in different
+streams have no order between them and may run at the same time on different engines. Every async call
+names its stream: the fifth argument of \`cudaMemcpyAsync\`, the fourth of \`<<<grid, block, smem, stream>>>\`.
+Leave it out and the work goes to **stream 0**, the legacy default stream, with its implicit
+synchronisation: an operation on stream 0 waits for all earlier work in every blocking stream (every
+stream made by \`cudaStreamCreate\`), and later work in those streams waits for it. One forgotten argument
+puts a barrier in the middle of the schedule:
 
-| Engine (one slot per stage) | 1 | 2 | 3 | 4 | 5 | 6 |
-| --- | --- | --- | --- | --- | --- | --- |
-| H2D copy engine | H2D 0 | | | H2D 1 | | |
-| SMs | | heavy 0 (stream 0) | | | heavy 1 (stream 0) | |
-| D2H copy engine | | | D2H 0 | | | D2H 1 |
+| Engine (one slot per stage) | 1 | 2 | 3 | 4 | 5 |
+| --- | --- | --- | --- | --- | --- |
+| H2D copy engine | H2D 0 | | H2D 1 | | |
+| SMs | | heavy 0 (stream 0) | | heavy 1 (stream 0) | |
+| D2H copy engine | | | D2H 0 | | D2H 1 |
 
-Each \`heavy\` on stream 0 waits for everything before it in every stream, and everything after waits for
-it: copy, compute, copy, one engine at a time, which is the baseline again.
+Each \`heavy\` on stream 0 waits for everything issued before it in every stream, and everything issued
+after it waits for it. Only chunk \`c\`'s D2H and chunk \`c + 1\`'s H2D, both issued after the barrier, can
+still share a slot; compute never overlaps a copy, which is close to the baseline again.
 
 With every call on its chunk's stream, the copy engines and the SMs pick up different chunks at once:
 
@@ -168,26 +170,26 @@ With every call on its chunk's stream, the copy engines and the SMs pick up diff
 | SMs | | heavy 0 | heavy 1 | heavy 2 | heavy 3 | |
 | D2H copy engine | | | D2H 0 | D2H 1 | D2H 2 | D2H 3 |
 
-The chunks land staggered by one chunk's compute. The table draws every stage the same length; with real
+The chunks land staggered by one stage. The table draws every stage the same length; with real
 proportions, and with one copy engine instead of two:
 
 :::widget stream-timeline
 
-- The host's loop runs in microseconds: it only enqueues. Twenty-odd calls are submitted before the first
+- The host's loop runs in microseconds: it only enqueues. All 27 calls are submitted before the first
   copy finishes, which is what lets the GPU look ahead.
 - Overlap needs a free engine of the right kind. With one copy engine (older or low-end parts,
   \`deviceProp.asyncEngineCount == 1\`) H2D and D2H share it and only copy–compute overlap remains;
   issuing order then matters, as NVIDIA's
   [overlap post](https://developer.nvidia.com/blog/how-overlap-data-transfers-cuda-cc/) shows.
 - Two \`heavy\` kernels from different streams can share the SMs only when one leaves room; each here fills
-  the GPU, so compute runs chunk after chunk while the copies fill the gaps.
+  the GPU, so kernels run chunk after chunk and the overlap is between copies and compute.
 
 :::quiz
 Q: Every copy is cudaMemcpyAsync on streams[c], but add_carry is launched as add_carry<<<GRID, BLOCK>>>. What happens?
-- [ ] Nothing changes — kernels run on the SMs whatever stream they are in
+- [ ] Nothing changes: kernels run on the SMs whatever stream they are in
 - [ ] add_carry runs on stream c because it follows a copy on stream c
-- [x] Each add_carry goes to the legacy default stream, which waits for all earlier work in every stream and blocks all later work: the chunks serialise
-> A launch without a stream argument is a launch on stream 0. Blocking streams created with cudaStreamCreate synchronise with it in both directions, so every add_carry becomes a device-wide barrier between chunks.
+- [x] Each add_carry goes to the legacy default stream, which waits for all earlier work in every blocking stream and holds back all later work: compute stops overlapping copies
+> A launch without a stream argument is a launch on stream 0. Blocking streams created with cudaStreamCreate synchronise with it in both directions, so every add_carry becomes a device-wide barrier between chunks: chunk c + 1's H2D and heavy cannot start until chunk c's heavy is done.
 :::
 
 # Events: timing and dependencies without stopping the host
@@ -197,9 +199,9 @@ issued to \`s\` before it has completed. That one primitive does two jobs:
 
 \`\`\`cuda
 // 1. a GPU-side dependency: stream s waits for e, the host does not
-cudaEventCreateWithFlags(&computed[c], cudaEventDisableTiming);  // no timestamp: cheaper
-cudaEventRecord(computed[c - 1], streams[c - 1]);                 // after add_carry of chunk c - 1
-cudaStreamWaitEvent(streams[c], computed[c - 1], 0);              // before add_carry of chunk c
+cudaEventCreateWithFlags(&computed[c], cudaEventDisableTiming);  // setup: no timestamp, cheaper
+cudaEventRecord(computed[c - 1], streams[c - 1]);                 // iteration c - 1, after its add_carry
+cudaStreamWaitEvent(streams[c], computed[c - 1], 0);              // iteration c, before its add_carry
 
 // 2. timing on the GPU clock
 cudaEventRecord(landed[c], streams[c]);                           // after D2H of chunk c
@@ -208,30 +210,32 @@ cudaEventElapsedTime(&chunk_ms[c], start, landed[c]);             // ms since st
 
 \`add_carry\` of chunk \`c\` reads \`d_out[off − 1]\`, which chunk \`c − 1\`'s stream writes. Without an order
 between the two streams the read races the write. The event is the order, and it holds back exactly
-one operation: the dashed edge runs from the record in stream 0 to the wait in stream 1, and \`heavy\` of
-chunk 1 sits above the wait, free to overlap chunk 0. Drop the wait and \`add_carry\` 1 may read a stale
-carry: max abs error far above \`1e-4\`, \`FAIL\`.
+one operation: the dashed edge runs from the record in \`streams[0]\` to the wait in \`streams[1]\`, and
+\`heavy\` of chunk 1 sits above the wait, free to overlap chunk 0. Drop the wait and the program may well
+still print \`PASS\`: \`add_carry\` of chunk \`c − 1\` is tiny and \`heavy\` of chunk \`c\` is long, so the write
+tends to win. Nothing guarantees it, and no tool flags it (compute-sanitizer's racecheck covers shared
+memory only), which is why the check pins the wait.
 
 :::gpu
 {
   "layout": "column",
   "items": [
     {"id": "two-streams", "label": "Chunks 0 and 1", "sub": "enqueued back to back", "align": "start", "items": [
-      {"id": "s0", "label": "Stream 0", "layout": "column", "items": [
+      {"id": "s0", "label": "streams[0]", "layout": "column", "items": [
         {"id": "heavy-0", "label": "heavy · chunk 0", "sub": "<<<4096, 256, 0, s0>>>", "tone": "compute"},
         {"id": "carry-0", "label": "add_carry · chunk 0", "sub": "writes d_out[CHUNK − 1]", "tone": "compute"},
         {"id": "rec-0", "label": "cudaEventRecord", "sub": "computed[0], s0", "detail": "Completes once everything issued to s0 before it, add_carry 0 included, has completed."}
       ]},
-      {"id": "s1", "label": "Stream 1", "layout": "column", "items": [
+      {"id": "s1", "label": "streams[1]", "layout": "column", "items": [
         {"id": "heavy-1", "label": "heavy · chunk 1", "sub": "<<<4096, 256, 0, s1>>>", "tone": "compute", "detail": "Touches only chunk 1, so it is not held back."},
-        {"id": "wait-1", "label": "cudaStreamWaitEvent", "sub": "s1, computed[0]", "detail": "Stream 1 waits on the GPU; the host returns at once and keeps enqueueing."},
+        {"id": "wait-1", "label": "cudaStreamWaitEvent", "sub": "s1, computed[0]", "detail": "s1 waits on the GPU; the host returns at once and keeps enqueueing."},
         {"id": "carry-1", "label": "add_carry · chunk 1", "sub": "reads d_out[CHUNK − 1]", "tone": "compute"}
       ]}
     ]},
     {"id": "dout", "label": "Global memory", "sub": "d_out, chunks 0 and 1", "tone": "global", "stretch": true, "items": [
       {"id": "dout-cells", "array": "d_out", "sub": "a cell = ¼ chunk, numbered by chunk", "cols": 8, "cells": ["0", "0", "0", "0", "1", "1", "1", "1"], "marks": [
-        {"cols": [3, 3], "tone": "register", "label": "carry"}
-      ], "detail": "The last element of chunk 0 is the one value stream 1 reads from stream 0's output."}
+        {"cols": [3, 3], "tone": "a", "label": "carry"}
+      ], "detail": "The last element of chunk 0 is the one value s1 reads from s0's output."}
     ]}
   ],
   "arrows": [
@@ -245,13 +249,18 @@ carry: max abs error far above \`1e-4\`, \`FAIL\`.
 | \`cudaDeviceSynchronize\` | host, for every stream | nothing is enqueued until the GPU drains |
 | \`cudaStreamSynchronize(s)\` | host, for one stream | the next chunk is enqueued only after this one finishes |
 | \`cudaStreamWaitEvent(s, e)\` | stream \`s\` only, on the GPU | the host keeps enqueueing; only the dependent operation waits |
-| synchronous \`cudaMemcpy\` | host, and stream 0 semantics | both of the above at once |
+| synchronous \`cudaMemcpy\` | host, until the copy is done | the host stalls, and the copy on the legacy stream is a barrier for every blocking stream |
 
 - The wait sits **after** \`heavy\`, not at the top of the chunk: \`heavy\` of chunk \`c\` does not read chunk
   \`c − 1\` and still overlaps it; only \`add_carry\` waits.
 - \`computed\` events only order work, so they are created with \`cudaEventDisableTiming\`; \`start\`, \`stop\`
   and \`landed\` carry timestamps.
-- The host synchronises once, after the loop — every stream, then \`stop\`. That is the only host wait.
+- A wait binds to the record **issued before it** on the host: \`cudaStreamWaitEvent\` uses the work the
+  event captured at its most recent \`cudaEventRecord\`, and a later record does not change it. A wait on an
+  event that was never recorded waits for nothing and returns success. The loop issues the record of
+  chunk \`c − 1\` one iteration before the wait of chunk \`c\`; reorder those two calls and the race is back,
+  silently.
+- The host synchronises once, after the loop: every stream, then \`stop\`. That is the only host wait.
 
 :::quiz
 Q: Why is cudaStreamWaitEvent(s, computed[c − 1], 0) placed between heavy and add_carry rather than before chunk c's H2D copy?
@@ -263,15 +272,16 @@ Q: Why is cudaStreamWaitEvent(s, computed[c − 1], 0) placed between heavy and 
 
 # Chunk count and the speedup you can get
 
-With three engines and \`n\` chunks, the pipeline costs the slowest stage plus the fill and drain of the
-other two:
+With three engines and \`n\` equal chunks, the pipeline costs the slowest stage plus \`1/n\` of the others,
+the fill before it and the drain after it:
 
 \`\`\`text
 T_baseline ≈ T_h2d + T_kernel + T_d2h
-T_pipe     ≈ T_h2d / n + max(T_h2d, T_kernel, T_d2h) + T_d2h / n      (compute-bound case: max = T_kernel)
+T_pipe     ≈ M + (T_baseline − M) / n      M = max(T_h2d, T_kernel, T_d2h)
+                                           one copy engine: M = max(T_h2d + T_d2h, T_kernel)
 \`\`\`
 
-For 16 MiB over about 25 GB/s (0.67 ms each way) and 1.6 ms of \`heavy\`:
+For 16 MiB over about 25 GB/s (0.67 ms each way) and 1.6 ms of \`heavy\` (compute-bound, \`M = T_kernel\`):
 
 | \`NSTREAMS\` | Chunk | \`T_pipe\` | Speedup | Cost |
 | --- | --- | --- | --- | --- |
@@ -279,12 +289,13 @@ For 16 MiB over about 25 GB/s (0.67 ms each way) and 1.6 ms of \`heavy\`:
 | 2 | 8 MiB | 2.27 ms | 1.3× | fill and drain are half the copies |
 | 4 | 4 MiB | 1.94 ms | 1.5× | the problem's setting |
 | 8 | 2 MiB | 1.77 ms | 1.7× | 8 streams, 16 events |
-| 64 | 256 KiB | ≈ 1.7 ms | < 1.8× | launch and copy overheads (~5–10 µs each) start to dominate |
+| 64 | 256 KiB | 1.62 ms in the model | 1.8× at most | about 450 host calls at a few µs each, and 256 KiB copies run below the link's peak |
 
-- The ceiling is \`T_baseline / max(stage)\`: here 2.94 / 1.6 ≈ 1.8×. More chunks only shrink fill and
-  drain toward it.
-- If the copies dominated instead, the kernel would hide under them and the bound would be the link.
-  Overlap never makes the slowest engine faster.
+- The ceiling is \`T_baseline / M\`: here 2.94 / 1.6 ≈ 1.8×. More chunks only shrink fill and drain
+  toward it.
+- Which stage is \`M\` depends on the GPU. A fast GPU finishes \`heavy\` in less than one copy, and then
+  the kernel hides under the copies and the link is the bound; with one copy engine both directions add
+  up. Overlap never makes the slowest engine faster.
 - Small copies lose bandwidth: each DMA has a fixed setup cost, and below a few hundred KiB the link runs
   well under its peak. Chunks of a few MiB are the usual sweet spot.
 - Streams are reused, not one per chunk forever: a long input cycles chunk \`c\` onto
@@ -293,7 +304,7 @@ For 16 MiB over about 25 GB/s (0.67 ms each way) and 1.6 ms of \`heavy\`:
 :::quiz
 Q: The kernel takes 1.6 ms for the whole array and each copy direction 0.67 ms. Can any number of streams reach a 2.5× speedup over the 2.94 ms baseline?
 - [ ] Yes, with 64 or more streams
-- [x] No — the SMs still need 1.6 ms, so the best is about 2.94 / 1.6 ≈ 1.8×
+- [x] No: the SMs still need 1.6 ms, so the best is about 2.94 / 1.6 ≈ 1.8×
 - [ ] Yes, if the two heavy kernels run concurrently on the SMs
 > Overlap hides the shorter stages under the longest; it cannot shorten the longest. Here that is compute, and concurrent kernels that each fill the GPU still share the same SMs.
 :::
@@ -302,31 +313,35 @@ Q: The kernel takes 1.6 ms for the whole array and each copy direction 0.67 ms. 
 
 The three ingredients stay; the machinery around them grows.
 
-- **Non-blocking streams.** \`cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking)\` or compiling with
-  \`--default-stream per-thread\` removes the implicit barrier with stream 0, so a library call that uses
-  the default stream cannot serialise your pipeline. PyTorch's \`torch.cuda.Stream\` objects are this kind.
+- **Non-blocking streams.** Streams made with \`cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking)\` do
+  not synchronise with the legacy default stream, so a library call that launches on stream 0 cannot
+  serialise your pipeline; PyTorch creates its side streams this way. Two traps come with them:
+  \`cudaEventRecord(start, 0)\` no longer orders anything against those streams (record \`start\` in one
+  of them and make the others wait on it), and \`--default-stream per-thread\` is a different fix. It turns
+  stream 0 into a per-thread stream only in the compilation units built with it, and that stream still
+  synchronises with the legacy stream any other code uses.
 - **CUDA Graphs.** The host still spends microseconds per call; at many small chunks that becomes the
   bottleneck. [CUDA Graphs](https://developer.nvidia.com/blog/cuda-graphs/) capture a whole multi-stream
-  schedule — copies, kernels, event edges — once with \`cudaStreamBeginCapture\` and replay it with one
-  \`cudaGraphLaunch\`. \`torch.cuda.graphs\` and the decode loops of LLM servers use exactly this.
+  schedule (copies, kernels, event edges) once with \`cudaStreamBeginCapture\` and replay it with one
+  \`cudaGraphLaunch\`. \`torch.cuda.CUDAGraph\` and the decode loops of LLM servers use exactly this.
 - **Pinned pools.** Frameworks allocate pinned memory once and recycle it: PyTorch's caching host allocator
-  behind \`pin_memory()\`, the \`DataLoader(pin_memory=True)\` worker that copies each batch into it, and
-  \`.to(device, non_blocking=True)\` that issues the H2D copy on the current stream.
+  behind \`pin_memory()\`, the \`DataLoader(pin_memory=True)\` pin-memory thread that copies each batch into
+  it, and \`.to(device, non_blocking=True)\` that issues the H2D copy on the current stream.
 - **Communication streams.** NCCL runs collectives on their own streams with events toward the compute
-  stream, so the all-reduce of one bucket of gradients overlaps the backward pass of the next layers —
+  stream, so the all-reduce of one bucket of gradients overlaps the backward pass of the next layers:
   the same \`cudaStreamWaitEvent\` edge as \`add_carry\`'s.
 
 :::details Why the program reports the fastest of three runs
-The first run of each version pays one-time costs that are not part of the mechanism: the warm-up launch
-already loads the kernel modules, but the first pipelined run also creates streams and events and may
-find the copy engines cold. Taking the minimum of \`REPS = 3\` runs measures the steady state, and zeroing
-\`h_out\` and \`d_out\` between the two versions makes sure a pipeline that never copies back cannot pass on
-the baseline's leftovers.
+The first timed run of each version can still pay costs that are not part of the mechanism (GPU clocks
+ramping up from idle, first-use work in the driver) even after the warm-up launches. Taking the minimum
+of \`REPS = 3\` runs measures the steady state, and the printed landing times come from that same fastest
+run. Zeroing \`h_out\` and \`d_out\` between the two versions makes sure a pipeline that never copies back
+cannot pass on the baseline's leftovers.
 :::
 
 :::quiz
 Q: A training loop calls .to(device, non_blocking=True) on a batch that came from a DataLoader with pin_memory=False. What does non_blocking buy?
-- [x] Almost nothing for H2D — the source is pageable, so the copy is staged by the CPU and the host does not run ahead
+- [x] Almost nothing for H2D: the source is pageable, so the copy is staged by the CPU and the host does not run ahead
 - [ ] Full overlap, because non_blocking makes PyTorch pin the tensor on the fly before every copy
 - [ ] A crash, because non_blocking requires pinned memory
 > non_blocking=True becomes cudaMemcpyAsync. From pageable memory that call is legal but staged and effectively synchronous, which is the pageable row of the table above; the batch must be pinned first.

@@ -62,6 +62,11 @@ this guide is the right one.
 
 # From RLHF to a loss on the policy
 
+Two refreshers first. The **KL divergence** \`KL(π ‖ π_ref) = E_{y∼π}[log π(y|x) − log π_ref(y|x)]\` is 0
+when the two models agree and grows as π puts mass where π_ref does not. The **Bradley–Terry model**
+turns two scores into a win probability, \`p(a beats b) = σ(r_a − r_b)\` with \`σ(z) = 1 / (1 + e^(−z))\`:
+equal scores give 0.5, a gap of 2 gives 0.88, and only the difference matters.
+
 RLHF's last stage maximises a learned reward while a KL term keeps the policy close to the SFT model
 it started from (the *reference*). DPO's observation is that this objective has a closed-form optimum,
 and that the optimum can be turned around to express the reward through the policy:
@@ -76,9 +81,12 @@ substitute    p(y_w ≻ y_l | x) = σ( β · h ),   Z(x) cancels
 loss          L = − log σ( β · h )                                    maximum likelihood
 \`\`\`
 
+- **Why the optimum has that form.** Per prompt, the objective equals \`−β · KL(π ‖ π_ref·e^(r/β)/Z) + β·log Z\`,
+  and \`Z\` does not depend on π, so it peaks where that KL is 0: π equals the reweighted reference
+  (the DPO paper's Appendix A.1).
 - **The partition function cancels.** \`Z(x)\` sums over every possible response and is intractable; it
   depends only on the prompt, and both sides of a comparison share the prompt. That is why DPO needs
-  pairs and cannot use single rated answers.
+  pairs and cannot use single rated answers directly.
 - **The reward model becomes the policy.** The logistic loss InstructGPT trains its reward model with is
   the same \`−log σ(r_w − r_l)\`; DPO plugs in \`r = β · log(π / π_ref)\` and trains the policy directly.
   Fitting the preferences with this reward and then solving RLHF would give back the same policy.
@@ -94,6 +102,20 @@ loss          L = − log σ( β · h )                                    maxim
 | chosen reward | β·(log π(y_w) − log π_ref(y_w)) | 0 |
 | reward accuracy | mean(r_w > r_l) | ties: float noise |
 | gradient weight | σ(−β·h) | 0.5 |
+
+One pair, worked through at β = 0.1. The policy scores the chosen response at \`log π(y_w|x) = −12.0\`
+and the rejected at \`−15.0\`; the reference scored them \`−13.0\` and \`−14.0\`:
+
+\`\`\`text
+h               = (−12.0 − (−15.0)) − (−13.0 − (−14.0)) = 3.0 − 1.0 = 2.0
+loss            = −log σ(0.1 · 2.0) = log(1 + e^(−0.2)) = 0.598          below ln 2: ranked right
+weight          = σ(−0.2) = 0.450                                       still pushing, a little less than 0.5
+chosen reward   = 0.1 · (−12.0 − (−13.0)) = +0.1
+rejected reward = 0.1 · (−15.0 − (−14.0)) = −0.1                        reward margin 0.2 = β·h
+\`\`\`
+
+The policy already prefers \`y_w\` by 3 nats, but only 2 of them are new: the reference preferred it by 1
+nat to begin with, and DPO credits only the change.
 
 :::quiz
 Q: Why does DPO need a pair of responses to the same prompt rather than one response with a score?
@@ -158,7 +180,7 @@ Every line has a way to be silently wrong. None of them crash, and all of them s
 | mistake | what the number becomes | what happens to training |
 |---|---|---|
 | no shift (logits[:, t] against token t) | each token scored by a position that already saw it | the margin is meaningless; the model learns to copy |
-| prompt not masked | log π(x, y) instead of log π(y given x) | the prompt term cancels in theory but adds its noise to every margin |
+| prompt not masked | log π(x, y) instead of log π(y given x) | h and the loss barely move (both rows score the same prompt prefix, which cancels up to float rounding), but each side's implicit reward absorbs the prompt's drift, and any length-normalised variant divides by the wrong count |
 | padding not masked | a short response gets pad-token log-probs added | rejected and chosen of different lengths are scored unfairly |
 | mean instead of sum | per-token average | a different, length-normalised objective (IPO as TRL runs it, SimPO) |
 | log_softmax in bf16 | differences below bf16's 8 significant bits are lost | h is rounding noise for small updates |
@@ -258,11 +280,19 @@ Where each one stops pulling, at β = 0.1:
 | cDPO, ε = 0.1 | β·h = ln 9, h ≈ 22.0 | weight → 0.9 | weight → −0.1, pushes back |
 | cDPO, ε = 0.2 | β·h = ln 4, h ≈ 13.9 | weight → 0.8 | weight → −0.2 |
 | IPO | h = 1/(2β) = 5 | gradient grows linearly | gradient grows linearly, pushes back |
+| rDPO (TRL's \`"robust"\`), ε = 0.1 | never | weight → (1 − ε)/(1 − 2ε) = 1.125 | weight → ε/(1 − 2ε) = 0.125, still pushing |
 
-TRL applies IPO to length-averaged log-probabilities (its code notes that the IPO authors confirmed this
-is the form behind the paper's results); the authors' DPO trainer and this problem apply the same
-formula to sums. With sums, \`1/(2β)\` is a margin over the whole response, which a long response reaches
-more easily than a short one.
+Smoothing is not the only way to model flipped labels. Robust DPO
+([Chowdhury et al., 2024](https://arxiv.org/abs/2403.00409)) divides by \`1 − 2ε\` and subtracts the
+flipped term instead of adding it, which makes the loss an unbiased estimate of the clean-label loss.
+Its weight never turns negative, so it de-biases the gradient but sets no finite target.
+
+Current TRL (v1.16) differs from the authors' trainer on both variants. Its \`"sigmoid"\` loss ignores
+\`label_smoothing\` (the option now feeds \`"robust"\`, \`"exo_pair"\` and \`"aot"\`), so cDPO is not one of
+its losses. Its \`"ipo"\` loss divides each side's summed log-ratio by its completion length (the code
+notes that the IPO authors confirmed this is the form behind the paper's results). The authors' trainer
+and this problem keep cDPO and apply IPO to sums. With sums, \`1/(2β)\` is a margin over the whole
+response, which a long response reaches more easily than a short one.
 
 :::quiz
 Q: With label smoothing ε = 0.1 and β = 0.1, a pair reaches h = 40. What does the cDPO gradient do?
@@ -292,21 +322,21 @@ wrong, beside the correct version:
 | the reference is | what h measures | what you see |
 |---|---|---|
 | a deep copy, eval, no grad (correct) | change in preference since the start | loss starts at ln 2, margin grows, reference bit-identical |
-| the same object as the policy (\`reference = policy\`) | always 0 | loss pinned at ln 2 while the policy still moves: every pair gets the constant weight 0.5, nothing anchors it |
+| the policy itself (\`reference = policy\`, no copy, no freeze) | always 0 | loss pinned at ln 2 while the policy still moves: every pair gets the constant weight 0.5, nothing anchors it |
 | a copy left in train mode with dropout | change plus dropout noise | first loss not ln 2; noisy margins |
-| re-copied from the policy every few steps | change since the last copy | the KL anchor drifts with the policy; β no longer bounds the distance from the SFT model |
+| re-copied from the policy every few steps | change since the last copy | the KL anchor drifts with the policy; β no longer bounds the distance from the SFT model (TR-DPO does this on purpose, TRL's \`sync_ref_model\`) |
 | run with grad | the right numbers | activation memory for a second model and gradients nobody uses |
 
 On the toy set (sort three digits ascending rather than descending) the run looks like this, from the
 solution's self-test, 150 steps at β = 0.1:
 
-| metric | step 0 | steps 1 to 10 | end |
+| metric | step 0 | steps 1 to 10 | end, all 32 pairs |
 |---|---|---|---|
-| loss (mean over the batch) | 0.693 | falling | 0.001 |
-| reward accuracy | float noise around ties | reaches 1.0 | 1.00 on all 32 pairs |
+| loss (mean) | 0.693 | falling | 0.001 |
+| reward accuracy | float noise around ties | 1.0 from step 2 | 1.00 |
 | reward margin | 0 | 0.32 (mean) | 7.26 |
-| chosen reward | 0 | up a little | about −0.18 |
-| rejected reward | 0 | down | about −7.3 |
+| chosen reward | 0 | up a little | about −0.32 |
+| rejected reward | 0 | down | about −7.58 |
 
 Two things to read from it. Reward accuracy saturates within a few steps and says little afterwards;
 the margin keeps moving. And the chosen reward ends *below* zero: the policy made the chosen response
@@ -316,15 +346,16 @@ log-probability dropping during training, and recipes such as RPO add a supervis
 response against it.
 
 :::details What production trainers add
-TRL's \`DPOTrainer\` and the authors' trainer run the same loop with: an SFT model as both the starting
-policy and the reference, reference log-probs precomputed in one pass over the data (they never change),
-LoRA adapters so the reference is simply the base model with the adapters disabled, bf16 with FSDP, a
-learning rate around 1e-6 with warmup, and evaluation by generating and judging rather than by reward
-accuracy on the training pairs.
+TRL's \`DPOTrainer\` runs the same loop with: an SFT model as both the starting policy and the
+reference, reference log-probs precomputed in one pass over the data (\`precompute_ref_log_probs\`: they
+never change), LoRA adapters so the reference is simply the base model with the adapters disabled, bf16
+with FSDP or DeepSpeed, a default learning rate of 1e-6, and evaluation by generating and judging rather
+than by reward accuracy on the training pairs. The authors' trainer has the FSDP, the warmup and the
+small learning rate, but neither precomputing nor LoRA.
 :::
 
 :::quiz
-Q: You write reference = policy instead of a deep copy. What does training look like?
+Q: You skip make_reference and pass the policy itself as the reference. What does training look like?
 - [ ] Training diverges, because the reference gradient doubles the step
 - [x] The loss reads exactly ln 2 at every step while the policy keeps changing, pushed with a constant weight and no anchor
 - [ ] Nothing changes, because the reference is evaluated without a graph

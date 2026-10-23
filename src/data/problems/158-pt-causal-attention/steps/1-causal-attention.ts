@@ -11,7 +11,7 @@ export const causalAttentionStep: Step = {
 Implement \`CausalSelfAttention(nn.Module)\` with \`__init__(self, d_model, n_heads, dropout=0.0, max_len=1024)\`
 and \`forward(self, x, attn_mask=None)\` → \`[B, T, d_model]\`, where position \`t\` attends to positions
 \`0..t\` only. \`torch.nn.functional.scaled_dot_product_attention\`, \`nn.MultiheadAttention\` and
-\`nn.Transformer*\` are **forbidden inside the module** — the self-test uses SDPA as the reference.
+\`nn.Transformer*\` are **forbidden inside the module**: the self-test uses SDPA as the reference.
 
 - **One fused projection**: \`self.qkv = nn.Linear(d_model, 3 * d_model)\`; \`split(d_model, dim=-1)\` gives
   \`q, k, v\`, each \`[B, T, d_model]\`. \`self.head_dim = d_model // n_heads\` (assert it divides).
@@ -34,15 +34,15 @@ and \`forward(self, x, attn_mask=None)\` → \`[B, T, d_model]\`, where position
   \`F.scaled_dot_product_attention(q, k, v, is_causal=True)\` through the same weights at \`atol=rtol=1e-5\`,
   a perturbation of token 5 that leaves positions \`0..4\` unchanged, a right-padded sample against SDPA
   with an explicit boolean mask, \`torch.autograd.gradcheck\` on a \`(8, 2)\` module in float64, dropout
-  that is a no-op in \`eval()\` — and \`PASS\`.
+  that is a no-op in \`eval()\`, and \`PASS\`.
 
 > The mask must zero the *probability*, not the score: \`-inf\` before the softmax makes \`exp\` return exactly
 > 0 and leaves the row normalised over the past alone. Masking after the softmax leaks the future
 > through the denominator.`,
   hints: [
     'Shapes first: `self.qkv(x)` is `[B, T, 3D]`; `.split(self.d_model, dim=-1)` gives three `[B, T, D]`; `.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)` makes each `[B, H, T, hd]`, and `q @ k.transpose(-2, -1)` is then `[B, H, T, T]` with no loop over heads.',
-    'Build the mask once in `__init__` as a bool buffer and slice `self.causal_mask[:T, :T]` in `forward`; a `[T, T]` bool broadcasts over `[B, H, T, T]`. `scores.masked_fill(~mask, float("-inf"))` then `torch.softmax(..., dim=-1, dtype=torch.promote_types(scores.dtype, torch.float32)).to(v.dtype)` — `promote_types` is float32 for half inputs and leaves float64 alone, which is what `gradcheck` needs.',
-    'After `probs @ v` the tensor is `[B, H, T, hd]`: `transpose(1, 2)` gives `[B, T, H, hd]`, which is not contiguous, so `.contiguous()` before `.view(B, T, D)`. The padding mask is `attn_mask[:, None, None, :]` — it masks *keys* (columns), not queries.',
+    'Build the mask once in `__init__` as a bool buffer and slice `self.causal_mask[:T, :T]` in `forward`; a `[T, T]` bool broadcasts over `[B, H, T, T]`. `scores.masked_fill(~mask, float("-inf"))` then `torch.softmax(..., dim=-1, dtype=torch.promote_types(scores.dtype, torch.float32)).to(v.dtype)`: `promote_types` is float32 for half inputs and leaves float64 alone, which is what `gradcheck` needs.',
+    'After `probs @ v` the tensor is `[B, H, T, hd]`: `transpose(1, 2)` gives `[B, T, H, hd]`, which is not contiguous, so `.contiguous()` before `.view(B, T, D)`. The padding mask is `attn_mask[:, None, None, :]`: it masks *keys* (columns), not queries.',
   ],
   checks: [
     {
@@ -102,7 +102,7 @@ and \`forward(self, x, attn_mask=None)\` → \`[B, T, d_model]\`, where position
       id: 'float32-softmax',
       title: 'The softmax runs in float32 (or wider)',
       detail:
-        '`softmax(..., dtype=torch.float32)` / `promote_types(scores.dtype, torch.float32)` or `scores.float()` on the same line: a bfloat16 softmax has 8 bits of mantissa and loses the small probabilities a long row is made of; cast back to `v.dtype` afterwards.',
+        '`softmax(..., dtype=torch.float32)` / `promote_types(scores.dtype, torch.float32)` or `scores.float()` on the same line: a softmax that sums in bfloat16 (8 significand bits) rounds away the small terms of a long row, and a 4096-key row sums about 30 % low; cast back to `v.dtype` afterwards.',
       match: {
         python: {all: [/softmax\([^\n]*(float32|\.float\(\))/]},
       },
@@ -123,7 +123,7 @@ and \`forward(self, x, attn_mask=None)\` → \`[B, T, d_model]\`, where position
     },
     {
       id: 'dropout-then-proj',
-      title: 'Dropout on the probabilities, then @ v, then proj — and no shortcut',
+      title: 'Dropout on the probabilities, then @ v, then proj, and no shortcut',
       detail:
         '`nn.Dropout(dropout)` applied after the softmax and before `probs @ v`, then `self.proj(...)` last; no `F.scaled_dot_product_attention` or `nn.MultiheadAttention` inside the module (the self-test may call SDPA as its reference).',
       match: {
@@ -309,7 +309,7 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `The module is nanoGPT's \`CausalSelfAttention\` written out, and each line is where it is for a reason. The **fused qkv** Linear is one \`[B·T, D] × [D, 3D]\` GEMM: \`x\` is read from memory once and the three projections share one launch — three separate layers cost three reads and three launches for the same arithmetic. **Heads are a view**: \`[B, T, D] → [B, T, H, hd] → [B, H, T, hd]\` costs no copy, and the batched \`q @ kᵀ\` runs all \`B × H\` attention matrices in one kernel; the \`.contiguous()\` on the way back is the only copy, because \`transpose\` only changes strides and \`view\` needs the memory in order. The **mask is a buffer**: it is state the module owns (it moves with \`.to(device)\`) but nothing trains it, and \`persistent=False\` keeps a megabyte of ones out of every checkpoint. **\`-inf\` before the softmax** is the only correct place for it — \`exp(-inf) = 0\` exactly, so masked keys get no probability and take no share of the denominator; a mask applied to the probabilities afterwards leaves the future in the normaliser, and a large finite constant like \`-1e4\` still gives \`exp(-1e4 + max)\`, which is not zero once the scores themselves are large. **Softmax in float32** matters in mixed precision: bfloat16 keeps 8 bits of mantissa, so a row of 4096 probabilities loses most of its small entries; \`promote_types\` upcasts half inputs and leaves float64 alone, which is why \`gradcheck\` passes on the same code path.
+  debrief: `The module is nanoGPT's \`CausalSelfAttention\` written out, and each line is where it is for a reason. The **fused qkv** Linear is one \`[B·T, D] × [D, 3D]\` GEMM: \`x\` is read from memory once and the three projections share one launch, where three separate layers cost three reads and three launches for the same arithmetic. **Heads are a view**: \`[B, T, D] → [B, T, H, hd] → [B, H, T, hd]\` costs no copy, and the batched \`q @ kᵀ\` runs all \`B × H\` attention matrices in one kernel; the \`.contiguous()\` on the way back is the only copy, because \`transpose\` only changes strides and \`view\` needs the memory in order. The **mask is a buffer**: it is state the module owns (it moves with \`.to(device)\`) but nothing trains it, and \`persistent=False\` keeps a megabyte of bools out of every checkpoint. **\`-inf\` before the softmax** is the only correct place for it: \`exp(-inf) = 0\` exactly, so masked keys get no probability and take no share of the denominator, while a mask applied to the probabilities afterwards leaves the future in the normaliser. A large finite fill such as \`-1e4\` also underflows to 0 in practice, but turns a row with no visible key into a silent uniform average over padding instead of a NaN you notice. **Softmax in float32** matters in mixed precision: a sum in bfloat16 (8 significand bits) rounds away the small terms of a long row, so a 4096-key row sums about 30 % low; PyTorch's softmax kernel already accumulates in float32, and the explicit \`dtype\` makes that the contract. \`promote_types\` upcasts half inputs and leaves float64 alone, which is why \`gradcheck\` passes on the same code path.
 
-What this module does *not* do is the whole reason \`F.scaled_dot_product_attention\` exists. The \`[B, H, T, T]\` score tensor is \`O(T²)\` memory — at \`T = 8192\`, \`H = 32\`, one sample is 4 GiB of bfloat16 scores plus the same again for the probabilities and their gradient — and it is written to HBM and read back three times (scores, softmax, \`probs @ v\`). **FlashAttention-2** never materialises it: it streams tiles of \`k\` and \`v\` through SRAM, keeps a running row-max and row-sum (the *online softmax*), and rescales partial outputs as the max moves, so memory is \`O(T)\` and the arithmetic stays on-chip; the backward pass recomputes the probabilities from the saved row statistics instead of storing them. SDPA dispatches to that kernel, to the memory-efficient xFormers kernel, or to this math fallback depending on dtype, mask shape and device — \`is_causal=True\` is a hint that lets the kernel skip the upper-triangle tiles entirely instead of computing and masking them. Production stacks add a **KV cache** at inference (\`k\` and \`v\` of past tokens kept, one query row per step), **grouped-query attention** (fewer \`k\`/\`v\` heads than \`q\` heads, shrinking that cache), **RoPE** applied to \`q\` and \`k\` before the scores, and \`torch.compile\` to fuse the reshapes and the scale into the surrounding kernels.`,
+What this module does *not* do is the whole reason \`F.scaled_dot_product_attention\` exists. The \`[B, H, T, T]\` score tensor is \`O(T²)\` memory (at \`T = 8192\`, \`H = 32\`, one sample is 4 GiB of bfloat16 scores, plus the same again for the probabilities and their gradient), and it makes a round trip through HBM at each of the scores, the softmax and \`probs @ v\`. **FlashAttention-2** never materialises it: it streams tiles of \`k\` and \`v\` through SRAM, keeps a running row-max and row-sum (the *online softmax*), and rescales partial outputs as the max moves, so memory is \`O(T)\` and the arithmetic stays on-chip; the backward pass recomputes the probabilities from the saved row statistics instead of storing them. SDPA dispatches to that kernel, to the memory-efficient (xFormers) kernel, to cuDNN attention, or to a math fallback like this file, depending on dtype, mask and device; \`is_causal=True\` lets the fused kernels skip the upper-triangle tiles entirely instead of computing and masking them. Two of its semantics bite when you swap it in: \`dropout_p\` applies whenever it is above 0, so pass \`self.dropout if self.training else 0\` as nanoGPT does, and \`is_causal\` cannot be combined with \`attn_mask\`, so padding needs the full boolean mask. Production stacks add a **KV cache** at inference (\`k\` and \`v\` of past tokens kept, one query row per step), **grouped-query attention** (fewer \`k\`/\`v\` heads than \`q\` heads, shrinking that cache), **RoPE** applied to \`q\` and \`k\` before the scores, and \`torch.compile\` to fuse the reshapes and the scale into the surrounding kernels.`,
 };

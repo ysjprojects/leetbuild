@@ -4,7 +4,7 @@ import {learn} from './learn';
 import {loraStep} from './steps/1-lora';
 
 /**
- * Deep-learning drill: LoRA as module surgery — a frozen `nn.Linear` wrapped with a zero-initialised
+ * Deep-learning drill: LoRA as module surgery: a frozen `nn.Linear` wrapped with a zero-initialised
  * rank-r update scaled by alpha / r, merged into the weight for inference and unmerged again, applied in
  * place to the attention projections of a small transformer, with adapter-only training and checkpoints.
  */
@@ -22,23 +22,24 @@ export const ptLoraProblem: Problem = {
 
 Fine-tuning a 7B model end to end means gradients and two AdamW moments for every one of its seven billion
 weights. LoRA (Hu et al., 2021) fine-tunes it on one GPU instead: freeze the pre-trained weight \`W\` of
-selected linear layers — usually the attention projections \`q_proj\` and \`v_proj\` — and learn the change
-as a product of two thin matrices, \`ΔW = B @ A · alpha / r\`, with \`A\` of shape \`(r, in)\`, \`B\` of shape
-\`(out, r)\` and \`r\` of 4 to 64. \`B\` starts at zero, so the adapted model is the pre-trained model at
-step 0; only \`A\` and \`B\` get gradients and optimizer state; and when training ends \`ΔW\` is added into
-\`W\`, so the served model is a plain transformer with no extra latency. Every open-weight fine-tuning
-stack — Hugging Face PEFT, Axolotl, torchtune, Unsloth — and every multi-adapter server is built on this.
+selected linear layers (the paper adapts the attention projections \`q_proj\` and \`v_proj\`; recipes since
+QLoRA adapt every linear layer) and learn the change as a product of two thin matrices,
+\`ΔW = B @ A · alpha / r\`, with \`A\` of shape \`(r, in)\`, \`B\` of shape \`(out, r)\` and \`r\` of 4 to 64. \`B\`
+starts at zero, so the adapted model is the pre-trained model at step 0; only \`A\` and \`B\` get gradients
+and optimizer state; and when training ends \`ΔW\` is added into \`W\`, so the served model is a plain
+transformer with no extra latency. Hugging Face PEFT, Axolotl, torchtune and Unsloth implement it, and
+multi-adapter servers (S-LoRA, Punica, vLLM) serve it unmerged.
 
 The surface is one class and three functions, in \`torch\` only:
 
-- \`LoRALinear(base: nn.Linear, r: int, alpha: float, dropout: float = 0.0)\` — keeps \`base\` frozen as a
+- \`LoRALinear(base: nn.Linear, r: int, alpha: float, dropout: float = 0.0)\`: keeps \`base\` frozen as a
   submodule, owns \`lora_A\` \`(r, in_features)\` and \`lora_B\` \`(out_features, r)\`, \`scaling = alpha / r\`,
   \`merged\`; \`forward(x)\` for \`x\` of shape \`(…, in_features)\`, \`merge()\`, \`unmerge()\`.
-- \`apply_lora(model, target_names, r, alpha, dropout=0.0) -> nn.Module\` — swaps every \`nn.Linear\` whose
+- \`apply_lora(model, target_names, r, alpha, dropout=0.0) -> nn.Module\`: swaps every \`nn.Linear\` whose
   attribute name is in \`target_names\` for a \`LoRALinear\` around it, in place.
-- \`mark_only_lora_trainable(model) -> int\` — \`requires_grad\` on \`lora_\` parameters only; returns the
+- \`mark_only_lora_trainable(model) -> int\`: \`requires_grad\` on \`lora_\` parameters only; returns the
   trainable count.
-- \`lora_state_dict(model) -> dict\` — the adapter checkpoint: the \`lora_\` entries of \`state_dict()\`.
+- \`lora_state_dict(model) -> dict\`: the adapter checkpoint, the \`lora_\` entries of \`state_dict()\`.
 
 ## What you build here
 
@@ -48,13 +49,13 @@ The surface is one class and three functions, in \`torch\` only:
 
 ## Run it on your machine
 
-\`python lora.py\` — the self-test checks that a fresh adapter reproduces the original layer bit for bit,
-that only \`lora_A\` and \`lora_B\` receive gradients, and that merge/unmerge round-trips in float64 (output
-within \`1e-6\`, weight within \`1e-12\`). It then adapts \`q_proj\` and \`v_proj\` of a two-block \`d = 128\`
-transformer with \`r = 4\`, \`alpha = 8\` — 4096 of 462336 parameters train — runs five \`AdamW\` steps,
-asserts the loss fell, every adapter moved and no frozen weight did, reloads the eight-tensor adapter
-checkpoint into a fresh copy, and compares merged against unmerged inference within \`1e-5\`. A passing run
-prints the trainable fraction and \`PASS\`.
+\`python lora.py\` runs in about 2 s on a laptop CPU. The self-test checks that a fresh adapter reproduces the
+original layer bit for bit, that only \`lora_A\` and \`lora_B\` receive gradients, and that merge/unmerge
+round-trips in float64 (output within \`1e-6\`, weight within \`1e-12\`). It then adapts \`q_proj\` and
+\`v_proj\` of a two-block \`d = 128\` transformer with \`r = 4\`, \`alpha = 8\` (4096 of 462336 parameters train),
+runs five \`AdamW\` steps, asserts the loss fell, every adapter moved and no frozen weight did, reloads the
+eight-tensor adapter checkpoint into a fresh copy, and compares merged against unmerged inference within
+\`1e-5\`. A passing run prints the trainable fraction and \`PASS\`.
 
 ## Left out on purpose
 

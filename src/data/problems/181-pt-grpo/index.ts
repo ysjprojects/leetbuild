@@ -85,9 +85,9 @@ trainer by taking the mean reward from about 0.13 to above 1.2 of 1.5 while the 
 
 A pretrained model, a tokenizer and chat templates; a KV cache during sampling and a separate rollout
 engine (vLLM) with weight syncing; left-padded prompts of different lengths; learned reward models and
-process rewards; DAPO's clip-higher and dynamic sampling (discussed in the debriefs); the reference
-refreshed every outer iteration as in DeepSeekMath's Algorithm 1; and FSDP or ZeRO sharding of the
-policy, reference and optimizer across GPUs.`,
+process rewards; DAPO's clip-higher and dynamic sampling (discussed in the debriefs); the outer loop of
+DeepSeekMath's Algorithm 1 (iterative GRPO), which resets the reference to the current policy and
+retrains the reward model; and FSDP or ZeRO sharding of the policy, reference and optimizer across GPUs.`,
   figures: [
     {
       title: 'One GRPO iteration',
@@ -205,7 +205,7 @@ policy, reference and optimizer across GPUs.`,
                           label: 'KL penalty, k3',
                           sub: 'e^(ref−logp) − (ref−logp) − 1',
                           detail:
-                            'Schulman’s k3 estimate of `KL(π_θ ‖ π_ref)` per sampled token: unbiased and never negative. Added to the loss, not to the reward.',
+                            'Schulman’s k3 estimate of `KL(π_θ ‖ π_ref)` per sampled token: unbiased on tokens drawn from `π_θ`, never negative. Added to the loss, not to the reward.',
                         },
                       ],
                     ],

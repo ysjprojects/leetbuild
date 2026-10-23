@@ -17,7 +17,7 @@ not each weight. Use \`prepare_hessian\` from step 2 and \`quant_params\` / \`qu
   - \`H, W = prepare_hessian(H, W, percdamp)\`.
   - \`U\` = the **upper** Cholesky factor of \`H⁻¹\`: \`torch.linalg.cholesky\` of \`H\`,
     \`torch.cholesky_inverse\`, then \`torch.linalg.cholesky(…, upper=True)\`. Row \`i\` of \`U\`, divided by
-    \`U[i, i]\`, is the optimal update of columns \`i..\` once columns \`0..i−1\` are fixed.
+    \`U[i, i]\`, is the optimal move of columns \`i..\` per unit of column \`i\`'s error, once columns \`0..i−1\` are fixed.
   - For each block of \`blocksize\` columns \`[i1, i2)\`, a working copy \`W1\` and an error matrix \`Err1\`;
     for each column \`i\` of the block:
     - at a group's first column (\`col % group_size == 0\`), new \`scale, zero\` from \`quant_params\` of
@@ -33,7 +33,7 @@ The self-test builds \`2,048\` correlated inputs of width 256 (32 latent factors
 scales), collects \`H\` with step 2's hook, and quantizes a \`64 × 256\` layer. It asserts:
 
 - the output error \`‖WXᵀ − ŴXᵀ‖²\` of GPTQ is under a third of round-to-nearest's (one run printed
-  13,361 against 2,687, 4.97× lower), while GPTQ's own weight error \`‖W − Ŵ‖²\` is **larger** (0.174 against 0.093);
+  2,687 against 13,361, 4.97× lower), while GPTQ's own weight error \`‖W − Ŵ‖²\` is **larger** (0.174 against 0.093);
 - \`blocksize\` 32 and 128 give the same codes (at least 99.9% equal): lazy batching only reorders the updates;
 - a slow reference (explicit \`H⁻¹\` in float64, one column at a time, the OBS update and the inverse
   downdate \`H⁻¹ −= H⁻¹[:, c] H⁻¹[c, :] / H⁻¹[c, c]\`) lands on the same weights: 99% within 1e-4 and output
@@ -45,8 +45,8 @@ Then it prints \`PASS\`.
 > whenever a later, correlated column can cancel the difference, and the Cholesky factor of \`H⁻¹\`
 > says exactly how much each later column should move.`,
   hints: [
-    '`L = torch.linalg.cholesky(H)`; `Hinv = torch.linalg.cholesky(torch.cholesky_inverse(L), upper=True)`. Work on `W1 = W[:, i1:i2].clone()` and write `Err1` column by column; keep `w` as a `(rows, 1)` slice so `err @ Hinv1[i:i + 1, i:]` is an outer product.',
-    'Take a group’s grid from `W1[:, i:i + group_size]`, not from the original `W`: earlier columns have already moved these weights, and the grid has to cover where they are now. That is why `blocksize % group_size == 0`: a group never straddles two blocks.',
+    '`torch.cholesky_inverse` takes the lower factor of `H` and returns `H⁻¹`; factor that again with `upper=True`. Work on a clone `W1` of the block and keep `w` as a `(rows, 1)` slice, so the in-block update is an outer product with a row of `U`.',
+    'Take a group’s grid from `W1[:, i:i + group_size]`: earlier columns of this block have already moved these weights, and `W` does not hold those updates yet. That is also why `blocksize % group_size == 0`: a group never straddles two blocks.',
     'The within-block update `W1[:, i:] -= err @ Hinv1[i:i + 1, i:]` changes only this block. After the inner loop, `W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]` applies the same updates to every later column in one matmul, because each later column receives a sum of `err_k · U[k, j]` over the block’s `k`.',
   ],
   checks: [
@@ -312,5 +312,5 @@ if __name__ == "__main__":
 `,
     },
   },
-  debrief: `This is Algorithm 1 of the GPTQ paper, and \`fasterquant\` in the authors' \`gptq.py\` line for line. Three ideas make Optimal Brain Quantization fast enough for a 175B model. **Same order for every row**: OBQ quantized each row's weights greedily in its own order, which needs a separate inverse Hessian per row; GPTQ quantizes every row left to right, so one \`H⁻¹\` serves all rows and the cost drops from \`O(d_row · d_col³)\` to \`O(max(d_row · d_col², d_col³))\`. **Cholesky instead of downdates**: removing column \`c\` from the inverse (\`H⁻¹ −= H⁻¹[:, c] H⁻¹[c, :] / H⁻¹[c, c]\`, the reference in the self-test) accumulates float error over thousands of columns and, with large models, produced indefinite matrices; the rows of the upper Cholesky factor of \`H⁻¹\` are exactly the rows those downdates would produce, computed once and stably. **Lazy batches**: the update of the columns after the block only needs the block's errors, so it waits and becomes one \`(rows × 128) @ (128 × rest)\` matmul, turning a memory-bound loop into compute-bound work. The group grid taken from the updated weights at the group's first column matches the reference's \`--groupsize\` path when the block and the group are aligned; here \`blocksize % group_size == 0\` guarantees it. What the reference adds: \`--act-order\` quantizes columns in order of decreasing \`diag(H)\` (the most sensitive first, while the most freedom remains, then permutes back), \`--static-groups\` fixes every group's grid before the loop so act-order still loads groups contiguously, and \`--sym\` for symmetric grids.`,
+  debrief: `This is Algorithm 1 of the GPTQ paper and \`fasterquant\` in the authors' \`gptq.py\`, with one difference in the group path (below). Three ideas make Optimal Brain Quantization fast enough for a 175B model. **Same order for every row**: OBQ quantized each row's weights greedily in its own order, which needs a separate inverse Hessian per row; GPTQ quantizes every row left to right, so one \`H⁻¹\` serves all rows and the cost drops from \`O(d_row · d_col³)\` to \`O(max(d_row · d_col², d_col³))\`. **Cholesky instead of downdates**: removing column \`c\` from the inverse (\`H⁻¹ −= H⁻¹[:, c] H⁻¹[c, :] / H⁻¹[c, c]\`, the reference in the self-test) accumulates float error over thousands of columns and, with large models, produced indefinite matrices. Row \`i\` of the upper Cholesky factor of \`H⁻¹\`, from the diagonal on, is the row those downdates would leave, divided by the square root of its diagonal entry: computed once and stably, with the division by \`U[i, i]\` in \`err\` restoring the scale. **Lazy batches**: the update of the columns after the block only needs the block's errors, so it waits and becomes one \`(rows × 128) @ (128 × rest)\` matmul, turning a memory-bound loop into compute-bound work. **Groups**: the paper takes each group's grid from "the most current updated weights", which is what reading \`W1\` does. The reference reads \`W[:, col:col + groupsize]\`, and inside a block \`W\` lacks the block's own earlier updates: the two agree when every group starts a block (\`group_size = blocksize = 128\`, the usual setting) and differ for smaller groups (on the self-test's layer with \`group_size = 32\` and \`blocksize = 128\`, one run gave an output error of 2,463 for the reference's choice against 2,381). What the reference adds: \`--act-order\` quantizes columns in order of decreasing \`diag(H)\` (the most sensitive first, while the most freedom remains, then permutes back), \`--static-groups\` fixes every group's grid before the loop so act-order still loads groups contiguously, and \`--sym\` for symmetric grids.`,
 };
