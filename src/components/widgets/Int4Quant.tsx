@@ -262,10 +262,9 @@ const Int4Quant: FC<WidgetProps> = memo(({params}) => {
   return (
     <WidgetFrame controls={controls} readout={readout} title="4-bit group quantization">
       <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${HEIGHT}`}>
-        <title>
-          One group of {g} weights on a {maxq + 1}-level grid set by its min and max, each weight&apos;s rounding error,
-          and the weight and output errors of round to nearest and of error feedback
-        </title>
+        <title>{`One group of ${g} weights on a ${
+          maxq + 1
+        }-level grid set by its min and max, each weight's rounding error, and the weight and output errors of round to nearest and of error feedback`}</title>
         <g fontFamily={MONO} fontSize={9}>
           {levels.map(c => (
             <line

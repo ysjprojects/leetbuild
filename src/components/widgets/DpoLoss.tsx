@@ -165,10 +165,7 @@ const DpoLoss: FC<WidgetProps> = memo(({params}) => {
   return (
     <WidgetFrame controls={controls} readout={readout} title="dpo loss and its gradient weight">
       <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${HEIGHT}`}>
-        <title>
-          The DPO loss −log σ(β·h) and IPO&apos;s squared loss against the margin h, and the DPO gradient weight
-          σ(−β·h), at β = {beta}
-        </title>
+        <title>{`The DPO loss −log σ(β·h) and IPO's squared loss against the margin h, and the DPO gradient weight σ(−β·h), at β = ${beta}`}</title>
         <defs>
           <clipPath id={`${clipId}-loss`}>
             <rect height={PH} width={PW} x={LEFT_X} y={PT} />

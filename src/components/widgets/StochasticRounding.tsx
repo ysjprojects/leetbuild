@@ -344,8 +344,8 @@ const StochasticRounding: FC<WidgetProps> = memo(({params}) => {
       return (
         <>
           {N.toLocaleString('en-US')} gradient-like values in {N / BLOCK} blocks of 16: {pct(stats.smallShare)} sit
-          below half the smallest code. Round-to-nearest stores {pct(stats.flushed)} of all values as 0 and moves the
-          small ones by{' '}
+          below the smallest non-zero code, 0.5. Round-to-nearest stores {pct(stats.flushed)} of all values as 0 and
+          moves the small ones by{' '}
           <b className="text-ink-100">
             {stats.rneSmall >= 0 ? '+' : ''}
             {pct(stats.rneSmall)}

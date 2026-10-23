@@ -227,10 +227,9 @@ const SequencePacking: FC<WidgetProps> = memo(({params}) => {
   return (
     <WidgetFrame controls={controls} readout={readout} title="sequence packing">
       <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${height}`}>
-        <title>
-          {docs} documents laid into rows of {seqLen} tokens, {mode}, and the block-diagonal causal attention mask of
-          row {row + 1}
-        </title>
+        <title>{`${docs} documents laid into rows of ${seqLen} tokens, ${mode}, and the block-diagonal causal attention mask of row ${
+          row + 1
+        }`}</title>
         <g fontFamily={MONO} fontSize={9}>
           <text fill={ink[300]} x={ROW_X} y={12}>
             {mode} rows · {rows.length} × {seqLen} tokens

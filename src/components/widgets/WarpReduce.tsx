@@ -41,7 +41,10 @@ interface Frame {
   treeAfter: number[];
 }
 
-/** Shuffle: lane i adds lane i + offset if that lane exists, else keeps its value. Tree: only tid < offset adds. */
+/**
+ * Shuffle: lane i adds lane i + offset; past the warp's end `__shfl_down_sync` returns the caller's own
+ * value, so those lanes double (their sums are never read). Tree: only tid < offset adds.
+ */
 const buildFrames = (): Frame[] => {
   const out: Frame[] = [
     {offset: null, warpBefore: [...VALUES], warpAfter: [...VALUES], treeBefore: [...VALUES], treeAfter: [...VALUES]},
@@ -53,7 +56,7 @@ const buildFrames = (): Frame[] => {
     out.push({
       offset: o,
       warpBefore: w,
-      warpAfter: w.map((v, i) => (i + o < WARP ? v + w[i + o] : v)),
+      warpAfter: w.map((v, i) => (i + o < WARP ? v + w[i + o] : v + v)),
       treeBefore: s,
       treeAfter: s.map((v, i) => (i < o ? v + s[i + o] : v)),
     });
@@ -95,8 +98,9 @@ const WarpReduce: FC<WidgetProps> = memo(() => {
     return (
       <>
         Step {step}/5, offset {o}: all 32 lanes execute the shuffle; lanes 0 to {o - 1} ({o} active) now hold live
-        partial sums, lanes {WARP - o} to 31 had no source lane and kept their value, the rest are don&apos;t-cares. The
-        tree: {o} threads add, {WARP - o} idle, {syncs} __syncthreads so far.
+        partial sums; lanes {WARP - o} to 31 had no source lane, so the shuffle returned their own value and they
+        doubled; the rest are don&apos;t-cares. The tree: {o} threads add, {WARP - o} idle, {syncs} __syncthreads so
+        far.
       </>
     );
   }, [done, frame, step, syncs]);

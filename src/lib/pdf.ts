@@ -60,7 +60,12 @@ const runs = (text: string): ContentText[] =>
       case 'code':
         return [{text: token.text, font: MONO, fontSize: 9, color: ACCENT}];
       case 'link':
-        return leafRuns(token.parts, {link: token.url, color: ACCENT, decoration: 'underline'});
+        return leafRuns(token.parts, {
+          link: token.url,
+          color: ACCENT,
+          decoration: 'underline',
+          ...(token.style === 'bold' ? {bold: true} : token.style === 'em' ? {italics: true} : {}),
+        });
       case 'text':
         return withSymbols({text: token.text});
     }

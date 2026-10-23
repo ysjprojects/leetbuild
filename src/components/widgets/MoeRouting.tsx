@@ -195,10 +195,7 @@ const MoeRouting: FC<WidgetProps> = memo(({params}) => {
   return (
     <WidgetFrame controls={controls} readout={readout} title="mixture-of-experts routing">
       <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${HEIGHT}`}>
-        <title>
-          Router probabilities for {TOKENS} tokens over {experts} experts, the top-{k} chosen experts, and each
-          expert&apos;s load against its capacity
-        </title>
+        <title>{`Router probabilities for ${TOKENS} tokens over ${experts} experts, the top-${k} chosen experts, and each expert's load against its capacity`}</title>
         <g fontFamily={MONO} fontSize={9}>
           <text fill={ink[300]} x={PROB_X} y={12}>
             router softmax p(expert)

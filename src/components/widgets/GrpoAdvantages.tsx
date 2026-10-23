@@ -214,10 +214,7 @@ const GrpoAdvantages: FC<WidgetProps> = memo(({params}) => {
   return (
     <WidgetFrame controls={controls} readout={readout} title="grpo group advantages">
       <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${height}`}>
-        <title>
-          {G} sampled completions of 3 + 1 = with their rewards and advantages, scaled by the group std and mean-only,
-          and the clipped objective as a function of the ratio for a positive and a negative advantage
-        </title>
+        <title>{`${G} sampled completions of 3 + 1 = with their rewards and advantages, scaled by the group std and mean-only, and the clipped objective as a function of the ratio for a positive and a negative advantage`}</title>
         <g fontFamily={MONO} fontSize={9}>
           <text fill={ink[300]} x={TEXT_X} y={HEAD_Y}>
             3 + 1 = …

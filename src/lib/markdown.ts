@@ -227,7 +227,8 @@ export type InlineToken =
   | InlineLeaf
   | {kind: 'bold'; parts: InlineLeaf[]}
   | {kind: 'em'; parts: InlineLeaf[]}
-  | {kind: 'link'; parts: InlineLeaf[]; url: string};
+  /** `style`: the whole link text is bold or emphasis, as a paper title in italics is (`[*Title*](url)`). */
+  | {kind: 'link'; parts: InlineLeaf[]; url: string; style?: 'bold' | 'em'};
 
 /** The inline runs of one line of the dialect, in order. */
 export const inlineTokens = (text: string): InlineToken[] => {
@@ -253,7 +254,12 @@ export const inlineTokens = (text: string): InlineToken[] => {
         const url = leaves(link[2])
           .map(leaf => (leaf.kind === 'code' ? `\`${leaf.text}\`` : leaf.text))
           .join('');
-        return [{kind: 'link', parts: leaves(link[1]), url}];
+        const bold = /^\*\*([^*]+)\*\*$/.exec(link[1]);
+        const em = bold === null ? /^\*([^*]+)\*$/.exec(link[1]) : null;
+        const style = bold !== null ? 'bold' : em !== null ? 'em' : undefined;
+        return [
+          {kind: 'link', parts: leaves(bold?.[1] ?? em?.[1] ?? link[1]), url, ...(style === undefined ? {} : {style})},
+        ];
       }
       return leaves(part);
     });

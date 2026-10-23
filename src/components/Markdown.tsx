@@ -56,7 +56,8 @@ const renderInline = (text: string): ReactNode[] =>
             {renderLeaves(token.parts)}
           </em>
         );
-      case 'link':
+      case 'link': {
+        const text = renderLeaves(token.parts);
         return (
           <a
             className="text-iris-300 decoration-iris-400/50 hover:text-iris-200 underline underline-offset-2"
@@ -64,9 +65,16 @@ const renderInline = (text: string): ReactNode[] =>
             key={index}
             rel="noreferrer"
             target="_blank">
-            {renderLeaves(token.parts)}
+            {token.style === 'bold' ? (
+              <strong className="font-semibold">{text}</strong>
+            ) : token.style === 'em' ? (
+              <em>{text}</em>
+            ) : (
+              text
+            )}
           </a>
         );
+      }
       case 'text':
         return token.text;
     }

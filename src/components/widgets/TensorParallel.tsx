@@ -288,11 +288,9 @@ const TensorParallel: FC<WidgetProps> = memo(({params}) => {
   return (
     <WidgetFrame controls={controls} readout={readout} title="megatron tensor parallelism">
       <svg className="w-full" role="img" viewBox={`0 0 ${WIDTH} ${HEIGHT}`}>
-        <title>
-          The {layer === 'mlp' ? 'MLP' : 'attention'} sublayer split over {p} rank{p === 1 ? '' : 's'},{' '}
-          {order === 'col-row' ? 'column then row parallel' : 'row then column parallel'}, with the collectives it needs
-          and the bytes each rank sends per token
-        </title>
+        <title>{`The ${layer === 'mlp' ? 'MLP' : 'attention'} sublayer split over ${p} rank${p === 1 ? '' : 's'}, ${
+          order === 'col-row' ? 'column then row parallel' : 'row then column parallel'
+        }, with the collectives it needs and the bytes each rank sends per token`}</title>
         <g fontFamily={MONO} fontSize={9}>
           {Array.from({length: p}, (_, r) => (
             <g key={r}>
