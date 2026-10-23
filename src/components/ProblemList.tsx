@@ -1,5 +1,5 @@
 import Link from 'next/link';
-import {type FC, memo, useCallback, useMemo, useState} from 'react';
+import {type FC, memo, useCallback, useId, useMemo, useState} from 'react';
 
 import {
   type TrackFilter,
@@ -43,6 +43,56 @@ const DIFFICULTY_RING: Record<Difficulty, string> = {
   medium: 'border-warning-400/50 text-warning-300',
   hard: 'border-danger-400/50 text-danger-300',
 };
+
+/** A solved row inverts its ring: the difficulty colour fills the disc. */
+const DIFFICULTY_DISC: Record<Difficulty, string> = {
+  easy: 'text-success-400',
+  medium: 'text-warning-400',
+  hard: 'text-danger-400',
+};
+
+/**
+ * The row's catalogue number in a ring of its difficulty colour. A solved problem keeps its number and
+ * inverts the ring: the colour fills the disc and the digits are cut out of it, so the card shows through.
+ */
+const RowNumber: FC<{n: number; difficulty: Difficulty; solved: boolean; started: boolean}> = memo(
+  ({n, difficulty, solved, started}) => {
+    const maskId = useId();
+    if (!solved)
+      return (
+        <span
+          className={`font-code flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold ${
+            DIFFICULTY_RING[difficulty]
+          } ${started ? 'bg-ink-800' : ''}`}>
+          {n}
+        </span>
+      );
+    return (
+      <svg
+        aria-label={`${n}, solved`}
+        className={`h-7 w-7 shrink-0 ${DIFFICULTY_DISC[difficulty]}`}
+        role="img"
+        viewBox="0 0 28 28">
+        <mask id={maskId}>
+          <rect fill="white" height={28} width={28} />
+          <text
+            className="font-code"
+            dominantBaseline="central"
+            fill="black"
+            fontSize={11}
+            fontWeight={600}
+            textAnchor="middle"
+            x={14}
+            y={14}>
+            {n}
+          </text>
+        </mask>
+        <circle cx={14} cy={14} fill="currentColor" mask={`url(#${maskId})`} r={14} />
+      </svg>
+    );
+  },
+);
+RowNumber.displayName = 'RowNumber';
 
 const RING = {size: 60, stroke: 5};
 
@@ -466,14 +516,7 @@ const ProblemRow: FC<{
       <Link
         className="border-ink-700 bg-ink-850 hover:border-iris-400/60 hover:bg-ink-800 group flex w-full items-center gap-3 rounded-xl border px-4 py-3.5 text-left transition"
         href={`/${problem.id}`}>
-        <span
-          className={`font-code flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold ${
-            solved
-              ? 'border-iris-400 bg-iris-400 text-ink-950'
-              : `${DIFFICULTY_RING[problem.difficulty]} ${started ? 'bg-ink-800' : ''}`
-          }`}>
-          {solved ? '✓' : index + 1}
-        </span>
+        <RowNumber difficulty={problem.difficulty} n={index + 1} solved={solved} started={started} />
         <span className="min-w-0 flex-1">
           <span className="flex flex-wrap items-center gap-2">
             <span className="text-ink-50 group-hover:text-iris-200 text-[14px] font-bold">{problem.title}</span>
