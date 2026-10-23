@@ -9,11 +9,6 @@ import (
 	"unsafe"
 )
 
-type dummy struct{}
-
-// DummyType represents a stand-in for a recursive type.
-var DummyType = reflect.TypeOf(dummy{})
-
 // The following type sizes must match their original definition in Go src/internal/abi/type.go.
 type abiType struct {
 	_ uintptr
@@ -52,10 +47,15 @@ type emptyInterface struct {
 
 // SetFieldType sets the type of the struct field at the given index, to the given type.
 //
-// The struct type must have been created at runtime. This is very unsafe.
+// The struct type must have been created at runtime. This is very unsafe: the new type must have
+// the field's size and kind, as the struct's size, field offsets and pointer bitmap stay. A field
+// that changes them panics (LeetBuild: it used to corrupt the heap).
 func SetFieldType(s reflect.Type, idx int, t reflect.Type) {
 	if s.Kind() != reflect.Struct || idx >= s.NumField() {
 		return
+	}
+	if old := s.Field(idx).Type; old.Size() != t.Size() || old.Kind() != t.Kind() {
+		panic("unsafe2: retyping field " + s.Field(idx).Name + " from " + old.String() + " to " + t.String() + " changes its layout")
 	}
 
 	rtyp := unpackType(s)

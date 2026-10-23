@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/traefik/yaegi/internal/unsafe2"
 )
@@ -1973,30 +1974,122 @@ var (
 	constVal           = reflect.TypeOf((*constant.Value)(nil)).Elem()
 )
 
+// refTypeContext is the state of one construction of reflect types (LeetBuild: rewritten).
+//
+// reflect cannot build a recursive type: a named struct type met again while it is being built
+// stands for a placeholder, a distinct zero-size type of its own, and once every struct of the
+// recursion is built, the struct fields holding placeholders are retyped in place to the real
+// types (unsafe2.SetFieldType). This is sound only where a placeholder sits behind an indirection
+// (pointer, slice, map, chan, func): the field keeps its size and pointer layout. A struct holding
+// one by value (directly or in an array) aborts the construction, which is retried with the named
+// struct that needs the other by value built first.
+//
+// The former construction shared one dummy type among all the types of a recursion and fixed every
+// field to the type where the recursion started, retyped by-value fields (a field of size 0 grew,
+// corrupting the heap), and cached slice, map or pointer types of the dummy in their itypes.
 type refTypeContext struct {
-	defined map[string]*itype
-
-	// refs keeps track of all the places (in the same type recursion) where the
-	// type name (as key) is used as a field of another (or possibly the same) struct
-	// type. Each of these fields will then live as an unsafe2.dummy type until the
-	// whole recursion is fully resolved, and the type is fixed.
-	refs map[string][]*itype
-
-	// When we detect for the first time that we are in a recursive type (thanks to
-	// defined), we keep track of the first occurrence of the type where the recursion
-	// started, so we can restart the last step that fixes all the types from the same
-	// "top-level" point.
-	rect       *itype
-	rebuilding bool
-	slevel     int
+	defined      map[string]*itype       // named struct types being or been built, by path/name
+	stack        []*itype                // the named struct types being built, innermost last
+	placeholders map[reflect.Type]*itype // the struct type each placeholder stands for
+	placeholder  map[*itype]reflect.Type // the placeholder of each struct type
+	pending      []pendingField          // struct fields to retype once the recursion is built
+	touched      []*itype                // the types this construction set rtype of
 }
 
-// Clone creates a copy of the ref type context.
-func (c *refTypeContext) Clone() *refTypeContext {
-	return &refTypeContext{defined: c.defined, refs: c.refs, rebuilding: c.rebuilding}
+// pendingField is field idx of struct s, whose type holds a placeholder.
+type pendingField struct {
+	s   reflect.Type
+	idx int
 }
 
-func (c *refTypeContext) isComplete() bool {
+// byValueRecursion aborts a construction that would hold a placeholder by value: first, a named
+// struct type, must be built before the one being built.
+type byValueRecursion struct{ first *itype }
+
+const placeholderPrefix = "LeetBuildPlaceholder"
+
+var placeholderSeq atomic.Int64
+
+// placeholderOf returns the placeholder of t, a struct type being built.
+func (c *refTypeContext) placeholderOf(t *itype) reflect.Type {
+	if p, ok := c.placeholder[t]; ok {
+		return p
+	}
+	p := reflect.StructOf([]reflect.StructField{{
+		Name: placeholderPrefix + strconv.FormatInt(placeholderSeq.Add(1), 10),
+		Type: reflect.TypeOf(struct{}{}),
+	}})
+	c.placeholder[t] = p
+	c.placeholders[p] = t
+	return p
+}
+
+// holds reports whether rt holds a placeholder, other than inside a struct type (which is
+// retyped in place), and whether it holds one by value.
+func (c *refTypeContext) holds(rt reflect.Type) (holds, byValue bool) {
+	if _, ok := c.placeholders[rt]; ok {
+		return true, true
+	}
+	switch rt.Kind() {
+	case reflect.Array:
+		return c.holds(rt.Elem())
+	case reflect.Ptr, reflect.Slice, reflect.Chan:
+		h, _ := c.holds(rt.Elem())
+		return h, false
+	case reflect.Map:
+		hk, _ := c.holds(rt.Key())
+		he, _ := c.holds(rt.Elem())
+		return hk || he, false
+	case reflect.Func:
+		for i := 0; i < rt.NumIn(); i++ {
+			if h, _ := c.holds(rt.In(i)); h {
+				return true, false
+			}
+		}
+		for i := 0; i < rt.NumOut(); i++ {
+			if h, _ := c.holds(rt.Out(i)); h {
+				return true, false
+			}
+		}
+	}
+	return false, false
+}
+
+// fix returns rt with its placeholders replaced by the types they stand for.
+func (c *refTypeContext) fix(rt reflect.Type) reflect.Type {
+	if t, ok := c.placeholders[rt]; ok {
+		return t.rtype
+	}
+	if h, _ := c.holds(rt); !h {
+		return rt
+	}
+	switch rt.Kind() {
+	case reflect.Array:
+		return reflect.ArrayOf(rt.Len(), c.fix(rt.Elem()))
+	case reflect.Ptr:
+		return reflect.PtrTo(c.fix(rt.Elem()))
+	case reflect.Slice:
+		return reflect.SliceOf(c.fix(rt.Elem()))
+	case reflect.Chan:
+		return reflect.ChanOf(rt.ChanDir(), c.fix(rt.Elem()))
+	case reflect.Map:
+		return reflect.MapOf(c.fix(rt.Key()), c.fix(rt.Elem()))
+	case reflect.Func:
+		in := make([]reflect.Type, rt.NumIn())
+		for i := range in {
+			in[i] = c.fix(rt.In(i))
+		}
+		out := make([]reflect.Type, rt.NumOut())
+		for i := range out {
+			out[i] = c.fix(rt.Out(i))
+		}
+		return reflect.FuncOf(in, out, rt.IsVariadic())
+	}
+	return rt
+}
+
+// complete reports whether every named struct type of the construction is built.
+func (c *refTypeContext) complete() bool {
 	for _, t := range c.defined {
 		if t.rtype == nil {
 			return false
@@ -2005,55 +2098,30 @@ func (c *refTypeContext) isComplete() bool {
 	return true
 }
 
-func (t *itype) fixDummy(typ reflect.Type) reflect.Type {
-	if typ == unsafe2.DummyType {
-		return t.rtype
+// resolve retypes the pending fields, now that the types their placeholders stand for exist.
+func (c *refTypeContext) resolve() {
+	for _, p := range c.pending {
+		if ft := p.s.Field(p.idx).Type; c.fix(ft) != ft {
+			unsafe2.SetFieldType(p.s, p.idx, c.fix(ft))
+		}
 	}
-	switch typ.Kind() {
-	case reflect.Array:
-		return reflect.ArrayOf(typ.Len(), t.fixDummy(typ.Elem()))
-	case reflect.Chan:
-		return reflect.ChanOf(typ.ChanDir(), t.fixDummy(typ.Elem()))
-	case reflect.Func:
-		in := make([]reflect.Type, typ.NumIn())
-		for i := range in {
-			in[i] = t.fixDummy(typ.In(i))
-		}
-		out := make([]reflect.Type, typ.NumOut())
-		for i := range out {
-			out[i] = t.fixDummy(typ.Out(i))
-		}
-		return reflect.FuncOf(in, out, typ.IsVariadic())
-	case reflect.Map:
-		return reflect.MapOf(t.fixDummy(typ.Key()), t.fixDummy(typ.Elem()))
-	case reflect.Ptr:
-		return reflect.PtrTo(t.fixDummy(typ.Elem()))
-	case reflect.Slice:
-		return reflect.SliceOf(t.fixDummy(typ.Elem()))
-	case reflect.Struct:
-		fields := make([]reflect.StructField, typ.NumField())
-		for i := range fields {
-			fields[i] = typ.Field(i)
-			fields[i].Type = t.fixDummy(fields[i].Type)
-		}
-		return reflect.StructOf(fields)
-	}
-	return typ
+	c.pending = nil
 }
 
 // RefType returns a reflect.Type representation from an interpreter type.
 // In simple cases, reflect types are directly mapped from the interpreter
-// counterpart.
-// For recursive named struct or interfaces, as reflect does not permit to
-// create a recursive named struct, a dummy type is set temporarily for each recursive
-// field. When done, the dummy type fields are updated with the original reflect type
-// pointer using unsafe. We thus obtain a usable recursive type definition, except
-// for string representation, as created reflect types are still unnamed.
+// counterpart. For recursive named struct types, see refTypeContext.
 func (t *itype) refType(ctx *refTypeContext) reflect.Type {
 	if ctx == nil {
-		ctx = &refTypeContext{
-			defined: map[string]*itype{},
-			refs:    map[string][]*itype{},
+		for attempt := 0; ; attempt++ {
+			rt, retry := t.buildRefType()
+			if retry == nil {
+				return rt
+			}
+			if attempt == 16 {
+				panic(fmt.Errorf("cannot build the recursive type %s", t.id()))
+			}
+			retry.first.refType(nil)
 		}
 	}
 	if t.incomplete || t.cat == nilT {
@@ -2064,33 +2132,23 @@ func (t *itype) refType(ctx *refTypeContext) reflect.Type {
 	}
 	name := t.path + "/" + t.name
 
-	if t.rtype != nil && !ctx.rebuilding {
+	if t.rtype != nil {
 		return t.rtype
 	}
 	if dt := ctx.defined[name]; dt != nil {
-		// We get here when we are a struct field, and our type name has already been
-		// seen at least once in one of our englobing structs. i.e. there's at least one
-		// level of type recursion.
+		// The type is a struct field, its type name seen in an englobing struct.
 		if dt.rtype != nil {
+			ctx.touched = append(ctx.touched, t)
 			t.rtype = dt.rtype
 			return dt.rtype
 		}
-
-		// The recursion has not been fully resolved yet.
-		// To indicate that a rebuild is needed on the englobing struct,
-		// return a dummy field type and create an empty entry.
-		flds := ctx.refs[name]
-		ctx.rect = dt
-
-		// We know we are used as a field by someone, but we don't know by who
-		// at this point in the code, so we just mark it as an empty *itype for now.
-		// We'll complete the *itype in the caller.
-		ctx.refs[name] = append(flds, (*itype)(nil))
-		return unsafe2.DummyType
+		// The recursion is not resolved yet: stand for the type by its placeholder.
+		return ctx.placeholderOf(dt)
 	}
 	if isGeneric(t) {
 		return reflect.TypeOf((*generic)(nil)).Elem()
 	}
+	ctx.touched = append(ctx.touched, t)
 	switch t.cat {
 	case linkedT:
 		t.rtype = t.val.refType(ctx)
@@ -2128,19 +2186,12 @@ func (t *itype) refType(ctx *refTypeContext) reflect.Type {
 	case mapT:
 		t.rtype = reflect.MapOf(t.key.refType(ctx), t.val.refType(ctx))
 	case ptrT:
-		rt := t.val.refType(ctx)
-		if rt == unsafe2.DummyType && ctx.slevel > 1 {
-			// We have a pointer to a recursive struct which is not yet fully computed.
-			// Return it but do not yet store it in rtype, so the complete version can
-			// be stored in future.
-			return reflect.PtrTo(rt)
-		}
-		t.rtype = reflect.PtrTo(rt)
+		t.rtype = reflect.PtrTo(t.val.refType(ctx))
 	case structT:
 		if t.name != "" {
 			ctx.defined[name] = t
+			ctx.stack = append(ctx.stack, t)
 		}
-		ctx.slevel++
 		var fields []reflect.StructField
 		for _, f := range t.field {
 			field := reflect.StructField{
@@ -2155,63 +2206,78 @@ func (t *itype) refType(ctx *refTypeContext) reflect.Type {
 				// stubs that panic; promotedMethod finds them through the field instead.
 				field.Anonymous = true
 			}
+			if _, byValue := ctx.holds(field.Type); byValue {
+				// The struct needs by value one being built: build the innermost named
+				// struct being built first (unless it is the one needed: an invalid type).
+				first := ctx.stack[len(ctx.stack)-1]
+				if ctx.placeholders[placeholderIn(field.Type)] == first {
+					panic(fmt.Errorf("invalid recursive type %s", first.id()))
+				}
+				panic(byValueRecursion{first})
+			}
 			fields = append(fields, field)
-			// Find any nil type refs that indicates a rebuild is needed on this field.
-			for _, flds := range ctx.refs {
-				for j, fld := range flds {
-					if fld == nil {
-						flds[j] = t
-					}
-				}
+		}
+		if t.name != "" {
+			ctx.stack = ctx.stack[:len(ctx.stack)-1]
+		}
+		rt := reflect.StructOf(fields)
+		for i, f := range fields {
+			if h, _ := ctx.holds(f.Type); h {
+				ctx.pending = append(ctx.pending, pendingField{rt, i})
 			}
 		}
-		ctx.slevel--
-		type fixStructField struct {
-			name  string
-			index int
+		t.rtype = rt
+		if ctx.complete() {
+			ctx.resolve()
 		}
-		fieldFix := []fixStructField{} // Slice of field indices to fix for recursivity.
-		t.rtype = reflect.StructOf(fields)
-		if ctx.isComplete() {
-			for _, s := range ctx.defined {
-				for i := 0; i < s.rtype.NumField(); i++ {
-					f := s.rtype.Field(i)
-					if strings.HasSuffix(f.Type.String(), "unsafe2.dummy") {
-						unsafe2.SetFieldType(s.rtype, i, ctx.rect.fixDummy(s.rtype.Field(i).Type))
-						if name == s.path+"/"+s.name {
-							fieldFix = append(fieldFix, fixStructField{s.name, i})
-						}
-						continue
-					}
-					if f.Type.Kind() == reflect.Func && strings.Contains(f.Type.String(), "unsafe2.dummy") {
-						fieldFix = append(fieldFix, fixStructField{s.name, i})
-					}
-				}
-			}
-		}
-
-		// The rtype has now been built, we can go back and rebuild
-		// all the recursive types that relied on this type.
-		// However, as we are keyed by type name, if two or more (recursive) fields at
-		// the same depth level are of the same type, or a "variation" of the same type
-		// (slice of, map of, etc), they "mask" each other, and only one
-		// of them is in ctx.refs. That is why the code around here is a bit convoluted,
-		// and we need both the loop above, around all the struct fields, and the loop
-		// below, around the ctx.refs.
-		for _, f := range ctx.refs[name] {
-			for _, ff := range fieldFix {
-				if ff.name == f.name {
-					ftyp := f.field[ff.index].typ.refType(&refTypeContext{defined: ctx.defined, rebuilding: true})
-					unsafe2.SetFieldType(f.rtype, ff.index, ftyp)
-				}
-			}
-		}
+		return rt
 	default:
 		if z, _ := t.zero(); z.IsValid() {
 			t.rtype = z.Type()
 		}
 	}
+	if t.rtype != nil {
+		if h, _ := ctx.holds(t.rtype); h {
+			// A type of a placeholder serves the struct being built, not later uses.
+			rt := t.rtype
+			t.rtype = nil
+			return rt
+		}
+	}
 	return t.rtype
+}
+
+// placeholderIn returns the placeholder rt holds by value.
+func placeholderIn(rt reflect.Type) reflect.Type {
+	for rt.Kind() == reflect.Array {
+		rt = rt.Elem()
+	}
+	return rt
+}
+
+// buildRefType builds the reflect type of t in a new construction, or reports the struct type to
+// build first. An aborted construction forgets the types it set.
+func (t *itype) buildRefType() (rt reflect.Type, retry *byValueRecursion) {
+	ctx := &refTypeContext{
+		defined:      map[string]*itype{},
+		placeholders: map[reflect.Type]*itype{},
+		placeholder:  map[*itype]reflect.Type{},
+	}
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		b, ok := r.(byValueRecursion)
+		if !ok {
+			panic(r)
+		}
+		for _, x := range ctx.touched {
+			x.rtype = nil
+		}
+		retry = &b
+	}()
+	return t.refType(ctx), nil
 }
 
 // TypeOf returns the reflection type of dynamic interpreter type t.

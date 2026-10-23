@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"math"
 	"reflect"
+	"strings"
 )
 
 type opPredicates map[action]func(reflect.Type) bool
@@ -54,7 +55,7 @@ func (check typecheck) assignment(n *node, typ *itype, context string) error {
 		return nil
 	}
 
-	if !n.typ.assignableTo(typ) && typ.str != "*unsafe2.dummy" {
+	if !n.typ.assignableTo(typ) && !strings.Contains(typ.str, placeholderPrefix) { // LeetBuild: placeholders of recursive types
 		if context == "" {
 			return n.cfgErrorf("cannot use type %s as type %s", n.typ.id(), typ.id())
 		}

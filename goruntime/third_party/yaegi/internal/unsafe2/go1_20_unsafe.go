@@ -9,11 +9,6 @@ import (
 	"unsafe"
 )
 
-type dummy struct{}
-
-// DummyType represents a stand-in for a recursive type.
-var DummyType = reflect.TypeOf(dummy{})
-
 // the following type sizes must match their original definition in Go src/reflect/type.go.
 
 type rtype struct {
