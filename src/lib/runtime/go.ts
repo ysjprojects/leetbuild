@@ -96,15 +96,25 @@ const guarded = <T extends object>(tree: T, live: () => boolean): T =>
  * throw from then on, and database connections it still holds are released, their transaction
  * rolled back, so the next program's statements neither wait on them nor run inside them.
  */
-const makeBridge = (): {bridge: object; disable: () => Promise<void>} => {
+const makeBridge = (alive: () => boolean): {bridge: object; disable: () => Promise<void>} => {
   let live = true;
   const held = new Set<() => void>();
+  /**
+   * A callback into the Go program, for a timer, a publish, a probe or a tick to call. Once the
+   * program is over (it exited or crashed) or cut off (its check ran out of time) it does nothing:
+   * the program must not run again, least of all against the next check's world.
+   */
+  const into =
+    <A extends unknown[]>(fn: (...args: A) => void) =>
+    (...args: A): void => {
+      if (live && alive()) fn(...args);
+    };
   const bridge = {
     clock: {
       now: (): number => CLOCK.now(),
-      setTimeout: (fn: () => void, ms: number): unknown => globalThis.setTimeout(fn, ms),
+      setTimeout: (fn: () => void, ms: number): unknown => globalThis.setTimeout(into(fn), ms),
       clearTimeout: (id: ReturnType<typeof setTimeout>): void => globalThis.clearTimeout(id),
-      setInterval: (fn: () => void, ms: number): unknown => globalThis.setInterval(fn, ms),
+      setInterval: (fn: () => void, ms: number): unknown => globalThis.setInterval(into(fn), ms),
       clearInterval: (id: ReturnType<typeof setInterval>): void => globalThis.clearInterval(id),
       advance: (ms: number): void => CLOCK.advance(ms),
       sleeps: (): number => CLOCK.sleeps,
@@ -119,16 +129,18 @@ const makeBridge = (): {bridge: object; disable: () => Promise<void>} => {
       transaction: (cmds: string[][]): Tagged[] => each(redis.SERVER.executeTransaction(cmds)),
       fingerprint: (key: string): string => redis.SERVER.fingerprint(key),
       probe: (key: string, fn: () => void): void => {
-        redis.SERVER.probes.push({key, fn, fired: false, result: undefined, error: undefined});
+        redis.SERVER.probes.push({key, fn: into(fn), fired: false, result: undefined, error: undefined});
       },
       subscribe: (
         name: string,
         pattern: boolean,
         fn: (pattern: string | null, channel: string, message: string) => void,
-      ): (() => void) =>
-        pattern
-          ? redis.SERVER.psubscribe(name, (p, channel, message) => fn(p, channel, message))
-          : redis.SERVER.subscribe(name, (channel, message) => fn(null, channel, message)),
+      ): (() => void) => {
+        const deliver = into(fn);
+        return pattern
+          ? redis.SERVER.psubscribe(name, (p, channel, message) => deliver(p, channel, message))
+          : redis.SERVER.subscribe(name, (channel, message) => deliver(null, channel, message));
+      },
       trips: (): string[][] => redis.SERVER.trips,
     },
     /** Postgres for the Go driver (goruntime/models/pq/backend.go), through the shared Db's lock and counts. */
@@ -151,14 +163,16 @@ const makeBridge = (): {bridge: object; disable: () => Promise<void>} => {
     },
     /** `fn` once every goroutine is blocked, no sleep is pending and nothing is in flight (or the sleep budget ran out). */
     settle: (fn: () => void): void => {
+      const done = into(fn);
       const check = (): void => {
         if (!CLOCK.interrupted && (CLOCK.hasPendingSleeps() || inFlight > 0)) nextMacrotask(check);
-        else fn();
+        else done();
       };
       nextMacrotask(check);
     },
     /** `fn` once every goroutine is blocked and nothing is in flight, the clock held where it is: pending sleeps wait. */
     tick: (fn: () => void): void => {
+      const done = into(fn);
       CLOCK.hold();
       const check = (): void => {
         if (inFlight > 0) {
@@ -166,11 +180,11 @@ const makeBridge = (): {bridge: object; disable: () => Promise<void>} => {
           return;
         }
         CLOCK.release();
-        fn();
+        done();
       };
       nextMacrotask(check);
     },
-    onInterrupt: (fn: () => void): void => CLOCK.onInterrupt(fn),
+    onInterrupt: (fn: () => void): void => CLOCK.onInterrupt(into(fn)),
   };
   return {
     bridge: guarded(bridge, () => live),
@@ -196,31 +210,25 @@ export async function createGoRuntime(host: GoHost): Promise<GoRuntime> {
   pg.DB.bridge = host.db;
   const compiled = await WebAssembly.compile(await host.wasm());
   let api: GoApi | null = null;
+  /** Settles once the current program is over: it exited, or crashed (`_resume` in wasmExec.js). */
   let exited: Promise<void> = Promise.resolve();
-  /** The current program has exited (a fatal Go error): its API must not be called again. */
-  let dead = false;
+  /** Whether the current program is over: its API must not be called again. */
+  let over = (): boolean => false;
   let disable = async (): Promise<void> => undefined;
 
   /** A fresh Go program on a fresh bridge; the previous program, if any, is cut off first. */
   const start = async (): Promise<GoApi> => {
     await disable();
-    const made = makeBridge();
-    disable = made.disable;
     const scope = globalThis as unknown as {Go: new () => GoProgram; __lbGo?: object; __lbGoRuntime?: GoApi};
+    const program = new scope.Go();
+    const made = makeBridge(() => !program.exited);
+    disable = made.disable;
     scope.__lbGo = made.bridge;
     delete scope.__lbGoRuntime;
-    const program = new scope.Go();
     const instance = await WebAssembly.instantiate(compiled, program.importObject);
     // run() executes main up to its `select {}` synchronously, so the API is in place on return.
-    dead = false;
-    exited = program.run(instance).then(
-      () => {
-        dead = true;
-      },
-      () => {
-        dead = true;
-      },
-    );
+    exited = program.run(instance).catch(() => undefined);
+    over = () => program.exited;
     const started = scope.__lbGoRuntime;
     if (started === undefined) throw new Error('the Go runtime did not start');
     return started;
@@ -252,7 +260,7 @@ export async function createGoRuntime(host: GoHost): Promise<GoRuntime> {
           const timedOut = new Promise<'timeout'>(resolve => {
             budget = CLOCK.realTimeout(() => resolve('timeout'), CHECK_BUDGET_MS);
           });
-          if (dead) api = await start();
+          if (over()) api = await start();
           const live = api;
           // A program that died between two checks throws on the call itself: a crash, like dying during one.
           const running = new Promise<string>((resolve, reject) => {

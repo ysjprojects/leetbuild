@@ -2,12 +2,15 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 //
-// Vendored from Go 1.27 (lib/wasm/wasm_exec.js) for LeetBuild's Go runtime, with two changes.
+// Vendored from Go 1.27 (lib/wasm/wasm_exec.js) for LeetBuild's Go runtime, with three changes.
 // The runtime's virtual clock (src/lib/runtime/ts/clock.ts) swaps setTimeout, clearTimeout,
 // Date.now and performance.now while a check runs, and the Go scheduler must keep real time, so
-// this copy captures them when it loads. And it installs no global `process` polyfill: the Lua VM
+// this copy captures them when it loads. It installs no global `process` polyfill: the Lua VM
 // in the same worker (fengari) takes a global `process` to mean Node and reaches for Node modules.
-// The runtime calls none of the process-backed syscalls (Getpid, Getwd, Getuid, …).
+// The runtime calls none of the process-backed syscalls (Getpid, Getwd, Getuid, …). And a program
+// that is over is never resumed (`_resume`): a wake-up or a callback JavaScript still holds returns
+// instead of throwing from wherever it was called, and a resume that throws (the engine's stack
+// overflowing in the program) ends the program as an exit would, so the runtime sees a crash.
 
 "use strict";
 
@@ -235,6 +238,7 @@
 						sp >>>= 0;
 						const code = this.mem.getInt32(sp + 8, true);
 						this.exited = true;
+						this._cancelTimeouts();
 						delete this._inst;
 						delete this._values;
 						delete this._goRefCounts;
@@ -280,7 +284,7 @@
 						this._scheduledTimeouts.set(id, realSetTimeout(
 							() => {
 								this._resume();
-								while (this._scheduledTimeouts.has(id)) {
+								while (!this.exited && this._scheduledTimeouts.has(id)) {
 									// for some reason Go failed to register the timeout event, log and try again
 									// (temporary workaround for https://github.com/golang/go/issues/28975)
 									console.warn("scheduleTimeoutEvent: missed timeout event");
@@ -550,13 +554,27 @@
 		}
 
 		_resume() {
+			// LeetBuild: over is over (see the header).
 			if (this.exited) {
-				throw new Error("Go program has already exited");
+				return;
 			}
-			this._inst.exports.resume();
+			try {
+				this._inst.exports.resume();
+			} catch (error) {
+				console.error("the Go program failed:", error);
+				this.exited = true;
+				this._cancelTimeouts();
+			}
 			if (this.exited) {
 				this._resolveExitPromise();
 			}
+		}
+
+		_cancelTimeouts() {
+			for (const timeout of this._scheduledTimeouts.values()) {
+				realClearTimeout(timeout);
+			}
+			this._scheduledTimeouts.clear();
 		}
 
 		_makeFuncWrapper(id) {
