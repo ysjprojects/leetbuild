@@ -34,6 +34,11 @@ interface Props {
   /** Baseline text for a unified diff against `value` (viewers only): the learner's code under the solution. */
   original?: string | null;
   /**
+   * What the gutter marks the file's changes against (editors only), as VS Code marks them against
+   * the last commit: the file's starter. Fixed for the file once its editor state exists.
+   */
+  baseline?: string | null;
+  /**
    * Identity of the file being edited (editors only). When it changes the view swaps to that
    * file's own editor state — undo history and selection stay per file, and Cmd+Z never pulls
    * another file's text into this one.
@@ -63,6 +68,7 @@ const StepEditor = memo(
     onSubmit,
     onRun,
     original = null,
+    baseline = null,
     fileKey,
     resetKey,
     viewRef,
@@ -87,20 +93,20 @@ const StepEditor = memo(
     onSubmitRef.current = onSubmit;
     onRunRef.current = onRun;
 
-    const buildState = (doc: string, baseline: string | null): EditorState => {
+    const buildState = (doc: string, diffOriginal: string | null): EditorState => {
       const extensions: Extension[] = [
         // First, so Vim's bindings see keys before the editing keymaps.
         settingsCompartment.current.of(settingsExtensions(settings, readOnly)),
-        readOnly ? viewerExtensions() : editorExtensions(),
+        readOnly ? viewerExtensions() : editorExtensions(baseline),
         // Typing comfort the read-only viewers do not need: paired brackets and completion of words
         // already in the file (the starter's identifiers are what the learner types most).
         readOnly ? [] : [closeBrackets(), autocompletion({override: [completeAnyWord]})],
         languageCompartment.current.of(languageExtensions(language)),
         diffCompartment.current.of(
-          baseline === null
+          diffOriginal === null
             ? []
             : unifiedMergeView({
-                original: baseline,
+                original: diffOriginal,
                 mergeControls: false,
                 highlightChanges: true,
                 gutter: true,

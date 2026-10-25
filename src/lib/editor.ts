@@ -33,6 +33,7 @@ import {
 import {highlightCode, tagHighlighter, tags} from '@lezer/highlight';
 import {vim} from '@replit/codemirror-vim';
 
+import {changeGutter} from './changeGutter';
 import type {EditorSettings} from './editorSettings';
 import type {Language} from './types';
 
@@ -157,9 +158,15 @@ export function viewerExtensions(): Extension[] {
   ];
 }
 
-export function editorExtensions(): Extension[] {
+/**
+ * Editors. `baseline` is the text the gutter right of the line numbers marks changes against (the
+ * file's starter; `src/lib/changeGutter.ts`); without one there is no change gutter.
+ */
+export function editorExtensions(baseline: string | null = null): Extension[] {
   return [
     ...shared,
+    // After the line numbers in the configuration, so its gutter sits right beside them.
+    baseline === null ? [] : changeGutter(baseline),
     history(),
     foldGutter(),
     indentOnInput(),

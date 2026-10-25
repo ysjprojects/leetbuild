@@ -716,6 +716,11 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   /** The step's own file — what Submit judges and the solution diffs against, whichever tab is open. */
   const stepCode = step === null ? '' : files[step.id] ?? codeFor(step, language).starter;
   const openCode = openFile === null ? '' : files[openFile] ?? '';
+  /** What the editor's gutter marks the open file's changes against: its starter, what reset restores. */
+  const openStarter = useMemo(() => {
+    const owner = problem?.steps.find(s => s.id === openFile);
+    return owner === undefined ? null : codeFor(owner, language).starter;
+  }, [problem, openFile, language]);
   /** What the course provides beside the learner's files in this language; read-only in the explorer. */
   const provided = useMemo(() => (problem === null ? [] : providedFiles(problem, language)), [problem, language]);
   const openProvided =
@@ -1798,6 +1803,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                   </>
                 ) : (
                   <StepEditor
+                    baseline={openStarter}
                     className="min-h-0 min-w-0 flex-1"
                     fileKey={`${problem.id}/${openFile}/${language}`}
                     language={language}

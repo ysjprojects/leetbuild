@@ -827,6 +827,7 @@ const MockInterview: FC = memo(() => {
             </div>
           ) : (
             <StepEditor
+              baseline={codeFor(scenario.step, language).starter}
               className="min-h-0 flex-1"
               fileKey={`${scenario.id}:${language}`}
               language={language}
