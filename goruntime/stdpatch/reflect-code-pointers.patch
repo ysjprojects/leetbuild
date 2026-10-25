@@ -1,0 +1,33 @@
+# Edits to the standard library that the WebAssembly build compiles with (scripts/build-go.ts applies
+# them through `go build -overlay`; each `find` must occur in its file exactly once).
+#
+# reflect calls a method of a concrete type through a word holding the method's code address, and
+# that word is typed unsafe.Pointer: it lives in the heap (it escapes), and storing into it records
+# the code address with the garbage collector's write barrier. Natively a code address never lies
+# in the heap, so that is harmless. On wasm a code address is a small number (function index << 16,
+# from 0x10000000 up), which the heap reaches once it grows past 256 MB: the collector then takes
+# it for a heap pointer, and finds an object that is not there ("found bad pointer in Go heap") or
+# marks a free one ("found pointer to free object"). Every reflect method call while the collector
+# marks does this; yaegi calls every method of a compiled type that way. Typed uintptr, the word
+# holds the same address and the collector never looks at it. The same bug in runtime.itabInit was
+# golang/go#80472; these two sites are still open upstream.
+
+file: reflect/value.go
+<<< find
+		ifn := textOffFor(v.typ(), m.Ifn)
+		fn = unsafe.Pointer(&ifn)
+=== replace
+		// LeetBuild (goruntime/stdpatch): a code address, where the collector does not take it for a heap pointer.
+		ifn := uintptr(textOffFor(v.typ(), m.Ifn))
+		fn = unsafe.Pointer(&ifn)
+>>>
+
+file: reflect/type.go
+<<< find
+	tfn := t.textOff(p.Tfn)
+	fn := unsafe.Pointer(&tfn)
+=== replace
+	// LeetBuild (goruntime/stdpatch): a code address, where the collector does not take it for a heap pointer.
+	tfn := uintptr(t.textOff(p.Tfn))
+	fn := unsafe.Pointer(&tfn)
+>>>

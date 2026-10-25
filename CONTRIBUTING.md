@@ -60,7 +60,7 @@ What the checks cannot enforce, reviewers will:
 - Components are `memo(...)`; hooks and non-component helpers live in `src/lib`, not in `.tsx` files (the lint fails otherwise). Props are typed inline on the `FC`.
 - Colours are palette tokens only — `ink-*`, `iris-*`, `success`/`warning`/`danger`, the concept colours — so both themes work; check Night and Day. Literal hex is for brand marks alone (the logo, LinkedIn's blue, company logos).
 - The app is a function of persisted progress (`src/lib/storage.ts`) and course data; there is no server. Badges are never revoked, certificates never rewritten, persisted records are repaired rather than rejected.
-- Runtime changes (`src/lib/runtime/`, `public/py/runtime/`, `goruntime/`) must leave every `yarn verify` harness suite green. After editing `goruntime/`, `yarn build:go` (Go 1.27) rebuilds `public/go/runtime.wasm.gz`, which is committed: `yarn verify` fails while it was built from other sources. The worker bundles are gitignored and rebuilt by `yarn dev`/`yarn build`.
+- Runtime changes (`src/lib/runtime/`, `public/py/runtime/`, `goruntime/`) must leave every `yarn verify` harness suite green. After editing `goruntime/`, `yarn build:go` (Go 1.27) rebuilds `public/go/runtime.wasm.gz`, which is committed: `yarn verify` fails while it was built from other sources. The build compiles the standard library with the edits in `goruntime/stdpatch` and stops when a toolchain's sources no longer contain the lines they edit: update the patch, never drop it. The worker bundles are gitignored and rebuilt by `yarn dev`/`yarn build`.
 
 ## Pull requests
 

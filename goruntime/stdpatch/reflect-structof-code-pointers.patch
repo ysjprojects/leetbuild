@@ -1,0 +1,93 @@
+# reflect.StructOf gives a struct embedding a type with methods (a lone embedded field, as yaegi
+# builds `type stamp struct{ time.Time }`) the promoted methods, and registers their code addresses
+# with the runtime (resolveReflectText), which keeps them in maps of unsafe.Pointer: memory the
+# garbage collector scans at every cycle. For the same reason as in reflect-code-pointers.patch, a
+# code address is a heap pointer to the collector on wasm once the heap has grown past it. Code
+# addresses are registered apart instead, as uintptr, from the same sequence of offsets, and textOff
+# resolves them from there.
+
+file: runtime/runtime1.go
+<<< find
+// reflect_addReflectOff adds a pointer to the reflection offset lookup map.
+//
+//go:linkname reflect_addReflectOff reflect.addReflectOff
+func reflect_addReflectOff(ptr unsafe.Pointer) int32 {
+=== replace
+// reflectOffsText holds the code addresses reflect registers (reflect_addReflectTextOff), by offset
+// and back, under reflectOffs' lock (LeetBuild: goruntime/stdpatch). As uintptr, the collector never
+// takes one for a heap pointer: on wasm a code address can lie inside the heap.
+var (
+	reflectOffsText    map[int32]uintptr
+	reflectOffsTextInv map[uintptr]int32
+)
+
+// reflect_addReflectTextOff is reflect_addReflectOff for a code address (see reflectOffsText).
+//
+//go:linkname reflect_addReflectTextOff reflect.addReflectTextOff
+func reflect_addReflectTextOff(ptr unsafe.Pointer) int32 {
+	reflectOffsLock()
+	if reflectOffs.m == nil {
+		reflectOffs.m = make(map[int32]unsafe.Pointer)
+		reflectOffs.minv = make(map[unsafe.Pointer]int32)
+		reflectOffs.next = -1
+	}
+	if reflectOffsText == nil {
+		reflectOffsText = make(map[int32]uintptr)
+		reflectOffsTextInv = make(map[uintptr]int32)
+	}
+	pc := uintptr(ptr)
+	id, found := reflectOffsTextInv[pc]
+	if !found {
+		id = reflectOffs.next
+		reflectOffs.next-- // one sequence with reflect_addReflectOff's
+		reflectOffsText[id] = pc
+		reflectOffsTextInv[pc] = id
+	}
+	reflectOffsUnlock()
+	return id
+}
+
+// reflect_addReflectOff adds a pointer to the reflection offset lookup map.
+//
+//go:linkname reflect_addReflectOff reflect.addReflectOff
+func reflect_addReflectOff(ptr unsafe.Pointer) int32 {
+>>>
+
+file: runtime/type.go
+<<< find
+	if md == nil {
+		reflectOffsLock()
+		res := reflectOffs.m[int32(off)]
+		reflectOffsUnlock()
+		if res == nil {
+			println("runtime: textOff", hex(off), "base", hex(base), "not in ranges:")
+=== replace
+	if md == nil {
+		reflectOffsLock()
+		res := reflectOffs.m[int32(off)]
+		if pc, ok := reflectOffsText[int32(off)]; ok {
+			// LeetBuild (goruntime/stdpatch): a code address reflect registered (reflectOffsText).
+			res = unsafe.Pointer(pc)
+		}
+		reflectOffsUnlock()
+		if res == nil {
+			println("runtime: textOff", hex(off), "base", hex(base), "not in ranges:")
+>>>
+
+file: reflect/type.go
+<<< find
+func resolveReflectText(ptr unsafe.Pointer) aTextOff {
+	return aTextOff(addReflectOff(ptr))
+}
+=== replace
+func resolveReflectText(ptr unsafe.Pointer) aTextOff {
+	return aTextOff(addReflectTextOff(ptr))
+}
+
+// addReflectTextOff is addReflectOff for a code address (LeetBuild: goruntime/stdpatch): the
+// runtime keeps it where the garbage collector does not take it for a heap pointer.
+//
+//go:linkname addReflectTextOff
+//go:noescape
+func addReflectTextOff(ptr unsafe.Pointer) int32
+>>>
