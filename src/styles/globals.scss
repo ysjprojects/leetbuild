@@ -178,9 +178,8 @@ dialog[open] {
     position: relative;
   }
 
-  .lb-change-added::before,
-  .lb-change-changed::before {
-    content: '';
+  .lb-change-added,
+  .lb-change-changed {
     position: absolute;
     top: 0;
     bottom: 0;
@@ -188,18 +187,17 @@ dialog[open] {
     width: 3px;
   }
 
-  .lb-change-added::before {
+  .lb-change-added {
     background: theme('colors.success.400');
   }
 
-  .lb-change-changed::before {
+  .lb-change-changed {
     background: theme('colors.concept.http');
   }
 
   /* Removed lines: a triangle pointing into the code, on the boundary the lines left. */
-  .lb-change-removed::before,
-  .lb-change-removed-end::before {
-    content: '';
+  .lb-change-removed,
+  .lb-change-removed-end {
     position: absolute;
     left: 0;
     z-index: 1;
@@ -208,11 +206,11 @@ dialog[open] {
     border-left: 6px solid theme('colors.danger.400');
   }
 
-  .lb-change-removed::before {
+  .lb-change-removed {
     top: -4px;
   }
 
-  .lb-change-removed-end::before {
+  .lb-change-removed-end {
     bottom: -4px;
   }
 
