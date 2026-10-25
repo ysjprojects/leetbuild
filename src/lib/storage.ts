@@ -4,8 +4,9 @@
  * chosen language, submission counters, last position).
  *
  * IndexedDB is the primary backend; localStorage is the fallback where IndexedDB is unavailable
- * (some private modes). Writes are debounced per record so typing does not hammer the database,
- * and `flush()` runs on page hide so the last edits survive navigation.
+ * (some private modes). Writes are debounced per record so typing does not hammer the database.
+ * A page going away flushes them, stashing them first in localStorage, which writes synchronously:
+ * an IndexedDB transaction may not outlive the page, and the next load applies the stash.
  */
 import {type StepAttempt, type Submission, HISTORY_LENGTH} from './scoring';
 import {type Scratchpad, normalizeShapes} from './scratchpad';
@@ -61,6 +62,8 @@ const WORKSPACES = 'workspaces';
 const PROGRESS = 'progress';
 const SCRATCHPADS = 'scratchpads';
 const FALLBACK_KEY = 'leetbuild:snapshot';
+/** Writes a page left pending as it went away (see `ProgressStore.flush`). */
+const STASH_KEY = 'leetbuild:pending';
 const WRITE_DELAY_MS = 400;
 const OPEN_TIMEOUT_MS = 4000;
 
@@ -339,12 +342,59 @@ function normalizeProgress(value: unknown): Progress {
   };
 }
 
+/**
+ * The stash: records by key (`workspace:<id>`, `progress`, `scratchpad:<id>`; null for a deleted
+ * workspace) that a page going away had not yet written. Each leaves it once the database has it.
+ */
+const readStash = (raw: string | null): Record<string, unknown> => {
+  try {
+    const parsed: unknown = raw === null ? null : JSON.parse(raw);
+    return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+};
+
+const stashGet = (): Record<string, unknown> => {
+  try {
+    return readStash(window.localStorage.getItem(STASH_KEY));
+  } catch {
+    return {};
+  }
+};
+
+const stashPut = (records: Record<string, unknown>): void => {
+  try {
+    if (Object.keys(records).length === 0) window.localStorage.removeItem(STASH_KEY);
+    else window.localStorage.setItem(STASH_KEY, JSON.stringify(records));
+  } catch {
+    // storage full or disabled: the IndexedDB write is all there is
+  }
+};
+
+/** Drop `key` from the stash: the database has the record now (or a newer one). */
+const unstash = (key: string): void => {
+  try {
+    const raw = window.localStorage.getItem(STASH_KEY);
+    if (raw === null) return;
+    const records = readStash(raw);
+    if (!(key in records)) return;
+    delete records[key];
+    stashPut(records);
+  } catch {
+    // storage disabled: nothing was stashed
+  }
+};
+
 export class ProgressStore {
   private backend: Promise<Backend>;
   private loading: Promise<Snapshot> | null = null;
   /** The snapshot `load()` resolved with; saves update it so a remount sees the latest state. */
   private snapshot: Snapshot | null = null;
-  private readonly pending = new Map<string, {timer: number; run: () => Promise<void>}>();
+  /** Writes waiting out the debounce, by record key, with the record each writes (null: a deletion). */
+  private readonly pending = new Map<string, {timer: number; run: () => Promise<void>; value: unknown}>();
+  /** Writes started and not yet confirmed by the database, by record key. */
+  private readonly inflight = new Map<string, {value: unknown}>();
 
   constructor() {
     this.backend =
@@ -352,9 +402,10 @@ export class ProgressStore {
         ? Promise.resolve(new LocalStorageBackend())
         : ProgressStore.openIdb().catch(() => new LocalStorageBackend());
     if (typeof window !== 'undefined') {
-      window.addEventListener('pagehide', () => void this.flush());
+      // The page may be going away: what is pending is stashed as well as written (see `flush`).
+      window.addEventListener('pagehide', () => void this.flush(true));
       document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'hidden') void this.flush();
+        if (document.visibilityState === 'hidden') void this.flush(true);
       });
     }
   }
@@ -382,7 +433,8 @@ export class ProgressStore {
 
   /**
    * Read everything once; concurrent callers (strict-mode double mounts) share the read, and later
-   * callers (client-side navigation back to the page) get the snapshot including every save.
+   * callers (client-side navigation back to the page) get the snapshot including every save. What
+   * a page stashed as it went away is applied over it, and written through.
    */
   load(): Promise<Snapshot> {
     if (this.loading === null) {
@@ -390,6 +442,7 @@ export class ProgressStore {
         .then(b => b.readAll())
         .then(snapshot => {
           this.snapshot = snapshot;
+          this.restoreStash(snapshot);
           return snapshot;
         });
     }
@@ -398,41 +451,96 @@ export class ProgressStore {
 
   saveWorkspace(id: string, state: Workspace): void {
     if (this.snapshot !== null) this.snapshot.workspaces[id] = state;
-    this.schedule(`workspace:${id}`, async () => (await this.backend).writeWorkspace(id, state));
+    this.schedule(`workspace:${id}`, state, async () => (await this.backend).writeWorkspace(id, state));
   }
 
   /** Forget a saved workspace so the step reopens with its starter. */
   deleteWorkspace(id: string): void {
     if (this.snapshot !== null) delete this.snapshot.workspaces[id];
-    this.schedule(`workspace:${id}`, async () => (await this.backend).deleteWorkspace(id));
+    this.schedule(`workspace:${id}`, null, async () => (await this.backend).deleteWorkspace(id));
   }
 
   saveProgress(progress: Progress): void {
     if (this.snapshot !== null) this.snapshot.progress = progress;
-    this.schedule('progress', async () => (await this.backend).writeProgress(progress));
+    this.schedule('progress', progress, async () => (await this.backend).writeProgress(progress));
   }
 
   saveScratchpad(id: string, pad: Scratchpad): void {
     if (this.snapshot !== null) this.snapshot.scratchpads[id] = pad;
-    this.schedule(`scratchpad:${id}`, async () => (await this.backend).writeScratchpad(id, pad));
+    this.schedule(`scratchpad:${id}`, pad, async () => (await this.backend).writeScratchpad(id, pad));
   }
 
-  /** Run every pending write now. */
-  async flush(): Promise<void> {
-    const runs = Array.from(this.pending.values());
-    for (const p of runs) window.clearTimeout(p.timer);
+  /**
+   * Run every pending write now. A page going away cannot count on them, nor on the writes already
+   * running: an IndexedDB transaction still open when the page unloads is aborted. With `stash`,
+   * the records of both are first kept in localStorage, which writes synchronously; the next load
+   * applies them.
+   */
+  async flush(stash = false): Promise<void> {
+    const runs = Array.from(this.pending);
+    for (const [, p] of runs) window.clearTimeout(p.timer);
     this.pending.clear();
-    await Promise.all(runs.map(p => p.run().catch(() => undefined)));
+    if (stash && runs.length + this.inflight.size > 0) {
+      const running = Array.from(this.inflight, ([key, write]) => [key, write.value]);
+      const waiting = runs.map(([key, p]) => [key, p.value]);
+      stashPut({...stashGet(), ...Object.fromEntries(running), ...Object.fromEntries(waiting)});
+    }
+    await Promise.all(runs.map(([key, p]) => this.write(key, p.value, p.run)));
   }
 
-  private schedule(key: string, run: () => Promise<void>): void {
+  private schedule(key: string, value: unknown, run: () => Promise<void>): void {
     const existing = this.pending.get(key);
     if (existing !== undefined) window.clearTimeout(existing.timer);
     const timer = window.setTimeout(() => {
       this.pending.delete(key);
-      void run().catch(() => undefined);
+      void this.write(key, value, run);
     }, WRITE_DELAY_MS);
-    this.pending.set(key, {timer, run});
+    this.pending.set(key, {timer, run, value});
+  }
+
+  /**
+   * One write, in flight until the database has it; then a stashed copy of the record is obsolete,
+   * unless a newer write of it has started since (the stash may hold that one).
+   */
+  private async write(key: string, value: unknown, run: () => Promise<void>): Promise<void> {
+    const write = {value};
+    this.inflight.set(key, write);
+    try {
+      await run();
+      if (this.inflight.get(key) !== write) return;
+      this.inflight.delete(key);
+      unstash(key);
+    } catch {
+      // kept in memory, and in the stash if it was stashed
+      if (this.inflight.get(key) === write) this.inflight.delete(key);
+    }
+  }
+
+  /**
+   * Apply what a page stashed as it went away, and write it through. A workspace or scratchpad is
+   * applied unless the database holds a newer one (another tab saved since); progress has no time,
+   * but any tab's write of it clears the stashed copy.
+   */
+  private restoreStash(snapshot: Snapshot): void {
+    for (const [key, value] of Object.entries(stashGet())) {
+      if (key === 'progress') {
+        this.saveProgress(normalizeProgress(value));
+      } else if (key.startsWith('workspace:')) {
+        const id = key.slice('workspace:'.length);
+        const state = value === null ? null : normalizeWorkspaces({[id]: value})[id];
+        const current = snapshot.workspaces[id];
+        if (state === null) this.deleteWorkspace(id);
+        else if (state !== undefined && (current === undefined || state.updatedAt >= current.updatedAt)) {
+          this.saveWorkspace(id, state);
+        } else unstash(key);
+      } else if (key.startsWith('scratchpad:')) {
+        const id = key.slice('scratchpad:'.length);
+        const pad = normalizeScratchpad(value);
+        const current = snapshot.scratchpads[id];
+        if (current === undefined || pad.updatedAt >= current.updatedAt) this.saveScratchpad(id, pad);
+        else unstash(key);
+      } else unstash(key);
+    }
   }
 }
 
