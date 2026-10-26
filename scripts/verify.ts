@@ -689,8 +689,17 @@ async function main(): Promise<void> {
 }
 
 // Loudly: the TypeScript runtime handles unhandled rejections for the learner's code, so a crash here
-// would otherwise end the process quietly with status 0.
-main().catch(error => {
-  console.error(error);
-  process.exit(1);
-});
+// would otherwise end the process quietly with status 0. Done, the process ends once its output is
+// written out (a pipe drains asynchronously): a runtime's library may still hold a timer of its own
+// (PGlite's Postgres re-arms its statistics timeout against the real clock, minutes ahead of a check's
+// virtual one), which would keep it alive for nothing.
+const exit = (code?: number): void => {
+  process.stdout.write('', () => process.stderr.write('', () => process.exit(code)));
+};
+main().then(
+  () => exit(),
+  error => {
+    console.error(error);
+    exit(1);
+  },
+);
