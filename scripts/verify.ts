@@ -12,6 +12,7 @@
  *   yarn verify --no-runtime                  # static checks only (no Pyodide boot)
  *   yarn verify --runtime go                  # execute only the Go harnesses (no Pyodide boot)
  *   yarn verify --runtime python,typescript   # execute only those languages' harnesses
+ *   yarn verify --runtime cpp --shard 2/6     # the second of six balanced shares of the problems (CI)
  */
 import {fork} from 'node:child_process';
 import {existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
@@ -64,6 +65,21 @@ const withRuntime = !args.includes('--no-runtime');
  * checks still cover every language).
  */
 const onlyRuntimes = flag('--runtime')?.split(',') ?? null;
+
+/**
+ * `--shard 2/6`: the second of six shares of the problems, balanced by the harnessed steps this run
+ * executes. CI runs the C++ harnesses as a matrix of shards: compiling every C++ program takes one
+ * runner past its time limit.
+ */
+const shard = ((): {index: number; count: number} | null => {
+  const value = flag('--shard');
+  if (value === null) return null;
+  const [index, count] = value.split('/').map(Number);
+  if (!(Number.isInteger(index) && Number.isInteger(count) && index >= 1 && index <= count)) {
+    throw new Error(`--shard ${value}: expected i/n with 1 ≤ i ≤ n`);
+  }
+  return {index: index - 1, count};
+})();
 
 /** Where this run keeps the C++ programs its workers compile ahead (a fresh directory, removed on exit). */
 let cppProgramDir: string | null = null;
@@ -505,6 +521,31 @@ function cppRuntimeFreshness(): string[] {
 }
 
 /**
+ * This run's share of the problems (all of them without `--shard`): heaviest first, each to the
+ * lightest shard, weighed by the harnessed steps the run executes. A problem with nothing to execute
+ * still weighs a little (its static checks), so those spread across the shards too.
+ */
+function shareOf(problems: Problem[]): Problem[] {
+  if (shard === null) return problems;
+  const executes = (step: Step): number =>
+    withRuntime
+      ? EXECUTING.filter(
+          ({language}) =>
+            (onlyRuntimes === null || onlyRuntimes.includes(language)) && step.harness?.[language] !== undefined,
+        ).length
+      : 0;
+  const weight = (problem: Problem): number => problem.steps.reduce((sum, step) => sum + executes(step), 0) + 1e-3;
+  const loads = new Array<number>(shard.count).fill(0);
+  const share = new Set<Problem>();
+  for (const problem of [...problems].sort((a, b) => weight(b) - weight(a) || a.id.localeCompare(b.id))) {
+    const lightest = loads.indexOf(Math.min(...loads));
+    loads[lightest] += weight(problem);
+    if (lightest === shard.index) share.add(problem);
+  }
+  return problems.filter(problem => share.has(problem));
+}
+
+/**
  * Compile every C++ program this run checks — each harnessed step's solution and starter, with its
  * neighbours — in worker processes, one per spare core, into the directory the C++ runtime loads
  * programs from. Clang runs single-threaded in WebAssembly: compiled one after another, the C++
@@ -585,7 +626,9 @@ async function main(): Promise<void> {
   let checked = 0;
   const harnesses: Partial<Record<Language, number>> = {};
   let programs = 0;
-  const selected = problems.filter(p => onlyProblem === null || p.id === onlyProblem || onlyProblem.endsWith(p.id));
+  const selected = shareOf(
+    problems.filter(p => onlyProblem === null || p.id === onlyProblem || onlyProblem.endsWith(p.id)),
+  );
   const runtimes: Partial<Record<Language, NodeRuntime>> = {};
   if (withRuntime)
     for (const {language, boot} of EXECUTING) {

@@ -1,6 +1,7 @@
-# The gate CONTRIBUTING.md describes, run on every PR and on main: lint + types, course verification,
-# production build — three independent jobs in parallel, then one `CI` job that is the single required
-# status check (branch protection names it; the jobs behind it can change without touching settings).
+# The gate CONTRIBUTING.md describes, run on every PR and on main: lint + types, course verification
+# (the C++ harnesses in shards of their own), production build — independent jobs in parallel, then one
+# `CI` job that is the single required status check (branch protection names it; the jobs behind it can
+# change without touching settings).
 name: CI
 
 on:
@@ -45,10 +46,16 @@ jobs:
       # Boots Pyodide in Node; its packages (fastapi, protobuf, …) come from jsDelivr at run time.
       - run: yarn verify --runtime python,typescript,go
 
+  # Compiling every C++ program with the clang the browser runs (WebAssembly, one core per compile)
+  # takes one runner past half an hour, so the problems are split into balanced shares.
   verify-cpp:
-    name: Verify courses in C++
+    name: Verify courses in C++ (${{ matrix.shard }}/8)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -56,9 +63,9 @@ jobs:
           node-version-file: .nvmrc
           cache: yarn
       - run: yarn install --frozen-lockfile
-      # Fetches the WASI sysroot (wasi-sdk's release, pinned by digest), then compiles every C++ step with the
-      # clang the browser runs, in parallel across the runner's cores, and runs its harness.
-      - run: yarn verify --runtime cpp
+      # Fetches the WASI sysroot (wasi-sdk's release, pinned by digest), compiles the share's C++ programs
+      # in parallel across the runner's cores, and runs their harnesses.
+      - run: yarn verify --runtime cpp --shard ${{ matrix.shard }}/8
 
   build:
     name: Build
