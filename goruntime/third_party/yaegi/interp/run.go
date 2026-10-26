@@ -220,7 +220,8 @@ func runCfg(n *node, f *frame, funcNode, callNode *node) {
 			// in this specific case, the stdlib would/will suppress the panic, so we
 			// suppress the logging here accordingly, to get a similar and consistent
 			// behavior.
-			if !ok || errorer.Error() != errAbortHandler.Error() {
+			quiet := n.interp.opt.quietPanic != nil && n.interp.opt.quietPanic(f.recovered) // LeetBuild
+			if !quiet && (!ok || errorer.Error() != errAbortHandler.Error()) {
 				fmt.Fprintln(n.interp.stderr, oNode.cfgErrorf("panic: %s(...)", panicFunc(oNode.scope)))
 			}
 			f.mutex.Unlock()

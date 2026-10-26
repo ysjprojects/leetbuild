@@ -19,5 +19,6 @@ export function cppSupported(): boolean {
   return typeof wasm?.Suspending === 'function' && typeof wasm.promising === 'function';
 }
 
+/** Why C++ does not run here: a run error on its own, and the tail of the problem pane's note. */
 export const CPP_UNSUPPORTED =
-  'C++ runs on WebAssembly stack switching (JSPI), which this browser lacks: use Chrome 137+, Firefox 153+ or Safari 27+';
+  'Running C++ here needs WebAssembly stack switching (JSPI), which this browser lacks. Chrome 137+, Firefox 153+ and Safari 27+ have it.';

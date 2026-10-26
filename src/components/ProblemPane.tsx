@@ -703,7 +703,7 @@ const ProblemPane: FC<{
                 {runtimeHarness(step, language) !== undefined
                   ? 'Your code runs in the browser: each check exercises it and reports what it observed.'
                   : step.harness?.[language] !== undefined
-                  ? `The checks read the shape of your code. ${CPP_UNSUPPORTED}, to run it.`
+                  ? `The checks read the shape of your code. ${CPP_UNSUPPORTED}`
                   : runsAsProgram(problem, step, language)
                   ? 'The checks read the shape of your code. Run executes the file here in the browser, PyTorch on the CPU, and the console shows its self-test, which prints PASS when it holds.'
                   : problem.track === 'dllm'

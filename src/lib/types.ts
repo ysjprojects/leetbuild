@@ -1,6 +1,6 @@
 /**
  * Content model for /leetbuild: problems are systems (a match engine, an image cache…) that the
- * learner builds step by step in one of four languages. Every step is a self-contained file with a
+ * learner builds step by step in one of five languages. Every step is a self-contained file with a
  * starter and a reference solution per language, a task statement, progressive hints, and a list
  * of checks the judge runs against the learner's code (see judge.ts).
  *

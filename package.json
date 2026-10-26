@@ -2,7 +2,10 @@
   "name": "leetbuild",
   "version": "1.0.0",
   "private": true,
-  "description": "LeetCode for systems: build an image cache, a match engine, a news feed… step by step in Python, Go, Scala or C++ across HTTPS, gRPC, Kafka and Redis.",
+  "description": "LeetCode for systems: build an image cache, a match engine, a news feed… step by step in Python, TypeScript, Go, Scala or C++ across HTTPS, gRPC, Kafka and Redis.",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",

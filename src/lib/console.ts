@@ -32,8 +32,8 @@ const split = (text: string, stream: OutputLine['stream']): OutputLine[] =>
   text === '' ? [] : text.split('\n').map(line => ({stream, text: line}));
 
 /**
- * A finished run as the console shows it: its output (what it streamed, or else, TypeScript and Go,
- * its stdout then stderr), then each check it executed by the title the step gives it.
+ * A finished run as the console shows it: its output (what it streamed, or else, TypeScript, Go and
+ * C++, its stdout then stderr), then each check it executed by the title the step gives it.
  */
 export const finished = (run: ConsoleRun, result: RunResult, checks: readonly StepCheck[] = []): ConsoleRun => ({
   ...run,

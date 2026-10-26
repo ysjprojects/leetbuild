@@ -22,17 +22,17 @@ The switch between them is `src/components/ModeSwitch.tsx`. The mock scenarios a
 Dependencies are local to this repo. Yarn may not be installed; npm works too.
 
 ```sh
-npm install --no-package-lock     # or: yarn install --ignore-engines
+npm install --no-package-lock     # or: yarn install (Node 24, see .nvmrc)
 npx next dev                      # or: yarn dev
 npx next build                    # or: yarn build
-npx tsx scripts/verify.ts         # all content + Python, TypeScript and Go harnesses
+npx tsx scripts/verify.ts         # all content + Python, TypeScript, Go and C++ harnesses
 npx tsx scripts/verify.ts --no-runtime
 npx tsc --noEmit
 npm run lint                      # prettier --check + eslint, what CI runs
 npm run format                    # prettier --write + eslint --fix
 ```
 
-`npx tsx scripts/build-runtime.ts` regenerates `public/py/worker.js` and `public/ts/worker.js`;
+`npx tsx scripts/build-runtime.ts` regenerates the runtime workers (`public/{py,ts,go,cpp}/worker.js`);
 `next dev`/`next build` normally do this through the package scripts.
 
 ## Generated artifacts and how to delete them

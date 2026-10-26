@@ -672,10 +672,10 @@ object ChannelRouting {
     },
     cpp: {
       starter: `#include <grpcpp/grpcpp.h>
+#include <openssl/md5.h>
 
 #include <chrono>
 #include <cstdint>
-#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -694,7 +694,13 @@ constexpr int kVNodes = 100;
 constexpr std::chrono::milliseconds kDeadline{300};
 
 // A 64-bit position on the ring (provided).
-uint64_t hash_key(const std::string& key) { return std::hash<std::string>{}(key); }
+uint64_t hash_key(const std::string& key) {
+  unsigned char digest[16];
+  MD5(reinterpret_cast<const unsigned char*>(key.data()), key.size(), digest);
+  uint64_t h = 0;
+  for (int i = 0; i < 8; ++i) h = (h << 8) | digest[i];  // first 8 bytes, big-endian
+  return h;
+}
 
 // Consistent hash ring: every instance owns kVNodes points, a key goes to the first point clockwise.
 class Ring {
@@ -743,10 +749,10 @@ std::vector<discord::Message> fetch_messages(int64_t channel_id, int64_t before,
 }
 `,
       solution: `#include <grpcpp/grpcpp.h>
+#include <openssl/md5.h>
 
 #include <chrono>
 #include <cstdint>
-#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -765,7 +771,13 @@ constexpr int kVNodes = 100;
 constexpr std::chrono::milliseconds kDeadline{300};
 
 // A 64-bit position on the ring (provided).
-uint64_t hash_key(const std::string& key) { return std::hash<std::string>{}(key); }
+uint64_t hash_key(const std::string& key) {
+  unsigned char digest[16];
+  MD5(reinterpret_cast<const unsigned char*>(key.data()), key.size(), digest);
+  uint64_t h = 0;
+  for (int i = 0; i < 8; ++i) h = (h << 8) | digest[i];  // first 8 bytes, big-endian
+  return h;
+}
 
 // Consistent hash ring: every instance owns kVNodes points, a key goes to the first point clockwise.
 class Ring {

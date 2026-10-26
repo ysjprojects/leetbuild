@@ -157,6 +157,7 @@ func RunCheck(job *Job, id string) Result {
 			Stdout:               stdout,
 			Stderr:               stderr,
 			GoroutinePanic:       func(r interface{}) { record(r) },
+			QuietPanic:           isFailure,
 		})
 		in.Haltable()
 		started = append(started, in)
@@ -219,8 +220,7 @@ func run(f func()) (message string) {
 		if r == nil {
 			return
 		}
-		var failure harness.Failure
-		if errors.As(asError(r), &failure) {
+		if failure, ok := failureOf(r); ok {
 			message = failure.Message
 			return
 		}
@@ -232,6 +232,18 @@ func run(f func()) (message string) {
 	}()
 	f()
 	return ""
+}
+
+// failureOf is the harness failure a check panicked with, if that is what r is.
+func failureOf(r any) (harness.Failure, bool) {
+	var failure harness.Failure
+	return failure, errors.As(asError(r), &failure)
+}
+
+// isFailure says a panic is a check's verdict: the interpreter does not report it on stderr as a crash.
+func isFailure(r any) bool {
+	_, ok := failureOf(r)
+	return ok
 }
 
 func asError(v any) error {

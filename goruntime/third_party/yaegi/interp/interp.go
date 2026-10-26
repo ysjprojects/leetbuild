@@ -183,6 +183,9 @@ type opt struct {
 	// goroutinePanic receives a panic escaping a goroutine started by interpreted
 	// code; nil keeps the stock behaviour (the panic kills the process).
 	goroutinePanic func(recovered interface{})
+	// quietPanic reports whether a panic unwinding interpreted code is left
+	// unreported on stderr; nil reports every panic.
+	quietPanic func(recovered interface{}) bool
 }
 
 // Interpreter contains global resources and state.
@@ -406,6 +409,11 @@ type Options struct {
 	// by interpreted code instead of letting it crash the host process (LeetBuild
 	// patch: one learner goroutine must not take the whole runtime down).
 	GoroutinePanic func(recovered interface{})
+
+	// QuietPanic, when set, says which panics unwinding interpreted code are not
+	// reported on Stderr (LeetBuild patch: a harness check's failure is a verdict,
+	// not a crash).
+	QuietPanic func(recovered interface{}) bool
 }
 
 // New returns a new interpreter.
@@ -442,6 +450,7 @@ func New(options Options) *Interpreter {
 		i.opt.args = os.Args
 	}
 	i.opt.goroutinePanic = options.GoroutinePanic
+	i.opt.quietPanic = options.QuietPanic
 
 	// unrestricted allows to use non sandboxed stdlib symbols and env.
 	if options.Unrestricted {
