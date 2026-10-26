@@ -1008,7 +1008,7 @@ void dead_letter(const RdKafka::Message& msg, const std::string& reason) {
   const std::string key = msg.key() ? *msg.key() : "";
   producer->produce(kDeadTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(payload.data()),
                     payload.size(), key.data(), key.size(), 0, headers, nullptr);
-  producer->flush(5000);
+  producer->flush(-1);  // until the broker acknowledged: a commit before that could lose the only copy
 }
 
 void run() {
@@ -1918,6 +1918,435 @@ func CheckCommitAfterWrite(ctx *harness.Ctx) {
 	ctx.Equal(ingestKeys(j), []string{"e1", "e2", "e3"}, "after a restart the consumer must redeliver e3 and write it: the journal's event ids")
 	ctx.Equal(len(j["e3"].entries), 2, "e3 must be written exactly once: its entries in the journal")
 	ingestFullyCommitted(ctx)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
+
+#include <pqxx/pqxx>
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <chrono>
+#include <exception>
+#include <initializer_list>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include "db.h"
+#include "ids.h"
+
+namespace {
+
+const std::string ingestSchema = R"(
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL REFERENCES transactions (id),
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL,
+    posted_at bigint NOT NULL
+);
+)";
+
+constexpr int64_t ingestT0 = 1700000000000LL;
+const std::string ingestTopic = "money-events";
+const std::string ingestDead = "money-events.dead";
+
+nlohmann::json ingestEvent(const std::string& eventID, const std::string& kind, int64_t amount, const std::string& currency, int64_t occurredAt) {
+  return {{"event_id", eventID}, {"type", kind}, {"amount", amount}, {"currency", currency}, {"occurred_at", occurredAt}, {"charge", "ch_" + eventID}};
+}
+
+nlohmann::json ingestCaptured(const std::string& eventID, int64_t amount) { return ingestEvent(eventID, "payment.captured", amount, "EUR", ingestT0); }
+
+std::string ingestJSON(const nlohmann::json& v) { return v.dump(); }
+
+// ingestSeed puts events on money-events keyed by their id; a string is a raw record keyed "raw".
+void ingestSeed(harness::Ctx& ctx, std::initializer_list<nlohmann::json> events) {
+  for (const auto& e : events) {
+    if (e.is_string()) {
+      ctx.Kafka.Seed(ingestTopic, "raw", e.get<std::string>());
+    } else {
+      ctx.Kafka.Seed(ingestTopic, e["event_id"].get<std::string>(), ingestJSON(e));
+    }
+  }
+}
+
+}  // namespace
+
+// The journal writer of step 4 (ledger_writer.cpp): one database transaction, insert-or-skip on the
+// event id, the entries at the transaction's posted_at. (Go swaps the writeTransaction variable; in C++
+// the step only declares write_transaction, so the harness defines it.)
+std::optional<std::string> write_transaction(const std::vector<Entry>& entries, const std::string& description,
+                                             std::optional<std::string> event_id, int64_t posted_at,
+                                             std::optional<std::string> settles) {
+  const std::string transactionID = new_uuid();
+  if (posted_at == 0) {
+    posted_at = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  }
+  bool duplicate = false;
+  db::transaction([&](pqxx::work& tx) {
+    const auto res = tx.exec_params(
+        "INSERT INTO transactions (id, event_id, description, settles, posted_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (event_id) DO NOTHING",
+        transactionID, event_id, description, settles, posted_at);
+    if (res.affected_rows() == 0) {
+      duplicate = true;
+      return;
+    }
+    for (const auto& e : entries) {
+      tx.exec_params("INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES ($1, $2, $3, $4, $5)",
+                     transactionID, e.account, e.currency, e.amount, posted_at);
+    }
+  });
+  if (duplicate) return std::nullopt;
+  return transactionID;
+}
+
+namespace {
+
+// The learner's run loop as the harness drives it. Go cancels run's context at the end of every
+// ingestRun; C++'s run() takes no context, so a loop still waiting for records stays alive and the
+// next ingestRun lets it carry on instead of starting a second loop on the same consumer.
+struct ingestLoop {
+  bool done = false;
+  std::optional<std::string> error;
+  std::exception_ptr failure;
+};
+std::shared_ptr<ingestLoop> ingestLive;
+
+// ingestConsumer puts the learner's consumer in front of the real journal writer (step 4, defined
+// above) and an empty ledger database.
+void ingestConsumer(harness::Ctx& ctx) { ctx.DB.Reset(ingestSchema); }
+
+// ingestRun runs the learner's loop until it returns or waits for records that will not come; it
+// returns what run threw (nullopt while it was still waiting).
+std::optional<std::string> ingestRun(harness::Ctx& ctx) {
+  if (ingestLive == nullptr || ingestLive->done) {
+    auto loop = std::make_shared<ingestLoop>();
+    ingestLive = loop;
+    ctx.Drain([loop] {
+      try {
+        run();
+      } catch (const std::exception& e) {
+        loop->error = e.what();
+      } catch (...) {
+        loop->failure = std::current_exception();
+      }
+      loop->done = true;
+    });
+  } else {
+    ctx.Settle();
+  }
+  const auto loop = ingestLive;
+  if (loop->failure) std::rethrow_exception(loop->failure);
+  return loop->done ? loop->error : std::nullopt;
+}
+
+// ingestRestart is a fresh replica of the consumer: the old consumer leaves the group, a new one with
+// the learner's configuration (make_consumer) joins it and starts from the committed offsets. A loop
+// still waiting in the old consumer's consume stays parked there.
+void ingestRestart() {
+  consumer->close();
+  consumer = make_consumer();
+  ingestLive = nullptr;
+}
+
+// ingestTx is a transaction of the journal with its entries {account, currency, amount, posted_at}.
+struct ingestTx {
+  harness::Row row;
+  std::vector<std::array<harness::Any, 4>> entries;
+};
+
+// ingestJournal is the journal by event id, as the database holds it.
+std::map<std::string, ingestTx> ingestJournal(harness::Ctx& ctx) {
+  const auto transactions = ctx.DB.Query("SELECT * FROM transactions ORDER BY event_id");
+  const auto entries = ctx.DB.Query("SELECT * FROM entries ORDER BY account");
+  std::map<std::string, ingestTx> out;
+  for (const auto& t : transactions) {
+    ingestTx tx{t, {}};
+    for (const auto& e : entries) {
+      if (e.at("transaction_id") == t.at("id")) {
+        tx.entries.push_back({e.at("account"), e.at("currency"), e.at("amount"), e.at("posted_at")});
+      }
+    }
+    out[t.at("event_id").String()] = tx;
+  }
+  return out;
+}
+
+std::vector<std::string> ingestKeys(const std::map<std::string, ingestTx>& j) {
+  std::vector<std::string> keys;
+  for (const auto& [k, _] : j) keys.push_back(k);
+  return keys;
+}
+
+// ingestCommit is a commit as the broker saw it, with the database's query log and the dead-letter
+// topic's values at that instant.
+struct ingestCommit {
+  std::string group;
+  harness::KafkaOffsets offsets;
+  std::vector<harness::DBQuery> queries;
+  std::vector<std::string> dead;
+};
+
+std::shared_ptr<std::vector<ingestCommit>> ingestWatch(harness::Ctx& ctx) {
+  auto seen = std::make_shared<std::vector<ingestCommit>>();
+  ctx.Kafka.OnCommit([&ctx, seen](const std::string& group, const harness::KafkaOffsets& offsets) {
+    seen->push_back({group, offsets, ctx.DB.Queries(), ctx.Kafka.Values(ingestDead)});
+  });
+  return seen;
+}
+
+std::string ingestTrimUpper(const std::string& s) {
+  const auto begin = s.find_first_not_of(" \\t\\r\\n");
+  if (begin == std::string::npos) return "";
+  const auto end = s.find_last_not_of(" \\t\\r\\n");
+  std::string out = s.substr(begin, end - begin + 1);
+  for (auto& c : out) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  return out;
+}
+
+// ingestWriteCommitted reports whether the database had committed a write of eventID by the end of
+// this query log.
+bool ingestWriteCommitted(const std::vector<harness::DBQuery>& queries, const std::string& eventID) {
+  for (size_t i = 0; i < queries.size(); i++) {
+    std::string lower = queries[i].SQL;
+    for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (lower.find("insert into transactions") == std::string::npos) continue;
+    for (const auto& arg : queries[i].Args) {
+      if (arg == eventID) {
+        for (size_t k = i + 1; k < queries.size(); k++) {
+          if (ingestTrimUpper(queries[k].SQL) == "COMMIT") return true;
+        }
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
+// ingestCommitted is a record of money-events with the query log and the dead-letter values at the
+// commit that first covered its offset.
+struct ingestCommitted {
+  harness::KafkaRecord record;
+  std::vector<harness::DBQuery> queries;
+  std::vector<std::string> dead;
+};
+
+std::vector<ingestCommitted> ingestNewlyCommitted(harness::Ctx& ctx, const std::vector<ingestCommit>& commits) {
+  std::vector<ingestCommitted> out;
+  std::map<int, int64_t> done;
+  for (const auto& c : commits) {
+    if (c.group != "ledger") continue;
+    for (const auto& [tp, offset] : c.offsets) {
+      if (tp.Topic != ingestTopic) continue;
+      const int p = tp.Partition;
+      for (const auto& record : ctx.Kafka.Records(ingestTopic)) {
+        if (record.Partition == p && done[p] <= record.Offset && record.Offset < offset) out.push_back({record, c.queries, c.dead});
+      }
+      if (offset > done[p]) done[p] = offset;
+    }
+  }
+  return out;
+}
+
+void ingestFullyCommitted(harness::Ctx& ctx) {
+  const int64_t lag = ctx.Kafka.Lag("ledger", ingestTopic);
+  ctx.Assert(lag == 0, "%d record(s) of money-events are not committed for group ledger after the consumer handled them", lag);
+}
+
+// An entry as Go's %v prints the struct: {account currency amount}.
+std::vector<std::tuple<std::string, std::string, int64_t>> ingestEntries(const std::optional<std::vector<Entry>>& entries) {
+  std::vector<std::tuple<std::string, std::string, int64_t>> out;
+  if (entries) {
+    for (const auto& e : *entries) out.emplace_back(e.account, e.currency, e.amount);
+  }
+  return out;
+}
+
+}  // namespace
+
+void CheckGroupManualCommit(harness::Ctx& ctx) {
+  ingestSeed(ctx, {ingestCaptured("e1", 4999), ingestCaptured("e2", 120), ingestCaptured("e3", 7)});
+  ingestConsumer(ctx);
+  const auto commits = ingestWatch(ctx);
+  ingestRun(ctx);
+  auto j = ingestJournal(ctx);
+  ctx.Equal(ingestKeys(j), {"e1", "e2", "e3"}, "the consumer must read money-events and write every event: the journal's event ids");
+  std::map<std::string, bool> committedGroups;
+  for (const auto& c : *commits) committedGroups[c.group] = true;
+  ctx.Assert(!ctx.Kafka.Commits("ledger").empty(), "no offsets were committed for group ledger (groups that committed: %v)", committedGroups);
+  ingestFullyCommitted(ctx);
+  int members = 0;
+  std::vector<std::string> groups;
+  bool autoCommit = false;
+  for (const auto& c : ctx.Kafka.Consumers()) {
+    groups.push_back(c.Group);
+    if (c.Group == "ledger") {
+      members++;
+      autoCommit = autoCommit || c.AutoCommit;
+    }
+  }
+  ctx.Assert(members > 0, "no consumer joined group ledger (groups seen: %q)", groups);
+  ctx.Assert(!autoCommit, "the consumer commits automatically: enable.auto.commit acknowledges on a timer, before the write — set it to false and commitSync after write_transaction returned");
+  for (const auto& c : ingestNewlyCommitted(ctx, *commits)) {
+    const std::string eventID = c.record.Key.value_or("");
+    ctx.Assert(ingestWriteCommitted(c.queries, eventID), "the offset of %s was committed before its transaction was in the journal: offsets are committed by the consumer, after the write", eventID);
+  }
+  // e4's write is slow (the transactions insert takes 6 s) and then fails on a constraint: a consumer
+  // that acknowledges before the write has returned loses e4.
+  ctx.DB.Exec("ALTER TABLE entries ADD CONSTRAINT journal_down CHECK (amount <> 7777) NOT VALID");
+  bool slow = false;
+  ctx.DB.After("INSERT INTO transactions", [&] {
+    slow = true;
+    ctx.Clock.Advance(6);
+  });
+  ingestSeed(ctx, {ingestCaptured("e4", 7777)});
+  ingestRun(ctx);  // the failed write surfaces here; what matters is what was committed
+  ctx.Assert(slow, "e4 was never written: the consumer must keep reading money-events");
+  const int64_t lag = ctx.Kafka.Lag("ledger", ingestTopic);
+  ctx.Assert(lag == 1, "e4's write took 6 s and then failed, yet group ledger's lag is %d instead of 1: e4 was acknowledged although its write never landed — disable enable.auto.commit and commitSync yourself, after the write", lag);
+  ctx.DB.Exec("ALTER TABLE entries DROP CONSTRAINT journal_down");
+  ingestRestart();
+  ingestRun(ctx);
+  j = ingestJournal(ctx);
+  const auto e4 = j.find("e4");
+  ctx.Assert(e4 != j.end() && e4->second.entries.size() == 2, "after a restart e4 must be redelivered and written once, the journal holds %q", ingestKeys(j));
+  ingestFullyCommitted(ctx);
+}
+
+void CheckMapping(harness::Ctx& ctx) {
+  ingestSeed(ctx, {
+                      ingestCaptured("e1", 4999),
+                      ingestEvent("e2", "payout.sent", 120000, "USD", ingestT0 + 5),
+                      ingestEvent("e3", "refund.issued", 999, "EUR", ingestT0 + 9),
+                  });
+  ingestConsumer(ctx);
+  ingestRun(ctx);
+  auto j = ingestJournal(ctx);
+  ctx.Equal(ingestKeys(j), {"e1", "e2", "e3"}, "three mapped events must become three transactions keyed by their event id");
+  struct expectation {
+    std::vector<std::string> entries;
+    std::string description;
+    int64_t occurredAt;
+  };
+  std::map<std::string, expectation> expected = {
+      {"e1", {{"cash:acquirer EUR 4999", "clearing:payments EUR -4999"}, "payment.captured", ingestT0}},
+      {"e2", {{"cash:bank USD -120000", "clearing:payouts USD 120000"}, "payout.sent", ingestT0 + 5}},
+      {"e3", {{"cash:acquirer EUR -999", "clearing:payments EUR 999"}, "refund.issued", ingestT0 + 9}},
+  };
+  for (const auto& eventID : ingestKeys(j)) {
+    const auto& tx = j[eventID];
+    const auto& want = expected[eventID];
+    std::vector<std::string> got;
+    std::vector<harness::Any> postedAts;
+    for (const auto& e : tx.entries) {
+      got.push_back(harness::Sprintf("%v %v %v", e[0], e[1], e[2]));
+      postedAts.push_back(e[3]);
+    }
+    std::sort(got.begin(), got.end());
+    ctx.Assert(tx.entries.size() == 2 && got == want.entries, "%s: the journal holds the entries %q — expected %q (the first account debited, the second credited the negated amount, in the event's currency)", eventID, got, want.entries);
+    ctx.Equal(tx.row.at("description"), want.description, "%s: the transaction's description must be the event type", eventID);
+    bool atOccurred = tx.row.at("posted_at") == want.occurredAt;
+    for (const auto& at : postedAts) atOccurred = atOccurred && at == want.occurredAt;
+    ctx.Assert(atOccurred, "%s: posted at %v / %v, expected the event's occurred_at %d", eventID, tx.row.at("posted_at"), postedAts, want.occurredAt);
+  }
+  const auto got = to_entries(Event{"x", "payment.captured", 250, "EUR", ingestT0});
+  ctx.Equal(ingestEntries(got), ingestEntries(std::vector<Entry>{{"cash:acquirer", "EUR", 250}, {"clearing:payments", "EUR", -250}}), "to_entries of a 250 EUR payment.captured");
+  ctx.Assert(!to_entries(Event{"x", "dispute.opened", 4999, "EUR", ingestT0}).has_value(), "to_entries must return nullopt for a type without a mapping");
+}
+
+void CheckDeadLetter(harness::Ctx& ctx) {
+  const auto unknown = ingestEvent("e2", "dispute.opened", 4999, "EUR", ingestT0);
+  ingestSeed(ctx, {ingestCaptured("e1", 4999), unknown, "{not json", ingestCaptured("e4", 4999)});
+  ingestConsumer(ctx);
+  // The dead-letter topic's leader is slow to acknowledge for the first 30 s of the run.
+  ctx.Kafka.StallFor(ingestDead, 30);
+  const auto commits = ingestWatch(ctx);
+  ingestRun(ctx);
+  auto j = ingestJournal(ctx);
+  ctx.Equal(ingestKeys(j), {"e1", "e4"}, "only the mapped events are written: the journal's event ids");
+  for (const auto& c : ingestNewlyCommitted(ctx, *commits)) {
+    const std::string key = c.record.Key.value_or("");
+    if (key == "e2" || key == "raw") {
+      const std::string value = c.record.Value.value_or("");
+      const bool parked = std::find(c.dead.begin(), c.dead.end(), value) != c.dead.end();
+      ctx.Assert(parked, "the offset of %q was committed while its dead-letter copy was not on money-events.dead yet: wait for the broker's acknowledgement before committing, or a crash in between loses the only copy", value);
+    }
+  }
+  const auto parked = ctx.Kafka.Records(ingestDead);
+  ctx.Equal(parked.size(), 2, "the unmapped event and the malformed record must both be parked on money-events.dead: records there");
+  std::map<std::string, bool> values;
+  for (const auto& r : parked) values[r.Value.value_or("")] = true;
+  ctx.Assert(values[ingestJSON(unknown)], "the unmapped event must be parked with its original value, unchanged");
+  ctx.Assert(values["{not json"], "the malformed record must be parked with its original value, unchanged");
+  for (const auto& r : parked) {
+    if (r.Value.value_or("") == ingestJSON(unknown)) ctx.Equal(r.Key.value_or(""), "e2", "the parked record must keep the original key");
+  }
+  for (const auto& r : parked) {
+    const std::string reason = r.Header("reason").value_or("");
+    std::map<std::string, std::string> headers;
+    for (const auto& h : r.Headers) headers[h.Key] = h.Value;
+    ctx.Assert(!reason.empty(), "every parked record must carry a 'reason' header, got headers %v", headers);
+  }
+}
+
+void CheckContinuesAfterDead(harness::Ctx& ctx) {
+  ingestSeed(ctx, {
+                      ingestEvent("e1", "dispute.opened", 4999, "EUR", ingestT0),
+                      ingestCaptured("e2", 4999),
+                      "{not json",
+                      ingestCaptured("e4", 4999),
+                      ingestEvent("e5", "chargeback.won", 4999, "EUR", ingestT0),
+                  });
+  ingestConsumer(ctx);
+  if (const auto err = ingestRun(ctx)) {
+    ctx.Fatalf("an event that cannot be mapped must not stop the consumer, but run threw %v", *err);
+  }
+  auto j = ingestJournal(ctx);
+  ctx.Equal(ingestKeys(j), {"e2", "e4"}, "the events after a parked one must still be written: the journal's event ids");
+  ctx.Equal(ctx.Kafka.Records(ingestDead).size(), 3, "three records must be parked: records on money-events.dead");
+  const int64_t lag = ctx.Kafka.Lag("ledger", ingestTopic);
+  ctx.Assert(lag == 0, "%d record(s) not committed: a parked record's offset must be committed too, or it is redelivered forever", lag);
+}
+
+void CheckCommitAfterWrite(harness::Ctx& ctx) {
+  ingestSeed(ctx, {ingestCaptured("e1", 4999), ingestCaptured("e2", 120)});
+  ingestConsumer(ctx);
+  const auto commits = ingestWatch(ctx);
+  ingestRun(ctx);
+  const auto committed = ingestNewlyCommitted(ctx, *commits);
+  ctx.Assert(!committed.empty(), "the offsets of e1 and e2 were never committed");
+  for (const auto& c : committed) {
+    const std::string eventID = c.record.Key.value_or("");
+    ctx.Assert(ingestWriteCommitted(c.queries, eventID), "the offset of %s was committed before its transaction was committed in the journal: commit the offset only after write_transaction returned", eventID);
+  }
+  // The journal starts refusing: an entry of 7777 now violates a constraint, so e3's write rolls back.
+  ctx.DB.Exec("ALTER TABLE entries ADD CONSTRAINT journal_down CHECK (amount <> 7777) NOT VALID");
+  ingestSeed(ctx, {ingestCaptured("e3", 7777)});
+  ingestRun(ctx);  // the failed write surfaces here; what matters is what was committed
+  ctx.Assert(ingestJournal(ctx).count("e3") == 0, "e3's write failed in the database and must have left nothing in the journal");
+  ctx.Equal(ctx.Kafka.Lag("ledger", ingestTopic), 1, "a record whose write failed must not be committed: it has to come back");
+  ctx.Equal(ctx.Kafka.Records(ingestDead).size(), 0, "a failed write is not a dead letter: the record is retried, not parked");
+  ctx.DB.Exec("ALTER TABLE entries DROP CONSTRAINT journal_down");
+  ingestRestart();
+  ingestRun(ctx);
+  auto j = ingestJournal(ctx);
+  ctx.Equal(ingestKeys(j), {"e1", "e2", "e3"}, "after a restart the consumer must redeliver e3 and write it: the journal's event ids");
+  ctx.Equal(j["e3"].entries.size(), 2, "e3 must be written exactly once: its entries in the journal");
+  ingestFullyCommitted(ctx);
 }
 `,
   },

@@ -747,16 +747,16 @@ std::pair<long long, long long> cached_total(const std::string& ns, const std::s
 class CounterService final : public counters::CounterService::Service {
  public:
   grpc::Status GetCount(grpc::ServerContext*, const counters::GetCountRequest* req, counters::GetCountReply* reply) override {
-    const auto it = kNamespaces.find(req->name_space());
-    if (it == kNamespaces.end()) return grpc::Status(grpc::StatusCode::NOT_FOUND, "unknown namespace " + req->name_space());
+    const auto it = kNamespaces.find(req->namespace_());
+    if (it == kNamespaces.end()) return grpc::Status(grpc::StatusCode::NOT_FOUND, "unknown namespace " + req->namespace_());
     if (!std::regex_match(req->name(), kNameRe))
       return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "name must match [A-Za-z0-9_-]{1,64}");
     if (it->second == "best_effort") {
-      reply->set_count(get_best_effort(req->name_space(), req->name()));
+      reply->set_count(get_best_effort(req->namespace_(), req->name()));
       reply->set_as_of(static_cast<long long>(std::time(nullptr)));
       return grpc::Status::OK;
     }
-    const auto [count, as_of] = cached_total(req->name_space(), req->name());
+    const auto [count, as_of] = cached_total(req->namespace_(), req->name());
     reply->set_count(count);
     reply->set_as_of(as_of);
     return grpc::Status::OK;
@@ -1131,6 +1131,153 @@ func CheckReply(ctx *harness.Ctx) {
 	reply = csMustGet(ctx, stub, "plays", "stranger-things")
 	now = ctx.Clock.Now() / 1000
 	ctx.Assert(reply.GetCount() == 1207 && reply.GetAsOf()-now <= 1 && now-reply.GetAsOf() <= 1, "an eventually-consistent reply carries the rolled-up 1207 and a current as_of, got [%d, %d]", reply.GetCount(), reply.GetAsOf())
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+namespace {
+
+const std::string csKey = "total:plays:stranger-things";
+
+harness::Ctx* csCtx = nullptr;
+
+long long csSum(harness::Ctx& ctx, const std::string& key) {
+  long long sum = 0;
+  for (const auto& [field, v] : ctx.Redis.HGetAll(key)) sum += std::atoll(v.c_str());
+  return sum;
+}
+
+// csService runs the learner's CounterService on the real stores of steps 2 and 4 (the best-effort
+// counter counter:{ns}:{name}, the minute buckets of rollup:{ns}:{name}) and returns a client on it.
+std::unique_ptr<counters::CounterService::Stub> csService(harness::Ctx& ctx) {
+  csCtx = &ctx;
+  ctx.Main();
+  return counters::CounterService::NewStub(ctx.GRPC.Dial("counters:9000"));
+}
+
+// csAddBestEffort is step 2's add_count: SET NX with the hour's TTL, then INCRBY.
+void csAddBestEffort(harness::Ctx& ctx, const std::string& ns, const std::string& name, long long delta) {
+  const std::string key = "counter:" + ns + ":" + name;
+  ctx.Redis.Set(key, 0, "NX", "EX", 3600);
+  ctx.Redis.Do("INCRBY", key, delta);
+}
+
+struct csAdd {
+  std::string token;
+  long long delta;
+};
+
+// csPlays makes eventually-consistent adds to plays/stranger-things as production does: each event is
+// claimed under seen:{token} and folded into its minute bucket (steps 3 and 4).
+void csPlays(harness::Ctx& ctx, const std::vector<csAdd>& adds) {
+  const std::string bucket = std::to_string(ctx.Clock.Now() / 1000 / 60 * 60);
+  for (const auto& a : adds) {
+    if (ctx.Redis.Set("seen:" + a.token, 1, "NX", "EX", 86400)) ctx.Redis.Do("HINCRBY", "rollup:plays:stranger-things", bucket, a.delta);
+  }
+}
+
+std::pair<grpc::Status, counters::GetCountReply> csGet(counters::CounterService::Stub& stub, const std::string& ns, const std::string& name) {
+  grpc::ClientContext call;
+  call.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(1));
+  counters::GetCountRequest req;
+  req.set_namespace_(ns);
+  req.set_name(name);
+  counters::GetCountReply reply;
+  const grpc::Status st = stub.GetCount(&call, req, &reply);
+  return {st, reply};
+}
+
+counters::GetCountReply csMustGet(harness::Ctx& ctx, counters::CounterService::Stub& stub, const std::string& ns, const std::string& name) {
+  const auto [st, reply] = csGet(stub, ns, name);
+  if (!st.ok()) ctx.Fatalf("GetCount(%q, %q) failed: %v: %s", ns, name, st.error_code(), st.error_message());
+  return reply;
+}
+
+void csFailsWith(harness::Ctx& ctx, counters::CounterService::Stub& stub, const std::string& ns, const std::string& name, grpc::StatusCode code) {
+  const auto [st, reply] = csGet(stub, ns, name);
+  if (!st.ok()) {
+    ctx.Equal(st.error_code(), code, "GetCount(%q, %q) failed with the wrong code", ns, name);
+    return;
+  }
+  ctx.Fatalf("GetCount(%q, %q) answered %d instead of failing with %v", ns, name, reply.count(), code);
+}
+
+}  // namespace
+
+// The stand-ins for steps 2 and 4, as the Go harness swaps in its function variables.
+long long get_best_effort(const std::string& ns, const std::string& name) {
+  const auto v = csCtx->Redis.Get("counter:" + ns + ":" + name);
+  return v ? std::stoll(*v) : 0;
+}
+
+long long get_rolled_up(const std::string& ns, const std::string& name) { return csSum(*csCtx, "rollup:" + ns + ":" + name); }
+
+void CheckNotFound(harness::Ctx& ctx) {
+  auto stub = csService(ctx);
+  csFailsWith(ctx, *stub, "likes", "stranger-things", grpc::StatusCode::NOT_FOUND);
+  csFailsWith(ctx, *stub, "", "stranger-things", grpc::StatusCode::NOT_FOUND);
+  const auto keys = ctx.Redis.Keys("*");
+  ctx.Assert(keys.empty(), "an unknown namespace must not leave anything in the cache, Redis holds %q", keys);
+}
+
+void CheckInvalidArgument(harness::Ctx& ctx) {
+  auto stub = csService(ctx);
+  for (const std::string bad : {std::string("bad name"), std::string(""), std::string(65, 'a'), std::string("dots.are.out")}) {
+    csFailsWith(ctx, *stub, "plays", bad, grpc::StatusCode::INVALID_ARGUMENT);
+    csFailsWith(ctx, *stub, "views", bad, grpc::StatusCode::INVALID_ARGUMENT);
+  }
+  const auto keys = ctx.Redis.Keys("*");
+  ctx.Assert(keys.empty(), "a bad name must be refused before any store is consulted, yet Redis holds %q", keys);
+  csFailsWith(ctx, *stub, "likes", "bad name", grpc::StatusCode::NOT_FOUND);  // the namespace is checked first
+}
+
+void CheckCacheKeyTtl(harness::Ctx& ctx) {
+  auto stub = csService(ctx);
+  csPlays(ctx, {{"t-1", 1200}, {"t-2", 7}});
+  const auto reply = csMustGet(ctx, *stub, "plays", "stranger-things");
+  ctx.Equal(reply.count(), 1207, "GetCount must answer the rolled-up total");
+  const auto cached = ctx.Redis.Get(csKey);
+  ctx.Assert(cached.has_value(), "the total must be cached under %s, keys are %q", csKey, ctx.Redis.Keys("*"));
+  const auto doc = nlohmann::json::parse(*cached, nullptr, false);
+  ctx.Assert(doc.is_object() && doc.value("count", nlohmann::json()) == 1207 && doc.value("as_of", nlohmann::json()) == reply.as_of(), "%s must hold JSON {count, as_of} matching the reply, got %s", csKey, *cached);
+  const long long ttl = ctx.Redis.TTL(csKey);
+  ctx.Assert(1 <= ttl && ttl <= 2, "%s expires in %d s, expected kCacheTtl (2 s)", csKey, ttl);
+  ctx.Clock.Advance(3);
+  ctx.Equal(ctx.Redis.Exists(csKey), 0, "%s must be gone after 2 s: EXISTS", csKey);
+}
+
+void CheckCacheAside(harness::Ctx& ctx) {
+  auto stub = csService(ctx);
+  csPlays(ctx, {{"t-1", 1200}, {"t-2", 7}});
+  const auto first = csMustGet(ctx, *stub, "plays", "stranger-things");
+  ctx.Equal(first.count(), 1207, "GetCount must answer the rolled-up total");
+  csPlays(ctx, {{"t-3", 93}});  // the buckets move on to 1300
+  ctx.Clock.Advance(1);
+  const auto second = csMustGet(ctx, *stub, "plays", "stranger-things");
+  ctx.Equal(std::vector<int64_t>{second.count(), second.as_of()}, std::vector<int64_t>{first.count(), first.as_of()}, "1 s after the first read the buckets moved to 1300, but a read within kCacheTtl is served from %s: [count, as_of]", csKey);
+  ctx.Clock.Advance(1.5);
+  const auto third = csMustGet(ctx, *stub, "plays", "stranger-things");
+  ctx.Equal(third.count(), 1300, "2.5 s after the total was cached the entry has expired and the next read must sum the buckets again");
+  ctx.Assert(third.as_of() >= first.as_of() + 2, "as_of must be the time of the recomputation (%d or later), got %d", first.as_of() + 2, third.as_of());
+}
+
+void CheckReply(harness::Ctx& ctx) {
+  auto stub = csService(ctx);
+  csAddBestEffort(ctx, "views", "trailer-7", 42);
+  auto reply = csMustGet(ctx, *stub, "views", "trailer-7");
+  ctx.Equal(reply.count(), 42, "a best-effort namespace answers the counter's count");
+  int64_t now = ctx.Clock.Now() / 1000;
+  ctx.Assert(reply.as_of() - now <= 1 && now - reply.as_of() <= 1, "a best-effort reply's as_of is now (%d), got %d", now, reply.as_of());
+  ctx.Equal(ctx.Redis.Exists("total:views:trailer-7"), 0, "best-effort counters are not cached (they are already one GET away): EXISTS total:views:trailer-7");
+  csAddBestEffort(ctx, "views", "trailer-7", 8);
+  reply = csMustGet(ctx, *stub, "views", "trailer-7");
+  ctx.Equal(reply.count(), 50, "a best-effort read goes straight to the counter: right after another add of 8 GetCount must answer 50");
+  csPlays(ctx, {{"t-1", 1200}, {"t-2", 7}});
+  reply = csMustGet(ctx, *stub, "plays", "stranger-things");
+  now = ctx.Clock.Now() / 1000;
+  ctx.Assert(reply.count() == 1207 && reply.as_of() - now <= 1 && now - reply.as_of() <= 1, "an eventually-consistent reply carries the rolled-up 1207 and a current as_of, got [%d, %d]", reply.count(), reply.as_of());
 }
 `,
   },

@@ -890,6 +890,152 @@ func CheckHandlerFault(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Kafka.Lag(ledgerGroup, ledgerTopic), 2, "the failed record and the one behind it must remain for redelivery")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+#include <nlohmann/json.hpp>
+
+#include <exception>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+const std::string ledgerGroup = "ledger-writer";
+const std::string ledgerTopic = "payments";
+
+// ledgerSeen is where a record the handler received sits: its value says so.
+using ledgerSeen = std::pair<int, int>;
+
+// seedLedger puts n well-formed payments on one partition; each value says where it sits, so the
+// handler's view can be checked.
+void seedLedger(harness::Ctx& ctx, int partition, int n) {
+  const int64_t start = ctx.Kafka.EndOffset(ledgerTopic, partition);
+  for (int i = 0; i < n; i++) {
+    const int64_t offset = start + i;
+    const nlohmann::json value = {{"id", "pay-" + std::to_string(partition) + "-" + std::to_string(offset)},
+                                  {"partition", partition},
+                                  {"offset", offset},
+                                  {"cents", 100 * (offset + 1)}};
+    ctx.Kafka.SeedPartition(ledgerTopic, partition, "acct-" + std::to_string(partition), value);
+  }
+}
+
+// runLedger drains the learner's loop with handler; a handler's error ends the loop.
+void runLedger(harness::Ctx& ctx, const Handler& handler) {
+  try {
+    ctx.Drain([&] { run(handler); });
+  } catch (const std::exception&) {
+  }
+}
+
+// ledgerPlace reads where an event sits from its value (-1 for a field that is missing).
+ledgerSeen ledgerPlace(const nlohmann::json& event) {
+  const auto at = [&](const char* field) {
+    return event.is_object() && event.contains(field) && event[field].is_number() ? event[field].get<int>() : -1;
+  };
+  return {at("partition"), at("offset")};
+}
+
+std::vector<int> ledgerOffsets(const std::vector<ledgerSeen>& seen, int partition) {
+  std::vector<int> out;
+  for (const auto& s : seen)
+    if (s.first == partition) out.push_back(s.second);
+  return out;
+}
+
+}  // namespace
+
+void CheckInOrder(harness::Ctx& ctx) {
+  seedLedger(ctx, 0, 3);
+  seedLedger(ctx, 1, 3);
+  seedLedger(ctx, 2, 2);
+  std::vector<nlohmann::json> events;
+  runLedger(ctx, [&](const nlohmann::json& e) { events.push_back(e); });
+  std::vector<ledgerSeen> seen;
+  for (const auto& e : events) {
+    ctx.Assert(e.is_object(), "the handler must receive the parsed JSON object, not the raw value");
+    seen.push_back(ledgerPlace(e));
+  }
+  ctx.Assert(seen.size() == 8, "the handler saw %d events, expected all 8", seen.size());
+  for (const auto& [p, n] : std::vector<std::pair<int, int>>{{0, 3}, {1, 3}, {2, 2}}) {
+    std::vector<int> expected;
+    for (int i = 0; i < n; i++) expected.push_back(i);
+    ctx.Equal(ledgerOffsets(seen, p), expected, "partition %d reached the handler as offsets", p);
+  }
+}
+
+void CheckManualCommit(harness::Ctx& ctx) {
+  seedLedger(ctx, 0, 2);
+  seedLedger(ctx, 1, 1);
+  runLedger(ctx, [](const nlohmann::json&) {});
+  ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(), "auto-commit is on: offsets were committed on a timer, before processing");
+  ctx.Assert(!ctx.Kafka.EventsOf("manual-commit").empty(), "no explicit commit happened");
+  const auto commits = ctx.Kafka.Commits(ledgerGroup);
+  ctx.Assert(commits.size() == 3, "%d commits for 3 records: commit once per record, after it is processed", commits.size());
+  for (const auto& c : commits) ctx.Assert(c.size() == 1, "each commit must name the processed record's partition alone");
+}
+
+void CheckCommittedOffset(harness::Ctx& ctx) {
+  seedLedger(ctx, 0, 3);
+  seedLedger(ctx, 1, 2);
+  runLedger(ctx, [](const nlohmann::json&) {});
+  for (const auto& [p, n] : std::vector<std::pair<int, int>>{{0, 3}, {1, 2}}) {
+    const int64_t committed = ctx.Kafka.CommittedOffset(ledgerGroup, ledgerTopic, p);
+    ctx.Assert(committed == n, "partition %d: committed offset is %d, expected %d (the next offset to read)", p, committed, n);
+  }
+  ctx.Equal(ctx.Kafka.Lag(ledgerGroup, ledgerTopic), 0, "every processed record must be committed");
+}
+
+void CheckCommitAfter(harness::Ctx& ctx) {
+  seedLedger(ctx, 0, 2);
+  seedLedger(ctx, 1, 2);
+  std::vector<ledgerSeen> processed;
+  std::vector<std::string> early;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) {
+    for (const auto& [tp, offset] : offsets) {
+      bool done = false;
+      for (const auto& s : processed) done = done || s == ledgerSeen{tp.Partition, static_cast<int>(offset - 1)};
+      if (!done)
+        early.push_back(harness::Sprintf("%s[%d] committed to %d before the handler finished offset %d", tp.Topic,
+                                         tp.Partition, offset, offset - 1));
+    }
+  });
+  runLedger(ctx, [&](const nlohmann::json& e) { processed.push_back(ledgerPlace(e)); });
+  ctx.Equal(ctx.Kafka.Commits(ledgerGroup).size(), 4, "expected one commit per record");
+  if (!early.empty()) ctx.Fatalf("%s", early[0]);
+}
+
+void CheckPoison(harness::Ctx& ctx) {
+  seedLedger(ctx, 0, 1);
+  ctx.Kafka.SeedPartition(ledgerTopic, 0, "acct-0", "not json");
+  seedLedger(ctx, 0, 1);
+  ctx.Kafka.SeedPartition(ledgerTopic, 1, "acct-1", R"({"id": "pay-1-0", "cents": )");
+  std::vector<ledgerSeen> seen;
+  runLedger(ctx, [&](const nlohmann::json& e) { seen.push_back(ledgerPlace(e)); });
+  ctx.Equal(ledgerOffsets(seen, 0), {0, 2},
+            "partition 0 reached the handler as offsets (skip the poison record, process the ones behind it)");
+  ctx.Equal(seen.size(), 2, "the malformed records must not reach the handler");
+  ctx.Equal(ctx.Kafka.CommittedOffset(ledgerGroup, ledgerTopic, 0), 3, "partition 0 must be committed past the poison record");
+  ctx.Equal(ctx.Kafka.CommittedOffset(ledgerGroup, ledgerTopic, 1), 1, "partition 1 must be committed past the poison record");
+  ctx.Equal(ctx.Kafka.Lag(ledgerGroup, ledgerTopic), 0,
+            "a malformed record must be skipped and committed, not left to replay forever");
+}
+
+void CheckHandlerFault(harness::Ctx& ctx) {
+  seedLedger(ctx, 0, 3);
+  std::vector<ledgerSeen> seen;
+  runLedger(ctx, [&](const nlohmann::json& e) {
+    const ledgerSeen s = ledgerPlace(e);
+    seen.push_back(s);
+    if (s.second == 1) throw std::runtime_error("ledger unavailable");
+  });
+  const int64_t committed = ctx.Kafka.CommittedOffset(ledgerGroup, ledgerTopic, 0);
+  ctx.Assert(committed == 1, "committed offset is %d, expected 1: the record whose handler failed must stay uncommitted", committed);
+  ctx.Equal(ledgerOffsets(seen, 0), {0, 1}, "the handler saw offsets (a failing handler stops the loop)");
+  ctx.Equal(ctx.Kafka.Lag(ledgerGroup, ledgerTopic), 2, "the failed record and the one behind it must remain for redelivery");
+}
+`,
   },
   debrief: `The loop has one commit site and it sits last, so the only question is which records reach it. A poison record reaches it by skipping the handler: committing it is the right call because nothing a retry does will make it parse, and leaving it uncommitted stalls the partition behind it. A record whose handler raised never reaches it: the exception leaves the loop before the commit, the offset stays where it was, and the restart replays that record — at-least-once, which means the handler must tolerate seeing it twice. Auto-commit would have broken both properties at once: it commits what was fetched, on a timer, regardless of what the handler did with it. Real consumers keep this exact shape and add what the drill leaves out — a commit per poll batch instead of per record, \`on_revoke\` committing before a rebalance takes the partition away, a dead-letter topic for poison records, and bounded retries before giving up on a handler.`,
 };

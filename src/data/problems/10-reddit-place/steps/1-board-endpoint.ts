@@ -785,12 +785,12 @@ int main() {
     const std::string user = body.value("user", "");
     if (x < 0 || x >= kSize || y < 0 || y >= kSize) {
       res.status = 400;
-      res.set_content(R"({"error":"x and y must be in [0, kSize)"})", "application/json");
+      res.set_content(R"re({"error":"x and y must be in [0, kSize)"})re", "application/json");
       return;
     }
     if (color < 0 || color >= kColors) {
       res.status = 400;
-      res.set_content(R"({"error":"color must be in [0, 16)"})", "application/json");
+      res.set_content(R"re({"error":"color must be in [0, 16)"})re", "application/json");
       return;
     }
     if (user.empty()) {
@@ -1223,6 +1223,195 @@ func CheckPlaced(ctx *harness.Ctx) {
 	events := bpPlacements(ctx)
 	ctx.Assert(len(events) == 1, "one painted tile must put exactly one record on placements, found %d: %+v", len(events), events)
 	ctx.Equal(events[0], bpEvent{User: "ana", X: 3, Y: 7, Color: 12}, "the placement recorded must be the painted tile: recordPlacement(ctx, user, x, y, color)")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+namespace {
+
+harness::Ctx* bpCtx = nullptr;
+
+const nlohmann::json bpTile = {{"x", 3}, {"y", 7}, {"color", 12}, {"user", "ana"}};
+
+// bpEvent is the part of a placements record the checks read.
+struct bpEvent {
+  std::string User;
+  int X = 0, Y = 0, Color = 0;
+  bool operator==(const bpEvent& o) const { return User == o.User && X == o.X && Y == o.Y && Color == o.Color; }
+  friend std::ostream& operator<<(std::ostream& out, const bpEvent& e) {
+    return out << "{User:" << e.User << " X:" << e.X << " Y:" << e.Y << " Color:" << e.Color << "}";
+  }
+};
+
+bpEvent bpDecode(harness::Ctx& ctx, const std::string& text, const char* what) {
+  const auto v = nlohmann::json::parse(text, nullptr, false);
+  if (!v.is_object()) ctx.Fatalf("%s is not a JSON object: %q", what, text);
+  bpEvent e;
+  e.User = v.value("user", "");
+  e.X = v.value("x", 0);
+  e.Y = v.value("y", 0);
+  e.Color = v.value("color", 0);
+  return e;
+}
+
+// bpAPI runs main as deployed: place_tile is step 2's cooldown (SET cooldown:{user} NX EX 300, then
+// SETRANGE board), record_placement step 3's producer (one JSON record on placements per tile);
+// the stand-ins are defined below main's file, as the Go harness swaps in its function variables.
+harness::HTTP bpAPI(harness::Ctx& ctx) {
+  bpCtx = &ctx;
+  return ctx.Main().HTTP();
+}
+
+// bpWith is the tile with some fields replaced.
+nlohmann::json bpWith(const nlohmann::json& fields) {
+  nlohmann::json out = bpTile;
+  for (const auto& [k, v] : fields.items()) out[k] = v;
+  return out;
+}
+
+int bpPixel(harness::Ctx& ctx, int x, int y) {
+  const std::string board = ctx.Redis.Get("board").value_or("");
+  const size_t off = static_cast<size_t>(y * kSize + x);
+  return off < board.size() ? static_cast<unsigned char>(board[off]) : 0;
+}
+
+int bpZeros(const std::string& b) {
+  int n = 0;
+  for (const char c : b) n += c == 0;
+  return n;
+}
+
+std::vector<bpEvent> bpPlacements(harness::Ctx& ctx) {
+  std::vector<bpEvent> out;
+  for (const auto& v : ctx.Kafka.Values("placements")) out.push_back(bpDecode(ctx, v, "a placements record"));
+  return out;
+}
+
+bool bpMaxAge1(std::string cache) {
+  std::erase(cache, ' ');
+  std::stringstream parts(cache);
+  for (std::string part; std::getline(parts, part, ',');) {
+    if (part == "max-age=1") return true;
+  }
+  return false;
+}
+
+harness::Response bpPost(harness::HTTP& api, const nlohmann::json& tile) {
+  return api.Post("/place", tile.dump(), "Content-Type", "application/json");
+}
+
+}  // namespace
+
+int place_tile(const std::string& user, int x, int y, int color) {
+  harness::Ctx& ctx = *bpCtx;
+  const std::string key = "cooldown:" + user;
+  if (!ctx.Redis.Set(key, "1", "NX", "EX", 300)) {
+    const long long ttl = ctx.Redis.TTL(key);
+    return ttl > 1 ? static_cast<int>(ttl) : 1;
+  }
+  ctx.Redis.Do("SETRANGE", "board", y * kSize + x, std::string(1, static_cast<char>(color)));
+  return 0;
+}
+
+void record_placement(const std::string& user, int x, int y, int color) {
+  harness::Ctx& ctx = *bpCtx;
+  const nlohmann::json value = {{"user", user}, {"x", x}, {"y", y}, {"color", color}, {"ts", ctx.Clock.Now()}};
+  ctx.Kafka.Seed("placements", std::to_string(x) + ":" + std::to_string(y), value.dump());
+}
+
+void CheckBoardBlob(harness::Ctx& ctx) {
+  auto api = bpAPI(ctx);
+  const int n = kSize * kSize;
+  auto r = api.Get("/board");
+  ctx.Assert(r.Status != 404 && r.Status != 405, "GET /board answered %d: no handler is registered for it", r.Status);
+  ctx.Equal(r.Status, 200, "GET /board");
+  const std::string ct = r.HeaderValue("Content-Type");
+  ctx.Assert(ct.starts_with("application/octet-stream"), "Content-Type is %q, expected application/octet-stream", ct);
+  ctx.Assert(static_cast<int>(r.Body.size()) == n, "an untouched board is %d bytes, expected size * size = %d zero bytes", r.Body.size(), n);
+  ctx.Equal(bpZeros(r.Body), n, "an untouched board must be all colour 0: the zero bytes");
+  ctx.Redis.Do("SETRANGE", "board", 7 * kSize + 3, std::string(1, static_cast<char>(12)));
+  r = api.Get("/board");
+  ctx.Assert(static_cast<int>(r.Body.size()) == n, "after one SETRANGE the board is %d bytes, expected %d: pad a short key with zeros", r.Body.size(), n);
+  ctx.Equal(static_cast<unsigned char>(r.Body[7 * kSize + 3]), 12, "byte y * size + x of the body must be the colour 12 written to Redis");
+  ctx.Equal(bpZeros(r.Body), n - 1, "every other pixel must still be colour 0: the zero bytes");
+  ctx.Redis.Do("SETRANGE", "board", 9 * kSize + 1, std::string(1, static_cast<char>(200)));  // a palette wider than 7 bits: every byte value must survive
+  r = api.Get("/board");
+  ctx.Assert(static_cast<int>(r.Body.size()) == n, "after a byte above 127 the board is %d bytes, expected %d: the body must be the raw bytes, not text", r.Body.size(), n);
+  ctx.Equal(static_cast<unsigned char>(r.Body[9 * kSize + 1]), 200, "byte (1, 9) of the body must be 200: read and send the board as bytes, not as a string");
+}
+
+void CheckCacheHeaders(harness::Ctx& ctx) {
+  auto api = bpAPI(ctx);
+  auto r = api.Get("/board");
+  const std::string cache = r.HeaderValue("Cache-Control");
+  ctx.Assert(bpMaxAge1(cache), "Cache-Control is %q, expected public, max-age=1, stale-while-revalidate=5", cache);
+  ctx.Assert(cache.find("public") != std::string::npos && cache.find("stale-while-revalidate") != std::string::npos, "Cache-Control is %q, expected public, max-age=1, stale-while-revalidate=5", cache);
+  const std::string etag = r.HeaderValue("ETag");
+  ctx.Assert(etag != "", "GET /board must carry an ETag so caches can revalidate instead of re-downloading the board");
+  const auto again = api.Get("/board");
+  ctx.Equal(again.HeaderValue("ETag"), etag, "the same bytes must give the same ETag");
+  r = api.Get("/board", "If-None-Match", etag);
+  ctx.Equal(r.Status, 304, "If-None-Match with the current ETag");
+  ctx.Equal(r.Text(), "", "a 304 has no body");
+  ctx.Equal(r.HeaderValue("ETag"), etag, "the 304 must repeat the ETag");
+  ctx.Assert(r.HeaderValue("Cache-Control").find("max-age=1") != std::string::npos, "the 304 must repeat Cache-Control so the cache extends its entry");
+  ctx.Redis.Do("SETRANGE", "board", 0, std::string(1, static_cast<char>(5)));
+  r = api.Get("/board", "If-None-Match", etag);
+  ctx.Equal(r.Status, 200, "after a tile changed the old ETag no longer matches");
+  ctx.Assert(r.HeaderValue("ETag") != etag, "a changed board must change the ETag");
+}
+
+void CheckValidate(harness::Ctx& ctx) {
+  auto api = bpAPI(ctx);
+  const std::vector<nlohmann::json> bads = {{{"x", -1}}, {{"x", kSize}}, {{"y", -1}}, {{"y", kSize}}, {{"color", -1}}, {{"color", 16}}, {{"user", ""}}};
+  for (const auto& bad : bads) {
+    const auto r = bpPost(api, bpWith(bad));
+    ctx.Equal(r.Status, 400, "POST /place with %s", bad.dump());
+  }
+  const auto cooling = ctx.Redis.Keys("cooldown:*");
+  ctx.Assert(cooling.empty(), "after only rejected requests Redis holds %v: a rejected placement reached place_tile and cost a user their turn", cooling);
+  const std::string board = ctx.Redis.Get("board").value_or("");
+  ctx.Equal(bpZeros(board), board.size(), "a rejected placement changed the board: the zero bytes");
+  ctx.Assert(ctx.Kafka.Records("placements").empty(), "a rejected placement must not be recorded, but placements holds %v", bpPlacements(ctx));
+  const std::vector<nlohmann::json> oks = {{{"x", kSize - 1}, {"y", kSize - 1}}, {{"x", 0}, {"y", 0}}, {{"color", 15}}, {{"color", 0}}};
+  for (size_t i = 0; i < oks.size(); i++) {
+    nlohmann::json tile = bpWith(oks[i]);
+    tile["user"] = "user" + std::to_string(i);
+    const auto r = bpPost(api, tile);
+    ctx.Equal(r.Status, 200, "POST /place with %s is within range", oks[i].dump());
+    const int x = tile["x"], y = tile["y"], color = tile["color"];
+    ctx.Equal(bpPixel(ctx, x, y), color, "after the accepted tile %s the board byte at (%d, %d)", tile.dump(), x, y);
+  }
+}
+
+void CheckCooldown429(harness::Ctx& ctx) {
+  auto api = bpAPI(ctx);
+  const auto first = bpPost(api, bpTile);
+  ctx.Equal(first.Status, 200, "ana's first tile");
+  ctx.Clock.Advance(113);
+  const auto r = bpPost(api, bpWith({{"x", 4}, {"color", 5}}));
+  const long long ttl = ctx.Redis.TTL("cooldown:ana");
+  ctx.Assert(r.Status == 429, "113 s after ana's first tile her second one answered %d, expected 429: her cooldown still has %d s to run", r.Status, ttl);
+  ctx.Equal(r.HeaderValue("Retry-After"), std::to_string(ttl), "Retry-After must be the %d s left on ana's cooldown (what place_tile returned)", ttl);
+  ctx.Equal(bpPixel(ctx, 4, 7), 0, "the refused tile was painted: the board byte at (4, 7)");
+  const auto events = bpPlacements(ctx);
+  ctx.Assert(events.size() == 1, "a tile refused by the cooldown is not a placement: expected only ana's first tile on placements, found %v", events);
+}
+
+void CheckPlaced(harness::Ctx& ctx) {
+  auto api = bpAPI(ctx);
+  const auto r = bpPost(api, bpTile);
+  ctx.Equal(r.Status, 200, "a painted tile");
+  const bpEvent body = bpDecode(ctx, r.Text(), "the response body");
+  ctx.Equal(body, bpEvent{"ana", 3, 7, 12}, "the body must carry the tile {x, y, color, user}");
+  ctx.Equal(bpPixel(ctx, 3, 7), 12, "after POST /place of %s the board byte at (3, 7) must be 12: place_tile(user, x, y, color) paints it", bpTile.dump());
+  const long long ttl = ctx.Redis.TTL("cooldown:ana");
+  ctx.Assert(ttl > 0, "after her tile was painted ana is not on cooldown (TTL of cooldown:ana is %d): place_tile(user, x, y, color) must run with her name", ttl);
+  const auto events = bpPlacements(ctx);
+  ctx.Assert(events.size() == 1, "one painted tile must put exactly one record on placements, found %d: %v", events.size(), events);
+  ctx.Equal(events[0], bpEvent{"ana", 3, 7, 12}, "the placement recorded must be the painted tile: record_placement(user, x, y, color)");
 }
 `,
   },

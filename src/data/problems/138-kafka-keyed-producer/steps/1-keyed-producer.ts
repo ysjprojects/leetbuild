@@ -885,6 +885,117 @@ func CheckNonBlocking(ctx *harness.Ctx) {
 	ctx.Equal(keyedStats(ctx), map[string]int64{"delivered": 1, "failed": 0}, "the delivery reports must count it")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+#include <nlohmann/json.hpp>
+
+#include <cstdint>
+#include <exception>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string keyedTopic = "order-events";
+
+// keyedStats is stats() as the TypeScript harness compares it, once the delivery reports served so far are counted.
+std::map<std::string, int64_t> keyedStats(harness::Ctx& ctx) {
+  ctx.Settle();
+  const Stats s = stats();
+  return {{"delivered", s.delivered}, {"failed", s.failed}};
+}
+
+}  // namespace
+
+void CheckKeyed(harness::Ctx& ctx) {
+  for (const std::string t : {"placed", "paid", "shipped"}) emit("o-1", t);
+  emit("o-2", "placed");
+  shutdown();
+  const auto produced = ctx.Kafka.Records(keyedTopic);
+  ctx.Equal(ctx.Kafka.Keys(keyedTopic), {"o-1", "o-1", "o-1", "o-2"}, "records must be keyed by the order id");
+  const int expected = ctx.Kafka.PartitionFor(keyedTopic, "o-1");
+  std::vector<std::string> types;
+  for (size_t i = 0; i < produced.size() && i < 3; i++) {
+    const auto& r = produced[i];
+    ctx.Assert(r.Partition == expected, "every event of order o-1 must land on the partition its key hashes to");
+    const auto event = nlohmann::json::parse(r.Value.value_or(""), nullptr, false);
+    types.push_back(event.is_object() && event.contains("type") && event["type"].is_string() ? event["type"].get<std::string>() : "");
+  }
+  ctx.Equal(types, {"placed", "paid", "shipped"}, "events of one order must keep their order");
+}
+
+void CheckValue(harness::Ctx& ctx) {
+  ctx.Clock.Advance(1000);
+  const double before = static_cast<double>(ctx.Clock.Now()) / 1000;
+  emit("o-7", "paid");
+  shutdown();
+  const auto produced = ctx.Kafka.Records(keyedTopic);
+  ctx.Equal(produced.size(), 1, "expected one record on %s", keyedTopic);
+  const std::string value = produced[0].Value.value_or("");
+  const auto event = nlohmann::json::parse(value, nullptr, false);
+  if (!event.is_object()) ctx.Fatalf("the value must be JSON: %s (%v)", value, "not a JSON object");
+  ctx.Assert(event.value("order_id", nlohmann::json()) == "o-7" && event.value("type", nlohmann::json()) == "paid",
+             "the value must carry order_id and type: %s", value);
+  const bool ok = event.contains("ts") && event["ts"].is_number();
+  const double ts = ok ? event["ts"].get<double>() : 0;
+  ctx.Assert(ok && ts >= before - 1 && ts <= static_cast<double>(ctx.Clock.Now()) / 1000 + 1,
+             "ts must be the current time in seconds (clock at %.0f), got %v", before,
+             event.contains("ts") ? event["ts"].dump() : std::string("<nil>"));
+}
+
+void CheckDelivered(harness::Ctx& ctx) {
+  ctx.Kafka.StallFor(keyedTopic, 2);  // the broker answers 2 s later
+  for (int i = 0; i < 4; i++) emit("o-" + std::to_string(i), "placed");
+  const int pending = shutdown();
+  ctx.Equal(pending, 0, "shutdown() must return 0 once everything is delivered");
+  const size_t n = ctx.Kafka.Records(keyedTopic).size();
+  ctx.Assert(n == 4, "shutdown() must flush: %d of 4 records reached the broker", n);
+  ctx.Equal(keyedStats(ctx), std::map<std::string, int64_t>{{"delivered", 4}, {"failed", 0}},
+            "the delivery reports must count 4 delivered, 0 failed");
+}
+
+void CheckCallback(harness::Ctx& ctx) {
+  ctx.Kafka.FailNext(keyedTopic, 1);
+  try {
+    emit("o-1", "placed");
+  } catch (const std::exception& e) {
+    ctx.Fatalf("emit() must not throw on a failed delivery; the delivery report carries it: %v", e.what());
+  }
+  emit("o-1", "paid");
+  const int pending = shutdown();
+  ctx.Equal(pending, 0, "a failed record is not pending: shutdown()");
+  ctx.Equal(keyedStats(ctx), std::map<std::string, int64_t>{{"delivered", 1}, {"failed", 1}},
+            "expected 1 delivered and 1 failed");
+  ctx.Equal(ctx.Kafka.Records(keyedTopic).size(), 1, "the second event must still be delivered after the first failed");
+}
+
+void CheckBounded(harness::Ctx& ctx) {
+  ctx.Kafka.Stall(keyedTopic);  // dead until resumed
+  for (int i = 0; i < 3; i++) emit("o-9", "event-" + std::to_string(i));
+  const int64_t started = ctx.Clock.Now();
+  const int pending = shutdown();
+  const int64_t waited = ctx.Clock.Now() - started;
+  ctx.Assert(waited <= 5500, "shutdown() waited %.1f s on a dead broker: give up after 5 s", static_cast<double>(waited) / 1000);
+  ctx.Equal(pending, 3, "shutdown() must return the 3 records still undelivered");
+  const Stats s = stats();
+  ctx.Equal(std::map<std::string, int64_t>{{"delivered", s.delivered}, {"failed", s.failed}},
+            std::map<std::string, int64_t>{{"delivered", 0}, {"failed", 0}},
+            "records still in flight are neither delivered nor failed");
+}
+
+void CheckNonBlocking(harness::Ctx& ctx) {
+  ctx.Kafka.StallFor(keyedTopic, 2);  // the broker answers 2 s later
+  const int64_t started = ctx.Clock.Now();
+  emit("o-3", "placed");
+  const int64_t waited = ctx.Clock.Now() - started;
+  ctx.Assert(waited < 1000, "emit() took %d ms with the broker stalled: hand the record to the producer and return", waited);
+  ctx.Equal(ctx.Kafka.Records(keyedTopic).size(), 0, "the record is in flight until the broker answers");
+  ctx.Equal(shutdown(), 0, "shutdown()");
+  ctx.Equal(ctx.Kafka.Records(keyedTopic).size(), 1, "the in-flight record must reach the broker once it answers");
+  ctx.Equal(keyedStats(ctx), std::map<std::string, int64_t>{{"delivered", 1}, {"failed", 0}},
+            "the delivery reports must count it");
+}
+`,
   },
   debrief: `The producer is a queue with a background thread; \`produce\` costs microseconds and \`emit\` must stay that cheap, so the only honest place to learn what happened is the delivery callback — which librdkafka runs inside \`poll\`/\`flush\`, hence the \`poll(0)\` after every produce. The key is the ordering contract: same order id → same partition → same order, whatever the partition count. \`acks=all\` means an acknowledged record survives a leader failover. \`flush(5)\` is the one wait a clean stop is allowed: it drains the queue if the broker is alive and returns the count it could not deliver if not, so the process exits either way and the number is logged instead of lost. Real systems add \`enable.idempotence\` so retries after a lost ack do not duplicate, a bounded queue (\`queue.buffering.max.messages\`) with a policy for when it is full, and a \`message.timeout.ms\` short enough that a dead broker fails records through the callback instead of holding them for five minutes.`,
 };

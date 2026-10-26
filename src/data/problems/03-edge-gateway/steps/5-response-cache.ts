@@ -850,6 +850,133 @@ func CheckXCache(ctx *harness.Ctx) {
 	ctx.Assert(strings.HasPrefix(plainHit.Header.Get("Content-Type"), "text/plain"), "the hit for a text/plain upstream answered Content-Type %q: store the content type with the body", plainHit.Header.Get("Content-Type"))
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <functional>
+#include <string>
+#include <vector>
+
+namespace {
+
+std::function<Upstream(const httplib::Request&)> upstream_stand_in;
+
+}  // namespace
+
+// The gRPC proxy from step 3, stood in for by the check.
+Upstream upstream(const httplib::Request& req) { return upstream_stand_in(req); }
+
+namespace {
+
+// get_item with the step-3 proxy stood in for: it counts every fetch and answers per item id.
+struct RespCache {
+  std::vector<std::string> calls;
+  httplib::Server svr;
+  harness::HTTP http;
+
+  explicit RespCache(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
+    upstream_stand_in = [this](const httplib::Request& req) -> Upstream {
+      calls.push_back(req.target);
+      const std::string id = req.matches[1];
+      if (id == "ghost") return {404, "application/json", R"({"error": "no such item"})"};
+      if (id == "down") return {503, "text/plain", "catalog unavailable"};
+      if (id == "plain") return {200, "text/plain", "plain item, fetch " + std::to_string(calls.size())};
+      const nlohmann::json body = {{"id", id}, {"name", "Kettle"}, {"price_cents", 3499}, {"fetch", calls.size()}};
+      return {200, "application/json", body.dump()};
+    };
+    svr.Get(R"(/items/([^/]+))", get_item);
+  }
+};
+
+std::string respKey(const std::string& target) { return "resp:" + sha256_hex(target); }
+
+// The fetch number a JSON item body carries (null when there is none).
+nlohmann::json respFetch(const harness::Response& r) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  return body.is_object() && body.contains("fetch") ? body["fetch"] : nlohmann::json();
+}
+
+}  // namespace
+
+void CheckKeyHash(harness::Ctx& ctx) {
+  RespCache rc(ctx);
+  auto r = rc.http.Get("/items/42?fields=name");
+  ctx.Equal(r.Status, 200, "GET /items/42?fields=name");
+  rc.http.Get("/items/42");
+  const auto keys = ctx.Redis.Keys("*");
+  for (const std::string target : {"/items/42?fields=name", "/items/42"}) {
+    ctx.Assert(ctx.Redis.Exists(respKey(target)) == 1, "no entry under resp:sha256(%q) = %q; Redis holds %q", target,
+               respKey(target), keys);
+  }
+  ctx.Equal(keys.size(), 2, "two distinct targets must make two distinct keys (Redis holds %q); the key count", keys);
+}
+
+void CheckBypass(harness::Ctx& ctx) {
+  RespCache rc(ctx);
+  rc.http.Get("/items/42");
+  auto second = rc.http.Get("/items/42");
+  ctx.Assert(second.HeaderValue("X-Cache") == "HIT" && rc.calls.size() == 1,
+             "a second request within the TTL must be served from the cache");
+  auto bypass = rc.http.Get("/items/42", "Cache-Control", "no-cache");
+  ctx.Equal(rc.calls.size(), 2, "Cache-Control: no-cache must reach the upstream, not the cached entry; upstream calls");
+  ctx.Equal(bypass.HeaderValue("X-Cache"), "MISS", "a bypassed request's X-Cache");
+  ctx.Assert(respFetch(bypass) == 2, "the bypassed request must answer with the fresh upstream response; its fetch is %s, want 2",
+             respFetch(bypass).dump());
+  auto after = rc.http.Get("/items/42");
+  ctx.Assert(after.HeaderValue("X-Cache") == "HIT" && rc.calls.size() == 2,
+             "the bypassed request still refreshes the entry: the next plain request is a hit");
+  ctx.Assert(respFetch(after) == 2, "the entry must be refreshed by the bypassed request; the fetch served is %s, want 2",
+             respFetch(after).dump());
+}
+
+void CheckTtl(harness::Ctx& ctx) {
+  RespCache rc(ctx);
+  rc.http.Get("/items/42");
+  const auto ttl = ctx.Redis.TTL(respKey("/items/42"));
+  ctx.Assert(1 <= ttl && ttl <= 10, "the entry's TTL is %d (-1 means no expiry), expected EX 10", ttl);
+  ctx.Clock.Advance(9.0);
+  auto warm = rc.http.Get("/items/42");
+  ctx.Assert(warm.HeaderValue("X-Cache") == "HIT" && rc.calls.size() == 1, "9 s after the store the entry is still fresh");
+  ctx.Clock.Advance(2.0);
+  auto cold = rc.http.Get("/items/42");
+  ctx.Assert(cold.HeaderValue("X-Cache") == "MISS" && rc.calls.size() == 2,
+             "11 s after the store the entry has expired: the upstream must be asked again");
+}
+
+void CheckOnly200(harness::Ctx& ctx) {
+  RespCache rc(ctx);
+  auto ghost = rc.http.Get("/items/ghost");
+  ctx.Equal(ghost.Status, 404, "a 404 from the upstream");
+  ctx.Equal(ctx.Redis.Keys("*").size(), 0, "a 404 was stored (%q); the keys", ctx.Redis.Keys("*"));
+  auto again = rc.http.Get("/items/ghost");
+  ctx.Assert(again.Status == 404 && rc.calls.size() == 2, "a 404 must be asked upstream again, never served from cache");
+  auto down = rc.http.Get("/items/down");
+  ctx.Equal(down.Status, 503, "a 503 from the upstream");
+  ctx.Equal(ctx.Redis.Keys("*").size(), 0, "a 503 was stored (%q); the keys", ctx.Redis.Keys("*"));
+  auto ok = rc.http.Get("/items/42");
+  ctx.Assert(ok.Status == 200 && ctx.Redis.Exists(respKey("/items/42")) == 1, "a 200 must still be stored");
+}
+
+void CheckXCache(harness::Ctx& ctx) {
+  RespCache rc(ctx);
+  auto miss = rc.http.Get("/items/42");
+  auto hit = rc.http.Get("/items/42");
+  auto plainMiss = rc.http.Get("/items/plain");
+  auto plainHit = rc.http.Get("/items/plain");
+  ctx.Equal(miss.HeaderValue("X-Cache"), "MISS", "the first request's X-Cache");
+  ctx.Equal(hit.HeaderValue("X-Cache"), "HIT", "the second request's X-Cache");
+  ctx.Equal(rc.calls.size(), 2, "upstream calls for four requests (one per distinct target)");
+  ctx.Assert(hit.Status == 200 && hit.Text() == miss.Text(), "a hit must replay the stored body");
+  ctx.Assert(hit.HeaderValue("Content-Type").rfind("application/json", 0) == 0,
+             "a hit must replay the stored content type, got %q", hit.HeaderValue("Content-Type"));
+  ctx.Assert(plainHit.HeaderValue("X-Cache") == "HIT" && plainHit.Text() == plainMiss.Text(),
+             "text responses are cached like any other 200");
+  ctx.Assert(plainHit.HeaderValue("Content-Type").rfind("text/plain", 0) == 0,
+             "the hit for a text/plain upstream answered Content-Type %q: store the content type with the body",
+             plainHit.HeaderValue("Content-Type"));
+}
+`,
   },
   debrief: `A response cache is cache-aside applied to whole HTTP responses, which is why the entry has to carry its content type and why the status guard matters: a cached error is an outage that outlives its cause. Ten seconds is a *micro-cache* — it flattens hot-key bursts without making anyone see stale data for long. Real gateways honour \`Vary\` (per-\`Accept\`, per-tenant keys), respect the upstream's own \`Cache-Control\`, add stale-while-revalidate so a hot key is refreshed in the background, and single-flight concurrent misses as in the stampede step of the image cache.`,
 };

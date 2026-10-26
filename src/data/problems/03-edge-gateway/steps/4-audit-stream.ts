@@ -431,6 +431,7 @@ object AuditLog {
       starter: `#include <librdkafka/rdkafkacpp.h>
 
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <iostream>
 #include <memory>
@@ -465,13 +466,14 @@ auto producer = make_producer();
 void audit(const std::string& api_key, const std::string& path, int status, double latency_ms) {
   const double ts = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
   std::string value = "{\\"api_key\\":\\"" + api_key + "\\",\\"path\\":\\"" + path + "\\",\\"status\\":" + std::to_string(status) +
-                      ",\\"latency_ms\\":" + std::to_string(latency_ms) + ",\\"ts\\":" + std::to_string(ts) + "}";
-  // TODO: produce keyed by api_key (RK_MSG_COPY); ERR__QUEUE_FULL → ++dropped; poll(0); never block
+                      ",\\"latency_ms\\":" + std::to_string(std::round(latency_ms * 10) / 10) + ",\\"ts\\":" + std::to_string(ts) + "}";
+  // TODO: poll(0) first (serve delivery callbacks); produce keyed by api_key (RK_MSG_COPY); ERR__QUEUE_FULL → ++dropped; never block
 }
 `,
       solution: `#include <librdkafka/rdkafkacpp.h>
 
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <iostream>
 #include <memory>
@@ -506,7 +508,8 @@ auto producer = make_producer();
 void audit(const std::string& api_key, const std::string& path, int status, double latency_ms) {
   const double ts = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
   std::string value = "{\\"api_key\\":\\"" + api_key + "\\",\\"path\\":\\"" + path + "\\",\\"status\\":" + std::to_string(status) +
-                      ",\\"latency_ms\\":" + std::to_string(latency_ms) + ",\\"ts\\":" + std::to_string(ts) + "}";
+                      ",\\"latency_ms\\":" + std::to_string(std::round(latency_ms * 10) / 10) + ",\\"ts\\":" + std::to_string(ts) + "}";
+  producer->poll(0);  // serve delivery callbacks first, so acknowledged records leave the queue; returns immediately
   const RdKafka::ErrorCode err = producer->produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
                                                    value.data(), value.size(), api_key.c_str(), api_key.size(), 0, nullptr);
   if (err == RdKafka::ERR__QUEUE_FULL) {
@@ -514,7 +517,6 @@ void audit(const std::string& api_key, const std::string& path, int status, doub
   } else if (err != RdKafka::ERR_NO_ERROR) {
     std::cerr << "audit produce failed: " << RdKafka::err2str(err) << "\\n";
   }
-  producer->poll(0);  // serve delivery callbacks; returns immediately
 }
 `,
     },
@@ -777,6 +779,117 @@ func CheckNonBlocking(ctx *harness.Ctx) {
 	auditMustReturn(ctx, "because the broker was slow (hand the record to the producer and return)", "/items/slow")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited < 1 && ctx.Clock.Sleeps() == sleeps, "audit() waited %.1f s for a stalled broker's acknowledgement: the request thread never waits for a broker, hand the record to the producer and return", waited)
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+#include <exception>
+#include <string>
+
+namespace {
+
+const std::string kAuditTopic = "gateway-audit";
+
+// Go reads its queue's bound as cap(queue); librdkafka keeps queue.buffering.max.messages to itself,
+// so the bound is found as the broker stalls: audit until produce() first refuses a record (that
+// record is the first drop). The default bound (100000) counts as no bound.
+int auditFill(harness::Ctx& ctx) {
+  constexpr int kLimit = 20000;
+  int accepted = 0;
+  while (dropped.load() == 0 && accepted < kLimit) {
+    audit("k1", "/items/" + std::to_string(accepted), 200, 1.0);
+    if (dropped.load() == 0) accepted++;
+  }
+  ctx.Assert(dropped.load() > 0,
+             "%d audit() calls on a stalled broker and nothing was dropped: the queue is unbounded, a slow broker grows "
+             "it until the gateway runs out of memory",
+             accepted);
+  ctx.Assert(accepted > 0, "the first record on a stalled broker was dropped: expected a positive bound on the records in flight");
+  return accepted;
+}
+
+// audit, failing the check with why when it throws.
+void auditMustReturn(harness::Ctx& ctx, const std::string& why, const std::string& path) {
+  try {
+    audit("k1", path, 200, 1.0);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("audit() failed the request %s: %s", why, e.what());
+  }
+}
+
+}  // namespace
+
+void CheckTopicKey(harness::Ctx& ctx) {
+  audit("k1", "/items/42", 200, 12.34);
+  audit("k2", "/items/7", 404, 3.0);
+  audit("k1", "/items/9", 200, 1.0);
+  ctx.Settle();
+  const auto records = ctx.Kafka.Records(kAuditTopic);
+  ctx.Equal(records.size(), 3, "three audit() calls must produce three records on gateway-audit; the records");
+  ctx.Equal(ctx.Kafka.Keys(kAuditTopic), {"k1", "k2", "k1"}, "records must be keyed by the API key");
+  ctx.Equal(records[0].Partition, records[2].Partition,
+            "the same API key must land on the same partition so one caller's trail stays ordered; k1's partitions");
+  nlohmann::json first;
+  try {
+    first = nlohmann::json::parse(records[0].Value.value_or(""));
+  } catch (const std::exception&) {
+  }
+  ctx.Assert(first.is_object() && first.value("api_key", "") == "k1" && first.value("path", "") == "/items/42" &&
+                 first.contains("status") && first["status"] == 200,
+             "the value must be JSON with api_key, path, status, latency_ms, ts: %s", records[0].Value.value_or(""));
+  ctx.Assert(first.contains("latency_ms") && first["latency_ms"].is_number() && first["latency_ms"].get<double>() == 12.3,
+             "latency_ms is %s, expected 12.3", first.value("latency_ms", nlohmann::json()).dump());
+  ctx.Assert(first.contains("ts"), "the record carries no ts: %s", records[0].Value.value_or(""));
+}
+
+void CheckBoundedQueue(harness::Ctx& ctx) {
+  // the broker stops acknowledging: nothing handed to the producer leaves its queue
+  ctx.Kafka.Stall(kAuditTopic);
+  const int max = auditFill(ctx);
+  for (int i = 0; i < 2; i++) audit("k1", "/items/42", 200, 1.0);
+  ctx.Equal(dropped.load(), 3, "dropped after %d records on a stalled broker with a bound of %d", max + 3, max);
+  ctx.Equal(ctx.Kafka.Records(kAuditTopic).size(), 0, "nothing can reach the topic while the broker is stalled; the records");
+}
+
+void CheckDropOnFull(harness::Ctx& ctx) {
+  ctx.Kafka.Stall(kAuditTopic);
+  const int max = auditFill(ctx);  // the queue is now full, one record refused
+  for (int i = 0; i < 2; i++) {
+    auditMustReturn(ctx, "when the queue was full (drop the record and count it instead)", "/items/42");
+  }
+  ctx.Equal(ctx.Kafka.Records(kAuditTopic).size(), 0, "nothing can be produced while the queue is full; the records");
+  ctx.Equal(dropped.load(), 3, "dropped after three refused records");
+  ctx.Equal(ctx.Clock.Sleeps(), 0, "a full queue must be handled by dropping, not by sleeping and retrying; the sleeps");
+  ctx.Kafka.Resume(kAuditTopic);
+  ctx.Clock.Advance(31);  // the broker is back: the queued records are acknowledged
+  ctx.Settle();
+  ctx.Equal(static_cast<int>(ctx.Kafka.Records(kAuditTopic).size()), max,
+            "once the broker answers again the %d queued records must be delivered; the records on the topic", max);
+  audit("k1", "/items/after", 200, 1.0);
+  ctx.Settle();
+  const auto values = ctx.Kafka.Values(kAuditTopic);
+  ctx.Assert(!values.empty() && values.back().find("/items/after") != std::string::npos,
+             "once the queue has room, audit records flow again");
+  ctx.Equal(dropped.load(), 3, "dropped after a successful produce must stay at 3");
+}
+
+void CheckNonBlocking(harness::Ctx& ctx) {
+  for (int i = 0; i < 3; i++) audit("k1", "/items/" + std::to_string(i), 200, 1.0);
+  const int sleeps = ctx.Clock.Sleeps();
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records(kAuditTopic).size(), 3, "three audit() calls must produce three records; the records");
+  ctx.Equal(sleeps, 0, "audit() must not sleep or wait; the sleeps");
+  ctx.Kafka.Stall(kAuditTopic);  // the broker stops answering: the request must not notice
+  const int64_t before = ctx.Clock.Now();
+  const int sleepsBefore = ctx.Clock.Sleeps();
+  auditMustReturn(ctx, "because the broker was slow (hand the record to the producer and return)", "/items/slow");
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited < 1 && ctx.Clock.Sleeps() == sleepsBefore,
+             "audit() waited %.1f s for a stalled broker's acknowledgement: the request thread never waits for a "
+             "broker, hand the record to the producer and return",
+             waited);
 }
 `,
   },

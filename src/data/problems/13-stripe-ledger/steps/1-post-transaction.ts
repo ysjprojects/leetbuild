@@ -1412,6 +1412,244 @@ func CheckCreated(ctx *harness.Ctx) {
 	ctx.Equal(r.Header.Get("Location"), fmt.Sprintf("/transactions/%v", t["id"]), "Location must point at the transaction")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+#include <nlohmann/json.hpp>
+#include <pqxx/pqxx>
+
+#include <algorithm>
+#include <tuple>
+
+#include "db.h"   // db::transaction(fn): the journal writer's database transaction
+#include "ids.h"  // new_uuid()
+
+namespace {
+
+const std::string ledgerSchema = R"(
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL REFERENCES transactions (id),
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL,
+    posted_at bigint NOT NULL
+);
+)";
+
+const std::string ledgerEUR = "EUR";
+
+nlohmann::json ledgerBalanced() {
+  return {
+      {"description", "capture ch_1"},
+      {"entries", nlohmann::json::array({
+                      {{"account", "cash:acquirer"}, {"currency", ledgerEUR}, {"amount", 4999}},
+                      {{"account", "clearing:payments"}, {"currency", ledgerEUR}, {"amount", -4999}},
+                  })},
+  };
+}
+
+nlohmann::json ledgerEntriesOf(const std::string& currency, std::initializer_list<nlohmann::json> amounts) {
+  const std::vector<std::string> accounts = {"cash:acquirer", "clearing:payments", "revenue:fees"};
+  nlohmann::json out = nlohmann::json::array();
+  size_t i = 0;
+  for (const auto& amount : amounts) out.push_back({{"account", accounts[i++]}, {"currency", currency}, {"amount", amount}});
+  return out;
+}
+
+}  // namespace
+
+// The journal writer of step 4 (ledger_writer.cpp): one database transaction, insert-or-skip on the
+// event id, the entries at the transaction's posted_at. Step 1 declares it returning the id ("" for
+// an already recorded event, which the API path, without event id, never meets).
+std::string write_transaction(const std::vector<Entry>& entries, const std::string& description, std::optional<std::string> event_id,
+                              int64_t posted_at, std::optional<std::string> settles) {
+  const std::string transaction_id = new_uuid();
+  if (posted_at == 0) posted_at = now_ms();
+  bool duplicate = false;
+  db::transaction([&](pqxx::work& tx) {
+    const auto res = tx.exec_params(
+        "INSERT INTO transactions (id, event_id, description, settles, posted_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (event_id) DO NOTHING",
+        transaction_id, event_id, description, settles, posted_at);
+    if (res.affected_rows() == 0) {
+      duplicate = true;
+      return;
+    }
+    for (const auto& e : entries)
+      tx.exec_params("INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES ($1, $2, $3, $4, $5)",
+                     transaction_id, e.account, e.currency, e.amount, posted_at);
+  });
+  return duplicate ? "" : transaction_id;
+}
+
+namespace {
+
+// ledgerAPI is the learner's API in front of the real journal writer (step 4, defined above) and an
+// empty ledger database.
+harness::HTTP ledgerAPI(harness::Ctx& ctx) {
+  ctx.DB.Reset(ledgerSchema);
+  return ctx.Main().HTTP();
+}
+
+// Go recovers a panic out of the handler; here an exception escaping the request is the crash.
+harness::Response ledgerPost(harness::Ctx& ctx, harness::HTTP& c, const nlohmann::json& body) {
+  harness::Response r;
+  try {
+    r = c.Post("/transactions", body.dump(), "Content-Type", "application/json");
+  } catch (const std::exception& e) {
+    ctx.Fatalf("POST /transactions with %s crashed the service with %v — validate before writing: the journal only takes integer amounts in one currency", body.dump(), std::string(e.what()));
+  }
+  if (r.Status == 500) {
+    ctx.Fatalf("POST /transactions with %s crashed the service: %s — validate before writing: the journal only takes integer amounts in one currency", body.dump(), r.Text());
+  }
+  return r;
+}
+
+harness::Any ledgerBody(const harness::Response& r) { return harness::ParseJSON(r.Text()).value_or(harness::Any()); }
+
+std::pair<std::vector<harness::Row>, std::vector<harness::Row>> ledgerJournal(harness::Ctx& ctx) {
+  auto transactions = ctx.DB.Query("SELECT * FROM transactions ORDER BY posted_at, id");
+  auto entries = ctx.DB.Query("SELECT * FROM entries ORDER BY transaction_id, account");
+  return {transactions, entries};
+}
+
+void ledgerAssertNothingWritten(harness::Ctx& ctx, const std::string& why) {
+  auto [transactions, entries] = ledgerJournal(ctx);
+  std::vector<std::vector<harness::Any>> pairs;
+  for (auto& e : entries) pairs.push_back({e["account"], e["amount"]});
+  ctx.Assert(transactions.empty() && entries.empty(), "%s, yet the journal now holds %d transaction(s) and %d entr(ies): %v", why, transactions.size(), entries.size(), pairs);
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = ledgerAPI(ctx);
+  const auto r = ledgerPost(ctx, c, ledgerBalanced());
+  ctx.Assert(r.Status != 404 && r.Status != 405, "POST /transactions answered %d: no handler is registered for it", r.Status);
+  ctx.Equal(r.Status, 201, "POST /transactions with a balanced body answered %s", r.Text());
+  auto [transactions, entries] = ledgerJournal(ctx);
+  ctx.Equal(transactions.size(), 1, "a balanced POST must leave one transaction in the journal");
+  ctx.Equal(ledgerBody(r)["transaction_id"], transactions[0]["id"], "the answer must carry the id of the transaction written to the journal (answer %s)", r.Text());
+}
+
+void CheckTwoEntriesBalanced(harness::Ctx& ctx) {
+  auto c = ledgerAPI(ctx);
+  const std::vector<std::pair<nlohmann::json, std::string>> cases = {
+      {{{"entries", ledgerEntriesOf(ledgerEUR, {4999})}}, "a single entry"},
+      {{{"entries", nlohmann::json::array()}}, "no entries"},
+      {nlohmann::json::object(), "a body without entries"},
+      {{{"entries", nlohmann::json::array({
+                        {{"currency", ledgerEUR}, {"amount", 4999}},
+                        {{"account", "clearing:payments"}, {"currency", ledgerEUR}, {"amount", -4999}},
+                    })}},
+       "an entry without an account"},
+      {{{"entries", ledgerEntriesOf(ledgerEUR, {4999, -4000})}}, "entries summing to 999"},
+      {{{"entries", ledgerEntriesOf(ledgerEUR, {4999, -4999, 1})}}, "three entries summing to 1"},
+  };
+  for (const auto& [body, why] : cases) {
+    const auto r = ledgerPost(ctx, c, body);
+    ctx.Equal(r.Status, 422, "%s is not double entry", why);
+    const std::string reason = ledgerBody(r)["error"].String();
+    ctx.Assert(!reason.empty(), "a 422 must say why in {error: reason}, got %s", r.Text());
+  }
+  ledgerAssertNothingWritten(ctx, "every request so far was refused");
+  const auto r = ledgerPost(ctx, c, {{"entries", ledgerEntriesOf(ledgerEUR, {4999, -4850, -149})}});
+  ctx.Equal(r.Status, 201, "three entries netting to zero are a valid transaction (answer %s)", r.Text());
+  auto [transactions, entries] = ledgerJournal(ctx);
+  ctx.Assert(transactions.size() == 1 && entries.size() == 3, "the valid transaction must leave one transaction and its three entries, found %d and %d", transactions.size(), entries.size());
+  int64_t total = 0;
+  for (auto& e : entries) total += e["amount"].Int();
+  ctx.Equal(total, 0, "the journal's entries must net to zero");
+}
+
+void CheckIntegerAmounts(harness::Ctx& ctx) {
+  auto c = ledgerAPI(ctx);
+  const std::vector<std::pair<nlohmann::json, std::string>> cases = {
+      {49.99, "a float"}, {"4999", "a string"}, {true, "a boolean"}, {0, "zero"}, {nullptr, "a missing amount"}};
+  for (const auto& [bad, why] : cases) {
+    const nlohmann::json body = {{"entries", nlohmann::json::array({
+                                                 {{"account", "cash:acquirer"}, {"currency", ledgerEUR}, {"amount", bad}},
+                                                 {{"account", "clearing:payments"}, {"currency", ledgerEUR}, {"amount", -4999}},
+                                             })}};
+    const auto r = ledgerPost(ctx, c, body);
+    ctx.Equal(r.Status, 422, "amount %s (%s) is not an integer in minor units", bad.dump(), why);
+  }
+  auto r = ledgerPost(ctx, c, {{"entries", nlohmann::json::array({
+                                               {{"account", "cash:acquirer"}, {"currency", ledgerEUR}, {"amount", 49.99}},
+                                               {{"account", "clearing:payments"}, {"currency", ledgerEUR}, {"amount", -49.99}},
+                                           })}});
+  ctx.Equal(r.Status, 422, "49.99 against -49.99 nets to zero but is a float");
+  r = ledgerPost(ctx, c, {{"entries", ledgerEntriesOf(ledgerEUR, {4999, 0, -4999})}});
+  ctx.Equal(r.Status, 422, "an entry with amount 0 moves nothing and must be refused");
+  ledgerAssertNothingWritten(ctx, "every amount so far was refused");
+  r = ledgerPost(ctx, c, {{"entries", ledgerEntriesOf(ledgerEUR, {-250000, 250000})}});
+  ctx.Equal(r.Status, 201, "a credit first and a debit second is fine (answer %s)", r.Text());
+  auto [transactions, entries] = ledgerJournal(ctx);
+  std::vector<int64_t> amounts;
+  for (auto& e : entries) amounts.push_back(e["amount"].Int());
+  std::sort(amounts.begin(), amounts.end());
+  ctx.Equal(amounts, std::vector<int64_t>{-250000, 250000}, "the journal must hold the integer amounts -250000 and 250000");
+}
+
+void CheckOneCurrency(harness::Ctx& ctx) {
+  auto c = ledgerAPI(ctx);
+  const nlohmann::json mixed = {{"entries", nlohmann::json::array({
+                                                {{"account", "cash:acquirer"}, {"currency", "EUR"}, {"amount", 4999}},
+                                                {{"account", "clearing:payments"}, {"currency", "USD"}, {"amount", -4999}},
+                                            })}};
+  auto r = ledgerPost(ctx, c, mixed);
+  ctx.Equal(r.Status, 422, "EUR against USD cannot balance");
+  for (const std::string bad : {"eur", "EURO", "E1R", ""}) {
+    r = ledgerPost(ctx, c, {{"entries", ledgerEntriesOf(bad, {4999, -4999})}});
+    ctx.Equal(r.Status, 422, "currency %q does not match ^[A-Z]{3}$", bad);
+  }
+  r = ledgerPost(ctx, c, {{"entries", nlohmann::json::array({
+                                          {{"account", "a"}, {"amount", 1}},
+                                          {{"account", "b"}, {"amount", -1}},
+                                      })}});
+  ctx.Equal(r.Status, 422, "entries without a currency");
+  ledgerAssertNothingWritten(ctx, "every currency so far was refused");
+  r = ledgerPost(ctx, c, {{"entries", ledgerEntriesOf("GBP", {4999, -4999})}});
+  ctx.Equal(r.Status, 201, "GBP on every entry is valid (answer %s)", r.Text());
+  auto [transactions, entries] = ledgerJournal(ctx);
+  std::vector<std::string> currencies;
+  for (auto& e : entries) currencies.push_back(e["currency"].String());
+  ctx.Equal(currencies, std::vector<std::string>{"GBP", "GBP"}, "the journal must hold two GBP entries");
+}
+
+void CheckCreated(harness::Ctx& ctx) {
+  auto c = ledgerAPI(ctx);
+  nlohmann::json body = ledgerBalanced();
+  body["settles"] = "tx-0";
+  for (auto& e : body["entries"]) e["note"] = "ignored";
+  const auto r = ledgerPost(ctx, c, body);
+  ctx.Equal(r.Status, 201, "a valid body must be answered 201 Created (answer %s)", r.Text());
+  auto [transactions, entries] = ledgerJournal(ctx);
+  ctx.Equal(transactions.size(), 1, "one valid POST must write exactly one transaction");
+  const auto t = transactions[0];
+  ctx.Equal(entries.size(), 2, "the transaction must have its two entries in the journal");
+  std::vector<std::tuple<std::string, std::string, int64_t>> stored;
+  for (auto& e : entries) stored.emplace_back(e["account"].String(), e["currency"].String(), e["amount"].Int());
+  std::sort(stored.begin(), stored.end());
+  ctx.Equal(stored, std::vector<std::tuple<std::string, std::string, int64_t>>{{"cash:acquirer", "EUR", 4999}, {"clearing:payments", "EUR", -4999}}, "the journal holds the entries");
+  ctx.Equal(t.at("description"), "capture ch_1", "the description must be passed through to the journal");
+  ctx.Equal(t.at("settles"), "tx-0", "the settles field must be passed through to the journal");
+  ctx.Equal(t.at("event_id"), nullptr, "an API-originated transaction has no event id");
+  const int64_t now = ctx.Clock.Now();  // virtual time: what the learner's system_clock reads
+  const int64_t postedAt = t.at("posted_at").Int();
+  ctx.Assert(postedAt - now < 5000 && now - postedAt < 5000, "posted_at must be now in milliseconds (%d), the journal holds %d", now, postedAt);
+  const auto payload = ledgerBody(r);
+  ctx.Equal(payload["transaction_id"], t.at("id"), "the body must carry the journal's transaction id (answer %s)", r.Text());
+  ctx.Equal(payload["posted_at"], t.at("posted_at"), "the body must carry the posted_at the journal got");
+  const auto cleaned = harness::ParseJSON(R"([{"account": "cash:acquirer", "currency": "EUR", "amount": 4999}, {"account": "clearing:payments", "currency": "EUR", "amount": -4999}])");
+  ctx.Equal(payload["entries"], *cleaned, "the body must echo the cleaned entries (account, currency, amount only)");
+  ctx.Equal(r.HeaderValue("Location"), "/transactions/" + t.at("id").String(), "Location must point at the transaction");
+}
+`,
   },
   debrief: `The validation is the product: a ledger that accepts one unbalanced transaction is no longer a ledger, because every balance computed from it is now suspect. The rules are cheap and run before any I/O — count, types, currency, sum — and each failure names the rule in the body so the publishing team can fix their producer. Integers in minor units are not pedantry: 0.1 + 0.2 ≠ 0.3 in a float, and a ledger that sums floats drifts by cents until it fails a clearing check. Stripe's post treats every event as a transaction between accounts of a fund flow; the entries here are the same idea with the account names flattened to strings. Real ledgers also type the accounts (asset, liability, clearing), restrict which accounts a producer may post to, and version the fund-flow definitions so a transaction can be re-validated against the rules that applied when it was posted.`,
 };

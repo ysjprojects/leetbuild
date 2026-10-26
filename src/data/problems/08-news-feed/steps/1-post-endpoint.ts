@@ -670,7 +670,7 @@ object PostApi {
 #include <nlohmann/json.hpp>
 
 #include "feed/events.h"  // events::publish(const Post&) — provided (Kafka topic "posts")
-#include "feed/store.h"   // Post, posts::save(const Post&), timeline::read(user, cursor, limit) -> Page{items, next_cursor} — provided
+#include "feed/store.h"   // Post, posts::save(Post&) (a reused Idempotency-Key fills post with the earlier one), timeline::read(user, cursor, limit) -> Page{items, next_cursor} — provided
 #include "feed/uuid.h"    // std::string uuid4() — provided
 
 using json = nlohmann::json;
@@ -729,7 +729,7 @@ int main() {
 #include <nlohmann/json.hpp>
 
 #include "feed/events.h"  // events::publish(const Post&) — provided (Kafka topic "posts")
-#include "feed/store.h"   // Post, posts::save(const Post&), timeline::read(user, cursor, limit) -> Page{items, next_cursor} — provided
+#include "feed/store.h"   // Post, posts::save(Post&) (a reused Idempotency-Key fills post with the earlier one), timeline::read(user, cursor, limit) -> Page{items, next_cursor} — provided
 #include "feed/uuid.h"    // std::string uuid4() — provided
 
 using json = nlohmann::json;
@@ -772,7 +772,7 @@ int main() {
       res.set_content("Idempotency-Key header required", "text/plain");
       return;
     }
-    const Post post{uuid4(), user, text, media_ids, now_ms(), key};
+    Post post{uuid4(), user, text, media_ids, now_ms(), key};
     posts::save(post);
     events::publish(post);
     reply_json(res, 201, json{{"post_id", post.id}, {"created_at", post.created_at}});
@@ -1146,6 +1146,134 @@ func CheckFeedResponse(ctx *harness.Ctx) {
 	ctx.Equal(*calls, []timelineCall{{"alice", int64(1700000000500), 5}}, "timeline.Read must get the user from X-User-Id, the cursor and the limit unchanged")
 	ctx.Equal(r.JSON(), map[string]any{"posts": []any{"p3", "p2"}, "next_cursor": float64(1700000000200)}, "the body must be the page from timeline.Read as posts and next_cursor")
 	ctx.Equal(r.Header.Get("Cache-Control"), "private, no-store", "Cache-Control")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+#include <nlohmann/json.hpp>
+
+#include <cstdlib>
+#include <memory>
+#include <optional>
+#include <string>
+#include <tuple>
+#include <vector>
+
+namespace {
+
+// A POST /posts as alice with Idempotency-Key k-1 (Go's postHeaders).
+harness::Response postAs(harness::HTTP& c, const nlohmann::json& body) {
+  return c.Post("/posts", body.dump(), "X-User-Id", "alice", "Idempotency-Key", "k-1");
+}
+
+harness::Response feedAs(harness::HTTP& c, const std::string& path) {
+  return c.Get(path, "X-User-Id", "alice", "Idempotency-Key", "k-1");
+}
+
+// timelineCall is one call of timeline::read: the user, the cursor (nullopt for none) and the limit.
+using timelineCall = std::tuple<std::string, std::optional<int64_t>, int>;
+
+// fakeTimeline swaps timeline::read on the provided facade: records every call and answers a fixed page.
+std::shared_ptr<std::vector<timelineCall>> fakeTimeline() {
+  auto calls = std::make_shared<std::vector<timelineCall>>();
+  timeline::read = [calls](const std::string& user, std::optional<int64_t> cursor, int limit) {
+    calls->emplace_back(user, cursor, limit);
+    return timeline::Page{{"p3", "p2"}, int64_t{1700000000200}};
+  };
+  return calls;
+}
+
+}  // namespace
+
+void CheckValidate(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  const std::vector<std::pair<nlohmann::json, std::string>> bad = {
+      {{{"text", ""}}, "empty text"},
+      {{{"text", std::string(281, 'x')}}, "281 characters of text"},
+      {{{"text", "hi"}, {"media_ids", {"m1", "m2", "m3", "m4", "m5"}}}, "5 media ids"},
+  };
+  for (const auto& [body, why] : bad) {
+    const auto r = postAs(c, body);
+    ctx.Equal(r.Status, 400, "%s must answer 400", why);
+  }
+  const auto keys = ctx.Redis.Keys("*");
+  ctx.Assert(keys.empty(), "a rejected post must not reach the store, but Redis holds %q", keys);
+  ctx.Equal(ctx.Kafka.Records("posts").size(), 0, "a rejected post must not be published");
+  const auto r = postAs(c, {{"text", std::string(280, 'x')}, {"media_ids", {"m1", "m2", "m3", "m4"}}});
+  ctx.Equal(r.Status, 201, "280 characters and 4 media ids are valid");
+}
+
+void CheckIdempotencyKey(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  const auto r = c.Post("/posts", R"({"text":"hello"})", "X-User-Id", "alice");
+  ctx.Equal(r.Status, 400, "a POST without Idempotency-Key must answer 400");
+  ctx.Assert(ctx.Redis.Keys("*").empty() && ctx.Kafka.Records("posts").empty(), "a POST without Idempotency-Key must not be saved or published");
+  const auto first = postAs(c, {{"text", "hello"}});
+  ctx.Equal(first.Status, 201, "a POST with Idempotency-Key must answer 201");
+  const auto retry = postAs(c, {{"text", "hello"}});
+  ctx.Equal(retry.Status, 201, "a retried POST with the same key must answer 201");
+  ctx.Equal(retry.JSON()["post_id"], first.JSON()["post_id"], "a retry with the same Idempotency-Key must be the same post: the key must reach posts::save as idempotency_key");
+}
+
+void CheckCreated(harness::Ctx& ctx) {
+  // posts::save reads idem:alice:k-1 first: what the posts topic held at that moment tells whether publish came before the save.
+  bool fired = false;
+  size_t atSave = 0;
+  ctx.Redis.After("idem:alice:k-1", [&] {
+    fired = true;
+    atSave = ctx.Kafka.Records("posts").size();
+  });
+  auto c = ctx.Main().HTTP();
+  const auto r = postAs(c, {{"text", "hello"}, {"media_ids", {"m1"}}});
+  ctx.Equal(r.Status, 201, "a valid post must answer 201");
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  const std::string postID = body.is_object() && body.contains("post_id") && body["post_id"].is_string() ? body["post_id"].get<std::string>() : "";
+  ctx.Assert(!postID.empty(), "the 201 body must carry post_id: %s", r.Text());
+  const bool isInteger = body.is_object() && body.contains("created_at") && body["created_at"].is_number_integer();
+  ctx.Assert(isInteger, "created_at must be an integer of milliseconds: %s", r.Text());
+  const int64_t createdAt = body["created_at"].get<int64_t>();
+  ctx.Assert(std::llabs(createdAt - ctx.Clock.Now()) < 5000, "created_at must be the current time in milliseconds, got %d", createdAt);
+  const auto saved = posts::get(postID);
+  ctx.Assert(saved.has_value(), "the post must be in the store after the 201");
+  const std::string shown = nlohmann::json(*saved).dump();
+  ctx.Assert(saved->id == postID && saved->author == "alice", "the saved post must carry the post_id and the author from X-User-Id: %s", shown);
+  ctx.Assert(saved->text == "hello" && saved->media_ids == std::vector<std::string>{"m1"}, "the saved post must carry text and media_ids: %s", shown);
+  ctx.Assert(fired, "the post must reach posts::save with its idempotency_key");
+  ctx.Equal(atSave, 0, "expected posts::save then events::publish, but the posts topic already held records when the store was first asked");
+  const auto values = ctx.Kafka.Values("posts");
+  ctx.Equal(values.size(), 1, "expected one record on the posts topic");
+  const auto published = nlohmann::json::parse(values[0], nullptr, false);
+  ctx.Assert(published.is_object(), "the published record must be the saved post as JSON");
+  ctx.Equal(published.value("post_id", ""), postID, "the published record must be the saved post");
+  ctx.Equal(r.HeaderValue("Cache-Control"), "private, no-store", "Cache-Control");
+}
+
+void CheckFeedLimit(harness::Ctx& ctx) {
+  const auto calls = fakeTimeline();
+  auto c = ctx.Main().HTTP();
+  for (const int limit : {0, 51, -1}) {
+    const auto r = feedAs(c, "/feed?limit=" + std::to_string(limit));
+    ctx.Equal(r.Status, 400, "limit=%d must answer 400", limit);
+  }
+  ctx.Equal(calls->size(), 0, "a rejected limit must not reach timeline::read");
+  for (const int limit : {1, 50}) {
+    const auto r = feedAs(c, "/feed?limit=" + std::to_string(limit));
+    ctx.Equal(r.Status, 200, "limit=%d is valid", limit);
+  }
+  const auto r = feedAs(c, "/feed");
+  ctx.Equal(r.Status, 200, "GET /feed without limit must use the default");
+  std::vector<int> limits;
+  for (const auto& call : *calls) limits.push_back(std::get<2>(call));
+  ctx.Equal(limits, {1, 50, 20}, "timeline::read must receive the limit (default 20)");
+}
+
+void CheckFeedResponse(harness::Ctx& ctx) {
+  const auto calls = fakeTimeline();
+  auto c = ctx.Main().HTTP();
+  const auto r = feedAs(c, "/feed?cursor=1700000000500&limit=5");
+  ctx.Equal(r.Status, 200, "GET /feed must answer 200");
+  ctx.Equal(*calls, std::vector<std::tuple<std::string, int64_t, int>>{{"alice", 1700000000500, 5}}, "timeline::read must get the user from X-User-Id, the cursor and the limit unchanged");
+  ctx.Equal(r.JSON(), harness::ParseJSON(R"({"posts":["p3","p2"],"next_cursor":1700000000200})"), "the body must be the page from timeline::read as posts and next_cursor");
+  ctx.Equal(r.HeaderValue("Cache-Control"), "private, no-store", "Cache-Control");
 }
 `,
   },

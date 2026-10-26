@@ -1705,6 +1705,240 @@ func CheckOverrides(ctx *harness.Ctx) {
 	ctx.Equal(getVariant("button_color", map[string]string{"user_id": "tomm", "locale": "de"}), "CONTROL", "once its expires_at has passed, the override stops applying without any reload")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <atomic>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace {
+
+struct FixtureShare {
+  std::string variant;
+  int pct;
+};
+
+struct FixturePopulation {
+  std::map<std::string, std::string> match;
+  std::vector<FixtureShare> mix;
+};
+
+// fixtureGate is a gate as step 1 publishes it.
+struct FixtureGate {
+  std::string name, seed, default_variant = "OFF";
+  std::vector<FixturePopulation> populations;
+  json overrides = json::array();
+  int version = 1;
+
+  std::string encode() const {
+    json pops = json::array();
+    for (const auto& p : populations) {
+      json mix = json::array();
+      for (const auto& s : p.mix) mix.push_back({{"variant", s.variant}, {"pct", s.pct}});
+      pops.push_back({{"match", p.match}, {"mix", mix}});
+    }
+    return json{{"name", name}, {"seed", seed}, {"default", default_variant}, {"populations", pops},
+                {"overrides", overrides}, {"version", version}}
+        .dump();
+  }
+};
+
+const std::vector<FixtureShare> threeWayMix = {{"RED_BUTTON", 33}, {"BLUE_BUTTON", 33}, {"CONTROL", 34}};
+
+// newFixtureGate has the defaults step 1 fills in: seed = name, default OFF, no overrides, version 1.
+FixtureGate newFixtureGate(const std::string& name, std::vector<FixturePopulation> populations) {
+  FixtureGate g;
+  g.name = name;
+  g.seed = name;
+  g.populations = std::move(populations);
+  return g;
+}
+
+std::vector<FixturePopulation> everyone(std::vector<FixtureShare> mix) { return {{{}, std::move(mix)}}; }
+
+// publishGates leaves what step 1 leaves behind: one field per gate in the hash, and the global version.
+void publishGates(harness::Ctx& ctx, int version, const std::vector<FixtureGate>& gates) {
+  for (const auto& g : gates) ctx.Redis.Do("HSET", "gates", g.name, g.encode());
+  ctx.Redis.Set("gates:version", version);
+}
+
+// expectedVariant is the spec, computed independently of the learner: sha256(seed:user)[:8 hex] % 10000, cumulative edges.
+std::string expectedVariant(const std::string& seed, const std::string& userID, const std::vector<FixtureShare>& mix) {
+  const int b = static_cast<int>(std::stoul(sha256_hex(seed + ":" + userID).substr(0, 8), nullptr, 16) % 10000);
+  int edge = 0;
+  for (const auto& share : mix) {
+    edge += share.pct * 100;
+    if (b < edge) return share.variant;
+  }
+  return mix.back().variant;
+}
+
+std::vector<std::string> userIDs(int n, const std::string& prefix) {
+  std::vector<std::string> ids;
+  for (int i = 0; i < n; i++) ids.push_back(prefix + std::to_string(i));
+  return ids;
+}
+
+std::vector<std::string> variantsOf(const std::string& gate, const std::vector<std::string>& ids) {
+  std::vector<std::string> out;
+  for (const auto& u : ids) out.push_back(get_variant(gate, {{"user_id", u}}));
+  return out;
+}
+
+// commandsSince flattens the learner's Redis round trips after the first 'before'.
+std::vector<std::string> commandsSince(harness::Ctx& ctx, size_t before) {
+  std::vector<std::string> sent;
+  const auto trips = ctx.Redis.RoundTrips();
+  for (size_t i = before; i < trips.size(); i++) sent.insert(sent.end(), trips[i].begin(), trips[i].end());
+  return sent;
+}
+
+}  // namespace
+
+void CheckStatelessHash(harness::Ctx& ctx) {
+  FixtureGate copyGate = newFixtureGate("button_copy", everyone(threeWayMix));
+  copyGate.seed = "button_color";
+  FixtureGate otherGate = newFixtureGate("other", everyone(threeWayMix));
+  otherGate.seed = "s2";
+  publishGates(ctx, 1, {newFixtureGate("button_color", everyone(threeWayMix)), copyGate, otherGate});
+  refresh();
+  const auto ids = userIDs(40, "u");
+  std::vector<std::string> want;
+  for (const auto& u : ids) {
+    const std::string expected = expectedVariant("button_color", u, threeWayMix);
+    want.push_back(expected);
+    const std::string got = get_variant("button_color", {{"user_id", u}});
+    ctx.Assert(got == expected,
+               "get_variant(%q, %s) is %q, expected %q: bucket = first 4 bytes of sha256(%q) as a big-endian integer "
+               "%% 10000, then cumulative edges 3300 / 6600 / 10000",
+               "button_color", u, got, expected, "button_color:" + u);
+  }
+  const auto again = variantsOf("button_color", ids);
+  ctx.Equal(again, want, "the same user must get the same variant on every call: the assignment is a hash, not a coin toss");
+  ctx.Equal(variantsOf("button_copy", ids), again,
+            "two gates with the same seed must assign every user the same way (that is what a shared seed is for)");
+  ctx.Assert(variantsOf("other", ids) != again,
+             "a different seed must shuffle the assignment; %q (seed s2) assigned every user exactly like button_color", "other");
+  std::atomic_store(&snapshot, std::make_shared<const Snapshot>());  // a second server: the snapshot starts empty
+  refresh();
+  ctx.Equal(variantsOf("button_color", ids), again,
+            "a second server loading the same snapshot must assign identically: nothing may be stored per user");
+}
+
+void CheckFallThrough(harness::Ctx& ctx) {
+  const std::vector<FixturePopulation> populations = {
+      {{{"locale", "de"}}, {{"RED_BUTTON", 100}}},
+      {{{"plan", "pro"}}, {{"BLUE_BUTTON", 100}}},
+      {{}, {{"CONTROL", 100}}},
+  };
+  FixtureGate narrow = newFixtureGate("narrow", {populations[0], populations[1]});
+  narrow.default_variant = "FALLBACK";
+  publishGates(ctx, 1, {newFixtureGate("button_color", populations), narrow});
+  refresh();
+  ctx.Equal(get_variant("button_color", {{"user_id", "ana"}, {"locale", "de"}, {"plan", "pro"}}), "RED_BUTTON",
+            "a German pro user matches the first population (locale de) — the first match decides, not the most "
+            "specific or the last");
+  ctx.Equal(get_variant("button_color", {{"user_id", "bo"}, {"locale", "en"}, {"plan", "pro"}}), "BLUE_BUTTON",
+            "an English pro user falls through to the second population (plan pro)");
+  ctx.Equal(get_variant("button_color", {{"user_id", "cy"}, {"locale", "en"}, {"plan", "free"}}), "CONTROL",
+            "a user matching nothing specific lands in the catch-all population ({} matches everyone)");
+  ctx.Equal(get_variant("button_color", {{"user_id", "dee"}}), "CONTROL",
+            "a missing attribute does not match a rule on it; the user still reaches the catch-all");
+  ctx.Equal(get_variant("narrow", {{"user_id", "cy"}, {"locale", "en"}, {"plan", "free"}}), "FALLBACK",
+            "when no population matches, the gate's own default is the answer");
+  ctx.Equal(get_variant("ghost", {{"user_id", "cy"}}), "OFF",
+            "a gate the snapshot does not know answers OFF — a client on a newer build must not crash the server");
+}
+
+void CheckMonotoneRollout(harness::Ctx& ctx) {
+  const auto ids = userIDs(2000, "user-");
+  const auto rollout = [](int on, int version) {
+    FixtureGate g = newFixtureGate("new_sidebar", everyone({{"ON", on}, {"OFF", 100 - on}}));
+    g.version = version;
+    return g;
+  };
+  const auto holdersOfOn = [&ids] {
+    std::set<std::string> set;
+    for (const auto& u : ids)
+      if (get_variant("new_sidebar", {{"user_id", u}}) == "ON") set.insert(u);
+    return set;
+  };
+  publishGates(ctx, 1, {rollout(10, 1)});
+  refresh();
+  const auto first = holdersOfOn();
+  ctx.Assert(140 <= first.size() && first.size() <= 260, "a 10%% share should hold about 200 of 2000 users, it holds %d",
+             first.size());
+  publishGates(ctx, 2, {rollout(20, 2)});
+  ctx.Equal(refresh(), true, "a bumped gates:version must make refresh() load the new config");
+  const auto second = holdersOfOn();
+  std::vector<std::string> lost;
+  for (const auto& u : ids)
+    if (first.count(u) && !second.count(u)) lost.push_back(u);
+  ctx.Assert(lost.empty(),
+             "raising ON from 10%% to 20%% must keep everyone who already had it, but %d users (e.g. %q) fell back to "
+             "OFF: shares are cumulative edges in mix order, not independent draws",
+             lost.size(), std::vector<std::string>(lost.begin(), lost.begin() + std::min<size_t>(3, lost.size())));
+  ctx.Assert(320 <= second.size() && second.size() <= 480, "a 20%% share should hold about 400 of 2000 users, it holds %d",
+             second.size());
+  publishGates(ctx, 3, {rollout(10, 3)});
+  refresh();
+  const auto third = holdersOfOn();
+  ctx.Equal(std::vector<std::string>(third.begin(), third.end()), std::vector<std::string>(first.begin(), first.end()),
+            "rolling back to 10%% must return exactly the original set of users");
+}
+
+void CheckSnapshot(harness::Ctx& ctx) {
+  ctx.Equal(get_variant("button_color", {{"user_id", "ana"}}), "OFF",
+            "before the first refresh the snapshot is empty and every gate is OFF");
+  publishGates(ctx, 7, {newFixtureGate("button_color", everyone(threeWayMix))});
+  size_t before = ctx.Redis.RoundTrips().size();
+  ctx.Equal(refresh(), true, "the first refresh after a publish must report a change");
+  auto sent = commandsSince(ctx, before);
+  const bool hasHGetAll = std::find(sent.begin(), sent.end(), "HGETALL") != sent.end();
+  ctx.Assert(hasHGetAll, "a changed version must be followed by HGETALL gates; the refresh sent %q", sent);
+  ctx.Equal(std::atomic_load(&snapshot)->version, 7, "the snapshot must carry the version it loaded");
+  before = ctx.Redis.RoundTrips().size();
+  ctx.Equal(refresh(), false, "an unchanged version must report no change");
+  ctx.Equal(commandsSince(ctx, before), {"GET"},
+            "an unchanged version costs exactly one GET gates:version; the commands the refresh sent");
+  before = ctx.Redis.RoundTrips().size();
+  for (int i = 0; i < 500; i++) get_variant("button_color", {{"user_id", "u" + std::to_string(i)}});
+  sent = commandsSince(ctx, before);
+  ctx.Assert(sent.empty(),
+             "get_variant must not touch Redis: 500 decisions sent %d commands (%q); evaluate the in-memory snapshot",
+             sent.size(), sent);
+  publishGates(ctx, 8,
+               {newFixtureGate("button_color", everyone(threeWayMix)), newFixtureGate("dark_mode", everyone({{"ON", 100}}))});
+  ctx.Equal(get_variant("dark_mode", {{"user_id", "ana"}}), "OFF",
+            "a gate published after the last refresh is not visible yet: the snapshot only moves when the loader runs");
+  ctx.Equal(refresh(), true, "refresh after gates:version moved to 8");
+  ctx.Equal(get_variant("dark_mode", {{"user_id", "ana"}}), "ON", "after the refresh the new gate is live");
+  ctx.Equal(std::atomic_load(&snapshot)->version, 8, "the snapshot's version after the second load");
+}
+
+void CheckOverrides(harness::Ctx& ctx) {
+  const int64_t now = ctx.Clock.Now() / 1000;
+  FixtureGate g = newFixtureGate("button_color", {{{{"locale", "de"}}, {{"CONTROL", 100}}}});
+  g.overrides = json::array({{{"user_id", "tomm"}, {"variant", "RED_BUTTON"}, {"expires_at", now + 3600}},
+                             {{"user_id", "old"}, {"variant", "RED_BUTTON"}, {"expires_at", now - 1}}});
+  publishGates(ctx, 1, {g});
+  refresh();
+  ctx.Equal(get_variant("button_color", {{"user_id", "tomm"}, {"locale", "de"}}), "RED_BUTTON",
+            "an unexpired override must win over the population the user matches");
+  ctx.Equal(get_variant("button_color", {{"user_id", "tomm"}, {"locale", "en"}}), "RED_BUTTON",
+            "an override applies even when the user matches no population at all — that is how a Dropboxer tests a "
+            "gate aimed at someone else");
+  ctx.Equal(get_variant("button_color", {{"user_id", "old"}, {"locale", "de"}}), "CONTROL",
+            "an expired override must be ignored");
+  ctx.Clock.Advance(3601);
+  ctx.Equal(get_variant("button_color", {{"user_id", "tomm"}, {"locale", "de"}}), "CONTROL",
+            "once its expires_at has passed, the override stops applying without any reload");
+}
+`,
   },
   debrief: `The whole system rests on two decisions this file makes. First, assignment is a **hash**, not a record: nothing is written when a user is assigned, so a hundred servers agree without talking, a new server agrees with the old ones the moment it loads the snapshot, and two gates can be made to agree by sharing a seed. Walking the shares as cumulative edges in a fixed order is what makes a rollout monotone — 10% → 20% keeps the first 10% — which is why the UI shows shares as an ordered list and why a reordering is a reshuffle. Second, evaluation is a **pure function over a snapshot**: the loader pays one \`GET\` per poll for the fleet and one \`HGETALL\` per edit, and a request pays nothing, which is also why Redis being down for a minute is invisible to users. Real systems add a signed config bundle instead of a hash in Redis, a push (pub/sub or a config service) to cut the ten minutes to seconds, exposure logging (step 4), and a kill switch that is itself just a gate with one population and one share.`,
 };

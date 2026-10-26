@@ -1534,6 +1534,381 @@ func CheckTtl(ctx *harness.Ctx) {
 	ctx.Equal(hcContents(page), []any{"again", "hello"}, "the page after expiry is read from Postgres: again, hello")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <grpcpp/grpcpp.h>
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "db.h"
+#include "messages.grpc.pb.h"
+
+namespace {
+
+constexpr int64_t hcEpoch = 1420070400000LL;
+constexpr int64_t hcBucketMs = 10LL * 24 * 3600 * 1000;
+const std::string hcInsert = "INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES ($1, $2, $3, $4, $5)";
+
+const std::vector<std::string> hcInstances = {"data-1:9000", "data-2:9000", "data-3:9000"};
+
+int64_t hcSnowflake(int64_t bucket, int64_t offsetMs) { return ((bucket * hcBucketMs + offsetMs) << 22) | (1 << 17); }
+
+int64_t hcNowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// hcPeer is step 3's data service: the page walk over Postgres behind MessageData.GetMessages.
+class hcPeer final : public discord::MessageData::Service {
+ public:
+  grpc::Status GetMessages(grpc::ServerContext*, const discord::GetMessagesRequest* req, discord::GetMessagesReply* reply) override {
+    const int64_t channel = static_cast<int64_t>(req->channel_id()), before = static_cast<int64_t>(req->before());
+    const int limit = static_cast<int>(req->limit());
+    try {
+      for (int64_t bucket = (before >> 22) / hcBucketMs; reply->messages_size() < limit && bucket >= (channel >> 22) / hcBucketMs; bucket--) {
+        const auto rows = db::exec("SELECT message_id, author_id, content FROM messages"
+                                   " WHERE channel_id = $1 AND bucket = $2 AND message_id < $3 ORDER BY message_id DESC LIMIT $4",
+                                   channel, bucket, before, limit - reply->messages_size());
+        for (const auto& row : rows) {
+          auto* m = reply->add_messages();
+          m->set_id(static_cast<uint64_t>(row[0].as<int64_t>()));
+          m->set_author_id(static_cast<uint64_t>(row[1].as<int64_t>()));
+          m->set_content(row[2].as<std::string>());
+        }
+      }
+    } catch (const std::exception& e) {
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, std::string("messages store: ") + e.what());
+    }
+    return grpc::Status::OK;
+  }
+};
+
+// entry is one message as the API answers it (and as the list holds it).
+struct entry {
+  std::string id, author_id, content;
+};
+
+// hcJSON is the entry as Go's json.Marshal of the struct writes it: fields in declaration order
+// (nlohmann would sort the keys), so the list holds exactly what POST would have pushed.
+std::string hcJSON(const entry& e) {
+  return "{\\"id\\":" + nlohmann::json(e.id).dump() + ",\\"author_id\\":" + nlohmann::json(e.author_id).dump() +
+         ",\\"content\\":" + nlohmann::json(e.content).dump() + "}";
+}
+
+// hcMaps is entries as the JSON the API answers.
+std::vector<std::map<std::string, std::string>> hcMaps(const std::vector<entry>& entries) {
+  std::vector<std::map<std::string, std::string>> out;
+  for (const auto& e : entries) out.push_back({{"id", e.id}, {"author_id", e.author_id}, {"content", e.content}});
+  return out;
+}
+
+std::vector<entry> hcSlice(const std::vector<entry>& v, size_t from, size_t to) {
+  return std::vector<entry>(v.begin() + static_cast<long>(from), v.begin() + static_cast<long>(std::min(to, v.size())));
+}
+
+// hcReads is what reached the data path since it was made: GetMessages calls and Postgres SELECTs.
+struct hcReads {
+  harness::Ctx* ctx;
+  size_t callsFrom;
+  size_t queriesFrom;
+
+  std::vector<harness::Call> calls() const {
+    auto all = ctx->GRPC.CallsTo("GetMessages", "");
+    return std::vector<harness::Call>(all.begin() + static_cast<long>(std::min(callsFrom, all.size())), all.end());
+  }
+
+  int selects() const {
+    int n = 0;
+    const auto queries = ctx->DB.Queries();
+    for (size_t i = queriesFrom; i < queries.size(); i++) {
+      std::istringstream words(queries[i].SQL);
+      std::string text, word;
+      while (words >> word) text += (text.empty() ? "" : " ") + word;
+      for (char& ch : text) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      if (text.rfind("select", 0) == 0) n++;
+    }
+    return n;
+  }
+
+  bool none() const { return calls().empty() && selects() == 0; }
+
+  std::string String() const { return harness::Sprintf("%d GetMessages call(s) and %d SELECT(s) on Postgres", calls().size(), selects()); }
+};
+
+discord::GetMessagesRequest hcRequest(const harness::Call& call) { return call.Request<discord::GetMessagesRequest>(); }
+
+// Query parameters, encoded sorted by key as Go's url.Values.Encode does.
+using Params = std::map<std::string, std::string>;
+
+Params hcLimit(int limit, const std::vector<std::string>& pairs = {}) {
+  Params q{{"limit", std::to_string(limit)}};
+  for (size_t i = 0; i + 1 < pairs.size(); i += 2) q[pairs[i]] = pairs[i + 1];
+  return q;
+}
+
+std::vector<harness::Any> hcContents(const harness::Any& page) {
+  std::vector<harness::Any> out;
+  for (const auto& m : page.Items()) out.push_back(m["content"]);
+  return out;
+}
+
+// hcWorld is the API over the real stack: Postgres, step 3's data service at every instance, the
+// neighbours of steps 1, 2, 4 and 5 as they were built there.
+struct hcWorld {
+  harness::Ctx* ctx;
+  int64_t nowB;
+  int64_t channel;  // created last bucket
+  std::string key;
+  std::vector<entry> entries;  // the stored messages, newest first
+  std::optional<harness::HTTP> http;
+  std::unique_ptr<discord::MessageData::Stub> stub;
+  int64_t lastMs = 0;
+  int64_t seq = 0;
+
+  // store is step 1's store_message: a snowflake minted now, its bucket, one row.
+  nlohmann::json store(int64_t channelID, int64_t authorID, const std::string& content) {
+    int64_t nowMs = hcNowMs();
+    if (nowMs <= lastMs) {
+      nowMs = lastMs;
+      seq = (seq + 1) & 0xFFF;
+      if (seq == 0) nowMs++;
+    } else {
+      seq = 0;
+    }
+    lastMs = nowMs;
+    const int64_t id = ((nowMs - hcEpoch) << 22) | (1 << 17) | seq;
+    const int32_t bucket = static_cast<int32_t>((id >> 22) / hcBucketMs);
+    db::exec(hcInsert, channelID, bucket, id, authorID, content);
+    return nlohmann::json{{"id", std::to_string(id)},
+                          {"channel_id", std::to_string(channelID)},
+                          {"author_id", std::to_string(authorID)},
+                          {"content", content},
+                          {"bucket", bucket}};
+  }
+
+  // fetch is step 4's fetch_messages: GetMessages on the data service under a 300 ms deadline.
+  // Go returns the error; step 4's C++ fetch_messages throws it.
+  std::vector<discord::Message> fetch(int64_t channelID, int64_t before, int limit) {
+    grpc::ClientContext callCtx;
+    callCtx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(300));
+    discord::GetMessagesRequest req;
+    req.set_channel_id(static_cast<uint64_t>(channelID));
+    req.set_before(static_cast<uint64_t>(before));
+    req.set_limit(static_cast<uint32_t>(limit));
+    discord::GetMessagesReply reply;
+    const grpc::Status status = stub->GetMessages(&callCtx, req, &reply);
+    if (!status.ok()) throw std::runtime_error("data service: " + status.error_message());
+    return std::vector<discord::Message>(reply.messages().begin(), reply.messages().end());
+  }
+
+  // publish is step 5's: one message.created record keyed by the channel.
+  void publish(const nlohmann::json& msg) {
+    const nlohmann::json value{{"type", "message.created"}, {"channel_id", msg["channel_id"]}, {"id", msg["id"]},
+                               {"author_id", msg["author_id"]}, {"content", msg["content"]}};
+    ctx->Kafka.Seed("message-events", msg["channel_id"].get<std::string>(), value.dump());
+  }
+
+  std::string path(const Params& params = {}) const {
+    std::string p = "/channels/" + std::to_string(channel) + "/messages";
+    bool first = true;
+    for (const auto& [k, v] : params) {
+      p += (first ? "?" : "&") + k + "=" + v;
+      first = false;
+    }
+    return p;
+  }
+
+  // get is one GET that must answer 200: its page and what it cost the data path.
+  std::pair<harness::Any, hcReads> get(const Params& params = {}) {
+    hcReads reads{ctx, ctx->GRPC.CallsTo("GetMessages", "").size(), ctx->DB.Queries().size()};
+    const auto r = http->Get(path(params));
+    std::string text = r.Text();
+    const auto start = text.find_first_not_of(" \\t\\r\\n");
+    text.erase(0, start == std::string::npos ? text.size() : start);
+    text.erase(text.find_last_not_of(" \\t\\r\\n") + 1);
+    if (text.size() > 120) text = text.substr(0, 120);
+    ctx->Equal(r.Status, 200, "GET answered %s", text);
+    const auto page = harness::ParseJSON(r.Text());
+    if (!page || !(page->IsArray() || page->IsNil())) ctx->Fatalf("the response body does not decode into []map[string]interface {}: %q", r.Text().substr(0, 200));
+    return {*page, reads};
+  }
+
+  harness::Response post(const std::string& content) {
+    return http->Post(path(), nlohmann::json{{"author_id", 7}, {"content", content}}.dump(), "Content-Type", "application/json");
+  }
+};
+
+hcWorld* hcCurrent = nullptr;
+
+// newHotWorld stores stored messages of the channel (db0 the oldest), leaves the newest cached of
+// them in recent:{channel} as POST would have, and starts the API.
+std::unique_ptr<hcWorld> newHotWorld(harness::Ctx& ctx, int stored, int cached) {
+  const int64_t nowB = (ctx.Clock.Now() - hcEpoch) / hcBucketMs;
+  auto w = std::make_unique<hcWorld>();
+  w->ctx = &ctx;
+  w->nowB = nowB;
+  w->channel = hcSnowflake(nowB - 1, 5000);
+  w->key = "recent:" + std::to_string(w->channel);
+  ctx.DB.Reset(db::kSchema);
+  for (int i = 0; i < stored; i++) {
+    const int64_t mid = hcSnowflake(nowB - 1, 10000 + 1000LL * i);
+    const std::string content = "db" + std::to_string(i);
+    ctx.DB.Exec(hcInsert, w->channel, nowB - 1, mid, 7, content);
+    w->entries.insert(w->entries.begin(), entry{std::to_string(mid), "7", content});
+  }
+  if (cached > 0) {
+    std::vector<std::string> args = {"RPUSH", w->key};
+    for (int i = 0; i < cached; i++) args.push_back(hcJSON(w->entries[i]));
+    ctx.Redis.Must(args);
+  }
+  for (const auto& node : hcInstances) ctx.GRPC.Server(node)->RegisterService(new hcPeer());
+  // The API's own client (Go's grpc.NewClient): its calls are the learner's, not the harness's.
+  w->stub = discord::MessageData::NewStub(grpc::CreateChannel(hcInstances[0], grpc::InsecureChannelCredentials()));
+  hcCurrent = w.get();
+  w->http = ctx.Main().HTTP();
+  return w;
+}
+
+}  // namespace
+
+// The neighbours the step's file declares, as steps 1, 2, 4 and 5 built them.
+bool valid_content(const std::string& content) {
+  const bool blank = std::all_of(content.begin(), content.end(), [](char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; });
+  // utf8.RuneCountInString: every byte that does not continue a sequence starts a rune.
+  const auto runes = std::count_if(content.begin(), content.end(), [](char c) { return (static_cast<unsigned char>(c) & 0xC0) != 0x80; });
+  return !blank && runes <= 2000;
+}
+
+nlohmann::json store_message(int64_t channel_id, int64_t author_id, const std::string& content) {
+  return hcCurrent->store(channel_id, author_id, content);
+}
+
+int64_t latest_snowflake() { return (hcNowMs() + 1 - hcEpoch) << 22; }
+
+std::vector<discord::Message> fetch_messages(int64_t channel_id, int64_t before, int limit) {
+  return hcCurrent->fetch(channel_id, before, limit);
+}
+
+void publish(const nlohmann::json& message) { hcCurrent->publish(message); }
+
+void CheckCacheRead(harness::Ctx& ctx) {
+  auto w = newHotWorld(ctx, 60, 60);
+  auto [page, reads] = w->get(hcLimit(50));
+  ctx.Equal(page, hcMaps(hcSlice(w->entries, 0, 50)), "with 60 cached entries limit=50 must be the first 50 of the list, newest first");
+  ctx.Assert(reads.none(), "the page was in the list, yet the read cost %s: a cache hit touches neither the data service nor the database", reads.String());
+  std::tie(page, reads) = w->get();
+  ctx.Assert(page.Len() == 50 && reads.none(), "without ?limit the default page of 50 comes from the list too; got %d entries for %s", page.Len(), reads.String());
+  std::tie(page, reads) = w->get(hcLimit(60));
+  ctx.Assert(harness::Same(page, hcMaps(w->entries)) && reads.none(), "limit=60 is covered by 60 entries: the whole list, no data path; got %d entries for %s", page.Len(), reads.String());
+  for (const int bad : {0, 101}) {
+    const auto r = w->http->Get(w->path(hcLimit(bad)));
+    ctx.Equal(r.Status, 400, "limit=%d is outside 1..100", bad);
+  }
+}
+
+void CheckFullPageOnly(harness::Ctx& ctx) {
+  auto w = newHotWorld(ctx, 12, 10);
+  auto [page, reads] = w->get(hcLimit(50));
+  auto calls = reads.calls();
+  ctx.Equal(calls.size(), 1, "10 cached entries cannot answer a page of 50: the data service must be asked once; times asked");
+  const auto req = hcRequest(calls[0]);
+  ctx.Assert(req.channel_id() == static_cast<uint64_t>(w->channel) && req.limit() == 50, "the fallback must ask for this channel and limit, asked %v", req.ShortDebugString());
+  ctx.Equal(page, hcMaps(w->entries), "the list holds only 10 of the channel's 12 messages: the page must be all 12 from the data service");
+  std::vector<std::string> cachedJSON;
+  for (const auto& e : hcSlice(w->entries, 0, 10)) cachedJSON.push_back(hcJSON(e));
+  ctx.Equal(ctx.Redis.LRange(w->key, 0, -1), cachedJSON, "reads never write the list: after the fallback it must hold exactly the 10 entries POST left there");
+  std::tie(page, reads) = w->get(hcLimit(10));
+  ctx.Assert(reads.none(), "10 cached entries do answer a page of 10, yet the read cost %s", reads.String());
+  ctx.Equal(page, hcMaps(hcSlice(w->entries, 0, 10)), "limit=10 must be served from the list");
+  std::tie(page, reads) = w->get(hcLimit(5, {"before", w->entries[7].id}));
+  calls = reads.calls();
+  ctx.Equal(calls.size(), 1, "a request with ?before is never the newest page: it must go to the data service even though the list holds enough entries; calls");
+  ctx.Equal(std::to_string(hcRequest(calls[0]).before()), w->entries[7].id, "the before cursor must be passed through to the data service");
+  ctx.Equal(page, hcMaps(hcSlice(w->entries, 8, w->entries.size())), "the page older than db4 is db3..db0 from the data service");
+}
+
+void CheckFallback(harness::Ctx& ctx) {
+  auto w = newHotWorld(ctx, 3, 0);
+  auto [page, reads] = w->get(hcLimit(50));
+  auto calls = reads.calls();
+  ctx.Equal(calls.size(), 1, "an empty list must fall back to the data service once; calls");
+  const uint64_t newest = std::stoull(w->entries[0].id);
+  ctx.Assert(hcRequest(calls[0]).before() > newest, "without ?before the fallback must pass latestSnowflake(), an id newer than anything stored; it passed %d", hcRequest(calls[0]).before());
+  ctx.Assert(reads.selects() > 0, "the fallback page must come from Postgres through the data service, no query reached it");
+  ctx.Equal(page, hcMaps(w->entries), "the data service's messages must be answered as {id, author_id, content} with string ids, newest first");
+  ctx.Equal(ctx.Redis.Exists(w->key), 0, "reads never fill the list: it is written only by POST, otherwise an old page could shadow a newer message");
+  std::tie(page, reads) = w->get(hcLimit(50));
+  ctx.Equal(reads.calls().size(), 1, "a second miss is a second data-service call (nothing was cached by the read); calls");
+  ctx.Assert(harness::Same(page, hcMaps(w->entries)) && ctx.Redis.Exists(w->key) == 0, "the second miss answers the same page and still leaves the list alone");
+}
+
+void CheckWriteThrough(harness::Ctx& ctx) {
+  auto w = newHotWorld(ctx, 99, 99);
+  auto r = w->post("");
+  ctx.Equal(r.Status, 400, "empty content must be a 400");
+  ctx.Equal(ctx.Redis.LLen(w->key), 99, "a rejected message must not touch the list");
+  std::vector<std::string> ids;
+  for (const std::string content : {"first", "second", "third"}) {
+    r = w->post(content);
+    ctx.Equal(r.Status, 201, "POST %q", content);
+    const auto created = harness::ParseJSON(r.Text());
+    ids.push_back(created ? (*created)["id"].String() : "");
+  }
+  const auto rows = ctx.DB.Query("SELECT message_id, content FROM messages ORDER BY message_id DESC LIMIT 3");
+  std::vector<std::string> newest;
+  std::vector<harness::Any> contents;
+  for (const auto& row : rows) {
+    newest.push_back(harness::Sprintf("%v", row.at("message_id")));
+    contents.push_back(row.at("content"));
+  }
+  ctx.Equal(newest, std::vector<std::string>{ids[2], ids[1], ids[0]}, "every message must be stored (storeMessage), the newest rows are %v", contents);
+  const auto produced = ctx.Kafka.Records("message-events");
+  bool keyed = produced.size() == 3;
+  for (const auto& rec : produced) keyed = keyed && rec.Key.value_or("") == std::to_string(w->channel);
+  ctx.Assert(keyed, "every stored message must be published once, keyed by the channel; produced keys %v", ctx.Kafka.Keys("message-events"));
+  ctx.Equal(ctx.Redis.LLen(w->key), 100, "99 cached + 3 pushed must be trimmed to 100 (LTRIM 0 99): list length");
+  std::vector<harness::Any> head;
+  for (const auto& item : ctx.Redis.LRange(w->key, 0, 2)) head.push_back(harness::ParseJSON(item).value_or(harness::Any()));
+  const auto want = hcMaps({{ids[2], "7", "third"}, {ids[1], "7", "second"}, {ids[0], "7", "first"}});
+  ctx.Equal(head, want, "the three posts must sit at the head of the list, newest first, as {id, author_id, content}");
+  std::vector<harness::Any> tail;
+  for (const auto& item : ctx.Redis.LRange(w->key, -1, -1)) tail.push_back(harness::ParseJSON(item).value_or(harness::Any()));
+  ctx.Equal(tail, hcMaps(hcSlice(w->entries, 96, 97)), "the two oldest cached entries must have been trimmed away");
+  auto [page, reads] = w->get(hcLimit(50));
+  ctx.Assert(reads.none(), "the newest page is in the list now, yet the read cost %s", reads.String());
+  const auto& items = page.Items();
+  ctx.Assert(items.size() == 50 && harness::Same(std::vector<harness::Any>(items.begin(), items.begin() + 3), head) &&
+                 harness::Same(std::vector<harness::Any>(items.begin() + 3, items.end()), hcMaps(hcSlice(w->entries, 0, 47))),
+             "the newest page comes from the list and starts with the messages just posted");
+}
+
+void CheckTtl(harness::Ctx& ctx) {
+  auto w = newHotWorld(ctx, 0, 0);
+  auto r = w->post("hello");
+  ctx.Equal(r.Status, 201, "POST");
+  const long long ttl = ctx.Redis.TTL(w->key);
+  ctx.Assert(ttl > 0, "%s has no expiry (TTL %d): quiet channels would stay in memory forever", w->key, ttl);
+  ctx.Assert(290 <= ttl && ttl <= 300, "%s expires in %d s, expected 300", w->key, ttl);
+  ctx.Clock.Advance(200);
+  w->post("again");
+  ctx.Assert(ctx.Redis.TTL(w->key) > 250, "a new message must re-arm the expiry, 200 s later the TTL is %d s", ctx.Redis.TTL(w->key));
+  ctx.Clock.Advance(301);
+  ctx.Equal(ctx.Redis.Exists(w->key), 0, "%s must be gone 300 s after the last message", w->key);
+  auto [page, reads] = w->get(hcLimit(50));
+  ctx.Equal(reads.calls().size(), 1, "once the list expired the newest page comes from the data service again; calls");
+  ctx.Equal(hcContents(page), {"again", "hello"}, "the page after expiry is read from Postgres: again, hello");
+}
+`,
   },
   debrief: `The list is the cheapest cache in the system because it has exactly one writer and one shape: the request that stored the message pushes it, so the head of the list is the newest message by construction, and a read that finds a full page can trust it without a version or a timestamp. Refusing to answer from a short list is what keeps that trust — a list that holds 30 items says nothing about item 31, which may well exist in the database. Not filling on a miss is the same discipline from the other side: a read-populated list would race the write that happened between the database read and the push, and could shadow a newer message until the TTL rescued it. Write-through costs one pipeline per post, which is nothing next to the write itself, and the TTL only decides when a cold channel stops paying rent. Discord's note that they "do not want to have to cache messages in Redis" is about the database being fast enough for the long tail; the hot head of a popular channel is a different workload, and a bounded list per channel is the usual answer to it. Real systems invalidate the list on edits and deletes, store a compact encoding instead of JSON, and keep the per-channel hash from the previous step beside it so "is there anything new since id X" is one HGET.`,
 };

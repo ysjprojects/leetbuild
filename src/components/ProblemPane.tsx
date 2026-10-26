@@ -3,6 +3,8 @@ import {type FC, memo, useCallback, useEffect, useMemo, useRef, useState} from '
 
 import {learnPath} from '@/lib/export';
 import {leetbuildHighlighter} from '@/lib/highlight';
+import {runtimeHarness} from '@/lib/runtime/client';
+import {CPP_UNSUPPORTED} from '@/lib/runtime/cpp/support';
 import {type ProblemScore, type StepAttempt, HINT_COST, potentialScore, problemScore, STEP_POINTS} from '@/lib/scoring';
 import {
   type Company,
@@ -698,8 +700,10 @@ const ProblemPane: FC<{
               <p className="text-ink-300 mt-1 text-[12px]">
                 Edit <code className="font-code text-iris-200">{fileName(step.file, language)}</code> in the editor,
                 then submit.{' '}
-                {step.harness?.[language] !== undefined
+                {runtimeHarness(step, language) !== undefined
                   ? 'Your code runs in the browser: each check exercises it and reports what it observed.'
+                  : step.harness?.[language] !== undefined
+                  ? `The checks read the shape of your code. ${CPP_UNSUPPORTED}, to run it.`
                   : runsAsProgram(problem, step, language)
                   ? 'The checks read the shape of your code. Run executes the file here in the browser, PyTorch on the CPU, and the console shows its self-test, which prints PASS when it holds.'
                   : problem.track === 'dllm'

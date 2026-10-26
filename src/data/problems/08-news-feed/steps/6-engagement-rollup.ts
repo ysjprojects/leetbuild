@@ -870,6 +870,98 @@ func CheckOrder(ctx *harness.Ctx) {
 	ctx.Assert(atCommit[0].likes == "1" && atCommit[0].seen, "the commit must come after the claim and the HIncrBy: at commit time stats:p1 likes was %v and seen:e1 existed: %v", atCommit[0].likes, atCommit[0].seen)
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <map>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+void seedEngagement(harness::Ctx& ctx, const std::string& kind, const std::string& postID, const std::string& eventID, const std::string& user) {
+  const nlohmann::json value = {{"event_id", eventID}, {"type", kind}, {"post_id", postID}, {"user_id", user}, {"ts", 1700000000000}};
+  ctx.Kafka.Seed("engagement", postID, value);
+}
+
+void drainRollup(harness::Ctx& ctx) {
+  ctx.Drain([] { run(); });
+}
+
+}  // namespace
+
+void CheckGroup(harness::Ctx& ctx) {
+  seedEngagement(ctx, "like", "p1", "e1", "alice");
+  drainRollup(ctx);
+  const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
+  ctx.Assert(!subscriptions.empty(), "the consumer must subscribe to a topic");
+  const auto& last = subscriptions.back();
+  ctx.Equal(last.Group, "engagement-rollup", "group.id must be engagement-rollup");
+  const bool subscribed = std::find(last.Topics.begin(), last.Topics.end(), "engagement") != last.Topics.end();
+  ctx.Assert(subscribed, "the consumer must subscribe to engagement, got %q", last.Topics);
+  ctx.Equal(ctx.Redis.HGet("stats:p1", "likes"), "1", "after one like event stats:p1 likes");
+}
+
+void CheckManualCommit(harness::Ctx& ctx) {
+  seedEngagement(ctx, "like", "p1", "e1", "alice");
+  seedEngagement(ctx, "like", "p1", "e2", "bob");
+  drainRollup(ctx);
+  const auto consumers = ctx.Kafka.Consumers();
+  ctx.Assert(!consumers.empty() && !consumers.back().AutoCommit, "the consumer must not commit by itself (enable.auto.commit=false): offsets would be committed on a timer, before the event was counted");
+  ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(), "auto-commit is on: offsets were committed on a timer, before processing");
+  ctx.Assert(!ctx.Kafka.EventsOf("manual-commit").empty(), "no explicit commit happened");
+  ctx.Equal(ctx.Kafka.Lag("engagement-rollup", "engagement"), 0, "every processed record must be committed");
+}
+
+void CheckDedupe(harness::Ctx& ctx) {
+  seedEngagement(ctx, "like", "p1", "e1", "alice");
+  seedEngagement(ctx, "like", "p1", "e2", "bob");
+  seedEngagement(ctx, "like", "p1", "e1", "alice");  // the replay, last on its partition: skipping it without a commit leaves lag
+  drainRollup(ctx);
+  ctx.Equal(ctx.Redis.HGet("stats:p1", "likes"), "2", "e1 arrived twice: stats:p1 likes");
+  ctx.Equal(ctx.Redis.Exists("seen:e1"), 1, "seen:{event_id} must be claimed with SET NX so a replay finds it: seen:e1 exists");
+  const auto ttl = ctx.Redis.TTL("seen:e1");
+  ctx.Assert(604000 < ttl && ttl <= 604800, "seen:e1 must expire after a week (EX 604800), its TTL is %d", ttl);
+  ctx.Equal(ctx.Kafka.Lag("engagement-rollup", "engagement"), 0, "a duplicate must be skipped but still committed, or it is re-read forever");
+}
+
+void CheckRollup(harness::Ctx& ctx) {
+  seedEngagement(ctx, "like", "p1", "e1", "alice");
+  seedEngagement(ctx, "like", "p1", "e2", "bob");
+  seedEngagement(ctx, "unlike", "p1", "e3", "alice");
+  seedEngagement(ctx, "comment", "p1", "e4", "alice");
+  seedEngagement(ctx, "share", "p1", "e5", "alice");
+  seedEngagement(ctx, "like", "p2", "e6", "alice");
+  seedEngagement(ctx, "view", "p1", "e7", "alice");  // unknown type
+  ctx.Kafka.Seed("engagement", "p1", "not json");
+  ctx.Kafka.Seed("engagement", "p1", R"({"type":"like"})");  // no event_id, no post_id
+  drainRollup(ctx);
+  ctx.Equal(ctx.Redis.HGetAll("stats:p1"), std::map<std::string, std::string>{{"likes", "1"}, {"comments", "1"}, {"shares", "1"}}, "stats:p1 must be likes 1 (2 likes, 1 unlike), comments 1, shares 1");
+  ctx.Equal(ctx.Redis.HGet("stats:p2", "likes"), "1", "stats:p2 likes");
+  ctx.Equal(ctx.Kafka.Lag("engagement-rollup", "engagement"), 0, "unknown types and malformed records must be skipped and committed, not crash-looped on");
+}
+
+void CheckOrder(harness::Ctx& ctx) {
+  seedEngagement(ctx, "like", "p1", "e1", "alice");
+  bool fired = false, claimedAtCount = false;
+  ctx.Redis.After("stats:p1", [&] {
+    fired = true;
+    claimedAtCount = ctx.Redis.Exists("seen:e1") == 1;
+  });
+  std::vector<std::pair<std::optional<std::string>, bool>> atCommit;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) {
+    atCommit.emplace_back(ctx.Redis.HGet("stats:p1", "likes"), ctx.Redis.Exists("seen:e1") == 1);
+  });
+  drainRollup(ctx);
+  ctx.Assert(fired, "HINCRBY stats:p1 never happened");
+  ctx.Equal(claimedAtCount, true, "seen:e1 must be claimed (SET NX) before the hincrby, not after: seen:e1 existed at the hincrby");
+  ctx.Assert(!atCommit.empty(), "the offset was never committed");
+  ctx.Assert(atCommit[0].first == "1" && atCommit[0].second, "the commit must come after the claim and the hincrby: at commit time stats:p1 likes was %v and seen:e1 existed: %v", atCommit[0].first, atCommit[0].second);
+}
+`,
   },
   debrief: `At-least-once delivery plus an idempotent consumer is how streams get effectively-once results without transactions: the \`SET NX\` claim is the idempotency key of the stream, and the counter only moves for events that won the claim. The window between the claim and the \`HINCRBY\` is the one real gap — a crash there loses the event's count, because the replay finds the key already set. Real rollups close it by doing both in one Lua script, batch commits per poll for throughput, and compute the counters per minute into a time series so "likes in the last hour" is a range read instead of a scan.`,
 };

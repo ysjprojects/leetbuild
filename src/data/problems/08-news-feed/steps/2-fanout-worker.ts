@@ -959,6 +959,118 @@ func CheckBatchedCommit(ctx *harness.Ctx) {
 	ctx.Assert(atCommit[0] == [2]int{3, 1}, "the commit must come after the last pipeline executed: at commit time %d pipeline(s) had run and timeline:f1239 had %d entries", atCommit[0][0], atCommit[0][1])
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+void seedPost(harness::Ctx& ctx, const std::string& postID, const std::string& author) {
+  const nlohmann::json value = {{"post_id", postID}, {"author", author}, {"text", "hi"}, {"media_ids", nlohmann::json::array()}, {"created_at", 1700000000000}};
+  ctx.Kafka.Seed("posts", author, value);
+}
+
+// drainWorker fills the follow graph, then runs the learner's loop until it waits for records.
+void drainWorker(harness::Ctx& ctx, const std::map<std::string, std::vector<std::string>>& followers) {
+  for (const auto& [author, ids] : followers) graph::followers_of[author] = ids;
+  ctx.Drain([] { run(); });
+}
+
+// fanoutPipelines are the learner's round trips that carried more than one command.
+std::vector<std::vector<std::string>> fanoutPipelines(harness::Ctx& ctx) {
+  std::vector<std::vector<std::string>> out;
+  for (const auto& trip : ctx.Redis.RoundTrips())
+    if (trip.size() > 1) out.push_back(trip);
+  return out;
+}
+
+std::vector<std::string> numbered(const std::string& prefix, int n) {
+  std::vector<std::string> out;
+  for (int i = 0; i < n; i++) out.push_back(prefix + std::to_string(i));
+  return out;
+}
+
+}  // namespace
+
+void CheckGroup(harness::Ctx& ctx) {
+  seedPost(ctx, "p1", "ann");
+  drainWorker(ctx, {{"ann", {"bob"}}});
+  const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
+  ctx.Assert(!subscriptions.empty(), "the consumer must subscribe to a topic");
+  const auto& last = subscriptions.back();
+  ctx.Equal(last.Group, "fanout", "group.id must be fanout");
+  const bool subscribed = std::find(last.Topics.begin(), last.Topics.end(), "posts") != last.Topics.end();
+  ctx.Assert(subscribed, "the consumer must subscribe to posts, got %q", last.Topics);
+  ctx.Equal(ctx.Redis.LRange("timeline:bob", 0, -1), {"p1"}, "after consuming p1 by ann, timeline:bob");
+}
+
+void CheckManualCommit(harness::Ctx& ctx) {
+  seedPost(ctx, "p1", "ann");
+  seedPost(ctx, "p2", "ann");
+  drainWorker(ctx, {{"ann", {"bob", "cat"}}});
+  const auto consumers = ctx.Kafka.Consumers();
+  ctx.Assert(!consumers.empty() && !consumers.back().AutoCommit, "the consumer must not commit by itself (enable.auto.commit=false): offsets would be committed on a timer, before the pushes");
+  ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(), "auto-commit is on: offsets were committed on a timer, before processing");
+  ctx.Assert(!ctx.Kafka.EventsOf("manual-commit").empty(), "no explicit commit happened");
+  ctx.Equal(ctx.Kafka.Lag("fanout", "posts"), 0, "every processed record must be committed");
+}
+
+void CheckCelebrity(harness::Ctx& ctx) {
+  seedPost(ctx, "p1", "taylor");
+  seedPost(ctx, "p2", "ann");
+  drainWorker(ctx, {{"taylor", numbered("fan", 10001)}, {"ann", {"bob", "cat"}}});
+  ctx.Equal(ctx.Redis.LRange("timeline:bob", 0, -1), {"p2"}, "ann has 2 followers: her post must be pushed, timeline:bob");
+  const auto pushed = ctx.Redis.Keys("timeline:fan*");
+  ctx.Equal(pushed.size(), 0, "taylor has 10 001 followers: her post must not be fanned out, but fan timelines were written");
+  ctx.Equal(ctx.Kafka.Lag("fanout", "posts"), 0, "a skipped celebrity post must still have its offset committed");
+}
+
+void CheckPushTrim(harness::Ctx& ctx) {
+  std::vector<std::string> old = {"RPUSH", "timeline:bob"};
+  for (const auto& id : numbered("old", 1000)) old.push_back(id);
+  ctx.Redis.Must(old);
+  seedPost(ctx, "p1", "ann");
+  seedPost(ctx, "p2", "ann");
+  drainWorker(ctx, {{"ann", {"bob", "cat"}}});
+  const auto bob = ctx.Redis.LRange("timeline:bob", 0, -1);
+  ctx.Assert(bob.size() >= 2 && bob[0] == "p2" && bob[1] == "p1", "timeline:bob must start with the newest post (LPUSH), got %q",
+             std::vector<std::string>(bob.begin(), bob.begin() + std::min<size_t>(3, bob.size())));
+  ctx.Equal(bob.size(), 1000, "timeline:bob must be trimmed to 1000 entries");
+  ctx.Equal(bob.back(), "old997", "LTRIM must drop the oldest entries: the tail of timeline:bob");
+  ctx.Equal(ctx.Redis.LRange("timeline:cat", 0, -1), {"p2", "p1"}, "timeline:cat");
+}
+
+void CheckBatchedCommit(harness::Ctx& ctx) {
+  seedPost(ctx, "p1", "ann");
+  std::vector<std::pair<int, int>> atCommit;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) {
+    atCommit.emplace_back(static_cast<int>(fanoutPipelines(ctx).size()), static_cast<int>(ctx.Redis.LLen("timeline:f1239")));
+  });
+  drainWorker(ctx, {{"ann", numbered("f", 1240)}});
+  ctx.Equal(ctx.Redis.LRange("timeline:f1239", 0, -1), {"p1"}, "every one of the 1240 followers must receive the post: timeline:f1239");
+  int writes = 0;
+  for (const auto& trip : ctx.Redis.RoundTrips())
+    if (trip.size() == 1 && (trip[0] == "LPUSH" || trip[0] == "LTRIM")) writes++;
+  ctx.Assert(writes == 0, "%d LPUSH/LTRIM were sent one by one: queue them on a pipeline per batch of 500 followers", writes);
+  std::vector<int> sizes;
+  int largest = 0, total = 0;
+  for (const auto& trip : fanoutPipelines(ctx)) {
+    const int n = static_cast<int>(trip.size());
+    sizes.push_back(n);
+    largest = std::max(largest, n);
+    total += n;
+  }
+  ctx.Equal(sizes.size(), 3, "1240 followers must take 3 pipelines (500, 500, 240 followers): pipeline execs observed");
+  ctx.Assert(largest <= 1000 && total == 2480, "each pipeline carries lpush + ltrim for at most 500 followers, observed command counts %v", sizes);
+  ctx.Assert(!atCommit.empty(), "the offset was never committed");
+  ctx.Assert(atCommit[0] == std::pair<int, int>{3, 1}, "the commit must come after the last pipeline executed: at commit time %d pipeline(s) had run and timeline:f1239 had %d entries", atCommit[0].first, atCommit[0].second);
+}
+`,
   },
   debrief: `Fan-out on write moves the cost from every read to the one write: a post costs one Redis command pair per follower, after which every follower's feed is a single \`LRANGE\`. The celebrity threshold is what keeps that bounded — one account with 50 million followers would otherwise turn a post into 50 million writes and a minutes-long delay for everyone else on the same partition. Pipelining matters as much as the threshold: 500 commands in one round trip versus 500 round trips is the difference between milliseconds and seconds. Real systems also skip inactive followers (they rebuild the timeline on their next login instead), shard timelines across Redis clusters, and run several worker groups so one hot author cannot stall the rest.`,
 };

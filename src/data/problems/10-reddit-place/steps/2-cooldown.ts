@@ -793,6 +793,183 @@ func CheckClaimFirst(ctx *harness.Ctx) {
 	ctx.Equal(cdPixel(ctx, 3, 7), 5, "bo's tile must be painted")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+namespace {
+
+std::string cdBoard(harness::Ctx& ctx) { return ctx.Redis.Get("board").value_or(""); }
+
+int cdPixel(harness::Ctx& ctx, int x, int y) {
+  const std::string b = cdBoard(ctx);
+  const size_t off = static_cast<size_t>(y * kSize + x);
+  return off < b.size() ? static_cast<unsigned char>(b[off]) : 0;
+}
+
+int cdZeros(const std::string& b) {
+  int n = 0;
+  for (const char c : b) n += c == 0;
+  return n;
+}
+
+int cdPlace(harness::Ctx& ctx, const std::string& user, int x, int y, int color) {
+  try {
+    return place_tile(user, x, y, color);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("place_tile(%q, %d, %d, %d) threw: %s", user, x, y, color, e.what());
+  }
+}
+
+// cdRival is a parallel request that runs right after the first command on key; the function it
+// returns gives what that request's place_tile returned, what it threw failing the check.
+std::function<int(const std::string&)> cdRival(harness::Ctx& ctx, const std::string& key, const std::string& user, int x, int y, int color) {
+  struct Outcome {
+    bool fired = false;
+    int wait = 0;
+    std::optional<std::string> err;
+  };
+  auto out = std::make_shared<Outcome>();
+  ctx.Redis.After(key, [out, user, x, y, color] {
+    out->fired = true;
+    try {
+      out->wait = place_tile(user, x, y, color);
+    } catch (const std::exception& e) {
+      out->err = e.what();
+    }
+  });
+  return [&ctx, out, user, x, y, color](const std::string& what) {
+    ctx.Assert(out->fired, "place_tile never touched %s", what);
+    ctx.Assert(!out->err, "the parallel place_tile(%q, %d, %d, %d) failed: %s", user, x, y, color, out->err.value_or(""));
+    return out->wait;
+  };
+}
+
+// cdAPI is POST /place as step 1 deploys it, over this place_tile: 429 with Retry-After for a
+// user on cooldown, 200 once the tile is painted.
+httplib::Server cdServer;
+
+harness::HTTP cdAPI(harness::Ctx& ctx) {
+  cdServer.Post("/place", [](const httplib::Request& req, httplib::Response& res) {
+    const auto body = nlohmann::json::parse(req.body, nullptr, false);
+    if (!body.is_object()) {
+      res.status = 400;
+      return;
+    }
+    try {
+      const int wait = place_tile(body.value("user", ""), body.value("x", 0), body.value("y", 0), body.value("color", 0));
+      if (wait > 0) {
+        res.set_header("Retry-After", std::to_string(wait));
+        res.status = 429;
+      } else {
+        res.status = 200;
+      }
+    } catch (const std::exception&) {
+      res.status = 503;
+    }
+  });
+  return ctx.HTTP(cdServer);
+}
+
+}  // namespace
+
+void CheckCooldownKey(harness::Ctx& ctx) {
+  ctx.Equal(cdPlace(ctx, "ana", 3, 7, 12), 0, "a user who never placed a tile is free: place_tile must return 0");
+  ctx.Assert(ctx.Redis.Exists("cooldown:ana") == 1, "after a placement the key cooldown:ana must exist (keys: %v)", ctx.Redis.Keys("*"));
+  const long long ttl = ctx.Redis.TTL("cooldown:ana");
+  ctx.Assert(295 <= ttl && ttl <= 300, "cooldown:ana expires in %d s, expected cooldown = 300 s", ttl);
+  ctx.Equal(cdPlace(ctx, "bo", 3, 8, 1), 0, "the cooldown is per user: bo is not affected by ana's tile");
+  ctx.Clock.Advance(299);
+  ctx.Assert(cdPlace(ctx, "ana", 4, 7, 1) > 0, "299 s after her tile ana is still on cooldown: place_tile must refuse");
+  ctx.Clock.Advance(2);
+  ctx.Equal(ctx.Redis.Exists("cooldown:ana"), 0, "cooldown:ana must be gone after 300 s");
+  ctx.Equal(cdPlace(ctx, "ana", 3, 7, 12), 0, "once the key expired the user is free again");
+}
+
+void CheckAtomicNx(harness::Ctx& ctx) {
+  // A bot fires two requests at once; they reach two app servers. The second one runs right after
+  // the first one's first command on cooldown:ana, the gap Reddit's check-then-write left open.
+  auto settled = cdRival(ctx, "cooldown:ana", "ana", 4, 7, 5);
+  const int mine = cdPlace(ctx, "ana", 3, 7, 12);
+  const int theirs = settled("cooldown:ana");
+  if (mine == 0 && theirs == 0) {
+    ctx.Fatalf("two parallel placements by ana returned %d and %d: both were painted. A check followed by a separate write lets every parallel request through (about 15 000 tiles slipped past r/place's cooldown that way); let one SET … NX decide", mine, theirs);
+  } else if (mine != 0 && theirs != 0) {
+    ctx.Fatalf("two parallel placements by ana returned %d and %d: neither was painted, but one of them must win", mine, theirs);
+  }
+  std::array<int, 3> won = {3, 7, 12};
+  std::array<int, 2> lost = {4, 7};
+  if (mine != 0) {
+    won = {4, 7, 5};
+    lost = {3, 7};
+  }
+  ctx.Equal(cdPixel(ctx, won[0], won[1]), won[2], "the winning placement returned 0, so (%d, %d) must show its colour", won[0], won[1]);
+  ctx.Equal(cdPixel(ctx, lost[0], lost[1]), 0, "the refused placement painted (%d, %d) anyway", lost[0], lost[1]);
+  const int wait = cdPlace(ctx, "ana", 5, 7, 1);
+  ctx.Assert(wait > 0, "a later tile from the same user within 300 s must be refused, but place_tile returned %d", wait);
+}
+
+void CheckPaint(harness::Ctx& ctx) {
+  const int off = 7 * kSize + 3;
+  cdPlace(ctx, "ana", 3, 7, 12);
+  std::string b = cdBoard(ctx);
+  ctx.Assert(static_cast<int>(b.size()) > off, "the board key is %d bytes after painting (3, 7): expected a write at offset y * size + x = %d", b.size(), off);
+  ctx.Equal(static_cast<unsigned char>(b[off]), 12, "byte %d of the board must be the colour 12", off);
+  ctx.Equal(cdZeros(b), b.size() - 1, "painting one tile must change exactly one byte: the zero bytes");
+  cdPlace(ctx, "bo", kSize - 1, kSize - 1, 15);
+  b = cdBoard(ctx);
+  ctx.Equal(b.size(), kSize * kSize, "after painting the last pixel the board must be size * size bytes");
+  ctx.Equal(static_cast<unsigned char>(b.back()), 15, "the last byte");
+  cdPlace(ctx, "cy", 3, 7, 3);
+  ctx.Equal(static_cast<unsigned char>(cdBoard(ctx)[off]), 3, "painting over a pixel replaces its colour");
+  ctx.Equal(ctx.Redis.Type("board"), "string", "board must be one string: its type");
+  // 200 placements a second: dee's tile is written while eve's is in progress.
+  auto settled = cdRival(ctx, "board", "dee", 50, 50, 7);
+  ctx.Equal(cdPlace(ctx, "eve", 10, 10, 9), 0, "eve is free: her tile must be painted");
+  ctx.Equal(settled("the board"), 0, "dee is free: her tile must be painted");
+  ctx.Equal(cdPixel(ctx, 10, 10), 9, "eve's tile at (10, 10): dee's write, started while eve's was in progress, replaced the board with a copy read before eve painted. Write the one byte in place");
+  ctx.Equal(cdPixel(ctx, 50, 50), 7, "dee's tile at (50, 50), painted while eve's was being written: eve's write replaced the board with a copy read before dee painted. Write the one byte in place");
+  ctx.Assert(cdPixel(ctx, kSize - 1, kSize - 1) == 15 && cdPixel(ctx, 3, 7) == 3, "earlier tiles must survive later ones");
+}
+
+void CheckRetryAfter(harness::Ctx& ctx) {
+  cdPlace(ctx, "ana", 3, 7, 12);
+  ctx.Clock.Advance(100);
+  int wait = cdPlace(ctx, "ana", 4, 7, 12);
+  ctx.Assert(199 <= wait && wait <= 200, "100 s into a 300 s cooldown place_tile returned %d, expected the TTL (200)", wait);
+  ctx.Clock.Advance(199.5);
+  wait = cdPlace(ctx, "ana", 4, 7, 12);
+  ctx.Assert(wait == 1, "half a second before the cooldown ends place_tile returned %d, expected at least 1", wait);
+  ctx.Clock.Advance(1);
+  ctx.Equal(cdPlace(ctx, "ana", 4, 7, 12), 0, "once the cooldown ended the tile must be painted");
+}
+
+void CheckClaimFirst(harness::Ctx& ctx) {
+  ctx.Equal(cdPlace(ctx, "ana", 3, 7, 12), 0, "ana is free: her tile must be painted");
+  ctx.Assert(cdPlace(ctx, "ana", 3, 7, 5) > 0, "the second tile within the cooldown must be refused");
+  ctx.Equal(cdPixel(ctx, 3, 7), 12, "a refused placement painted the board: (3, 7) must keep the earlier 12. Claim the cooldown first, paint second");
+  // cy's two parallel requests on one pixel: the board must show the one that was accepted.
+  auto settled = cdRival(ctx, "cooldown:cy", "cy", 6, 7, 5);
+  const int mine = cdPlace(ctx, "cy", 6, 7, 9);
+  const int theirs = settled("cooldown:cy");
+  std::vector<int> accepted, refused;
+  for (const auto& [color, wait] : std::vector<std::pair<int, int>>{{9, mine}, {5, theirs}}) {
+    if (wait > 0) refused.push_back(color);
+    else if (wait == 0) accepted.push_back(color);
+  }
+  const int shown = cdPixel(ctx, 6, 7);
+  const auto in = [shown](const std::vector<int>& colors) { return std::find(colors.begin(), colors.end(), shown) != colors.end(); };
+  ctx.Assert(!in(refused) || in(accepted), "two parallel tiles by cy on (6, 7): colour %v was accepted, %v refused, and the board shows %d: the refused tile was painted. Claim the cooldown first, paint second", accepted, refused, shown);
+  auto api = cdAPI(ctx);
+  auto r = api.Post("/place", R"({"x": 3, "y": 7, "color": 5, "user": "ana"})", "Content-Type", "application/json");
+  ctx.Equal(r.Status, 429, "through the API a user on cooldown gets 429");
+  const std::string retry = r.HeaderValue("Retry-After");
+  ctx.Assert(retry == "299" || retry == "300", "Retry-After is %q, expected the TTL (300)", retry);
+  r = api.Post("/place", R"({"x": 3, "y": 7, "color": 5, "user": "bo"})", "Content-Type", "application/json");
+  ctx.Equal(r.Status, 200, "another user may paint the same pixel");
+  ctx.Equal(cdPixel(ctx, 3, 7), 5, "bo's tile must be painted");
+}
+`,
   },
   debrief: `The cooldown and the lock are the same key. \`SET NX EX\` answers "was this user free?" and makes them not free in one atomic step, so a thousand parallel requests from one bot produce exactly one tile — the race Reddit shipped with (check in Cassandra, then write, with nothing in between) is simply not expressible here. \`SETRANGE\` is the other half of the design: the board is a flat array in a string, a pixel is one byte at a computed offset, and Redis updates it in place with no read, no lock and no version check, which is why 200 placements per second never contended. Real deployments pack two 4-bit pixels per byte with \`BITFIELD SET u4 #offset\`, keep the per-tile author and timestamp in a wide table for "who placed this?", and make the cooldown adjustable at runtime — Reddit turned the knob several times during the event to shed load.`,
 };

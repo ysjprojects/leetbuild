@@ -10,3 +10,5 @@ public/py/worker.js
 public/ts/worker.js
 public/go/worker.js
 public/py/torch/
+public/cpp/sysroot.*
+public/cpp/worker.js

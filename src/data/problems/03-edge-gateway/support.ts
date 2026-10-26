@@ -1,3 +1,5 @@
+import {CPP_DIGEST_H} from '../cpp-support';
+
 /**
  * TypeScript support modules of the edge gateway. The Python course reads `cert.pem` / `key.pem`
  * from disk; the TypeScript runtime has no file system, so the deploy's TLS material is a provided
@@ -27,4 +29,9 @@ AzkZuJT4u4plkrx+nup6c4vwY7MnmS+v6YIm+6yvmHh2U8tQv+oFK91V
 -----END PRIVATE KEY-----
 \`;
 `,
+};
+
+/** C++ support: `sha256.h` (SHA-256 in hex), the response cache's key digest. */
+export const supportModulesCpp: Record<string, string> = {
+  'sha256.h': CPP_DIGEST_H,
 };

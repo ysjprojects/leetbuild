@@ -761,6 +761,115 @@ func CheckChronological(ctx *harness.Ctx) {
 	ctx.Equal(texts, want, "after 60 messages recent(ctx, %q) must be m11 .. m60 oldest first", "room-7")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string recentKey = "recent:room-7";
+
+ServerMsg recentMsg(int i, const std::string& room) {
+  ServerMsg msg;
+  msg.set_room(room);
+  msg.set_user(i % 2 == 1 ? "ana" : "bo");
+  msg.set_text("m" + std::to_string(i));
+  msg.set_ts(1700000000000 + i);
+  return msg;
+}
+
+// The list as Redis holds it, head first, parsed back into ServerMsgs.
+std::vector<ServerMsg> storedRecent(harness::Ctx& ctx, const std::string& key) {
+  std::vector<ServerMsg> out;
+  for (const auto& v : ctx.Redis.LRange(key, 0, -1)) {
+    ServerMsg msg;
+    ctx.Assert(google::protobuf::util::JsonStringToMessage(v, &msg).ok(), "%s holds %q, which is not a JSON ServerMsg", key, v);
+    out.push_back(msg);
+  }
+  return out;
+}
+
+std::vector<std::string> recentTexts(const std::vector<ServerMsg>& msgs) {
+  std::vector<std::string> texts;
+  for (const auto& msg : msgs) texts.push_back(msg.text());
+  return texts;
+}
+
+}  // namespace
+
+void CheckLpush(harness::Ctx& ctx) {
+  remember("room-7", recentMsg(1, "room-7"));
+  remember("room-7", recentMsg(2, "room-7"));
+  remember("room-8", recentMsg(3, "room-8"));
+  ctx.Equal(ctx.Redis.Type(recentKey), "list", "the type of recent:room-7 (keys: %q)", ctx.Redis.Keys("*"));
+  const auto list = storedRecent(ctx, recentKey);
+  ctx.Equal(recentTexts(list), {"m2", "m1"}, "recent:room-7 head first: LPUSH puts the newest at the head");
+  ctx.Assert(list[1].SerializeAsString() == recentMsg(1, "room-7").SerializeAsString(), "the stored JSON parses back to %s, expected %s",
+             list[1].ShortDebugString(), recentMsg(1, "room-7").ShortDebugString());
+  ctx.Equal(recentTexts(storedRecent(ctx, "recent:room-8")), {"m3"}, "recent:room-8: one list per room");
+}
+
+void CheckTrim(harness::Ctx& ctx) {
+  for (int i = 1; i <= 55; i++) remember("room-7", recentMsg(i, "room-7"));
+  ctx.Equal(ctx.Redis.LLen(recentKey), 50, "after 55 messages the entries in recent:room-7 (LTRIM 0 49 after every push)");
+  const auto list = storedRecent(ctx, recentKey);
+  const std::string first = list.front().text(), last = list.back().text();
+  ctx.Assert(first == "m55" && last == "m6",
+             "the list runs %s .. %s, expected m55 .. m6: trimming must drop the oldest, not the newest", first, last);
+}
+
+void CheckExpire(harness::Ctx& ctx) {
+  remember("room-7", recentMsg(1, "room-7"));
+  long long ttl = ctx.Redis.TTL(recentKey);
+  ctx.Assert(3500 <= ttl && ttl <= 3600, "recent:room-7 has TTL %d, expected 3600 s", ttl);
+  ctx.Clock.Advance(1800);
+  remember("room-7", recentMsg(2, "room-7"));
+  ttl = ctx.Redis.TTL(recentKey);
+  ctx.Assert(3500 <= ttl && ttl <= 3600,
+             "a new message must restart the hour: TTL is %d after the second remember, expected 3600", ttl);
+  ctx.Clock.Advance(3601);
+  ctx.Equal(ctx.Redis.Exists(recentKey), 0, "a room quiet for an hour must drop out of Redis: recent:room-7 exists");
+}
+
+void CheckPipelined(harness::Ctx& ctx) {
+  const size_t before = ctx.Redis.RoundTrips().size();
+  remember("room-7", recentMsg(1, "room-7"));
+  const auto all = ctx.Redis.RoundTrips();
+  const std::vector<std::vector<std::string>> trips(all.begin() + static_cast<long>(before), all.end());
+  std::vector<std::string> direct;
+  for (const auto& trip : trips)
+    if (trip.size() == 1) direct.insert(direct.end(), trip.begin(), trip.end());
+  ctx.Assert(direct.empty(),
+             "remember sent %q outside a pipeline: queue lpush, ltrim and expire in one redis.transaction() and exec once",
+             direct);
+  ctx.Equal(trips.size(), 1, "remember's round trips (%v)", trips);
+  const auto& trip = trips[0];
+  std::vector<std::string> commands;
+  for (const auto& c : trip)
+    if (c != "MULTI" && c != "EXEC") commands.push_back(c);
+  ctx.Equal(commands, {"LPUSH", "LTRIM", "EXPIRE"}, "the commands the pipeline queued, in order");
+  ctx.Assert(trip[0] == "MULTI", "the pipeline must be a MULTI (redis.transaction()) so no reader ever sees the list at 51");
+  const auto list = storedRecent(ctx, recentKey);
+  const long long ttl = ctx.Redis.TTL(recentKey);
+  ctx.Assert(list.size() == 1 && list[0].text() == "m1" && 3500 <= ttl && ttl <= 3600,
+             "after exec the list must hold the message with its TTL set");
+}
+
+void CheckChronological(harness::Ctx& ctx) {
+  auto got = recent("room-7");
+  ctx.Assert(got.empty(), "a quiet room must give an empty list, got %v", recentTexts(got));
+  for (int i = 1; i <= 3; i++) remember("room-7", recentMsg(i, "room-7"));
+  got = recent("room-7");
+  ctx.Equal(recentTexts(got), {"m1", "m2", "m3"}, "recent(%q) oldest first", "room-7");
+  ctx.Assert(got[0].SerializeAsString() == recentMsg(1, "room-7").SerializeAsString(), "recent()[0] is %s, expected %s", got[0].ShortDebugString(),
+             recentMsg(1, "room-7").ShortDebugString());
+  for (int i = 4; i <= 60; i++) remember("room-7", recentMsg(i, "room-7"));
+  std::vector<std::string> want;
+  for (int i = 0; i < 50; i++) want.push_back("m" + std::to_string(i + 11));
+  ctx.Equal(recentTexts(recent("room-7")), want, "after 60 messages recent(%q) must be m11 .. m60 oldest first", "room-7");
+}
+`,
   },
   debrief: `LPUSH + LTRIM + EXPIRE is the Redis idiom for a bounded, self-cleaning recent-items list, and wrapping the three in MULTI/EXEC is what makes it one round trip *and* one atomic unit — a plain pipeline saves the round trips but another client's LRANGE can still slip in between the push and the trim. The list is maintained by the writer, so a miss is not a signal to load anything; it just means the client uses the history endpoint. Real systems store a sequence number with each entry so a reconnecting client can ask for "everything after N", and keep the list per shard when a single room is hot enough to make one Redis key a bottleneck.`,
 };

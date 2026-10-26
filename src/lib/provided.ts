@@ -374,15 +374,30 @@ function scalaHelpers(problem: Problem, protoPackages: {pkg: string; name: strin
   return [...out.values()];
 }
 
-/** C++: every quoted include that is not a generated header — a step's own header, or a helper's. */
+/**
+ * C++: every quoted include that is not a generated header — a step's own header, or a helper's.
+ * One the course ships for the C++ runtime (`support.cpp`, real declarations the harness compiles
+ * against) is shown as it is; otherwise a stub says what it is.
+ */
 function cppHelpers(problem: Problem, generatedHeaders: Set<string>): ProvidedFile[] {
   const code = allCode(problem, 'cpp');
+  const shipped = problem.support?.cpp ?? {};
   const out = new Map<string, ProvidedFile>();
   for (const m of code.matchAll(/^\s*#include\s+"([^"]+)"/gm)) {
     const include = m[1];
     if (generatedHeaders.has(include) || out.has(include)) continue;
     const name = stem(include.split('/').pop() ?? include);
     const owner = problem.steps.findIndex(s => s.file === name);
+    const text = shipped[include];
+    if (text !== undefined) {
+      out.set(include, {
+        path: include,
+        syntax: 'cpp',
+        note: `Shipped by the course: the step files include it as "${include}", and the browser runtime compiles against it.`,
+        text,
+      });
+      continue;
+    }
     out.set(include, {
       path: include,
       syntax: 'cpp',

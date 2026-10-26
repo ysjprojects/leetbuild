@@ -57,7 +57,7 @@ harness plays.`,
     ],
     edges: [{from: 'uploader', to: 'ingest', kind: 'grpc', label: 'GetStatus · Upload (Chunk ⇄ Ack)'}],
   },
-  support: {python: protoModules, typescript: protoFiles, go: protoFiles},
+  support: {python: protoModules, typescript: protoFiles, go: protoFiles, cpp: protoFiles},
   steps: [resumableUploadStep],
   learn,
 };

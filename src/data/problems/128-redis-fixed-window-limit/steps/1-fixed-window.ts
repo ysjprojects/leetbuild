@@ -808,6 +808,166 @@ func CheckAtomicIncr(ctx *harness.Ctx) {
 	ctx.Assert(ok && count >= fwLimit, "%s must have counted every request, it holds %s", k, harness.Show(fwHeld(ctx, k)))
 }
 `,
+    cpp: `// redis-fixed-window-limit/fixed-window checks: limit, retry-after, window-rolls, ttl-set, per-client, atomic-incr
+#include <leetbuild/harness.h>
+
+#include <cmath>
+#include <cstdlib>
+#include <exception>
+#include <optional>
+#include <string>
+#include <utility>
+
+namespace {
+
+constexpr int fwLimit = 100;
+constexpr long long fwWindow = 60;
+
+// fwAlign parks the clock one second into a window so a check's hundred calls never straddle a boundary; it returns the window number.
+long long fwAlign(harness::Ctx& ctx) {
+  const double nowS = static_cast<double>(ctx.Clock.Now()) / 1000;
+  ctx.Clock.Advance(fwWindow - std::fmod(nowS, static_cast<double>(fwWindow)) + 1);
+  return ctx.Clock.Now() / 1000 / fwWindow;
+}
+
+std::string fwKey(const std::string& client, long long window) { return harness::Sprintf("rl:%s:%d", client, window); }
+
+std::pair<bool, int> fwAllow(harness::Ctx& ctx, const std::string& client) {
+  try {
+    return allow(client);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("allow(%q) returned an error: %s", client, e.what());
+  }
+  return {false, 0};
+}
+
+// fwFill makes fwLimit calls, every one of which must be allowed.
+void fwFill(harness::Ctx& ctx, const std::string& client) {
+  for (int i = 0; i < fwLimit; i++) {
+    const auto [allowed, retry] = fwAllow(ctx, client);
+    ctx.Assert(allowed, "call %d of %d for %q in a fresh window must be allowed, it was denied (retryAfterS %d)", i + 1, fwLimit, client, retry);
+    ctx.Equal(retry, 0, "an allowed call answers retryAfterS 0; call %d for %q", i + 1, client);
+  }
+}
+
+// fwHeld is the key's value, or nil when it does not exist.
+std::optional<std::string> fwHeld(harness::Ctx& ctx, const std::string& k) { return ctx.Redis.Get(k); }
+
+// fwCount is the key's value as a number, if it is one.
+std::optional<long long> fwCount(harness::Ctx& ctx, const std::string& k) {
+  const auto v = ctx.Redis.Get(k);
+  if (!v || v->empty()) return std::nullopt;
+  char* end = nullptr;
+  const long long n = std::strtoll(v->c_str(), &end, 10);
+  if (*end != 0) return std::nullopt;
+  return n;
+}
+
+}  // namespace
+
+void CheckLimit(harness::Ctx& ctx) {
+  const long long window = fwAlign(ctx);
+  fwFill(ctx, "alice");
+  auto [allowed, retry] = fwAllow(ctx, "alice");
+  ctx.Equal(allowed, false, "call %d must be denied: the limit is %d per 60-second window", fwLimit + 1, fwLimit);
+  ctx.Assert(retry >= 1, "a denied call answers retryAfterS as an integer of at least 1, got %d", retry);
+  allowed = fwAllow(ctx, "alice").first;
+  ctx.Equal(allowed, false, "every call past the limit stays denied until the window ends");
+  const auto count = fwCount(ctx, fwKey("alice", window));
+  ctx.Assert(count && *count >= fwLimit, "the count must live in rl:alice:%d; it holds %s", window, harness::ShowValue(fwHeld(ctx, fwKey("alice", window))));
+}
+
+void CheckRetryAfter(harness::Ctx& ctx) {
+  const long long window = fwAlign(ctx);
+  const std::string k = fwKey("bob", window);
+  fwFill(ctx, "bob");
+  auto [allowed, retry] = fwAllow(ctx, "bob");
+  long long ttl = ctx.Redis.TTL(k);
+  ctx.Equal(allowed, false, "call %d must be denied", fwLimit + 1);
+  ctx.Assert(std::llabs(retry - ttl) <= 1, "retryAfterS must be the key's TTL (%d s left on %s), it was %d", ttl, k, retry);
+  ctx.Clock.Advance(17);
+  std::tie(allowed, retry) = fwAllow(ctx, "bob");
+  ttl = ctx.Redis.TTL(k);
+  ctx.Equal(allowed, false, "17 s into a full window the client is still denied");
+  ctx.Assert(std::llabs(retry - ttl) <= 1 && 41 <= retry && retry <= 44, "17 s later about 43 s are left; retryAfterS was %d (TTL %d)", retry, ttl);
+  ctx.Clock.Advance(fwWindow - 0.4 - std::fmod(static_cast<double>(ctx.Clock.Now()) / 1000, static_cast<double>(fwWindow)));
+  std::tie(allowed, retry) = fwAllow(ctx, "bob");
+  ttl = ctx.Redis.TTL(k);
+  ctx.Equal(allowed, false, "400 ms before the window ends it is still full");
+  ctx.Assert(retry >= 1 && std::llabs(retry - ttl) <= 1, "in the window's last second retryAfterS is still the TTL (%d) and never 0 (a caller must not retry at once); got %d", ttl, retry);
+}
+
+void CheckWindowRolls(harness::Ctx& ctx) {
+  const long long window = fwAlign(ctx);
+  fwFill(ctx, "carol");
+  bool allowed = fwAllow(ctx, "carol").first;
+  ctx.Equal(allowed, false, "call %d must be denied", fwLimit + 1);
+  ctx.Clock.Advance(fwWindow);
+  int retry = 0;
+  std::tie(allowed, retry) = fwAllow(ctx, "carol");
+  ctx.Equal(allowed, true, "60 s later a new window has started: carol's first call in it must be allowed");
+  ctx.Equal(retry, 0, "an allowed call answers retryAfterS 0");
+  ctx.Equal(fwHeld(ctx, fwKey("carol", window + 1)), "1", "the new window counts from 1 in its own key rl:carol:%d", window + 1);
+  for (int i = 0; i < fwLimit - 1; i++) {
+    allowed = fwAllow(ctx, "carol").first;
+    ctx.Assert(allowed, "the new window admits a full %d again; call %d was denied", fwLimit, i + 2);
+  }
+  allowed = fwAllow(ctx, "carol").first;
+  ctx.Equal(allowed, false, "call %d of the new window is denied like the old one's", fwLimit + 1);
+}
+
+void CheckTtlSet(harness::Ctx& ctx) {
+  const long long window = fwAlign(ctx);
+  const std::string k = fwKey("dan", window);
+  fwAllow(ctx, "dan");
+  ctx.Equal(fwHeld(ctx, k), "1", "after one call %s must hold 1", k);
+  long long ttl = ctx.Redis.TTL(k);
+  ctx.Assert(ttl != -1, "%s has no TTL: a counter without an expiry never goes away, and the client it belongs to stays blocked forever once it fills", k);
+  ctx.Assert(0 < ttl && ttl <= fwWindow, "the first hit sets a TTL of %d s; %s has %d", fwWindow, k, ttl);
+  ctx.Clock.Advance(30);
+  for (int i = 0; i < 10; i++) fwAllow(ctx, "dan");
+  ttl = ctx.Redis.TTL(k);
+  ctx.Assert(0 < ttl && ttl <= fwWindow - 30 + 1, "30 s and ten hits later about 30 s should be left on %s, not %d: only the hit that created the key sets the TTL, later hits must not re-arm it", k, ttl);
+}
+
+void CheckPerClient(harness::Ctx& ctx) {
+  const long long window = fwAlign(ctx);
+  fwFill(ctx, "erin");
+  bool allowed = fwAllow(ctx, "erin").first;
+  ctx.Equal(allowed, false, "call %d must be denied", fwLimit + 1);
+  int retry = 0;
+  std::tie(allowed, retry) = fwAllow(ctx, "frank");
+  ctx.Equal(allowed, true, "frank has made no requests; erin's full window must not block him");
+  ctx.Equal(retry, 0, "an allowed call answers retryAfterS 0");
+  ctx.Equal(fwHeld(ctx, fwKey("frank", window)), "1", "frank's count lives in rl:frank:%d and starts at 1", window);
+  const auto count = fwCount(ctx, fwKey("erin", window));
+  ctx.Assert(count && *count >= fwLimit, "frank's call must not touch erin's counter");
+  allowed = fwAllow(ctx, "erin").first;
+  ctx.Equal(allowed, false, "erin stays denied after frank's call");
+}
+
+void CheckAtomicIncr(harness::Ctx& ctx) {
+  const long long window = fwAlign(ctx);
+  const std::string k = fwKey("gus", window);
+  bool fired = false;
+  ctx.Redis.After(k, [&ctx, &fired, k] {
+    fired = true;
+    ctx.Redis.Do("INCR", k);
+  });
+  bool allowed = fwAllow(ctx, "gus").first;
+  ctx.Assert(fired, "allow(ctx, %q) never touched %s: the count must live in that key", "gus", k);
+  ctx.Equal(allowed, true, "the first call of a window is allowed even when another worker's request lands right behind it");
+  ctx.Equal(fwHeld(ctx, k), "2", "after allow(ctx, %q) plus one concurrent request from another worker %s must hold 2: a GET-then-SET overwrote the other worker's increment", "gus", k);
+  for (int i = 0; i < fwLimit - 2; i++) {
+    allowed = fwAllow(ctx, "gus").first;
+    ctx.Assert(allowed, "call %d of the window (counting the other worker's) must be allowed", i + 3);
+  }
+  allowed = fwAllow(ctx, "gus").first;
+  ctx.Equal(allowed, false, "the other worker used one slot, so this is request %d of the window: it must be denied (a lost update would let it through)", fwLimit + 1);
+  const auto count = fwCount(ctx, k);
+  ctx.Assert(count && *count >= fwLimit, "%s must have counted every request, it holds %s", k, harness::ShowValue(fwHeld(ctx, k)));
+}
+`,
   },
   debrief: `Everything hangs on where the increment happens. \`INCR\` runs on the server, single-threaded, so a hundred gateway workers hammering one client's key produce one correct count with no lock and no read-modify-write; \`GET\` then \`SET\` would let two workers both see 99 and both write 100, which is exactly the lost update the race check lands. The window lives in the key **name**, so nothing is ever reset: a new minute is a new key that starts from nothing, and the old one is garbage the moment its TTL fires — which is why the TTL is set on the hit that returns 1 and never touched again (re-arming it on every hit would keep a busy client's key alive forever and extend nothing useful). Answering \`TTL\` as \`retry_after_s\` costs one extra command on the deny path only, and clamping it to 1 keeps a client from retrying inside the same second. Real systems add two things: a Lua script or \`SET key 0 EX 60 NX\` before the \`INCR\` so a crash between \`INCR\` and \`EXPIRE\` cannot leave a key without a TTL, and a **sliding** window (or a token bucket) when the boundary burst — 100 requests at 0:59 and 100 more at 1:00 — is not acceptable.`,
 };

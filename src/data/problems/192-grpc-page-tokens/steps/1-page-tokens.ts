@@ -1368,6 +1368,253 @@ func CheckMalformedToken(ctx *harness.Ctx) {
 	ctx.Equal(page, bookIDs(10, 1), "an empty page_token is the first page, b-0001 to b-0010")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <absl/strings/escaping.h>
+
+#include <algorithm>
+#include <chrono>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <string>
+#include <vector>
+
+namespace {
+
+using LibraryStub = library::v1::Library::Stub;
+using Pages = std::vector<std::vector<std::string>>;
+
+// b-0001, b-0002, … (or b-0010, b-0020, … with step 10).
+std::vector<std::string> BookIds(int n, int step) {
+  std::vector<std::string> out;
+  for (int i = 0; i < n; ++i) out.push_back(harness::Sprintf("b-%04d", (i + 1) * step));
+  return out;
+}
+
+std::vector<std::string> Slice(const std::vector<std::string>& list, size_t from, size_t to) {
+  return std::vector<std::string>(list.begin() + static_cast<long>(from), list.begin() + static_cast<long>(to));
+}
+
+std::string ShowBooks(const std::vector<std::string>& list) {
+  if (list.size() <= 6) return harness::Sprintf("%q", list);
+  return harness::Sprintf("%d books %q … %q", list.size(), Slice(list, 0, 3), Slice(list, list.size() - 2, list.size()));
+}
+
+// Puts a book on a shelf (or takes it off with an empty title), as the catalogue does.
+void SetShelf(const std::string& shelf, const std::string& id, const std::string& title) {
+  std::unique_lock lock(shelves_mu);
+  if (title.empty()) {
+    SHELVES[shelf].erase(id);
+    return;
+  }
+  SHELVES[shelf][id] = title;
+}
+
+// Seeds SHELVES in place, runs the learner's server and returns a client on it.
+std::unique_ptr<LibraryStub> StartLibrary(harness::Ctx& ctx, const std::map<std::string, std::vector<std::string>>& seed) {
+  {
+    std::unique_lock lock(shelves_mu);
+    SHELVES.clear();
+    for (const auto& [name, list] : seed) {
+      auto& books = SHELVES[name];
+      for (const auto& id : list) books[id] = "Title " + id;
+    }
+  }
+  ctx.Main();
+  return library::v1::Library::NewStub(ctx.GRPC.Dial("library:9000"));
+}
+
+grpc::Status ListCall(LibraryStub& client, const std::string& shelf, int32_t page_size, const std::string& page_token,
+                      library::v1::ListBooksResponse* reply) {
+  grpc::ClientContext c;
+  c.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+  library::v1::ListBooksRequest request;
+  request.set_shelf(shelf);
+  request.set_page_size(page_size);
+  request.set_page_token(page_token);
+  return client.ListBooks(&c, request, reply);
+}
+
+library::v1::ListBooksResponse ListBooks(harness::Ctx& ctx, LibraryStub& client, const std::string& shelf, int32_t page_size,
+                                         const std::string& page_token) {
+  library::v1::ListBooksResponse reply;
+  const grpc::Status status = ListCall(client, shelf, page_size, page_token, &reply);
+  if (!status.ok())
+    ctx.Fatalf("ListBooks(shelf=%q, page_size=%d, page_token=%q) failed with %v: %s", shelf, page_size, page_token,
+               status.error_code(), status.error_message());
+  return reply;
+}
+
+grpc::StatusCode ListCode(LibraryStub& client, const std::string& shelf, int32_t page_size, const std::string& page_token) {
+  library::v1::ListBooksResponse reply;
+  return ListCall(client, shelf, page_size, page_token, &reply).error_code();
+}
+
+std::vector<std::string> IdsOf(const library::v1::ListBooksResponse& reply) {
+  std::vector<std::string> out;
+  for (const auto& b : reply.books()) out.push_back(b.id());
+  return out;
+}
+
+std::vector<int> PageSizes(const Pages& pages) {
+  std::vector<int> sizes;
+  for (const auto& p : pages) sizes.push_back(static_cast<int>(p.size()));
+  return sizes;
+}
+
+std::vector<std::string> FlattenPages(const Pages& pages) {
+  std::vector<std::string> out;
+  for (const auto& p : pages) out.insert(out.end(), p.begin(), p.end());
+  return out;
+}
+
+// Every page from page_token to the one carrying next_page_token "".
+Pages WalkShelf(harness::Ctx& ctx, LibraryStub& client, const std::string& shelf, int32_t page_size, std::string page_token) {
+  Pages pages;
+  for (int i = 0; i < 20; ++i) {
+    const auto reply = ListBooks(ctx, client, shelf, page_size, page_token);
+    pages.push_back(IdsOf(reply));
+    page_token = reply.next_page_token();
+    if (page_token.empty()) return pages;
+  }
+  ctx.Fatalf("shelf %q at page_size %d: still a next_page_token after 20 pages, sizes %v", shelf, page_size, PageSizes(pages));
+}
+
+bool Contains(const std::vector<std::string>& list, const std::string& item) {
+  return std::find(list.begin(), list.end(), item) != list.end();
+}
+
+}  // namespace
+
+void CheckPageSize(harness::Ctx& ctx) {
+  auto client = StartLibrary(ctx, {{"fiction", BookIds(250, 1)}});
+  const auto every = BookIds(250, 1);
+  for (const auto& [size, want] : std::vector<std::pair<int, size_t>>{{0, 50}, {7, 7}, {100, 100}, {101, 100}, {500, 100}}) {
+    const auto reply = ListBooks(ctx, *client, "fiction", size, "");
+    const auto got = IdsOf(reply);
+    ctx.Equal(got.size(), want, "the books page_size %d returns on a shelf of 250", size);
+    ctx.Assert(got == Slice(every, 0, want), "page_size %d: the first page is the %d lowest ids in ascending order (%s to %s), got %s",
+               size, want, every[0], every[want - 1], ShowBooks(got));
+    ctx.Assert(!reply.next_page_token().empty(), "page_size %d: %d books remain after the first page, so next_page_token must not be empty",
+               size, 250 - want);
+  }
+  const auto books = ListBooks(ctx, *client, "fiction", 1, "");
+  ctx.Assert(books.books_size() > 0, "page_size 1 returned no book");
+  ctx.Equal(books.books(0).title(), "Title b-0001", "each Book carries its title from SHELVES");
+}
+
+void CheckRejectBadRequest(harness::Ctx& ctx) {
+  auto client = StartLibrary(ctx, {{"fiction", BookIds(20, 1)}});
+  for (const auto& [shelf, size] : std::vector<std::pair<std::string, int32_t>>{{"poetry", 0}, {"poetry", 10}, {"", 0}}) {
+    ctx.Equal(ListCode(*client, shelf, size, ""), grpc::StatusCode::NOT_FOUND, "shelf %q does not exist", shelf);
+  }
+  for (const int32_t size : {-1, -100}) {
+    ctx.Equal(ListCode(*client, "fiction", size, ""), grpc::StatusCode::INVALID_ARGUMENT, "page_size %d", size);
+  }
+  const std::string token = ListBooks(ctx, *client, "fiction", 5, "").next_page_token();
+  ctx.Assert(!token.empty(), "5 of 20 books listed: next_page_token must not be empty");
+  ctx.Equal(ListCode(*client, "fiction", -1, token), grpc::StatusCode::INVALID_ARGUMENT, "page_size -1 with a valid page_token");
+}
+
+void CheckFullWalk(harness::Ctx& ctx) {
+  auto client = StartLibrary(
+      ctx, {{"fiction", BookIds(120, 1)}, {"history", BookIds(100, 1)}, {"trilogy", BookIds(3, 1)}, {"empty", {}}});
+  Pages pages = WalkShelf(ctx, *client, "fiction", 0, "");
+  ctx.Equal(PageSizes(pages), {50, 50, 20}, "120 books at the default page size: the page sizes");
+  const auto flat = FlattenPages(pages);
+  ctx.Assert(flat == BookIds(120, 1), "the walk must return every book once in ascending id order, got %s", ShowBooks(flat));
+  pages = WalkShelf(ctx, *client, "history", 50, "");
+  ctx.Equal(PageSizes(pages), {50, 50},
+            "100 books at page_size 50 are exactly two pages, the second with next_page_token %q because nothing follows it; the page sizes", "");
+  ctx.Assert(FlattenPages(pages) == BookIds(100, 1), "the history walk must return b-0001 to b-0100 in order");
+  pages = WalkShelf(ctx, *client, "trilogy", 1, "");
+  ctx.Equal(pages, Pages{{"b-0001"}, {"b-0002"}, {"b-0003"}}, "3 books at page_size 1 are three pages of one");
+  const auto reply = ListBooks(ctx, *client, "empty", 0, "");
+  ctx.Assert(IdsOf(reply).empty() && reply.next_page_token().empty(), "an empty shelf is one empty page with next_page_token %q, got %q and %q",
+             "", IdsOf(reply), reply.next_page_token());
+}
+
+void CheckKeyset(harness::Ctx& ctx) {
+  auto client = StartLibrary(ctx, {{"fiction", BookIds(20, 10)}});  // b-0010 … b-0200
+  auto page = ListBooks(ctx, *client, "fiction", 5, "");
+  std::vector<std::string> seen = IdsOf(page);
+  ctx.Equal(seen, {"b-0010", "b-0020", "b-0030", "b-0040", "b-0050"}, "page 1 at page_size 5");
+  // Two books already listed are removed: an offset into the shorter list would skip b-0060 and b-0070.
+  SetShelf("fiction", "b-0020", "");
+  SetShelf("fiction", "b-0030", "");
+  page = ListBooks(ctx, *client, "fiction", 5, page.next_page_token());
+  auto got = IdsOf(page);
+  ctx.Equal(got, {"b-0060", "b-0070", "b-0080", "b-0090", "b-0100"},
+            "b-0020 and b-0030 (already listed) were removed: page 2 must continue after b-0050 (an offset skips survivors)");
+  seen.insert(seen.end(), got.begin(), got.end());
+  // Three books added before the cursor, and the cursor's own book removed: an offset would repeat books.
+  for (const std::string id : {"b-0005", "b-0025", "b-0045"}) SetShelf("fiction", id, "Title " + id);
+  SetShelf("fiction", "b-0100", "");
+  page = ListBooks(ctx, *client, "fiction", 5, page.next_page_token());
+  got = IdsOf(page);
+  ctx.Equal(got, {"b-0110", "b-0120", "b-0130", "b-0140", "b-0150"},
+            "three books were added before the cursor and the cursor's own book (b-0100) was removed: page 3 must continue strictly after b-0100");
+  seen.insert(seen.end(), got.begin(), got.end());
+  // A book added ahead of the cursor is simply part of the rest of the walk.
+  SetShelf("fiction", "b-0155", "Title b-0155");
+  const auto rest = FlattenPages(WalkShelf(ctx, *client, "fiction", 5, page.next_page_token()));
+  ctx.Equal(rest, {"b-0155", "b-0160", "b-0170", "b-0180", "b-0190", "b-0200"},
+            "the rest of the walk is everything now after b-0150 (b-0155 was added ahead of the cursor)");
+  seen.insert(seen.end(), rest.begin(), rest.end());
+  std::vector<std::string> twice;
+  for (size_t i = 0; i < seen.size(); ++i) {
+    const auto first = static_cast<size_t>(std::find(seen.begin(), seen.end(), seen[i]) - seen.begin());
+    if (first != i && !Contains(twice, seen[i])) twice.push_back(seen[i]);
+  }
+  std::sort(twice.begin(), twice.end());
+  ctx.Assert(twice.empty(), "no book may come back twice in one walk, but %q did", twice);
+  std::vector<std::string> missing;
+  for (const auto& id : BookIds(20, 10)) {
+    if (!Contains({"b-0020", "b-0030", "b-0100"}, id) && !Contains(seen, id)) missing.push_back(id);
+  }
+  ctx.Assert(missing.empty(), "every book present for the whole walk must be listed, but %q never was", missing);
+  ctx.Assert(std::is_sorted(seen.begin(), seen.end()), "one walk lists books in ascending id order, got %s", ShowBooks(seen));
+}
+
+void CheckBoundToShelf(harness::Ctx& ctx) {
+  auto client = StartLibrary(ctx, {{"fiction", BookIds(30, 1)}, {"history", BookIds(30, 1)}});
+  const std::string token = ListBooks(ctx, *client, "fiction", 10, "").next_page_token();
+  ctx.Assert(!token.empty(), "10 of 30 fiction books listed: next_page_token must not be empty");
+  ctx.Assert(!Contains({"b-0010", "b-0011", "10"}, token), "the token must be opaque and carry the shelf, not the bare position %q", token);
+  ctx.Equal(ListCode(*client, "history", 10, token), grpc::StatusCode::INVALID_ARGUMENT, "a token issued for shelf %q sent with shelf %q",
+            "fiction", "history");
+  auto page = IdsOf(ListBooks(ctx, *client, "fiction", 10, token));
+  ctx.Equal(page, Slice(BookIds(20, 1), 10, 20), "the fiction token still continues fiction with b-0011 to b-0020");
+  const auto history = ListBooks(ctx, *client, "history", 10, "");
+  ctx.Equal(ListCode(*client, "fiction", 10, history.next_page_token()), grpc::StatusCode::INVALID_ARGUMENT,
+            "a token issued for shelf %q sent with shelf %q", "history", "fiction");
+  page = IdsOf(ListBooks(ctx, *client, "history", 10, history.next_page_token()));
+  ctx.Equal(page, Slice(BookIds(20, 1), 10, 20), "the history token still continues history with b-0011 to b-0020");
+}
+
+void CheckMalformedToken(harness::Ctx& ctx) {
+  auto client = StartLibrary(ctx, {{"fiction", BookIds(30, 1)}});
+  const std::vector<std::string> tokens = {
+      "not a token",
+      "%%%",
+      absl::WebSafeBase64Escape("not json"),
+      absl::WebSafeBase64Escape("[1, 2]"),
+      absl::WebSafeBase64Escape("42"),
+      absl::WebSafeBase64Escape("{}"),
+      absl::WebSafeBase64Escape(R"("b-0010")"),
+  };
+  for (const auto& token : tokens) {
+    const grpc::StatusCode got = ListCode(*client, "fiction", 10, token);
+    const std::string hint = got == grpc::StatusCode::UNKNOWN ? " (an exception escaped the handler)" : "";
+    ctx.Assert(got == grpc::StatusCode::INVALID_ARGUMENT,
+               "page_token %q is not a token this server issued: expected INVALID_ARGUMENT, got %v%s", token, got, hint);
+  }
+  const auto page = IdsOf(ListBooks(ctx, *client, "fiction", 10, ""));
+  ctx.Equal(page, BookIds(10, 1), "an empty page_token is the first page, b-0001 to b-0010");
+}
+`,
   },
   debrief: `The token carries a key, not a count, because a count is only meaningful against the list it was computed on, and that list is gone by the next call: remove two books before the cursor and "skip 5" skips two survivors, add three and it repeats three. "Everything with \`id > b-0050\`" means the same thing whatever happened in between, including when \`b-0050\` itself was deleted, which is why the comparison is strict and the cursor is never looked up by position. The shelf travels inside the token so a token cannot be replayed against another collection, and decoding is total: garbage, a JSON list or a number is the client's mistake (\`INVALID_ARGUMENT\`), never an exception that surfaces as \`UNKNOWN\`. Counting what lies past the page, instead of checking that the page came out full, is what keeps the last page's token empty when the remaining books divide evenly. Real list methods run the same idea in the database (\`WHERE id > $1 ORDER BY id LIMIT $2 + 1\` on an index), use a composite key such as \`(created_at, id)\` when the sort column is not unique, bind every request parameter (\`filter\`, \`order_by\`) into the token, and serialize it as a versioned proto that is signed or encrypted, because AIP-158 says plain base64 is not opacity: clients that can read a token will come to depend on what is inside it.`,
 };

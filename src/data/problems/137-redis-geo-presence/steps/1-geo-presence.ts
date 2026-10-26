@@ -1403,6 +1403,192 @@ func CheckSweepStale(ctx *harness.Ctx) {
 	ctx.Assert(gpSweep(ctx, 100) == 6 && ctx.Redis.ZCard("drivers") == 0, "the next sweep clears the rest")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <map>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace {
+
+constexpr double gpPickupLat = 48.85, gpPickupLon = 2.35;
+constexpr double gpEarthKm = 6372.797560856;  // the radius Redis's GEO commands use
+
+// The great-circle distance the way GEOSEARCH WITHDIST computes it, independently of the learner.
+double gpKm(double lat1, double lon1, double lat2, double lon2) {
+  const auto rad = [](double d) { return d * M_PI / 180; };
+  const double a = std::pow(std::sin(rad(lat2 - lat1) / 2), 2) +
+                   std::cos(rad(lat1)) * std::cos(rad(lat2)) * std::pow(std::sin(rad(lon2 - lon1) / 2), 2);
+  return 2 * gpEarthKm * std::asin(std::sqrt(a));
+}
+
+struct gpDriver {
+  std::string id;
+  double lat, lon;
+};
+
+// The GEO member and, when seen, a 30 s presence key: what a heartbeat leaves behind.
+void gpSeed(harness::Ctx& ctx, const std::vector<gpDriver>& drivers, bool seen) {
+  for (const auto& d : drivers) {
+    ctx.Redis.Do("GEOADD", "drivers", d.lon, d.lat, d.id);
+    if (seen) ctx.Redis.Set("seen:" + d.id, "1", "EX", 30);
+  }
+}
+
+std::vector<std::string> gpIDs(const std::vector<Near>& found) {
+  std::vector<std::string> ids;
+  for (const auto& n : found) ids.push_back(n.driver_id);
+  return ids;
+}
+
+// The driver's GEOPOS as (lon, lat), or nullopt when it is not in drivers.
+std::optional<std::vector<double>> gpPos(harness::Ctx& ctx, const std::string& driverID) {
+  const auto reply = ctx.Redis.Do("GEOPOS", "drivers", driverID);
+  if (!reply.IsArray() || reply.Array().empty()) return std::nullopt;
+  const auto pair = reply.Array()[0];
+  if (!pair.IsArray() || pair.Array().size() != 2) return std::nullopt;
+  return std::vector<double>{std::strtod(pair.Array()[0].String().c_str(), nullptr),
+                             std::strtod(pair.Array()[1].String().c_str(), nullptr)};
+}
+
+std::vector<std::string> gpMembers(harness::Ctx& ctx) {
+  std::vector<std::string> ids;
+  for (const auto& z : ctx.Redis.ZRangeWithScores("drivers", 0, -1)) ids.push_back(z.Member);
+  std::sort(ids.begin(), ids.end());
+  return ids;
+}
+
+// The learner's round trips since before.
+std::vector<std::vector<std::string>> gpTripsSince(harness::Ctx& ctx, size_t before) {
+  auto trips = ctx.Redis.RoundTrips();
+  trips.erase(trips.begin(), trips.begin() + static_cast<long>(std::min(before, trips.size())));
+  return trips;
+}
+
+}  // namespace
+
+void CheckHeartbeatPipeline(harness::Ctx& ctx) {
+  const size_t before = ctx.Redis.RoundTrips().size();
+  heartbeat("d-a", 48.852, 2.352);
+  const auto trips = gpTripsSince(ctx, before);
+  auto p = gpPos(ctx, "d-a");
+  ctx.Assert(p.has_value(), "heartbeat must GEOADD the driver to the GEO set drivers");
+  ctx.Assert(std::abs((*p)[0] - 2.352) < 1e-4 && std::abs((*p)[1] - 48.852) < 1e-4, "d-a is at lat 48.852, lon 2.352 but GEOPOS says (lon %v, lat %v): GEOADD takes longitude before latitude", (*p)[0], (*p)[1]);
+  ctx.Equal(ctx.Redis.Exists("seen:d-a"), 1, "heartbeat must SET seen:d-a");
+  auto ttl = ctx.Redis.TTL("seen:d-a");
+  ctx.Assert(28 <= ttl && ttl <= 30, "seen:d-a must expire after 30 s (EX 30), its TTL is %d", ttl);
+  ctx.Assert(trips.size() == 1, "heartbeat made %d round trip(s) (%v): queue GEOADD and SET on one pipeline and exec once", trips.size(), trips);
+  ctx.Clock.Advance(20);
+  ctx.Assert(ctx.Redis.TTL("seen:d-a") <= 10, "the presence key must count down on its own");
+  heartbeat("d-a", 48.853, 2.353);
+  ttl = ctx.Redis.TTL("seen:d-a");
+  ctx.Assert(28 <= ttl && ttl <= 30, "a new heartbeat must reset the presence key to a full 30 s, its TTL is %d", ttl);
+  p = gpPos(ctx, "d-a");
+  ctx.Assert(p && std::abs((*p)[0] - 2.353) < 1e-4 && std::abs((*p)[1] - 48.853) < 1e-4, "a new heartbeat must move the driver: GEOPOS says %v, expected (2.353, 48.853)", p);
+  ctx.Equal(ctx.Redis.ZCard("drivers"), 1, "a driver that heartbeats twice is one GEO member, not two: ZCARD drivers");
+  ctx.Clock.Advance(31);
+  ctx.Equal(ctx.Redis.Exists("seen:d-a"), 0, "30 s after the last heartbeat the presence key must be gone on its own (EX 30): EXISTS seen:d-a");
+  ctx.Equal(ctx.Redis.ZCard("drivers"), 1, "expiry removes only the presence key, the GEO set still holds the driver: ZCARD drivers");
+}
+
+void CheckRadiusOrder(harness::Ctx& ctx) {
+  const std::vector<gpDriver> drivers{{"d-a", 48.852, 2.352}, {"d-b", 48.857, 2.35}, {"d-c", 48.86, 2.37}, {"d-far", 48.9, 2.35}};
+  // inserted farthest first: the order must come from the distance
+  gpSeed(ctx, {drivers[3], drivers[2], drivers[1], drivers[0]}, true);
+  auto found = nearest(gpPickupLat, gpPickupLon, 3, 10);
+  ctx.Equal(gpIDs(found), std::vector<std::string>{"d-a", "d-b", "d-c"}, "nearest(radius 3 km): nearest first, lon before lat in the search, d-far (5.6 km) outside the radius");
+  std::map<std::string, double> byID;
+  for (const auto& n : found) byID[n.driver_id] = n.distance_km;
+  for (size_t i = 0; i < 3; i++) {
+    const auto& d = drivers[i];
+    const auto it = byID.find(d.id);
+    const double want = gpKm(gpPickupLat, gpPickupLon, d.lat, d.lon);
+    ctx.Assert(it != byID.end(), "the distance of %s must be a number in km, got none", d.id);
+    const double dist = it->second;
+    ctx.Assert(std::abs(dist - want) < 0.01, "%s is %.3f km away (WITHDIST, km), nearest says %v", d.id, want, dist);
+    ctx.Equal(dist, std::round(dist * 1000) / 1000, "distances are rounded to 3 decimals: %s's distance", d.id);
+  }
+  found = nearest(gpPickupLat, gpPickupLon, 1, 10);
+  ctx.Equal(gpIDs(found), std::vector<std::string>{"d-a", "d-b"}, "nearest(radius 1 km): d-c is 1.8 km away");
+  found = nearest(gpPickupLat, gpPickupLon, 0.1, 10);
+  ctx.Assert(found.empty(), "nobody within 100 m: nearest must return no drivers, got %+v", gpIDs(found));
+  found = nearest(45.76, 4.84, 3, 10);
+  ctx.Assert(found.empty(), "a search 400 km away finds nobody, got %+v", gpIDs(found));
+}
+
+void CheckStaleExcluded(harness::Ctx& ctx) {
+  gpSeed(ctx, {{"d-a", 48.852, 2.352}, {"d-c", 48.86, 2.37}}, true);
+  ctx.Clock.Advance(10);
+  gpSeed(ctx, {{"d-b", 48.857, 2.35}}, true);
+  ctx.Clock.Advance(21);  // d-a and d-c heartbeat 31 s ago, d-b 21 s ago
+  size_t before = ctx.Redis.RoundTrips().size();
+  auto found = nearest(gpPickupLat, gpPickupLon, 3, 10);
+  auto trips = gpTripsSince(ctx, before);
+  ctx.Equal(gpIDs(found), std::vector<std::string>{"d-b"}, "nearest: d-a and d-c last heartbeat 31 s ago, their seen: keys expired");
+  ctx.Assert(ctx.Redis.ZScore("drivers", "d-a").has_value(), "nothing removed d-a from the GEO set — nearest must filter on the seen: keys, not trust GEOSEARCH");
+  ctx.Assert(trips.size() <= 2, "nearest made %d round trips (%v): one GEOSEARCH, then one MGET over every candidate's seen: key — never a GET or EXISTS per driver", trips.size(), trips);
+  heartbeat("d-a", 48.852, 2.352);
+  found = nearest(gpPickupLat, gpPickupLon, 3, 10);
+  ctx.Equal(gpIDs(found), std::vector<std::string>{"d-a", "d-b"}, "after a fresh heartbeat d-a is back: nearest");
+  ctx.Clock.Advance(10);  // d-b is now 31 s old
+  found = nearest(gpPickupLat, gpPickupLon, 3, 10);
+  ctx.Equal(gpIDs(found), std::vector<std::string>{"d-a"}, "d-b went silent 31 s ago: nearest");
+  before = ctx.Redis.RoundTrips().size();
+  found = nearest(0, 0, 1, 5);
+  ctx.Assert(found.empty(), "no candidates at all: nearest must return no drivers, got %+v", gpIDs(found));
+  trips = gpTripsSince(ctx, before);
+  ctx.Assert(trips.size() <= 2, "an empty search still costs at most two round trips, this one made %d", trips.size());
+}
+
+void CheckOverfetchK(harness::Ctx& ctx) {
+  // 0.11 .. 0.56 km: GEO members with no presence key; then three live drivers at 0.78, 0.89, 1.00 km.
+  std::vector<gpDriver> silent, live;
+  for (int i = 0; i < 5; i++) silent.push_back({harness::Sprintf("s-%d", i + 1), 48.85 + (i + 1) / 1000.0, 2.35});
+  for (int i = 0; i < 3; i++) live.push_back({harness::Sprintf("l-%d", i + 1), 48.85 + (7 + i) / 1000.0, 2.35});
+  gpSeed(ctx, silent, false);
+  gpSeed(ctx, live, true);
+  auto found = nearest(gpPickupLat, gpPickupLon, 3, 2);
+  ctx.Equal(gpIDs(found), std::vector<std::string>{"l-1", "l-2"}, "nearest(k=2): the five nearest members are silent and the live ones come after them — ask Redis for COUNT 4k = 8 candidates, drop the silent, then cut to k");
+  ctx.Equal(found.size(), 2, "k=2: the number of drivers nearest returned");
+  found = nearest(gpPickupLat, gpPickupLon, 3, 5);
+  ctx.Equal(gpIDs(found), std::vector<std::string>{"l-1", "l-2", "l-3"}, "k=5 with three live drivers in range returns all three");
+  gpSeed(ctx, {{"s-6", 48.8575, 2.35}}, false);  // between l-1 and l-2: the 8 candidates are s-1..s-5, l-1, s-6, l-2
+  found = nearest(gpPickupLat, gpPickupLon, 3, 2);
+  ctx.Equal(gpIDs(found), std::vector<std::string>{"l-1", "l-2"}, "with a silent driver between the two live ones nearest(k=2)");
+}
+
+void CheckRemoveBoth(harness::Ctx& ctx) {
+  gpSeed(ctx, {{"d-a", 48.852, 2.352}, {"d-b", 48.857, 2.35}}, true);
+  remove(std::string("d-a"));  // a string, not ::remove(const char*) from <cstdio>
+  ctx.Assert(!ctx.Redis.ZScore("drivers", "d-a").has_value(), "remove must ZREM the driver from drivers");
+  ctx.Equal(ctx.Redis.Exists("seen:d-a"), 0, "remove must DEL seen:d-a");
+  ctx.Assert(ctx.Redis.ZScore("drivers", "d-b").has_value() && ctx.Redis.Exists("seen:d-b") == 1, "remove touches only the driver it was given");
+  ctx.Equal(gpIDs(nearest(gpPickupLat, gpPickupLon, 3, 10)), std::vector<std::string>{"d-b"}, "a removed driver is gone from nearest at once");
+  remove(std::string("ghost"));
+  ctx.Assert(ctx.Redis.ZCard("drivers") == 1 && ctx.Redis.Exists("seen:d-b") == 1, "removing an unknown driver changes nothing");
+}
+
+void CheckSweepStale(harness::Ctx& ctx) {
+  gpSeed(ctx, {{"s-1", 48.851, 2.35}, {"s-2", 48.852, 2.35}, {"s-3", 48.853, 2.35}}, true);
+  ctx.Clock.Advance(31);  // their presence keys expired
+  gpSeed(ctx, {{"l-1", 48.857, 2.35}, {"l-2", 48.858, 2.35}}, true);
+  ctx.Redis.Do("GEOADD", "drivers", 2.36, 48.84, "orphan");  // a GEO member that never had a presence key
+  ctx.Equal(sweep(100), 4, "sweep must return how many stale members it removed (s-1, s-2, s-3, orphan = 4)");
+  ctx.Equal(gpMembers(ctx), std::vector<std::string>{"l-1", "l-2"}, "after the sweep the GEO set must hold exactly the live drivers");
+  ctx.Assert(ctx.Redis.TTL("seen:l-1") > 0 && ctx.Redis.TTL("seen:l-2") > 0, "sweep must not touch presence keys");
+  ctx.Equal(sweep(100), 0, "nothing stale left: sweep returns 0");
+  ctx.Equal(gpMembers(ctx), std::vector<std::string>{"l-1", "l-2"}, "a sweep with nothing to do removes nothing");
+  ctx.Redis.Del("drivers", "seen:l-1", "seen:l-2");
+  for (int i = 0; i < 10; i++) ctx.Redis.Do("GEOADD", "drivers", 2.3 + i / 100.0, 48.8, harness::Sprintf("x-%d", i));
+  ctx.Equal(sweep(4), 4, "sweep(4) inspects the first 4 members (ZRANGE drivers 0 3) and removes the stale among them");
+  ctx.Equal(ctx.Redis.ZCard("drivers"), 6, "sweep(4) must leave the other 6 members for the next pass: ZCARD drivers");
+  ctx.Assert(sweep(100) == 6 && ctx.Redis.ZCard("drivers") == 0, "the next sweep clears the rest");
+}
+`,
   },
   debrief: `Two facts, two shapes. Position goes into the GEO set because that is the structure that can answer a radius query sorted by distance in one command; it is a sorted set underneath, which is why \`ZREM\` and \`ZRANGE\` work on it and why nothing in it ever expires by itself. Liveness goes into a plain key with a TTL because expiry is exactly the semantics a heartbeat needs: refresh it or lose it, no sweeper on the hot path. The query joins them client-side in two round trips, and over-fetches because a filter can only shrink a list — ask for \`k\` and one silent driver among the nearest hands the rider \`k − 1\`. \`sweep\` exists only to keep the GEO set from growing with every driver who ever logged in; it is bounded by \`limit\` so it can run from a cron without stalling Redis. Real systems shard the set per city, use \`COUNT … ANY\` when any \`k\` live drivers will do, fold driver status into the same \`MGET\` (a hash per driver instead of a flag), and replace straight-line distance with an ETA from the routing service once the candidate list is short.`,
 };

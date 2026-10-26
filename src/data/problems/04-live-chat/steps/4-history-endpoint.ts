@@ -1101,6 +1101,218 @@ func CheckCacheControl(ctx *harness.Ctx) {
 	ctx.Equal(directives, []string{"max-age=5", "private"}, "the Cache-Control directives in %q", value)
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cctype>
+#include <map>
+#include <sstream>
+#include <string>
+#include <tuple>
+#include <vector>
+
+namespace {
+
+constexpr long long historyHourMs = 3600 * 1000;
+
+// One call the store saw: op "exists" (room) or "list" (room, before, limit).
+struct HistoryCall {
+  std::string op;
+  std::string room;
+  long long before = 0;
+  int limit = 0;
+  bool operator==(const HistoryCall& o) const {
+    return std::tie(op, room, before, limit) == std::tie(o.op, o.room, o.before, o.limit);
+  }
+  friend std::ostream& operator<<(std::ostream& out, const HistoryCall& c) {
+    return out << "{" << c.op << " " << c.room << " " << c.before << " " << c.limit << "}";
+  }
+};
+
+// The provided message store's contents and the calls it saw: every request gets a fresh store
+// holding 120 messages in room-7 (ts = 1000 .. 120000) plus one dated an hour from now, and an
+// empty room "quiet".
+std::map<std::string, std::vector<Message>> historyRooms;
+std::vector<HistoryCall> historyCalls;
+
+bool listed() {
+  return std::any_of(historyCalls.begin(), historyCalls.end(), [](const HistoryCall& c) { return c.op == "list"; });
+}
+
+struct HistoryApp {
+  harness::Ctx& ctx;
+  harness::HTTP client;
+
+  explicit HistoryApp(harness::Ctx& c) : ctx(c), client((reset(c), c.Main().HTTP())) {}
+
+  static void reset(harness::Ctx& ctx) {
+    std::vector<Message> room7;
+    for (int i = 1; i <= 120; i++) {
+      room7.push_back(Message{i % 2 == 1 ? "ana" : "bo", "message " + std::to_string(i), static_cast<long long>(i) * 1000});
+    }
+    room7.push_back(Message{"cy", "from the future", ctx.Clock.Now() + historyHourMs});
+    historyRooms = {{"room-7", room7}, {"quiet", {}}};
+    historyCalls.clear();
+  }
+
+  // GET path to a fresh store.
+  harness::Response get(const std::string& path) {
+    reset(ctx);
+    return client.Get(path);
+  }
+};
+
+// The JSON page: the whole object and its messages.
+std::pair<harness::Any, std::vector<harness::Any>> historyBody(harness::Ctx& ctx, const harness::Response& r) {
+  const auto body = harness::ParseJSON(r.Text());
+  ctx.Assert(body && body->IsObject(), "the body must be the JSON object {messages: [...], next_before: ...}, got %s",
+             r.Text());
+  const harness::Any& raw = (*body)["messages"];
+  ctx.Assert(raw.IsArray(), "messages must be a JSON array, got %s", r.Text());
+  for (const auto& m : raw.Items()) ctx.Assert(m.IsObject(), "every message must be a JSON object, got %s", r.Text());
+  return {*body, raw.Items()};
+}
+
+std::vector<long long> historyTs(const std::vector<harness::Any>& messages) {
+  std::vector<long long> ts;
+  for (const auto& m : messages) ts.push_back(m["ts"].Int());
+  return ts;
+}
+
+std::vector<long long> historyTsDown(long long from) {
+  std::vector<long long> ts;
+  for (long long i = 0; i < 10; i++) ts.push_back((from - i) * 1000);
+  return ts;
+}
+
+}  // namespace
+
+// The provided message store and JSON writer the step's file declares: newest first, ts < before,
+// at most limit; every call recorded.
+bool MessageStore::exists(const std::string& room) {
+  historyCalls.push_back({"exists", room, 0, 0});
+  return historyRooms.count(room) > 0;
+}
+
+std::vector<Message> MessageStore::list(const std::string& room, long long before, int limit) {
+  historyCalls.push_back({"list", room, before, limit});
+  std::vector<Message> newestFirst = historyRooms[room];
+  std::stable_sort(newestFirst.begin(), newestFirst.end(), [](const Message& a, const Message& b) { return a.ts > b.ts; });
+  std::vector<Message> out;
+  for (const auto& m : newestFirst)
+    if (m.ts < before && static_cast<int>(out.size()) < limit) out.push_back(m);
+  return out;
+}
+
+std::string json_array(const std::vector<Message>& messages) {
+  std::string out = "[";
+  for (const auto& m : messages) {
+    if (out.size() > 1) out += ",";
+    out += R"({"user":)" + harness::Quote(m.user) + R"(,"text":)" + harness::Quote(m.text) + R"(,"ts":)" +
+           std::to_string(m.ts) + "}";
+  }
+  return out + "]";
+}
+
+void CheckRoute(harness::Ctx& ctx) {
+  HistoryApp a(ctx);
+  const auto r = a.get("/rooms/room-7/messages");
+  ctx.Equal(r.Status, 200, "GET /rooms/room-7/messages");
+  const std::string type = r.HeaderValue("Content-Type");
+  ctx.Assert(type.rfind("application/json", 0) == 0, "Content-Type is %q, expected JSON", type);
+  const auto body = harness::ParseJSON(r.Text());
+  ctx.Assert(body && body->IsObject() && body->Fields().count("messages") && body->Fields().count("next_before"),
+             "the body must be {messages: [...], next_before: ...}, got %s", r.Text());
+  const auto [_, messages] = historyBody(ctx, r);
+  ctx.Equal(messages.size(), 50, "the messages on the default page (limit = 50)");
+  ctx.Equal(messages[0], std::map<std::string, harness::Any>{{"user", harness::Any(std::string("bo"))},
+                                                              {"text", harness::Any(std::string("message 120"))},
+                                                              {"ts", harness::Any(120000.0)}},
+            "the first message of the page must be the newest one (ts 120000)");
+}
+
+void CheckLimitBounds(harness::Ctx& ctx) {
+  HistoryApp a(ctx);
+  for (int limit : {0, 101, -5}) {
+    const auto r = a.get("/rooms/room-7/messages?limit=" + std::to_string(limit));
+    ctx.Equal(r.Status, 400, "limit=%d", limit);
+    ctx.Assert(historyCalls.empty(), "limit=%d must be rejected before touching the store, but the store saw %v", limit,
+               historyCalls);
+  }
+  for (int limit : {1, 100}) {
+    const auto r = a.get("/rooms/room-7/messages?limit=" + std::to_string(limit));
+    ctx.Equal(r.Status, 200, "limit=%d is within 1-100", limit);
+    const auto [_, messages] = historyBody(ctx, r);
+    ctx.Equal(messages.size(), limit, "the messages limit=%d returned", limit);
+  }
+}
+
+void CheckUnknownRoom(harness::Ctx& ctx) {
+  HistoryApp a(ctx);
+  auto r = a.get("/rooms/nowhere/messages");
+  ctx.Equal(r.Status, 404, "an unknown room");
+  ctx.Assert(std::find(historyCalls.begin(), historyCalls.end(), HistoryCall{"exists", "nowhere", 0, 0}) != historyCalls.end(),
+             "the handler must ask store.exists(%q); the store saw %v", "nowhere", historyCalls);
+  ctx.Assert(!listed(), "an unknown room must not be listed, but the store saw %v", historyCalls);
+  r = a.get("/rooms/nowhere/messages?limit=0");
+  ctx.Equal(r.Status, 400, "a bad limit on an unknown room (validate before the store lookup)");
+  ctx.Assert(historyCalls.empty(), "a bad limit must be rejected before store.exists, but the store saw %v", historyCalls);
+  r = a.get("/rooms/quiet/messages");
+  ctx.Equal(r.Status, 200, "an existing but empty room");
+  ctx.Equal(harness::ParseJSON(r.Text()),
+            harness::Any(std::map<std::string, harness::Any>{{"messages", harness::Any(std::vector<harness::Any>{})},
+                                                             {"next_before", harness::Any()}}),
+            "an empty room must answer {messages: [], next_before: null}");
+}
+
+void CheckNextBefore(harness::Ctx& ctx) {
+  HistoryApp a(ctx);
+  auto r = a.client.Get("/rooms/room-7/messages?limit=10");
+  ctx.Equal(r.Status, 200, "GET ...?limit=10");
+  std::vector<HistoryCall> lists;
+  for (const auto& c : historyCalls)
+    if (c.op == "list") lists.push_back(c);
+  ctx.Assert(lists.size() == 1 && lists[0].room == "room-7" && lists[0].limit == 10,
+             "expected one store.list(%q, <now>, 10), the store saw %v", "room-7", historyCalls);
+  const long long before = lists[0].before;
+  const long long now = ctx.Clock.Now();
+  ctx.Assert(before - now < 60000 && now - before < 60000,
+             "without ?before the store was asked for ts < %d, expected about now (%d ms)", before, now);
+  auto [body, messages] = historyBody(ctx, r);
+  ctx.Equal(historyTs(messages), historyTsDown(120),
+            "the ts on the first page (newest first, 'from the future' excluded because before defaults to now)");
+  ctx.Equal(body["next_before"], 111000, "next_before must be the ts of the last message on the page");
+  r = a.client.Get("/rooms/room-7/messages?before=111000&limit=10");
+  ctx.Equal(r.Status, 200, "GET ...?before=111000&limit=10");
+  ctx.Equal(historyCalls.back(), HistoryCall{"list", "room-7", 111000, 10}, "the second page must list (room-7, 111000, 10)");
+  std::tie(body, messages) = historyBody(ctx, r);
+  ctx.Equal(historyTs(messages), historyTsDown(110), "the ts on the second page");
+  ctx.Equal(body["next_before"], 101000, "next_before of the second page");
+  r = a.client.Get("/rooms/room-7/messages?before=5000&limit=10");
+  std::tie(body, messages) = historyBody(ctx, r);
+  ctx.Equal(messages.size(), 4, "before=5000 leaves 4 messages");
+  ctx.Equal(body["next_before"], nullptr, "a page shorter than limit is the last one: next_before must be null");
+}
+
+void CheckCacheControl(harness::Ctx& ctx) {
+  HistoryApp a(ctx);
+  const auto r = a.get("/rooms/room-7/messages?limit=5");
+  ctx.Equal(r.Status, 200, "GET /rooms/room-7/messages?limit=5");
+  const std::string value = r.HeaderValue("Cache-Control");
+  ctx.Assert(!value.empty(), "the response carries no Cache-Control header");
+  std::vector<std::string> directives;
+  std::stringstream parts(value);
+  for (std::string d; std::getline(parts, d, ',');) {
+    const size_t from = d.find_first_not_of(" \\t");
+    const size_t to = d.find_last_not_of(" \\t");
+    d = from == std::string::npos ? "" : d.substr(from, to - from + 1);
+    for (char& c : d) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    directives.push_back(d);
+  }
+  std::sort(directives.begin(), directives.end());
+  ctx.Equal(directives, {"max-age=5", "private"}, "the Cache-Control directives in %q", value);
+}
+`,
   },
   debrief: `The endpoint is a cursor-paginated read: validate, authorise the resource (404), fetch one page, hand back the cursor for the next. \`next_before\` being derived from the data rather than from arithmetic is what makes it stable while new messages arrive. \`Cache-Control: private\` is the header people forget: without it a CDN or corporate proxy could happily serve one person's private room to the next. Real APIs sign or opaque-encode the cursor, cap the total scroll depth, and add \`ETag\`s so a repeated page costs a 304.`,
 };

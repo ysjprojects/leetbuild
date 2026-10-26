@@ -1807,6 +1807,270 @@ func CheckClosed(ctx *harness.Ctx) {
 	ctx.Assert(err != nil, "the reader still commits after shutdown: close it")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cctype>
+#include <map>
+#include <memory>
+#include <set>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+namespace {
+
+const std::string inbox = kInbox;
+const std::string outbox = kOutbox;
+const std::string groupID = kGroup;
+
+std::string showReport(const Report& r) {
+  return harness::Sprintf("{forwarded:%d committed_offsets:%v undelivered:%d uncommitted:%d}", r.forwarded, r.committed_offsets,
+                          r.undelivered, r.uncommitted);
+}
+
+// gsSeed puts inbox records on one partition, so offsets and order are known.
+void gsSeed(harness::Ctx& ctx, const std::vector<std::string>& keys) {
+  for (const auto& key : keys) ctx.Kafka.SeedPartition(inbox, 0, key, "v-" + key);
+}
+
+// gsHandler records every key it sees, takes 2 s of clock on the slow keys, and stalls outbox when
+// it sees stallOn; it forwards the value upper-cased.
+Handler gsHandler(harness::Ctx& ctx, std::vector<std::string>& calls, const std::set<std::string>& slow, const std::string& stallOn) {
+  return [&ctx, &calls, slow, stallOn](const RdKafka::Message& msg) {
+    const std::string key = msg.key() != nullptr ? *msg.key() : std::string();
+    calls.push_back(key);
+    if (slow.count(key)) ctx.Clock.Advance(2);
+    if (key == stallOn) ctx.Kafka.Stall(outbox);
+    std::string value(static_cast<const char*>(msg.payload()), msg.len());
+    for (char& c : value) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return value;
+  };
+}
+
+// The learner's loop on a thread of its own: it takes every record there is (the clock held) and
+// waits for more; shutdown() stops it.
+struct gsRun {
+  std::thread thread;
+  ~gsRun() {
+    if (thread.joinable()) thread.detach();
+  }
+};
+
+std::unique_ptr<gsRun> gsDrain(harness::Ctx& ctx, const Handler& handler) {
+  auto r = std::make_unique<gsRun>();
+  r->thread = std::thread([handler] { run(handler); });
+  ctx.Tick();
+  return r;
+}
+
+// gsStop: shutdown(deadline) as the supervisor calls it, then the loop's end.
+Report gsStop(harness::Ctx& ctx, gsRun& r, int deadlineMs) {
+  const Report report = shutdown(deadlineMs);
+  if (!ctx.Drain([&r] { r.thread.join(); })) r.thread.detach();
+  return report;
+}
+
+// gsRestart is a fresh process over the same broker: the program's state as it starts it.
+void gsRestart() {
+  consumer = make_consumer();
+  producer = make_producer();
+  stopping = false;
+  forwarded = 0;
+  pending.clear();
+  watermark.clear();
+  committed.clear();
+}
+
+std::vector<std::pair<std::string, std::string>> gsOutbox(harness::Ctx& ctx) {
+  std::vector<std::pair<std::string, std::string>> out;
+  for (const auto& r : ctx.Kafka.Records(outbox)) out.emplace_back(r.Key.value_or(""), r.Value.value_or(""));
+  return out;
+}
+
+size_t gsDelivered(harness::Ctx& ctx) {
+  size_t n = 0;
+  for (const auto& e : ctx.Kafka.EventsOf("deliver"))
+    if (e.Group == groupID && e.Topic == inbox) n++;
+  return n;
+}
+
+size_t gsStalledForwards(harness::Ctx& ctx) {
+  size_t n = 0;
+  for (const auto& e : ctx.Kafka.EventsOf("produce-stalled"))
+    if (e.Topic == outbox) n++;
+  return n;
+}
+
+size_t gsCloses(harness::Ctx& ctx) {
+  size_t n = 0;
+  for (const auto& e : ctx.Kafka.EventsOf("close"))
+    if (e.Group == groupID) n++;
+  return n;
+}
+
+double gsSeconds(harness::Ctx& ctx, int64_t before) { return static_cast<double>(ctx.Clock.Now() - before) / 1000; }
+
+int64_t committedAt(const Report& r, int partition) {
+  const auto it = r.committed_offsets.find(partition);
+  return it == r.committed_offsets.end() ? -1 : it->second;
+}
+
+}  // namespace
+
+void CheckDrain(harness::Ctx& ctx) {
+  gsSeed(ctx, {"a", "slow", "b"});
+  std::vector<std::string> calls;
+  std::vector<std::pair<harness::KafkaOffsets, size_t>> atCommit;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) {
+    atCommit.emplace_back(offsets, ctx.Kafka.Records(outbox).size());
+  });
+  auto running = gsDrain(ctx, gsHandler(ctx, calls, {"slow"}, ""));
+  ctx.Equal(ctx.Kafka.EventsOf("auto-commit").size(), 0,
+            "auto-commit is on: offsets were committed on a timer, before the forward was acknowledged; auto-commits");
+  const int64_t before = ctx.Clock.Now();
+  const Report report = gsStop(ctx, *running, 5000);
+  const double took = gsSeconds(ctx, before);
+  ctx.Assert(took <= 5.5, "shutdown(5000) with a healthy broker took %.1f s of clock time", took);
+  ctx.Equal(gsOutbox(ctx), std::vector<std::pair<std::string, std::string>>{{"a", "V-A"}, {"slow", "V-SLOW"}, {"b", "V-B"}},
+            "outbox must hold every forward with the inbox key and the handler's value, in order");
+  ctx.Equal(calls, {"a", "slow", "b"}, "the handler must see a, slow, b once each: keys the handler saw");
+  ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 3, "after a clean shutdown every forwarded record is committed: the committed offset");
+  for (const auto& [offsets, held] : atCommit)
+    for (const auto& [tp, offset] : offsets)
+      ctx.Assert(static_cast<int64_t>(held) >= offset,
+                 "%s was committed to %d when outbox held only %d records: commit after the forward's ack, never before", tp, offset, held);
+  ctx.Assert(report.undelivered == 0 && report.uncommitted == 0, "a clean stop reports undelivered 0 and uncommitted 0, got %s",
+             showReport(report));
+  ctx.Equal(report.forwarded, 3, "forwarded must count the acknowledged forwards");
+  ctx.Equal(committedAt(report, 0), 3, "committed_offsets must say inbox partition 0 is committed to 3 (%v)", report.committed_offsets);
+}
+
+void CheckStalled(harness::Ctx& ctx) {
+  gsSeed(ctx, {"a", "b", "c", "d"});
+  std::vector<std::string> calls;
+  auto running = gsDrain(ctx, gsHandler(ctx, calls, {}, "c"));  // the broker stops acknowledging outbox from c on
+  ctx.Equal(gsOutbox(ctx), std::vector<std::pair<std::string, std::string>>{{"a", "V-A"}, {"b", "V-B"}},
+            "with outbox stalled from c on, only a and b can be there: outbox");
+  const int64_t before = ctx.Clock.Now();
+  const Report report = gsStop(ctx, *running, 5000);
+  const double took = gsSeconds(ctx, before);
+  ctx.Assert(took <= 5.5, "shutdown(5000) took %.1f s with outbox stalled: flush with the time left, not message.timeout.ms", took);
+  ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 2,
+            "c's forward was never acknowledged, so nothing past it may be committed: the committed offset");
+  ctx.Equal(gsOutbox(ctx), std::vector<std::pair<std::string, std::string>>{{"a", "V-A"}, {"b", "V-B"}},
+            "nothing can reach outbox while it is stalled: outbox");
+  const size_t wantUndelivered = gsStalledForwards(ctx);
+  const size_t wantUncommitted = gsDelivered(ctx) - 2;
+  ctx.Assert(wantUndelivered >= 1 && wantUncommitted >= 1, "the handler stalled outbox on c: at least c must be in flight");
+  ctx.Equal(report.undelivered, wantUndelivered, "undelivered must count the forwards the broker never acknowledged");
+  ctx.Equal(report.uncommitted, wantUncommitted, "uncommitted must count the records taken from inbox whose offset is not committed");
+  ctx.Equal(report.forwarded, 2, "forwarded counts acknowledged forwards only (a, b)");
+  ctx.Equal(committedAt(report, 0), 2, "committed_offsets must say inbox partition 0 is committed to 2 (%v)", report.committed_offsets);
+  ctx.Assert(gsCloses(ctx) > 0, "the consumer must be closed by the time shutdown returns");
+}
+
+void CheckRestart(harness::Ctx& ctx) {
+  gsSeed(ctx, {"a", "b", "c", "d"});
+  std::vector<std::string> calls;
+  auto running = gsDrain(ctx, gsHandler(ctx, calls, {}, "c"));
+  gsStop(ctx, *running, 5000);
+  const std::set<std::string> resumable = {"c", "d"};  // taken past the committed offset 2: a restart may handle these again
+  ctx.Kafka.Resume(outbox);
+  gsRestart();  // a fresh process over the same broker
+  std::vector<std::string> calls2;
+  auto running2 = gsDrain(ctx, gsHandler(ctx, calls2, {}, ""));
+  const Report report2 = gsStop(ctx, *running2, 5000);
+  const auto has = [&calls2](const std::string& key) { return std::find(calls2.begin(), calls2.end(), key) != calls2.end(); };
+  ctx.Assert(!has("a") && !has("b"), "the restart handled %v: it must resume from the committed offset (2), not from the beginning", calls2);
+  ctx.Assert(has("c") && has("d"), "the restart handled %v: the records taken but not committed (c, d) must be handled again", calls2);
+  const auto held = gsOutbox(ctx);
+  std::map<std::string, int> counts;
+  for (const auto& [k, v] : held) counts[k]++;
+  for (const std::string key : {"a", "b", "c", "d"}) {
+    std::string upper = key;
+    for (char& c : upper) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    const bool found = std::find(held.begin(), held.end(), std::make_pair(key, "V-" + upper)) != held.end();
+    ctx.Assert(found, "after the restart outbox must hold every inbox record at least once; %s is missing from %v", key, held);
+  }
+  for (const auto& [key, n] : counts)
+    ctx.Assert(n == 1 || resumable.count(key),
+               "%s reached outbox twice although it was committed: duplicates may only be the records reported uncommitted", key);
+  ctx.Equal(ctx.Kafka.Lag(groupID, inbox), 0, "after the restart's clean shutdown nothing may be left uncommitted: lag");
+  ctx.Assert(report2.undelivered == 0 && report2.uncommitted == 0, "the restart's clean stop must report zeros, got %s", showReport(report2));
+}
+
+void CheckOnce(harness::Ctx& ctx) {
+  gsSeed(ctx, {"a", "b", "c"});
+  std::vector<std::string> calls;
+  auto running = gsDrain(ctx, gsHandler(ctx, calls, {}, ""));
+  gsStop(ctx, *running, 5000);
+  gsSeed(ctx, {"d", "e"});
+  gsRestart();  // a fresh process over the same broker
+  auto running2 = gsDrain(ctx, gsHandler(ctx, calls, {}, ""));
+  gsStop(ctx, *running2, 5000);
+  ctx.Equal(calls, {"a", "b", "c", "d", "e"}, "across a clean shutdown and a restart each record reaches the handler once: keys the handler saw");
+  std::vector<std::string> keys;
+  for (const auto& [k, v] : gsOutbox(ctx)) keys.push_back(k);
+  ctx.Equal(keys, {"a", "b", "c", "d", "e"}, "outbox must hold each record once, in order");
+  ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 5, "the committed offset");
+  ctx.Equal(gsCloses(ctx), 2, "each process must close its consumer on shutdown: closes seen for group forwarder");
+}
+
+void CheckDeadline(harness::Ctx& ctx) {
+  gsSeed(ctx, {"a", "b"});
+  std::vector<std::string> calls;
+  ctx.Kafka.StallFor(outbox, 2);  // the broker is slow at the moment of the stop: it answers 2 s later
+  auto running = gsDrain(ctx, gsHandler(ctx, calls, {}, ""));
+  int64_t before = ctx.Clock.Now();
+  Report report = gsStop(ctx, *running, 5000);
+  double took = gsSeconds(ctx, before);
+  ctx.Equal(gsOutbox(ctx), std::vector<std::pair<std::string, std::string>>{{"a", "V-A"}, {"b", "V-B"}},
+            "the broker answered after 2 s, within the deadline: shutdown must wait for the forwards; outbox");
+  ctx.Assert(took <= 2.5, "the broker answered after 2 s yet shutdown(5000) took %.1f s: wait for the forwards, not for the whole deadline", took);
+  ctx.Assert(report.undelivered == 0 && report.uncommitted == 0, "everything was acknowledged and committed, the report must say so: %s",
+             showReport(report));
+  ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 2, "both forwards were acknowledged: both offsets must be committed");
+
+  gsSeed(ctx, {"c"});
+  ctx.Kafka.Stall(outbox);  // now the broker is down for good
+  gsRestart();
+  auto running2 = gsDrain(ctx, gsHandler(ctx, calls, {}, ""));
+  before = ctx.Clock.Now();
+  report = gsStop(ctx, *running2, 3000);
+  took = gsSeconds(ctx, before);
+  ctx.Assert(took <= 3.5, "with outbox down, shutdown(3000) took %.1f s of clock time: the deadline is the bound", took);
+  ctx.Assert(took >= 2.5, "with outbox down, shutdown(3000) gave up after %.1f s: the broker may still answer within the deadline, flush with the time left", took);
+  ctx.Assert(report.undelivered == 1 && report.uncommitted == 1, "c's forward never got an ack: expected undelivered 1, uncommitted 1, got %s",
+             showReport(report));
+  ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 2, "c was not acknowledged: its offset must not be committed");
+}
+
+void CheckClosed(harness::Ctx& ctx) {
+  gsSeed(ctx, {"a", "b"});
+  std::vector<std::string> calls;
+  auto running = gsDrain(ctx, gsHandler(ctx, calls, {}, ""));
+  gsStop(ctx, *running, 5000);
+  int lastCommit = -1;
+  int closeAt = -1;
+  const auto events = ctx.Kafka.EventsOf("manual-commit", "close");
+  for (size_t i = 0; i < events.size(); i++) {
+    const auto& e = events[i];
+    if (e.Group != groupID) continue;
+    if (e.Kind == "manual-commit") lastCommit = static_cast<int>(i);
+    else if (closeAt == -1) closeAt = static_cast<int>(i);
+  }
+  ctx.Assert(closeAt != -1, "the consumer must be closed by the time shutdown returns");
+  ctx.Assert(lastCommit != -1, "no explicit commit happened");
+  ctx.Assert(lastCommit < closeAt, "the final commit must happen before the consumer is closed");
+  ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 2, "the committed offset");
+  std::vector<RdKafka::TopicPartition*> offsets{RdKafka::TopicPartition::create(inbox, 0, 1)};
+  const RdKafka::ErrorCode err = consumer->commitSync(offsets);
+  RdKafka::TopicPartition::destroy(offsets);
+  ctx.Assert(err != RdKafka::ERR_NO_ERROR, "the consumer still commits after shutdown: close it");
+}
+`,
   },
   debrief: `A graceful shutdown is the same loop in reverse, run against a clock. The order is forced by what each step owes the previous one: stop taking records first (anything taken now is a promise to forward), let the record in hand finish because its offset is the next commit, flush because a commit before the ack would acknowledge a record the outbox never got, commit synchronously because an async commit behind a closing socket is a commit that did not happen, and only then close. Every wait gets the time left rather than its own timeout, so the whole call — not each step — fits the deadline a supervisor gives before SIGKILL. What does not fit is not retried into the deadline; it is left uncommitted and reported, and the restart's at-least-once redelivery is the recovery path. Real workers add the same discipline on rebalance (the \`on_revoke\` callback is a shutdown of one partition), make the downstream write idempotent so the redelivery is harmless, and run the forward as a Kafka transaction when the outbox and the commit must move together.`,
 };

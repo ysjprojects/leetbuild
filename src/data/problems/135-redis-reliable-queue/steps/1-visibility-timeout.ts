@@ -1470,6 +1470,205 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 	ctx.Assert(ctx.Redis.ZCard(wqInflight) == 2 && ctx.Redis.LLen(wqReady) == 0, "after both claims inflight must hold 2 and ready 0")
 }
 `,
+    cpp: `// redis-reliable-queue/visibility-timeout checks: claim-inflight, fifo-dedupe, ack-owner, visibility-timeout, requeue-only-expired, atomic-claim
+#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <exception>
+#include <map>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string wqName = "emails";
+const std::string wqReady = "q:emails:ready";
+const std::string wqInflight = "q:emails:inflight";
+const std::string wqOwner = "q:emails:owner";
+const std::string wqJobs = "q:emails:jobs";
+
+using Claimed = std::optional<std::vector<std::string>>;
+
+bool wqEnqueue(harness::Ctx&, const std::string& jobID, const std::string& payload) {
+  return enqueue(wqName, jobID, payload);
+}
+
+void wqQueue(harness::Ctx& ctx, int n) {
+  for (int i = 1; i <= n; i++) {
+    ctx.Equal(wqEnqueue(ctx, harness::Sprintf("j%d", i), harness::Sprintf("p%d", i)), true,
+              "enqueue of a fresh id j%d must return true", i);
+  }
+}
+
+// wqClaim is the claim as [jobID, payload], or nullopt when claim returned nothing.
+Claimed wqClaim(harness::Ctx&, const std::string& worker, long long visibility, long long now) {
+  const auto c = claim(wqName, worker, visibility, now);
+  if (!c) return std::nullopt;
+  return std::vector<std::string>{c->first, c->second};
+}
+
+bool wqAck(harness::Ctx&, const std::string& jobID, const std::string& worker) { return ack(wqName, jobID, worker); }
+
+long long wqRequeue(harness::Ctx&, long long now) { return requeue_expired(wqName, now); }
+
+// Stats as {ready, inflight}.
+std::vector<long long> wqStats(harness::Ctx&) {
+  const Stats s = stats(wqName);
+  return {s.ready, s.inflight};
+}
+
+std::optional<double> wqScore(harness::Ctx& ctx, const std::string& id) { return ctx.Redis.ZScore(wqInflight, id); }
+
+std::optional<std::string> wqHGet(harness::Ctx& ctx, const std::string& key, const std::string& field) {
+  return ctx.Redis.HGet(key, field);
+}
+
+int wqHExists(harness::Ctx& ctx, const std::string& key, const std::string& field) {
+  return ctx.Redis.HGet(key, field) ? 1 : 0;
+}
+
+std::vector<std::string> wqInflightIDs(harness::Ctx& ctx) {
+  std::vector<std::string> ids;
+  for (const auto& z : ctx.Redis.ZRangeWithScores(wqInflight, 0, -1)) ids.push_back(z.Member);
+  return ids;
+}
+
+}  // namespace
+
+void CheckClaimInflight(harness::Ctx& ctx) {
+  wqQueue(ctx, 2);
+  ctx.Equal(ctx.Redis.LRange(wqReady, 0, -1), {"j1", "j2"}, "ready after two enqueues, expected [j1, j2] (RPUSH)");
+  const auto got = wqClaim(ctx, "A", 30, 100);
+  ctx.Equal(got, {"j1", "p1"}, "claim must return the head of ready with its payload");
+  ctx.Equal(ctx.Redis.LRange(wqReady, 0, -1), {"j2"}, "ready after the claim: the claimed id must leave the list");
+  ctx.Assert(wqScore(ctx, "j1").has_value(), "inflight is %q, expected j1: the claimed id must be ZADDed", wqInflightIDs(ctx));
+  ctx.Equal(wqScore(ctx, "j1"), 130, "j1's inflight score, expected now + visibility = 100 + 30 = 130");
+  ctx.Equal(wqHGet(ctx, wqOwner, "j1"), "A", "owner of j1");
+  ctx.Equal(wqHGet(ctx, wqJobs, "j1"), "p1", "the payload must stay in q:emails:jobs until the ack");
+  ctx.Equal(wqStats(ctx), {1, 1}, "stats, expected ready 1 / inflight 1");
+  ctx.Equal(wqClaim(ctx, "B", 30, 101), {"j2", "p2"}, "the second claim gets j2");
+  ctx.Equal(wqClaim(ctx, "B", 30, 102), nullptr, "a claim on an empty ready list must return ok false");
+  ctx.Equal(wqStats(ctx), {0, 2}, "stats, expected ready 0 / inflight 2");
+}
+
+void CheckFifoDedupe(harness::Ctx& ctx) {
+  wqQueue(ctx, 5);
+  std::vector<std::string> order;
+  for (int i = 0; i < 5; i++) {
+    const auto got = wqClaim(ctx, "A", 30, 100);
+    ctx.Assert(got.has_value(), "claim returned ok false with jobs still ready (claims so far: %q)", order);
+    order.push_back((*got)[0]);
+  }
+  ctx.Equal(order, {"j1", "j2", "j3", "j4", "j5"}, "claims must come out as j1..j5 in enqueue order (RPUSH in, LPOP out)");
+  ctx.Equal(wqClaim(ctx, "A", 30, 100), nullptr, "the sixth claim must return ok false");
+  ctx.Equal(wqEnqueue(ctx, "j6", "p6"), true, "enqueue of a fresh id j6");
+  ctx.Equal(wqEnqueue(ctx, "j6", "other"), false, "enqueue of an id that already exists must return false");
+  ctx.Equal(wqHGet(ctx, wqJobs, "j6"), "p6", "a refused enqueue must not overwrite the payload");
+  ctx.Equal(ctx.Redis.LRange(wqReady, 0, -1), {"j6"}, "ready: a refused enqueue must not push a second entry");
+  const auto got = wqClaim(ctx, "A", 30, 100);
+  ctx.Assert(got.has_value(), "claim returned ok false with j6 ready");
+  ctx.Equal((*got)[0], "j6", "the claim after the refused enqueue");
+  ctx.Equal(wqEnqueue(ctx, "j6", "again"), false, "an id that is inflight still exists and must be refused");
+  ctx.Equal(ctx.Redis.LLen(wqReady), 0, "LLEN q:emails:ready");
+}
+
+void CheckAckOwner(harness::Ctx& ctx) {
+  wqQueue(ctx, 2);
+  wqClaim(ctx, "A", 30, 100);
+  ctx.Equal(wqAck(ctx, "j1", "B"), false, "ack from a worker that does not own the job must return false");
+  ctx.Assert(wqScore(ctx, "j1") == 130.0 && wqHGet(ctx, wqOwner, "j1") == "A" && wqHGet(ctx, wqJobs, "j1") == "p1",
+             "a refused ack must change nothing");
+  ctx.Equal(wqAck(ctx, "j2", "A"), false, "ack of a job that is not inflight (j2 is still ready) must return false");
+  const auto ready = ctx.Redis.LRange(wqReady, 0, -1);
+  ctx.Assert(!ready.empty() && ready[0] == "j2" && wqHGet(ctx, wqJobs, "j2") == "p2", "a refused ack must leave the ready job alone");
+  ctx.Equal(wqAck(ctx, "ghost", "A"), false, "ack of an unknown id must return false");
+  ctx.Equal(wqAck(ctx, "j1", "A"), true, "the owner's ack must return true");
+  ctx.Equal(wqScore(ctx, "j1"), nullptr, "after the ack j1 must leave inflight");
+  ctx.Equal(wqHExists(ctx, wqOwner, "j1"), 0, "after the ack j1 must have no owner");
+  ctx.Equal(wqHExists(ctx, wqJobs, "j1"), 0, "after the ack the payload must be deleted from jobs");
+  ctx.Equal(wqAck(ctx, "j1", "A"), false, "a second ack must return false");
+  ctx.Equal(wqStats(ctx), {1, 0}, "stats after the ack");
+  ctx.Equal(wqEnqueue(ctx, "j1", "p1-again"), true, "once acked, the id is free to be enqueued again");
+}
+
+void CheckVisibilityTimeout(harness::Ctx& ctx) {
+  wqQueue(ctx, 2);
+  ctx.Equal(wqClaim(ctx, "A", 30, 100), {"j1", "p1"}, "the first claim");
+  ctx.Equal(wqRequeue(ctx, 129), 0, "before the deadline (130) nothing is expired: requeueExpired(129)");
+  auto ready = ctx.Redis.LRange(wqReady, 0, -1);
+  ctx.Assert(wqScore(ctx, "j1") == 130.0 && !ready.empty() && ready[0] == "j2", "requeueExpired before the deadline must move nothing");
+  auto got = wqClaim(ctx, "B", 30, 129);
+  ctx.Assert(got.has_value() && (*got)[0] == "j2", "while j1 is inflight, another worker gets the next job, never j1: got %q", got);
+  const auto n = wqRequeue(ctx, 130);
+  ctx.Equal(n, 1, "requeueExpired(130): j1's deadline is 130 and score <= now counts as expired");
+  ctx.Equal(ctx.Redis.LRange(wqReady, 0, -1), {"j1"}, "ready: the expired job goes back to the head (LPUSH)");
+  ctx.Equal(wqScore(ctx, "j1"), nullptr, "a requeued job must leave inflight");
+  ctx.Equal(wqHExists(ctx, wqOwner, "j1"), 0, "a requeued job must have no owner");
+  ctx.Equal(wqHGet(ctx, wqJobs, "j1"), "p1", "requeue keeps the payload");
+  ctx.Equal(wqAck(ctx, "j1", "A"), false, "the worker that lost the job cannot ack it any more");
+  got = wqClaim(ctx, "B", 60, 131);
+  ctx.Equal(got, {"j1", "p1"}, "after the requeue another worker claims j1 again");
+  ctx.Equal(wqScore(ctx, "j1"), 191, "the re-claimed job's deadline, expected 131 + 60 = 191");
+  ctx.Equal(wqHGet(ctx, wqOwner, "j1"), "B", "owner of the re-claimed j1");
+  ctx.Equal(wqAck(ctx, "j1", "A"), false, "A's late ack must be refused: B owns j1 now");
+  ctx.Equal(wqAck(ctx, "j1", "B"), true, "B's ack of j1");
+}
+
+void CheckRequeueOnlyExpired(harness::Ctx& ctx) {
+  wqQueue(ctx, 4);
+  wqClaim(ctx, "A", 10, 100);
+  wqClaim(ctx, "B", 20, 100);
+  wqClaim(ctx, "C", 30, 100);
+  ctx.Equal(wqRequeue(ctx, 120), 2, "at 120 two deadlines (110, 120) have passed: requeueExpired(120)");
+  const auto ready = ctx.Redis.LRange(wqReady, 0, -1);
+  auto sorted = ready;
+  std::sort(sorted.begin(), sorted.end());
+  ctx.Assert(sorted == std::vector<std::string>{"j1", "j2", "j4"} && ready[2] == "j4",
+             "ready is %q: j1 and j2 must be back ahead of the never-claimed j4", ready);
+  ctx.Equal(wqInflightIDs(ctx), {"j3"}, "inflight, expected only j3 (deadline 130)");
+  ctx.Equal(ctx.Redis.HGetAll(wqOwner), std::map<std::string, std::string>{{"j3", "C"}}, "owner, expected only j3 -> C");
+  ctx.Equal(wqStats(ctx), {3, 1}, "stats after the sweep");
+  ctx.Equal(wqRequeue(ctx, 120), 0, "a second sweep at the same instant has nothing left: requeueExpired(120)");
+  ctx.Equal(wqRequeue(ctx, 1000), 1, "requeueExpired(1000)");
+  ctx.Assert(ctx.Redis.ZCard(wqInflight) == 0 && ctx.Redis.HLen(wqOwner) == 0, "after the last sweep inflight and owner must be empty");
+  ctx.Equal(ctx.Redis.LLen(wqReady), 4, "LLEN q:emails:ready");
+}
+
+void CheckAtomicClaim(harness::Ctx& ctx) {
+  wqQueue(ctx, 2);
+  // What worker B saw and got, claiming right after A's first command on ready.
+  bool fired = false;
+  std::optional<std::string> err;
+  std::vector<std::string> seenReady, seenInflight;
+  std::map<std::string, std::string> seenOwner;
+  Claimed seenGot;
+  ctx.Redis.After(wqReady, [&] {
+    fired = true;
+    seenReady = ctx.Redis.LRange(wqReady, 0, -1);
+    seenInflight = wqInflightIDs(ctx);
+    seenOwner = ctx.Redis.HGetAll(wqOwner);
+    try {
+      seenGot = wqClaim(ctx, "B", 30, 100);
+    } catch (const std::exception& e) {
+      err = e.what();
+    }
+  });
+  const auto gotA = wqClaim(ctx, "A", 30, 100);
+  ctx.Assert(fired, "claim never touched q:emails:ready");
+  ctx.Assert(!err, "worker B's claim failed: %s", err.value_or(""));
+  ctx.Equal(gotA, {"j1", "p1"}, "worker A's claim, expected j1");
+  const bool popped = std::find(seenReady.begin(), seenReady.end(), "j1") == seenReady.end();
+  ctx.Assert(popped, "at the instant ready was touched j1 should already have been popped");
+  const bool inflight = std::find(seenInflight.begin(), seenInflight.end(), "j1") != seenInflight.end();
+  ctx.Assert(inflight && seenOwner["j1"] == "A",
+             "right after ready was touched, inflight is %q and owner %v: j1 was popped but not yet inflight — a crash here loses the job; pop, ZADD and HSET must be one script",
+             seenInflight, seenOwner);
+  ctx.Equal(seenGot, {"j2", "p2"}, "worker B, claiming at that instant, must get j2: two workers must never hold the same job");
+  ctx.Equal(ctx.Redis.HGetAll(wqOwner), std::map<std::string, std::string>{{"j1", "A"}, {"j2", "B"}}, "owners, expected j1 -> A, j2 -> B");
+  ctx.Assert(ctx.Redis.ZCard(wqInflight) == 2 && ctx.Redis.LLen(wqReady) == 0, "after both claims inflight must hold 2 and ready 0");
+}
+`,
   },
   debrief: `The queue is three scripts because each one is a multi-key state transition that must be all-or-nothing. \`claim\` is the one that matters most: a client-side \`LPOP\` followed by \`ZADD\` has a window — a crash, a network blip, a deploy — in which the job exists in no key, and a queue that can lose a job silently is not a queue. Putting the pop, the deadline and the owner in one script makes "every job is in exactly one of ready or inflight" an invariant Redis enforces, which is also why \`requeue_expired\` can be a dumb sweep: whatever it finds past its deadline is, by construction, a job whose worker went quiet. The owner hash is the fencing token: once the sweep has given the job to someone else, the first worker's late \`ack\` is refused instead of deleting work the second worker is halfway through. Real systems add a retry counter and a dead-letter list for jobs that expire too many times (so a poison job cannot cycle forever), \`BLPOP\`-style blocking or Streams with consumer groups (\`XREADGROUP\` / \`XAUTOCLAIM\` is this exact protocol built into the server), a heartbeat that extends the deadline for long jobs, and per-queue metrics on the age of the oldest inflight member.`,
 };

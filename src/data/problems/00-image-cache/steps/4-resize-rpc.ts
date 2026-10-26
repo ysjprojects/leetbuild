@@ -630,6 +630,106 @@ func CheckBounded(ctx *harness.Ctx) {
 	ctx.Equal(resizeCalls(ctx), 2, "attempts against a down resizer: retries must stop after the second")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <exception>
+#include <optional>
+#include <string>
+
+namespace {
+
+// resizerPeer is the resizer: it knows every image but ghost and counts its calls.
+class ResizerPeer final : public thumbs::Resizer::Service {
+ public:
+  int calls = 0;
+
+  grpc::Status Resize(grpc::ServerContext*, const thumbs::ResizeRequest* req, thumbs::ResizeReply* reply) override {
+    calls++;
+    if (req->image_id() == "ghost") return grpc::Status(grpc::StatusCode::NOT_FOUND, "no such image");
+    reply->set_jpeg("JPEG-" + req->image_id() + "-" + std::to_string(req->width()));
+    return grpc::Status::OK;
+  }
+};
+
+ResizerPeer* servePeer(harness::Ctx& ctx) {
+  auto* peer = new ResizerPeer();
+  ctx.GRPC.Server("")->RegisterService(peer);
+  return peer;
+}
+
+int resizeCalls(harness::Ctx& ctx) { return static_cast<int>(ctx.GRPC.CallsTo("Resize", "").size()); }
+
+// The C++ render reports a failed RPC by throwing; Go reads the code off the returned error. Here the
+// code is the one the last Resize call ended with.
+grpc::StatusCode lastCode(harness::Ctx& ctx) {
+  const auto calls = ctx.GRPC.CallsTo("Resize", "");
+  return calls.empty() ? grpc::StatusCode::OK : calls.back().Code;
+}
+
+// render, failing the check when it throws (Go's ctx.NoError on the returned error).
+std::optional<std::string> mustRender(harness::Ctx& ctx, const std::string& id, int width, const std::string& why) {
+  try {
+    return render(id, width);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("%s: render(%q, %d) threw: %s", why, id, width, e.what());
+  }
+}
+
+// Whether render threw.
+bool renderThrows(const std::string& id, int width) {
+  try {
+    render(id, width);
+  } catch (const std::exception&) {
+    return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  servePeer(ctx);
+  const auto got = mustRender(ctx, "cat", 256, "render(\\"cat\\", 256)");
+  ctx.Equal(got.value_or(""), "JPEG-cat-256", "render must return the resizer's bytes");
+  const auto calls = ctx.GRPC.CallsTo("Resize", "");
+  ctx.Assert(!calls.empty(), "render never called Resize");
+  const auto& call = calls.back();
+  ctx.Assert(call.HasDeadline(), "the RPC carries no deadline");
+  ctx.Assert(0.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 1.0, "the deadline must be about 800 ms, got %vs",
+             call.TimeoutSeconds());
+  ctx.GRPC.SetLatency("Resize", 3.0, "");
+  ctx.Assert(renderThrows("cat", 128), "a resizer slower than the deadline must surface DEADLINE_EXCEEDED");
+  ctx.Equal(lastCode(ctx), grpc::StatusCode::DEADLINE_EXCEEDED, "the status a slow resizer surfaces");
+  ctx.Equal(resizeCalls(ctx), 2, "DEADLINE_EXCEEDED must not be retried: Resize calls");
+}
+
+void CheckNotFound(harness::Ctx& ctx) {
+  auto* peer = servePeer(ctx);
+  const auto got = mustRender(ctx, "ghost", 256, "NOT_FOUND means the origin has no such image: render must return nullopt");
+  ctx.Assert(!got, "NOT_FOUND means the origin has no such image: return nullopt, got %q", got);
+  ctx.Equal(peer->calls, 1, "NOT_FOUND must not be retried: Resize calls");
+}
+
+void CheckRetryUnavailable(harness::Ctx& ctx) {
+  servePeer(ctx);
+  ctx.GRPC.Fail("Resize", grpc::StatusCode::UNAVAILABLE, "", 1, "");
+  const auto got = mustRender(ctx, "cat", 256, "one UNAVAILABLE must be retried and succeed");
+  ctx.Equal(got.value_or(""), "JPEG-cat-256", "one UNAVAILABLE must be retried and succeed");
+  ctx.Equal(resizeCalls(ctx), 2, "exactly one retry after UNAVAILABLE: Resize calls");
+  ctx.GRPC.Fail("Resize", grpc::StatusCode::INVALID_ARGUMENT, "width", 1, "");
+  ctx.Assert(renderThrows("cat", 256), "INVALID_ARGUMENT must propagate, not be retried or swallowed");
+  ctx.Equal(lastCode(ctx), grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT must propagate as is");
+  ctx.Equal(resizeCalls(ctx), 3, "INVALID_ARGUMENT must not be retried: Resize calls");
+}
+
+void CheckBounded(harness::Ctx& ctx) {
+  servePeer(ctx);
+  ctx.GRPC.Fail("Resize", grpc::StatusCode::UNAVAILABLE, "", 50, "");
+  ctx.Assert(renderThrows("cat", 256), "a resizer that stays UNAVAILABLE must make render throw");
+  ctx.Equal(lastCode(ctx), grpc::StatusCode::UNAVAILABLE, "a resizer that stays down must surface UNAVAILABLE");
+  ctx.Equal(resizeCalls(ctx), 2, "attempts against a down resizer: retries must stop after the second");
+}
+`,
   },
   debrief: `Deadlines are the single most important thing a client sets: without one, a slow dependency turns into a slow *you*. Retrying only \`UNAVAILABLE\` — and only a bounded number of times — is what keeps a retry from becoming a retry storm. Production clients add jittered backoff between attempts, honour the server's retry policy, and propagate the caller's deadline instead of picking their own (\`ctx\` in Go, \`grpc-timeout\` on the wire).`,
 };

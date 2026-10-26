@@ -108,6 +108,17 @@ export class Clock {
     if (this.holds === 0 && this.hasPendingSleeps()) this.schedulePump();
   }
 
+  /**
+   * The check's sleep budget. Raised past the sleeps already taken, the clock moves on again: a
+   * limit that had been hit no longer holds pending sleeps back (nor counts as the interruption).
+   */
+  setSleepLimit(n: number | null): void {
+    this.sleepLimit = n;
+    if (n !== null && this.sleeps >= n) return;
+    this.interrupted = false;
+    if (this.holds === 0 && this.hasPendingSleeps()) this.schedulePump();
+  }
+
   /** Move the clock forward: keys expire, windows roll over, deadlines pass, timers and background jobs fire. */
   advance(ms: number): void {
     this.offset += ms;

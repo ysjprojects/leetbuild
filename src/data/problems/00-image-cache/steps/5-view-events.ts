@@ -654,6 +654,89 @@ func CheckFlush(ctx *harness.Ctx) {
 	ctx.Equal(len(ctx.Kafka.Records("image-views")), 3, "shutdown() must flush: buffered events that had reached the broker when it returned")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <chrono>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <thread>
+
+#include <nlohmann/json.hpp>
+
+namespace {
+
+// veLog records everything the learner writes to std::cerr (the delivery reports) while it lives.
+struct VeLog {
+  std::ostringstream lines;
+  std::streambuf* previous = std::cerr.rdbuf(lines.rdbuf());
+  ~VeLog() { std::cerr.rdbuf(previous); }
+};
+
+}  // namespace
+
+void CheckTopic(harness::Ctx& ctx) {
+  emit_view("cat", 256, true);
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));  // the producer's background work gets a turn
+  const auto produced = ctx.Kafka.Records("image-views");
+  ctx.Equal(produced.size(), 1, "records on image-views");
+  const std::string value = produced[0].Value.value_or("");
+  const auto event = nlohmann::json::parse(value, nullptr, false);
+  ctx.Assert(event.is_object(), "the value must be JSON, got %q", value);
+  ctx.Assert(event.value("id", nlohmann::json()) == "cat" && event.value("w", nlohmann::json()) == 256 &&
+                 event.value("hit", nlohmann::json()) == true,
+             "the value must be JSON with id, w, hit (and ts): %s", value);
+  ctx.Assert(event.contains("ts"), "the event must carry a timestamp");
+}
+
+void CheckKeyed(harness::Ctx& ctx) {
+  emit_view("cat", 256, true);
+  emit_view("cat", 64, false);
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  ctx.Equal(ctx.Kafka.Keys("image-views"), {"cat", "cat"}, "records must be keyed by the image id");
+  const auto produced = ctx.Kafka.Records("image-views");
+  ctx.Equal(produced.size(), 2, "records on image-views");
+  ctx.Equal(produced[0].Partition, produced[1].Partition, "the same image id must land on the same partition");
+}
+
+void CheckNonBlocking(harness::Ctx& ctx) {
+  ctx.Kafka.StallFor("image-views", 2);  // the broker answers 2 s later
+  const int64_t started = ctx.Clock.Now();
+  emit_view("cat", 256, true);
+  const int64_t waited = ctx.Clock.Now() - started;
+  ctx.Assert(waited < 1000,
+             "emit_view took %d ms with the broker stalled: hand the record to the producer and return, do not wait "
+             "for the ack",
+             waited);
+  ctx.Equal(ctx.Kafka.Records("image-views").size(), 0,
+            "emit_view returned only after the broker acknowledged the record: hand it to the producer and return, do "
+            "not wait for the ack");
+  shutdown();
+  ctx.Equal(ctx.Kafka.Records("image-views").size(), 1, "the event handed to the producer must still reach the broker");
+}
+
+void CheckCallback(harness::Ctx& ctx) {
+  VeLog logged;
+  ctx.Kafka.FailNext("image-views", 1);
+  emit_view("cat", 256, true);  // the failure arrives through the delivery report callback, not as a return value
+  emit_view("cat", 256, true);
+  // librdkafka serves delivery reports only in poll()/flush() (Go's client calls back on its own):
+  // shutdown's flush serves the pending one at the latest, as the Python harness does.
+  shutdown();
+  ctx.Assert(!logged.lines.str().empty(), "a failed delivery must be logged by the delivery report callback (std::cerr)");
+  ctx.Equal(ctx.Kafka.Records("image-views").size(), 1, "the second event must still be delivered after the first failed");
+}
+
+void CheckFlush(harness::Ctx& ctx) {
+  ctx.Kafka.StallFor("image-views", 2);  // the broker answers 2 s later
+  emit_view("cat", 256, true);
+  emit_view("dog", 256, true);
+  emit_view("cat", 64, false);
+  shutdown();
+  ctx.Equal(ctx.Kafka.Records("image-views").size(), 3,
+            "shutdown() must flush: buffered events that had reached the broker when it returned");
+}
+`,
   },
   debrief: `A Kafka producer is a buffer with a background thread: \`produce\`/\`send\` costs microseconds, the network happens later in batches. That is what makes "emit an event per request" free — as long as nobody blocks on the acknowledgement. The key is your ordering contract: same key → same partition → same order for that image. Real systems also set \`acks=all\` for events they cannot afford to lose, enable idempotent producers so retries do not duplicate, and never let the buffer grow unbounded (\`queue.buffering.max.messages\`, back-pressure).`,
 };

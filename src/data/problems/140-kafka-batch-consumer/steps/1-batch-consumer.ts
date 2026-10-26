@@ -1093,6 +1093,188 @@ func CheckNoEmptyFlush(ctx *harness.Ctx) {
 	ctx.Equal(len(rec.commits), 1, "one batch, one commit; commits")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+const std::string rollupGroup = "rollup";
+const std::string metricsTopic = "metrics";
+
+void seedMetrics(harness::Ctx& ctx, int n, const std::function<int(int)>& partition) {
+  for (int i = 0; i < n; i++) {
+    const std::string host = "host-" + std::to_string(i);
+    ctx.Kafka.SeedPartition(metricsTopic, partition(i), host,
+                            R"({"host":")" + host + R"(","cpu":)" + std::to_string(i) + "}");
+  }
+}
+
+int roundRobin3(int i) { return i % 3; }
+
+// metricPlace is a flushed record: its partition and offset.
+using metricPlace = std::pair<int, int64_t>;
+
+struct rollupCommit {
+  std::string group;
+  std::map<std::string, int64_t> offsets;
+  int64_t at;
+};
+
+// rollupRecorder is what the learner's loop did: every flush as places, every commit with the clock
+// at that moment, and their order.
+struct rollupRecorder {
+  std::vector<std::vector<metricPlace>> flushes;
+  std::vector<rollupCommit> commits;
+  std::vector<std::string> log;
+
+  void flush(const Batch& records) {
+    std::vector<metricPlace> places;
+    for (const auto& r : records) places.emplace_back(r->partition(), r->offset());
+    flushes.push_back(places);
+    log.push_back("flush " + std::to_string(records.size()));
+  }
+
+  std::vector<int> sizes() const {
+    std::vector<int> out;
+    for (const auto& f : flushes) out.push_back(static_cast<int>(f.size()));
+    return out;
+  }
+};
+
+void recordRollup(harness::Ctx& ctx, rollupRecorder& rec) {
+  ctx.Kafka.OnCommit([&ctx, &rec](const std::string& group, const harness::KafkaOffsets& offsets) {
+    std::map<std::string, int64_t> byKey;
+    for (const auto& [tp, o] : offsets) byKey[tp.String()] = o;
+    rec.commits.push_back({group, byKey, ctx.Clock.Now()});
+    rec.log.push_back("commit");
+  });
+}
+
+// runRollup runs the learner's loop over everything seeded, until it waits for records that will not
+// come: a window still open closes on the way.
+void runRollup(harness::Ctx& ctx, rollupRecorder& rec) {
+  ctx.Drain([&] { run([&](const Batch& batch) { rec.flush(batch); }); });
+}
+
+std::map<std::string, int64_t> expectedRollupCommit(const std::vector<metricPlace>& flush) {
+  std::map<std::string, int64_t> last;
+  for (const auto& [partition, offset] : flush) {
+    const std::string key = metricsTopic + "|" + std::to_string(partition);
+    last[key] = std::max(last[key], offset + 1);
+  }
+  return last;
+}
+
+}  // namespace
+
+void CheckGroup(harness::Ctx& ctx) {
+  seedMetrics(ctx, 50, roundRobin3);
+  rollupRecorder rec;
+  recordRollup(ctx, rec);
+  runRollup(ctx, rec);
+  const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
+  ctx.Assert(!subscriptions.empty(), "the consumer must subscribe to a topic");
+  const auto& last = subscriptions.back();
+  ctx.Equal(last.Group, rollupGroup, "group.id must be %s", rollupGroup);
+  ctx.Assert(std::find(last.Topics.begin(), last.Topics.end(), metricsTopic) != last.Topics.end(),
+             "the consumer must read %s, got %q", metricsTopic, last.Topics);
+  const auto consumers = ctx.Kafka.Consumers();
+  ctx.Assert(!consumers.empty() && !consumers.back().AutoCommit,
+             "auto-commit is on (enable.auto.commit): offsets would be committed as read, not once per flushed batch");
+  ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(), "offsets were auto-committed");
+  ctx.Assert(!ctx.Kafka.EventsOf("manual-commit").empty(), "no explicit commit happened after the flush");
+  const int64_t lag = ctx.Kafka.Lag(rollupGroup, metricsTopic);
+  ctx.Equal(lag, 0, "%d flushed record(s) are not committed", lag);
+}
+
+void CheckBatchSize(harness::Ctx& ctx) {
+  seedMetrics(ctx, 120, roundRobin3);
+  rollupRecorder rec;
+  recordRollup(ctx, rec);
+  runRollup(ctx, rec);
+  ctx.Equal(rec.sizes(), {50, 50, 20}, "120 records must flush as [50, 50, 20]");
+  ctx.Equal(rec.log, {"flush 50", "commit", "flush 50", "commit", "flush 20", "commit"},
+            "expected flush, commit, flush, commit, flush, commit — one commit right after each flush");
+  std::set<metricPlace> seen;
+  size_t total = 0;
+  for (const auto& f : rec.flushes) {
+    for (const auto& p : f) {
+      seen.insert(p);
+      total++;
+    }
+  }
+  ctx.Equal(seen.size(), total, "a record was flushed twice: the batch must start empty after a flush; distinct records flushed");
+  size_t missing = 0;
+  const auto seeded = ctx.Kafka.Records(metricsTopic);
+  for (const auto& r : seeded)
+    if (!seen.count({r.Partition, r.Offset})) missing++;
+  ctx.Equal(seeded.size() - missing, seeded.size(), "%d seeded record(s) never reached flush; seeded records flushed", missing);
+  for (size_t i = 0; i < rec.flushes.size(); i++) {
+    const auto& f = rec.flushes[i];
+    std::vector<int> partitions;
+    for (const auto& p : f)
+      if (std::find(partitions.begin(), partitions.end(), p.first) == partitions.end()) partitions.push_back(p.first);
+    for (const int partition : partitions) {
+      std::vector<int64_t> offsets;
+      for (const auto& p : f)
+        if (p.first == partition) offsets.push_back(p.second);
+      ctx.Assert(std::is_sorted(offsets.begin(), offsets.end()),
+                 "flush %d holds partition %d out of order: %v — keep the records in delivery order", i + 1, partition,
+                 offsets);
+    }
+  }
+}
+
+void CheckBatchWait(harness::Ctx& ctx) {
+  seedMetrics(ctx, 70, roundRobin3);
+  rollupRecorder rec;
+  recordRollup(ctx, rec);
+  runRollup(ctx, rec);
+  ctx.Equal(rec.sizes(), {50, 20}, "70 records must flush as [50, 20] — the 20 once 500 ms pass with nothing new");
+  ctx.Equal(rec.commits.size(), 2, "expected one commit per batch");
+  // Measured from the previous commit (the batch starts right after it); a few real ms of slack.
+  const int64_t elapsed = rec.commits[1].at - rec.commits[0].at;
+  ctx.Assert(elapsed >= 490 && elapsed < 750, "the trailing batch must flush and commit 500 ms after it started, not %d ms later", elapsed);
+}
+
+void CheckCommitOffsets(harness::Ctx& ctx) {
+  seedMetrics(ctx, 55, [](int i) { return i < 50 ? 1 : 2; });
+  rollupRecorder rec;
+  recordRollup(ctx, rec);
+  runRollup(ctx, rec);
+  ctx.Equal(rec.flushes.size(), 2, "55 records on partitions 1 and 2 must flush as two batches, got sizes %v; batches", rec.sizes());
+  ctx.Equal(rec.commits.size(), rec.flushes.size(), "expected one commit per flush");
+  for (size_t i = 0; i < rec.flushes.size(); i++) {
+    const auto& commit = rec.commits[i];
+    ctx.Equal(commit.group, rollupGroup, "commit %d came from the wrong group", i + 1);
+    ctx.Equal(commit.offsets, expectedRollupCommit(rec.flushes[i]),
+              "commit %d must be the batch's highest offset + 1 per partition it touched", i + 1);
+  }
+  ctx.Assert(ctx.Kafka.CommittedOffset(rollupGroup, metricsTopic, 1) == 50 &&
+                 ctx.Kafka.CommittedOffset(rollupGroup, metricsTopic, 2) == 5,
+             "after both batches partition 1 must be committed at 50 and partition 2 at 5");
+  ctx.Equal(ctx.Kafka.CommittedOffset(rollupGroup, metricsTopic, 0), -1,
+            "partition 0 had no records: it must not appear in any commit (-1: no committed offset)");
+}
+
+void CheckNoEmptyFlush(harness::Ctx& ctx) {
+  seedMetrics(ctx, 50, roundRobin3);
+  rollupRecorder rec;
+  recordRollup(ctx, rec);
+  runRollup(ctx, rec);
+  for (const auto& f : rec.flushes) ctx.Assert(!f.empty(), "flush was called with an empty batch: flushes of sizes %v", rec.sizes());
+  ctx.Equal(rec.flushes.size(), 1, "exactly 50 records then silence must flush once; flushes");
+  ctx.Equal(rec.commits.size(), 1, "one batch, one commit; commits");
+}
+`,
   },
   debrief: `The batch is closed by whichever of two conditions comes first because each bounds a different thing: the count bounds how much one sink call carries (and how much is at risk between flush and commit), the clock bounds how stale the sink may be when the stream is quiet. The commit is built from the batch itself — one offset per partition the batch touched, the highest + 1 — so a partition the batch never saw is left alone and a crash after the flush replays at most one batch: at-least-once, batch-granular. \`consume(n, timeout)\` is that loop in one call in librdkafka; kafkajs's real client has \`eachBatch\`, but assembling the batch across \`eachMessage\` with a timer is what every "window by count or time" looks like inside a connector. Production versions add: commit what you hold when a partition is revoked (\`on_revoke\`), pause the partition when the sink is slow instead of blowing \`max.poll.interval.ms\`, retry or dead-letter a failed flush rather than crash-loop on it, and size the batch in bytes as well as records.`,
 };

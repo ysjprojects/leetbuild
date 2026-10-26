@@ -55,7 +55,7 @@ runtime does not run.`,
     ],
     edges: [{from: 'client', to: 'notes', kind: 'grpc', label: 'GetNote · DeleteNote + metadata'}],
   },
-  support: {python: protoModules, typescript: protoFiles, go: protoFiles},
+  support: {python: protoModules, typescript: protoFiles, go: protoFiles, cpp: protoFiles},
   steps: [metadataAuthStep],
   learn,
 };

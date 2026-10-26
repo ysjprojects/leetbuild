@@ -233,7 +233,9 @@ export interface Step {
    * `check_<id>(ctx)` the same way, see src/lib/runtime/ts/harness.ts. Go: a file of the learner's
    * package (compiled beside the step's file as harness_test.go) with one
    * `func Check<Id>(ctx *harness.Ctx)` per check (`release-atomic` → `CheckReleaseAtomic`), see
-   * goruntime/harness/ctx.go. Scala and C++ have none.
+   * goruntime/harness/ctx.go. C++: a file compiled in one translation unit after the step's file
+   * (so it sees the file's declarations) with one `void Check<Id>(harness::Ctx& ctx)` per check,
+   * see cppruntime/include/leetbuild/harness.h. Scala has none.
    */
   harness?: Partial<Record<Language, string>>;
   /**

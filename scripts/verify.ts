@@ -1,9 +1,9 @@
 /**
  * Checks every /leetbuild problem: the shape of the problem (steps, diagram, sequences, hints,
  * widgets), for every step in every language that the starter fails at least one static check
- * while the reference solution passes them all, and for every step with a Python, TypeScript or Go
- * harness that the solution passes every runtime check while the starter does not (the harnesses
- * run in the browser runtimes, here in Node). Run after editing problems:
+ * while the reference solution passes them all, and for every step with a Python, TypeScript, Go or
+ * C++ harness that the solution passes every runtime check while the starter does not (the
+ * harnesses run in the browser runtimes, here in Node). Run after editing problems:
  *
  *   yarn verify                               # everything
  *   yarn verify --problem image-cache         # one problem (by id or NN- prefix)
@@ -11,16 +11,21 @@
  *   yarn verify --verbose                     # list every check result
  *   yarn verify --no-runtime                  # static checks only (no Pyodide boot)
  *   yarn verify --runtime go                  # execute only the Go harnesses (no Pyodide boot)
+ *   yarn verify --runtime python,typescript   # execute only those languages' harnesses
  */
-import {existsSync, readFileSync} from 'node:fs';
-import {resolve} from 'node:path';
+import {fork} from 'node:child_process';
+import {existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
+import {cpus, tmpdir, totalmem} from 'node:os';
+import {join, resolve} from 'node:path';
 
 import {architectureProblems} from '../src/lib/architecture';
 import {gpuProblems} from '../src/lib/gpuFigure';
 import {describePattern, judge, matches, stripComments} from '../src/lib/judge';
 import {malformedBlocksOf, widgetsOf} from '../src/lib/markdown';
+import {CLANG_VERSION, CPP_UNSUPPORTED, cppSupported} from '../src/lib/runtime/cpp/support';
 import {
   type NodeRuntime,
+  createNodeCppRuntime,
   createNodeGoRuntime,
   createNodePythonRuntime,
   createNodeTypeScriptRuntime,
@@ -40,6 +45,8 @@ import {
   SYSTEMS_CONCEPTS,
 } from '../src/lib/types';
 import {WIDGETS} from '../src/lib/widgets';
+import {clangVersion, CPP_RUNTIME_MANIFEST, cppPackFromSources, cppRuntimeFresh} from './cpp-runtime';
+import {fetchCpp} from './fetch-cpp';
 import {fetchTorch} from './fetch-torch';
 import {GO_RUNTIME_MANIFEST, goRuntimeHash} from './go-runtime';
 
@@ -52,8 +59,24 @@ const onlyProblem = flag('--problem');
 const onlyFile = flag('--file');
 const verbose = args.includes('--verbose');
 const withRuntime = !args.includes('--no-runtime');
-/** `--runtime typescript`: run only that language's harnesses (static checks still cover every language). */
-const onlyRuntime = flag('--runtime');
+/**
+ * `--runtime typescript` (or `python,typescript`): run only those languages' harnesses (static
+ * checks still cover every language).
+ */
+const onlyRuntimes = flag('--runtime')?.split(',') ?? null;
+
+/** Where this run keeps the C++ programs its workers compile ahead (a fresh directory, removed on exit). */
+let cppProgramDir: string | null = null;
+const cppPrograms = (): string => {
+  if (cppProgramDir === null) {
+    const dir = (cppProgramDir = mkdtempSync(join(tmpdir(), 'leetbuild-cpp-programs-')));
+    process.on('exit', () => rmSync(dir, {recursive: true, force: true}));
+    // Interrupted, the run still exits through 'exit' (Node skips it on a signal it has no handler for).
+    process.once('SIGINT', () => process.exit(130));
+    process.once('SIGTERM', () => process.exit(143));
+  }
+  return cppProgramDir;
+};
 
 const MIN_STEPS = 4;
 const MIN_CHECKS = 3;
@@ -404,6 +427,18 @@ const EXECUTING: {
     declares: (harness, name) => new RegExp(`^func ${name}\\(\\w+ \\*harness\\.Ctx\\)`, 'm').test(harness),
     boot: createNodeGoRuntime,
   },
+  {
+    language: 'cpp',
+    checkName: goCheckName,
+    declares: (harness, name) => new RegExp(`^void ${name}\\(harness::Ctx& \\w+\\)`, 'm').test(harness),
+    boot: async () => {
+      if (!cppSupported()) throw new Error(`${CPP_UNSUPPORTED} (Node 24+ for yarn verify; this is ${process.version})`);
+      await fetchCpp();
+      // A stale committed pack (reported below) gives way to one built from the sources in the tree.
+      const pack = cppRuntimeFresh() ? undefined : await cppPackFromSources(line => console.log(`  ${line}`));
+      return createNodeCppRuntime(pack, cppPrograms());
+    },
+  },
 ];
 
 /** A run's ending, for a message: the runtime failure, or the exit status and the last lines it printed to stderr. */
@@ -453,6 +488,59 @@ function goRuntimeFreshness(): string[] {
     : ['public/go/runtime.wasm.gz was built from other goruntime/ sources than these: run yarn build:go'];
 }
 
+/**
+ * The C++ runtime's pack must come from the committed cppruntime/ sources (`yarn build:cpp` records
+ * their hash), and the browser must load the compiler `yarn verify` and the build ran.
+ */
+function cppRuntimeFreshness(): string[] {
+  const errors =
+    clangVersion() === CLANG_VERSION
+      ? []
+      : [`CLANG_VERSION (src/lib/runtime/cpp/support.ts) is ${CLANG_VERSION}, @yowasp/clang is ${clangVersion()}`];
+  if (!existsSync(CPP_RUNTIME_MANIFEST)) return [...errors, `${CPP_RUNTIME_MANIFEST} is missing: run yarn build:cpp`];
+  if (!cppRuntimeFresh()) {
+    errors.push('public/cpp/runtime.pack.gz was built from other cppruntime/ sources than these: run yarn build:cpp');
+  }
+  return errors;
+}
+
+/**
+ * Compile every C++ program this run checks — each harnessed step's solution and starter, with its
+ * neighbours — in worker processes, one per spare core, into the directory the C++ runtime loads
+ * programs from. Clang runs single-threaded in WebAssembly: compiled one after another, the C++
+ * programs alone would take most of `yarn verify`.
+ */
+async function precompileCpp(problems: Problem[]): Promise<void> {
+  const jobs = problems.flatMap(problem =>
+    problem.steps
+      .filter(step => step.harness?.cpp !== undefined)
+      .flatMap(step => [
+        runJob(problem, step, 'cpp', codeFor(step, 'cpp').solution),
+        runJob(problem, step, 'cpp', codeFor(step, 'cpp').starter),
+      ]),
+  );
+  // A worker peaks near 2 GB (Node, clang, the sysroot); past what memory holds (4 GB left to this
+  // process's runtimes), more workers only swap.
+  const byMemory = Math.floor((totalmem() - 2 ** 32) / 2 ** 31);
+  const workers = Math.min(Math.max(1, cpus().length - 1), byMemory, 8, Math.ceil(jobs.length / 4));
+  if (workers < 2) return;
+  const file = join(cppPrograms(), 'jobs.json');
+  writeFileSync(file, JSON.stringify(jobs));
+  const started = Date.now();
+  await Promise.all(
+    Array.from(
+      {length: workers},
+      (_, i) =>
+        new Promise<void>((done, fail) => {
+          const args = [file, cppPrograms(), String(i), String(workers)];
+          const child = fork('scripts/cpp-compile-worker.ts', args, {execArgv: ['--import', 'tsx']});
+          child.on('exit', code => (code === 0 ? done() : fail(new Error(`a C++ compile worker exited with ${code}`))));
+        }),
+    ),
+  );
+  console.log(`✓ ${jobs.length} C++ programs compiled ahead by ${workers} workers (${Date.now() - started} ms)`);
+}
+
 /** Runtime checks of one problem in one language: harness shape, solution passes, starter does not. */
 async function verifyRuntime(
   problem: Problem,
@@ -489,8 +577,8 @@ async function verifyRuntime(
 }
 
 async function main(): Promise<void> {
-  const errors: string[] = [...judgeSelfTest(), ...goRuntimeFreshness()];
-  console.log(`${errors.length === 0 ? '✓' : '✗'} judge self-tests, Go runtime built from these sources`);
+  const errors: string[] = [...judgeSelfTest(), ...goRuntimeFreshness(), ...cppRuntimeFreshness()];
+  console.log(`${errors.length === 0 ? '✓' : '✗'} judge self-tests, Go and C++ runtimes built from these sources`);
   const problems = await loadProblems();
   const ids = new Set<string>();
   let steps = 0;
@@ -501,7 +589,7 @@ async function main(): Promise<void> {
   const runtimes: Partial<Record<Language, NodeRuntime>> = {};
   if (withRuntime)
     for (const {language, boot} of EXECUTING) {
-      if (onlyRuntime !== null && onlyRuntime !== language) continue;
+      if (onlyRuntimes !== null && !onlyRuntimes.includes(language)) continue;
       const programsHere =
         language === 'python' && selected.some(p => p.steps.some(s => runsAsProgram(p, s, language)));
       if (!programsHere && !selected.some(p => p.steps.some(s => s.harness?.[language] !== undefined))) continue;
@@ -510,6 +598,7 @@ async function main(): Promise<void> {
       runtimes[language] = await boot();
       console.log(`✓ ${language} runtime booted (${Date.now() - started} ms)`);
     }
+  if (runtimes.cpp !== undefined) await precompileCpp(selected);
   for (const problem of problems) {
     if (ids.has(problem.id)) errors.push(`duplicate problem id '${problem.id}'`);
     ids.add(problem.id);

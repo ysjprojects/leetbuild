@@ -642,7 +642,7 @@ std::unique_ptr<RdKafka::KafkaConsumer> connect() {
 }
 
 auto consumer = connect();
-const std::regex kAccountField(R"("account"\\s*:\\s*"([^"]+)")");
+const std::regex kAccountField(R"re("account"\\s*:\\s*"([^"]+)")re");
 const std::regex kDeltaField(R"("delta"\\s*:\\s*(-?\\d+))");
 
 Store store() { return Store{applied, watermark}; }
@@ -702,7 +702,7 @@ std::unique_ptr<RdKafka::KafkaConsumer> connect() {
 }
 
 auto consumer = connect();
-const std::regex kAccountField(R"("account"\\s*:\\s*"([^"]+)")");
+const std::regex kAccountField(R"re("account"\\s*:\\s*"([^"]+)")re");
 const std::regex kDeltaField(R"("delta"\\s*:\\s*(-?\\d+))");
 
 Store store() { return Store{applied, watermark}; }
@@ -1003,6 +1003,107 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 			ctx.Equal(c.store.Applied["a"], expected[offset], "committing offset %d: the apply must come before the commit; a", offset)
 		}
 	}
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+// seedTransfers puts transfers on one partition, in this order.
+void seedTransfers(harness::Ctx& ctx, int partition, const std::vector<std::pair<std::string, int>>& transfers) {
+  for (const auto& [account, delta] : transfers)
+    ctx.Kafka.SeedPartition("transfers", partition, account,
+                            R"({"account":")" + account + R"(","delta":)" + std::to_string(delta) + "}");
+}
+
+// drainBalances runs the consumer until it waits for transfers that will not come.
+void drainBalances(harness::Ctx& ctx) { ctx.Drain([] { run(); }); }
+
+}  // namespace
+
+void CheckApplies(harness::Ctx& ctx) {
+  seedTransfers(ctx, 0, {{"a", 100}, {"a", -30}});
+  seedTransfers(ctx, 1, {{"b", 50}, {"b", -50}});
+  seedTransfers(ctx, 2, {{"c", 7}});
+  drainBalances(ctx);
+  ctx.Equal(store().applied, std::map<std::string, int64_t>{{"a", 70}, {"b", 0}, {"c", 7}}, "the balances");
+}
+
+void CheckManualCommit(harness::Ctx& ctx) {
+  seedTransfers(ctx, 0, {{"a", 1}, {"b", 2}});
+  drainBalances(ctx);
+  const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
+  bool ok = !subscriptions.empty();
+  if (ok) {
+    const auto& last = subscriptions.back();
+    ok = last.Group == "balances" && std::find(last.Topics.begin(), last.Topics.end(), "transfers") != last.Topics.end();
+  }
+  ctx.Assert(ok, "the consumer must subscribe to transfers in group balances");
+  ctx.Equal(ctx.Kafka.EventsOf("auto-commit").size(), 0, "offsets were committed on a timer, before the apply: auto-commits");
+  ctx.Assert(!ctx.Kafka.EventsOf("manual-commit").empty(), "no explicit commit happened");
+  ctx.Equal(ctx.Kafka.CommittedOffset("balances", "transfers", 0), 2, "partition 0's committed offset");
+  ctx.Equal(ctx.Kafka.Lag("balances", "transfers"), 0, "every processed record must be committed: lag");
+}
+
+void CheckSkipsRedelivery(harness::Ctx& ctx) {
+  seedTransfers(ctx, 0, {{"a", 10}, {"a", 5}, {"b", 3}});
+  seedTransfers(ctx, 1, {{"b", 4}});
+  drainBalances(ctx);
+  const Store before = store();
+  ctx.Equal(before.applied, std::map<std::string, int64_t>{{"a", 15}, {"b", 7}}, "the balances after the first run");
+  // The commits for offsets 1 and 2 of partition 0 never landed: the group resumes from 1.
+  ctx.Kafka.Commit("balances", {{{"transfers", 0}, 1}});
+  restart();
+  drainBalances(ctx);
+  const Store after = store();
+  ctx.Equal(after.applied, std::map<std::string, int64_t>{{"a", 15}, {"b", 7}}, "redelivered records must not be applied again: the balances");
+  ctx.Equal(after.watermark, before.watermark, "the watermark must not move on a redelivery");
+  ctx.Equal(ctx.Kafka.CommittedOffset("balances", "transfers", 0), 3,
+            "skipped records must still be committed, or they are redelivered forever: partition 0's committed offset");
+  ctx.Equal(ctx.Kafka.Lag("balances", "transfers"), 0, "every record must be committed after the restart: lag");
+}
+
+void CheckWatermark(harness::Ctx& ctx) {
+  seedTransfers(ctx, 0, {{"a", 1}, {"a", 1}, {"a", 1}});
+  seedTransfers(ctx, 1, {{"b", 1}, {"b", 1}});
+  drainBalances(ctx);
+  ctx.Equal(store().watermark, std::map<int, int64_t>{{0, 2}, {1, 1}},
+            "the watermark (the last applied offset per partition, no entry for partition 2)");
+}
+
+void CheckFreshPartition(harness::Ctx& ctx) {
+  seedTransfers(ctx, 2, {{"z", 9}});
+  drainBalances(ctx);
+  const Store s = store();
+  ctx.Equal(s.applied, std::map<std::string, int64_t>{{"z", 9}}, "the first record of a partition (offset 0) must be applied: the balances");
+  ctx.Equal(s.watermark, std::map<int, int64_t>{{2, 0}}, "the watermark");
+}
+
+void CheckCommitAfter(harness::Ctx& ctx) {
+  seedTransfers(ctx, 0, {{"a", 5}, {"a", 6}});
+  std::vector<std::pair<harness::KafkaOffsets, Store>> atCommit;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) { atCommit.emplace_back(offsets, store()); });
+  drainBalances(ctx);
+  ctx.Assert(!atCommit.empty(), "the offsets were never committed");
+  const std::map<int64_t, int64_t> expected = {{1, 5}, {2, 11}};
+  for (const auto& [offsets, s] : atCommit) {
+    for (const auto& [tp, offset] : offsets) {
+      const auto it = s.watermark.find(tp.Partition);
+      const std::optional<int64_t> wm = it == s.watermark.end() ? std::nullopt : std::optional<int64_t>(it->second);
+      ctx.Equal(wm, offset - 1, "committing %s → %d: the watermark must move before the commit; the watermark", tp, offset);
+      const auto a = s.applied.find("a");
+      ctx.Equal(a == s.applied.end() ? 0 : a->second, expected.count(offset) ? expected.at(offset) : -1,
+                "committing offset %d: the apply must come before the commit; a", offset);
+    }
+  }
 }
 `,
   },

@@ -7,7 +7,7 @@ import {chatStreamStep} from './steps/2-chat-stream';
 import {fanOutTopicStep} from './steps/3-fan-out-topic';
 import {historyEndpointStep} from './steps/4-history-endpoint';
 import {recentCacheStep} from './steps/5-recent-cache';
-import {supportModules, supportModulesGo, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Live chat fan-out: presence with TTL heartbeats in Redis → one gRPC bidirectional stream per
@@ -78,6 +78,7 @@ are what every live fan-out system — chat, collaborative editing, live dashboa
     python: {...protoModules, ...supportModules},
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
   },
   learn,
 };

@@ -738,6 +738,83 @@ func CheckBatched(ctx *harness.Ctx) {
 	ctx.Assert(slices.Contains(calls, "MGET") || len(trips) <= 2, "onlineMembers issued %v: expected SMEMBERS then one MGET (or one pipeline)", trips)
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <map>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace {
+
+// presence:{user} as Redis holds it, nullopt when the key does not exist.
+std::optional<std::string> presenceOf(harness::Ctx& ctx, const std::string& user) {
+  return ctx.Redis.Get("presence:" + user);
+}
+
+}  // namespace
+
+void CheckTtl(harness::Ctx& ctx) {
+  heartbeat("ana", "srv-a");
+  ctx.Equal(presenceOf(ctx, "ana"), "srv-a", "presence:ana");
+  long long ttl = ctx.Redis.TTL("presence:ana");
+  ctx.Assert(25 <= ttl && ttl <= 30, "presence:ana has TTL %d, expected 30 s", ttl);
+  ctx.Clock.Advance(20);
+  heartbeat("ana", "srv-a");
+  ttl = ctx.Redis.TTL("presence:ana");
+  ctx.Assert(25 <= ttl && ttl <= 30, "a heartbeat must restart the 30 s lease; TTL after the second beat is %d", ttl);
+  ctx.Clock.Advance(31);
+  ctx.Equal(presenceOf(ctx, "ana"), nullptr, "a user who stopped heartbeating must vanish after 30 s: presence:ana");
+}
+
+void CheckMembership(harness::Ctx& ctx) {
+  join_room("room-7", "ana");
+  join_room("room-7", "bo");
+  join_room("room-7", "ana");
+  ctx.Equal(ctx.Redis.SMembers("room:room-7:members"), {"ana", "bo"}, "room:room-7:members (a set: joining twice adds once)");
+  leave("room-7", "ana");
+  ctx.Equal(ctx.Redis.SMembers("room:room-7:members"), {"bo"}, "after ana leaves, room:room-7:members");
+}
+
+void CheckLeaveClears(harness::Ctx& ctx) {
+  join_room("room-7", "ana");
+  heartbeat("ana", "srv-a");
+  leave("room-7", "ana");
+  ctx.Equal(presenceOf(ctx, "ana"), nullptr,
+            "an explicit leave must DEL presence:{user} instead of waiting for the TTL: presence:ana");
+  ctx.Assert(!ctx.Redis.SIsMember("room:room-7:members", "ana"), "leave must SREM the user from the room set");
+}
+
+void CheckBatched(harness::Ctx& ctx) {
+  auto online = online_members("empty-room");
+  ctx.Assert(online.empty(), "a room with no members has nobody online: online_members(%q) is %v", "empty-room", online);
+  for (const std::string user : {"ana", "bo", "cy"}) join_room("room-7", user);
+  heartbeat("ana", "srv-a");
+  heartbeat("cy", "srv-b");
+  heartbeat("dee", "srv-b");  // alive but not a member of room-7
+  online = online_members("room-7");
+  ctx.Equal(online, std::map<std::string, std::string>{{"ana", "srv-a"}, {"cy", "srv-b"}},
+            "online_members(%q) (bo never heartbeat)", "room-7");
+  ctx.Clock.Advance(31);
+  heartbeat("ana", "srv-a");
+  online = online_members("room-7");
+  ctx.Equal(online, std::map<std::string, std::string>{{"ana", "srv-a"}}, "after cy's lease expired online_members(%q)",
+            "room-7");
+  // Round trips: one SMEMBERS plus one MGET (or one pipeline), never a GET per member.
+  const size_t before = ctx.Redis.RoundTrips().size();
+  online_members("room-7");
+  const auto all = ctx.Redis.RoundTrips();
+  const std::vector<std::vector<std::string>> trips(all.begin() + static_cast<long>(before), all.end());
+  std::vector<std::string> calls;
+  for (const auto& trip : trips) calls.insert(calls.end(), trip.begin(), trip.end());
+  const auto has = [&](const std::string& name) { return std::find(calls.begin(), calls.end(), name) != calls.end(); };
+  ctx.Assert(!has("GET"), "online_members issued %v: resolve every presence key in one MGET or one pipeline, not a GET per member",
+             trips);
+  ctx.Assert(has("MGET") || trips.size() <= 2, "online_members issued %v: expected SMEMBERS then one MGET (or one pipeline)",
+             trips);
+}
+`,
   },
   debrief: `Presence is the canonical use of a TTL as a *liveness lease*: the client renews it, and the absence of renewals is the failure signal — no health checker, no reaper job. Membership stays in a separate set because it outlives the connection. The MGET is the part that scales: one round trip per room view instead of one per member. Real systems shard presence by user, publish transitions (online → offline) instead of polling, and keep a "last seen" timestamp next to the lease so the UI can say "5 minutes ago".`,
 };

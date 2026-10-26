@@ -623,6 +623,93 @@ func CheckNoStore(ctx *harness.Ctx) {
 	ctx.Assert(strings.Contains(strings.ToLower(cacheControl), "no-store"), "the 200 carries Cache-Control %q, expected no-store", cacheControl)
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace {
+
+void seedBook(harness::Ctx& ctx, const std::string& symbol, const std::string& bid, const std::string& ask, const std::string& last) {
+  ctx.Redis.Do("HSET", "book:" + symbol, "bid", bid, "ask", ask, "last", last);
+}
+
+// bodyNumber is the TypeScript Number(body[k] ?? -1): a JSON number, or a string holding one.
+double bodyNumber(const harness::Any& v) {
+  if (v.IsNil()) return -1;
+  if (v.IsNumber()) return v.Float();
+  if (v.IsString()) {
+    const std::string& text = v.String();
+    char* end = nullptr;
+    const double n = std::strtod(text.c_str(), &end);
+    if (!text.empty() && end == text.c_str() + text.size()) return n;
+  }
+  return -2;
+}
+
+// The body decoded the way encoding/json decodes into map[string]any (nil when it is not JSON).
+harness::Any decode(const harness::Response& r) { return harness::ParseJSON(r.Text()).value_or(harness::Any()); }
+
+}  // namespace
+
+void CheckValidate(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  seedBook(ctx, "ACME", "10.05", "10.06", "10.05");
+  // A probe on each invalid symbol's key: it fires if any Redis command ever touches it.
+  std::vector<std::string> touched;
+  for (const std::string symbol : {"acme", "ACME1", "TOOLONGX", "AC-ME"}) {
+    const std::string key = "book:" + symbol;
+    ctx.Redis.After(key, [&touched, key] { touched.push_back(key); });
+    const auto r = c.Get("/book/" + symbol);
+    ctx.Equal(r.Status, 400, "GET /book/%s", symbol);
+  }
+  ctx.Equal(touched, std::vector<std::string>{}, "an invalid symbol must be rejected before any Redis call; keys read");
+  const auto r = c.Get("/book/ACME");
+  ctx.Equal(r.Status, 200, "GET /book/ACME");
+}
+
+void CheckHash(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  seedBook(ctx, "ACME", "10.05", "10.06", "10.05");
+  seedBook(ctx, "BETA", "1", "2", "1.5");
+  const auto r = c.Get("/book/ACME");
+  ctx.Equal(r.Status, 200, "GET /book/ACME");
+  const harness::Any body = decode(r);
+  ctx.Equal(body["symbol"], "ACME", "the body must name the symbol, got %s; symbol", r.Text());
+  std::map<std::string, double> got;
+  for (const std::string k : {"bid", "ask", "last"}) got[k] = bodyNumber(body[k]);
+  ctx.Equal(got, std::map<std::string, double>{{"bid", 10.05}, {"ask", 10.06}, {"last", 10.05}},
+            "the body must carry bid/ask/last from book:ACME, got %s", r.Text());
+  const auto r2 = c.Get("/book/BETA");
+  double last = -1.0;
+  if (r2.Status == 200) last = bodyNumber(decode(r2)["last"]);
+  ctx.Assert(r2.Status == 200 && last == 1.5, "GET /book/BETA must read book:BETA, got %d %s", r2.Status, r2.Text());
+}
+
+void CheckNotFound(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  auto r = c.Get("/book/GHOST");
+  ctx.Equal(r.Status, 404, "GET /book/GHOST with no hash");
+  seedBook(ctx, "GHOST", "10.05", "10.06", "10.05");
+  r = c.Get("/book/GHOST");
+  ctx.Equal(r.Status, 200, "once book:GHOST exists, GET /book/GHOST");
+}
+
+void CheckNoStore(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  seedBook(ctx, "ACME", "10.05", "10.06", "10.05");
+  const auto r = c.Get("/book/ACME");
+  ctx.Equal(r.Status, 200, "GET /book/ACME");
+  const std::string cacheControl = r.HeaderValue("Cache-Control");
+  std::string lower = cacheControl;
+  std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  ctx.Assert(lower.find("no-store") != std::string::npos, "the 200 carries Cache-Control %q, expected no-store", cacheControl);
+}
+`,
   },
   debrief: `The same three-exit shape as the first HTTPS step — validate, look up, represent — with the cache policy flipped: \`no-store\` because the resource's truth has a lifetime of one trade. Validating the path segment before the Redis call is not pedantry; it is what keeps \`GET /book/../../admin\`-style input from ever reaching a key. Real market-data APIs add \`ETag\`s made from the tick sequence number (so a poll can be cheap when nothing changed), rate limits per API key, and serve depth (the full ladder) from a snapshot log rather than one hash.`,
 };

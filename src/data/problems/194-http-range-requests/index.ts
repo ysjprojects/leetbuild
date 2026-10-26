@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {CPP_DIGEST_H} from '../cpp-support';
 import {learn} from './learn';
 import {byteRangesStep} from './steps/1-byte-ranges';
 
@@ -53,5 +54,6 @@ front.`,
     edges: [{from: 'client', to: 'service', kind: 'http', label: '206 slice · 416 */len · 200 whole'}],
   },
   steps: [byteRangesStep],
+  support: {cpp: {'sha256.h': CPP_DIGEST_H}},
   learn,
 };

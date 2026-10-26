@@ -1224,6 +1224,164 @@ func CheckComplete(ctx *harness.Ctx) {
 	ctx.Assert(len(keys) == 0, "after completing every job nothing remains, but Redis holds %q", keys)
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <optional>
+#include <string>
+#include <tuple>
+#include <vector>
+
+namespace {
+
+// A job as {ID Payload Attempt}, comparable and printable the way Go's Job struct is.
+using DjJob = std::tuple<std::string, std::string, int>;
+
+std::vector<DjJob> djJobs(const std::vector<Job>& jobs) {
+  std::vector<DjJob> out;
+  for (const auto& j : jobs) out.emplace_back(j.id, j.payload, j.attempt);
+  return out;
+}
+
+std::vector<std::string> djIDs(const std::vector<Job>& jobs) {
+  std::vector<std::string> ids;
+  for (const auto& j : jobs) ids.push_back(j.id);
+  return ids;
+}
+
+// The job's score in jobs:delayed, or nullopt when it is not there.
+std::optional<double> djScore(harness::Ctx& ctx, const std::string& id) { return ctx.Redis.ZScore("jobs:delayed", id); }
+
+std::vector<std::string> djDelayed(harness::Ctx& ctx) {
+  std::vector<std::string> ids;
+  for (const auto& z : ctx.Redis.ZRangeWithScores("jobs:delayed", 0, -1)) ids.push_back(z.Member);
+  return ids;
+}
+
+}  // namespace
+
+void CheckScheduled(harness::Ctx& ctx) {
+  schedule("a", "send-email:a", 5000);
+  schedule("b", "send-email:b", 2000);
+  ctx.Equal(ctx.Redis.HGet("jobs:payload", "a"), "send-email:a", "jobs:payload a must hold the payload");
+  ctx.Equal(djScore(ctx, "a"), 5000, "jobs:delayed must score a at runAtMs 5000");
+  ctx.Equal(djScore(ctx, "b"), 2000, "jobs:delayed must score b at runAtMs 2000");
+  ctx.Equal(ctx.Redis.Keys("*"), std::vector<std::string>{"jobs:delayed", "jobs:payload"}, "schedule must write exactly jobs:payload and jobs:delayed");
+  const auto early = djJobs(pop_due(1999, 10));
+  ctx.Assert(early.empty(), "at 1999 ms nothing is due (b is due at 2000), got %+v", early);
+  ctx.Equal(ctx.Redis.ZCard("jobs:delayed"), 2, "a pop that returned nothing must remove nothing: ZCARD jobs:delayed");
+  ctx.Equal(djJobs(pop_due(2000, 10)), std::vector<DjJob>{{"b", "send-email:b", 0}}, "at 2000 ms exactly b is due");
+  ctx.Equal(djDelayed(ctx), std::vector<std::string>{"a"}, "after popping b jobs:delayed must hold only a");
+  ctx.Equal(ctx.Redis.HGet("jobs:payload", "b"), "send-email:b", "popping must not delete the payload: complete does");
+}
+
+void CheckDueInOrder(harness::Ctx& ctx) {
+  const std::vector<std::pair<std::string, long long>> seed{{"j3", 3000}, {"j1", 1000}, {"j5", 5000}, {"j2", 2000}, {"j4", 4000}};
+  for (const auto& [id, runAt] : seed) schedule(id, "payload-" + id, runAt);
+  const auto first = pop_due(3500, 2);
+  ctx.Equal(djIDs(first), std::vector<std::string>{"j1", "j2"}, "at 3500 ms with limit 2 the two earliest due jobs are j1, j2");
+  ctx.Equal(djJobs(first), std::vector<DjJob>{{"j1", "payload-j1", 0}, {"j2", "payload-j2", 0}}, "each job is {ID, Payload, Attempt}");
+  ctx.Equal(djDelayed(ctx), std::vector<std::string>{"j3", "j4", "j5"}, "the jobs beyond the limit must stay in jobs:delayed");
+  ctx.Equal(djIDs(pop_due(3500, 10)), std::vector<std::string>{"j3"}, "j3 is the only job still due at 3500 ms");
+  ctx.Equal(djIDs(pop_due(10000, 10)), std::vector<std::string>{"j4", "j5"}, "at 10000 ms the rest pop in runAt order");
+  const auto drained = djJobs(pop_due(10000, 10));
+  ctx.Assert(drained.empty(), "a drained set pops nothing, got %+v", drained);
+  ctx.Equal(ctx.Redis.ZCard("jobs:delayed"), 0, "every job was popped; jobs:delayed must be empty");
+}
+
+void CheckAtomicClaim(harness::Ctx& ctx) {
+  schedule("solo", "p", 100);
+  ctx.Equal(djIDs(pop_due(100, 10)), std::vector<std::string>{"solo"}, "the jobs due at 100 ms");
+  ctx.Equal(djScore(ctx, "solo"), nullptr, "a popped job must be gone from jobs:delayed: the script ZREMs what it returns");
+  for (int i = 0; i < 3; i++) {
+    schedule(harness::Sprintf("j%d", i), harness::Sprintf("p%d", i), 1000);
+  }
+  // A second worker's popDue lands right after the first command that touches jobs:delayed —
+  // between a client-side ZRANGEBYSCORE and its ZREM, or after the whole script.
+  bool fired = false;
+  std::optional<std::string> rivalErr;
+  std::vector<Job> his;
+  ctx.Redis.After("jobs:delayed", [&] {
+    fired = true;
+    try {
+      his = pop_due(1000, 10);
+    } catch (const std::exception& e) {
+      rivalErr = e.what();
+    }
+  });
+  const auto mine = pop_due(1000, 10);
+  ctx.Assert(fired, "popDue never touched jobs:delayed as a script key: pass it as KEYS[1]");
+  ctx.Assert(!rivalErr, "the second worker's popDue failed: %v", rivalErr);
+  std::vector<std::string> shared;
+  for (const auto& a : djIDs(mine)) {
+    for (const auto& b : djIDs(his)) {
+      if (a == b) shared.push_back(a);
+    }
+  }
+  ctx.Assert(shared.empty(), "two workers popping at once both got %q: a ZRANGEBYSCORE followed by a separate ZREM lets both read the same ids. Read and remove inside one Lua script", shared);
+  auto all = djIDs(mine);
+  for (const auto& id : djIDs(his)) all.push_back(id);
+  std::sort(all.begin(), all.end());
+  ctx.Assert(harness::Value(all) == "[j0 j1 j2]", "between them the two workers must get every due job once: %q and %q", djIDs(mine), djIDs(his));
+  ctx.Assert(ctx.Redis.ZCard("jobs:delayed") == 0, "jobs:delayed still holds %q after both pops", djDelayed(ctx));
+}
+
+void CheckBackoff(harness::Ctx& ctx) {
+  schedule("j", "p", 0);
+  long long now = 0;
+  const std::vector<long long> delays{1000, 2000, 4000, 8000};
+  for (int failures = 0; failures < static_cast<int>(delays.size()); failures++) {
+    const long long delay = delays[static_cast<size_t>(failures)];
+    ctx.Equal(djJobs(pop_due(now, 10)), std::vector<DjJob>{{"j", "p", failures}}, "at %d ms the job is due with %d failure(s) so far", now, failures);
+    ctx.Equal(fail("j", now), now + delay, "failure %d must reschedule at now + %d ms: the runAtMs fail returned", failures + 1, delay);
+    ctx.Equal(djScore(ctx, "j"), now + delay, "after failure %d jobs:delayed must score j at now + %d ms", failures + 1, delay);
+    ctx.Equal(ctx.Redis.HGet("jobs:attempts", "j"), std::to_string(failures + 1), "jobs:attempts j after %d failure(s)", failures + 1);
+    const auto early = djJobs(pop_due(now + delay - 1, 10));
+    ctx.Assert(early.empty(), "1 ms before its new runAt the job must not pop, got %+v", early);
+    now += delay;
+  }
+  ctx.Equal(djJobs(pop_due(now, 10)), std::vector<DjJob>{{"j", "p", 4}}, "the fifth run sees 4 failures");
+  ctx.Equal(fail("j", now), nullptr, "the fifth failure must not reschedule: fail returns rescheduled false");
+  ctx.Equal(djScore(ctx, "j"), nullptr, "a dead job must not be in jobs:delayed");
+  ctx.Equal(ctx.Redis.LRange("jobs:dead", 0, -1), std::vector<std::string>{"j"}, "jobs:dead");
+  ctx.Equal(ctx.Redis.HGet("jobs:attempts", "j"), nullptr, "a dead job's attempt count is dropped");
+  ctx.Equal(ctx.Redis.HGet("jobs:payload", "j"), "p", "a dead job's payload stays for inspection");
+  const auto late = djJobs(pop_due(1000000000, 10));
+  ctx.Assert(late.empty(), "a dead job never pops again, got %+v", late);
+}
+
+void CheckBackoffCap(harness::Ctx& ctx) {
+  const std::vector<std::pair<int, long long>> cases{{1, 1000}, {2, 2000}, {3, 4000}, {4, 8000}, {5, 16000}, {6, 32000}, {7, 60000}, {8, 60000}, {12, 60000}};
+  for (const auto& [attempt, want] : cases) {
+    ctx.Equal(backoff_ms(attempt), want, "backoffMs(%d): baseMs * 2^(attempt - 1) capped at maxBackoffMs", attempt);
+  }
+  schedule("j", "p", 0);
+  pop_due(0, 10);
+  ctx.Equal(fail("j", 500000), 501000, "the first failure at 500000 ms must reschedule at 501000");
+  pop_due(501000, 10);
+  ctx.Equal(fail("j", 501000), 503000, "the second failure at 501000 ms must reschedule at 503000");
+}
+
+void CheckComplete(harness::Ctx& ctx) {
+  schedule("a", "pa", 0);
+  schedule("b", "pb", 5000);
+  ctx.Equal(djIDs(pop_due(0, 10)), std::vector<std::string>{"a"}, "the jobs due at 0 ms");
+  fail("a", 0);
+  ctx.Equal(djIDs(pop_due(1000, 10)), std::vector<std::string>{"a"}, "the jobs due at 1000 ms");
+  complete("a");
+  ctx.Equal(ctx.Redis.HGet("jobs:payload", "a"), nullptr, "complete must delete the payload");
+  ctx.Equal(ctx.Redis.HGet("jobs:attempts", "a"), nullptr, "complete must delete the attempt count");
+  ctx.Equal(djScore(ctx, "a"), nullptr, "a completed job is not in jobs:delayed");
+  bool dead = false;
+  for (const auto& id : ctx.Redis.LRange("jobs:dead", 0, -1)) dead = dead || id == "a";
+  ctx.Assert(!dead, "a completed job is not in jobs:dead");
+  ctx.Assert(ctx.Redis.HGet("jobs:payload", "b") == "pb" && djScore(ctx, "b") == 5000.0, "completing a must leave b untouched");
+  ctx.Equal(djIDs(pop_due(5000, 10)), std::vector<std::string>{"b"}, "the jobs due at 5000 ms");
+  complete("b");
+  const auto keys = ctx.Redis.Keys("*");
+  ctx.Assert(keys.empty(), "after completing every job nothing remains, but Redis holds %q", keys);
+}
+`,
   },
   debrief: `The queue is three structures and one script. The sorted set is the index by time, so "what is due" is a range query, not a scan; the hashes keep the payload and the failure count out of the member name so a reschedule is a score update, not a rewrite. The script is the whole point: \`ZRANGEBYSCORE\` then \`ZREM\` from the client is two round trips with a window in between, and every worker that polls in that window runs the same job — the probe in the atomic-claim check lands exactly there. Inside Lua nothing interleaves, so a returned id is a claimed id. The backoff is deliberately plain — doubling from a base, capped, with a hard attempt limit that moves the job to a dead list instead of retrying forever. Real systems (Sidekiq, Celery's Redis broker, BullMQ) add jitter so a thundering herd of retries spreads out, a *processing* set with a visibility timeout so a worker that crashes mid-job is not a lost job, per-queue priorities, and \`SCRIPT LOAD\` + \`EVALSHA\` so the script text is not re-sent on every poll.`,
 };

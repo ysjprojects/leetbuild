@@ -1013,6 +1013,159 @@ func CheckReleaseByOrder(ctx *harness.Ctx) {
 	ctx.Equal(stringAt(ctx, shoeStockKey), "7", "stock after release(o2) raced the sweeper (the units must not go back twice: release must go through the same EXISTS-guarded script)")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <set>
+#include <thread>
+
+namespace {
+
+const std::string shoeStockKey = "stock:shoe-42";
+
+// placeHold writes a hold of shoe-42 as step 1 does: the key with its safety-net TTL and the
+// expiry-queue member, due expiresIn seconds from now.
+std::string placeHold(harness::Ctx& ctx, const std::string& orderID, int qty, int64_t expiresIn) {
+  const std::string member = orderID + ":shoe-42:" + std::to_string(qty);
+  ctx.Redis.Set("hold:" + orderID, member, "EX", 2 * 600);
+  ctx.Redis.Do("ZADD", "holds", ctx.Clock.Now() / 1000 + expiresIn, member);
+  return member;
+}
+
+// stringAt is the string at key, nil when it does not exist.
+std::optional<std::string> stringAt(harness::Ctx& ctx, const std::string& key) { return ctx.Redis.Get(key); }
+
+// sweepDue runs the sweeper until the world settles (it loops forever).
+void sweepDue(harness::Ctx& ctx) { ctx.Drain([] { sweep(); }); }
+
+// releaseHold is release_hold(member); an exception fails the check.
+bool releaseHold(harness::Ctx& ctx, const std::string& member) {
+  try {
+    return release_hold(member);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("releaseHold(%q) returned an error: %v", member, std::string(e.what()));
+  }
+}
+
+// releaseOrder is release(orderID); an exception fails the check.
+void releaseOrder(harness::Ctx& ctx, const std::string& orderID, const std::string& what) {
+  try {
+    release(orderID);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("%s: %v", what, std::string(e.what()));
+  }
+}
+
+// sighting is a release touching a hold key, and the virtual time it happened at.
+struct sighting {
+  int64_t at;
+  std::string member;
+};
+
+}  // namespace
+
+void CheckExpiredBatch(harness::Ctx& ctx) {
+  ctx.Redis.Set(shoeStockKey, 0);
+  std::vector<std::string> expired;
+  for (int i = 0; i < 150; i++) expired.push_back(placeHold(ctx, "e" + std::to_string(i), 1, -10));
+  const std::string future = placeHold(ctx, "later", 2, 600);
+  // Each hold key is touched once, by the release that gives it back: note when it happened.
+  std::vector<sighting> seen;
+  for (const auto& member : expired) {
+    const std::string orderID = member.substr(0, member.find(':'));
+    ctx.Redis.After("hold:" + orderID, [&ctx, &seen, member] { seen.push_back({ctx.Clock.Now(), member}); });
+  }
+  // The sweeper runs in the background while the check moves time on in 100 ms steps: a loop that
+  // sleeps and one that waits on a timer progress alike, and each tick happens at one instant.
+  std::thread([] { sweep(); }).detach();
+  ctx.Tick();
+  for (int i = 0; i < 30; i++) {
+    ctx.Clock.Advance(0.1);
+    ctx.Tick();
+  }
+  ctx.Assert(!seen.empty(), "sweep released nothing: 150 holds are past their expiry");
+  std::vector<int64_t> ticks;
+  for (const auto& s : seen) {
+    if (ticks.empty() || ticks.back() != s.at) ticks.push_back(s.at);
+  }
+  std::vector<sighting> firstTick, secondTick;
+  for (const auto& s : seen) {
+    if (s.at == ticks[0]) firstTick.push_back(s);
+    else if (ticks.size() > 1 && s.at == ticks[1]) secondTick.push_back(s);
+  }
+  ctx.Assert(firstTick.size() <= 100, "the first tick released %d holds; at most kBatch = 100 per tick", firstTick.size());
+  ctx.Equal(firstTick.size(), 100, "holds released by the first tick (the full batch)");
+  ctx.Equal(secondTick.size(), 50, "holds released by the second tick (the remaining 50)");
+  const int64_t gap = secondTick[0].at - firstTick[0].at;
+  ctx.Assert(900 <= gap && gap <= 1200, "the loop slept %d ms between ticks, expected kSweepInterval = 1000", gap);
+  ctx.Equal(stringAt(ctx, "hold:later"), future, "a hold that expires in 600 s must not be released: only members with a score up to now");
+  ctx.Assert(ctx.Redis.ZScore("holds", future).has_value(), "the unexpired member must stay in holds");
+  std::set<std::string> members;
+  for (const auto& s : seen) members.insert(s.member);
+  ctx.Equal(members.size(), 150, "distinct expired holds released by the sweep");
+  ctx.Equal(stringAt(ctx, shoeStockKey), "150", "stock after releasing 150 holds of 1 on 0: each hold goes back exactly once");
+}
+
+void CheckAtomicRelease(harness::Ctx& ctx) {
+  ctx.Redis.Set(shoeStockKey, 3);
+  const std::string member = placeHold(ctx, "o1", 2, -5);
+  ctx.Equal(releaseHold(ctx, member), true, "releasing an existing hold must return true");
+  ctx.Equal(stringAt(ctx, shoeStockKey), "5", "stock after releasing a hold of 2 on 3");
+  ctx.Equal(ctx.Redis.Exists("hold:o1"), 0, "hold:o1 must be deleted by the release");
+  ctx.Assert(!ctx.Redis.ZScore("holds", member).has_value(), "the member must be removed from holds by the release");
+  ctx.Equal(releaseHold(ctx, member), false, "releasing the same hold again must return false");
+  ctx.Equal(stringAt(ctx, shoeStockKey), "5", "stock after a second release (units go back exactly once)");
+
+  ctx.Redis.Set(shoeStockKey, 0);
+  placeHold(ctx, "a", 2, 600);
+  placeHold(ctx, "b", 3, 600);
+  const std::string c = placeHold(ctx, "c", 1, 1800);
+  ctx.Clock.Advance(601);
+  sweepDue(ctx);
+  ctx.Equal(stringAt(ctx, shoeStockKey), "5", "stock after sweeping two expired holds of 2 and 3");
+  ctx.Equal(ctx.Redis.Exists("hold:a", "hold:b"), 0, "the sweeper must delete the expired hold keys");
+  std::vector<std::string> left;
+  for (const auto& z : ctx.Redis.ZRangeWithScores("holds", 0, -1)) left.push_back(z.Member);
+  ctx.Equal(left, {c}, "holds must keep only the unexpired member");
+  ctx.Equal(stringAt(ctx, "hold:c"), c, "an unexpired hold must be left alone");
+}
+
+void CheckSkipFulfilled(harness::Ctx& ctx) {
+  ctx.Redis.Set(shoeStockKey, 3);
+  const std::string member = "o1:shoe-42:2";
+  ctx.Redis.Do("ZADD", "holds", ctx.Clock.Now() / 1000 - 5, member);
+  ctx.Equal(releaseHold(ctx, member), false, "a member whose hold:o1 is gone (confirmed) must return false");
+  ctx.Equal(stringAt(ctx, shoeStockKey), "3", "a confirmed order's units were sold, not given back: stock");
+  ctx.Assert(!ctx.Redis.ZScore("holds", member).has_value(), "the stale member must be ZREMed so the sweeper never reads it again");
+
+  ctx.Redis.Do("ZADD", "holds", ctx.Clock.Now() / 1000 - 5, "o2:shoe-42:1");
+  sweepDue(ctx);
+  ctx.Equal(stringAt(ctx, shoeStockKey), "3", "sweeping a confirmed order must not touch stock");
+  ctx.Equal(ctx.Redis.ZCard("holds"), 0, "the sweeper must drop the stale member from holds");
+}
+
+void CheckReleaseByOrder(harness::Ctx& ctx) {
+  ctx.Redis.Set(shoeStockKey, 3);
+  const std::string member = placeHold(ctx, "o1", 2, 600);
+  releaseOrder(ctx, "o1", "release(o1) returned an error");
+  ctx.Equal(stringAt(ctx, shoeStockKey), "5", "stock after release(o1)");
+  ctx.Equal(ctx.Redis.Exists("hold:o1"), 0, "hold:o1 must be gone after release(o1)");
+  ctx.Assert(!ctx.Redis.ZScore("holds", member).has_value(), "the member must leave holds after release(o1)");
+  releaseOrder(ctx, "o1", "a second release(o1) returned an error");
+  ctx.Equal(stringAt(ctx, shoeStockKey), "5", "a second release(o1) must not give the units back again");
+  releaseOrder(ctx, "never-reserved", "release(never-reserved) returned an error");
+  ctx.Equal(stringAt(ctx, shoeStockKey), "5", "release of an unknown order must do nothing");
+
+  // The sweeper gets there first: right after release(o2) has read the member, the hold is swept.
+  const std::string racing = placeHold(ctx, "o2", 2, -5);
+  ctx.Redis.After("hold:o2", [&ctx, racing] {
+    ctx.Redis.Do("INCRBY", shoeStockKey, 2);
+    ctx.Redis.Del("hold:o2");
+    ctx.Redis.Do("ZREM", "holds", racing);
+  });
+  releaseOrder(ctx, "o2", "release(o2) returned an error");
+  ctx.Equal(stringAt(ctx, shoeStockKey), "7", "stock after release(o2) raced the sweeper (the units must not go back twice: release must go through the same EXISTS-guarded script)");
+}
+`,
   },
   debrief: `The sorted set is a priority queue keyed by time, and \`ZRANGEBYSCORE … LIMIT\` is the classic way to drain one in bounded slices. The \`EXISTS\` guard inside the script is what makes the sweeper, the API's 503 path and the consumer's no-stock path safe to run concurrently and to repeat: a hold is released at most once no matter who gets there first. Real systems run the sweeper on an elected leader (or shard the sorted set by SKU prefix), treat keyspace notifications only as a hint, and reconcile the Redis counter against the warehouse ledger after the drop — the oversell that any cache-fronted counter eventually produces is caught by accounting, not by more Lua.`,
 };

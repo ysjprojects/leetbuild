@@ -1538,6 +1538,276 @@ func CheckReplayDedupable(ctx *harness.Ctx) {
 	ctx.Equal(twice, landed, "the records that landed on the failed attempt must appear twice, with the same headers both times")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cctype>
+#include <exception>
+#include <map>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+// cleanEvents are seven records over four keys: ana's three must stay in this order on one partition of clean.
+const std::vector<std::pair<std::string, std::string>> cleanEvents = {
+    {"ana", " hello "}, {"bo", "x"}, {"ana", "world"}, {"cy", "ok"}, {"bo", "y"}, {"ana", "!"}, {"dee", "z"}};
+
+const std::string group = kGroup;
+const std::string rawTopic = kRawTopic;
+const std::string cleanTopic = kCleanTopic;
+
+std::string cleanTransform(const std::string& value) {
+  const size_t first = value.find_first_not_of(' ');
+  const size_t last = value.find_last_not_of(' ');
+  std::string out = first == std::string::npos ? "" : value.substr(first, last - first + 1);
+  for (char& c : out) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  return out;
+}
+
+bool decimal(const std::string& s) {
+  return !s.empty() && std::all_of(s.begin(), s.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+std::vector<harness::KafkaRecord> seedRaw(harness::Ctx& ctx) {
+  std::vector<harness::KafkaRecord> seeded;
+  for (const auto& [key, value] : cleanEvents) seeded.push_back(ctx.Kafka.Seed(rawTopic, key, value));
+  return seeded;
+}
+
+// runCleaner runs the learner's loop until it waits for input (the open batch finished on the idle
+// timeout) or throws; what it threw.
+std::exception_ptr runCleaner(harness::Ctx& ctx) {
+  try {
+    ctx.Drain([] { run(cleanTransform); });
+  } catch (...) {
+    return std::current_exception();
+  }
+  return nullptr;
+}
+
+std::string describe(const std::exception_ptr& error) {
+  try {
+    std::rethrow_exception(error);
+  } catch (const std::exception& e) {
+    return e.what();
+  } catch (...) {
+    return harness::CurrentExceptionType();
+  }
+}
+
+void noError(harness::Ctx& ctx, const std::exception_ptr& error, const char* what) {
+  if (error) ctx.Fatalf("%s threw: %v", what, describe(error));
+}
+
+// runFails: run must fail with BatchFailed; anything else is a verdict.
+void runFails(harness::Ctx& ctx) {
+  const std::exception_ptr error = runCleaner(ctx);
+  ctx.Assert(error != nullptr,
+             "run returned although a record of the batch was never acknowledged: the batch must fail (BatchFailed) and nothing of it be committed");
+  try {
+    std::rethrow_exception(error);
+  } catch (const BatchFailed&) {
+  } catch (...) {
+    ctx.Fatalf("run failed with another error than BatchFailed: %v", describe(error));
+  }
+}
+
+// cleanHome is the partition of clean the producer's partitioner puts key on.
+int cleanHome(harness::Ctx& ctx, const std::optional<std::string>& key) { return ctx.Kafka.PartitionFor(cleanTopic, key); }
+
+// sourceOf is "src_partition/src_offset" of a clean record; it asserts the headers are there.
+std::string sourceOf(harness::Ctx& ctx, const harness::KafkaRecord& r) {
+  const auto partition = r.Header("src_partition");
+  const auto offset = r.Header("src_offset");
+  if (!partition || !offset) {
+    std::vector<std::string> names;
+    for (const auto& h : r.Headers) names.push_back(h.Key);
+    ctx.Fatalf("clean record %q has headers %q: every record needs src_partition and src_offset", r.Value, names);
+  }
+  ctx.Assert(decimal(*partition) && decimal(*offset), "src_partition/src_offset must be decimal strings, got %q/%q", partition, offset);
+  return *partition + "/" + *offset;
+}
+
+}  // namespace
+
+void CheckTransformOrder(harness::Ctx& ctx) {
+  const auto seeded = seedRaw(ctx);
+  noError(ctx, runCleaner(ctx), "run(transform)");
+  const auto clean = ctx.Kafka.Records(cleanTopic);
+  ctx.Assert(clean.size() == seeded.size(),
+             "clean holds %d records for %d raw ones: each raw record becomes exactly one clean record", clean.size(), seeded.size());
+  for (const std::string key : {"ana", "bo", "cy", "dee"}) {
+    std::vector<std::string> expected;
+    for (const auto& [k, v] : cleanEvents)
+      if (k == key) expected.push_back(cleanTransform(v));
+    std::vector<harness::KafkaRecord> mine;
+    for (const auto& r : clean)
+      if (r.Key == key) mine.push_back(r);
+    std::stable_sort(mine.begin(), mine.end(), [](const auto& a, const auto& b) { return a.Offset < b.Offset; });
+    std::vector<std::string> values;
+    std::vector<int> partitions;
+    for (const auto& r : mine) {
+      values.push_back(r.Value.value_or(""));
+      if (partitions.empty() || partitions.back() != r.Partition) partitions.push_back(r.Partition);
+    }
+    ctx.Equal(values, expected, "clean records keyed %s (transform(value), in raw order)", key);
+    ctx.Equal(partitions, {cleanHome(ctx, key)},
+              "partitions of clean holding the records keyed %s: produce under the source key so a key stays on one partition", key);
+  }
+  const int64_t lag = ctx.Kafka.Lag(group, rawTopic);
+  ctx.Assert(lag == 0, "%d raw record(s) were never committed: finish the open batch once the input goes idle", lag);
+}
+
+void CheckSourceHeaders(harness::Ctx& ctx) {
+  const auto seeded = seedRaw(ctx);
+  noError(ctx, runCleaner(ctx), "run(transform)");
+  const auto clean = ctx.Kafka.Records(cleanTopic);
+  ctx.Assert(!clean.empty(), "nothing reached clean");
+  std::map<std::string, harness::KafkaRecord> bySource;
+  std::vector<std::string> all;
+  for (const auto& r : seeded) {
+    const std::string src = std::to_string(r.Partition) + "/" + std::to_string(r.Offset);
+    bySource[src] = r;
+    all.push_back(src);
+  }
+  std::set<std::string> named;
+  for (const auto& r : clean) {
+    const std::string source = sourceOf(ctx, r);
+    const auto it = bySource.find(source);
+    ctx.Assert(it != bySource.end(), "clean record %q points at raw[%s], which does not exist", r.Value, source);
+    const auto& src = it->second;
+    ctx.Assert(r.Value == cleanTransform(src.Value.value_or("")) && r.Key == src.Key,
+               "clean record %q (key %s) points at raw[%s], whose transform is %q (key %s)", r.Value, r.Key, source,
+               cleanTransform(src.Value.value_or("")), src.Key);
+    named.insert(source);
+  }
+  std::sort(all.begin(), all.end());
+  ctx.Equal(std::vector<std::string>(named.begin(), named.end()), all, "the headers of clean must name every raw record");
+}
+
+void CheckCommitAfterAcks(harness::Ctx& ctx) {
+  const auto seeded = seedRaw(ctx);
+  ctx.Kafka.StallFor(cleanTopic, 1);  // the broker acknowledges produces to clean one second from now
+  const int64_t started = ctx.Clock.Now();
+  struct commitSeen {
+    std::string group;
+    std::map<int, int> shortBy;
+    double at;
+  };
+  std::vector<commitSeen> commits;
+  ctx.Kafka.OnCommit([&](const std::string& g, const harness::KafkaOffsets& offsets) {
+    // The producer puts a key on the partition its partitioner picks: partition p of clean must
+    // already hold at least as many records as the commit covers of the raw records hashing to p.
+    std::map<int, int> need;
+    for (const auto& [tp, upto] : offsets) {
+      if (tp.Topic != rawTopic) continue;
+      for (const auto& r : seeded)
+        if (r.Partition == tp.Partition && r.Offset < upto) need[cleanHome(ctx, r.Key)]++;
+    }
+    std::map<int, int> have;
+    for (const auto& r : ctx.Kafka.Records(cleanTopic)) have[r.Partition]++;
+    std::map<int, int> shortBy;
+    for (const auto& [p, n] : need)
+      if (n - have[p] > 0) shortBy[p] = n - have[p];
+    commits.push_back({g, shortBy, static_cast<double>(ctx.Clock.Now() - started) / 1000});
+  });
+  noError(ctx, runCleaner(ctx), "run(transform)");
+  ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(),
+             "auto-commit is on: offsets were committed on a timer, before the records were acknowledged");
+  ctx.Assert(!commits.empty(), "no offset was ever committed");
+  for (const auto& c : commits) {
+    ctx.Equal(c.group, group, "offsets were committed for the wrong group");
+    ctx.Assert(c.shortBy.empty(),
+               "at commit time clean was still missing %v record(s) (per partition) the commit covers: wait for every write before committing",
+               c.shortBy);
+    ctx.Assert(c.at >= 1,
+               "committed %.1f s in, before the broker acknowledged anything (it answers after 1 s): the commit must wait for the acks", c.at);
+  }
+  ctx.Equal(ctx.Kafka.Records(cleanTopic).size(), seeded.size(), "records on clean");
+  const int64_t lag = ctx.Kafka.Lag(group, rawTopic);
+  ctx.Assert(lag == 0, "%d raw record(s) were never committed", lag);
+}
+
+void CheckIdempotent(harness::Ctx& ctx) {
+  seedRaw(ctx);
+  ctx.Kafka.LoseAcks(cleanTopic, 2);  // two records are written but their acks never arrive: the producer retries
+  noError(ctx, runCleaner(ctx), "run(transform)");
+  std::vector<std::string> got;
+  for (const auto& r : ctx.Kafka.Records(cleanTopic)) got.push_back(r.Key.value_or("") + "=" + r.Value.value_or(""));
+  std::vector<std::string> want;
+  for (const auto& [k, v] : cleanEvents) want.push_back(k + "=" + cleanTransform(v));
+  std::sort(got.begin(), got.end());
+  std::sort(want.begin(), want.end());
+  ctx.Equal(got, want,
+            "key=value records on clean after two lost acks: an idempotent producer's retry neither duplicates, loses nor changes a record");
+  const int64_t lag = ctx.Kafka.Lag(group, rawTopic);
+  ctx.Assert(lag == 0, "%d raw record(s) were never committed", lag);
+}
+
+void CheckFlushTimeout(harness::Ctx& ctx) {
+  const auto seeded = seedRaw(ctx);
+  ctx.Kafka.Stall(cleanTopic);  // the broker never acknowledges produces to clean
+  const int64_t started = ctx.Clock.Now();
+  runFails(ctx);
+  const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
+  ctx.Assert(waited <= 3.5, "run gave up after %.1f s: a batch waits at most the idle poll and the flush timeout (2 s)", waited);
+  const auto commits = ctx.Kafka.Commits(group);
+  ctx.Assert(commits.empty(), "offsets were committed (%v) although no record of the batch was acknowledged: the batch would be lost", commits);
+  ctx.Equal(ctx.Kafka.Lag(group, rawTopic), seeded.size(), "raw records not committed");
+  ctx.Equal(ctx.Kafka.Records(cleanTopic).size(), 0, "records on clean");
+  ctx.Kafka.Resume(cleanTopic);
+  restart();
+  noError(ctx, runCleaner(ctx), "run(transform) after restart()");
+  std::set<std::string> distinct;
+  for (const auto& value : ctx.Kafka.Values(cleanTopic)) distinct.insert(value);
+  std::vector<std::string> want;
+  for (const auto& [k, v] : cleanEvents) want.push_back(cleanTransform(v));
+  std::sort(want.begin(), want.end());
+  ctx.Equal(std::vector<std::string>(distinct.begin(), distinct.end()), want,
+            "after restart() the failed batch must be re-read from the committed offsets and land: values on clean");
+  const int64_t lag = ctx.Kafka.Lag(group, rawTopic);
+  ctx.Assert(lag == 0, "%d raw record(s) were never committed after the restart", lag);
+}
+
+void CheckReplayDedupable(harness::Ctx& ctx) {
+  const auto seeded = seedRaw(ctx);
+  ctx.Kafka.FailNext(cleanTopic, 1);  // the first write fails with a retriable error; the others land
+  runFails(ctx);
+  const size_t landed = ctx.Kafka.Records(cleanTopic).size();
+  const auto commits = ctx.Kafka.Commits(group);
+  ctx.Assert(commits.empty(), "offsets were committed (%v) although a record of the batch failed: it would be lost", commits);
+  ctx.Assert(landed == seeded.size() - 1, "%d records reached clean on the failed attempt, expected the %d whose write did not fail",
+             landed, seeded.size() - 1);
+  restart();
+  noError(ctx, runCleaner(ctx), "run(transform) after restart()");
+  const auto clean = ctx.Kafka.Records(cleanTopic);
+  const int64_t lag = ctx.Kafka.Lag(group, rawTopic);
+  ctx.Assert(lag == 0, "%d raw record(s) were never committed after the restart", lag);
+  ctx.Assert(clean.size() == landed + seeded.size(),
+             "clean holds %d records after the replay, expected %d from the failed attempt plus %d re-read", clean.size(), landed,
+             seeded.size());
+  std::vector<std::string> sources;
+  for (const auto& r : seeded) sources.push_back(std::to_string(r.Partition) + "/" + std::to_string(r.Offset));
+  std::sort(sources.begin(), sources.end());
+  std::map<std::string, std::vector<harness::KafkaRecord>> bySource;
+  for (const auto& r : clean) bySource[sourceOf(ctx, r)].push_back(r);
+  std::vector<std::string> named;
+  for (const auto& [source, _] : bySource) named.push_back(source);
+  ctx.Equal(named, sources, "deduplicated by src_partition/src_offset, clean must name exactly the raw records");
+  size_t twice = 0;
+  for (const auto& [source, copies] : bySource) {
+    std::set<std::string> distinct;
+    for (const auto& r : copies) distinct.insert(r.Key.value_or("") + "=" + r.Value.value_or(""));
+    ctx.Assert(distinct.size() == 1, "the copies of raw[%s] on clean differ: %v — a replay must produce the same key and value",
+               source, distinct);
+    if (copies.size() > 1) twice++;
+  }
+  ctx.Equal(twice, landed, "the records that landed on the failed attempt must appear twice, with the same headers both times");
+}
+`,
   },
   debrief: `The guarantee is an ordering, not a feature: produce, **flush**, then **commit**. Committing before the acks is at-most-once — a crash between the two loses the batch; committing after is at-least-once — a crash replays it. The two additions make the replay harmless. The **idempotent producer** (\`enable.idempotence\`, which requires \`acks=all\`) gives every record a producer id and a sequence number, so when a produce is written and its acknowledgement is lost, the broker recognises the retry and keeps one copy — the producer's own duplicates never exist. The **source headers** cover the duplicates the producer cannot see: a replay after a crash is a *new* produce of the same source record, and only \`src_partition\`/\`src_offset\` tell a downstream consumer so. Bounding the flush matters as much as ordering it: an unbounded flush on a dead broker holds the partition forever, while a bounded one fails the batch and lets a restart (or a rebalance to another member) try again. Real systems add Kafka transactions when the output and the offsets must move together (\`sendOffsetsToTransaction\`, \`read_committed\` readers), a deduplicating state store downstream keyed by the source headers, rebalance listeners that finish the open batch on revocation, and a dead-letter topic for records the transform rejects — a poison record must not fail the batch forever.`,
 };

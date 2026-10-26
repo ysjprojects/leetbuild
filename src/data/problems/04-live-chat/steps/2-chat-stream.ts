@@ -1080,6 +1080,227 @@ func CheckCancelCleanup(ctx *harness.Ctx) {
 	ctx.Equal(n, 0, "the client finished its stream: clean up however the call ends; subscriptions left in room-7")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "chat.grpc.pb.h"
+#include "subscriptions.cpp"
+
+namespace {
+
+chat::ClientMsg chatJoin(const std::string& room, const std::string& user) {
+  chat::ClientMsg msg;
+  msg.mutable_join()->set_room(room);
+  msg.mutable_join()->set_user(user);
+  return msg;
+}
+
+chat::ClientMsg chatSay(const std::string& text) {
+  chat::ClientMsg msg;
+  msg.mutable_say()->set_text(text);
+  return msg;
+}
+
+chat::ServerMsg chatServerMsg(const std::string& user, const std::string& text, int64_t ts) {
+  chat::ServerMsg msg;
+  msg.set_room("room-7");
+  msg.set_user(user);
+  msg.set_text(text);
+  msg.set_ts(ts);
+  return msg;
+}
+
+// One publish(room, msg) the stream handler made.
+struct ChatPublished {
+  std::string room;
+  chat::ServerMsg msg;
+};
+
+// What the stand-in for step 3's room bus recorded: publish only records.
+std::mutex chatBusMu;
+std::vector<ChatPublished> chatBus;
+
+std::vector<ChatPublished> published() {
+  std::lock_guard<std::mutex> lock(chatBusMu);
+  return chatBus;
+}
+
+std::vector<std::string> publishedText(const std::vector<ChatPublished>& all) {
+  std::vector<std::string> out;
+  for (const auto& p : all) out.push_back(p.room + ": " + p.msg.ShortDebugString());
+  return out;
+}
+
+// The client side of one stream: what arrived, how it ended, and a read with a (virtual) 1 s
+// patience. A thread of its own reads the stream (Go's receiving goroutine); it owns the state.
+struct ChatClientStream {
+  grpc::ClientContext context;
+  std::unique_ptr<grpc::ClientReaderWriter<chat::ClientMsg, chat::ServerMsg>> stream;
+  std::mutex mu;
+  std::condition_variable cv;
+  std::deque<chat::ServerMsg> inbox;
+  std::optional<grpc::StatusCode> end;  // how the stream ended (OK when the server returned OK)
+
+  void send(harness::Ctx& ctx, const chat::ClientMsg& msg) {
+    ctx.Assert(stream->Write(msg), "sending %s: the stream is closed", msg.ShortDebugString());
+  }
+
+  // How the stream ended, nullopt while it is open.
+  std::optional<grpc::StatusCode> status() {
+    std::lock_guard<std::mutex> lock(mu);
+    return end;
+  }
+
+  // The next message the server sent, nullopt when none arrives within 1 s or the stream ended.
+  std::optional<chat::ServerMsg> read() {
+    std::unique_lock<std::mutex> lock(mu);
+    cv.wait_for(lock, std::chrono::seconds(1), [&] { return !inbox.empty() || end.has_value(); });
+    if (inbox.empty()) return std::nullopt;
+    chat::ServerMsg msg = inbox.front();
+    inbox.pop_front();
+    return msg;
+  }
+};
+
+std::shared_ptr<ChatClientStream> openChat(chat::Chat::Stub& client) {
+  auto s = std::make_shared<ChatClientStream>();
+  s->stream = client.Chat(&s->context);
+  std::thread([s] {
+    chat::ServerMsg msg;
+    while (s->stream->Read(&msg)) {
+      std::lock_guard<std::mutex> lock(s->mu);
+      s->inbox.push_back(msg);
+      s->cv.notify_all();
+    }
+    const grpc::Status st = s->stream->Finish();
+    std::lock_guard<std::mutex> lock(s->mu);
+    s->end = st.error_code();
+    s->cv.notify_all();
+  }).detach();
+  return s;
+}
+
+// Runs the learner's server with publish recording, and returns a client on it.
+std::unique_ptr<chat::Chat::Stub> startChat(harness::Ctx& ctx) {
+  ctx.Main();
+  return chat::Chat::NewStub(ctx.GRPC.Dial("chat-server:9000"));
+}
+
+std::shared_ptr<ChatClientStream> joinedChat(harness::Ctx& ctx, chat::Chat::Stub& client, const std::string& room,
+                                             const std::string& user) {
+  auto s = openChat(client);
+  s->send(ctx, chatJoin(room, user));
+  ctx.Settle();
+  if (const auto e = s->status()) {
+    ctx.Fatalf("the stream ended with %v right after the join%s", *e,
+               *e == grpc::StatusCode::UNAVAILABLE ? " (main registered no Chat handler)" : "");
+  }
+  return s;
+}
+
+}  // namespace
+
+// Stands in for step 3's room bus (room_bus.cpp), as the Go harness does: publish only records.
+void publish(const std::string& room, const chat::ServerMsg& msg) {
+  std::lock_guard<std::mutex> lock(chatBusMu);
+  chatBus.push_back({room, msg});
+}
+
+void CheckJoinFirst(harness::Ctx& ctx) {
+  auto client = startChat(ctx);
+  auto s = openChat(*client);
+  s->send(ctx, chatSay("hi"));
+  ctx.Settle();
+  const auto e = s->status();
+  ctx.Assert(e.has_value(), "a stream whose first message is a say must end with INVALID_ARGUMENT, but it did not fail");
+  ctx.Assert(*e != grpc::StatusCode::UNAVAILABLE, "main registered no Chat handler");
+  ctx.Assert(*e == grpc::StatusCode::INVALID_ARGUMENT || *e == grpc::StatusCode::FAILED_PRECONDITION,
+             "a say before any join ended the call with %v, expected INVALID_ARGUMENT", *e);
+  ctx.Equal(subscribers("room-7"), 0,
+            "a rejected first message must not leave a subscription behind: subscriptions in room-7");
+  ctx.Assert(published().empty(), "a rejected first message must not be published, got %v", publishedText(published()));
+  auto second = openChat(*client);
+  second->send(ctx, chatJoin("room-7", "ana"));
+  ctx.Settle();
+  if (const auto e2 = second->status()) {
+    ctx.Fatalf("a stream that starts with a join must stay open, but it ended with %v", *e2);
+  }
+}
+
+void CheckSayPublishes(harness::Ctx& ctx) {
+  auto client = startChat(ctx);
+  auto s = joinedChat(ctx, *client, "room-7", "ana");
+  s->send(ctx, chatSay("hi"));
+  s->send(ctx, chatSay("anyone here?"));
+  ctx.Settle();
+  const auto got = published();
+  ctx.Equal(got.size(), 2, "two says must publish exactly two messages (published: %v)", publishedText(got));
+  const std::vector<std::string> texts = {"hi", "anyone here?"};
+  for (size_t i = 0; i < texts.size(); i++) {
+    const auto& [room, msg] = got[i];
+    ctx.Equal(room, "room-7", "the room publish was called with");
+    ctx.Equal(std::vector<std::string>{msg.room(), msg.user(), msg.text()}, std::vector<std::string>{"room-7", "ana", texts[i]},
+              "the published ServerMsg's room, user and text");
+    const int64_t delta = msg.ts() - ctx.Clock.Now();
+    ctx.Assert(-60000 < delta && delta < 60000, "ServerMsg.ts is %d, expected the current time in milliseconds", msg.ts());
+  }
+  // Nothing is written back directly: the first thing this client reads is what the bus delivers.
+  local_deliver("room-7", chatServerMsg("bo", "hello ana", 1));
+  const auto first = s->read();
+  ctx.Assert(first.has_value(), "nothing reached the client after the bus delivered a message");
+  ctx.Equal(std::vector<std::string>{first->user(), first->text()}, {"bo", "hello ana"},
+            "the client received %s before anything came from the bus: a say reaches its sender through publish, "
+            "never through a direct write; user and text",
+            first->ShortDebugString());
+}
+
+void CheckSubscribeForward(harness::Ctx& ctx) {
+  auto client = startChat(ctx);
+  auto s = joinedChat(ctx, *client, "room-7", "ana");
+  ctx.Equal(subscribers("room-7"), 1, "after the join, the subscriptions in room-7 on this instance (subscribe(room, …))");
+  local_deliver("room-7", chatServerMsg("bo", "hello ana", 1));
+  local_deliver("room-7", chatServerMsg("cy", "hi both", 2));
+  const auto first = s->read();
+  const auto second = s->read();
+  if (!first || !second) {
+    ctx.Fatalf("the client received %s after the bus delivered two: forward every message the subscription yields",
+               first ? "one message" : "nothing");
+  }
+  ctx.Equal(std::vector<std::string>{first->user(), first->text()}, {"bo", "hello ana"},
+            "the first forwarded message's user and text");
+  ctx.Equal(std::vector<std::string>{second->user(), second->text()}, {"cy", "hi both"},
+            "the second forwarded message's user and text (forward in order)");
+  ctx.Assert(published().empty(), "forwarding bus messages must not publish them again");
+}
+
+void CheckCancelCleanup(harness::Ctx& ctx) {
+  auto client = startChat(ctx);
+  auto s = joinedChat(ctx, *client, "room-7", "ana");
+  ctx.Equal(subscribers("room-7"), 1, "after the join, the subscriptions in room-7");
+  s->context.TryCancel();
+  ctx.Settle();
+  ctx.Equal(subscribers("room-7"), 0,
+            "the client hung up: unsubscribe once the call is cancelled (ctx->IsCancelled()); subscriptions left in "
+            "room-7 on this instance");
+  // A client that closes its side normally must be cleaned up the same way.
+  auto second = openChat(*client);
+  second->send(ctx, chatJoin("room-7", "bo"));
+  ctx.Settle();
+  ctx.Assert(second->stream->WritesDone(), "closing the client side failed");
+  ctx.Settle();
+  ctx.Equal(subscribers("room-7"), 0,
+            "the client finished its stream: clean up however the call ends; subscriptions left in room-7");
+}
+`,
   },
   debrief: `A bidi stream is two independent half-duplex streams over one HTTP/2 stream, which is why the handler splits into a reader and a writer. The join-first rule turns a stateless RPC into a session with a validated first message, and the cancellation hook is what makes long-lived calls safe: every resource acquired for the call is released by the call's end, whatever caused it. Real chat gateways add flow control (drop or coalesce when a slow client cannot keep up), keep-alive pings, and resume tokens so a reconnecting client asks for "everything since sequence N" instead of rejoining blind.`,
 };

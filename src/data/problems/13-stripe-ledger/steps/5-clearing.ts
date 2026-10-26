@@ -1201,6 +1201,185 @@ func CheckStuckEndpoint(ctx *harness.Ctx) {
 	ctx.Equal(len(clrOpen(ctx)), 3, "reading the report must not change clearing:open: items there")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <cstdlib>
+#include <exception>
+#include <map>
+
+#include "db.h"
+#include "ids.h"
+
+namespace {
+
+const std::string clrSchema = R"(
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL REFERENCES transactions (id),
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL,
+    posted_at bigint NOT NULL
+);
+)";
+
+constexpr int64_t clrH = 3600 * 1000;
+
+const std::vector<Entry> clrCapture = {{"cash:acquirer", "EUR", 4999}, {"clearing:payments", "EUR", -4999}};
+const std::vector<Entry> clrPayout = {{"clearing:payments", "EUR", 4999}, {"clearing:payouts", "EUR", -4999}};
+const std::vector<Entry> clrCashOnly = {{"cash:bank", "EUR", 100}, {"cash:acquirer", "EUR", -100}};
+
+// clrWorld is an empty ledger behind the real journal writer (step 4), which calls the learner's
+// track after every commit.
+void clrWorld(harness::Ctx& ctx) { ctx.DB.Reset(clrSchema); }
+
+// clrWrite is a real transaction through the journal, posted at its own time ("" settles nothing):
+// one database transaction, then track. It returns the transaction id.
+std::string clrWrite(harness::Ctx& ctx, const std::vector<Entry>& entries, int64_t postedAt, const std::string& settles) {
+  std::optional<std::string> settled;
+  if (!settles.empty()) settled = settles;
+  const std::string transactionID = new_uuid();
+  try {
+    db::transaction([&](pqxx::work& tx) {
+      tx.exec_params("INSERT INTO transactions (id, event_id, description, settles, posted_at) VALUES ($1, NULL, 'flow', $2, $3)",
+                     transactionID, settled, postedAt);
+      for (const auto& e : entries)
+        tx.exec_params("INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES ($1, $2, $3, $4, $5)",
+                       transactionID, e.account, e.currency, e.amount, postedAt);
+    });
+  } catch (const std::exception& e) {
+    ctx.Fatalf("the journal writer failed: %v", std::string(e.what()));  // Go's ctx.NoError
+  }
+  track(transactionID, postedAt, entries, settled);
+  return transactionID;
+}
+
+std::map<std::string, double> clrOpen(harness::Ctx& ctx) {
+  std::map<std::string, double> out;
+  for (const auto& z : ctx.Redis.ZRangeWithScores("clearing:open", 0, -1)) out[z.Member] = z.Score;
+  return out;
+}
+
+// clrStuck calls the learner's stuck at the current time; an exception (Go: a non-nil error) fails the check.
+std::vector<StuckItem> clrStuck(harness::Ctx& ctx) {
+  try {
+    return stuck(now_ms());
+  } catch (const std::exception& e) {
+    ctx.Fatalf("stuck must return the list of stuck items, it failed: %v", std::string(e.what()));
+  }
+}
+
+// clrNames maps transaction ids to the names they were written under (unknown ids stay as they are).
+std::vector<std::string> clrNames(const std::vector<std::string>& transactionIDs, const std::map<std::string, std::string>& names) {
+  std::vector<std::string> out;
+  for (const auto& id : transactionIDs) {
+    const auto it = names.find(id);
+    out.push_back(it != names.end() ? it->second : id);
+  }
+  return out;
+}
+
+std::vector<std::string> clrStuckIDs(const std::vector<StuckItem>& items) {
+  std::vector<std::string> out;
+  for (const auto& item : items) out.push_back(item.transaction_id);
+  return out;
+}
+
+}  // namespace
+
+void CheckOpensItem(harness::Ctx& ctx) {
+  clrWorld(ctx);
+  const int64_t t0 = ctx.Clock.Now() - 3 * clrH;
+  const std::string a = clrWrite(ctx, clrCapture, t0, "");
+  ctx.Equal(ctx.Redis.Type("clearing:open"), "zset", "clearing:open must be a sorted set");
+  const auto s = ctx.Redis.ZScore("clearing:open", a);
+  ctx.Assert(s.has_value(), "a transaction crediting clearing:payments must be added to clearing:open under its transaction id");
+  ctx.Equal(*s, t0, "the score must be the transaction's own posted_at: a late event must already be overdue");
+  const std::string b = clrWrite(ctx, clrCashOnly, ctx.Clock.Now(), "");
+  ctx.Assert(!ctx.Redis.ZScore("clearing:open", b).has_value(), "a transaction between cash accounts touches no clearing account and must not be tracked");
+  const std::string c = clrWrite(ctx, clrPayout, t0 + 1, "");
+  ctx.Equal(clrOpen(ctx), std::map<std::string, double>{{a, double(t0)}, {c, double(t0 + 1)}}, "clearing:open should hold the capture and the payout");
+}
+
+void CheckSettlesCloses(harness::Ctx& ctx) {
+  clrWorld(ctx);
+  const int64_t t0 = ctx.Clock.Now() - 3 * clrH;
+  const std::string a = clrWrite(ctx, clrCapture, t0, "");
+  const std::string b = clrWrite(ctx, clrPayout, t0 + 2 * clrH, a);
+  ctx.Assert(!ctx.Redis.ZScore("clearing:open", a).has_value(), "the transaction that settles the capture must ZRem it from clearing:open");
+  ctx.Assert(!ctx.Redis.ZScore("clearing:open", b).has_value(), "the settling transaction is the closing side of the flow: it must not open an item of its own");
+  // Go recovers a panic here; in C++ the learner's track throws (sw::redis::Error is a std::exception).
+  try {
+    clrWrite(ctx, clrPayout, t0, "tx-unknown");
+  } catch (const std::exception& e) {
+    ctx.Fatalf("settling an id that is not open must be a no-op, but the write failed in track with %v", std::string(e.what()));
+  }
+  ctx.Equal(clrOpen(ctx), std::map<std::string, double>{}, "clearing:open should be empty");
+  const std::string c = clrWrite(ctx, clrCapture, t0, "");
+  const std::string d = clrWrite(ctx, clrCapture, t0 + 1, "");
+  clrWrite(ctx, clrPayout, t0 + 2, c);
+  ctx.Equal(clrOpen(ctx), std::map<std::string, double>{{d, double(t0 + 1)}}, "only the first of two captures was settled: clearing:open should hold the second");
+}
+
+void CheckStuckWindow(harness::Ctx& ctx) {
+  clrWorld(ctx);
+  const int64_t now = ctx.Clock.Now();
+  std::map<std::string, std::string> ids;
+  const std::vector<std::pair<std::string, int64_t>> windows = {{"48h", 48}, {"23h", 23}, {"25h", 25}, {"1h", 1}};
+  for (const auto& [name, hours] : windows) ids[clrWrite(ctx, clrCapture, now - hours * clrH, "")] = name;
+  auto items = clrStuck(ctx);
+  ctx.Equal(clrOpen(ctx).size(), 4, "stuck reports; it must not remove anything from clearing:open: items there");
+  auto got = clrNames(clrStuckIDs(items), ids);
+  ctx.Equal(got, {"48h", "25h"}, "of transactions posted 48 h, 23 h, 25 h and 1 h ago, the ones older than 24 h, oldest first");
+  for (const auto& item : items) {
+    const double s = ctx.Redis.ZScore("clearing:open", item.transaction_id).value_or(0);
+    ctx.Equal(item.opened_at, s, "opened_at must be the item's score (item {%s %d %d})", item.transaction_id, item.opened_at, item.age_s);
+  }
+  std::map<std::string, int64_t> ages;
+  for (const auto& item : items) ages[ids[item.transaction_id]] = item.age_s;
+  ctx.Assert(std::abs(ages["48h"] - 48 * 3600) <= 2 && std::abs(ages["25h"] - 25 * 3600) <= 2, "age_s must be the age in seconds, got %v", ages);
+  ctx.Clock.Advance(2 * 3600);
+  items = clrStuck(ctx);
+  got = clrNames(clrStuckIDs(items), ids);
+  ctx.Equal(got, {"48h", "25h", "23h"}, "two hours later the 23 h one has crossed 24 h and must be reported");
+  // A late event: posted 30 h ago, journaled just now — stuck immediately, because the score is its own time.
+  const std::string late = clrWrite(ctx, clrCapture, ctx.Clock.Now() - 30 * clrH, "");
+  bool found = false;
+  for (const auto& item : clrStuck(ctx)) found = found || item.transaction_id == late;
+  ctx.Assert(found, "a transaction posted 30 h ago that reaches the journal now is already stuck");
+}
+
+void CheckStuckEndpoint(harness::Ctx& ctx) {
+  clrWorld(ctx);
+  const int64_t now = ctx.Clock.Now();
+  std::map<std::string, std::string> ids;
+  const std::vector<std::pair<std::string, int64_t>> windows = {{"27h", 27}, {"2h", 2}, {"30h", 30}};
+  for (const auto& [name, hours] : windows) ids[clrWrite(ctx, clrCapture, now - hours * clrH, "")] = name;
+  const auto r = ctx.Main().HTTP().Get("/clearing/stuck");
+  ctx.Equal(r.Status, 200, "GET /clearing/stuck");
+  const std::string contentType = r.HeaderValue("Content-Type");
+  ctx.Assert(contentType.rfind("application/json", 0) == 0, "the report must be JSON, got Content-Type %q", contentType);
+  const auto body = harness::ParseJSON(r.Text()).value_or(harness::Any());
+  ctx.Assert(body.IsArray(), "the report is a JSON list, got %s", r.Text());
+  std::vector<std::string> transactionIDs;
+  for (const auto& item : body.Items()) transactionIDs.push_back(item["transaction_id"].String());
+  ctx.Equal(clrNames(transactionIDs, ids), {"30h", "27h"}, "expected the two transactions older than 24 h, oldest first");
+  for (const auto& item : body.Items()) {
+    const auto& fields = item.Fields();
+    const bool hasID = fields.count("transaction_id") != 0, hasOpened = fields.count("opened_at") != 0, hasAge = fields.count("age_s") != 0;
+    ctx.Assert(hasID && hasOpened && hasAge, "every item carries transaction_id, opened_at and age_s, got %v", item);
+  }
+  const double age = body[0]["age_s"].Float();
+  ctx.Assert(age - 30 * 3600 <= 2 && 30 * 3600 - age <= 2, "the 30 h one's age_s should be about %d, got %v", 30 * 3600, age);
+  ctx.Equal(clrOpen(ctx).size(), 3, "reading the report must not change clearing:open: items there");
+}
+`,
   },
   debrief: `A sorted set keyed by the transaction's own time turns "which money has been in transit too long" into one range query, and the 24-hour cutoff is the timeliness window from Stripe's post expressed as a score. The rule that a settling transaction closes rather than opens is what makes the set converge: every flow adds exactly one item on its way in and removes it on its way out. The report is deliberately read-only — someone has to decide whether a stuck item is a missing event, a mislabelled one or a real operational problem, and Stripe's post describes tooling that attributes each one to a team and generates the investigation query. Real systems track clearing per account and per currency with the open *balance* as well as the open items, alert on the aged balance rather than on the count, and let an item be re-opened when a correction reverses the transaction that settled it.`,
 };

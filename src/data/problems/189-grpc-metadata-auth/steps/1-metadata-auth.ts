@@ -1151,6 +1151,182 @@ func CheckAdminDeletes(ctx *harness.Ctx) {
 	ctx.Equal(r.code, codes.InvalidArgument, "the admin's DeleteNote with an empty id (%s)", r.details)
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <chrono>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+namespace {
+
+using NotesMap = std::map<std::string, std::string>;
+
+const std::string kReaderAuth = "Bearer reader-7f3a";
+const std::string kAdminAuth = "Bearer admin-91c2";
+
+const NotesMap kNotesSeed = {{"n-1", "buy milk"}, {"n-2", "ship the release notes"}, {"n-3", "rotate the admin token"}};
+
+// What a caller sent: every one of them must be UNAUTHENTICATED.
+struct BadCredential {
+  std::string label;
+  std::vector<std::string> md;  // metadata pairs
+};
+
+const std::vector<BadCredential> kBadCredentials = {
+    {"no authorization", {}},
+    {"an empty authorization", {"authorization", ""}},
+    {"a bare token", {"authorization", "reader-7f3a"}},
+    {"Basic instead of Bearer", {"authorization", "Basic admin-91c2"}},
+    {"'Bearer' without a space", {"authorization", "Beareradmin-91c2"}},
+    {"'Bearer ' with no token", {"authorization", "Bearer "}},
+    {"an unknown token", {"authorization", "Bearer guest-0000"}},
+    {"a known token with a suffix", {"authorization", "Bearer admin-91c2x"}},
+    {"the admin credentials under another key", {"token", kAdminAuth}},
+};
+
+// NotesImpl keeps its notes private; the harness seeds and reads them as whoever runs the server does.
+NotesMap NotesImpl::* NotesField();
+std::mutex NotesImpl::* NotesMutex();
+template <NotesMap NotesImpl::* Notes, std::mutex NotesImpl::* Mu>
+struct NotesAccess {
+  friend NotesMap NotesImpl::* NotesField() { return Notes; }
+  friend std::mutex NotesImpl::* NotesMutex() { return Mu; }
+};
+template struct NotesAccess<&NotesImpl::notes_, &NotesImpl::mu_>;
+
+// The learner's server, its notes seeded, served on notes:50051, and a client on it.
+struct NotesAt {
+  NotesImpl* srv;
+  std::unique_ptr<notes::v1::Notes::Stub> client;
+
+  // The server's notes now.
+  NotesMap Stored() {
+    std::lock_guard<std::mutex> lock(srv->*NotesMutex());
+    return srv->*NotesField();
+  }
+};
+
+NotesAt StartNotes(harness::Ctx& ctx) {
+  auto* srv = new NotesImpl();
+  srv->*NotesField() = kNotesSeed;
+  ctx.GRPC.Server("notes:50051")->RegisterService(srv);
+  return {srv, notes::v1::Notes::NewStub(ctx.GRPC.Dial("notes:50051"))};
+}
+
+// The outcome of one call: its code, details, and the reply when it is OK.
+struct NotesReply {
+  grpc::StatusCode code;
+  std::string details;
+  notes::v1::Note note;
+  notes::v1::DeleteNoteResponse deleted;
+};
+
+NotesReply CallNotes(NotesAt& n, const std::string& method, const std::string& id, const std::vector<std::string>& pairs) {
+  grpc::ClientContext c;
+  for (size_t i = 0; i + 1 < pairs.size(); i += 2) c.AddMetadata(pairs[i], pairs[i + 1]);
+  c.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+  NotesReply r;
+  grpc::Status status;
+  if (method == "GetNote") {
+    notes::v1::GetNoteRequest request;
+    request.set_id(id);
+    status = n.client->GetNote(&c, request, &r.note);
+  } else {
+    notes::v1::DeleteNoteRequest request;
+    request.set_id(id);
+    status = n.client->DeleteNote(&c, request, &r.deleted);
+  }
+  r.code = status.error_code();
+  r.details = status.error_message();
+  return r;
+}
+
+}  // namespace
+
+void CheckReaderReads(harness::Ctx& ctx) {
+  NotesAt n = StartNotes(ctx);
+  for (const std::string id : {"n-1", "n-2"}) {
+    NotesReply r = CallNotes(n, "GetNote", id, {"authorization", kReaderAuth});
+    ctx.Equal(r.code, grpc::StatusCode::OK, "GetNote(%s) with %q (%s)", id, kReaderAuth, r.details);
+    ctx.Equal(std::vector<std::string>{r.note.id(), r.note.text()}, std::vector<std::string>{id, kNotesSeed.at(id)},
+              "GetNote(%s) must answer Note{%s, %q}; id and text", id, id, kNotesSeed.at(id));
+  }
+  NotesReply r = CallNotes(n, "GetNote", "n-3", {"authorization", kAdminAuth});
+  ctx.Equal(r.code, grpc::StatusCode::OK, "the admin token holds notes.read too, but GetNote(n-3) failed (%s)", r.details);
+  ctx.Equal(r.note.text(), kNotesSeed.at("n-3"), "GetNote(n-3)'s text");
+  ctx.Equal(n.Stored(), kNotesSeed, "reading must not change the notes");
+}
+
+void CheckUnauthenticated(harness::Ctx& ctx) {
+  NotesAt n = StartNotes(ctx);
+  for (const BadCredential& bad : kBadCredentials) {
+    for (const std::string method : {"GetNote", "DeleteNote"}) {
+      NotesReply r = CallNotes(n, method, "n-1", bad.md);
+      ctx.Equal(r.code, grpc::StatusCode::UNAUTHENTICATED, "%s(n-1) with %s %q (%s)", method, bad.label, bad.md, r.details);
+    }
+  }
+  ctx.Equal(n.Stored(), kNotesSeed, "no unauthenticated call may delete anything: the notes");
+}
+
+void CheckPermissionDenied(harness::Ctx& ctx) {
+  NotesAt n = StartNotes(ctx);
+  NotesReply r = CallNotes(n, "DeleteNote", "n-2", {"authorization", kReaderAuth});
+  ctx.Equal(r.code, grpc::StatusCode::PERMISSION_DENIED,
+            "DeleteNote(n-2) with the reader token (%s): the token is known, it lacks notes.write", r.details);
+  ctx.Equal(n.Stored()["n-2"], kNotesSeed.at("n-2"), "a PERMISSION_DENIED delete must leave the note in the notes");
+  NotesReply read = CallNotes(n, "GetNote", "n-2", {"authorization", kReaderAuth});
+  ctx.Assert(read.code == grpc::StatusCode::OK && read.note.text() == kNotesSeed.at("n-2"),
+             "after the refused delete the reader must still read n-2, got %v (%s)", read.code, read.details);
+  for (const auto& [id, what] : std::vector<std::pair<std::string, std::string>>{{"ghost", "a missing note"}, {"", "an empty id"}}) {
+    r = CallNotes(n, "DeleteNote", id, {"authorization", kReaderAuth});
+    ctx.Equal(r.code, grpc::StatusCode::PERMISSION_DENIED,
+              "the reader's DeleteNote of %s (%s): authorize before you validate or look up", what, r.details);
+  }
+  ctx.Equal(n.Stored(), kNotesSeed, "the reader must not be able to delete anything: the notes");
+}
+
+void CheckAuthFirst(harness::Ctx& ctx) {
+  NotesAt n = StartNotes(ctx);
+  NotesReply r = CallNotes(n, "GetNote", "", {"authorization", kReaderAuth});
+  ctx.Equal(r.code, grpc::StatusCode::INVALID_ARGUMENT, "GetNote with an empty id and valid credentials (%s)", r.details);
+  r = CallNotes(n, "GetNote", "ghost", {"authorization", kReaderAuth});
+  ctx.Equal(r.code, grpc::StatusCode::NOT_FOUND, "GetNote(ghost) with valid credentials (%s)", r.details);
+  for (const BadCredential& bad : {kBadCredentials[0], kBadCredentials[2], kBadCredentials[6]}) {
+    for (const std::string method : {"GetNote", "DeleteNote"}) {
+      NotesReply exists = CallNotes(n, method, "n-1", bad.md);
+      for (const auto& [id, what] : std::vector<std::pair<std::string, std::string>>{{"ghost", "a missing note"}, {"", "an empty id"}}) {
+        r = CallNotes(n, method, id, bad.md);
+        ctx.Equal(r.code, grpc::StatusCode::UNAUTHENTICATED,
+                  "%s of %s with %s (%s): authenticate before you validate or look up", method, what, bad.label, r.details);
+        ctx.Equal(std::vector<std::string>{grpc::EnumName(r.code), r.details},
+                  std::vector<std::string>{grpc::EnumName(exists.code), exists.details},
+                  "%s with %s must answer the same for %s as for an existing note; code and details", method, bad.label, what);
+      }
+    }
+  }
+  ctx.Equal(n.Stored(), kNotesSeed, "no unauthenticated call may delete anything: the notes");
+}
+
+void CheckAdminDeletes(harness::Ctx& ctx) {
+  NotesAt n = StartNotes(ctx);
+  NotesReply r = CallNotes(n, "DeleteNote", "n-3", {"authorization", kAdminAuth});
+  ctx.Equal(r.code, grpc::StatusCode::OK, "DeleteNote(n-3) with the admin token (%s)", r.details);
+  ctx.Equal(r.deleted.deleted(), true, "DeleteNote must answer deleted: true, got {%s}", r.deleted.ShortDebugString());
+  ctx.Assert(n.Stored().count("n-3") == 0, "after the admin's delete n-3 must be gone from the notes");
+  ctx.Equal(n.Stored(), NotesMap{{"n-1", kNotesSeed.at("n-1")}, {"n-2", kNotesSeed.at("n-2")}}, "only n-3 may be deleted: the notes");
+  for (const std::string& token : {kAdminAuth, kReaderAuth}) {
+    r = CallNotes(n, "GetNote", "n-3", {"authorization", token});
+    ctx.Equal(r.code, grpc::StatusCode::NOT_FOUND, "GetNote(n-3) after the delete with %q (%s)", token, r.details);
+  }
+  r = CallNotes(n, "DeleteNote", "n-3", {"authorization", kAdminAuth});
+  ctx.Equal(r.code, grpc::StatusCode::NOT_FOUND, "deleting n-3 a second time (%s)", r.details);
+  r = CallNotes(n, "DeleteNote", "", {"authorization", kAdminAuth});
+  ctx.Equal(r.code, grpc::StatusCode::INVALID_ARGUMENT, "the admin's DeleteNote with an empty id (%s)", r.details);
+}
+`,
   },
   debrief: `The order of the gates is the whole design. Authentication answers "who is this?", and only a caller with an answer gets \`PERMISSION_DENIED\`, which says "I know you, and you may not". Validation and lookup come last because their answers carry information: \`NOT_FOUND\` against \`PERMISSION_DENIED\` tells an anonymous caller which ids exist, and an id space that can be probed for free is a leak even when the contents stay hidden. That is also why the auth failure has fixed details, independent of the request. Credentials ride in metadata rather than in the request message so that one helper (in production an interceptor, or a sidecar such as Envoy's ext_authz) can judge every RPC of every service the same way without knowing its messages. Real systems verify a signed token (a JWT checked against a JWKS, or an mTLS client certificate) instead of a lookup table, compare secrets in constant time, cache introspection results briefly, and log every denial with the caller's identity; some go further and answer \`NOT_FOUND\` instead of \`PERMISSION_DENIED\` when even the existence of a resource is private to its owner.`,
 };

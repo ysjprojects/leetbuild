@@ -1161,6 +1161,133 @@ func CheckFlushBound(ctx *harness.Ctx) {
 	ctx.Assert(s.delivered == 0 && s.pending == 1, "nothing was delivered and one record is still in flight: %v", stats())
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <set>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+const std::string eventsTopic = "events";
+
+std::string showStats(const Stats& s) {
+  return harness::Sprintf("{delivered:%d retried:%d dead:%q pending:%d}", s.delivered, s.retried, s.dead, s.pending);
+}
+
+// serveReportsFor is the 10 ms the TypeScript check sleeps while e1's retry chain runs: the delivery
+// reports that arrive meanwhile are served as a poll loop would.
+void serveReportsFor(harness::Ctx& ctx, int64_t ms) {
+  const int64_t over = ctx.Clock.Now() + ms;
+  for (int64_t left = ms; left > 0; left = over - ctx.Clock.Now()) producer->poll(static_cast<int>(left));
+}
+
+}  // namespace
+
+void CheckLoseAcks(harness::Ctx& ctx) {
+  ctx.Kafka.LoseAcks(eventsTopic, 1);
+  send("e1", "p1");
+  shutdown();
+  const auto records = ctx.Kafka.Records(eventsTopic);
+  ctx.Equal(records.size(), 1, "a lost ack must not duplicate the record (enable.idempotence): copies on %s", eventsTopic);
+  const Stats s = stats();
+  ctx.Equal(s.delivered, 1, "the record was written once and must count as delivered once: delivered");
+  ctx.Assert(s.dead.empty(), "a lost ack is not a failure: dead=%q", s.dead);
+  ctx.Equal(s.pending, 0, "nothing is in flight after shutdown: pending");
+}
+
+void CheckRetries(harness::Ctx& ctx) {
+  ctx.Kafka.FailNext(eventsTopic, 2);
+  send("e1", "p1");
+  shutdown();
+  const Stats s = stats();
+  ctx.Equal(s.retried, 2, "two retriable failures mean two retries: retried");
+  ctx.Equal(s.delivered, 1, "the third attempt succeeds: delivered");
+  ctx.Assert(s.dead.empty(), "a record that eventually delivered must not be in dead: %q", s.dead);
+  ctx.Equal(ctx.Kafka.Keys(eventsTopic), {"e1"}, "exactly one record with key e1 on %s", eventsTopic);
+  ctx.Equal(ctx.Kafka.Values(eventsTopic), {"p1"}, "the retry must carry the same value");
+}
+
+void CheckDead(harness::Ctx& ctx) {
+  ctx.Kafka.FailNext(eventsTopic, 4);
+  send("e1", "p1");
+  serveReportsFor(ctx, 10);  // the retry chain runs
+  send("e2", "p2");
+  shutdown();
+  const Stats s = stats();
+  ctx.Equal(s.dead, {"e1"}, "a record that failed maxRetries + 1 times belongs in dead");
+  ctx.Equal(s.retried, 3, "maxRetries retries, no more: retried");
+  ctx.Equal(s.delivered, 1, "e2 still delivers: delivered");
+  const auto keys = ctx.Kafka.Keys(eventsTopic);
+  const auto e1 = std::count(keys.begin(), keys.end(), "e1");
+  const auto e2 = std::count(keys.begin(), keys.end(), "e2");
+  ctx.Assert(e1 <= 1, "e1 is on the topic %d times", e1);
+  ctx.Equal(e2, 1, "e2 must be on the topic exactly once, keys %q; copies of e2", keys);
+  ctx.Equal(s.pending, 0, "a dead record is not in flight: pending");
+}
+
+void CheckBackpressure(harness::Ctx& ctx) {
+  ctx.Kafka.StallFor(eventsTopic, 5);  // the broker answers again after 5 s
+  std::vector<std::string> ids;
+  for (int i = 0; i < 150; i++) ids.push_back("e" + std::to_string(i));
+  std::thread sender([&ids] {
+    for (const auto& id : ids) send(id, "p");
+  });
+  struct detachOnExit {
+    std::thread& thread;
+    ~detachOnExit() {
+      if (thread.joinable()) thread.detach();
+    }
+  } senderGuard{sender};
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));  // the probe: the stall is still on
+  const size_t stalled = ctx.Kafka.EventsOf("produce-stalled").size();
+  ctx.Assert(stalled <= 100, "%d records were handed to the stalled broker: send must wait once maxPending are in flight", stalled);
+  ctx.Assert(stalled > 0, "with the broker stalled the first maxPending records must still be handed to the producer");
+  const int pending = stats().pending;
+  ctx.Assert(pending <= 100, "pending is %d during the stall: maxPending is 100", pending);
+  sender.join();
+  shutdown();
+  const auto keys = ctx.Kafka.Keys(eventsTopic);
+  const std::set<std::string> distinct(keys.begin(), keys.end());
+  auto sortedKeys = keys;
+  std::sort(sortedKeys.begin(), sortedKeys.end());
+  std::sort(ids.begin(), ids.end());
+  ctx.Equal(sortedKeys, ids, "every record must land once the broker answers: %d of 150, %d distinct", keys.size(), distinct.size());
+  const Stats s = stats();
+  ctx.Assert(s.delivered == 150 && s.dead.empty(), "delivered=%d dead=%q: waiting is not dropping", s.delivered, s.dead);
+}
+
+void CheckKeyed(harness::Ctx& ctx) {
+  for (const std::string id : {"order-1", "order-2", "order-3"}) send(id, "p");
+  shutdown();
+  const auto records = ctx.Kafka.Records(eventsTopic);
+  std::vector<std::optional<std::string>> keys;
+  for (const auto& r : records) keys.push_back(r.Key);
+  ctx.Equal(keys, {"order-1", "order-2", "order-3"}, "keys must be the event ids");
+  for (const auto& r : records)
+    ctx.Equal(r.Partition, ctx.Kafka.PartitionFor(eventsTopic, r.Key),
+              "%s sits on a partition other than the one its key hashes to", r.Key);
+}
+
+void CheckFlushBound(harness::Ctx& ctx) {
+  ctx.Kafka.Stall(eventsTopic);  // dead broker
+  send("e1", "p1");
+  const int64_t started = ctx.Clock.Now();
+  const int left = shutdown();
+  const int64_t waited = ctx.Clock.Now() - started;
+  ctx.Assert(waited >= 2500 && waited <= 10'000,
+             "shutdown waited %d ms on a dead broker: flush must be bounded by flushTimeoutMs = 3000", waited);
+  ctx.Equal(left, 1, "shutdown must return how many records are still in flight");
+  const Stats s = stats();
+  ctx.Assert(s.delivered == 0 && s.pending == 1, "nothing was delivered and one record is still in flight: %v", showStats(s));
+}
+`,
   },
   debrief: `Three things happen at three places, and the solution keeps them apart. **Idempotence is configuration**: \`enable.idempotence\` with \`acks=all\` makes the *client's* retries safe — a batch whose ack was lost is resent with the same producer id and sequence number and the broker writes it once — so the delivery report arrives exactly once per record and \`delivered\` is honest. **Retries are the callback's**: the client already retried what it could; what reaches the callback as a retriable error (a message timeout, a transport error) is yours to re-produce, bounded by \`MAX_RETRIES\`, with the same key so the retry lands on the same partition; everything else is parked in \`dead\` instead of looping forever. **The window is the caller's**: \`pending\` counts produces minus reports, and \`send\` waits on it — polling, which is what serves the reports that free a slot — so a stalled broker slows the caller down rather than filling memory, and the records wait their turn instead of being dropped. Real producers add a dead-letter *topic* for the parked ids, \`max.in.flight.requests.per.connection ≤ 5\` (idempotence keeps order within it), \`delivery.timeout.ms\` tuned to how long a retry is worth, and metrics on \`pending\` — the first number that moves when a broker is in trouble.`,
 };

@@ -1,13 +1,14 @@
 /**
  * Main-thread handle on a runtime worker — one per executing language: `prewarm()` when a step
  * that will run opens, `run()` on submit. The workers are `public/py/worker.js` (Python, Pyodide),
- * `public/ts/worker.js` (TypeScript, esbuild-wasm) and `public/go/worker.js` (Go, the yaegi
- * interpreter in WebAssembly), ES-module bundles built by `yarn build:runtime` (Pyodide only runs in
- * module workers, which webpack cannot emit here). A run that overshoots its budget (a learner's
- * infinite loop cannot be interrupted from outside the worker) terminates the worker; the next run
- * boots a fresh one.
+ * `public/ts/worker.js` (TypeScript, esbuild-wasm), `public/go/worker.js` (Go, the yaegi
+ * interpreter in WebAssembly) and `public/cpp/worker.js` (C++, clang in WebAssembly), ES-module
+ * bundles built by `yarn build:runtime` (Pyodide only runs in module workers, which webpack cannot
+ * emit here). A run that overshoots its budget (a learner's infinite loop cannot be interrupted
+ * from outside the worker) terminates the worker; the next run boots a fresh one.
  */
-import type {Language} from '../types';
+import type {Language, Step} from '../types';
+import {cppSupported} from './cpp/support';
 import type {OutputLine, Phase, RunJob, RunResult, WorkerIn, WorkerOut} from './types';
 
 export type RuntimeStatus =
@@ -21,12 +22,27 @@ export const RUN_TIMEOUT_MS = 20_000;
 /** A program run's budget (a deep-learning step's self-test trains on the CPU, single-threaded). */
 export const PROGRAM_TIMEOUT_MS = 120_000;
 
-/** Languages graded by execution, with their worker bundle (`yarn build:runtime` writes it under public/) and first boot phase. */
-export const RUNTIMES: Partial<Record<Language, {workerUrl: string; firstPhase: Phase}>> = {
+/**
+ * Languages graded by execution, with their worker bundle (`yarn build:runtime` writes it under
+ * public/), first boot phase, and whether a run compiles first (its budget then starts when the
+ * compiled code does, as a program's does).
+ */
+export const RUNTIMES: Partial<Record<Language, {workerUrl: string; firstPhase: Phase; compiles?: boolean}>> = {
   python: {workerUrl: '/py/worker.js', firstPhase: 'pyodide'},
   typescript: {workerUrl: '/ts/worker.js', firstPhase: 'esbuild'},
   go: {workerUrl: '/go/worker.js', firstPhase: 'go'},
+  cpp: {workerUrl: '/cpp/worker.js', firstPhase: 'clang', compiles: true},
 };
+
+/** Whether `language` runs in this browser: C++ needs WebAssembly stack switching (JSPI). */
+export function executesHere(language: Language): boolean {
+  return RUNTIMES[language] !== undefined && (language !== 'cpp' || cppSupported());
+}
+
+/** The harness `step` runs with in `language` here; none when the language is judged statically in this browser. */
+export function runtimeHarness(step: Step, language: Language): string | undefined {
+  return executesHere(language) ? step.harness?.[language] : undefined;
+}
 
 export const STATUS_TEXT: Record<Phase, string> = {
   pyodide: 'starting Python (downloading the runtime, ~10 MB the first time)',
@@ -35,13 +51,15 @@ export const STATUS_TEXT: Record<Phase, string> = {
   go: 'starting Go (downloading the interpreter, ~9 MB the first time)',
   runtime: 'installing the LeetBuild runtime',
   torch: 'loading PyTorch (~40 MB the first time)',
+  clang: 'starting C++ (downloading the compiler, ~30 MB the first time)',
 };
 
 interface Pending {
   resolve: (result: RunResult) => void;
   /**
-   * The budget timer. It starts when the runtime is ready, or for a program when its code starts
-   * (after PyTorch loads), so a slow first download is never charged to the run.
+   * The budget timer. It starts when the runtime is ready, or for a program, or a run that compiles
+   * first, when its code starts (after PyTorch loads, after clang), so neither a slow first download
+   * nor a compile is charged to the run.
    */
   timer: number | null;
   program: boolean;
@@ -56,7 +74,11 @@ export class RuntimeRunner {
   private readonly listeners = new Set<(status: RuntimeStatus) => void>();
   private nextId = 1;
 
-  constructor(private readonly workerUrl: string, private readonly firstPhase: Phase) {}
+  constructor(
+    private readonly workerUrl: string,
+    private readonly firstPhase: Phase,
+    private readonly compiles = false,
+  ) {}
 
   onStatus(listener: (status: RuntimeStatus) => void): () => void {
     this.listeners.add(listener);
@@ -75,7 +97,8 @@ export class RuntimeRunner {
     const program = job.program === true;
     if (this.ready) this.setStatus({state: 'running'});
     return new Promise<RunResult>(resolve => {
-      this.pending.set(id, {resolve, timer: this.ready && !program ? this.budget(id, false) : null, program, onOutput});
+      const timer = this.ready && !program && !this.compiles ? this.budget(id, false) : null;
+      this.pending.set(id, {resolve, timer, program, onOutput});
       worker.postMessage({type: 'run', id, job} satisfies WorkerIn);
     });
   }
@@ -102,7 +125,7 @@ export class RuntimeRunner {
       case 'ready':
         this.ready = true;
         for (const [id, pending] of this.pending) {
-          if (pending.timer === null && !pending.program) pending.timer = this.budget(id, false);
+          if (pending.timer === null && !pending.program && !this.compiles) pending.timer = this.budget(id, false);
         }
         this.setStatus(this.pending.size > 0 ? {state: 'running'} : {state: 'ready'});
         return;
@@ -173,13 +196,13 @@ export class RuntimeRunner {
 
 const runners = new Map<Language, RuntimeRunner>();
 
-/** The runner for `language`, or null when it is graded statically. */
+/** The runner for `language`, or null when it is graded statically (here: C++ without JSPI too). */
 export function getRunner(language: Language): RuntimeRunner | null {
   const runtime = RUNTIMES[language];
-  if (runtime === undefined) return null;
+  if (runtime === undefined || !executesHere(language)) return null;
   let runner = runners.get(language);
   if (runner === undefined) {
-    runner = new RuntimeRunner(runtime.workerUrl, runtime.firstPhase);
+    runner = new RuntimeRunner(runtime.workerUrl, runtime.firstPhase, runtime.compiles);
     runners.set(language, runner);
   }
   return runner;

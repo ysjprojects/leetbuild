@@ -752,6 +752,105 @@ func CheckRaises(ctx *harness.Ctx) {
 	failsToPublish(ctx, orderFor("o-3", "ACME"), "an acknowledgement that never arrives within ackTimeout")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <cstdint>
+#include <exception>
+#include <string>
+
+namespace {
+
+Order orderFor(const std::string& order_id, const std::string& symbol) {
+  return Order{order_id, symbol, "BUY", "c-1", 10.05, 100};
+}
+
+void mustPublish(harness::Ctx& ctx, const Order& o) {
+  try {
+    publish_order(o);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("publish_order(%s) threw: %s", o.order_id, e.what());
+  }
+}
+
+// failsToPublish: publish_order must throw PublishFailed (the gateway's 503).
+void failsToPublish(harness::Ctx& ctx, const Order& o, const std::string& what) {
+  try {
+    publish_order(o);
+  } catch (const PublishFailed&) {
+    return;
+  } catch (const std::exception& e) {
+    ctx.Fatalf("%s must make publish_order throw PublishFailed (the gateway catches only that), it threw %s", what, e.what());
+  }
+  ctx.Fatalf("%s must make publish_order throw PublishFailed, it returned normally", what);
+}
+
+}  // namespace
+
+void CheckKeyedBySymbol(harness::Ctx& ctx) {
+  mustPublish(ctx, orderFor("o-1", "ACME"));
+  mustPublish(ctx, orderFor("o-2", "ACME"));
+  mustPublish(ctx, orderFor("o-3", "BETA"));
+  const auto produced = ctx.Kafka.Records("orders");
+  ctx.Equal(produced.size(), 3, "expected three records on orders");
+  ctx.Equal(ctx.Kafka.Keys("orders"), {"ACME", "ACME", "BETA"}, "records must be keyed by the symbol");
+  ctx.Equal(produced[0].Partition, produced[1].Partition, "two ACME orders must land on the same partition");
+  const std::string text = produced[0].Value.value_or("");
+  const auto value = harness::ParseJSON(text).value_or(harness::Any());
+  ctx.Assert(value["order_id"] == "o-1" && value["symbol"] == "ACME" && value["qty"] == 100.0,
+             "the value must be the JSON of the order, got %s", text);
+}
+
+void CheckAcksAll(harness::Ctx& ctx) {
+  mustPublish(ctx, orderFor("o-1", "ACME"));
+  // The partition leader fails right after it answered: a record acknowledged by the leader alone is gone.
+  ctx.Kafka.Failover("orders");
+  const size_t held = ctx.Kafka.Records("orders").size();
+  ctx.Equal(held, 1, "publish_order returned (the gateway would answer 202), then the partition leader failed and orders lost the order: it had been acknowledged by the leader alone. The 202 is a durability promise and needs acks=all; records on orders");
+}
+
+void CheckIdempotent(harness::Ctx& ctx) {
+  // The broker writes the order but its acknowledgement is lost on the way back: the producer retries.
+  ctx.Kafka.LoseAcks("orders", 1);
+  mustPublish(ctx, orderFor("o-1", "ACME"));
+  // librdkafka has an idempotent producer (kafka-go, which the Go harness accepts tagged copies from,
+  // has none): the broker drops the retried copy, so orders holds the order exactly once.
+  const auto records = ctx.Kafka.Records("orders");
+  ctx.Assert(!records.empty(), "after a lost acknowledgement the order must still be on orders, it holds nothing");
+  for (const auto& r : records) {
+    const auto value = harness::ParseJSON(r.Value.value_or("")).value_or(harness::Any());
+    ctx.Equal(value["order_id"], "o-1", "after a lost acknowledgement orders must hold only the order o-1; order_id of a record");
+  }
+  ctx.Equal(records.size(), 1, "a retried write after a lost acknowledgement duplicated the order: the producer needs enable.idempotence; copies on orders");
+}
+
+void CheckWaitsForAck(harness::Ctx& ctx) {
+  // The broker is slow but answers within kAckTimeoutMs: the call waits for the ack and returns.
+  ctx.Kafka.StallFor("orders", 0.5);
+  int64_t start = ctx.Clock.Now();
+  mustPublish(ctx, orderFor("o-1", "ACME"));
+  const int64_t waited = ctx.Clock.Now() - start;
+  ctx.Equal(ctx.Kafka.Records("orders").size(), 1, "the order must be on the topic once publish_order returned");
+  ctx.Assert(waited >= 500, "publish_order returned after %d ms while the broker only answered after 500 ms: it returned without waiting for the acknowledgement", waited);
+  // The broker never answers: the wait is bounded by kAckTimeoutMs, not librdkafka's 5-minute message timeout.
+  ctx.Kafka.Stall("orders");
+  start = ctx.Clock.Now();
+  failsToPublish(ctx, orderFor("o-2", "ACME"), "an acknowledgement that never arrives");
+  const int64_t gaveUp = ctx.Clock.Now() - start;
+  const int64_t limit = kAckTimeoutMs;
+  ctx.Assert(gaveUp >= limit - 1 && gaveUp <= limit + 1000, "publish_order gave up after %d ms, expected kAckTimeoutMs (%d ms)", gaveUp, limit);
+}
+
+void CheckRaises(harness::Ctx& ctx) {
+  ctx.Kafka.FailNext("orders", 1);
+  failsToPublish(ctx, orderFor("o-1", "ACME"), "a delivery error");
+  ctx.Equal(ctx.Kafka.Records("orders").size(), 0, "the failed order must not be on the topic; records on orders");
+  mustPublish(ctx, orderFor("o-2", "ACME"));  // the producer is still usable afterwards
+  ctx.Equal(ctx.Kafka.Records("orders").size(), 1, "the next order must be published normally; records on orders");
+  // The broker never answers: the flush times out with the record still pending.
+  ctx.Kafka.Stall("orders");
+  failsToPublish(ctx, orderFor("o-3", "ACME"), "an acknowledgement that never arrives within kAckTimeoutMs");
+}
+`,
   },
   debrief: `Same producer API as an analytics event, opposite trade-off: here latency is spent to buy durability, because the 202 already left the building as a promise. \`acks=all\` moves the failure from "lost silently" to "reported", idempotence keeps the broker's own retries from turning one order into two, and the symbol key is what lets the next step keep one book per partition with no locks at all. Real exchanges skip Kafka on the hot path — a sequencer assigns a global sequence number and replicates the input log to standbys synchronously — but the shape is identical: nothing is acknowledged to the client before it is on more than one machine, and everything downstream is a deterministic function of the sequenced log.`,
 };

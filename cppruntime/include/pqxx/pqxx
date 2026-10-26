@@ -1,0 +1,769 @@
+// libpqxx 7 (the C++ client for Postgres), as the courses use it, over the runtime's shared Postgres
+// (PGlite, one session): connection, the transaction types (work, transaction<…>, read_transaction,
+// nontransaction), exec / exec_params / exec_prepared and their row-count variants, query<T…>,
+// query_value, result / row / field with as<T>(), params, prepared statements, quoting, and the
+// exception hierarchy (sql_error with its SQLSTATE: unique_violation, check_violation, …).
+//
+// A transaction holds the single connection from its BEGIN to its COMMIT/ROLLBACK, as a checked-out
+// connection would: statements from other threads (and the harness's) wait for it. A transaction
+// destroyed without commit() rolls back. The connection string is ignored: every connection reaches
+// the same database. Templates live here; the rest is in cppruntime/src/pqxx.cpp.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <iterator>
+#include <limits>
+#include <map>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <type_traits>
+#include <typeinfo>
+#include <utility>
+#include <vector>
+
+#include <pqxx/internal/lb_world.hxx>
+
+namespace pqxx {
+
+using oid = unsigned int;
+using result_size_type = int;
+using row_size_type = int;
+using zview = std::string_view;
+
+// Character traits for std::byte (libc++ has none), as libpqxx 7.10 defines them for pqxx::bytes.
+struct byte_char_traits : std::char_traits<char> {
+  using char_type = std::byte;
+  static void assign(std::byte& a, const std::byte& b) noexcept { a = b; }
+  static std::byte* assign(std::byte* p, std::size_t n, std::byte b) noexcept {
+    for (std::size_t i = 0; i < n; i++) p[i] = b;
+    return p;
+  }
+  static bool eq(std::byte a, std::byte b) noexcept { return a == b; }
+  static bool lt(std::byte a, std::byte b) noexcept { return a < b; }
+  static int compare(const std::byte* a, const std::byte* b, std::size_t n) noexcept {
+    for (std::size_t i = 0; i < n; i++) {
+      if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
+    }
+    return 0;
+  }
+  static std::size_t length(const std::byte*) { return 0; }
+  static const std::byte* find(const std::byte* p, std::size_t n, const std::byte& b) noexcept {
+    for (std::size_t i = 0; i < n; i++) {
+      if (p[i] == b) return p + i;
+    }
+    return nullptr;
+  }
+  static std::byte* move(std::byte* to, const std::byte* from, std::size_t n) noexcept {
+    if (n != 0) __builtin_memmove(to, from, n);
+    return to;
+  }
+  static std::byte* copy(std::byte* to, const std::byte* from, std::size_t n) noexcept {
+    if (n != 0) __builtin_memcpy(to, from, n);
+    return to;
+  }
+  static std::byte to_char_type(int_type c) noexcept { return static_cast<std::byte>(c); }
+  static int_type to_int_type(std::byte c) noexcept { return static_cast<int_type>(c); }
+};
+
+using bytes = std::basic_string<std::byte, byte_char_traits>;
+using bytes_view = std::basic_string_view<std::byte, byte_char_traits>;
+
+// ---- exceptions ---------------------------------------------------------------------------------
+
+struct failure : std::runtime_error {
+  explicit failure(const std::string& what) : std::runtime_error(what) {}
+};
+
+struct broken_connection : failure {
+  explicit broken_connection(const std::string& what = "Connection to database failed.") : failure(what) {}
+};
+
+struct variable_set_to_null : failure {
+  using failure::failure;
+};
+
+class sql_error : public failure {
+ public:
+  explicit sql_error(const std::string& what = "Failed query", const std::string& query = "",
+                     const char* sqlstate = nullptr)
+      : failure(what), query_(query), sqlstate_(sqlstate == nullptr ? "" : sqlstate) {}
+  // The statement that failed.
+  const std::string& query() const noexcept { return query_; }
+  // The SQLSTATE error code ("23505"), empty when unknown.
+  const std::string& sqlstate() const noexcept { return sqlstate_; }
+
+ private:
+  std::string query_;
+  std::string sqlstate_;
+};
+
+struct in_doubt_error : failure {
+  using failure::failure;
+};
+
+#define LB_PQXX_SQL_ERROR(name, base)                                                             \
+  struct name : base {                                                                            \
+    explicit name(const std::string& err, const std::string& Q = "", const char* sqlstate = nullptr) \
+        : base(err, Q, sqlstate) {}                                                                \
+  };
+
+LB_PQXX_SQL_ERROR(feature_not_supported, sql_error)
+LB_PQXX_SQL_ERROR(data_exception, sql_error)
+LB_PQXX_SQL_ERROR(integrity_constraint_violation, sql_error)
+LB_PQXX_SQL_ERROR(restrict_violation, integrity_constraint_violation)
+LB_PQXX_SQL_ERROR(not_null_violation, integrity_constraint_violation)
+LB_PQXX_SQL_ERROR(foreign_key_violation, integrity_constraint_violation)
+LB_PQXX_SQL_ERROR(unique_violation, integrity_constraint_violation)
+LB_PQXX_SQL_ERROR(check_violation, integrity_constraint_violation)
+LB_PQXX_SQL_ERROR(invalid_cursor_state, sql_error)
+LB_PQXX_SQL_ERROR(invalid_sql_statement_name, sql_error)
+LB_PQXX_SQL_ERROR(invalid_cursor_name, sql_error)
+LB_PQXX_SQL_ERROR(syntax_error, sql_error)
+LB_PQXX_SQL_ERROR(undefined_column, syntax_error)
+LB_PQXX_SQL_ERROR(undefined_function, syntax_error)
+LB_PQXX_SQL_ERROR(undefined_table, syntax_error)
+LB_PQXX_SQL_ERROR(insufficient_privilege, sql_error)
+LB_PQXX_SQL_ERROR(insufficient_resources, sql_error)
+LB_PQXX_SQL_ERROR(disk_full, insufficient_resources)
+LB_PQXX_SQL_ERROR(out_of_memory, insufficient_resources)
+LB_PQXX_SQL_ERROR(plpgsql_error, sql_error)
+LB_PQXX_SQL_ERROR(plpgsql_raise, plpgsql_error)
+LB_PQXX_SQL_ERROR(plpgsql_no_data_found, plpgsql_error)
+LB_PQXX_SQL_ERROR(plpgsql_too_many_rows, plpgsql_error)
+LB_PQXX_SQL_ERROR(transaction_rollback, sql_error)
+LB_PQXX_SQL_ERROR(serialization_failure, transaction_rollback)
+LB_PQXX_SQL_ERROR(statement_completion_unknown, transaction_rollback)
+LB_PQXX_SQL_ERROR(deadlock_detected, transaction_rollback)
+#undef LB_PQXX_SQL_ERROR
+
+struct internal_error : std::logic_error {
+  explicit internal_error(const std::string& what) : std::logic_error("libpqxx internal error: " + what) {}
+};
+struct usage_error : std::logic_error {
+  explicit usage_error(const std::string& what) : std::logic_error(what) {}
+};
+struct argument_error : std::invalid_argument {
+  explicit argument_error(const std::string& what) : std::invalid_argument(what) {}
+};
+struct conversion_error : std::domain_error {
+  explicit conversion_error(const std::string& what) : std::domain_error(what) {}
+};
+struct unexpected_null : conversion_error {
+  explicit unexpected_null(const std::string& what) : conversion_error(what) {}
+};
+struct conversion_overrun : conversion_error {
+  explicit conversion_overrun(const std::string& what) : conversion_error(what) {}
+};
+struct range_error : std::out_of_range {
+  explicit range_error(const std::string& what) : std::out_of_range(what) {}
+};
+struct unexpected_rows : range_error {
+  explicit unexpected_rows(const std::string& what) : range_error(what) {}
+};
+
+// ---- parameters -----------------------------------------------------------------------------------
+
+// Statement parameters built up one by one: tx.exec(sql, pqxx::params{a, b}).
+class params {
+ public:
+  params() = default;
+  template <class... A>
+  explicit params(const A&... args) {
+    (append(args), ...);
+  }
+  template <class T>
+  void append(const T& v) {
+    if constexpr (std::is_same_v<std::decay_t<T>, params>) {
+      for (const auto& p : v.list_) list_.push_back(p);
+    } else {
+      list_.push_back(lb::pg::to_param(v));
+    }
+  }
+  void append() { list_.push_back({std::nullopt, 'n'}); }
+  template <class R>
+  void append_multi(const R& range) {
+    for (const auto& v : range) append(v);
+  }
+  int size() const noexcept { return static_cast<int>(list_.size()); }
+  const std::vector<lb::pg::Param>& lb_list() const { return list_; }
+
+ private:
+  std::vector<lb::pg::Param> list_;
+};
+
+// A prepared statement's name, for tx.exec(pqxx::prepped{"name"}, params).
+class prepped {
+ public:
+  explicit prepped(std::string name) : name_(std::move(name)) {}
+  explicit prepped(const char* name) : name_(name) {}
+  const std::string& name() const { return name_; }
+
+ private:
+  std::string name_;
+};
+
+namespace internal {
+
+template <class... A>
+std::vector<lb::pg::Param> params_of(const A&... args) {
+  std::vector<lb::pg::Param> out;
+  out.reserve(sizeof...(A));
+  (
+      [&] {
+        if constexpr (std::is_same_v<std::decay_t<A>, params>) {
+          for (const auto& p : args.lb_list()) out.push_back(p);
+        } else {
+          out.push_back(lb::pg::to_param(args));
+        }
+      }(),
+      ...);
+  return out;
+}
+
+// Text as a value of T (libpqxx's from_string); what cannot convert throws conversion_error.
+long long parse_integer(std::string_view text, const char* type);
+unsigned long long parse_unsigned(std::string_view text, const char* type);
+double parse_float(std::string_view text);
+bool parse_bool(std::string_view text);
+std::string parse_bytea(std::string_view text);
+std::string type_name(const char* mangled);
+
+template <class T>
+struct is_optional : std::false_type {};
+template <class T>
+struct is_optional<std::optional<T>> : std::true_type {};
+
+}  // namespace internal
+
+// Convert a field's text to T (libpqxx's string conversion).
+template <class T>
+T from_string(std::string_view text) {
+  using D = std::decay_t<T>;
+  if constexpr (std::is_same_v<D, bool>) {
+    return internal::parse_bool(text);
+  } else if constexpr (std::is_same_v<D, char>) {
+    if (text.size() != 1) throw conversion_error("Could not convert string to char: '" + std::string(text) + "'.");
+    return text[0];
+  } else if constexpr (std::is_integral_v<D> && std::is_signed_v<D>) {
+    const long long v = internal::parse_integer(text, internal::type_name(typeid(D).name()).c_str());
+    if (v < static_cast<long long>(std::numeric_limits<D>::min()) || v > static_cast<long long>(std::numeric_limits<D>::max()))
+      throw conversion_overrun("Value out of range for " + internal::type_name(typeid(D).name()) + ": '" + std::string(text) + "'.");
+    return static_cast<D>(v);
+  } else if constexpr (std::is_integral_v<D>) {
+    const unsigned long long v = internal::parse_unsigned(text, internal::type_name(typeid(D).name()).c_str());
+    if (v > static_cast<unsigned long long>(std::numeric_limits<D>::max()))
+      throw conversion_overrun("Value out of range for " + internal::type_name(typeid(D).name()) + ": '" + std::string(text) + "'.");
+    return static_cast<D>(v);
+  } else if constexpr (std::is_floating_point_v<D>) {
+    return static_cast<D>(internal::parse_float(text));
+  } else if constexpr (std::is_same_v<D, std::string>) {
+    return std::string(text);
+  } else if constexpr (std::is_same_v<D, std::string_view>) {
+    return text;
+  } else if constexpr (std::is_same_v<D, bytes>) {
+    const std::string raw = internal::parse_bytea(text);
+    return bytes(reinterpret_cast<const std::byte*>(raw.data()), raw.size());
+  } else {
+    static_assert(sizeof(D) == 0, "pqxx: no string conversion to this type");
+  }
+}
+
+// A value as a parameter's text (libpqxx's to_string).
+template <class T>
+std::string to_string(const T& v) {
+  const lb::pg::Param p = lb::pg::to_param(v);
+  if (!p.text) throw conversion_error("Attempt to convert null to a string.");
+  return *p.text;
+}
+
+// ---- results ---------------------------------------------------------------------------------------
+
+class result;
+class row;
+
+namespace internal {
+struct result_data {
+  lb::pg::Result r;
+  std::string query;
+};
+}  // namespace internal
+
+class field {
+ public:
+  using size_type = std::size_t;
+  field() = default;
+  field(std::shared_ptr<const internal::result_data> data, int row, int col) : data_(std::move(data)), row_(row), col_(col) {}
+
+  bool is_null() const noexcept { return !cell().has_value(); }
+  const char* c_str() const& { return is_null() ? "" : cell()->c_str(); }
+  std::string_view view() const& { return is_null() ? std::string_view() : std::string_view(*cell()); }
+  size_type size() const noexcept { return is_null() ? 0 : cell()->size(); }
+  const char* name() const { return data_->r.columns.at(static_cast<size_t>(col_)).name.c_str(); }
+  oid type() const { return data_->r.columns.at(static_cast<size_t>(col_)).oid; }
+  int num() const { return col_; }
+  int column_number() const { return col_; }
+  int rownumber() const { return row_; }
+
+  // The value as T; NULL throws (as<std::optional<T>>() gives nullopt).
+  template <class T>
+  T as() const {
+    if constexpr (internal::is_optional<T>::value) {
+      if (is_null()) return std::nullopt;
+      return as<typename T::value_type>();
+    } else {
+      if (is_null()) null_error(internal::type_name(typeid(T).name()));
+      if constexpr (std::is_same_v<T, const char*>) {
+        return cell()->c_str();
+      } else {
+        return from_string<T>(*cell());
+      }
+    }
+  }
+  // The value as T, or fallback when NULL.
+  template <class T>
+  T as(const T& fallback) const {
+    return is_null() ? fallback : as<T>();
+  }
+  // The value, or nullopt when NULL.
+  template <class T>
+  std::optional<T> get() const {
+    if (is_null()) return std::nullopt;
+    return as<T>();
+  }
+  // Read into out; false (out untouched) when NULL.
+  template <class T>
+  bool to(T& out) const {
+    if (is_null()) return false;
+    out = as<T>();
+    return true;
+  }
+  template <class T>
+  bool to(T& out, const T& fallback) const {
+    const bool has = to(out);
+    if (!has) out = fallback;
+    return has;
+  }
+  template <class T>
+  bool operator>>(T& out) const {
+    return to(out);
+  }
+  bool operator==(const field& other) const { return is_null() == other.is_null() && view() == other.view(); }
+
+ private:
+  [[noreturn]] void null_error(const std::string& type) const;
+  const std::optional<std::string>& cell() const {
+    return data_->r.rows.at(static_cast<size_t>(row_)).at(static_cast<size_t>(col_));
+  }
+  std::shared_ptr<const internal::result_data> data_;
+  int row_ = 0;
+  int col_ = 0;
+};
+
+class row {
+ public:
+  using size_type = int;
+  using reference = field;
+
+  class const_iterator {
+   public:
+    using iterator_category = std::random_access_iterator_tag;
+    using value_type = field;
+    using difference_type = std::ptrdiff_t;
+    using pointer = const field*;
+    using reference = field;
+    const_iterator() = default;
+    const_iterator(const row* r, int col) : row_(r), col_(col) {}
+    field operator*() const { return (*row_)[col_]; }
+    const_iterator& operator++() {
+      ++col_;
+      return *this;
+    }
+    const_iterator operator++(int) {
+      auto old = *this;
+      ++col_;
+      return old;
+    }
+    const_iterator& operator--() {
+      --col_;
+      return *this;
+    }
+    const_iterator& operator+=(difference_type n) {
+      col_ += static_cast<int>(n);
+      return *this;
+    }
+    const_iterator operator+(difference_type n) const { return {row_, col_ + static_cast<int>(n)}; }
+    difference_type operator-(const const_iterator& o) const { return col_ - o.col_; }
+    bool operator==(const const_iterator& o) const { return col_ == o.col_; }
+    bool operator!=(const const_iterator& o) const { return col_ != o.col_; }
+
+   private:
+    const row* row_ = nullptr;
+    int col_ = 0;
+  };
+  using iterator = const_iterator;
+
+  row() = default;
+  row(std::shared_ptr<const internal::result_data> data, int index) : data_(std::move(data)), index_(index) {}
+
+  size_type size() const noexcept { return data_ ? static_cast<int>(data_->r.columns.size()) : 0; }
+  bool empty() const noexcept { return size() == 0; }
+  field operator[](int col) const noexcept { return field(data_, index_, col); }
+  field operator[](zview name) const { return field(data_, index_, column_number(name)); }
+  field operator[](const char* name) const { return (*this)[zview(name)]; }
+  field operator[](const std::string& name) const { return (*this)[zview(name)]; }
+  field at(int col) const;
+  field at(zview name) const { return (*this)[name]; }
+  field front() const { return (*this)[0]; }
+  field back() const { return (*this)[size() - 1]; }
+  const_iterator begin() const { return {this, 0}; }
+  const_iterator end() const { return {this, size()}; }
+  const_iterator cbegin() const { return begin(); }
+  const_iterator cend() const { return end(); }
+  int rownumber() const noexcept { return index_; }
+  int num() const noexcept { return index_; }
+  int column_number(zview name) const;
+  oid column_type(int col) const { return data_->r.columns.at(static_cast<size_t>(col)).oid; }
+
+  // The fields as a tuple of the given types: auto [id, name] = r.as<int, std::string>().
+  template <class... T>
+  std::tuple<T...> as() const {
+    expect(static_cast<int>(sizeof...(T)));
+    return as_tuple<T...>(std::index_sequence_for<T...>{});
+  }
+  template <class... T>
+  void to(std::tuple<T...>& out) const {
+    out = as<T...>();
+  }
+
+ private:
+  void expect(int columns) const;
+  template <class... T, std::size_t... I>
+  std::tuple<T...> as_tuple(std::index_sequence<I...>) const {
+    return std::tuple<T...>((*this)[static_cast<int>(I)].template as<T>()...);
+  }
+  std::shared_ptr<const internal::result_data> data_;
+  int index_ = 0;
+};
+
+class result {
+ public:
+  using size_type = int;
+  using difference_type = std::ptrdiff_t;
+  using reference = row;
+
+  class const_iterator {
+   public:
+    using iterator_category = std::random_access_iterator_tag;
+    using value_type = row;
+    using difference_type = std::ptrdiff_t;
+    using pointer = const row*;
+    using reference = row;
+    const_iterator() = default;
+    const_iterator(const result* r, int index) : result_(r), index_(index) {}
+    row operator*() const { return (*result_)[index_]; }
+    const_iterator& operator++() {
+      ++index_;
+      return *this;
+    }
+    const_iterator operator++(int) {
+      auto old = *this;
+      ++index_;
+      return old;
+    }
+    const_iterator& operator--() {
+      --index_;
+      return *this;
+    }
+    const_iterator& operator+=(difference_type n) {
+      index_ += static_cast<int>(n);
+      return *this;
+    }
+    const_iterator operator+(difference_type n) const { return {result_, index_ + static_cast<int>(n)}; }
+    difference_type operator-(const const_iterator& o) const { return index_ - o.index_; }
+    bool operator==(const const_iterator& o) const { return index_ == o.index_; }
+    bool operator!=(const const_iterator& o) const { return index_ != o.index_; }
+
+   private:
+    const result* result_ = nullptr;
+    int index_ = 0;
+  };
+  using iterator = const_iterator;
+
+  result() : data_(std::make_shared<internal::result_data>()) {}
+  explicit result(std::shared_ptr<const internal::result_data> data) : data_(std::move(data)) {}
+
+  size_type size() const noexcept { return static_cast<int>(data_->r.rows.size()); }
+  bool empty() const noexcept { return data_->r.rows.empty(); }
+  row operator[](int index) const noexcept { return row(data_, index); }
+  row at(int index) const;
+  row front() const noexcept { return (*this)[0]; }
+  row back() const noexcept { return (*this)[size() - 1]; }
+  const_iterator begin() const { return {this, 0}; }
+  const_iterator end() const { return {this, size()}; }
+  const_iterator cbegin() const { return begin(); }
+  const_iterator cend() const { return end(); }
+
+  // Rows an INSERT/UPDATE/DELETE changed (the rows returned, for a SELECT).
+  size_type affected_rows() const;
+  row_size_type columns() const noexcept { return static_cast<int>(data_->r.columns.size()); }
+  const char* column_name(row_size_type n) const;
+  row_size_type column_number(zview name) const;
+  oid column_type(row_size_type n) const;
+  const std::string& query() const noexcept { return data_->query; }
+
+  // Row-count expectations (libpqxx 7.8): unexpected_rows otherwise.
+  row one_row() const;
+  std::optional<row> opt_row() const;
+  field one_field() const;
+  void no_rows() const;
+  result expect_rows(size_type n) const;
+  result expect_columns(row_size_type n) const;
+
+  // Each row as a tuple of the given types: for (auto [id, name] : r.iter<int, std::string>()).
+  template <class... T>
+  std::vector<std::tuple<T...>> iter() const {
+    std::vector<std::tuple<T...>> out;
+    out.reserve(static_cast<size_t>(size()));
+    for (const auto& r : *this) out.push_back(r.template as<T...>());
+    return out;
+  }
+
+ private:
+  std::shared_ptr<const internal::result_data> data_;
+};
+
+// ---- connections ----------------------------------------------------------------------------------
+
+class transaction_base;
+
+class connection {
+ public:
+  connection() = default;
+  explicit connection(const std::string& options) : options_(options) {}
+  explicit connection(const char* options) : options_(options == nullptr ? "" : options) {}
+  connection(const connection&) = delete;
+  connection& operator=(const connection&) = delete;
+  connection(connection&&) = default;
+  connection& operator=(connection&&) = default;
+  ~connection() = default;
+
+  bool is_open() const noexcept { return open_; }
+  void close() { open_ = false; }
+  const char* dbname() const { return "app"; }
+  const char* username() const { return "app"; }
+  const char* hostname() const { return "db"; }
+  const char* port() const { return "5432"; }
+  const std::string& connection_string() const { return options_; }
+  int server_version() const noexcept { return 160000; }
+  int protocol_version() const noexcept { return 3; }
+  int backendpid() const noexcept { return 1; }
+  int sock() const noexcept { return 3; }
+
+  // Prepared statements: exec_prepared(name, args…) runs definition with those parameters.
+  void prepare(const std::string& name, const std::string& definition) { prepared_[name] = definition; }
+  void prepare(const std::string& definition) { prepared_[""] = definition; }
+  void unprepare(const std::string& name) { prepared_.erase(name); }
+  const std::string& lb_prepared(const std::string& name) const;
+
+  std::string esc(std::string_view text) const;
+  std::string esc_raw(bytes_view data) const;
+  std::string quote_raw(bytes_view data) const;
+  std::string quote_name(std::string_view identifier) const;
+  std::string quote_table(std::string_view name) const { return quote_name(name); }
+  template <class T>
+  std::string quote(const T& v) const {
+    const lb::pg::Param p = lb::pg::to_param(v);
+    if (!p.text) return "NULL";
+    if (p.kind == 'y') return "'" + esc(*p.text) + "'::bytea";
+    return "'" + esc(*p.text) + "'";
+  }
+
+  // @internal the transaction holding this connection, and its thread.
+  transaction_base* lb_active = nullptr;
+  int lb_owner = 0;
+
+ private:
+  std::string options_;
+  bool open_ = true;
+  std::map<std::string, std::string> prepared_;
+};
+
+// ---- transactions ---------------------------------------------------------------------------------
+
+enum class isolation_level { read_committed, repeatable_read, serializable };
+enum class write_policy { read_only, read_write };
+
+class transaction_base {
+ public:
+  transaction_base(const transaction_base&) = delete;
+  transaction_base& operator=(const transaction_base&) = delete;
+  virtual ~transaction_base();
+
+  // Make the transaction's work permanent (COMMIT) / undo it (ROLLBACK); either ends it.
+  void commit();
+  void abort();
+
+  result exec(std::string_view query, std::string_view desc = {});
+  result exec(std::string_view query, const params& args) { return run(std::string(query), args.lb_list()); }
+  result exec(const prepped& statement, const params& args = {}) {
+    return run(conn_.lb_prepared(statement.name()), args.lb_list());
+  }
+  result exec0(std::string_view query, std::string_view desc = {}) { return exec_n(0, query, desc); }
+  row exec1(std::string_view query, std::string_view desc = {}) { return exec_n(1, query, desc).front(); }
+  result exec_n(result::size_type rows, std::string_view query, std::string_view desc = {});
+
+  template <class... A>
+  result exec_params(std::string_view query, const A&... args) {
+    return run(std::string(query), internal::params_of(args...));
+  }
+  template <class... A>
+  result exec_params0(std::string_view query, const A&... args) {
+    return expect(0, exec_params(query, args...));
+  }
+  template <class... A>
+  row exec_params1(std::string_view query, const A&... args) {
+    return expect(1, exec_params(query, args...)).front();
+  }
+  template <class... A>
+  result exec_params_n(result::size_type rows, std::string_view query, const A&... args) {
+    return expect(rows, exec_params(query, args...));
+  }
+
+  template <class... A>
+  result exec_prepared(const std::string& statement, const A&... args) {
+    return run(conn_.lb_prepared(statement), internal::params_of(args...));
+  }
+  template <class... A>
+  result exec_prepared0(const std::string& statement, const A&... args) {
+    return expect(0, exec_prepared(statement, args...));
+  }
+  template <class... A>
+  row exec_prepared1(const std::string& statement, const A&... args) {
+    return expect(1, exec_prepared(statement, args...)).front();
+  }
+  template <class... A>
+  result exec_prepared_n(result::size_type rows, const std::string& statement, const A&... args) {
+    return expect(rows, exec_prepared(statement, args...));
+  }
+
+  // Rows as tuples: for (auto [id, name] : tx.query<int, std::string>("SELECT id, name …")).
+  template <class... T>
+  std::vector<std::tuple<T...>> query(std::string_view q) {
+    return exec(q).template iter<T...>();
+  }
+  template <class... T>
+  std::vector<std::tuple<T...>> query(std::string_view q, const params& args) {
+    return exec(q, args).template iter<T...>();
+  }
+  template <class... T>
+  std::vector<std::tuple<T...>> stream(std::string_view q) {
+    return query<T...>(q);
+  }
+  template <class... T>
+  std::vector<std::tuple<T...>> query_n(result::size_type rows, std::string_view q) {
+    return expect(rows, exec(q)).template iter<T...>();
+  }
+  template <class... T>
+  std::tuple<T...> query1(std::string_view q) {
+    return expect(1, exec(q)).front().template as<T...>();
+  }
+  template <class... T>
+  std::tuple<T...> query1(std::string_view q, const params& args) {
+    return expect(1, exec(q, args)).front().template as<T...>();
+  }
+  template <class... T>
+  std::optional<std::tuple<T...>> query01(std::string_view q) {
+    const result r = exec(q);
+    if (r.size() > 1) expect(1, r);
+    if (r.empty()) return std::nullopt;
+    return r.front().template as<T...>();
+  }
+  template <class... T>
+  std::optional<std::tuple<T...>> query01(std::string_view q, const params& args) {
+    const result r = exec(q, args);
+    if (r.size() > 1) expect(1, r);
+    if (r.empty()) return std::nullopt;
+    return r.front().template as<T...>();
+  }
+  // The single field of the single row as T.
+  template <class T>
+  T query_value(std::string_view q) {
+    return value_of<T>(exec(q));
+  }
+  template <class T>
+  T query_value(std::string_view q, const params& args) {
+    return value_of<T>(exec(q, args));
+  }
+
+  std::string esc(std::string_view text) const { return conn_.esc(text); }
+  std::string esc_raw(bytes_view data) const { return conn_.esc_raw(data); }
+  std::string quote_raw(bytes_view data) const { return conn_.quote_raw(data); }
+  std::string quote_name(std::string_view identifier) const { return conn_.quote_name(identifier); }
+  template <class T>
+  std::string quote(const T& v) const {
+    return conn_.quote(v);
+  }
+  connection& conn() const noexcept { return conn_; }
+  const std::string& name() const noexcept { return name_; }
+
+ protected:
+  // held: a real transaction (BEGIN … COMMIT on a held connection); begin: its BEGIN statement.
+  transaction_base(connection& c, std::string name, bool held, std::string begin);
+  void close() noexcept;
+
+ private:
+  result run(const std::string& query, const std::vector<lb::pg::Param>& args);
+  result expect(result::size_type rows, const result& r) const;
+  template <class T>
+  T value_of(const result& r) {
+    if (r.size() != 1) throw unexpected_rows("Queried single value from result with " + std::to_string(r.size()) + " rows.");
+    if (r.columns() != 1)
+      throw usage_error("Queried single value from result with " + std::to_string(r.columns()) + " columns.");
+    return r.front()[0].template as<T>();
+  }
+  void end(const char* statement);
+
+  connection& conn_;
+  std::string name_;
+  bool held_ = false;
+  int hold_ = 0;
+  bool done_ = false;
+};
+
+namespace internal {
+const char* begin_command(isolation_level level, write_policy rw);
+}
+
+template <isolation_level ISOLATION = isolation_level::read_committed, write_policy READWRITE = write_policy::read_write>
+class transaction : public transaction_base {
+ public:
+  explicit transaction(connection& c, std::string_view name = {})
+      : transaction_base(c, std::string(name), true, internal::begin_command(ISOLATION, READWRITE)) {}
+  ~transaction() override { close(); }
+};
+
+using work = transaction<>;
+using read_transaction = transaction<isolation_level::read_committed, write_policy::read_only>;
+
+// A "transaction" that is none: every statement commits on its own.
+class nontransaction : public transaction_base {
+ public:
+  explicit nontransaction(connection& c, std::string_view name = {}) : transaction_base(c, std::string(name), false, "") {}
+  ~nontransaction() override { close(); }
+};
+
+// libpqxx's robusttransaction: here as reliable as a plain transaction.
+template <isolation_level ISOLATION = isolation_level::read_committed>
+class robusttransaction : public transaction_base {
+ public:
+  explicit robusttransaction(connection& c, std::string_view name = {})
+      : transaction_base(c, std::string(name), true, internal::begin_command(ISOLATION, write_policy::read_write)) {}
+  ~robusttransaction() override { close(); }
+};
+
+}  // namespace pqxx

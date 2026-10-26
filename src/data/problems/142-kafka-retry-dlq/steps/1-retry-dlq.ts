@@ -1263,6 +1263,183 @@ func CheckCommitsAdvance(ctx *harness.Ctx) {
 	}
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <exception>
+#include <functional>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+using OrderHandler = std::function<void(const std::string&)>;
+
+void seedOrder(harness::Ctx& ctx, const std::string& key, int order) {
+  ctx.Kafka.Seed("orders", key, nlohmann::json{{"order", order}, {"sku", "lamp"}});
+}
+
+// headersOf is each record's header as text, empty when absent.
+std::vector<std::optional<std::string>> headersOf(const std::vector<harness::KafkaRecord>& records, const std::string& name) {
+  std::vector<std::optional<std::string>> out;
+  for (const auto& r : records) out.push_back(r.Header(name));
+  return out;
+}
+
+// orderOf is the order field of a record's JSON value, null when it does not parse.
+nlohmann::json orderOf(const harness::KafkaRecord& r) {
+  const auto event = nlohmann::json::parse(r.Value.value_or(""), nullptr, false);
+  return event.is_object() && event.contains("order") ? event["order"] : nlohmann::json();
+}
+
+int orderIn(const std::string& value) {
+  const auto event = nlohmann::json::parse(value, nullptr, false);
+  return event.is_object() && event.contains("order") && event["order"].is_number() ? event["order"].get<int>() : 0;
+}
+
+// failingHandler throws for its first times calls and succeeds after; calls collects the orders it saw.
+OrderHandler failingHandler(int times, std::vector<int>& calls) {
+  return [times, &calls](const std::string& value) {
+    calls.push_back(orderIn(value));
+    if (static_cast<int>(calls.size()) <= times) throw std::runtime_error("warehouse down");
+  };
+}
+
+// consumeOrders runs the learner's loop until it waits for records that will not come.
+void consumeOrders(harness::Ctx& ctx, const OrderHandler& handler) {
+  try {
+    ctx.Drain([&] { run(handler); });
+  } catch (const std::exception& e) {
+    ctx.Fatalf("run threw: %v", e.what());
+  }
+}
+
+bool noLag(harness::Ctx& ctx) {
+  return ctx.Kafka.Lag("fulfilment", "orders") == 0 && ctx.Kafka.Lag("fulfilment", "orders.retry") == 0;
+}
+
+}  // namespace
+
+void CheckRetryThenSucceed(harness::Ctx& ctx) {
+  seedOrder(ctx, "order-7", 7);
+  std::vector<int> calls;
+  consumeOrders(ctx, failingHandler(2, calls));
+  ctx.Equal(calls, {7, 7, 7}, "the handler must see the order once per attempt (3 times)");
+  const auto retry = ctx.Kafka.Records("orders.retry");
+  ctx.Equal(headersOf(retry, "attempt"), {"1", "2"}, "orders.retry must hold attempt 1 then 2");
+  for (const auto& r : retry) {
+    ctx.Assert(r.Header("error") == "warehouse down", "the error header must carry the handler error's message, got %q", r.Header("error"));
+    ctx.Assert(orderOf(r) == 7, "the hand-off must carry the source value unchanged, got %q", r.Value);
+  }
+  ctx.Equal(ctx.Kafka.Records("orders.dlq").size(), 0,
+            "a record that eventually succeeds must not be dead-lettered: records on orders.dlq");
+  ctx.Assert(noLag(ctx), "every handled record must be committed");
+}
+
+void CheckDeadLetter(harness::Ctx& ctx) {
+  seedOrder(ctx, "order-7", 7);
+  std::vector<int> calls;
+  consumeOrders(ctx, failingHandler(99, calls));
+  ctx.Equal(calls.size(), 3, "a record is tried maxAttempts = 3 times: handler calls");
+  ctx.Equal(headersOf(ctx.Kafka.Records("orders.retry"), "attempt"), {"1", "2"}, "the first two failures go to orders.retry");
+  const auto dlq = ctx.Kafka.Records("orders.dlq");
+  ctx.Equal(dlq.size(), 1, "the third failure dead-letters the record once: records on orders.dlq");
+  ctx.Equal(dlq[0].Header("attempt"), "3", "the dead letter's attempt header");
+  ctx.Equal(dlq[0].Header("error"), "warehouse down", "the dead letter's error header must carry the handler error's message");
+  ctx.Assert(orderOf(dlq[0]) == 7, "the dead letter must carry the source value unchanged: its order is %v", orderOf(dlq[0]).dump());
+  ctx.Assert(noLag(ctx), "dead-lettering commits the source offset");
+}
+
+void CheckKeyedHandoff(harness::Ctx& ctx) {
+  seedOrder(ctx, "order-7", 7);
+  seedOrder(ctx, "order-8", 8);
+  std::vector<int> calls;
+  consumeOrders(ctx, [&](const std::string& value) {
+    const int order = orderIn(value);
+    calls.push_back(order);
+    if (order == 7) throw std::runtime_error("warehouse down");
+  });
+  auto handed = ctx.Kafka.Records("orders.retry");
+  for (auto& r : ctx.Kafka.Records("orders.dlq")) handed.push_back(r);
+  ctx.Equal(handed.size(), 3, "order 7 fails three times, two retries and a dead letter: hand-offs");
+  std::vector<std::string> keys;
+  for (const auto& r : handed) keys.push_back(r.Key.value_or(""));
+  for (const auto& key : keys) ctx.Assert(key == "order-7", "hand-off records must keep the key order-7, got %q", keys);
+  for (const auto& r : handed)
+    ctx.Equal(r.Partition, ctx.Kafka.PartitionFor(r.Topic, "order-7"), "a keyed hand-off hashes to the key's partition on %s", r.Topic);
+  const auto sevens = std::count(calls.begin(), calls.end(), 7);
+  const auto eights = std::count(calls.begin(), calls.end(), 8);
+  ctx.Assert(eights == 1 && sevens == 3, "order 8 is handled once, order 7 three times; saw %v", calls);
+}
+
+void CheckAckBeforeCommit(harness::Ctx& ctx) {
+  seedOrder(ctx, "order-7", 7);
+  ctx.Kafka.StallFor("orders.retry", 5);
+  std::vector<size_t> atCommit;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) {
+    atCommit.push_back(ctx.Kafka.Records("orders.retry").size());
+  });
+  std::vector<int> calls;
+  const int64_t before = ctx.Clock.Now();
+  consumeOrders(ctx, failingHandler(1, calls));
+  bool stalled = false;
+  for (const auto& e : ctx.Kafka.EventsOf("produce-stalled")) stalled = stalled || e.Topic == "orders.retry";
+  ctx.Assert(stalled, "the hand-off must be produced to orders.retry (it was stalled)");
+  ctx.Assert(!atCommit.empty(), "the source offset was never committed");
+  ctx.Equal(atCommit[0], 1,
+            "the source offset was committed while the hand-off was still in flight (wait for the acknowledgement first): records on orders.retry at the first commit");
+  ctx.Assert(ctx.Clock.Now() - before > 4000,
+             "the commit must wait out the stall (5 s of virtual time) for the broker's acknowledgement");
+  ctx.Equal(calls, {7, 7}, "the retry record must be handled once the broker resumes: handler calls");
+  ctx.Assert(noLag(ctx), "every handled record must be committed");
+}
+
+void CheckPoison(harness::Ctx& ctx) {
+  ctx.Kafka.Seed("orders", "order-9", "not json");
+  seedOrder(ctx, "order-7", 7);
+  std::vector<int> calls;
+  consumeOrders(ctx, failingHandler(0, calls));
+  ctx.Equal(calls, {7}, "the handler must never see a record that does not parse: handler calls");
+  ctx.Equal(ctx.Kafka.Records("orders.retry").size(), 0, "malformed JSON is not retried: records on orders.retry");
+  const auto dlq = ctx.Kafka.Records("orders.dlq");
+  ctx.Assert(dlq.size() == 1 && dlq[0].Key == "order-9" && dlq[0].Value == "not json",
+             "the malformed record goes to orders.dlq with its key and value");
+  ctx.Equal(dlq[0].Header("attempt"), "1", "dead-lettered on first sight: the attempt header");
+  ctx.Assert(!dlq[0].Header("error").value_or("").empty(), "the dead letter's error header must say why");
+  ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 0, "a dead-lettered record's offset must be committed: lag on orders");
+}
+
+void CheckCommitsAdvance(harness::Ctx& ctx) {
+  for (const int order : {7, 8, 9, 10}) seedOrder(ctx, "order-" + std::to_string(order), order);
+  std::vector<int> calls;
+  bool eightFailed = false;
+  consumeOrders(ctx, [&](const std::string& value) {
+    const int order = orderIn(value);
+    calls.push_back(order);
+    if (order == 8 && !eightFailed) {
+      eightFailed = true;
+      throw std::runtime_error("warehouse down");
+    }
+  });
+  auto sorted = calls;
+  std::sort(sorted.begin(), sorted.end());
+  ctx.Equal(sorted, {7, 8, 8, 9, 10}, "four orders, one retried once: expected five handler calls, saw %v", calls);
+  ctx.Equal(ctx.Kafka.EventsOf("auto-commit").size(), 0,
+            "auto-commit is on (offsets were committed on a timer): auto-commit events");
+  const size_t commits = ctx.Kafka.Commits("fulfilment").size();
+  ctx.Assert(commits >= 5, "each handled record ends with a commit (5 expected), saw %d", commits);
+  for (const std::string topic : {"orders", "orders.retry"}) {
+    for (int partition = 0; partition < 3; partition++) {
+      const int64_t end = ctx.Kafka.EndOffset(topic, partition);
+      const int64_t committed = ctx.Kafka.Committed("fulfilment", topic, partition).value_or(0);
+      ctx.Equal(committed, end, "%s[%d]: the committed offset must reach the end offset", topic, partition);
+    }
+  }
+}
+`,
   },
   debrief: `The shape is one consumer over two topics and one hand-off function. Re-producing the failed record instead of re-processing it in place is what keeps a poison record from parking the partition behind it; keeping the key keeps a customer's orders on one partition of the retry topic, in order. The attempt count travels in a header so the record's value is never rewritten, and the error header makes the dead letter debuggable without logs. The one subtle line is the flush before the commit: a commit is a promise that the record is dealt with, and it is only true once the retry record is durably on the next topic — produce-then-commit without the wait is at-most-once under a slow broker. Real systems add a delay before re-consuming the retry topic (a \`retry.5s\`, \`retry.1m\` ladder, or pausing the partition until the record's due time), a DLQ consumer that alerts and replays, and a bounded header size so error text cannot grow a record past the broker's limit.`,
 };

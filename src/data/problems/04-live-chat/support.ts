@@ -201,3 +201,69 @@ func Subscribers(room string) int {
 }
 `,
 };
+
+/**
+ * The same subscription table for C++ (`subscriptions.cpp`): one `Deliver` callback per open stream.
+ * The chat stream (step 2) declares `subscribe` / `unsubscribe`, the room bus (step 3) `local_deliver`;
+ * a program compiles only its step's file, so the harness includes this one beside it.
+ */
+export const supportModulesCpp: Record<string, string> = {
+  'subscriptions.cpp': `// Provided: the subscription table of one chat-server instance. Every open stream that joined a
+// room registers one Deliver callback; the room bus hands every delivered message to all of them.
+#include <algorithm>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "chat.pb.h"
+
+using Deliver = std::function<void(const chat::ServerMsg&)>;
+using Subscription = std::shared_ptr<Deliver>;
+
+namespace {
+
+std::mutex subscriptions_mu;
+std::map<std::string, std::vector<Subscription>> subscriptions_by_room;
+
+}  // namespace
+
+// Registers deliver for every message delivered to room on this instance; the handle unsubscribes it.
+Subscription subscribe(const std::string& room, Deliver deliver) {
+  auto sub = std::make_shared<Deliver>(std::move(deliver));
+  std::lock_guard<std::mutex> lock(subscriptions_mu);
+  subscriptions_by_room[room].push_back(sub);
+  return sub;
+}
+
+// Drops sub from room: it receives nothing more.
+void unsubscribe(const std::string& room, const Subscription& sub) {
+  std::lock_guard<std::mutex> lock(subscriptions_mu);
+  auto it = subscriptions_by_room.find(room);
+  if (it == subscriptions_by_room.end()) return;
+  auto& subs = it->second;
+  subs.erase(std::remove(subs.begin(), subs.end(), sub), subs.end());
+  if (subs.empty()) subscriptions_by_room.erase(it);
+}
+
+// Hands msg to every stream on this instance subscribed to room.
+void local_deliver(const std::string& room, const chat::ServerMsg& msg) {
+  std::vector<Subscription> subs;
+  {
+    std::lock_guard<std::mutex> lock(subscriptions_mu);
+    auto it = subscriptions_by_room.find(room);
+    if (it != subscriptions_by_room.end()) subs = it->second;
+  }
+  for (const auto& sub : subs) (*sub)(msg);  // outside the lock: a callback may unsubscribe
+}
+
+// How many streams on this instance are subscribed to room.
+int subscribers(const std::string& room) {
+  std::lock_guard<std::mutex> lock(subscriptions_mu);
+  auto it = subscriptions_by_room.find(room);
+  return it == subscriptions_by_room.end() ? 0 : static_cast<int>(it->second.size());
+}
+`,
+};

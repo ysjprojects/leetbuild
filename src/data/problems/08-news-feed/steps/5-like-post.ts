@@ -1047,6 +1047,148 @@ func CheckCountRead(ctx *harness.Ctx) {
 	ctx.Assert(r.Status == 200 && answeredLikes(r, 2), "after two likes GET must answer likes 2, got %d %s", r.Status, r.Text())
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <optional>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace {
+
+// answeredLikes reports whether the body is exactly {"likes": n}.
+bool answeredLikes(const harness::Response& r, int n) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  return body == nlohmann::json{{"likes", n}};
+}
+
+std::vector<std::string> members(harness::Ctx& ctx, const std::string& key) {
+  auto out = ctx.Redis.SMembers(key);
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+std::vector<nlohmann::json> engagementEvents(harness::Ctx& ctx) {
+  std::vector<nlohmann::json> out;
+  for (const auto& value : ctx.Kafka.Values("engagement")) {
+    const auto event = nlohmann::json::parse(value, nullptr, false);
+    ctx.Assert(event.is_object(), "an engagement event must be JSON, got %q", value);
+    out.push_back(event);
+  }
+  return out;
+}
+
+}  // namespace
+
+void CheckIdempotentLike(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  auto r = c.Post("/posts/p1/like", "", "X-User-Id", "alice");
+  ctx.Equal(r.Status, 200, "the first like must answer 200");
+  ctx.Equal(r.JSON(), harness::ParseJSON(R"({"likes":1})"), "the first like must answer likes 1");
+  r = c.Post("/posts/p1/like", "", "X-User-Id", "alice");
+  ctx.Equal(r.Status, 409, "a second like by the same user must answer 409");
+  ctx.Equal(ctx.Redis.Get("likes:p1"), "1", "a duplicate like must not move the counter: likes:p1");
+  r = c.Post("/posts/p1/like", "", "X-User-Id", "bob");
+  ctx.Assert(r.Status == 200 && answeredLikes(r, 2), "a like by another user counts: expected 200 likes 2, got %d %s", r.Status, r.Text());
+  ctx.Equal(members(ctx, "liked:p1"), {"alice", "bob"}, "liked:p1 must hold the users who liked");
+}
+
+void CheckCountAfterMembership(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  ctx.Redis.Do("SADD", "liked:p1", "alice");  // the fact exists; the counter does not yet
+  auto r = c.Post("/posts/p1/like", "", "X-User-Id", "alice");
+  ctx.Equal(r.Status, 409, "SADD returned 0 for alice: expected 409");
+  ctx.Equal(ctx.Redis.Get("likes:p1"), nullptr, "the counter must not move when SADD added nothing: likes:p1");
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records("engagement").size(), 0, "a rejected like must not produce an event");
+  r = c.Post("/posts/p1/like", "", "X-User-Id", "bob");
+  ctx.Assert(r.Status == 200 && answeredLikes(r, 1), "bob is a new member: expected 200 likes 1, got %d %s", r.Status, r.Text());
+  ctx.Equal(ctx.Redis.Get("likes:p1"), "1", "likes:p1 must be 1 after one successful INCR");
+  ctx.Equal(ctx.Redis.SCard("liked:p1"), 2, "liked:p1 must hold alice and bob: %q", members(ctx, "liked:p1"));
+}
+
+void CheckUnlike(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  auto r = c.Delete("/posts/p1/like", "X-User-Id", "alice");
+  ctx.Equal(r.Status, 409, "unliking a post alice never liked must answer 409");
+  ctx.Equal(ctx.Redis.Get("likes:p1"), nullptr, "a rejected unlike must not touch the counter: likes:p1");
+  c.Post("/posts/p1/like", "", "X-User-Id", "alice");
+  c.Post("/posts/p1/like", "", "X-User-Id", "bob");
+  r = c.Delete("/posts/p1/like", "X-User-Id", "alice");
+  ctx.Assert(r.Status == 200 && answeredLikes(r, 1), "unlike after a like must answer 200 with the decremented count, got %d %s", r.Status, r.Text());
+  ctx.Equal(members(ctx, "liked:p1"), {"bob"}, "SREM must remove alice from liked:p1");
+  r = c.Delete("/posts/p1/like", "X-User-Id", "alice");
+  ctx.Equal(r.Status, 409, "a repeated unlike must answer 409");
+  ctx.Equal(ctx.Redis.Get("likes:p1"), "1", "the counter must equal the set size (1): likes:p1");
+  ctx.Settle();
+  std::vector<std::string> kinds;
+  for (const auto& event : engagementEvents(ctx)) kinds.push_back(event.value("type", ""));
+  ctx.Equal(kinds, {"like", "like", "unlike"}, "expected like, like, unlike events");
+}
+
+void CheckEvent(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  c.Post("/posts/p1/like", "", "X-User-Id", "alice");
+  c.Post("/posts/p1/like", "", "X-User-Id", "alice");  // 409: no event
+  c.Post("/posts/p2/like", "", "X-User-Id", "alice");
+  c.Delete("/posts/p1/like", "X-User-Id", "alice");
+  ctx.Settle();
+  const auto records = ctx.Kafka.Records("engagement");
+  ctx.Equal(records.size(), 3, "expected 3 engagement events (like, like, unlike)");
+  // The producer batches per partition: the records of two posts may land out of request order,
+  // while each post's own records keep theirs.
+  const auto events = engagementEvents(ctx);
+  std::vector<std::string> keys;
+  std::vector<nlohmann::json> p1Events;
+  std::vector<int> p1Partitions;
+  for (size_t i = 0; i < records.size(); i++) {
+    const std::string key = records[i].Key.value_or("");
+    keys.push_back(key);
+    if (key == "p1") {
+      p1Events.push_back(events[i]);
+      p1Partitions.push_back(records[i].Partition);
+    }
+  }
+  std::sort(keys.begin(), keys.end());
+  ctx.Equal(keys, {"p1", "p1", "p2"}, "events must be keyed by the post id: keys");
+  ctx.Equal(p1Partitions[0], p1Partitions[1], "one post's events must land on one partition");
+  const auto& like = p1Events[0];
+  const auto& unlike = p1Events[1];
+  ctx.Assert(like.value("type", "") == "like" && like.value("post_id", "") == "p1" && like.value("user_id", "") == "alice", "the like event must carry type, post_id and user_id: %s", like.dump());
+  ctx.Assert(unlike.value("type", "") == "unlike" && unlike.value("post_id", "") == "p1", "the unlike event must carry type unlike: %s", unlike.dump());
+  std::set<std::string> ids;
+  bool allSet = true;
+  std::vector<std::string> shown;
+  for (const auto& event : events) {
+    const std::string id = event.contains("event_id") && event["event_id"].is_string() ? event["event_id"].get<std::string>() : "";
+    allSet = allSet && !id.empty();
+    ids.insert(id);
+    shown.push_back(event.dump());
+  }
+  ctx.Assert(allSet && ids.size() == 3, "every event needs its own event_id, got %v", shown);
+  // The broker stops acknowledging: a request that waits for the produce hangs (and then fails) with it.
+  ctx.Kafka.Stall("engagement");
+  const int64_t before = ctx.Clock.Now();
+  const auto r = c.Post("/posts/p3/like", "", "X-User-Id", "alice");
+  ctx.Equal(r.Status, 200, "while the broker does not acknowledge, the like must still answer 200 — the request must not wait for the broker");
+  const int64_t waited = ctx.Clock.Now() - before;
+  ctx.Assert(waited < 1000, "the request waited %d ms for the broker: produce fire-and-forget, never wait for the acknowledgement (no flush)", waited);
+  ctx.Kafka.Resume("");
+}
+
+void CheckCountRead(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  auto r = c.Get("/posts/fresh/likes");
+  ctx.Equal(r.Status, 200, "a post nobody liked must answer 200");
+  ctx.Equal(r.JSON(), harness::ParseJSON(R"({"likes":0})"), "a post nobody liked has 0 likes");
+  c.Post("/posts/p1/like", "", "X-User-Id", "alice");
+  c.Post("/posts/p1/like", "", "X-User-Id", "bob");
+  r = c.Get("/posts/p1/likes");
+  ctx.Assert(r.Status == 200 && answeredLikes(r, 2), "after two likes GET must answer likes 2, got %d %s", r.Status, r.Text());
+}
+`,
   },
   debrief: `The set is the fact ("alice likes p1") and the counter is a derived number; letting \`SADD\`'s return value gate the \`INCR\` is what makes a retried request harmless. Keying the engagement event by post id keeps a post's likes and unlikes in order on one partition, and the fire-and-forget produce keeps the broker off the request path. Real systems make the two Redis commands atomic (a Lua script or \`MULTI\`), keep the sets in a sharded cluster because \`liked:{post}\` of a viral post has millions of members, and eventually move the counter to the rollup stream of step 6 so the request path only writes the fact.`,
 };

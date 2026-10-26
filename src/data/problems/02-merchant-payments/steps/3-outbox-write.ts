@@ -930,6 +930,123 @@ func CheckEventId(ctx *harness.Ctx) {
 	}
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <regex>
+
+namespace {
+
+const std::string outboxSchema = R"(
+CREATE TABLE orders (
+    id text PRIMARY KEY,
+    merchant_id text NOT NULL,
+    amount_cents bigint NOT NULL,
+    currency text NOT NULL,
+    status text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE outbox (
+    id text PRIMARY KEY,
+    topic text NOT NULL,
+    key text NOT NULL CHECK (key <> 'm-broken'),
+    payload text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    sent_at timestamptz
+);
+)";
+
+const Order firstOrder{"o-1", "m-42"};
+const Capture someCapture{4999, "EUR"};
+const std::regex uuidV4("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$");
+
+std::vector<harness::Row> tableRows(harness::Ctx& ctx, const std::string& table) {
+  return ctx.DB.Query("SELECT * FROM " + table + " ORDER BY created_at, id");
+}
+
+std::string captureOrder(harness::Ctx& ctx, const Order& order) {
+  try {
+    return record_capture(order, someCapture);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("recordCapture({ID:%s MerchantID:%s}) returned an error: %v", order.id, order.merchant_id, std::string(e.what()));
+  }
+}
+
+harness::Any decodePayload(harness::Ctx& ctx, harness::Row& row) {
+  const auto event = harness::ParseJSON(row["payload"].String());
+  if (!event || !event->IsObject()) ctx.Fatalf("outbox.payload must be the event as JSON, got %s", harness::ShowValue(row["payload"]));
+  return *event;
+}
+
+}  // namespace
+
+void CheckAtomic(harness::Ctx& ctx) {
+  ctx.DB.Reset(outboxSchema);
+  captureOrder(ctx, firstOrder);
+  ctx.Equal(tableRows(ctx, "orders").size(), 1, "orders rows");
+  ctx.Equal(tableRows(ctx, "outbox").size(), 1, "outbox rows next to the order");
+  ctx.Equal(ctx.DB.Events(), {"BEGIN", "COMMIT"}, "both rows must be written in one transaction; the database saw");
+  // The outbox insert for merchant m-broken violates a constraint: the order must roll back with it.
+  bool failed = false;
+  try {
+    record_capture(Order{"o-2", "m-broken"}, someCapture);
+  } catch (const std::exception&) {
+    failed = true;
+  }
+  ctx.Assert(failed, "a failed outbox insert must propagate (the transaction rolls back), not be swallowed");
+  const auto events = ctx.DB.Events();
+  ctx.Equal(events.back(), "ROLLBACK", "the failed transaction must roll back; the last event the database saw");
+  std::vector<harness::Any> ids;
+  for (auto& o : tableRows(ctx, "orders")) ids.push_back(o["id"]);
+  ctx.Equal(ids, {"o-1"}, "the outbox insert failed, so the orders row o-2 must not be committed: the two writes belong in one transaction");
+}
+
+void CheckOutboxRow(harness::Ctx& ctx) {
+  ctx.DB.Reset(outboxSchema);
+  const std::string eventID = captureOrder(ctx, firstOrder);
+  auto outbox = tableRows(ctx, "outbox");
+  ctx.Equal(outbox.size(), 1, "outbox rows");
+  auto& row = outbox[0];
+  ctx.Equal(row["topic"], "payments", "outbox.topic");
+  ctx.Equal(row["key"], "m-42", "outbox.key must be the merchant id");
+  ctx.Equal(row["sent_at"], nullptr, "a fresh outbox row is unsent: outbox.sent_at");
+  const harness::Any event = decodePayload(ctx, row);
+  const std::vector<std::pair<std::string, harness::Any>> fields = {
+      {"type", harness::Any::Of("payment.captured")}, {"merchant_id", harness::Any::Of("m-42")}, {"order_id", harness::Any::Of("o-1")},
+      {"amount_cents", harness::Any::Of(4999)},         {"currency", harness::Any::Of("EUR")}};
+  for (const auto& [name, value] : fields) ctx.Equal(event[name], value, "payload.%s", name);
+  ctx.Equal(event["event_id"], row["id"], "payload.event_id must equal the row id");
+  ctx.Equal(eventID, row["id"], "recordCapture must return the outbox row id");
+}
+
+void CheckNoDualWrite(harness::Ctx& ctx) {
+  ctx.DB.Reset(outboxSchema);
+  captureOrder(ctx, firstOrder);
+  ctx.Equal(ctx.Kafka.EventsOf("producer", "client").size(), 0, "this file must not create a Kafka client or producer (the relay publishes committed outbox rows): producer events");
+  ctx.Equal(ctx.Kafka.Records("payments").size(), 0, "records recordCapture produced to Kafka from the request path");
+  ctx.Equal(tableRows(ctx, "outbox").size(), 1, "the event must be an outbox row instead: outbox rows");
+}
+
+void CheckEventId(harness::Ctx& ctx) {
+  ctx.DB.Reset(outboxSchema);
+  const std::string first = captureOrder(ctx, firstOrder);
+  const std::string second = captureOrder(ctx, Order{"o-2", "m-42"});
+  for (const auto& eventID : {first, second}) {
+    ctx.Assert(std::regex_match(eventID, uuidV4), "the event id must be a random (version 4) UUID, got %q", eventID);
+  }
+  ctx.Assert(first != second, "every event needs its own UUID");
+  auto outbox = tableRows(ctx, "outbox");
+  std::vector<std::string> ids;
+  for (auto& row : outbox) ids.push_back(row["id"].String());
+  std::sort(ids.begin(), ids.end());
+  std::vector<std::string> want = {first, second};
+  std::sort(want.begin(), want.end());
+  ctx.Equal(ids, want, "outbox row ids must be the returned event ids");
+  for (auto& row : outbox) {
+    ctx.Equal(decodePayload(ctx, row)["event_id"], row["id"], "payload.event_id must be the same UUID as the row id");
+  }
+}
+`,
   },
   debrief: `A dual write has no atomicity: two systems, two failure points, and no way to make the second write conditional on the first surviving. The outbox borrows the database's transaction so the event is committed exactly when the order is; publishing becomes a separate, retryable job. Real systems either poll the table like the relay you build next or tail the write-ahead log with change data capture (Debezium), and they garbage-collect sent rows so the table does not grow forever.`,
 };

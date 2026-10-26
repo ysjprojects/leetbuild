@@ -72,8 +72,8 @@ export interface OutputLine {
   text: string;
 }
 
-/** Boot phases the runtimes report: Pyodide's, esbuild's, the Go interpreter's, the LeetBuild runtime itself, PyTorch. */
-export type Phase = 'pyodide' | 'packages' | 'esbuild' | 'go' | 'runtime' | 'torch';
+/** Boot phases the runtimes report: Pyodide's, esbuild's, the Go interpreter's, the LeetBuild runtime itself, PyTorch, clang's. */
+export type Phase = 'pyodide' | 'packages' | 'esbuild' | 'go' | 'runtime' | 'torch' | 'clang';
 
 export type WorkerIn = {type: 'boot'} | {type: 'run'; id: number; job: RunJob};
 export type WorkerOut =

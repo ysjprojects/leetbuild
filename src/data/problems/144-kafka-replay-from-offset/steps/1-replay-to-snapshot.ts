@@ -995,6 +995,150 @@ func CheckIndependent(ctx *harness.Ctx) {
 	ctx.Equal(countEvents(ctx, "close"), countEvents(ctx, "consumer"), "each replay closes the readers it created: closes")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <exception>
+#include <functional>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string replayTopic = "order-events";
+const std::string liveGroup = "orders";
+
+// seedAt appends keyless records to one partition of the topic.
+void seedAt(harness::Ctx& ctx, int partition, const std::vector<std::string>& values) {
+  for (const auto& v : values) ctx.Kafka.SeedPartition(replayTopic, partition, nullptr, v);
+}
+
+// replayed runs replay until it returns (or waits for records that will not come); a throw fails the check.
+int replayed(harness::Ctx& ctx, int64_t from, const std::function<void(const ReplayRecord&)>& handler) {
+  int n = 0;
+  try {
+    ctx.Drain([&] { n = replay(replayTopic, from, handler); });
+  } catch (const std::exception& e) {
+    ctx.Fatalf("replay(%q, %d) threw: %v", replayTopic, from, e.what());
+  }
+  return n;
+}
+
+// perPartition lists the handled records as "offset:value", per partition.
+std::map<int, std::vector<std::string>> perPartition(const std::vector<ReplayRecord>& records) {
+  std::map<int, std::vector<std::string>> out;
+  for (const auto& r : records) out[r.partition].push_back(std::to_string(r.offset) + ":" + r.value);
+  return out;
+}
+
+size_t countEvents(harness::Ctx& ctx, const std::string& kind) { return ctx.Kafka.EventsOf(kind).size(); }
+
+}  // namespace
+
+void CheckReplaysInOrder(harness::Ctx& ctx) {
+  seedAt(ctx, 0, {"a0", "a1", "a2"});
+  seedAt(ctx, 1, {"b0"});
+  seedAt(ctx, 2, {"c0", "c1"});
+  std::vector<ReplayRecord> seen;
+  const int count = replayed(ctx, 0, [&](const ReplayRecord& r) { seen.push_back(r); });
+  ctx.Equal(count, 6, "replay's return value (the number of records handled)");
+  auto got = perPartition(seen);
+  ctx.Equal(got[0], {"0:a0", "1:a1", "2:a2"}, "partition 0 must be handled at offsets 0..2 in order");
+  ctx.Equal(got[1], {"0:b0"}, "partition 1");
+  ctx.Equal(got[2], {"0:c0", "1:c1"}, "partition 2 must be handled at offsets 0..1 in order");
+  for (const auto& r : seen)
+    ctx.Assert(r.key.empty(), "records seeded without a key must reach the handler with an empty key, got %q", r.key);
+}
+
+void CheckSnapshotEnd(harness::Ctx& ctx) {
+  seedAt(ctx, 0, {"a0", "a1"});
+  seedAt(ctx, 1, {"b0"});
+  seedAt(ctx, 2, {"c0", "c1", "c2"});
+  std::vector<ReplayRecord> seen;
+  const int count = replayed(ctx, 0, [&](const ReplayRecord& r) {
+    if (seen.empty()) {
+      // Producers keep writing while the replay runs: one more record on every partition.
+      seedAt(ctx, 0, {"a-late"});
+      seedAt(ctx, 1, {"b-late"});
+      seedAt(ctx, 2, {"c-late"});
+    }
+    seen.push_back(r);
+  });
+  ctx.Equal(ctx.Kafka.EndOffset(replayTopic, 0), 3, "the harness appended a record to partition 0 mid-replay: its end offset");
+  std::vector<std::string> late;
+  for (const auto& r : seen)
+    if (r.value.size() >= 5 && r.value.compare(r.value.size() - 5, 5, "-late") == 0) late.push_back(r.value);
+  ctx.Equal(late, std::vector<std::string>{},
+            "records appended after the replay started must not be handled: the end is a snapshot taken before the first fetch");
+  ctx.Equal(count, 6, "replay's return value (the records that existed when it started)");
+  ctx.Equal(seen.size(), 6, "records handled");
+}
+
+void CheckNoCommits(harness::Ctx& ctx) {
+  seedAt(ctx, 0, {"a0", "a1", "a2"});
+  seedAt(ctx, 1, {"b0", "b1"});
+  seedAt(ctx, 2, {"c0"});
+  // The live group is half-way through the topic.
+  const std::map<int, int64_t> live = {{0, 1}, {1, 2}, {2, 0}};
+  harness::KafkaOffsets offsets;
+  for (const auto& [p, o] : live) offsets[{replayTopic, p}] = o;
+  ctx.Kafka.Commit(liveGroup, offsets);
+  std::vector<ReplayRecord> seen;
+  const int count = replayed(ctx, 0, [&](const ReplayRecord& r) { seen.push_back(r); });
+  ctx.Clock.Advance(30);
+  ctx.Equal(count, 6, "replay's return value");
+  for (int p = 0; p < 3; p++)
+    ctx.Equal(ctx.Kafka.CommittedOffset(liveGroup, replayTopic, p), live.at(p),
+              "group orders' committed offset for partition %d must not move: the replay must not touch the live group", p);
+  ctx.Equal(ctx.Kafka.Commits("replay-tool").size(), 0, "commits by group replay-tool (a replay tool never commits)");
+  ctx.Equal(ctx.Kafka.Commits("").size() - 1, 0, "commits made during the replay");
+  ctx.Equal(countEvents(ctx, "auto-commit"), 0, "auto-commits (the replay consumer must not commit on a timer)");
+  // A replay assigns the partitions it reads: no consumer may join a group (subscribe), which
+  // would take partitions from the live consumers of that group.
+  std::vector<std::string> groups;
+  for (const auto& e : ctx.Kafka.EventsOf("subscribe")) groups.push_back(e.Group);
+  ctx.Equal(groups, std::vector<std::string>{}, "groups the replay's consumers joined (assign partitions, do not subscribe)");
+}
+
+void CheckFromOffset(harness::Ctx& ctx) {
+  seedAt(ctx, 0, {"a0", "a1", "a2", "a3"});
+  seedAt(ctx, 1, {"b0"});
+  seedAt(ctx, 2, {"c0", "c1", "c2"});
+  std::vector<ReplayRecord> seen;
+  const int count = replayed(ctx, 2, [&](const ReplayRecord& r) { seen.push_back(r); });
+  auto got = perPartition(seen);
+  ctx.Equal(got[0], {"2:a2", "3:a3"}, "partition 0 must be handled at offsets 2 and 3 only");
+  ctx.Equal(got[1], std::vector<std::string>{}, "partition 1 has one record (offset 0) and must contribute nothing from offset 2");
+  ctx.Equal(got[2], {"2:c2"}, "partition 2 must be handled at offset 2 only");
+  ctx.Equal(count, 3, "replay's return value");
+  std::vector<ReplayRecord> beyond;
+  const int none = replayed(ctx, 10, [&](const ReplayRecord& r) { beyond.push_back(r); });
+  ctx.Assert(none == 0 && beyond.empty(), "replay from beyond every end handled %d record(s) and returned %d; expected 0",
+             beyond.size(), none);
+}
+
+void CheckIndependent(harness::Ctx& ctx) {
+  seedAt(ctx, 0, {"a0", "a1"});
+  seedAt(ctx, 1, {"b0"});
+  std::vector<ReplayRecord> first;
+  ctx.Equal(replayed(ctx, 1, [&](const ReplayRecord& r) { first.push_back(r); }), 1,
+            "the first replay from offset 1 should handle exactly a1");
+  ctx.Equal(perPartition(first), std::map<int, std::vector<std::string>>{{0, {"1:a1"}}}, "records handled by the first replay");
+  const size_t firstReaders = countEvents(ctx, "consumer");
+  seedAt(ctx, 0, {"a2"});
+  seedAt(ctx, 2, {"c0"});
+  std::vector<ReplayRecord> second;
+  const int count = replayed(ctx, 0, [&](const ReplayRecord& r) { second.push_back(r); });
+  ctx.Equal(count, 5, "the second replay from 0 starts over and sees the records appended since the first");
+  auto got = perPartition(second);
+  ctx.Equal(got[0], {"0:a0", "1:a1", "2:a2"}, "partition 0 in the second replay");
+  ctx.Equal(got[2], {"0:c0"}, "partition 2 in the second replay");
+  ctx.Equal(ctx.Kafka.Commits("").size(), 0, "neither replay may commit: commits");
+  // Each replay creates its own consumer, and closes it.
+  ctx.Assert(firstReaders > 0 && countEvents(ctx, "consumer") > firstReaders, "each replay creates its own consumer");
+  ctx.Equal(countEvents(ctx, "close"), countEvents(ctx, "consumer"), "each replay closes the consumer it created: closes");
+}
+`,
   },
   debrief: `Three decisions make this a replay tool and not a second live consumer. It owns its **assignment** — \`assign\` in Python and the Java client, \`subscribe\` + \`seek\` in kafkajs — so it starts where it is told, not where a group's bookmark is; it **never commits** (auto-commit off, no commit call, nothing on close), so group \`orders\` resumes exactly where it was and no other tool ever inherits the replay's position; and it reads to a **snapshot of the end** taken before the first fetch, so the job is bounded by two offsets per partition no matter how fast producers write. The pause-when-done loop is the shape every bounded read takes: the broker keeps serving a partition past its snapshot, so the position check — not the fetch — decides what the handler sees. Real tools add \`offsets_for_times\` to pick \`from_offset\` by timestamp, read the partition count from metadata instead of a constant, write the handler's output through an idempotent sink (a replay is by definition a duplicate), and run one replay per partition in parallel with the same two fixed ends.`,
 };

@@ -936,6 +936,112 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Kafka.Lag("engine", "orders"), 0, "the malformed record must be skipped and committed so the partition does not stall; uncommitted orders")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace {
+
+struct seededOrder {
+  std::string orderID, symbol, side;
+  double price;
+  int qty;
+};
+
+void seedOrders(harness::Ctx& ctx, const std::vector<seededOrder>& orders) {
+  for (const auto& o : orders) {
+    const std::string value = harness::Sprintf("{%q:%q,%q:%q,%q:%q,%q:%v,%q:%d,%q:%q}", "order_id", o.orderID, "symbol", o.symbol, "side",
+                                               o.side, "price", o.price, "qty", o.qty, "client_order_id", "c-" + o.orderID);
+    ctx.Kafka.Seed("orders", o.symbol, value);
+  }
+}
+
+// runEngine drains the orders topic through the learner's loop.
+void runEngine(harness::Ctx& ctx) { ctx.Drain([] { run(); }); }
+
+std::vector<harness::Any> tradesOnBroker(harness::Ctx& ctx) {
+  std::vector<harness::Any> out;
+  for (const auto& v : ctx.Kafka.Values("trades")) {
+    const auto t = harness::ParseJSON(v);
+    ctx.Assert(t.has_value(), "a trades record is not JSON: %q", v);
+    out.push_back(*t);
+  }
+  return out;
+}
+
+}  // namespace
+
+void CheckGroup(harness::Ctx& ctx) {
+  seedOrders(ctx, {{"o-1", "ACME", "BUY", 10.05, 100}});
+  runEngine(ctx);
+  const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
+  ctx.Assert(!subscriptions.empty(), "the consumer never subscribed");
+  const auto& last = subscriptions.back();
+  ctx.Equal(last.Group, "engine", "the consumer joined the wrong group");
+  ctx.Equal(last.Topics, {"orders"}, "the consumer's topics");
+  int delivered = 0;
+  for (const auto& e : ctx.Kafka.EventsOf("deliver"))
+    if (e.Group == "engine") delivered++;
+  ctx.Assert(delivered > 0, "group engine consumed nothing from orders");
+}
+
+void CheckManualCommit(harness::Ctx& ctx) {
+  seedOrders(ctx, {{"o-1", "ACME", "BUY", 10.05, 100}});
+  runEngine(ctx);
+  ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(), "offsets were auto-committed: enable.auto.commit false; the offset moves only when the engine says so");
+  ctx.Assert(!ctx.Kafka.EventsOf("manual-commit").empty(), "the engine never committed the offset explicitly");
+  const int64_t lag = ctx.Kafka.Lag("engine", "orders");
+  ctx.Equal(lag, 0, "after draining, the engine still has %d uncommitted orders", lag);
+}
+
+void CheckMatch(harness::Ctx& ctx) {
+  seedOrders(ctx, {
+                      {"o-1", "ACME", "BUY", 10.05, 100},
+                      {"o-2", "BETA", "SELL", 9.0, 100},  // another symbol: must not cross with ACME
+                      {"o-3", "ACME", "SELL", 10.0, 60},  // crosses o-1 at the resting price
+                  });
+  runEngine(ctx);
+  const auto fills = tradesOnBroker(ctx);
+  ctx.Equal(fills.size(), 1, "expected exactly one fill (ACME 60 @ 10.05), trades %v; trades", fills);
+  const auto& fill = fills[0];
+  ctx.Assert(fill["symbol"] == "ACME" && fill["qty"] == 60.0 && fill["price"] == 10.05,
+             "the fill must be 60 ACME at the resting price 10.05, got %v", fill);
+  ctx.Assert(fill["buy_order_id"] == "o-1" && fill["sell_order_id"] == "o-3", "the fill must name o-1 (buy) and o-3 (sell), got %v", fill);
+}
+
+void CheckTrades(harness::Ctx& ctx) {
+  seedOrders(ctx, {
+                      {"o-1", "ACME", "SELL", 10.05, 50},
+                      {"o-2", "ACME", "SELL", 10.06, 50},
+                      {"o-3", "ACME", "BUY", 10.1, 80},  // fills 50 @ 10.05 then 30 @ 10.06
+                  });
+  runEngine(ctx);
+  const auto records = ctx.Kafka.Records("trades");
+  ctx.Equal(records.size(), 2, "two fills must become two trades records");
+  const auto keys = ctx.Kafka.Keys("trades");
+  for (const auto& k : keys) ctx.Assert(k == "ACME", "trades must be keyed by the symbol, got %q", keys);
+  ctx.Equal(records[0].Partition, records[1].Partition, "one symbol's trades must stay on one partition");
+  std::vector<std::vector<harness::Any>> fills;
+  for (const auto& t : tradesOnBroker(ctx)) fills.push_back({t["price"], t["qty"]});
+  ctx.Equal(fills, std::vector<std::vector<double>>{{10.05, 50.0}, {10.06, 30.0}}, "expected fills [[10.05, 50], [10.06, 30]] in price-time order");
+}
+
+void CheckCommitAfter(harness::Ctx& ctx) {
+  seedOrders(ctx, {{"o-1", "ACME", "BUY", 10.05, 100}, {"o-2", "ACME", "SELL", 10.0, 40}});
+  ctx.Kafka.Seed("orders", "ACME", "this is not an order");
+  // The trades topic's leader is slow to acknowledge: a trade is on the broker only once it was acknowledged.
+  ctx.Kafka.StallFor("trades", 0.2);
+  std::vector<size_t> seen;  // trades on the broker at the moment of each commit
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { seen.push_back(ctx.Kafka.Records("trades").size()); });
+  runEngine(ctx);
+  ctx.Equal(seen.size(), 3, "expected one commit per record (two orders and one malformed)");
+  ctx.Equal(seen[1], 1, "the offset of the crossing order was committed while its trade was still waiting for the broker's acknowledgement: flush the producer before committing; trades on the broker at that commit");
+  ctx.Equal(tradesOnBroker(ctx).size(), 1, "expected one fill");
+  ctx.Equal(ctx.Kafka.Lag("engine", "orders"), 0, "the malformed record must be skipped and committed so the partition does not stall; uncommitted orders");
+}
+`,
   },
   debrief: `The consumer group turns the partition key into ownership: whoever holds the \`ACME\` partition holds the \`ACME\` book, so the hottest structure in the system runs single-threaded with no lock. Producing the trades before committing keeps the offset honest — but with an in-memory book, a replay is not idempotent, which is the gap that separates this exercise from a real engine. Real engines close it by making the book a pure function of the sequenced input: on restart they rebuild from a snapshot plus the log (the commit is just a bookmark), and they deduplicate by sequence number so a replayed order is recognised, not re-matched. Add to that a warm standby consuming the same partition a few messages behind, and you have the failover story of every exchange.`,
 };

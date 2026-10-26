@@ -14,9 +14,11 @@
     "protogen": "tsx scripts/protogen.ts",
     "build:runtime": "tsx scripts/build-runtime.ts",
     "build:go": "tsx scripts/build-go.ts",
+    "build:cpp": "tsx scripts/build-cpp.ts",
     "fetch:torch": "tsx scripts/fetch-torch.ts",
-    "predev": "tsx scripts/build-runtime.ts && tsx scripts/fetch-torch.ts",
-    "prebuild": "tsx scripts/build-runtime.ts && tsx scripts/fetch-torch.ts"
+    "fetch:cpp": "tsx scripts/fetch-cpp.ts",
+    "predev": "tsx scripts/build-runtime.ts && tsx scripts/fetch-torch.ts && tsx scripts/fetch-cpp.ts",
+    "prebuild": "tsx scripts/build-runtime.ts && tsx scripts/fetch-torch.ts && tsx scripts/fetch-cpp.ts"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.3",
@@ -52,6 +54,7 @@
     "@types/react-dom": "^18",
     "@typescript-eslint/eslint-plugin": "^5.14.0",
     "@typescript-eslint/parser": "^5.14.0",
+    "@yowasp/clang": "22.0.0-git20542-10",
     "autoprefixer": "^10.4.20",
     "esbuild": "0.28.2",
     "esbuild-wasm": "0.28.2",

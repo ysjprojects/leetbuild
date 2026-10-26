@@ -1049,6 +1049,182 @@ func CheckDestroyAndUnknown(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Redis.Keys("*"), []string{"sess:" + b}, "a miss must create no key: only sess:{b} may exist")
 }
 `,
+    cpp: `// redis-session-store/sliding-session checks: session-id, ttl-on-create, slides-on-get, touch, expires, destroy-and-unknown
+#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <exception>
+#include <map>
+#include <optional>
+#include <regex>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace {
+
+using Fields = std::map<std::string, std::string>;
+
+constexpr long long ssTTL = 1800;
+const std::regex ssHex32("^[0-9a-f]{32}$");
+const std::string ssNobody(32, '0');
+
+std::string ssCreate(harness::Ctx& ctx, const std::string& userID, const Fields& data) {
+  try {
+    return create(userID, data);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("create(ctx, %q, %s) returned an error: %s", userID, harness::ShowValue(data), e.what());
+  }
+  return "";
+}
+
+std::optional<Fields> ssGet(harness::Ctx& ctx, const std::string& sid) {
+  try {
+    return get(sid);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("get(ctx, %q) returned an error: %s", sid, e.what());
+  }
+  return std::nullopt;
+}
+
+bool ssTouch(harness::Ctx& ctx, const std::string& sid) {
+  try {
+    return touch(sid);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("touch(ctx, %q) returned an error: %s", sid, e.what());
+  }
+  return false;
+}
+
+void ssDestroy(harness::Ctx& ctx, const std::string& sid) {
+  try {
+    destroy(sid);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("destroy(ctx, %q) returned an error: %s", sid, e.what());
+  }
+}
+
+// ssFieldNames is the hash's field names, sorted.
+std::vector<std::string> ssFieldNames(const Fields& fields) {
+  std::vector<std::string> names;
+  for (const auto& [f, _] : fields) names.push_back(f);
+  return names;
+}
+
+}  // namespace
+
+void CheckSessionId(harness::Ctx& ctx) {
+  std::vector<std::string> sids;
+  for (int i = 0; i < 50; i++) {
+    sids.push_back(ssCreate(ctx, harness::Sprintf("u%d", i), {{"theme", "dark"}, {"locale", "de"}}));
+  }
+  for (const auto& sid : sids) {
+    ctx.Assert(std::regex_match(sid, ssHex32), "a session id must be 32 lower-case hex chars (16 random bytes), got %q", sid);
+  }
+  const std::set<std::string> distinct(sids.begin(), sids.end());
+  ctx.Equal(distinct.size(), 50, "fifty sessions must get fifty distinct ids (a secure random source, never a counter or a timestamp)");
+  const std::string sid = sids[0];
+  const std::string k = "sess:" + sid;
+  ctx.Equal(ctx.Redis.Type(k), "hash", "the session must be the hash sess:{sid}; the type of %s", k);
+  Fields fields = ctx.Redis.HGetAll(k);
+  ctx.Equal(fields["user_id"], "u0", "the hash must carry user_id = u0 (it holds %s)", harness::ShowValue(fields));
+  const bool ok = fields.count("created_at") > 0;
+  const std::string createdAt = ok ? fields["created_at"] : "";
+  char* end = nullptr;
+  const long long at = std::strtoll(createdAt.c_str(), &end, 10);
+  const bool parsed = !createdAt.empty() && *end == 0;
+  const long long now = ctx.Clock.Now() / 1000;
+  ctx.Assert(ok && parsed && at - now <= 1 && now - at <= 1, "created_at must be the unix seconds at create, it is %q", createdAt);
+  ctx.Assert(fields["theme"] == "dark" && fields["locale"] == "de", "every entry of data must be a field of the hash; the hash holds %s", harness::ShowValue(fields));
+  fields = ctx.Redis.HGetAll(k);
+  ctx.Equal(ssFieldNames(fields), {"created_at", "locale", "theme", "user_id"}, "the hash must hold exactly user_id, created_at and the data entries");
+  ctx.Equal(ssGet(ctx, sid).value_or(Fields{}), fields, "get must return the hash's fields as stored");
+  const std::string bare = ssCreate(ctx, "u99", {});
+  ctx.Equal(ssFieldNames(ctx.Redis.HGetAll("sess:" + bare)), {"created_at", "user_id"}, "with empty data the hash holds only user_id and created_at");
+  const auto keys = ctx.Redis.Keys("*");
+  std::vector<std::string> want;
+  sids.push_back(bare);
+  for (const auto& s : sids) want.push_back("sess:" + s);
+  std::sort(want.begin(), want.end());
+  const std::vector<std::string> shown(keys.begin(), keys.begin() + static_cast<long>(std::min<size_t>(keys.size(), 5)));
+  ctx.Assert(keys == want, "the only keys written are sess:{sid}, found %s", harness::ShowValue(shown));
+}
+
+void CheckTtlOnCreate(harness::Ctx& ctx) {
+  const std::string sid = ssCreate(ctx, "ana", {{"theme", "dark"}});
+  ctx.Equal(ctx.Redis.TTL("sess:" + sid), ssTTL, "right after create the TTL of sess:{sid} must be %d s (sessionTTL)", ssTTL);
+  ctx.Clock.Advance(100);
+  ctx.Equal(ctx.Redis.TTL("sess:" + sid), ssTTL - 100, "the TTL counts down while nobody reads: 100 s later");
+  const auto theme = ctx.Redis.HGet("sess:" + sid, "theme");
+  ctx.Equal(theme.value_or(""), "dark", "the fields must survive the EXPIRE (EXPIRE sets a TTL, it does not rewrite the hash)");
+}
+
+void CheckSlidesOnGet(harness::Ctx& ctx) {
+  const std::string sid = ssCreate(ctx, "ana", {{"theme", "dark"}});
+  const std::string k = "sess:" + sid;
+  const auto stored = ctx.Redis.HGetAll(k);
+  ctx.Clock.Advance(1000);
+  ctx.Equal(ctx.Redis.TTL(k), ssTTL - 1000, "the TTL 1000 s after create");
+  const auto got = ssGet(ctx, sid);
+  ctx.Assert(got && got->count("user_id") && got->at("user_id") == "ana" && got->count("theme") && got->at("theme") == "dark",
+             "get on a live session must return its fields, got %s", harness::ShowValue(got));
+  ctx.Equal(ctx.Redis.TTL(k), ssTTL, "a read must slide the TTL back to %d (EXPIRE after HGETALL)", ssTTL);
+  ctx.Equal(ctx.Redis.HGetAll(k), stored, "a read must not rewrite the hash (created_at and the data stay as they were)");
+  ctx.Clock.Advance(1500);
+  ctx.Equal(ctx.Redis.Exists(k), 1, "2500 s after create but only 1500 s after the last read the session must still be there");
+  ctx.Assert(ssGet(ctx, sid).has_value(), "a session read every 1500 s must never expire");
+  ctx.Equal(ctx.Redis.TTL(k), ssTTL, "every read slides the TTL, not just the first");
+}
+
+void CheckTouch(harness::Ctx& ctx) {
+  const std::string sid = ssCreate(ctx, "ana", {{"theme", "dark"}});
+  const std::string k = "sess:" + sid;
+  const auto stored = ctx.Redis.HGetAll(k);
+  ctx.Clock.Advance(1000);
+  ctx.Equal(ssTouch(ctx, sid), true, "touch on a live session must return true");
+  ctx.Equal(ctx.Redis.TTL(k), ssTTL, "touch must slide the TTL back to %d", ssTTL);
+  ctx.Equal(ctx.Redis.HGetAll(k), stored, "touch must leave the fields alone");
+  ctx.Equal(ssTouch(ctx, ssNobody), false, "touch on an unknown id must return false (EXPIRE answers 0 for a missing key)");
+  ctx.Equal(ctx.Redis.Exists("sess:" + ssNobody), 0, "touch on an unknown id must not create a key");
+  ctx.Equal(ctx.Redis.Keys("*"), std::vector<std::string>{k}, "touch must write no other key");
+}
+
+void CheckExpires(harness::Ctx& ctx) {
+  const std::string sid = ssCreate(ctx, "ana", {{"theme", "dark"}});
+  const std::string k = "sess:" + sid;
+  ctx.Clock.Advance(1799);
+  ctx.Equal(ctx.Redis.Exists(k), 1, "1799 s without a read is still inside the idle window: the session must be there");
+  ctx.Clock.Advance(2);
+  ctx.Equal(ctx.Redis.Exists(k), 0, "1801 s without a read: Redis must have evicted sess:{sid} (the TTL set at create is the only thing keeping it alive)");
+  ctx.Assert(!ssGet(ctx, sid).has_value(), "get on an expired session must return nil");
+  ctx.Equal(ssTouch(ctx, sid), false, "touch on an expired session must return false");
+  const auto keys = ctx.Redis.Keys("*");
+  ctx.Assert(keys.empty(), "get/touch on an expired session must not recreate anything, found %s", harness::ShowValue(keys));
+  const std::string other = ssCreate(ctx, "bo", {});
+  ctx.Clock.Advance(1000);
+  ctx.Assert(ssGet(ctx, other).has_value(), "get on a live session must return its fields");
+  ctx.Clock.Advance(1799);
+  ctx.Equal(ctx.Redis.Exists("sess:" + other), 1, "a read at 1000 s buys a fresh 1800 s: 1799 s after it the session must still be there");
+  ctx.Clock.Advance(2);
+  ctx.Assert(!ssGet(ctx, other).has_value(), "a read buys 1800 s and no more: 1801 s after the last read the session must be gone");
+}
+
+void CheckDestroyAndUnknown(harness::Ctx& ctx) {
+  const std::string a = ssCreate(ctx, "ana", {{"theme", "dark"}});
+  const std::string b = ssCreate(ctx, "bo", {{"theme", "light"}});
+  ssDestroy(ctx, a);
+  ctx.Equal(ctx.Redis.Exists("sess:" + a), 0, "destroy must DEL sess:{sid}");
+  ctx.Assert(!ssGet(ctx, a).has_value(), "get after destroy must return nil");
+  ctx.Equal(ssTouch(ctx, a), false, "touch after destroy must return false");
+  const auto got = ssGet(ctx, b);
+  ctx.Assert(got && got->count("theme") && got->at("theme") == "light", "destroying one session must not touch another");
+  ssDestroy(ctx, a);  // idempotent
+  ctx.Assert(!ssGet(ctx, ssNobody).has_value(), "get on an id that was never created must return nil");
+  ctx.Equal(ssTouch(ctx, ssNobody), false, "touch on an id that was never created must return false");
+  ctx.Equal(ctx.Redis.Keys("*"), std::vector<std::string>{"sess:" + b}, "a miss must create no key: only sess:{b} may exist");
+}
+`,
   },
   debrief: `The store is two commands and an ordering. \`HSET\` plus \`EXPIRE\` inside one \`MULTI\` means a crash between the write and the TTL can never leave an immortal session — the hash and its lifetime land together or not at all. \`HGETALL\` followed by \`EXPIRE\` is the slide: the TTL measures *idle time*, so an active user is never logged out mid-session and an abandoned tab is gone 30 minutes after its last request, with Redis doing the eviction and nobody running a sweeper. \`touch\` is that same \`EXPIRE\` alone, and its 0/1 reply doubles as "does this session exist" — the reason an unknown or expired id never creates a key is that neither \`HGETALL\` nor \`EXPIRE\` writes anything for a missing key. The id is 128 bits from a cryptographic source, which is what makes a cookie unguessable; a counter or a timestamp would let anyone enumerate live sessions. Real systems add an absolute lifetime next to the idle one (a second field compared at read time, or a shorter \`EXPIRE\` ceiling), rotate the id at login against session fixation, keep a per-user set of ids so "log out everywhere" is one \`SMEMBERS\` and a few \`DEL\`s, and sign the cookie so a tampered id is rejected before Redis is asked.`,
 };

@@ -1076,6 +1076,171 @@ func CheckAccepted(ctx *harness.Ctx) {
 	ctx.Equal(len(enqueued(ctx)), 2, "the retry after a 503 must enqueue the notification: records on notifications")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <librdkafka/rdkafkacpp.h>
+
+#include <map>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+const json notifyBody = {{"user_id", "u42"}, {"channel", "push"}, {"title", "Shipped"},
+                         {"body", "Your order is on its way"}, {"priority", "normal"}};
+
+// Delivery reports of the bus's producer: msg_opaque points at the outcome slot enqueue waits on.
+class BusOutcome : public RdKafka::DeliveryReportCb {
+ public:
+  void dr_cb(RdKafka::Message& message) override { *static_cast<RdKafka::ErrorCode*>(message.msg_opaque()) = message.err(); }
+};
+BusOutcome busOutcomes;
+
+// Step 2's producer: every in-sync replica acknowledges, records keyed by user.
+RdKafka::Producer* busProducer() {
+  static std::unique_ptr<RdKafka::Producer> producer = [] {
+    std::string err;
+    std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+    conf->set("bootstrap.servers", "kafka:9092", err);
+    conf->set("dr_cb", &busOutcomes, err);
+    conf->set("acks", "all", err);
+    return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
+  }();
+  return producer.get();
+}
+
+std::vector<harness::Any> enqueued(harness::Ctx& ctx) {
+  std::vector<harness::Any> out;
+  for (const auto& v : ctx.Kafka.Values("notifications")) {
+    const auto n = harness::ParseJSON(v);
+    ctx.Assert(n && n->IsObject(), "a record on notifications is not a notification as JSON: %q", v);
+    out.push_back(*n);
+  }
+  return out;
+}
+
+// POST body (null: notifyBody) with an Idempotency-Key header unless key is "".
+harness::Response postNotification(harness::HTTP& c, const json& body, const std::string& key) {
+  const std::string text = (body.is_null() ? notifyBody : body).dump();
+  if (key.empty()) return c.Post("/notifications", text, "Content-Type", "application/json");
+  return c.Post("/notifications", text, "Content-Type", "application/json", "Idempotency-Key", key);
+}
+
+// notifyBody with fields replaced.
+json notifyBodyWith(const std::vector<std::pair<std::string, std::string>>& fields) {
+  json out = notifyBody;
+  for (const auto& [k, v] : fields) out[k] = v;
+  return out;
+}
+
+// The id of a JSON answer (nil without one).
+harness::Any answeredID(const harness::Response& r) {
+  const auto body = harness::ParseJSON(r.Text());
+  return body ? (*body)["id"] : harness::Any();
+}
+
+}  // namespace
+
+// Stands in for step 2's enqueue (notification_bus.cpp), as the Go harness does: the real bus, so
+// what the API enqueued is what the notifications topic holds.
+void enqueue(const Notification& n) {
+  const std::string value = json{{"id", n.id},       {"user_id", n.user_id}, {"channel", n.channel},
+                                 {"title", n.title}, {"body", n.body},       {"priority", n.priority}}
+                                .dump();
+  RdKafka::ErrorCode outcome = RdKafka::ERR__IN_PROGRESS;
+  auto headers = std::unique_ptr<RdKafka::Headers>(RdKafka::Headers::create());
+  headers->add("priority", n.priority);
+  RdKafka::Producer* producer = busProducer();
+  const RdKafka::ErrorCode queued =
+      producer->produce("notifications", RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY,
+                        const_cast<char*>(value.data()), value.size(), n.user_id.c_str(), n.user_id.size(), 0,
+                        headers.get(), &outcome);
+  if (queued != RdKafka::ERR_NO_ERROR) throw std::runtime_error("no ack for " + n.id + ": " + RdKafka::err2str(queued));
+  headers.release();
+  if (producer->flush(2000) != RdKafka::ERR_NO_ERROR || outcome != RdKafka::ERR_NO_ERROR)
+    throw std::runtime_error("no ack for " + n.id + ": " + RdKafka::err2str(outcome));
+}
+
+void CheckValidate(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  const std::vector<std::pair<std::string, std::string>> bad = {
+      {"channel", "fax"}, {"priority", "urgent"}, {"user_id", ""}, {"title", ""}};
+  for (const auto& field : bad) {
+    const auto r = postNotification(c, notifyBodyWith({field}), "k-" + field.first);
+    ctx.Equal(r.Status, 400, "an invalid %s must be answered with 400", field.first);
+  }
+  const auto keys = ctx.Redis.Keys("idem:*");
+  ctx.Assert(keys.empty(), "a rejected request must not claim an idempotency key, found %v", keys);
+  ctx.Equal(enqueued(ctx).size(), 0, "a rejected request must not be enqueued: records on notifications");
+  const auto r = postNotification(c, notifyBodyWith({{"channel", "email"}, {"priority", "high"}}), "k-ok");
+  ctx.Equal(r.Status, 202, "a valid request must be answered with 202");
+}
+
+void CheckHeaderRequired(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  auto r = postNotification(c, nullptr, "");
+  ctx.Equal(r.Status, 400, "a request without Idempotency-Key must be answered with 400");
+  ctx.Equal(enqueued(ctx).size(), 0, "a request without Idempotency-Key must not be enqueued: records on notifications");
+  const auto keys = ctx.Redis.Keys("idem:*");
+  ctx.Assert(keys.empty(), "a request without Idempotency-Key must not claim a key, found %v", keys);
+  r = postNotification(c, nullptr, "k1");
+  ctx.Equal(r.Status, 202, "with the header the same request must be answered with 202");
+}
+
+void CheckReserveNx(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  ctx.Redis.Set("idem:k-taken", "n-earlier");
+  auto r = postNotification(c, nullptr, "k1");
+  ctx.Equal(r.Status, 202, "POST must be answered with 202");
+  const auto stored = ctx.Redis.Get("idem:k1");
+  ctx.Assert(stored.has_value(), "idem:k1 must be claimed in Redis");
+  ctx.Equal(stored, answeredID(r), "idem:k1 must hold the id the API answered with (%s)", r.Text());
+  const long long ttl = ctx.Redis.TTL("idem:k1");
+  ctx.Assert(86000 <= ttl && ttl <= 86400, "idem:k1 must expire after 86400 s, TTL is %d", ttl);
+  r = postNotification(c, nullptr, "k-taken");
+  ctx.Assert(r.Status != 202, "a key that already exists must not be claimed again");
+  ctx.Equal(ctx.Redis.Get("idem:k-taken"), "n-earlier", "SET without NX overwrote the id stored under an existing key");
+  ctx.Equal(ctx.Redis.TTL("idem:k-taken"), -1, "a refused SET NX must not touch the existing key's expiry");
+}
+
+void CheckReplay(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  ctx.Redis.Set("idem:k-old", "n-stored");
+  const auto first = postNotification(c, nullptr, "k1");
+  ctx.Equal(first.Status, 202, "the first POST must be answered with 202");
+  const auto again = postNotification(c, nullptr, "k1");
+  ctx.Equal(again.Status, 200, "a retry with the same key must be answered with 200");
+  ctx.Equal(answeredID(again), answeredID(first), "the replay answered %s: it must carry the original id", again.Text());
+  ctx.Equal(enqueued(ctx).size(), 1, "enqueue must run once for one key: records on notifications");
+  const auto old = postNotification(c, nullptr, "k-old");
+  ctx.Assert(old.Status == 200 && answeredID(old) == "n-stored", "a key stored earlier must replay its id with 200, got %d %s",
+             old.Status, old.Text());
+  ctx.Equal(enqueued(ctx).size(), 1, "a replay must not enqueue again: records on notifications");
+}
+
+void CheckAccepted(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  auto r = postNotification(c, nullptr, "k1");
+  ctx.Equal(r.Status, 202, "POST must be answered with 202 Accepted");
+  const harness::Any nid = answeredID(r);
+  ctx.Assert(!nid.IsNil() && !(nid == ""), "the 202 body must carry the id, got %s", r.Text());
+  ctx.Equal(enqueued(ctx).size(), 1, "enqueue must run once: records on notifications");
+  const harness::Any sent = enqueued(ctx)[0];
+  ctx.Assert(sent["user_id"] == "u42" && sent["id"] == nid,
+             "enqueue received %v: expected the notification with its minted id %v", sent, nid);
+  ctx.Equal(ctx.Redis.Get("idem:k1"), nid, "the key must be claimed before enqueue runs, holding the id that was enqueued");
+  ctx.Kafka.FailNext("notifications", 1);  // the broker does not acknowledge the next record
+  r = postNotification(c, nullptr, "k2");
+  ctx.Equal(r.Status, 503, "a failed enqueue must be answered with 503");
+  ctx.Equal(ctx.Redis.Exists("idem:k2"), 0, "a failed enqueue must release idem:k2 so the retry can enqueue again");
+  r = postNotification(c, nullptr, "k2");
+  ctx.Equal(r.Status, 202, "the retry after a 503 must be answered with 202");
+  ctx.Equal(enqueued(ctx).size(), 2, "the retry after a 503 must enqueue the notification: records on notifications");
+}
+`,
   },
   debrief: `The intake endpoint is where "at least once" from the network becomes "at most once" into the system: the atomic \`SET NX EX\` is both the check and the claim, the stored id makes the replay identical, and releasing the key on a failed enqueue keeps the promise honest. The 202 matters too — the API answers as soon as Kafka has the record, so a slow push provider never slows the services calling it. Real intake APIs also fingerprint the body (same key, different payload → 422) and scope keys per caller so two teams cannot collide on \`order-123\`.`,
 };

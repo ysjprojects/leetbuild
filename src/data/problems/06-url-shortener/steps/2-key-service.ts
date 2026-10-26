@@ -1115,6 +1115,190 @@ func CheckLocked(ctx *harness.Ctx) {
 	ctx.Assert(!lockHeld(), "a failed refill must release mu, or every later request deadlocks")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <exception>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+constexpr uint64_t firstCounter = 3842000;
+
+// lockHeld reports whether the learner's mu is held, without waiting for it.
+bool lockHeld() {
+  if (mu.try_lock()) {
+    mu.unlock();
+    return false;
+  }
+  return true;
+}
+
+// keyPeer is the key service: hands out blocks of 'block' counters; successive blocks start 1000 apart, so a
+// client that keeps minting past the end of a block produces a code the service never issued.
+class keyPeer final : public shortener::KeyService::Service {
+ public:
+  explicit keyPeer(uint32_t block) : block_(block) {}
+
+  grpc::Status ReserveBlock(grpc::ServerContext*, const shortener::ReserveRequest* req,
+                            shortener::ReserveReply* reply) override {
+    const bool held = lockHeld();
+    std::lock_guard<std::mutex> lock(guard_);
+    sizes.push_back(req->size());
+    lockedDuringCall.push_back(held);
+    reply->set_start(next_);
+    next_ += 1000;
+    reply->set_size(std::min(req->size(), block_));
+    return grpc::Status::OK;
+  }
+
+  std::vector<uint32_t> sizes;
+  std::vector<bool> lockedDuringCall;
+
+ private:
+  std::mutex guard_;
+  uint64_t next_ = firstCounter;
+  uint32_t block_;
+};
+
+keyPeer& serveKeys(harness::Ctx& ctx, uint32_t block) {
+  auto* p = new keyPeer(block);  // the harness owns the peers it registers
+  ctx.GRPC.Server("keys:9000")->RegisterService(p);
+  return *p;
+}
+
+int reserveCalls(harness::Ctx& ctx) { return static_cast<int>(ctx.GRPC.CallsTo("ReserveBlock", "").size()); }
+
+// keyFailure is the gRPC status a failed next_code surfaced; the check fails when it returned a code.
+// Go's nextCode returns the status as its error; the C++ one throws, so the status is the one the
+// last ReserveBlock call ended with.
+grpc::StatusCode keyFailure(harness::Ctx& ctx, const std::string& resolvedMessage) {
+  bool threw = false;
+  try {
+    next_code();
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  ctx.Assert(threw, "%s", resolvedMessage);
+  const auto calls = ctx.GRPC.CallsTo("ReserveBlock", "");
+  ctx.Assert(!calls.empty(), "next_code failed without calling ReserveBlock, expected a gRPC status error");
+  return calls.back().Code;
+}
+
+// mintCode is next_code(); an exception fails the check (Go's ctx.NoError).
+std::string mintCode(harness::Ctx& ctx) {
+  try {
+    return next_code();
+  } catch (const std::exception& e) {
+    ctx.Fatalf("next_code: %s", e.what());
+  }
+}
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  serveKeys(ctx, 1);
+  ctx.Equal(mintCode(ctx), base62(firstCounter), "next_code must hand out the first counter of the reserved block");
+  const auto calls = ctx.GRPC.CallsTo("ReserveBlock", "");
+  ctx.Assert(!calls.empty(), "next_code handed out a code without calling ReserveBlock");
+  const auto& call = calls.back();
+  ctx.Assert(call.HasDeadline(), "ReserveBlock carries no deadline: a slow key service would stall every shorten request");
+  const double timeout = call.TimeoutSeconds();
+  ctx.Assert(0.4 <= timeout && timeout <= 0.6, "the deadline must be 500 ms, got %v s", timeout);
+  ctx.GRPC.SetLatency("ReserveBlock", 3.0, "");
+  const auto st = keyFailure(ctx, "a key service slower than the deadline must surface DEADLINE_EXCEEDED");
+  ctx.Equal(st, grpc::StatusCode::DEADLINE_EXCEEDED, "the status a slow key service surfaced");
+  ctx.Equal(reserveCalls(ctx), 2, "DEADLINE_EXCEEDED is not UNAVAILABLE: it must not be retried");
+}
+
+void CheckRetryUnavailable(harness::Ctx& ctx) {
+  serveKeys(ctx, 1);
+  ctx.GRPC.Fail("ReserveBlock", grpc::StatusCode::UNAVAILABLE, "key service restarting", 1, "");
+  ctx.Equal(mintCode(ctx), base62(firstCounter), "one UNAVAILABLE must be retried and the second attempt's block used");
+  ctx.Equal(reserveCalls(ctx), 2, "expected exactly one retry after UNAVAILABLE");
+  ctx.GRPC.Fail("ReserveBlock", grpc::StatusCode::RESOURCE_EXHAUSTED, "quota", 1, "");
+  auto st = keyFailure(ctx, "RESOURCE_EXHAUSTED must propagate, not be retried or swallowed");
+  ctx.Equal(st, grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED must propagate");
+  ctx.Equal(reserveCalls(ctx), 3, "only UNAVAILABLE is worth a second attempt");
+  ctx.GRPC.Fail("ReserveBlock", grpc::StatusCode::UNAVAILABLE, "down", 50, "");
+  st = keyFailure(ctx, "a key service that stays UNAVAILABLE must return an error, not a code");
+  ctx.Equal(st, grpc::StatusCode::UNAVAILABLE, "the status after the retries");
+  ctx.Equal(reserveCalls(ctx) - 3, 2, "attempts against a down key service; retries must stop after the second");
+}
+
+void CheckRefillWhenEmpty(harness::Ctx& ctx) {
+  keyPeer& peer = serveKeys(ctx, 3);
+  ctx.Equal(reserveCalls(ctx), 0, "no block is reserved before the first code is needed");
+  for (int i = 0; i < 3; i++) {
+    mintCode(ctx);
+    ctx.Equal(reserveCalls(ctx), 1, "code %d of a block of 3 reserved another block: refill only when remaining is 0", i + 1);
+  }
+  mintCode(ctx);
+  ctx.Equal(reserveCalls(ctx), 2, "the 4th code needs a new block: expected a second ReserveBlock");
+  mintCode(ctx);
+  mintCode(ctx);
+  ctx.Equal(reserveCalls(ctx), 2, "codes 5 and 6 come from the second block without an RPC");
+  mintCode(ctx);
+  ctx.Equal(reserveCalls(ctx), 3, "the 7th code needs a third block");
+  ctx.Equal(peer.sizes, std::vector<uint32_t>{kBlockSize, kBlockSize, kBlockSize}, "ReserveBlock must ask for kBlockSize (%d) counters", kBlockSize);
+}
+
+void CheckBase62Advance(harness::Ctx& ctx) {
+  serveKeys(ctx, 3);
+  std::vector<std::string> got;
+  for (int i = 0; i < 5; i++) got.push_back(mintCode(ctx));
+  std::vector<std::string> want;
+  for (const uint64_t n : {firstCounter, firstCounter + 1, firstCounter + 2, firstCounter + 1000, firstCounter + 1001}) {
+    want.push_back(base62(n));
+  }
+  ctx.Equal(got, want, "the codes handed out: base62 of 3842000, 3842001, 3842002 then the next block 3843000, 3843001");
+  std::vector<std::string> unique = got;
+  std::sort(unique.begin(), unique.end());
+  unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+  ctx.Assert(unique.size() == 5, "codes must be unique, got %q", got);
+}
+
+void CheckLocked(harness::Ctx& ctx) {
+  keyPeer& peer = serveKeys(ctx, 2);
+  mintCode(ctx);
+  ctx.Equal(peer.lockedDuringCall, std::vector<bool>{true}, "the refill must happen under the lock: another request could reserve a second block meanwhile");
+  ctx.Assert(!lockHeld(), "mu must be released once the code is handed out");
+  mintCode(ctx);
+  mintCode(ctx);
+  ctx.Equal(peer.lockedDuringCall, std::vector<bool>{true, true}, "every refill, not only the first, happens under the lock");
+  std::vector<std::string> concurrent(3);
+  std::vector<std::string> errs(3);
+  std::vector<std::thread> threads;
+  for (int i = 0; i < 3; i++) {
+    threads.emplace_back([&concurrent, &errs, i] {
+      try {
+        concurrent[i] = next_code();
+      } catch (const std::exception& e) {
+        errs[i] = e.what();
+      }
+    });
+  }
+  for (auto& t : threads) t.join();
+  for (const auto& err : errs) {
+    if (!err.empty()) ctx.Fatalf("a concurrent next_code: %s", err);
+  }
+  ctx.Assert(reserveCalls(ctx) == 3, "three concurrent next_code calls on a block of 2 reserved %d blocks: without the lock every caller sees an empty block and reserves its own", reserveCalls(ctx) - 2);
+  std::vector<std::string> want = {base62(firstCounter + 1001), base62(firstCounter + 2000), base62(firstCounter + 2001)};
+  std::sort(concurrent.begin(), concurrent.end());
+  std::sort(want.begin(), want.end());
+  ctx.Equal(concurrent, want, "concurrent callers must get the last code of the block and then two consecutive codes of one new block");
+  ctx.GRPC.Fail("ReserveBlock", grpc::StatusCode::UNAVAILABLE, "down", 50, "");
+  try {
+    next_code();  // the block is used up: this refill fails; what matters is the lock
+  } catch (const std::exception&) {
+  }
+  ctx.Assert(!lockHeld(), "a failed refill must release mu, or every later request deadlocks");
+}
+`,
   },
   debrief: `Reserving a block turns a coordination problem into a local one: one RPC per thousand codes, and a key service outage only matters when the block runs dry. The codes are sequential, which is fine for a shortener (and is what a database sequence would give you) — a counter is unguessable only if you need it to be, and then you add a random prefix or encrypt it. Real key services pre-fetch the next block before the current one is empty, so the refill never sits on a request path, and survive their own restarts by persisting the high-water mark.`,
 };

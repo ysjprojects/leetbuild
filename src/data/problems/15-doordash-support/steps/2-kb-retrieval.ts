@@ -1414,6 +1414,239 @@ func CheckCacheRoundTrip(ctx *harness.Ctx) {
 	ctx.Assert(gone == nil, "after config.CacheTTL the answer must be gone")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cmath>
+#include <sstream>
+
+namespace {
+
+const std::string kbPayQ = "Payout missing after five business days — bank details on file?";
+const std::string kbLoginQ = "Forgot Password reset email, two-factor code, account locked";
+
+// kbRow is one chunk the knowledge base cuts into, computed without the learner.
+struct kbRow {
+  std::string id, article;
+  int position;
+  std::string text;
+};
+
+std::vector<kbRow> kbExpectedChunks() {
+  std::vector<kbRow> out;
+  for (const auto& a : assistant::articles()) {
+    const auto chunks = assistant::chunk(a.body);
+    for (size_t position = 0; position < chunks.size(); position++) {
+      out.push_back({a.id + "-" + std::to_string(position), a.id, static_cast<int>(position), chunks[position]});
+    }
+  }
+  return out;
+}
+
+// kbRanked is a chunk id and its cosine with the question.
+struct kbRanked {
+  double score;
+  std::string id;
+};
+
+// kbExpectedRanking is the spec, independently: cosine of the question against every chunk, best first.
+std::vector<kbRanked> kbExpectedRanking(const std::string& question, int k) {
+  const auto q = assistant::embed(question);
+  std::vector<kbRanked> out;
+  for (const auto& c : kbExpectedChunks()) out.push_back({assistant::cosine(q, assistant::embed(c.text)), c.id});
+  std::stable_sort(out.begin(), out.end(), [](const kbRanked& a, const kbRanked& b) { return a.score > b.score; });
+  out.resize(static_cast<size_t>(k));
+  return out;
+}
+
+// noError runs fn, the learner's call; what it throws fails the check with msg (Go's ctx.NoError).
+template <class F>
+auto noError(harness::Ctx& ctx, const std::string& msg, F fn) -> decltype(fn()) {
+  try {
+    return fn();
+  } catch (const std::exception& e) {
+    ctx.Fatalf("%s: %v", msg, std::string(e.what()));
+  }
+}
+
+// kbIndexed is a fresh schema with the knowledge base indexed by the learner; the count index_articles returned.
+int kbIndexed(harness::Ctx& ctx) {
+  ctx.DB.Reset(db::kSchema);
+  try {
+    return index_articles(assistant::articles());
+  } catch (const std::exception& e) {
+    ctx.Fatalf("indexArticles(kb.Articles) crashed: %v", std::string(e.what()));
+  }
+}
+
+std::string join(const std::vector<std::string>& items, const std::string& sep) {
+  std::string out;
+  for (size_t i = 0; i < items.size(); i++) out += (i == 0 ? "" : sep) + items[i];
+  return out;
+}
+
+std::string showHits(const std::vector<Hit>& hits) {
+  std::string out = "[";
+  for (size_t i = 0; i < hits.size(); i++) {
+    out += (i == 0 ? "{" : " {") + harness::Sprintf("ID:%s Text:%s Score:%v", hits[i].id, hits[i].text, hits[i].score) + "}";
+  }
+  return out + "]";
+}
+
+std::string showAnswer(const std::optional<CachedAnswer>& a) {
+  if (!a) return "<nil>";
+  return harness::Sprintf("&{Answer:%s Sources:%v}", a->answer, a->sources);
+}
+
+std::string kbKeyOf(const std::string& question) {
+  std::string lower;
+  for (unsigned char c : question) lower += static_cast<char>(std::tolower(c));
+  std::istringstream words(lower);
+  std::vector<std::string> parts;
+  for (std::string w; words >> w;) parts.push_back(w);
+  return "answer:" + sha256_hex(join(parts, " "));
+}
+
+}  // namespace
+
+void CheckIndexChunks(harness::Ctx& ctx) {
+  const int n = kbIndexed(ctx);
+  const auto want = kbExpectedChunks();
+  auto rows = ctx.DB.Query("SELECT id, article, position, text FROM kb_chunks ORDER BY article, position");
+  ctx.Assert(rows.size() == want.size(), "the ten articles chunk into %d windows (chunk.Chunk, 48 words, overlap 12), kb_chunks holds %d row(s)", want.size(), rows.size());
+  ctx.Assert(n == static_cast<int>(want.size()), "indexArticles must return the number of chunks it inserted (%d), it returned %d", want.size(), n);
+  std::vector<std::string> got, wanted, ids;
+  for (auto& r : rows) {
+    got.push_back(harness::Sprintf("%v|%v|%v|%v", r["id"], r["article"], r["position"], r["text"]));
+    ids.push_back(harness::Sprintf("%v", r["id"]));
+  }
+  for (const auto& c : want) wanted.push_back(harness::Sprintf("%s|%s|%d|%s", c.id, c.article, c.position, c.text));
+  std::sort(got.begin(), got.end());
+  std::sort(wanted.begin(), wanted.end());
+  std::sort(ids.begin(), ids.end());
+  ctx.Assert(join(got, "\\n") == join(wanted, "\\n"), "kb_chunks must hold one row per chunk with id <article>-<position>; ids found: %q", ids);
+  // Each stored vector is compared with embed(text) in Postgres (vector_dims, <=>) rather than parsed here.
+  for (auto& r : rows) {
+    const std::string text = r["text"].String();
+    auto stored = ctx.DB.Query("SELECT vector_dims(embedding) AS dims, 1 - (embedding <=> $1::vector) AS cosine FROM kb_chunks WHERE id = $2", assistant::to_pgvector(assistant::embed(text)), r["id"].String())[0];
+    ctx.Assert(harness::Sprintf("%v", stored["dims"]) == "512", "chunk %v must carry a 512-dimensional embedding, found %v dimensions", r["id"], stored["dims"]);
+    const double cos = stored["cosine"].Float();
+    ctx.Assert(cos > 0.999, "chunk %v's stored vector is not embed.Embed(text): cosine %.3f against the expected vector", r["id"], cos);
+  }
+  const int again = noError(ctx, "indexArticles(kb.Articles) a second time", [] { return index_articles(assistant::articles()); });
+  auto count = ctx.DB.Query("SELECT count(*) AS n FROM kb_chunks")[0]["n"];
+  ctx.Assert(harness::Sprintf("%v", count) == std::to_string(want.size()), "indexing twice must leave the table unchanged (%d rows): ON CONFLICT (id) DO NOTHING — found %v", want.size(), count);
+  ctx.Assert(again == 0, "a second indexArticles inserts nothing, so it returns 0, not %d", again);
+}
+
+void CheckNearestChunks(harness::Ctx& ctx) {
+  kbIndexed(ctx);
+  std::map<std::string, std::string> texts;
+  for (const auto& c : kbExpectedChunks()) texts[c.id] = c.text;
+  struct Case {
+    std::string question, article;
+    int k;
+  };
+  for (const auto& tc : {Case{kbPayQ, "pay", 4}, Case{kbLoginQ, "login", 3}}) {
+    const auto hits = noError(ctx, harness::Sprintf("search(%q, %d)", tc.question, tc.k), [&] { return search(tc.question, tc.k); });
+    ctx.Assert(static_cast<int>(hits.size()) == tc.k, "search(%q, %d) must return exactly %d chunks, got %d", tc.question, tc.k, tc.k, hits.size());
+    std::vector<std::string> got, scores;
+    for (const auto& h : hits) {
+      ctx.Assert(h.score > 0 && h.score <= 1 + 1e-6, "Score is 1 - cosine distance, in (0, 1]: chunk %s scored %v", h.id, h.score);
+      got.push_back(h.id);
+    }
+    ctx.Assert(hits[0].id.rfind(tc.article + "-", 0) == 0, "for %q the best chunk must come from the '%s' article, got %q", tc.question, tc.article, got);
+    for (size_t i = 0; i < hits.size(); i++) {
+      scores.push_back(harness::Sprintf("%v", hits[i].score));
+      ctx.Assert(i == 0 || hits[i - 1].score >= hits[i].score, "hits must come best first, scores were %v", scores);
+    }
+    const auto want = kbExpectedRanking(tc.question, tc.k);
+    std::vector<std::string> wantIDs;
+    for (const auto& r : want) wantIDs.push_back(r.id);
+    auto gotSorted = got;
+    auto wantSorted = wantIDs;
+    std::sort(gotSorted.begin(), gotSorted.end());
+    std::sort(wantSorted.begin(), wantSorted.end());
+    ctx.Assert(join(gotSorted, ",") == join(wantSorted, ","), "the %d nearest chunks to %q are %q, search returned %q", tc.k, tc.question, wantIDs, got);
+    for (size_t i = 0; i < hits.size(); i++) {
+      ctx.Assert(std::fabs(hits[i].score - want[i].score) < 1e-3, "chunk %s must score 1 - distance = %.4f, got %v", hits[i].id, want[i].score, hits[i].score);
+    }
+    for (const auto& h : hits) ctx.Equal(h.text, texts[h.id], "hit %s must carry the chunk's text", h.id);
+  }
+  const auto one = noError(ctx, harness::Sprintf("search(%q, 1)", kbPayQ), [] { return search(kbPayQ, 1); });
+  ctx.Assert(one.size() == 1 && one[0].id.rfind("pay-", 0) == 0, "k=1 returns the single best chunk, got %s", showHits(one));
+}
+
+void CheckRankedInDatabase(harness::Ctx& ctx) {
+  kbIndexed(ctx);
+  const size_t before = ctx.DB.Queries().size();
+  const auto hits = noError(ctx, harness::Sprintf("search(%q, 4)", kbPayQ), [] { return search(kbPayQ, 4); });
+  ctx.Equal(hits.size(), 4, "search must return 4 chunks");
+  std::vector<std::string> during, selects;
+  const auto queries = ctx.DB.Queries();
+  for (size_t i = before; i < queries.size(); i++) {
+    const std::string& sql = queries[i].SQL;
+    during.push_back(sql);
+    std::string lower;
+    for (unsigned char c : sql) lower += static_cast<char>(std::tolower(c));
+    const size_t start = lower.find_first_not_of(" \\t\\r\\n");
+    if (lower.find("kb_chunks") != std::string::npos && start != std::string::npos && lower.compare(start, 6, "select") == 0) {
+      selects.push_back(sql);
+    }
+  }
+  ctx.Assert(!selects.empty(), "search must query kb_chunks; the statements it ran were %q", during);
+  bool ranked = false;
+  for (const auto& sql : selects) ranked = ranked || sql.find("<=>") != std::string::npos;
+  ctx.Assert(ranked, "the nearest-neighbour ranking belongs to Postgres: use pgvector's <=> operator; the statements were %q", selects);
+  for (const auto& sql : selects) {
+    std::string lower;
+    for (unsigned char c : sql) lower += static_cast<char>(std::tolower(c));
+    ctx.Assert(lower.find("limit") != std::string::npos, "a SELECT on kb_chunks without a LIMIT pulls every chunk into the process to sort it there; let the database rank and bound: %s", sql);
+  }
+  ctx.Assert(selects.size() == 1, "one query answers a search; %d SELECTs on kb_chunks ran: %q", selects.size(), selects);
+}
+
+void CheckCacheKey(harness::Ctx& ctx) {
+  const std::string key = noError(ctx, "cacheKey", [] { return cache_key("How do I get paid?"); });
+  ctx.Equal(key, kbKeyOf("How do I get paid?"), "cacheKey must be \\"answer:\\" + sha256 hex of the normalised question");
+  for (const std::string variant : {"  how do i   get PAID? ", "HOW DO I GET PAID?", "how\\tdo i get paid?\\n"}) {
+    const std::string got = cache_key(variant);
+    ctx.Assert(got == key, "%q is the same question once lower-cased, whitespace-collapsed and trimmed, but it got the key %q instead of %q", variant, got, key);
+  }
+  ctx.Assert(cache_key("How do I get a tip?") != key, "a different question must have a different key");
+  noError(ctx, "rememberAnswer", [] { remember_answer("How do I get paid?", "Weekly, on Mondays [kb:pay-0].", {"pay-0"}); });
+  ctx.Equal(ctx.Redis.Keys("*"), {key}, "rememberAnswer must write exactly the key %s", key);
+}
+
+void CheckCacheRoundTrip(harness::Ctx& ctx) {
+  const auto miss = noError(ctx, "cachedAnswer", [] { return cached_answer("When do I get paid?"); });
+  ctx.Assert(!miss, "nothing has been remembered yet: cachedAnswer must be nil, got %s", showAnswer(miss));
+  noError(ctx, "rememberAnswer", [] { remember_answer("When do I get paid?", "Weekly, on Mondays [kb:pay-0].", {"pay-0", "pay-1"}); });
+  const auto hit = noError(ctx, "cachedAnswer", [] { return cached_answer("  when DO i get   paid? "); });
+  const std::string wantAnswer = "Weekly, on Mondays [kb:pay-0].";
+  const std::vector<std::string> wantSources = {"pay-0", "pay-1"};
+  ctx.Assert(hit.has_value(), "the same question written differently must hit with {answer, sources}, got nil");
+  ctx.Equal(std::make_pair(hit->answer, hit->sources), std::make_pair(wantAnswer, wantSources), "the same question written differently must hit with {answer, sources}");
+  const std::string key = kbKeyOf("When do I get paid?");
+  const auto raw = ctx.Redis.Get(key);
+  ctx.Assert(raw.has_value(), "the answer must be stored under %s, Redis holds %q", key, ctx.Redis.Keys("*"));
+  const auto stored = harness::ParseJSON(*raw);
+  bool same = stored.has_value() && (*stored)["answer"] == hit->answer;
+  if (same) {
+    std::vector<std::string> sources;
+    for (const auto& s : (*stored)["sources"].Items()) sources.push_back(s.String());
+    same = join(sources, ",") == join(hit->sources, ",");
+  }
+  ctx.Assert(same, "the stored value must be the JSON {answer, sources}, it is %q", *raw);
+  const long long ttl = ctx.Redis.TTL(key);
+  ctx.Assert(config::kCacheTtlS - 5 <= ttl && ttl <= config::kCacheTtlS, "the cached answer must expire after config.CacheTTL = %d s, its TTL is %d", config::kCacheTtlS, ttl);
+  const auto other = noError(ctx, "cachedAnswer", [] { return cached_answer("How do tips work?"); });
+  ctx.Assert(!other, "a different question must still miss");
+  ctx.Clock.Advance(config::kCacheTtlS + 1);
+  const auto gone = noError(ctx, "cachedAnswer", [] { return cached_answer("When do I get paid?"); });
+  ctx.Assert(!gone, "after config.CacheTTL the answer must be gone");
+}
+`,
   },
   debrief: `Retrieval is a database problem before it is a model problem. Keeping the vectors in the same Postgres as the text means one store, one transaction for indexing, and a nearest-neighbour search that is just a query: \`ORDER BY embedding <=> $1 LIMIT k\` lets the planner use a vector index (HNSW or IVFFlat in production) and hands back four rows, not four thousand — the moment the code fetches the table and sorts it in memory, the knowledge base cannot grow. Cosine distance is the right metric for these vectors because they are normalised: direction is meaning, length is just how many words the chunk had; \`<=>\` is 1 − cosine, so ascending distance is descending similarity and \`score = 1 − distance\` reads naturally in a guardrail threshold. The cache is keyed by the question *after* normalisation and hashed, so a capital letter or a double space is not a miss, the key has a bounded length and the Dasher's words never become a Redis key; the value carries the sources with the answer, so a cached reply is as attributable as a fresh one, and the TTL bounds how long a stale article keeps answering. DoorDash's pipeline retrieves more than articles: the conversation is first summarised into an issue, and the top-N *similar past cases* are fetched alongside the knowledge-base segments, so the prompt carries what worked for the same problem before. Production also re-ranks the candidates with a cross-encoder, filters chunks by market and language, versions the index so a re-chunked article invalidates its cache entries, and treats "nothing close enough" as a signal to hand off rather than a reason to guess.`,
 };

@@ -1771,6 +1771,249 @@ func CheckComplete(ctx *harness.Ctx) {
 	stopConsumer(ctx, runDone)
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <condition_variable>
+#include <cstdint>
+#include <initializer_list>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+// ackGates is the harness's handler: every record waits on its own gate, so the harness decides the
+// completion order. Each handler runs on its own thread, so records start in any order.
+struct ackGates {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::set<std::string> opened;
+  std::vector<std::string> started;
+  std::vector<std::string> completed;
+
+  void handler(const std::string& value) {
+    std::unique_lock<std::mutex> lock(mu);
+    started.push_back(value);
+    cv.wait(lock, [&] { return opened.count(value) > 0; });
+    completed.push_back(value);
+  }
+
+  void open(const std::vector<std::string>& values) {
+    std::lock_guard<std::mutex> lock(mu);
+    for (const auto& v : values) opened.insert(v);
+    cv.notify_all();
+  }
+
+  // snapshot is what started and completed so far, each sorted.
+  std::pair<std::vector<std::string>, std::vector<std::string>> snapshot() {
+    std::lock_guard<std::mutex> lock(mu);
+    auto s = started;
+    auto c = completed;
+    std::sort(s.begin(), s.end());
+    std::sort(c.begin(), c.end());
+    return {s, c};
+  }
+
+  int running() {
+    std::lock_guard<std::mutex> lock(mu);
+    return static_cast<int>(started.size() - completed.size());
+  }
+};
+
+std::vector<std::string> seedRequests(harness::Ctx& ctx, int n, int partition, const std::string& prefix) {
+  std::vector<std::string> values;
+  for (int i = 0; i < n; i++) {
+    const std::string value = prefix + std::to_string(i);
+    values.push_back(value);
+    ctx.Kafka.SeedPartition("requests", partition, nullptr, value);
+  }
+  return values;
+}
+
+std::vector<std::string> sortedCopy(std::vector<std::string> values) {
+  std::sort(values.begin(), values.end());
+  return values;
+}
+
+// A thread still running when the check ends (a failed assertion) is left behind, not joined.
+struct detachOnExit {
+  std::thread& thread;
+  ~detachOnExit() {
+    if (thread.joinable()) thread.detach();
+  }
+};
+
+// The learner's loop on a thread of its own, started and settled with the clock held.
+struct consumerRun {
+  std::thread thread;
+  ~consumerRun() {
+    if (thread.joinable()) thread.detach();
+  }
+};
+
+std::unique_ptr<consumerRun> startConsumer(harness::Ctx& ctx, ackGates& g) {
+  auto r = std::make_unique<consumerRun>();
+  r->thread = std::thread([&g] { run([&g](const std::string& value) { g.handler(value); }); });
+  ctx.Tick();
+  return r;
+}
+
+void stopConsumer(harness::Ctx& ctx, consumerRun& r) {
+  ctx.Drain([] { shutdown(); });
+  ctx.Tick();
+  if (!ctx.Drain([&r] { r.thread.join(); })) r.thread.detach();
+  ctx.Assert(!ctx.Kafka.EventsOf("close").empty(), "shutdown() must close the consumer");
+}
+
+// After gates open: every thread runs with the clock held, then the poll loop comes round — its
+// consume(100) times out, it applies the completions and commits — and runs again.
+void passAcks(harness::Ctx& ctx) {
+  ctx.Tick();
+  ctx.Clock.Advance(0.2);
+  ctx.Tick();
+}
+
+}  // namespace
+
+void CheckConcurrency(harness::Ctx& ctx) {
+  const auto values = seedRequests(ctx, 20, 0, "r");
+  ackGates g;
+  auto runDone = startConsumer(ctx, g);
+  ctx.Equal(g.snapshot().first, sortedCopy({values.begin(), values.begin() + 8}),
+            "with every handler still running exactly concurrency = 8 records may be started");
+  ctx.Equal(stats().in_flight, 8, "stats() must count 8 in flight while 8 handlers run");
+  g.open({"r0"});
+  passAcks(ctx);
+  ctx.Equal(g.snapshot().first, sortedCopy({values.begin(), values.begin() + 9}),
+            "one completion frees exactly one slot: the 9th record starts, no more");
+  ctx.Equal(g.running(), 8, "handlers running after one finished and one started");
+  g.open(values);
+  passAcks(ctx);
+  const auto completed = g.snapshot().second;
+  ctx.Assert(g.running() == 0 && completed.size() == 20,
+             "every record must be handled once the gates open: %d of 20 completed, %d running", completed.size(), g.running());
+  stopConsumer(ctx, *runDone);
+  ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, "requests", 0), 20, "with everything finished the committed offset");
+  ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(), "auto-commit is on: offsets were committed on a timer, not by the tracker");
+}
+
+void CheckFrontier(harness::Ctx& ctx) {
+  const auto values = seedRequests(ctx, 12, 0, "r");
+  ackGates g;
+  const auto lowestUnfinished = [&g]() -> int64_t {
+    const auto completed = g.snapshot().second;
+    const std::set<std::string> done(completed.begin(), completed.end());
+    for (int i = 0; i < 12; i++)
+      if (!done.count("r" + std::to_string(i))) return i;
+    return 12;
+  };
+  std::vector<std::pair<int64_t, int64_t>> violations;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) {
+    const auto it = offsets.find({"requests", 0});
+    const int64_t lowest = lowestUnfinished();
+    if (it != offsets.end() && it->second > lowest) violations.emplace_back(it->second, lowest);
+  });
+  auto runDone = startConsumer(ctx, g);
+  for (const std::string value : {"r3", "r1", "r0", "r6", "r5", "r2", "r4", "r9", "r7", "r11", "r8", "r10"}) {
+    g.open({value});
+    passAcks(ctx);
+    if (!violations.empty())
+      ctx.Fatalf("offset %d was committed while offset %d was still running: the commit passed an unfinished record",
+                 violations[0].first, violations[0].second);
+    const int64_t committedNow = ctx.Kafka.CommittedOffset(kGroup, "requests", 0);
+    ctx.Assert(std::max<int64_t>(committedNow, 0) <= lowestUnfinished(), "committed %d but offset %d is still running", committedNow,
+               lowestUnfinished());
+  }
+  ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, "requests", 0), 12, "once every record has finished the committed offset must reach 12");
+  stopConsumer(ctx, *runDone);
+  ctx.Equal(g.snapshot().second, sortedCopy(values), "each record must be handled exactly once");
+}
+
+void CheckGap(harness::Ctx& ctx) {
+  seedRequests(ctx, 5, 0, "a");
+  seedRequests(ctx, 3, 1, "b");
+  ackGates g;
+  auto runDone = startConsumer(ctx, g);
+  g.open({"a1", "a2", "a3", "a4", "b0", "b1", "b2"});
+  passAcks(ctx);
+  ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, "requests", 1), 3, "partition 1 is fully done: it must be committed to 3 while partition 0 waits");
+  const int64_t p0 = ctx.Kafka.CommittedOffset(kGroup, "requests", 0);
+  ctx.Assert(p0 == -1 || p0 == 0, "a0 is still running: partition 0 must not be committed past 0, got %d", p0);
+  ctx.Equal(stats().in_flight, 1, "only a0 should be running: stats() in flight");
+  g.open({"a0"});
+  passAcks(ctx);
+  ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, "requests", 0), 5, "a1..a4 were already done when a0 finished: partition 0 must jump to 5");
+  std::vector<int64_t> onP0;
+  for (const auto& commit : ctx.Kafka.Commits(kGroup)) {
+    const auto it = commit.find({"requests", 0});
+    if (it != commit.end()) onP0.push_back(it->second);
+  }
+  ctx.Equal(onP0, {5}, "partition 0 must be committed exactly once, straight to 5 — never 1, 2, 3 or 4 while a0 ran: its commits");
+  ctx.Equal(stats().committed, std::map<int32_t, int64_t>{{0, 5}, {1, 3}}, "stats() committed");
+  stopConsumer(ctx, *runDone);
+}
+
+void CheckShutdown(harness::Ctx& ctx) {
+  seedRequests(ctx, 6, 0, "r");
+  ackGates g;
+  auto runDone = startConsumer(ctx, g);
+  g.open({"r0", "r1", "r3", "r4", "r5"});
+  passAcks(ctx);
+  ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, "requests", 0), 2, "r2 still runs: the frontier");
+  bool shutDone = false;
+  std::thread shutter([&shutDone] {
+    shutdown();
+    shutDone = true;
+  });
+  detachOnExit shutterGuard{shutter};
+  ctx.Tick();
+  if (shutDone) ctx.Fatalf("shutdown() must wait for the handler still running (r2), not return under it");
+  ctx.Assert(ctx.Kafka.EventsOf("close").empty(), "the consumer was closed while a handler was still running");
+  ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, "requests", 0), 2, "shutdown() must not commit past the frontier while r2 runs");
+  g.open({"r2"});
+  passAcks(ctx);
+  const bool returned = ctx.Drain([&shutter] { shutter.join(); });
+  if (!returned) shutter.detach();
+  ctx.Assert(returned, "shutdown() must return once the last in-flight handler has finished");
+  ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, "requests", 0), 6, "after shutdown the committed offset must equal the contiguous frontier");
+  ctx.Assert(!ctx.Kafka.EventsOf("close").empty(), "shutdown() must close the consumer");
+  ctx.Equal(stats().in_flight, 0, "nothing may be in flight after shutdown: stats() in flight");
+  if (!ctx.Drain([&runDone] { runDone->thread.join(); })) runDone->thread.detach();
+}
+
+void CheckComplete(harness::Ctx& ctx) {
+  std::vector<std::string> values;
+  for (int i = 0; i < 30; i++) {
+    const std::string value = "req-" + std::to_string(i);
+    values.push_back(value);
+    ctx.Kafka.Seed("requests", value, value);
+  }
+  ackGates g;
+  auto runDone = startConsumer(ctx, g);
+  g.open(std::vector<std::string>(values.rbegin(), values.rend()));
+  passAcks(ctx);
+  const auto [started, completed] = g.snapshot();
+  ctx.Equal(started, sortedCopy(values), "each record must reach the handler exactly once");
+  ctx.Equal(completed, sortedCopy(values), "each record must finish exactly once");
+  std::map<int32_t, int64_t> ends;
+  for (int p = 0; p < 3; p++) {
+    const int64_t end = ctx.Kafka.EndOffset("requests", p);
+    if (end > 0) ends[p] = end;
+  }
+  for (const auto& [p, end] : ends)
+    ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, "requests", p), end, "partition %d must be committed to its end %d", p, end);
+  ctx.Equal(ctx.Kafka.Lag(kGroup, "requests"), 0, "nothing may be left uncommitted: lag");
+  const Stats s = stats();
+  ctx.Equal(s.committed, ends, "stats() committed");
+  ctx.Equal(s.in_flight, 0, "stats() in flight");
+  stopConsumer(ctx, *runDone);
+}
+`,
   },
   debrief: `Kafka has no per-record acknowledgement: a partition's committed offset is one number that promises "everything below this is done". Serial consumers keep that promise by construction; the moment handlers overlap, completion order and delivery order part ways, and a consumer that commits \`offset + 1\` whenever something finishes will, sooner or later, commit past a record that is still running — a crash then replays nothing and the record is gone. The tracker turns a set of completions back into that one number: the frontier only moves across finished offsets, so a slow record pins it and the finished offsets above it wait in the set until it clears, then the commit jumps in one step. The bound on in-flight handlers is what keeps that set small and the replay-after-crash window bounded; the shutdown waits so that work already done is committed rather than redone. Real systems add what this drill leaves out: Confluent's Parallel Consumer encodes the finished-above-the-frontier set into the commit metadata so a restart skips what was already done, orders work by key inside a partition, and keeps heartbeating (or pauses partitions) while the loop waits at the limit so the group coordinator does not evict a consumer that is merely busy.`,
 };

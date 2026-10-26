@@ -8,7 +8,7 @@ import {cooldownStep} from './steps/2-cooldown';
 import {placementEventsStep} from './steps/3-placement-events';
 import {tileStreamStep} from './steps/4-tile-stream';
 import {leaderboardStep} from './steps/5-leaderboard';
-import {supportModules, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesTs} from './support';
 
 /**
  * r/place, after Reddit's own write-up of the 2017 experiment: the board as one Redis string served
@@ -112,6 +112,7 @@ whiteboard or map.`,
     python: {...protoModules, ...supportModules},
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles},
+    cpp: {...protoFiles, ...supportModulesCpp},
   },
   learn,
 };

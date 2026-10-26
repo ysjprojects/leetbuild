@@ -914,6 +914,129 @@ func CheckStoreResponse(ctx *harness.Ctx) {
 	ctx.Assert(!held, "when processCheckout fails the key must be released, or every retry gets 409 for a day")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <functional>
+#include <stdexcept>
+
+namespace {
+
+const std::string checkoutReq = R"({"merchant_id":"m-42","amount_cents":4999,"currency":"EUR","card_token":"tok_visa"})";
+
+// idemSeen is what idem:k1 held while process_checkout ran.
+struct idemSeen {
+  std::optional<std::string> value;
+  long long ttl;
+};
+
+std::function<std::string(const std::string&)> processCheckout;
+
+// checkoutRecorder stands in for process_checkout: the bodies it saw, and what idem:k1 held while it ran.
+struct checkoutRecorder {
+  std::vector<harness::Any> calls;
+  std::vector<idemSeen> seen;
+  std::optional<harness::HTTP> http;
+
+  harness::Response post(const std::string& key) {
+    if (key.empty()) return http->Post("/checkout", checkoutReq, "Content-Type", "application/json");
+    return http->Post("/checkout", checkoutReq, "Content-Type", "application/json", "Idempotency-Key", key);
+  }
+};
+
+harness::Any parsed(const std::string& text) {
+  const auto doc = harness::ParseJSON(text);
+  return doc ? *doc : harness::Any(text);
+}
+
+std::unique_ptr<checkoutRecorder> newCheckoutRecorder(harness::Ctx& ctx) {
+  auto rec = std::make_unique<checkoutRecorder>();
+  checkoutRecorder* r = rec.get();
+  processCheckout = [&ctx, r](const std::string& body) {
+    r->calls.push_back(parsed(body));
+    r->seen.push_back(idemSeen{ctx.Redis.Get("idem:k1"), ctx.Redis.TTL("idem:k1")});
+    return R"({"order_id":"o-)" + std::to_string(r->calls.size()) + R"(","status":"captured"})";
+  };
+  rec->http = ctx.Main().HTTP();
+  return rec;
+}
+
+}  // namespace
+
+// The later steps' process_checkout, stood in for by the check (Go's harness reassigns processCheckout).
+std::string process_checkout(const std::string& body) { return processCheckout(body); }
+
+void CheckHeaderRequired(harness::Ctx& ctx) {
+  auto rec = newCheckoutRecorder(ctx);
+  auto r = rec->post("");
+  ctx.Equal(r.Status, 400, "POST /checkout without Idempotency-Key");
+  ctx.Equal(rec->calls.size(), 0, "a request without a key must not reach processCheckout");
+  r = rec->post("k1");
+  ctx.Equal(r.Status, 201, "POST /checkout with a fresh key");
+  ctx.Equal(rec->calls, std::vector<harness::Any>{parsed(checkoutReq)}, "processCheckout must run once with the request body");
+}
+
+void CheckReserveNx(harness::Ctx& ctx) {
+  auto rec = newCheckoutRecorder(ctx);
+  auto r = rec->post("k1");
+  ctx.Equal(r.Status, 201, "POST /checkout with a fresh key");
+  ctx.Assert(!rec->seen.empty(), "processCheckout did not run");
+  const idemSeen seen = rec->seen[0];
+  ctx.Equal(seen.value, "processing", "while processCheckout ran idem:k1 must hold the processing reservation");
+  ctx.Assert(86000 <= seen.ttl && seen.ttl <= 86400, "the reservation TTL was %d, expected 86400 s", seen.ttl);
+  ctx.Redis.Set("idem:k2", "processing");
+  r = rec->post("k2");
+  ctx.Assert(r.Status != 201, "a key already reserved by another request was claimed again: the SET must be NX");
+  ctx.Equal(rec->calls.size(), 1, "a key already reserved must not run processCheckout a second time");
+  // A concurrent retry with the same key lands right after the first command that touches idem:k3.
+  bool claimedByRetry = false;
+  ctx.Redis.After("idem:k3", [&] { claimedByRetry = ctx.Redis.Set("idem:k3", "processing", "NX"); });
+  r = rec->post("k3");
+  if (claimedByRetry) {
+    ctx.Assert(r.Status != 201, "a retry claimed idem:k3 between your read and your write and both charged: the reservation must be one atomic SetNX");
+    ctx.Equal(rec->calls.size(), 1, "a retry claimed idem:k3 between your read and your write and both ran processCheckout: the reservation must be one atomic SetNX");
+  } else {
+    ctx.Equal(r.Status, 201, "the request that won the SetNX");
+  }
+}
+
+void CheckInFlight(harness::Ctx& ctx) {
+  auto rec = newCheckoutRecorder(ctx);
+  ctx.Redis.Set("idem:k1", "processing", "EX", 86400);
+  const auto r = rec->post("k1");
+  ctx.Equal(r.Status, 409, "a key whose first request is still processing");
+  ctx.Equal(rec->calls.size(), 0, "the in-flight key must not run processCheckout again");
+  ctx.Equal(ctx.Redis.Get("idem:k1").value_or(""), "processing", "the 409 must leave the running request's reservation in place");
+}
+
+void CheckReplay(harness::Ctx& ctx) {
+  auto rec = newCheckoutRecorder(ctx);
+  const auto first = rec->post("k1");
+  ctx.Equal(first.Status, 201, "the first request");
+  const auto again = rec->post("k1");
+  const auto other = rec->post("k2");
+  ctx.Equal(again.Status, 200, "the retry with the same key");
+  ctx.Equal(again.Text(), first.Text(), "the replay must return the same body");
+  ctx.Equal(parsed(again.Text())["order_id"].String(), "o-1", "the replayed document must be the first response, not a fresh one");
+  ctx.Assert(rec->calls.size() == 2 && other.Status == 201, "the retry must not charge again; a different key is a new order");
+}
+
+void CheckStoreResponse(harness::Ctx& ctx) {
+  auto rec = newCheckoutRecorder(ctx);
+  auto r = rec->post("k1");
+  ctx.Equal(r.Status, 201, "POST /checkout with a fresh key");
+  const auto stored = ctx.Redis.Get("idem:k1");
+  ctx.Assert(stored && *stored != "processing", "after the response idem:k1 holds %q, expected the JSON response", stored.value_or(""));
+  const auto storedDoc = harness::ParseJSON(*stored);
+  if (!storedDoc) ctx.Fatalf("idem:k1 must hold the JSON response, it holds %q", *stored);
+  ctx.Equal(*storedDoc, parsed(r.Text()), "the stored document must be the response body");
+  const long long ttl = ctx.Redis.TTL("idem:k1");
+  ctx.Assert(86000 <= ttl && ttl <= 86400, "the stored response has TTL %d, expected 86400 s (same as the reservation)", ttl);
+  processCheckout = [](const std::string&) -> std::string { throw std::runtime_error("provider down"); };
+  r = rec->post("k3");
+  ctx.Assert(r.Status >= 500, "a failing processCheckout answered %d", r.Status);
+  ctx.Assert(!ctx.Redis.Get("idem:k3").has_value(), "when processCheckout fails the key must be released, or every retry gets 409 for a day");
+}
+`,
   },
   debrief: `The idempotency key turns "at least once" from the network into "exactly once" at the API: the atomic \`SET NX EX\` is both the check and the claim, the stored body makes the replay byte-identical, and the TTL bounds how long the promise is kept. Stripe's implementation adds a fingerprint of the request body (same key, different body → 422), scopes keys per API key, and stores the response even when it was an error so a retry does not accidentally succeed.`,
 };

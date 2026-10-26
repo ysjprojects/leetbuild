@@ -1039,6 +1039,167 @@ func CheckRetryable(ctx *harness.Ctx) {
 	ctx.Equal(devices.Disabled, []string(nil), "only INVALID_ARGUMENT / NOT_FOUND disable the token: devices.Disabled")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <cmath>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace {
+
+// The push gateway: it answers every token but "stale" (NOT_FOUND) and counts the calls that reached it.
+class PushPeer final : public notify::PushGateway::Service {
+ public:
+  grpc::Status Send(grpc::ServerContext*, const notify::SendRequest* req, notify::SendReply* reply) override {
+    std::lock_guard<std::mutex> lock(mu);
+    calls++;
+    if (req->device_token() == "stale") return grpc::Status(grpc::StatusCode::NOT_FOUND, "unregistered device token");
+    reply->set_message_id("m-" + req->device_token() + "-" + std::to_string(calls));
+    return grpc::Status::OK;
+  }
+  std::mutex mu;
+  int calls = 0;
+};
+
+PushPeer& servePushPeer(harness::Ctx& ctx) {
+  static PushPeer peer;
+  ctx.GRPC.Server("")->RegisterService(&peer);
+  return peer;
+}
+
+// How send_push ended: its result, or what it threw (retryable: a Retryable).
+struct PushResult {
+  std::optional<std::string> id;
+  std::string error;
+  bool retryable = false;
+  bool failed() const { return !error.empty(); }
+};
+
+PushResult pushSend(const std::string& token) {
+  try {
+    return {send_push(token, "Shipped", "On its way", "order-1"), "", false};
+  } catch (const Retryable& e) {
+    return {std::nullopt, std::string("Retryable: ") + e.what(), true};
+  } catch (const std::exception& e) {
+    return {std::nullopt, harness::CurrentExceptionType() + ": " + e.what(), false};
+  }
+}
+
+// One send_push that first met injected failures: its result, the virtual seconds it took and the sleeps it took.
+struct PushWait {
+  std::optional<std::string> result;
+  double seconds = 0;
+  int sleeps = 0;
+};
+
+PushWait pushWaited(harness::Ctx& ctx, grpc::StatusCode code, int times) {
+  ctx.GRPC.Fail("Send", code, "", times, "");
+  const int64_t started = ctx.Clock.Now();
+  const int sleeps = ctx.Clock.Sleeps();
+  const PushResult r = pushSend("tok-1");
+  ctx.Assert(!r.failed(), "send_push after %d %v threw %s", times, code, r.error);
+  return {r.id, std::round(static_cast<double>(ctx.Clock.Now() - started) / 1000 * 1e6) / 1e6, ctx.Clock.Sleeps() - sleeps};
+}
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  servePushPeer(ctx);
+  PushResult r = pushSend("tok-1");
+  ctx.Assert(!r.failed(), "send_push threw %s", r.error);
+  ctx.Equal(r.id, "m-tok-1-1", "send_push must return the gateway's message_id");
+  ctx.GRPC.Fail("Send", grpc::StatusCode::UNAVAILABLE, "", 1, "");
+  r = pushSend("tok-1");
+  ctx.Assert(!r.failed(), "one UNAVAILABLE must be retried and succeed, send_push threw %s", r.error);
+  ctx.Equal(r.id, "m-tok-1-2", "one UNAVAILABLE must be retried and succeed");
+  const auto calls = ctx.GRPC.CallsTo("Send", "");
+  ctx.Equal(calls.size(), 3, "expected 3 calls (one success, one failure, one retry)");
+  for (const auto& call : calls) {
+    ctx.Assert(call.HasDeadline(), "an RPC carries no deadline");
+    const double timeout = call.TimeoutSeconds();
+    ctx.Assert(2.5 <= timeout && timeout <= 3.0, "every call must carry a deadline of about 3 s, got %v s", timeout);
+  }
+  ctx.Assert(calls[0].HasRequest(), "the call carried no SendRequest");
+  const auto request = calls[0].Request<notify::SendRequest>();
+  ctx.Equal(std::vector<std::string>{request.device_token(), request.title(), request.body(), request.collapse_key()},
+            {"tok-1", "Shipped", "On its way", "order-1"}, "the request must carry token, title, body and collapse_key");
+}
+
+void CheckBackoff(harness::Ctx& ctx) {
+  servePushPeer(ctx);
+  const PushWait one = pushWaited(ctx, grpc::StatusCode::UNAVAILABLE, 1);
+  ctx.Equal(one.result, "m-tok-1-1", "one UNAVAILABLE must be retried and succeed");
+  ctx.Equal(one.sleeps, 1, "expected one backoff sleep between the two attempts: sleeps");
+  ctx.Assert(0.2 <= one.seconds && one.seconds <= 0.45, "the first backoff must be about 200 ms plus jitter, it was %v s",
+             one.seconds);
+  const PushWait two = pushWaited(ctx, grpc::StatusCode::RESOURCE_EXHAUSTED, 2);
+  ctx.Equal(two.result, "m-tok-1-2", "two RESOURCE_EXHAUSTED must be retried and the third attempt succeed");
+  ctx.Equal(two.sleeps, 2, "expected two backoff sleeps before the third attempt: sleeps");
+  ctx.Assert(0.6 <= two.seconds && two.seconds <= 1.05,
+             "the two backoffs must be about 200 + 400 ms plus jitter, together they were %v s", two.seconds);
+  std::set<double> seen = {one.seconds};
+  for (int i = 0; i < 6; i++) seen.insert(pushWaited(ctx, grpc::StatusCode::UNAVAILABLE, 1).seconds);
+  ctx.Assert(seen.size() > 1, "every first backoff lasted exactly %v s: add jitter so retries do not synchronise", one.seconds);
+}
+
+void CheckBounded(harness::Ctx& ctx) {
+  PushPeer& peer = servePushPeer(ctx);
+  ctx.GRPC.Fail("Send", grpc::StatusCode::UNAVAILABLE, "", 50, "");
+  const PushResult r = pushSend("tok-1");
+  ctx.Assert(r.failed(), "a gateway that stays UNAVAILABLE must throw Retryable, send_push returned normally");
+  ctx.Assert(r.retryable, "a gateway that stays UNAVAILABLE must throw Retryable, send_push threw %s", r.error);
+  ctx.Equal(ctx.GRPC.CallsTo("Send", "").size(), 3, "attempts against a down gateway");
+  ctx.Equal(peer.calls, 0, "no attempt reached the gateway (every one was UNAVAILABLE): calls the gateway answered");
+}
+
+void CheckStaleToken(harness::Ctx& ctx) {
+  servePushPeer(ctx);
+  PushResult r = pushSend("stale");
+  ctx.Assert(!r.failed(), "NOT_FOUND means the token is unregistered: send_push must not throw, it threw %s", r.error);
+  ctx.Equal(r.id, nullptr, "NOT_FOUND means the token is unregistered: the message id");
+  ctx.Equal(devices::disabled, {"stale"}, "the stale token must be disabled: devices::disabled");
+  ctx.Equal(ctx.GRPC.CallsTo("Send", "").size(), 1, "NOT_FOUND must not be retried: calls to Send");
+  ctx.GRPC.Fail("Send", grpc::StatusCode::INVALID_ARGUMENT, "malformed token", 1, "");
+  r = pushSend("bad");
+  ctx.Assert(!r.failed(), "INVALID_ARGUMENT means the token is bad: send_push must not throw, it threw %s", r.error);
+  ctx.Equal(r.id, nullptr, "INVALID_ARGUMENT means the token is bad: the message id");
+  ctx.Equal(devices::disabled, {"stale", "bad"}, "the bad token must be disabled: devices::disabled");
+  ctx.Equal(ctx.GRPC.CallsTo("Send", "").size(), 2, "INVALID_ARGUMENT must not be retried: calls to Send");
+  ctx.Equal(ctx.Clock.Sleeps(), 0, "a stale token must not wait for a backoff: sleeps");
+}
+
+void CheckRetryable(harness::Ctx& ctx) {
+  servePushPeer(ctx);
+  ctx.GRPC.SetLatency("Send", 5.0, "");
+  const PushResult slow = pushSend("tok-1");
+  ctx.Assert(slow.failed(), "a gateway slower than the deadline must throw Retryable, send_push returned normally");
+  ctx.Assert(slow.retryable, "a gateway slower than the deadline must throw Retryable, send_push threw %s", slow.error);
+  ctx.Equal(ctx.GRPC.CallsTo("Send", "").size(), 1,
+            "DEADLINE_EXCEEDED must not be retried (the consumer re-queues the record instead): calls to Send");
+  ctx.GRPC.SetLatency("Send", 0.0, "");
+  ctx.GRPC.Fail("Send", grpc::StatusCode::RESOURCE_EXHAUSTED, "", 3, "");
+  const PushResult exhausted = pushSend("tok-1");
+  ctx.Assert(exhausted.failed(), "exhausted retries must throw Retryable, send_push returned normally");
+  ctx.Assert(exhausted.retryable, "exhausted retries must throw Retryable, send_push threw %s", exhausted.error);
+  ctx.GRPC.Fail("Send", grpc::StatusCode::PERMISSION_DENIED, "bad credentials", 1, "");
+  const PushResult denied = pushSend("tok-1");
+  ctx.Assert(denied.failed(), "PERMISSION_DENIED must propagate as an exception, send_push returned normally");
+  // Go also reads the status code off the error; the C++ step throws a plain std::runtime_error
+  // carrying the status message, so the check reads the message.
+  ctx.Assert(!denied.retryable,
+             "PERMISSION_DENIED is not transient: it must propagate as a plain error, not Retryable (%s)", denied.error);
+  ctx.Assert(denied.error.find("bad credentials") != std::string::npos,
+             "PERMISSION_DENIED must propagate with the gateway's message (bad credentials), send_push threw %s",
+             denied.error);
+  ctx.Equal(devices::disabled, std::vector<std::string>{},
+            "only INVALID_ARGUMENT / NOT_FOUND disable the token: devices::disabled");
+}
+`,
   },
   debrief: `Three decisions make a provider call safe to put inside a consumer: a deadline, so one stuck call cannot hold a partition; retries only for the statuses that mean "not right now", with backoff and jitter so a provider recovering from an outage is not hit by every worker at once; and a distinct retryable error, so the caller can park the work instead of blocking on it. Disabling a stale token on the spot is what keeps the gateway's error rate honest. Real clients also honour \`Retry-After\` metadata from the gateway, use a circuit breaker when the error rate stays high, and collapse duplicate notifications with the \`collapse_key\` on the device.`,
 };

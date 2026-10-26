@@ -11,7 +11,7 @@ import {type Badge, badgeOf, dayKey, earnedBadges, streakOf} from '@/lib/gamify'
 import {type Verdict, exampleCheck, judge, narrow, withRuntime} from '@/lib/judge';
 import {type ProvidedFile, isProvidedId, providedFiles, providedId, providedPath} from '@/lib/provided';
 import {stepIssueUrl} from '@/lib/report';
-import {type RuntimeStatus, getRunner} from '@/lib/runtime/client';
+import {type RuntimeStatus, getRunner, runtimeHarness} from '@/lib/runtime/client';
 import type {OutputLine, RunJob} from '@/lib/runtime/types';
 import {
   type StepAttempt,
@@ -1106,7 +1106,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
 
   // A step that runs in the browser boots the runtime as soon as it opens, so Submit does not wait for the download.
   useEffect(() => {
-    if (loaded && (step?.harness?.[language] !== undefined || program)) runner?.prewarm();
+    if (loaded && step !== null && (runtimeHarness(step, language) !== undefined || program)) runner?.prewarm();
   }, [loaded, step, language, runner, program]);
 
   /** Record a decided verdict: the attempt, the submission history (with the code judged), the score, the celebration. */
@@ -1197,7 +1197,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
     const result = judge(step, language, src);
     setVerdictCode(src);
     const token = ++submitSeq.current;
-    const harness = step.harness?.[language];
+    const harness = runtimeHarness(step, language);
     if (harness === undefined) {
       setVerdict(result);
       setReference(null);
@@ -1230,7 +1230,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
   /** Run: execute the example check only and show what happened; no attempt, history or score is touched. */
   const trial = useCallback(() => {
     if (problem === null || step === null || running) return;
-    const harness = step.harness?.[language];
+    const harness = runtimeHarness(step, language);
     if (harness === undefined || runner === null) return;
     const src = filesRef.current[step.id] ?? codeFor(step, language).starter;
     const example = exampleCheck(step);
@@ -1281,7 +1281,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
    */
   const compare = useCallback(() => {
     if (problem === null || step === null || running || comparing) return;
-    const harness = step.harness?.[language];
+    const harness = runtimeHarness(step, language);
     if (harness === undefined || runner === null) return;
     const solution = codeFor(step, language).solution;
     const job = assemble(
@@ -1751,7 +1751,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                       type="button">
                       reset
                     </button>
-                    {step.harness?.[language] !== undefined || program ? (
+                    {runtimeHarness(step, language) !== undefined || program ? (
                       <button
                         className="border-ink-600 text-ink-200 hover:border-iris-400/60 hover:text-ink-50 rounded-lg border px-2.5 py-[3px] text-[12px] font-semibold transition disabled:cursor-wait disabled:opacity-60"
                         disabled={running || comparing}
@@ -1825,7 +1825,7 @@ const LeetBuildPlayground: FC<{problemId: string | null; stepId: string | null}>
                   comparing={comparing}
                   consoleRun={consoleRun}
                   earned={earned}
-                  executes={step.harness?.[language] !== undefined}
+                  executes={runtimeHarness(step, language) !== undefined}
                   issueUrl={issueUrl}
                   language={language}
                   nextTitle={problem.steps[stepIndex + 1]?.title}

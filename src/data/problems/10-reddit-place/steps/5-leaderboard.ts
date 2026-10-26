@@ -1027,7 +1027,7 @@ int main() {
     const int y = req.has_param("y") ? std::stoi(req.get_param_value("y")) : -1;
     if (x < 0 || x >= kSize || y < 0 || y >= kSize) {
       res.status = 400;
-      res.set_content(R"({"error":"x and y must be in [0, kSize)"})", "application/json");
+      res.set_content(R"re({"error":"x and y must be in [0, kSize)"})re", "application/json");
       return;
     }
     std::vector<std::string> items;
@@ -1430,6 +1430,186 @@ func CheckEndpoints(ctx *harness.Ctx) {
 		r = api.Get("/history?" + bad)
 		ctx.Equal(r.Status, 400, "GET /history?%s", bad)
 	}
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+namespace {
+
+constexpr int64_t ldTS = 1700000000000LL;
+const std::string ldLeaders = "place:leaders";
+
+// ldTile is one placement to seed: user on (x, y) with color.
+struct ldTile {
+  std::string user;
+  int x, y, color;
+};
+
+// ldSeed puts placements on the topic as step 3's producer does.
+void ldSeed(harness::Ctx& ctx, const std::vector<ldTile>& tiles) {
+  for (size_t i = 0; i < tiles.size(); i++) {
+    const auto& t = tiles[i];
+    const nlohmann::json value = {{"user", t.user}, {"x", t.x}, {"y", t.y}, {"color", t.color}, {"ts", ldTS + static_cast<int64_t>(i)}};
+    ctx.Kafka.Seed("placements", std::to_string(t.x) + ":" + std::to_string(t.y), value.dump());
+  }
+}
+
+ldTile ldAt37(const std::string& user) { return {user, 3, 7, 12}; }
+
+// ldRun runs the worker until it returns or waits for records that will not come; what it threw
+// (Go's run returns an error; the C++ worker's failure is an exception escaping run).
+std::optional<std::string> ldRun(harness::Ctx& ctx) {
+  // The worker polls with consume(1000): a few idle seconds, then it counts as waiting (Go's reader
+  // blocks without a clock).
+  ctx.Clock.SetSleepLimit(ctx.Clock.Sleeps() + 5);
+  std::optional<std::string> err;
+  ctx.Drain([&err] {
+    try {
+      run();
+    } catch (const std::exception& e) {
+      err = e.what();
+    }
+  });
+  return err;
+}
+
+void ldNoError(harness::Ctx& ctx, const std::optional<std::string>& err, const char* what) {
+  if (err) ctx.Fatalf("%s: %s", what, *err);
+}
+
+std::vector<std::string> ldUsers(harness::Ctx& ctx, const std::vector<std::string>& items) {
+  std::vector<std::string> users;
+  for (const auto& item : items) {
+    const auto e = nlohmann::json::parse(item, nullptr, false);
+    ctx.Assert(e.is_object(), "a history entry is not JSON: %q", item);
+    users.push_back(e.value("user", ""));
+  }
+  return users;
+}
+
+}  // namespace
+
+void CheckConsumer(harness::Ctx& ctx) {
+  ldSeed(ctx, {ldAt37("ana"), {"bo", 4, 7, 5}});
+  const auto bo = ctx.Kafka.Records("placements")[1];
+  ctx.Redis.Set("history:4:7", "corrupt");  // bo's pixel: the worker's write fails while it handles her tile
+  ldRun(ctx);                               // the worker died on bo's placement
+  // The process is stopped (deploy, SIGTERM): its consumer leaves the group.
+  consumer->close();
+  const int64_t committed = ctx.Kafka.CommittedOffset("leaderboard", "placements", bo.Partition);
+  ctx.Assert(committed == -1 || committed <= bo.Offset, "bo's placement never reached her pixel's history, yet group leaderboard committed past it (offset %d) by the time the worker stopped: offsets were acknowledged for what was delivered, not for what was processed. Consume, write, then commit", committed);
+  ctx.Redis.Del("history:4:7");  // the fault is repaired and the worker restarts
+  consumer = make_consumer();
+  ldNoError(ctx, ldRun(ctx), "run threw after the restart");
+  const auto history = ctx.Redis.LRange("history:4:7", 0, -1);
+  ctx.Assert(!history.empty() && ldUsers(ctx, history)[0] == "bo", "after the restart bo's placement must be replayed into history:4:7, which holds %v: it was lost", history);
+  const int64_t lag = ctx.Kafka.Lag("leaderboard", "placements");
+  ctx.Assert(lag == 0, "group leaderboard on placements has %d uncommitted record(s) after the worker processed everything: commit each record once it is counted", lag);
+}
+
+void CheckZincrby(harness::Ctx& ctx) {
+  ldSeed(ctx, {ldAt37("ana"), ldAt37("bo"), {"ana", 4, 7, 1}, {"ana", 5, 7, 2}, {"cy", 0, 0, 15}});
+  ldNoError(ctx, ldRun(ctx), "run threw");
+  ctx.Equal(ctx.Redis.Type(ldLeaders), "zset", "%s must be a sorted set (keys: %v): its type", ldLeaders, ctx.Redis.Keys("*"));
+  for (const auto& [user, tiles] : std::vector<std::pair<std::string, int>>{{"ana", 3}, {"bo", 1}, {"cy", 1}}) {
+    const double score = ctx.Redis.ZScore(ldLeaders, user).value_or(0);
+    ctx.Equal(score, tiles, "%s's score in %s", user, ldLeaders);
+  }
+}
+
+void CheckHistoryCapped(harness::Ctx& ctx) {
+  std::vector<ldTile> tiles;
+  for (int i = 0; i < 12; i++) tiles.push_back({harness::Sprintf("u%02d", i), 3, 7, i % 16});
+  tiles.push_back({"zed", 4, 7, 5});
+  ldSeed(ctx, tiles);
+  ldNoError(ctx, ldRun(ctx), "run threw");
+  const std::string key = history_key(3, 7);
+  ctx.Equal(key, "history:3:7", "history_key(3, 7)");
+  ctx.Equal(ctx.Redis.Type(key), "list", "%s must be a list (keys: %v): its type", key, ctx.Redis.Keys("*"));
+  const auto items = ctx.Redis.LRange(key, 0, -1);
+  ctx.Assert(items.size() == 10, "%s holds %d entries after 12 placements, expected kHistoryLen = 10 (LPUSH + LTRIM 0 9)", key, items.size());
+  std::vector<std::string> want;
+  for (int i = 11; i > 1; i--) want.push_back(harness::Sprintf("u%02d", i));
+  ctx.Equal(ldUsers(ctx, items), want, "the list must be newest first and keep the last 10: its users");
+  const auto first = nlohmann::json::parse(items[0], nullptr, false);
+  ctx.Assert(first.is_object(), "a history entry is not JSON");
+  ctx.Assert(first.value("color", -1) == 11 && first.value("ts", int64_t{0}) == ldTS + 11, "each entry carries user, color and ts: %s", items[0]);
+  const auto other = ctx.Redis.LRange("history:4:7", 0, -1);
+  ctx.Assert(!other.empty() && ldUsers(ctx, other)[0] == "zed", "every pixel has its own list");
+}
+
+void CheckCommitAfter(harness::Ctx& ctx) {
+  ldSeed(ctx, {ldAt37("ana")});
+  ctx.Kafka.Seed("placements", "bad", "not json");
+  ctx.Kafka.Seed("placements", "bad", R"({"user":"ghost"})");
+  const auto placement = ctx.Kafka.Records("placements")[0];
+  struct snapshot {
+    harness::KafkaOffsets offsets;
+    std::optional<double> score;
+    long long history;
+  };
+  std::vector<snapshot> atCommit;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) {
+    atCommit.push_back({offsets, ctx.Redis.ZScore(ldLeaders, "ana"), ctx.Redis.LLen("history:3:7")});
+  });
+  ldNoError(ctx, ldRun(ctx), "run threw");
+  ctx.Assert(!atCommit.empty(), "no offset was ever committed");
+  std::vector<snapshot> covering;
+  for (const auto& s : atCommit) {
+    const auto it = s.offsets.find({"placements", placement.Partition});
+    if (it != s.offsets.end() && it->second > placement.Offset) covering.push_back(s);
+  }
+  ctx.Assert(!covering.empty(), "ana's placement was never committed");
+  const auto& c = covering[0];
+  ctx.Assert(c.score && *c.score == 1 && c.history == 1, "the commit must come after ZINCRBY and LPUSH: when ana's placement was committed the score was %v (present: %v) and the history held %d entries", c.score.value_or(0), c.score.has_value(), c.history);
+  ctx.Equal(ctx.Kafka.Lag("leaderboard", "placements"), 0, "malformed records must be skipped and committed, not left to replay forever: the lag");
+  ctx.Assert(ctx.Redis.ZCard(ldLeaders) == 1, "malformed records must not be counted: %v", ctx.Redis.ZRangeWithScores(ldLeaders, 0, -1));
+}
+
+void CheckEndpoints(harness::Ctx& ctx) {
+  std::vector<std::string> args = {"ZADD", ldLeaders};
+  for (int i = 0; i < 12; i++) {
+    args.push_back(std::to_string(100 - i));
+    args.push_back(harness::Sprintf("user%02d", i));
+  }
+  ctx.Redis.Must(args);
+  for (int i = 0; i < 3; i++) {
+    const nlohmann::json entry = {{"user", "u" + std::to_string(i)}, {"color", i}, {"ts", ldTS + i}};
+    ctx.Redis.Do("LPUSH", "history:3:7", entry.dump());
+  }
+  auto api = ctx.Main().HTTP();
+  auto r = api.Get("/top");
+  ctx.Equal(r.Status, 200, "GET /top");
+  auto rows = nlohmann::json::parse(r.Text(), nullptr, false);
+  ctx.Assert(rows.is_array() && rows.size() == 10, "expected the 10 top users, got %s", r.Text());
+  nlohmann::json users = nlohmann::json::array(), tiles = nlohmann::json::array();
+  nlohmann::json wantUsers = nlohmann::json::array(), wantTiles = nlohmann::json::array();
+  for (size_t i = 0; i < rows.size(); i++) {
+    users.push_back(rows[i].value("user", nlohmann::json()));
+    tiles.push_back(rows[i].value("tiles", nlohmann::json()));
+    wantUsers.push_back(harness::Sprintf("user%02d", i));
+    wantTiles.push_back(100 - static_cast<int>(i));
+  }
+  ctx.Equal(users, wantUsers, "rows must be in descending score order: their users");
+  ctx.Equal(tiles, wantTiles, "each row carries the tile count as %q", "tiles");
+  r = api.Get("/history?x=3&y=7");
+  ctx.Equal(r.Status, 200, "GET /history?x=3&y=7");
+  const auto entries = nlohmann::json::parse(r.Text(), nullptr, false);
+  ctx.Assert(entries.is_array() && !entries.empty(), "history must be newest first with user, color and ts (%s)", r.Text());
+  nlohmann::json got = nlohmann::json::array();
+  for (const auto& e : entries) got.push_back(e.value("user", nlohmann::json()));
+  ctx.Equal(got, nlohmann::json{"u2", "u1", "u0"}, "history must be newest first with user, color and ts (%s): its users", r.Text());
+  ctx.Equal(entries[0], nlohmann::json{{"user", "u2"}, {"color", 2}, {"ts", ldTS + 2}}, "each entry is the stored document");
+  r = api.Get("/history?x=0&y=0");
+  ctx.Assert(r.Status == 200, "a pixel nobody painted has an empty history, got %d %s", r.Status, r.Text());
+  const auto empty = nlohmann::json::parse(r.Text(), nullptr, false);
+  ctx.Assert(empty.is_array() && empty.empty(), "a pixel nobody painted has an empty history, got %d %s", r.Status, r.Text());
+  for (const std::string bad : {std::string("x=-1&y=0"), "x=0&y=" + std::to_string(kSize), "x=" + std::to_string(kSize) + "&y=0"}) {
+    r = api.Get("/history?" + bad);
+    ctx.Equal(r.Status, 400, "GET /history?%s", bad);
+  }
 }
 `,
   },

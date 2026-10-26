@@ -110,7 +110,7 @@ Implement \`add_count(ns, name, delta)\`, \`get_count(ns, name)\` and \`clear_co
           none: [/\.Expire\(\s*ctx\s*,\s*\w+\s*,\s*ttl\s*\)/],
         },
         scala: {all: [/\.pipelined\(\)/, /\.sync\(\)/], none: [/\.expire\(\s*\w+\s*,\s*TtlSeconds\s*\)/]},
-        cpp: {all: [/\.pipeline\(/, /\.exec\(\)/], none: [/\.expire\(\s*\w+\s*,\s*kTtl\s*\)/]},
+        cpp: {all: [/\.(pipeline|transaction)\(/, /\.exec\(\)/], none: [/\.expire\(\s*\w+\s*,\s*kTtl\s*\)/]},
       },
     },
     {
@@ -394,7 +394,7 @@ std::string key_of(const std::string& ns, const std::string& name) {
 
 long long add_count(const std::string& ns, const std::string& name, long long delta) {
   const std::string key = key_of(ns, name);
-  // TODO: one pipeline: set(key, "0", kTtl, UpdateType::NOT_EXIST), then incrby(key, delta); exec and return the incrby reply
+  // TODO: one MULTI/EXEC pipeline (redis.transaction()): set(key, "0", kTtl, UpdateType::NOT_EXIST), then incrby(key, delta); exec and return the incrby reply
   // TODO: never expire on every add: the TTL is armed once, when the key is created
   return 0;
 }
@@ -423,7 +423,7 @@ std::string key_of(const std::string& ns, const std::string& name) {
 
 long long add_count(const std::string& ns, const std::string& name, long long delta) {
   const std::string key = key_of(ns, name);
-  auto pipe = redis.pipeline();
+  auto pipe = redis.transaction();  // MULTI/EXEC: one round trip, nothing lands between the two commands
   // The SET arms the TTL on the add that creates the key and is a no-op afterwards.
   auto replies = pipe.set(key, "0", kTtl, sw::redis::UpdateType::NOT_EXIST).incrby(key, delta).exec();
   return replies.get<long long>(1);
@@ -668,6 +668,103 @@ func CheckGetClear(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Redis.Exists(beKey), 0, "clearCount must DEL %s: EXISTS", beKey)
 	ctx.Equal(beGet(ctx, "trailer-7"), 0, "a cleared counter reads as 0")
 	ctx.NoError(clearCount(beBg, "views", "never-existed"), "clearing an unknown counter is not an error")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+namespace {
+
+const std::string beKey = "counter:views:trailer-7";
+
+long long beAdd(harness::Ctx& ctx, const std::string& name, long long delta) {
+  try {
+    return add_count("views", name, delta);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("add_count(%q, %q, %d) threw: %s", "views", name, delta, e.what());
+  }
+}
+
+long long beGet(harness::Ctx& ctx, const std::string& name) {
+  try {
+    return get_count("views", name);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("get_count(%q, %q) threw: %s", "views", name, e.what());
+  }
+}
+
+void beClear(harness::Ctx& ctx, const std::string& name, const char* what) {
+  try {
+    clear_count("views", name);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("%s: %s", what, e.what());
+  }
+}
+
+// beValue is the key's string value, or nullopt when it is missing.
+std::optional<std::string> beValue(harness::Ctx& ctx, const std::string& key) { return ctx.Redis.Get(key); }
+
+}  // namespace
+
+void CheckKey(harness::Ctx& ctx) {
+  ctx.Equal(beAdd(ctx, "trailer-7", 3), 3, "the first add of 3 must return 3");
+  ctx.Assert(beValue(ctx, beKey) == "3", "the counter must live under %s, keys are %q", beKey, ctx.Redis.Keys("*"));
+  beAdd(ctx, "trailer-8", 1);
+  ctx.Assert(beValue(ctx, "counter:views:trailer-8") == "1" && beValue(ctx, beKey) == "3", "each counter has its own key");
+}
+
+void CheckIncrby(harness::Ctx& ctx) {
+  ctx.Equal(beAdd(ctx, "trailer-7", 3), 3, "the first add of 3");
+  ctx.Equal(beAdd(ctx, "trailer-7", 4), 7, "the second add returns the running count 7");
+  ctx.Equal(beAdd(ctx, "trailer-7", -2), 5, "a negative delta decrements: expected 5");
+  ctx.Equal(beValue(ctx, beKey), "5", "after +3 +4 -2 the key holds 5");
+}
+
+void CheckTtlOnCreate(harness::Ctx& ctx) {
+  beAdd(ctx, "trailer-7", 1);
+  const long long ttl = ctx.Redis.TTL(beKey);
+  ctx.Assert(ttl > 0, "%s has no expiry (TTL %d): a best-effort counter must leave the cache on its own", beKey, ttl);
+  ctx.Assert(3600 - 5 <= ttl && ttl <= 3600, "%s expires in %d s, expected kTtl (an hour, 3600 s)", beKey, ttl);
+  ctx.Clock.Advance(3601);
+  ctx.Equal(ctx.Redis.Exists(beKey), 0, "%s must be gone after kTtl: EXISTS", beKey);
+  ctx.Equal(beGet(ctx, "trailer-7"), 0, "an expired counter reads as 0");
+  ctx.Equal(beAdd(ctx, "trailer-7", 2), 2, "an add after expiry starts a fresh counter at the delta");
+  const long long fresh = ctx.Redis.TTL(beKey);
+  ctx.Assert(3600 - 5 <= fresh && fresh <= 3600, "the fresh counter gets a fresh TTL, got %d s", fresh);
+}
+
+void CheckPipelined(harness::Ctx& ctx) {
+  beAdd(ctx, "trailer-7", 1);
+  ctx.Clock.Advance(1200);
+  beAdd(ctx, "trailer-7", 1);
+  long long ttl = ctx.Redis.TTL(beKey);
+  ctx.Assert(ttl <= 3600 - 1200 + 5, "20 minutes after creation a second add left the TTL at %d s: the expiry was re-armed, so a busy counter would never expire", ttl);
+  ctx.Assert(ttl >= 3600 - 1200 - 5, "TTL is %d s, expected about %d", ttl, 3600 - 1200);
+  ctx.Equal(beValue(ctx, beKey), "2", "both adds must count");
+  ctx.Clock.Advance(2401);
+  ctx.Equal(ctx.Redis.Exists(beKey), 0, "the counter expires 3600 s after its creation, regardless of later adds: EXISTS");
+  // The counter's hour runs out in the middle of an add: only an add whose SET NX and INCRBY reach
+  // Redis as one unit (a pipeline) cannot leave a counter behind without an expiry.
+  beAdd(ctx, "trailer-7", 1);
+  ctx.Clock.Advance(3599);
+  bool fired = false;
+  ctx.Redis.After(beKey, [&] {
+    fired = true;
+    ctx.Clock.Advance(2);
+  });
+  beAdd(ctx, "trailer-7", 1);
+  ctx.Assert(fired, "add_count never touched %s", beKey);
+  ttl = ctx.Redis.TTL(beKey);
+  ctx.Assert(ttl != -1, "the counter's hour ran out between the SET NX and the INCRBY of one add, and the INCRBY recreated %s without any expiry (it now holds %v forever): send both in one pipeline so nothing lands between them", beKey, beValue(ctx, beKey));
+}
+
+void CheckGetClear(harness::Ctx& ctx) {
+  ctx.Equal(beGet(ctx, "trailer-7"), 0, "a counter that was never added to reads as 0, not an error");
+  beAdd(ctx, "trailer-7", 5);
+  ctx.Equal(beGet(ctx, "trailer-7"), 5, "get_count returns the current count");
+  beClear(ctx, "trailer-7", "clear_count threw");
+  ctx.Equal(ctx.Redis.Exists(beKey), 0, "clear_count must DEL %s: EXISTS", beKey);
+  ctx.Equal(beGet(ctx, "trailer-7"), 0, "a cleared counter reads as 0");
+  beClear(ctx, "never-existed", "clearing an unknown counter is not an error");
 }
 `,
   },

@@ -1499,6 +1499,250 @@ func CheckEmptyMemo(ctx *harness.Ctx) {
 	ctx.Equal(w.contents(r), []any{"new", "old"}, "the starting bucket must not be remembered as empty: the newest page is new, old")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <array>
+#include <map>
+#include <regex>
+#include <sstream>
+
+// Step 1's bucket_of (post_message.cpp).
+int32_t bucket_of(int64_t snowflake) { return static_cast<int32_t>((snowflake >> 22) / (10LL * 24 * 3600 * 1000)); }
+
+namespace {
+
+constexpr int64_t walkEpoch = 1420070400000LL;
+constexpr int64_t walkBucketMs = 10LL * 24 * 3600 * 1000;
+const std::string walkInsert = "INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES ($1, $2, $3, $4, $5)";
+
+const std::regex walkBucketRe("(?:^|[^a-z_])bucket ?= ?([$][0-9]+|[0-9]+)");
+const std::regex walkLimitRe("limit ?([$][0-9]+|[0-9]+)");
+
+using Read = std::array<int64_t, 2>;
+
+// walkSnowflake is a snowflake minted offsetMs into bucket.
+int64_t walkSnowflake(int64_t bucket, int64_t offsetMs) { return ((bucket * walkBucketMs + offsetMs) << 22) | (1 << 17); }
+
+// walkRow is a stored message: its bucket, its offset in it, its content.
+struct walkRow {
+  int64_t bucket, offsetMs;
+  std::string content;
+};
+
+std::string walkID(int64_t id) { return std::to_string(id); }
+
+int64_t nowBucket(harness::Ctx& ctx) { return (ctx.Clock.Now() - walkEpoch) / walkBucketMs; }
+
+// walkReads is the page walk as Postgres saw it since it was made.
+struct walkReads {
+  harness::Ctx* ctx;
+  size_t since;
+
+  // compared is the value Postgres compared with in re: a $n parameter or an inline number (-1: none).
+  int64_t compared(const std::regex& re, const std::string& text, const std::vector<harness::Any>& args) const {
+    std::smatch found;
+    if (!std::regex_search(text, found, re)) return -1;
+    std::string slot = found[1];
+    if (slot[0] == '$') {
+      const int n = std::atoi(slot.c_str() + 1);
+      if (n < 1 || n > static_cast<int>(args.size())) return -1;
+      slot = harness::Sprintf("%v", args[n - 1]);
+    }
+    return std::strtoll(slot.c_str(), nullptr, 10);
+  }
+
+  // all is [bucket, limit] of every SELECT on messages (limit -1 when there is none).
+  std::vector<Read> all() const {
+    std::vector<Read> out;
+    const auto queries = ctx->DB.Queries();
+    for (size_t i = since; i < queries.size(); i++) {
+      const auto& q = queries[i];
+      std::istringstream words(q.SQL);
+      std::string text, word;
+      while (words >> word) text += (text.empty() ? "" : " ") + word;
+      for (char& ch : text) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      if (text.rfind("select", 0) != 0 || text.find("messages") == std::string::npos) continue;
+      const int64_t bucket = compared(walkBucketRe, text, q.Args);
+      ctx->Assert(bucket != -1, "Postgres ran a read of messages that is not confined to one bucket: %q — each query must name one (channel_id, bucket) partition", q.SQL);
+      out.push_back({bucket, compared(walkLimitRe, text, q.Args)});
+    }
+    return out;
+  }
+
+  std::vector<int64_t> buckets() const {
+    std::vector<int64_t> out;
+    for (const auto& read : all()) out.push_back(read[0]);
+    return out;
+  }
+};
+
+using Params = std::vector<std::pair<std::string, std::string>>;
+
+// walkWorld is the learner's server over Postgres, around a channel created ten buckets ago.
+struct walkWorld {
+  harness::Ctx* ctx;
+  int64_t nowB;     // the bucket a message sent now lands in
+  int64_t channel;  // a channel created ten buckets ago
+  int64_t end;      // a cursor at the very end of the current bucket
+  int64_t sibling;  // another channel created ten buckets ago, with no memo yet
+  std::optional<harness::HTTP> http;
+
+  void insert(int64_t ch, const std::vector<walkRow>& messages) {
+    for (const auto& m : messages) ctx->DB.Exec(walkInsert, ch, m.bucket, walkSnowflake(m.bucket, m.offsetMs), 7, m.content);
+  }
+
+  // get is one GET on channel; it returns the response and the bucket reads Postgres ran for it.
+  std::pair<harness::Response, walkReads> get(int64_t ch, const Params& params = {}) {
+    walkReads reads{ctx, ctx->DB.Queries().size()};
+    std::string path = "/channels/" + std::to_string(ch) + "/messages";
+    for (size_t i = 0; i < params.size(); i++) path += (i == 0 ? "?" : "&") + params[i].first + "=" + params[i].second;
+    return {http->Get(path), reads};
+  }
+
+  // page decodes a 200 answer as its list of messages.
+  harness::Any page(const harness::Response& r) {
+    std::string text = r.Text();
+    text.erase(0, text.find_first_not_of(" \\t\\r\\n") == std::string::npos ? text.size() : text.find_first_not_of(" \\t\\r\\n"));
+    text.erase(text.find_last_not_of(" \\t\\r\\n") + 1);
+    if (text.size() > 120) text = text.substr(0, 120);
+    ctx->Equal(r.Status, 200, "GET answered %s", text);
+    return decode(r);
+  }
+
+  harness::Any decode(const harness::Response& r) {
+    const auto page = harness::ParseJSON(r.Text());
+    if (!page || !(page->IsArray() || page->IsNil())) ctx->Fatalf("the response body does not decode into []map[string]interface {}: %q", r.Text().substr(0, 200));
+    return *page;
+  }
+
+  std::vector<harness::Any> contents(const harness::Response& r);
+};
+
+// walkField lists one field of every message of a page.
+std::vector<harness::Any> walkField(const harness::Any& page, const std::string& name) {
+  std::vector<harness::Any> out;
+  for (const auto& m : page.Items()) out.push_back(m[name]);
+  return out;
+}
+
+std::vector<harness::Any> walkWorld::contents(const harness::Response& r) { return walkField(page(r), "content"); }
+
+// newWalkWorld stores messages of the channel, then starts the server.
+walkWorld newWalkWorld(harness::Ctx& ctx, const std::vector<walkRow>& messages) {
+  const int64_t nowB = nowBucket(ctx);
+  walkWorld w{&ctx, nowB, walkSnowflake(nowB - 10, 5000), walkSnowflake(nowB, walkBucketMs - 1), walkSnowflake(nowB - 10, 6000), std::nullopt};
+  ctx.DB.Reset(db::kSchema);
+  w.insert(w.channel, messages);
+  w.http = ctx.Main().HTTP();
+  return w;
+}
+
+}  // namespace
+
+void CheckLimitBounds(harness::Ctx& ctx) {
+  const int64_t nowB = nowBucket(ctx);
+  std::vector<walkRow> rows;
+  for (int i = 0; i < 60; i++) rows.push_back({nowB, 1000LL * (i + 1), "m" + std::to_string(i)});
+  auto w = newWalkWorld(ctx, rows);
+  for (const std::string bad : {"0", "101", "-5"}) {
+    const auto [r, reads] = w.get(w.channel, {{"limit", bad}});
+    ctx.Equal(r.Status, 400, "limit=%s is outside 1..100", bad);
+  }
+  auto r = w.get(w.channel).first;
+  ctx.Equal(r.Status, 200, "GET without limit");
+  ctx.Equal(w.page(r).Len(), 50, "without ?limit the page holds defaultLimit (50) messages");
+  r = w.get(w.channel, {{"limit", "100"}}).first;
+  ctx.Equal(w.page(r).Len(), 60, "limit=100 on a channel with 60 messages returns all 60");
+  r = w.get(w.channel, {{"limit", "1"}}).first;
+  ctx.Equal(w.page(r).Len(), 1, "limit=1 returns one message");
+}
+
+void CheckNewestFirst(harness::Ctx& ctx) {
+  const int64_t nowB = nowBucket(ctx);
+  std::vector<walkRow> rows;
+  std::vector<int64_t> ids;
+  for (int64_t i = 1; i <= 5; i++) {
+    rows.push_back({nowB, 1000 * i, "m" + std::to_string(i)});
+    ids.push_back(walkSnowflake(nowB, 1000 * i));
+  }
+  auto w = newWalkWorld(ctx, rows);
+  auto [r, reads] = w.get(w.channel, {{"limit", "3"}});
+  ctx.Equal(r.Status, 200, "GET with limit=3");
+  const auto page = w.page(r);
+  ctx.Equal(walkField(page, "id"), {walkID(ids[4]), walkID(ids[3]), walkID(ids[2])}, "limit=3 must return the three newest ids as strings, newest first");
+  ctx.Equal(walkField(page, "content"), {"m5", "m4", "m3"}, "each message carries its content: %s", r.Text());
+  for (const auto& author : walkField(page, "author_id")) {
+    ctx.Assert(author == "7", "each message carries author_id (as a string): %s", r.Text());
+  }
+  auto first = reads.all();
+  if (first.size() > 1) first.resize(1);
+  ctx.Equal(first, std::vector<Read>{Read{w.nowB, 3}}, "the first query must read the current bucket %d bounded by the page size (LIMIT 3), as [bucket, limit]", w.nowB);
+  r = w.get(w.channel, {{"before", walkID(ids[3])}, {"limit", "10"}}).first;
+  ctx.Equal(walkField(w.page(r), "id"), {walkID(ids[2]), walkID(ids[1]), walkID(ids[0])}, "before=<id of m4> must return m3, m2, m1 (strictly older)");
+  r = w.get(w.channel, {{"before", walkID(ids[0])}, {"limit", "10"}}).first;
+  const auto got = w.page(r);
+  ctx.Assert(got.IsArray() && got.Len() == 0, "nothing is older than the first message: expected [], got %s", r.Text());
+}
+
+void CheckWalkBack(harness::Ctx& ctx) {
+  const int64_t nowB = nowBucket(ctx);
+  const std::vector<walkRow> rows = {{nowB, 1000, "a"}, {nowB, 2000, "b"}, {nowB - 2, 1000, "c"}, {nowB - 2, 2000, "d"}, {nowB - 5, 1000, "e"}};
+  auto w = newWalkWorld(ctx, rows);
+  auto [r, reads] = w.get(w.channel, {{"before", walkID(w.end)}, {"limit", "3"}});
+  ctx.Equal(w.contents(r), {"b", "a", "d"}, "a page of 3 spans buckets %d and %d: expected b, a, d", nowB, nowB - 2);
+  ctx.Equal(reads.buckets(), {nowB, nowB - 1, nowB - 2}, "the walk must query buckets %d, %d, %d in that order and stop once the page is full; buckets Postgres was asked for", nowB, nowB - 1, nowB - 2);
+  std::vector<int64_t> limits;
+  for (const auto& read : reads.all()) limits.push_back(read[1]);
+  ctx.Equal(limits, {3, 1, 1}, "each bucket is asked only for what is still missing (LIMIT 3, then 1, then 1); LIMITs Postgres ran");
+  w.insert(w.sibling, rows);
+  std::tie(r, reads) = w.get(w.sibling, {{"before", walkID(w.end)}, {"limit", "10"}});
+  ctx.Equal(w.contents(r), {"b", "a", "d", "c", "e"}, "a page larger than the channel returns everything newest first");
+  std::vector<int64_t> want;
+  for (int i = 0; i < 11; i++) want.push_back(nowB - i);
+  ctx.Equal(reads.buckets(), want, "with the page still short the walk continues down to the channel's bucket (%d); buckets Postgres was asked for", nowB - 10);
+}
+
+void CheckChannelFloor(harness::Ctx& ctx) {
+  const int64_t nowB = nowBucket(ctx);
+  auto w = newWalkWorld(ctx, {{nowB - 9, 1000, "old"}});
+  auto [r, reads] = w.get(w.channel, {{"before", walkID(w.end)}, {"limit", "50"}});
+  ctx.Equal(w.contents(r), {"old"}, "the only message sits nine buckets back and must be found");
+  const auto buckets = reads.buckets();
+  int64_t lowest = -1;
+  for (size_t i = 0; i < buckets.size(); i++) {
+    if (i == 0 || buckets[i] < lowest) lowest = buckets[i];
+  }
+  ctx.Assert(!buckets.empty() && lowest == nowB - 10, "the walk must reach bucketOf(channelID) = %d and stop there; Postgres was asked for buckets down to %d", nowB - 10, lowest);
+  ctx.Equal(buckets.size(), 11, "from %d down to %d is 11 bucket queries", nowB, nowB - 10);
+  const int64_t young = walkSnowflake(nowB - 1, 0);
+  std::tie(r, reads) = w.get(young, {{"before", walkID(w.end)}, {"limit", "50"}});
+  const auto empty = w.decode(r);
+  ctx.Assert(empty.IsArray() && empty.Len() == 0, "a channel with no messages answers an empty page, got %s", r.Text());
+  ctx.Equal(reads.buckets(), {nowB, nowB - 1}, "a channel created in bucket %d needs exactly two queries (%d, %d)", nowB - 1, nowB, nowB - 1);
+}
+
+void CheckEmptyMemo(harness::Ctx& ctx) {
+  const int64_t nowB = nowBucket(ctx);
+  auto w = newWalkWorld(ctx, {{nowB, 1000, "new"}, {nowB - 9, 1000, "old"}});
+  auto [r, reads] = w.get(w.channel, {{"before", walkID(w.end)}, {"limit", "5"}});
+  ctx.Equal(w.contents(r), {"new", "old"}, "expected new then old");
+  ctx.Equal(reads.buckets().size(), 11, "the first read of a quiet channel walks every bucket (11 queries)");
+  std::tie(r, reads) = w.get(w.channel, {{"before", walkID(w.end)}, {"limit", "5"}});
+  ctx.Equal(w.contents(r), {"new", "old"}, "the second read must return the same page");
+  const auto second = reads.buckets();
+  ctx.Assert(second.size() <= 3, "the second read must skip the buckets known to be empty: at most 3 queries (%d, %d, %d), Postgres ran %d: %v", nowB, nowB - 9, nowB - 10, second.size(), second);
+  for (const int64_t b : second) {
+    ctx.Assert(b != nowB - 5, "bucket %d came back empty on the first read and must not be queried again", nowB - 5);
+  }
+  r = w.get(w.channel, {{"before", walkID(walkSnowflake(nowB, 1000))}, {"limit", "5"}}).first;
+  ctx.Equal(w.contents(r), {"old"}, "before=<id of new> hides new");
+  std::tie(r, reads) = w.get(w.channel, {{"before", walkID(w.end)}, {"limit", "5"}});
+  bool sawStart = false;
+  for (const int64_t b : reads.buckets()) sawStart = sawStart || b == nowB;
+  ctx.Assert(sawStart, "the starting bucket %d returned nothing only because of the before cursor: it is not empty, yet the next read skipped it (Postgres was asked for %v)", nowB, reads.buckets());
+  ctx.Equal(w.contents(r), {"new", "old"}, "the starting bucket must not be remembered as empty: the newest page is new, old");
+}
+`,
   },
   debrief: `The read side is where the schema pays off and where it bites. Because the bucket is part of the partition key, each query touches exactly one partition and the walk from newest to oldest is a handful of sequential range scans — cheap for the busy channels that generate most reads, since their page fills from the first bucket. Quiet channels are the price: a server that talks twice a month spreads fifty messages over dozens of windows, and without a memo every page load re-reads every empty one. Discord's 2017 fix was that memo, after a channel with millions of deleted messages (and so millions of tombstones in otherwise empty buckets) took twenty seconds to load. The channel id as a floor is the other half: it is free, exact, and turns "walk back forever" into "walk back to creation". Real systems persist the memo rather than keeping it per process, invalidate it when old messages are imported, and cap the number of buckets one request may scan so a pathological channel cannot hold a connection for seconds.`,
 };

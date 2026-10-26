@@ -821,6 +821,97 @@ func CheckInvalidate(ctx *harness.Ctx) {
 	ctx.Equal(len(prefsLoads()), before+1, "the read after the PUT must reload from the database: loads")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <string>
+#include <vector>
+
+namespace {
+
+const Prefs prefsRow{true, 22, 7};
+
+// u42's row in the provided database.
+void seedPrefs() { db::rows["u42"] = prefsRow; }
+
+// The users db::load_prefs was called for, in call order.
+std::vector<std::string> prefsLoads() {
+  std::vector<std::string> users;
+  for (const auto& c : db::calls)
+    if (c.op == "load") users.push_back(c.user_id);
+  return users;
+}
+
+// db::calls as "load u42" / "save u42 {…}".
+std::vector<std::string> prefsCalls() {
+  std::vector<std::string> out;
+  for (const auto& c : db::calls) out.push_back(c.op + " " + c.user_id + (c.op == "save" ? " " + json(c.prefs).dump() : ""));
+  return out;
+}
+
+}  // namespace
+
+void CheckKey(harness::Ctx& ctx) {
+  seedPrefs();
+  ctx.Equal(get_prefs("u42"), prefsRow, "get_prefs must return the database row");
+  const auto cached = ctx.Redis.Get("prefs:u42");
+  ctx.Assert(cached.has_value(), "the row must be cached under prefs:u42, keys are %v", ctx.Redis.Keys("*"));
+  const auto doc = harness::ParseJSON(*cached);
+  ctx.Assert(doc.has_value(), "prefs:u42 must hold the row as JSON, got %q", *cached);
+  ctx.Equal(*doc,
+            harness::Any(std::map<std::string, harness::Any>{
+                {"push", harness::Any(true)}, {"quiet_start", harness::Any(22.0)}, {"quiet_end", harness::Any(7.0)}}),
+            "prefs:u42 must hold the row as JSON (%s)", *cached);
+}
+
+void CheckReadFirst(harness::Ctx& ctx) {
+  seedPrefs();
+  Prefs stale = prefsRow;
+  stale.push = false;
+  ctx.Redis.Set("prefs:u42", json(stale).dump());
+  ctx.Equal(get_prefs("u42"), stale, "a cached entry must be returned as is, without consulting the database");
+  ctx.Equal(prefsLoads(), std::vector<std::string>{},
+            "the cache held prefs:u42, yet db::load_prefs was called (calls %v): loads", prefsCalls());
+  ctx.Equal(get_prefs("u7"), db::default_prefs, "a miss must load the row from the database");
+  ctx.Equal(prefsLoads(), {"u7"}, "expected one load for u7 (calls %v): loads", prefsCalls());
+  get_prefs("u7");
+  ctx.Equal(prefsLoads().size(), 1, "the second read of u7 must hit the cache, not the database: loads");
+}
+
+void CheckTtl(harness::Ctx& ctx) {
+  seedPrefs();
+  get_prefs("u42");
+  const long long ttl = ctx.Redis.TTL("prefs:u42");
+  ctx.Assert(540 <= ttl && ttl <= 600, "prefs:u42 must expire after 600 s, TTL is %d", ttl);
+  ctx.Clock.Advance(601);
+  ctx.Equal(ctx.Redis.Get("prefs:u42"), nullptr, "the cached entry must be gone after 600 s");
+  get_prefs("u42");
+  ctx.Equal(prefsLoads().size(), 2, "after the entry expired the next read must reload from the database: loads");
+}
+
+void CheckInvalidate(harness::Ctx& ctx) {
+  seedPrefs();
+  get_prefs("u42");
+  ctx.Assert(ctx.Redis.Exists("prefs:u42") == 1, "warm the cache first");
+  std::vector<long long> cacheAtSave;
+  const auto savePrefs = db::save_prefs;
+  db::save_prefs = [&](const std::string& user_id, const Prefs& p) {
+    cacheAtSave.push_back(ctx.Redis.Exists("prefs:u42"));
+    savePrefs(user_id, p);
+  };
+  const Prefs next{false, 23, 8};
+  const auto r = ctx.Main().HTTP().Put("/users/u42/preferences", R"({"push":false,"quiet_start":23,"quiet_end":8})",
+                                       "Content-Type", "application/json");
+  ctx.Assert(r.Status == 200 || r.Status == 204, "PUT answered %d, expected 204 (or 200)", r.Status);
+  ctx.Equal(db::rows["u42"], next, "the database must hold the new preferences");
+  ctx.Equal(cacheAtSave, {1LL},
+            "db::save_prefs must run before the del: the cache entry was already gone when the database was written");
+  ctx.Equal(ctx.Redis.Exists("prefs:u42"), 0, "PUT must delete prefs:u42, it holds %v (invalidate, never set)",
+            ctx.Redis.Get("prefs:u42"));
+  const size_t before = prefsLoads().size();
+  ctx.Equal(get_prefs("u42"), next, "the next read must see the new preferences");
+  ctx.Equal(prefsLoads().size(), before + 1, "the read after the PUT must reload from the database: loads");
+}
+`,
   },
   debrief: `Cache-aside on the read path and invalidate-on-write is the pairing that survives concurrency: readers refill from the source of truth, writers only ever remove, and the TTL bounds how long a missed invalidation can hurt. Updating the cache in place looks faster and is the classic source of "my setting reverted ten minutes later" bugs. Real systems add a short negative entry for users with no row, version the document so an old refill cannot overwrite a newer one, and fan the DEL out to every region's cache.`,
 };

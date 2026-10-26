@@ -515,9 +515,7 @@ std::unique_ptr<RdKafka::KafkaConsumer> make_consumer() {
   conf->set("group.id", kGroupId, err);
   // TODO: auto.offset.reset latest — a restarted instance must not replay history to live clients
   conf->set("enable.auto.commit", "true", err);
-  auto consumer = std::unique_ptr<RdKafka::KafkaConsumer>(RdKafka::KafkaConsumer::create(conf.get(), err));
-  consumer->subscribe({kTopic});
-  return consumer;
+  return std::unique_ptr<RdKafka::KafkaConsumer>(RdKafka::KafkaConsumer::create(conf.get(), err));
 }
 
 auto producer = make_producer();
@@ -531,6 +529,7 @@ void publish(const std::string& room, const ServerMsg& msg) {
 }
 
 void run_consumer() {
+  consumer->subscribe({kTopic});
   // TODO: consume in a loop; ParseFromArray into a ServerMsg; local_deliver(*record->key(), msg)
 }
 `,
@@ -569,9 +568,7 @@ std::unique_ptr<RdKafka::KafkaConsumer> make_consumer() {
   conf->set("group.id", kGroupId, err);
   conf->set("auto.offset.reset", "latest", err);
   conf->set("enable.auto.commit", "true", err);
-  auto consumer = std::unique_ptr<RdKafka::KafkaConsumer>(RdKafka::KafkaConsumer::create(conf.get(), err));
-  consumer->subscribe({kTopic});
-  return consumer;
+  return std::unique_ptr<RdKafka::KafkaConsumer>(RdKafka::KafkaConsumer::create(conf.get(), err));
 }
 
 auto producer = make_producer();
@@ -588,6 +585,7 @@ void publish(const std::string& room, const ServerMsg& msg) {
 }
 
 void run_consumer() {
+  consumer->subscribe({kTopic});
   while (true) {
     std::unique_ptr<RdKafka::Message> record(consumer->consume(200));
     if (record->err() != RdKafka::ERR_NO_ERROR) continue;  // timeouts included
@@ -1006,6 +1004,217 @@ func CheckDeliver(ctx *harness.Ctx) {
 	}
 	ctx.Equal(shape(delivered), shape(expected), "what localDeliver received (room = the record key, msg = the decoded value)")
 	ctx.Equal(fanTexts(delivered, "room-7"), []string{"hi", "hey"}, "room-7's messages, in production order")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cctype>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "chat.pb.h"
+#include "subscriptions.cpp"
+
+namespace {
+
+const std::string fanTopic = "chat-messages";
+
+chat::ServerMsg fanMsg(const std::string& room, const std::string& user, const std::string& text, int64_t ts) {
+  chat::ServerMsg msg;
+  msg.set_room(room);
+  msg.set_user(user);
+  msg.set_text(text);
+  msg.set_ts(ts);
+  return msg;
+}
+
+// One message local_deliver handed to a room.
+struct FanDelivery {
+  std::string room;
+  chat::ServerMsg msg;
+};
+
+// Everything local_deliver hands to its rooms on this instance: real subscriptions on the shared table.
+struct FanRecording {
+  std::shared_ptr<std::mutex> mu = std::make_shared<std::mutex>();
+  std::shared_ptr<std::vector<FanDelivery>> got = std::make_shared<std::vector<FanDelivery>>();
+
+  explicit FanRecording(const std::vector<std::string>& rooms) {
+    for (const auto& room : rooms) {
+      subscribe(room, [room, mu = mu, got = got](const chat::ServerMsg& msg) {
+        std::lock_guard<std::mutex> lock(*mu);
+        got->push_back({room, msg});
+      });
+    }
+  }
+
+  std::vector<FanDelivery> take() const {
+    std::lock_guard<std::mutex> lock(*mu);
+    return *got;
+  }
+};
+
+std::vector<std::string> fanTexts(const std::vector<FanDelivery>& delivered, const std::string& room) {
+  std::vector<std::string> texts;
+  for (const auto& d : delivered)
+    if (d.room == room) texts.push_back(d.msg.text());
+  return texts;
+}
+
+// A record on the topic the way the learner's own publish produces it: the serialized ServerMsg
+// keyed by the room.
+void fanSeed(harness::Ctx& ctx, const std::string& room, const chat::ServerMsg& msg) {
+  ctx.Kafka.Seed(fanTopic, room, msg.SerializeAsString());
+}
+
+// Runs fn(group) the moment a consumer subscribes to the topic, before it reads, the way another
+// instance's message lands between a subscription and its first poll.
+void onFanSubscribe(harness::Ctx& ctx, std::function<void(const std::string& group)> fn) {
+  ctx.Kafka.OnSubscribe([fn](const std::string& group, const std::vector<std::string>& topics) {
+    if (std::find(topics.begin(), topics.end(), fanTopic) != topics.end()) fn(group);
+  });
+}
+
+// One publish, delivered: the producer sends in the background (linger.ms), so the harness lets it
+// finish before the next one, as awaiting each publish does in TypeScript.
+void fanPublish(harness::Ctx& ctx, const std::string& room, const chat::ServerMsg& msg) {
+  publish(room, msg);
+  ctx.Settle();
+}
+
+bool hasHexRun(const std::string& s, size_t n) {
+  size_t run = 0;
+  for (char c : s) {
+    run = std::isxdigit(static_cast<unsigned char>(c)) ? run + 1 : 0;
+    if (run >= n) return true;
+  }
+  return false;
+}
+
+}  // namespace
+
+void CheckTopicKeyed(harness::Ctx& ctx) {
+  const auto hi = fanMsg("room-7", "ana", "hi", 1700000000000);
+  fanPublish(ctx, "room-7", hi);
+  fanPublish(ctx, "room-8", fanMsg("room-8", "bo", "yo", 1700000000000));
+  fanPublish(ctx, "room-7", fanMsg("room-7", "cy", "hey", 1700000000000));
+  const auto records = ctx.Kafka.Records(fanTopic);
+  ctx.Equal(records.size(), 3, "the records three publish calls produced to %q (topics seen: %v)", fanTopic,
+            ctx.Kafka.Topics());
+  ctx.Equal(ctx.Kafka.Keys(fanTopic), {"room-7", "room-8", "room-7"}, "the record keys must be the room ids");
+  chat::ServerMsg parsed;
+  ctx.Assert(records[0].Value.has_value() && parsed.ParseFromString(*records[0].Value),
+             "the record value must be the serialized ServerMsg");
+  ctx.Assert(parsed.SerializeAsString() == hi.SerializeAsString(),
+             "the record value must be the serialized ServerMsg; parsed back: %s", parsed.ShortDebugString());
+  std::set<int> parts;
+  for (const auto& r : records)
+    if (r.Key == "room-7") parts.insert(r.Partition);
+  ctx.Equal(parts.size(), 1,
+            "room-7's messages landed on partitions %v: keyed by room they stay on one partition; partitions used", parts);
+}
+
+// Go starts a second process of the program (ctx.Instance()); a C++ check runs one process, so
+// instance B is a consumer the harness runs the way a second chat-server would: its own group,
+// chat-server-{hostname}-{its pid}, configured as kGroupId's consumer is.
+void CheckUniqueGroup(harness::Ctx& ctx) {
+  const FanRecording da({"room-7"});
+  const std::string ga = kGroupId;
+  const std::string host = hostname();
+  ctx.Assert(ga.rfind("chat-server-", 0) == 0, "kGroupId is %q, expected chat-server-{hostname}-{pid}", ga);
+  const size_t at = ga.find(host);
+  ctx.Assert(at != std::string::npos, "kGroupId %q does not contain the hostname %q", ga, host);
+  ctx.Assert(ga.size() > std::string("chat-server-").size() + host.size() + 1,
+             "kGroupId %q needs a per-process part (pid) after the hostname", ga);
+  const std::string tail = ga.substr(at + host.size());
+  const std::string pid = std::to_string(getpid());
+  ctx.Assert(tail.find(pid) != std::string::npos || hasHexRun(tail, 8),
+             "two instances on this host computed the same group id %q: with a shared group the topic is split between "
+             "them instead of broadcast (put the pid, %s, or a uuid after the hostname)",
+             ga, pid);
+  const std::string gb = "chat-server-" + host + "-" + std::to_string(getpid() + 1);
+  std::set<std::string> seeded;
+  onFanSubscribe(ctx, [&](const std::string& group) {
+    // each instance's first subscription is answered by one new message
+    if (!seeded.insert(group).second) return;
+    fanSeed(ctx, "room-7", fanMsg("room-7", "ana", std::string("hello from ") + (group == ga ? "A" : "B"), 1700000000000));
+  });
+  auto textsB = std::make_shared<std::vector<std::string>>();
+  const auto runB = [gb, textsB] {
+    std::string err;
+    std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+    conf->set("bootstrap.servers", "kafka:9092", err);
+    conf->set("group.id", gb, err);
+    conf->set("auto.offset.reset", "latest", err);
+    conf->set("enable.auto.commit", "true", err);
+    std::unique_ptr<RdKafka::KafkaConsumer> b(RdKafka::KafkaConsumer::create(conf.get(), err));
+    b->subscribe({fanTopic});
+    while (true) {
+      std::unique_ptr<RdKafka::Message> record(b->consume(200));
+      if (record->err() != RdKafka::ERR_NO_ERROR) continue;
+      chat::ServerMsg msg;
+      if (msg.ParseFromArray(record->payload(), static_cast<int>(record->len())) && *record->key() == "room-7")
+        textsB->push_back(msg.text());
+    }
+  };
+  ctx.Drain([] { run_consumer(); });  // A joins and sees 'hello from A'
+  ctx.Drain(runB);                    // B joins; 'hello from B' is produced while both groups exist
+  ctx.Settle();                       // A keeps consuming
+  std::vector<std::string> groups;
+  for (const auto& c : ctx.Kafka.Consumers())
+    if (std::find(groups.begin(), groups.end(), c.Group) == groups.end()) groups.push_back(c.Group);
+  std::sort(groups.begin(), groups.end());
+  ctx.Assert(std::find(groups.begin(), groups.end(), ga) != groups.end(),
+             "the broker saw consumer groups %v, expected the consumer to use group.id = kGroupId (%q)", groups, ga);
+  ctx.Equal(*textsB, {"hello from B"}, "what instance B delivered");
+  ctx.Equal(fanTexts(da.take(), "room-7"), {"hello from A", "hello from B"},
+            "what instance A delivered: with one group per instance every instance receives every message");
+}
+
+void CheckLatest(harness::Ctx& ctx) {
+  const FanRecording delivered({"room-7"});
+  fanSeed(ctx, "room-7", fanMsg("room-7", "ana", "yesterday", 1700000000000));
+  onFanSubscribe(ctx, [&](const std::string&) { fanSeed(ctx, "room-7", fanMsg("room-7", "bo", "now", 1700000000000)); });
+  ctx.Drain([] { run_consumer(); });
+  ctx.Assert(!ctx.Kafka.EventsOf("subscribe").empty(), "the consumer never subscribed to %q", fanTopic);
+  ctx.Equal(fanTexts(delivered.take(), "room-7"), {"now"},
+            "what a freshly started instance delivered: a new group must start at the latest offset "
+            "(auto.offset.reset=latest), not replay 'yesterday'");
+}
+
+void CheckDeliver(harness::Ctx& ctx) {
+  const FanRecording recording({"room-7", "room-8"});
+  const std::vector<FanDelivery> expected = {
+      {"room-7", fanMsg("room-7", "ana", "hi", 1)},
+      {"room-8", fanMsg("room-8", "bo", "yo", 2)},
+      {"room-7", fanMsg("room-7", "cy", "hey", 3)},
+  };
+  onFanSubscribe(ctx, [&](const std::string&) {
+    for (const auto& e : expected) fanSeed(ctx, e.room, e.msg);
+  });
+  ctx.Drain([] { run_consumer(); });
+  const auto subscribes = ctx.Kafka.EventsOf("subscribe");
+  ctx.Assert(std::any_of(subscribes.begin(), subscribes.end(),
+                         [](const harness::KafkaEvent& e) {
+                           return std::find(e.Topics.begin(), e.Topics.end(), fanTopic) != e.Topics.end();
+                         }),
+             "the consumer never subscribed to %q (subscribe events: %v)", fanTopic, subscribes);
+  const auto delivered = recording.take();
+  ctx.Equal(delivered.size(), 3, "three records were produced: the calls to local_deliver");
+  const auto shape = [](const std::vector<FanDelivery>& ds) {
+    std::vector<std::string> out;
+    for (const auto& d : ds)
+      out.push_back(d.room + " " + d.msg.user() + " " + d.msg.text() + " " + std::to_string(d.msg.ts()));
+    std::sort(out.begin(), out.end());
+    return out;
+  };
+  ctx.Equal(shape(delivered), shape(expected), "what local_deliver received (room = the record key, msg = the decoded value)");
+  ctx.Equal(fanTexts(delivered, "room-7"), {"hi", "hey"}, "room-7's messages, in production order");
 }
 `,
   },

@@ -7,7 +7,7 @@ import {tokenBucketStep} from './steps/2-token-bucket';
 import {grpcProxyStep} from './steps/3-grpc-proxy';
 import {auditStreamStep} from './steps/4-audit-stream';
 import {responseCacheStep} from './steps/5-response-cache';
-import {supportModulesTs} from './support';
+import {supportModulesCpp, supportModulesTs} from './support';
 
 /**
  * Rate-limited API gateway: the edge process in front of an internal catalog. TLS listener with
@@ -68,6 +68,11 @@ changing its shape — which is the shape of every gateway you will meet.`,
     ],
   },
   steps: [tlsListenerStep, tokenBucketStep, grpcProxyStep, auditStreamStep, responseCacheStep],
-  support: {python: protoModules, typescript: {...protoFiles, ...supportModulesTs}, go: {...protoFiles}},
+  support: {
+    python: protoModules,
+    typescript: {...protoFiles, ...supportModulesTs},
+    go: {...protoFiles},
+    cpp: {...protoFiles, ...supportModulesCpp},
+  },
   learn,
 };

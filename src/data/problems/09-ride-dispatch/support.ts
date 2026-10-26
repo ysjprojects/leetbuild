@@ -1,3 +1,5 @@
+import {CPP_IDS_H} from '../cpp-support';
+
 /**
  * Runtime support modules for the Python steps: the "provided" pieces the starters import but no
  * step builds — the ride store and dispatcher hand-off (steps 1 and 5) and the geo helpers (step 6).
@@ -155,6 +157,90 @@ export function haversineKm(a: {lat: number; lng: number}, b: {lat: number; lng:
   const dLng = toRad(b.lng) - toRad(a.lng);
   const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
   return 2 * EARTH_RADIUS_KM * Math.asin(Math.sqrt(h));
+}
+`,
+};
+
+/**
+ * The C++ twins, included by the starters: dispatch.h (step 1's hand-off to the dispatcher) and
+ * ride_store.h (step 5's status store) declare the dispatcher's interface — the harness stands in
+ * for it, as the Go harness does — ids.h makes ride ids, and geo.h (step 6) is the grid cell and
+ * the great-circle distance.
+ */
+export const supportModulesCpp: Record<string, string> = {
+  'ids.h': CPP_IDS_H,
+  'dispatch.h': `// The hand-off from the ride API to the dispatcher (provided): the ride, matching it, reading it back.
+#pragma once
+
+#include <optional>
+#include <string>
+
+#include "ids.h"
+
+struct Point {
+  double lat;
+  double lng;
+};
+
+struct Ride {
+  std::string ride_id;
+  std::string rider_id;
+  Point pickup;
+  Point dropoff;
+  std::string status;     // "matching", then "matched", ...
+  std::string driver_id;  // "" until a driver accepted
+};
+
+// Records the ride and queues it for matching (the dispatcher is built in the next steps).
+void start_matching(const Ride& ride);
+
+// The stored ride, or nullopt when the id is unknown.
+std::optional<Ride> get_ride(const std::string& ride_id);
+
+// A fresh ride id: a random UUID.
+inline std::string new_ride_id() { return new_uuid(); }
+`,
+  'ride_store.h': `// The dispatcher's ride store (provided): each ride's status, as the trip-state consumer keeps it.
+#pragma once
+
+#include <string>
+
+// The ride's status; "" for a ride nobody has seen yet.
+std::string get_status(const std::string& ride_id);
+
+// Record the ride's new status; throws when the store is unavailable.
+void set_status(const std::string& ride_id, const std::string& status);
+`,
+  'geo.h': `// Geo helpers (provided): a ~1 km grid id for cache keys and the great-circle distance.
+#pragma once
+
+#include <cmath>
+#include <cstdio>
+#include <string>
+
+#include "routing.pb.h"
+
+inline constexpr double kEarthRadiusKm = 6371.0088;
+// ~1.1 km of latitude.
+inline constexpr double kCellDeg = 0.01;
+
+// A ~1 km grid id: both coordinates floored to 0.01 degrees, as 8 hex digits.
+inline std::string cell(double lat, double lng) {
+  const long long row = static_cast<long long>(std::floor(lat / kCellDeg)) & 0xffff;
+  const long long col = static_cast<long long>(std::floor(lng / kCellDeg)) & 0xffff;
+  char out[9];
+  std::snprintf(out, sizeof out, "%04llx%04llx", row, col);
+  return out;
+}
+
+// Great-circle distance between two points, in km.
+inline double haversine_km(const dispatch::LatLng& a, const dispatch::LatLng& b) {
+  const double rad = M_PI / 180;
+  const double lat1 = a.lat() * rad, lat2 = b.lat() * rad;
+  const double d_lat = lat2 - lat1;
+  const double d_lng = b.lng() * rad - a.lng() * rad;
+  const double h = std::pow(std::sin(d_lat / 2), 2) + std::cos(lat1) * std::cos(lat2) * std::pow(std::sin(d_lng / 2), 2);
+  return 2 * kEarthRadiusKm * std::asin(std::sqrt(h));
 }
 `,
 };

@@ -975,6 +975,168 @@ func CheckCache60s(ctx *harness.Ctx) {
 	ctx.Assert(!cachedEstimate, "an estimate must never be cached: a 500 ms outage would become a 60 s one")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <cmath>
+#include <exception>
+#include <mutex>
+#include <string>
+#include <utility>
+
+namespace {
+
+// routingPeer is a fake Routing service answering 412 s and counting its calls.
+class routingPeer final : public dispatch::Routing::Service {
+ public:
+  grpc::Status Eta(grpc::ServerContext*, const dispatch::EtaRequest*, dispatch::EtaReply* reply) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    calls_++;
+    reply->set_seconds(412);
+    return grpc::Status::OK;
+  }
+  int seen() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return calls_;
+  }
+
+ private:
+  std::mutex mu_;
+  int calls_ = 0;
+};
+
+// etaWorld serves the fake Routing peer (geo.h is provided as is).
+routingPeer& etaWorld(harness::Ctx& ctx) {
+  auto* peer = new routingPeer();  // the harness owns the services it registers, for the whole check
+  ctx.GRPC.Server("")->RegisterService(peer);
+  return *peer;
+}
+
+LatLng latLng(double lat, double lng) {
+  LatLng p;
+  p.set_lat(lat);
+  p.set_lng(lng);
+  return p;
+}
+
+// etaPair is a distinct origin/destination pair (distinct cache cells) per i.
+std::pair<LatLng, LatLng> etaPair(int i) { return {latLng(48.85 + i / 10.0, 2.35), latLng(48.86 + i / 10.0, 2.36)}; }
+
+std::string etaKey(const LatLng& origin, const LatLng& dest) {
+  return "eta:" + cell(origin.lat(), origin.lng()) + ":" + cell(dest.lat(), dest.lng());
+}
+
+double fallbackSeconds(const LatLng& origin, const LatLng& dest) { return haversine_km(origin, dest) / 30 * 3600; }
+
+// showEta is Go's %+v of the answer.
+std::string showEta(const Eta& eta) {
+  return harness::Sprintf("{Seconds:%d Estimated:%t}", eta.seconds, eta.estimated);
+}
+
+Eta etaOK(harness::Ctx& ctx, const LatLng& origin, const LatLng& dest) {
+  try {
+    return eta_seconds(origin, dest);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("eta_seconds threw: %s", std::string(e.what()));
+  }
+}
+
+}  // namespace
+
+void CheckDeadline(harness::Ctx& ctx) {
+  etaWorld(ctx);
+  const auto [origin, dest] = etaPair(0);
+  const Eta eta = etaOK(ctx, origin, dest);
+  ctx.Assert(eta.seconds == 412 && !eta.estimated, "a routing answer of 412 s must be returned as-is, got %s", showEta(eta));
+  const auto calls = ctx.GRPC.CallsTo("Eta", "");
+  ctx.Assert(!calls.empty(), "no Eta RPC was made");
+  const harness::Call& last = calls.back();
+  ctx.Assert(last.HasDeadline(), "the Eta call carries no deadline");
+  const double timeout = last.TimeoutSeconds();
+  ctx.Assert(0.4 <= timeout && timeout <= 0.6, "the deadline must be about 500 ms, got %v s", timeout);
+  const auto req = last.Request<dispatch::EtaRequest>();
+  ctx.Assert(last.HasRequest() && req.origin().lat() == origin.lat() && req.dest().lng() == dest.lng(), "the request must carry origin and dest, got %s", req.ShortDebugString());
+}
+
+void CheckFallback(harness::Ctx& ctx) {
+  etaWorld(ctx);
+  auto [origin, dest] = etaPair(0);
+  ctx.GRPC.SetLatency("Eta", 3.0, "");
+  Eta eta = etaOK(ctx, origin, dest);
+  const double expected = fallbackSeconds(origin, dest);
+  ctx.Assert(eta.estimated, "a routing service slower than the deadline must degrade to an estimate, got %s", showEta(eta));
+  ctx.Assert(std::abs(eta.seconds - expected) <= 2, "the estimate must be haversine_km / 30 km/h in seconds (about %.0f), got %d", expected, eta.seconds);
+  ctx.GRPC.SetLatency("Eta", 0.0, "");
+  std::tie(origin, dest) = etaPair(1);
+  ctx.GRPC.Fail("Eta", grpc::StatusCode::UNAVAILABLE, "routing down", 1, "");
+  eta = etaOK(ctx, origin, dest);
+  ctx.Assert(eta.estimated && std::abs(eta.seconds - fallbackSeconds(origin, dest)) <= 2, "UNAVAILABLE must degrade to the straight-line estimate, got %s", showEta(eta));
+  std::tie(origin, dest) = etaPair(2);
+  ctx.GRPC.Fail("Eta", grpc::StatusCode::INVALID_ARGUMENT, "bad coordinates", 1, "");
+  // Go returns the status as the error; the C++ eta_seconds throws for a status it does not degrade
+  // on, carrying the status message.
+  try {
+    eta = eta_seconds(origin, dest);
+  } catch (const std::exception& e) {
+    const std::string what = e.what();
+    ctx.Assert(what.find("bad coordinates") != std::string::npos, "the INVALID_ARGUMENT status must propagate: the exception says %q", what);
+    return;
+  }
+  ctx.Fatalf("INVALID_ARGUMENT must propagate, not be turned into an estimate: got %s", showEta(eta));
+}
+
+void CheckEstimatedFlag(harness::Ctx& ctx) {
+  etaWorld(ctx);
+  auto [origin, dest] = etaPair(0);
+  Eta eta = etaOK(ctx, origin, dest);
+  ctx.Equal(eta.estimated, false, "a real routing answer must not be flagged as estimated (%s)", showEta(eta));
+  std::tie(origin, dest) = etaPair(1);
+  ctx.GRPC.SetLatency("Eta", 3.0, "");
+  eta = etaOK(ctx, origin, dest);
+  ctx.Equal(eta.estimated, true, "the straight-line fallback must be flagged estimated: true so the screen can say '~4 min' (%s)", showEta(eta));
+}
+
+void CheckNoRetry(harness::Ctx& ctx) {
+  etaWorld(ctx);
+  auto [origin, dest] = etaPair(0);
+  ctx.GRPC.SetLatency("Eta", 3.0, "");
+  etaOK(ctx, origin, dest);
+  ctx.Equal(ctx.GRPC.CallsTo("Eta", "").size(), 1, "calls to a slow routing service: one attempt, then the fallback");
+  ctx.GRPC.SetLatency("Eta", 0.0, "");
+  std::tie(origin, dest) = etaPair(1);
+  ctx.GRPC.Fail("Eta", grpc::StatusCode::UNAVAILABLE, "routing down", 3, "");
+  const Eta eta = etaOK(ctx, origin, dest);
+  ctx.Assert(eta.estimated, "UNAVAILABLE must degrade, not fail");
+  ctx.Equal(ctx.GRPC.CallsTo("Eta", "").size(), 2, "calls after the second request: UNAVAILABLE must not be retried");
+}
+
+void CheckCache60s(harness::Ctx& ctx) {
+  routingPeer& peer = etaWorld(ctx);
+  const auto [origin, dest] = etaPair(0);
+  const std::string k = etaKey(origin, dest);
+  Eta eta = etaOK(ctx, origin, dest);
+  ctx.Equal(eta.seconds, 412, "the routing answer");
+  ctx.Equal(ctx.Redis.Get(k).value_or(""), "412", "%s after a real answer (keys: %v)", k, ctx.Redis.Keys("eta:*"));
+  const long long ttl = ctx.Redis.TTL(k);
+  ctx.Assert(0 < ttl && ttl <= 60, "%s has TTL %d, expected kEtaTtl (60 s)", k, ttl);
+  const LatLng nearOrigin = latLng(origin.lat() + 0.001, origin.lng() + 0.001);  // same ~1 km cell
+  eta = etaOK(ctx, nearOrigin, dest);
+  ctx.Assert(eta.seconds == 412 && !eta.estimated, "a nearby origin in the same cell must be served from the cache, got %s", showEta(eta));
+  ctx.Equal(peer.seen(), 1, "a cached cell pair must not call Routing again: calls Routing saw");
+  ctx.Clock.Advance(61);
+  etaOK(ctx, origin, dest);
+  ctx.Equal(peer.seen(), 2, "after 60 s the cached answer has expired and Routing must be asked again: calls Routing saw");
+  const auto [seededOrigin, seededDest] = etaPair(1);
+  ctx.Redis.Set(etaKey(seededOrigin, seededDest), "99", "EX", 60);
+  eta = etaOK(ctx, seededOrigin, seededDest);
+  ctx.Assert(eta.seconds == 99 && !eta.estimated, "a cached value must be returned without an RPC, got %s", showEta(eta));
+  ctx.Equal(peer.seen(), 2, "the cache must be read before calling Routing: calls Routing saw");
+  const auto [farOrigin, farDest] = etaPair(2);
+  ctx.GRPC.SetLatency("Eta", 3.0, "");
+  eta = etaOK(ctx, farOrigin, farDest);
+  ctx.Assert(eta.estimated, "a routing service slower than the deadline must degrade to an estimate, got %s", showEta(eta));
+  ctx.Assert(!ctx.Redis.Get(etaKey(farOrigin, farDest)).has_value(), "an estimate must never be cached: a 500 ms outage would become a 60 s one");
+}
+`,
   },
   debrief: `Graceful degradation is a design decision made in advance: decide what a *worse but acceptable* answer looks like, and switch to it on exactly the failures that mean "slow or gone". The deadline bounds the cost of finding out, the flag keeps the degradation honest to the caller, and not caching the estimate keeps a 500 ms outage from becoming a 60 s one. Real clients propagate the caller's deadline instead of choosing their own, use hedged requests to a second routing replica, and feed the estimate/actual ratio back to tune the fallback speed per city and hour.`,
 };

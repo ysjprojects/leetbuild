@@ -8,6 +8,7 @@ import {stampedeStep} from './steps/3-stampede';
 import {resizeRpcStep} from './steps/4-resize-rpc';
 import {viewEventsStep} from './steps/5-view-events';
 import {countViewsStep} from './steps/6-count-views';
+import {supportModulesCpp} from './support';
 
 /**
  * Image cache microservice: a thumbnail service in front of an origin store. HTTPS endpoint with
@@ -69,6 +70,6 @@ what transfers to every other cache you will build.`,
     ],
   },
   steps: [serveEndpointStep, cacheAsideStep, stampedeStep, resizeRpcStep, viewEventsStep, countViewsStep],
-  support: {python: protoModules, typescript: protoFiles, go: protoFiles},
+  support: {python: protoModules, typescript: protoFiles, go: protoFiles, cpp: supportModulesCpp},
   learn,
 };

@@ -86,9 +86,11 @@ course content, `AGENTS.md`, or the mock-interview feature unless the user names
   what the problem takes from it. Every link is checked against the live page, never written from
   memory; `yarn verify` enforces the shape.
 - The AI-era courses currently use static review checks only. The classic courses have Python,
-  TypeScript and Go harnesses that execute in the browser runtime (Go's: `goruntime/`, rebuilt into
-  the committed `public/go/runtime.wasm.gz` by `yarn build:go` after any change there). If you add
-  AI-era harnesses, keep the checks outcome-based and update the README.
+  TypeScript, Go and C++ harnesses that execute in the browser runtime (Go's: `goruntime/`, rebuilt
+  into the committed `public/go/runtime.wasm.gz` by `yarn build:go` after any change there; C++'s:
+  `cppruntime/`, rebuilt into the committed `public/cpp/runtime.pack.gz` by `yarn build:cpp`, and
+  `yarn verify` needs Node 24 to run it). If you add AI-era harnesses, keep the checks
+  outcome-based and update the README.
 
 ## Pull requests
 

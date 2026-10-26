@@ -1167,6 +1167,172 @@ func CheckIdleSleep(ctx *harness.Ctx) {
 	ctx.Equal(len(ctx.Kafka.Records("payments")), 1, "records on payments")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <condition_variable>
+#include <mutex>
+#include <set>
+
+namespace {
+
+const std::string relaySchema = R"(
+CREATE TABLE outbox (
+    id text PRIMARY KEY,
+    topic text NOT NULL,
+    key text NOT NULL,
+    payload text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    sent_at timestamptz
+);
+)";
+
+void seedOutbox(harness::Ctx& ctx, const std::string& rowID, const std::string& merchant, const std::string& topic) {
+  const std::string payload = R"({"event_id":")" + rowID + R"(","merchant_id":")" + merchant + R"(","type":"payment.captured"})";
+  ctx.DB.Exec("INSERT INTO outbox (id, topic, key, payload) VALUES ($1, $2, $3, $4)", rowID, topic, merchant, payload);
+}
+
+// resetOutbox empties the outbox and seeds (id, merchant) rows on the payments topic.
+void resetOutbox(harness::Ctx& ctx, const std::vector<std::pair<std::string, std::string>>& rows = {}) {
+  ctx.DB.Reset(relaySchema);
+  for (const auto& [id, merchant] : rows) seedOutbox(ctx, id, merchant, "payments");
+}
+
+int relayPass(harness::Ctx& ctx) {
+  try {
+    return relay_once();
+  } catch (const std::exception& e) {
+    ctx.Fatalf("relayOnce returned an error: %v", std::string(e.what()));
+  }
+}
+
+// sentMarks maps row id → marked sent?
+std::map<std::string, bool> sentMarks(harness::Ctx& ctx) {
+  std::map<std::string, bool> marks;
+  for (auto& row : ctx.DB.Query("SELECT id, sent_at FROM outbox ORDER BY id")) marks[row["id"].String()] = !row["sent_at"].IsNil();
+  return marks;
+}
+
+std::string eventIDOf(const harness::KafkaRecord& r) {
+  const auto event = harness::ParseJSON(r.Value.value_or(""));
+  return event ? (*event)["event_id"].String() : "";
+}
+
+// The learner's thread parks for good: how a check stops a loop that would otherwise never yield to it
+// (Go's harness cancels run's context instead; run() here takes none).
+void parkForever() {
+  std::mutex mu;
+  std::condition_variable never;
+  std::unique_lock<std::mutex> lock(mu);
+  never.wait(lock, [] { return false; });
+}
+
+// stopAfterPasses parks run() once it has committed passes transactions without the clock's sleep
+// count moving past sleeps: a loop polling an empty outbox in a tight loop.
+void stopAfterPasses(harness::Ctx& ctx, int passes) {
+  ctx.DB.After("COMMIT", [&ctx, passes] {
+    if (passes <= 1) parkForever();
+    else stopAfterPasses(ctx, passes - 1);
+  });
+}
+
+}  // namespace
+
+void CheckDurableProducer(harness::Ctx& ctx) {
+  resetOutbox(ctx, {{"e1", "m-1"}});
+  ctx.Kafka.LoseAcks("payments", 1);  // the broker wrote e1 but its acknowledgement never arrived: the producer retries
+  ctx.Equal(relayPass(ctx), 1, "relayOnce must return how many rows it delivered");
+  const auto records = ctx.Kafka.Records("payments");
+  ctx.Assert(!records.empty(), "after one lost acknowledgement the topic holds no record of e1: the retry must deliver it");
+  for (const auto& r : records) {
+    ctx.Assert(r.Key == records[0].Key && r.Value == records[0].Value,
+               "the retry after a lost acknowledgement must resend the same record (same key and value, so the event_id lets the ledger dedupe), got %q / %q and %q / %q",
+               records[0].Key.value_or(""), records[0].Value.value_or(""), r.Key.value_or(""), r.Value.value_or(""));
+  }
+  seedOutbox(ctx, "e2", "m-2", "payments");
+  ctx.Equal(relayPass(ctx), 1, "relayOnce over the new row e2");
+  ctx.Kafka.Failover("payments");  // the partition leader dies right after acknowledging e2
+  std::set<std::string> distinct;
+  for (const auto& r : ctx.Kafka.Records("payments")) distinct.insert(r.Key.value_or("") + "|" + r.Value.value_or(""));
+  ctx.Equal(distinct.size(), 2, "a leader failover right after the acknowledgement must leave e1 and e2 on payments (e2 acknowledged by the leader alone is lost: produce with acks=all): distinct records");
+}
+
+void CheckKeyed(harness::Ctx& ctx) {
+  resetOutbox(ctx, {{"e1", "m-1"}, {"e2", "m-2"}, {"e3", "m-1"}});
+  seedOutbox(ctx, "e4", "m-1", "refunds");
+  ctx.Equal(relayPass(ctx), 4, "relayOnce must return how many rows it delivered");
+  const auto records = ctx.Kafka.Records("payments");
+  ctx.Equal(records.size(), 3, "records on payments");
+  std::map<std::string, harness::KafkaRecord> byID;
+  std::vector<std::string> ids;
+  for (const auto& r : records) {
+    byID[eventIDOf(r)] = r;
+    ids.push_back(eventIDOf(r));
+  }
+  std::sort(ids.begin(), ids.end());
+  ctx.Equal(ids, {"e1", "e2", "e3"}, "the record value must be the row's payload: event ids on payments");
+  for (const auto& [id, merchant] : std::vector<std::pair<std::string, std::string>>{{"e1", "m-1"}, {"e2", "m-2"}, {"e3", "m-1"}}) {
+    ctx.Equal(byID[id].Key.value_or(""), merchant, "record %s must be keyed by the merchant id", id);
+  }
+  ctx.Equal(byID["e1"].Partition, byID["e3"].Partition, "one merchant's events must share a partition: e1 and e3");
+  const auto refunds = ctx.Kafka.Records("refunds");
+  ctx.Assert(refunds.size() == 1 && eventIDOf(refunds[0]) == "e4", "each row goes to its own topic column: refunds must hold e4 alone");
+}
+
+void CheckAckBeforeMark(harness::Ctx& ctx) {
+  resetOutbox(ctx, {{"e1", "m-1"}, {"e2", "m-2"}});
+  ctx.Kafka.FailNext("payments", 1);  // the first produce is refused by the broker (its delivery report carries the error)
+  const int delivered = relayPass(ctx);
+  std::vector<std::string> marked, unmarked;
+  for (const auto& [id, sent] : sentMarks(ctx)) (sent ? marked : unmarked).push_back(id);
+  ctx.Equal(marked.size(), 1, "one of two records was acknowledged; rows marked sent: %v - only acknowledged rows may be marked, and acknowledged rows must be", marked);
+  ctx.Equal(unmarked.size(), 1, "the record whose delivery failed must stay unsent, rows unsent: %v", unmarked);
+  ctx.Equal(delivered, 1, "relayOnce must return the delivered rows");
+  ctx.Equal(ctx.DB.Events(), {"BEGIN", "COMMIT"}, "select, produce, wait for the acknowledgements and update belong to one transaction; the database saw");
+}
+
+void CheckMarkDelivered(harness::Ctx& ctx) {
+  resetOutbox(ctx, {{"e1", "m-1"}, {"e2", "m-2"}, {"e3", "m-3"}});
+  ctx.Equal(relayPass(ctx), 3, "relayOnce over three rows");
+  const auto marks = sentMarks(ctx);
+  for (const auto& [id, sent] : marks) ctx.Assert(sent, "every delivered row must be marked sent_at, got %v", marks);
+  ctx.Equal(relayPass(ctx), 0, "a second pass must find nothing: sent rows are not re-published");
+  ctx.Equal(ctx.Kafka.Records("payments").size(), 3, "sent rows were produced again: records on payments");
+  seedOutbox(ctx, "e4", "m-4", "payments");
+  ctx.Kafka.FailNext("payments", 1);
+  const int refused = relayPass(ctx);
+  ctx.Equal(refused, 0, "a refused delivery is not a delivered row");
+  ctx.Equal(sentMarks(ctx)["e4"], false, "a row whose delivery failed must stay unsent for the next pass");
+  ctx.Equal(relayPass(ctx), 1, "the next pass must pick the unsent row up again");
+  ctx.Equal(sentMarks(ctx)["e4"], true, "the retried row must be marked once delivered");
+  ctx.Equal(ctx.Kafka.Records("payments").size(), 4, "records on payments");
+}
+
+// run() takes no context to cancel (Go's run(ctx) does): the sleep limit ends its idle loop instead
+// (its next sleep never ends), and a loop that never sleeps is parked after 50 passes.
+void CheckIdleSleep(harness::Ctx& ctx) {
+  resetOutbox(ctx);
+  const int64_t start = ctx.Clock.Now();
+  // Three idle sleeps over an empty outbox, then the loop's next sleep never ends.
+  ctx.Clock.SetSleepLimit(3);
+  stopAfterPasses(ctx, 50);
+  ctx.Drain([] { run(); });
+  const int sleeps = ctx.Clock.Sleeps();
+  ctx.Assert(sleeps >= 2, "run() made %d passes over an empty outbox without sleeping: sleep between passes instead of polling in a tight loop", ctx.DB.Events().size() / 2);
+  const double elapsed = static_cast<double>(ctx.Clock.Now() - start) / 1000;
+  const double perSleep = elapsed / sleeps;
+  ctx.Assert(0.05 <= perSleep && perSleep <= 5.0, "%d idle sleeps advanced the clock by %.1f s; the idle sleep should be brief (kIdleSleep)", sleeps, elapsed);
+  // A row arrives: a fresh run() must relay it before it ever sleeps (no sleep ends any more).
+  seedOutbox(ctx, "e1", "m-1", "payments");
+  ctx.Clock.SetSleepLimit(ctx.Clock.Sleeps());
+  int sleptBeforePass = -1;
+  ctx.DB.After("BEGIN", [&] { sleptBeforePass = ctx.Clock.Sleeps() - sleeps; });
+  stopAfterPasses(ctx, 50);
+  ctx.Drain([] { run(); });
+  ctx.Assert(sentMarks(ctx)["e1"] && sleptBeforePass == 0, "run() must relay a pending row before it sleeps");
+  ctx.Equal(ctx.Kafka.Records("payments").size(), 1, "records on payments");
+}
+`,
   },
   debrief: `The relay is where "durable" is decided: \`acks=all\` plus the idempotent producer make the broker side safe, and marking rows only after the acknowledgement makes the database side honest about what was published. Everything else is throughput: batches of 100, \`SKIP LOCKED\` so relays scale out, an idle sleep so an empty table costs nothing. Production relays add a \`sent_at\` sweeper that deletes old rows, back off on broker errors, and are usually replaced by change data capture once volume grows.`,
 };

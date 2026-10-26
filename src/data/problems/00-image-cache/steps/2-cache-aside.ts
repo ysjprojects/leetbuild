@@ -612,6 +612,107 @@ func CheckNegative(ctx *harness.Ctx) {
 	ctx.Equal(len(*calls), 2, "once the sentinel expires the image is rendered again")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <exception>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+// caJPEG is fake JPEG bytes: the real SOI marker (FF D8 FF, not valid UTF-8) and a label.
+std::string caJPEG(const std::string& label) { return "\\xff\\xd8\\xff" + label; }
+
+// caHex shows bytes as hex, nullopt as nil.
+std::string caHex(const std::optional<std::string>& b) {
+  if (!b) return "nil";
+  static const char* digits = "0123456789abcdef";
+  std::string out;
+  for (unsigned char c : *b) {
+    out += digits[c >> 4];
+    out += digits[c & 15];
+  }
+  return out;
+}
+
+// One render call the stand-in saw: (id, width).
+using CaCall = std::pair<std::string, int>;
+std::vector<CaCall> caCalls;
+
+// caResizer stands in for render (the resizer, step 4): it knows cat and records every call.
+std::vector<CaCall>& caResizer() {
+  caCalls.clear();
+  return caCalls;
+}
+
+// get_thumb, failing the check when it throws (Go's ctx.NoError on the returned error).
+std::optional<std::string> caGetThumb(harness::Ctx& ctx, const std::string& id, int width) {
+  try {
+    return get_thumb(id, width);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("get_thumb(%q, %d) threw: %s", id, width, e.what());
+  }
+}
+
+}  // namespace
+
+// The resizer of step 4, stood in for (Go swaps the render variable instead).
+std::optional<std::string> render(const std::string& id, int width) {
+  caCalls.push_back({id, width});
+  if (id != "cat") return std::nullopt;
+  return caJPEG("JPEG-" + id);
+}
+
+void CheckKey(harness::Ctx& ctx) {
+  caResizer();
+  const auto got = caGetThumb(ctx, "cat", 256);
+  ctx.Assert(got == caJPEG("JPEG-cat"), "a miss must return the rendered bytes: got %s, expected %s", caHex(got),
+             caHex(caJPEG("JPEG-cat")));
+  ctx.Assert(ctx.Redis.Exists("thumb:cat:256") == 1, "after a miss the bytes must be stored under thumb:cat:256, keys are %q",
+             ctx.Redis.Keys("*"));
+  const auto stored = ctx.Redis.Get("thumb:cat:256");
+  ctx.Assert(stored == caJPEG("JPEG-cat"), "the cached value must be the rendered bytes, verbatim: stored %s, expected %s",
+             caHex(stored), caHex(caJPEG("JPEG-cat")));
+  caGetThumb(ctx, "cat", 64);
+  ctx.Assert(ctx.Redis.Exists("thumb:cat:64") == 1, "every width is its own entry: thumb:cat:64");
+}
+
+void CheckReadFirst(harness::Ctx& ctx) {
+  auto& calls = caResizer();
+  ctx.Redis.Set("thumb:cat:256", caJPEG("CACHED"));
+  const auto hit = caGetThumb(ctx, "cat", 256);
+  ctx.Assert(hit == caJPEG("CACHED"), "a hit must return the cached bytes verbatim: got %s, expected %s", caHex(hit),
+             caHex(caJPEG("CACHED")));
+  ctx.Equal(calls.size(), 0, "render() must not run on a hit");
+  const auto miss = caGetThumb(ctx, "cat", 128);
+  ctx.Assert(miss == caJPEG("JPEG-cat"), "a miss must return the rendered bytes: got %s, expected %s", caHex(miss),
+             caHex(caJPEG("JPEG-cat")));
+  ctx.Equal(calls, std::vector<CaCall>{{"cat", 128}}, "a miss renders exactly once");
+}
+
+void CheckTtl(harness::Ctx& ctx) {
+  caResizer();
+  caGetThumb(ctx, "cat", 256);
+  const long long ttl = ctx.Redis.TTL("thumb:cat:256");
+  ctx.Assert(86000 <= ttl && ttl <= 86400, "expected a TTL of 86400 s on thumb:cat:256, got %d", ttl);
+  ctx.Clock.Advance(86401);
+  ctx.Assert(!ctx.Redis.Get("thumb:cat:256"), "the entry must be gone once the TTL passes");
+}
+
+void CheckNegative(harness::Ctx& ctx) {
+  auto& calls = caResizer();
+  ctx.Assert(!caGetThumb(ctx, "ghost", 256), "a missing image returns nothing");
+  ctx.Assert(!caGetThumb(ctx, "ghost", 256), "a missing image still returns nothing on the second call");
+  ctx.Equal(calls.size(), 1, "render calls for a missing image: the second call must hit the negative cache");
+  const long long ttl = ctx.Redis.TTL("thumb:ghost:256");
+  ctx.Assert(0 < ttl && ttl <= 60, "the negative entry must expire within 60 s, got TTL %d", ttl);
+  ctx.Clock.Advance(61);
+  caGetThumb(ctx, "ghost", 256);
+  ctx.Equal(calls.size(), 2, "once the sentinel expires the image is rendered again");
+}
+`,
   },
   debrief: `Cache-aside keeps the cache a pure optimisation: if Redis is flushed the service still works, only slower. The TTL bounds staleness and memory; the sentinel turns a class of expensive repeated misses into cheap hits. Real caches add jittered TTLs so entries written together do not expire together, and size limits with an eviction policy (\`allkeys-lru\`).`,
 };

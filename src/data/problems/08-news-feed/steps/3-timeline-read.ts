@@ -838,6 +838,119 @@ func CheckCursor(ctx *harness.Ctx) {
 	ctx.Equal(cursorValue(next), nil, "an empty page has no next cursor")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <exception>
+#include <optional>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+namespace {
+
+// postIDAt is a post id carrying its timestamp: "<created_at ms>-<tag>" (ids::created_at parses the prefix).
+std::string postIDAt(int ms, const std::string& tag) { return std::to_string(ms) + "-" + tag; }
+
+// pushIDs are fan-out writes: ids given oldest first end up newest first in the list.
+void pushIDs(harness::Ctx& ctx, const std::string& user, const std::vector<std::string>& ids) {
+  for (const auto& id : ids) ctx.Redis.Do("LPUSH", "timeline:" + user, id);
+}
+
+void pullIDs(harness::Ctx& ctx, const std::string& author, const std::vector<std::string>& ids) {
+  for (const auto& id : ids) ctx.Redis.Do("ZADD", "posts:" + author, id.substr(0, id.find('-')), id);
+}
+
+// readTimeline is the learner's read; what it throws fails the check (Go's ctx.NoError on the error).
+std::pair<std::vector<std::string>, std::optional<int64_t>> readTimeline(harness::Ctx& ctx, const std::string& user,
+                                                                         std::optional<int64_t> cursor, int limit) {
+  try {
+    Page page = read(user, cursor, limit);
+    return {page.items, page.next_cursor};
+  } catch (const std::exception& e) {
+    ctx.Fatalf("read(%q, %v, %d) threw: %s", user, cursor, limit, e.what());
+  }
+}
+
+}  // namespace
+
+void CheckPushed(harness::Ctx& ctx) {
+  std::vector<std::string> ids;
+  for (int i = 0; i < 10; i++) ids.push_back(postIDAt(100 + i, "a"));
+  pushIDs(ctx, "alice", ids);
+  auto [page, next] = readTimeline(ctx, "alice", std::nullopt, 3);
+  ctx.Equal(page, {postIDAt(109, "a"), postIDAt(108, "a"), postIDAt(107, "a")}, "with 10 pushed ids and limit 3 the page must be the 3 newest");
+  ctx.Equal(next, 107, "the next cursor must be the created_at of the last id of the page (107)");
+  page = readTimeline(ctx, "alice", std::nullopt, 20).first;
+  const std::vector<std::string> newestFirst(ids.rbegin(), ids.rend());
+  ctx.Equal(page, newestFirst, "with limit 20 every pushed id must be returned newest first");
+}
+
+void CheckPulled(harness::Ctx& ctx) {
+  std::vector<std::string> taylor;
+  for (int i = 0; i < 5; i++) taylor.push_back(postIDAt(200 + i, "t"));
+  const std::vector<std::string> nasa = {postIDAt(150, "n"), postIDAt(151, "n")};
+  pullIDs(ctx, "taylor", taylor);
+  pullIDs(ctx, "nasa", nasa);
+  graph::celebrities_followed_by["alice"] = {"taylor", "nasa"};
+  auto [page, next] = readTimeline(ctx, "alice", std::nullopt, 4);
+  ctx.Equal(page, {postIDAt(204, "t"), postIDAt(203, "t"), postIDAt(202, "t"), postIDAt(201, "t")}, "nothing was pushed: the page must be the 4 newest celebrity posts");
+  ctx.Equal(next, 201, "the next cursor");
+  page = readTimeline(ctx, "alice", std::nullopt, 10).first;
+  ctx.Equal(page, {taylor[4], taylor[3], taylor[2], taylor[1], taylor[0], nasa[1], nasa[0]}, "every post of every followed celebrity must be pulled, newest first");
+  page = readTimeline(ctx, "bob", std::nullopt, 10).first;
+  ctx.Assert(page.empty(), "bob follows no celebrity and has no timeline: expected an empty page, got %q", page);
+}
+
+void CheckSinglePipeline(harness::Ctx& ctx) {
+  pushIDs(ctx, "alice", {postIDAt(100, "a"), postIDAt(300, "a")});
+  pullIDs(ctx, "taylor", {postIDAt(200, "t")});
+  pullIDs(ctx, "nasa", {postIDAt(400, "n")});
+  graph::celebrities_followed_by["alice"] = {"taylor", "nasa"};
+  const auto page = readTimeline(ctx, "alice", std::nullopt, 10).first;
+  ctx.Equal(page, {postIDAt(400, "n"), postIDAt(300, "a"), postIDAt(200, "t"), postIDAt(100, "a")}, "unexpected page");
+  std::vector<std::string> reads;
+  std::vector<std::vector<std::string>> pipelines;
+  for (const auto& trip : ctx.Redis.RoundTrips()) {
+    if (trip.size() > 1) pipelines.push_back(trip);
+    else if (trip.size() == 1 && (trip[0] == "LRANGE" || trip[0] == "ZREVRANGEBYSCORE" || trip[0] == "ZRANGE")) reads.push_back(trip[0]);
+  }
+  ctx.Assert(reads.empty(), "%d Redis read(s) were sent outside a pipeline (%v): queue the lrange and every zrevrangebyscore on one pipeline", reads.size(), reads);
+  ctx.Equal(pipelines.size(), 1, "a page must cost one round trip: pipeline execs observed");
+  ctx.Equal(pipelines[0].size(), 3, "the pipeline must carry the lrange and one zrevrangebyscore per celebrity (3 commands for 2 celebrities)");
+}
+
+void CheckMerged(harness::Ctx& ctx) {
+  pushIDs(ctx, "alice", {postIDAt(100, "a"), postIDAt(300, "a"), postIDAt(500, "a")});
+  pullIDs(ctx, "taylor", {postIDAt(200, "t"), postIDAt(400, "t"), postIDAt(600, "t")});
+  pullIDs(ctx, "nasa", {postIDAt(500, "a")});  // the same post also arrived through fan-out
+  graph::celebrities_followed_by["alice"] = {"taylor", "nasa"};
+  auto [page, next] = readTimeline(ctx, "alice", std::nullopt, 4);
+  ctx.Equal(page, {postIDAt(600, "t"), postIDAt(500, "a"), postIDAt(400, "t"), postIDAt(300, "a")}, "pushed and pulled ids must be merged newest first and cut to limit");
+  ctx.Equal(next, 300, "the next cursor");
+  page = readTimeline(ctx, "alice", std::nullopt, 10).first;
+  int copies = 0;
+  for (const auto& id : page)
+    if (id == postIDAt(500, "a")) copies++;
+  ctx.Assert(copies == 1, "an id present in both sources must appear once, got %q", page);
+  ctx.Equal(page, {postIDAt(600, "t"), postIDAt(500, "a"), postIDAt(400, "t"), postIDAt(300, "a"), postIDAt(200, "t"), postIDAt(100, "a")}, "the full merge must be every distinct id newest first");
+}
+
+void CheckCursor(harness::Ctx& ctx) {
+  for (int i = 0; i < 10; i++) pushIDs(ctx, "alice", {postIDAt(100 + 2 * i, "a")});  // 100, 102, ..., 118; LRANGE 0 5 sees 118..108
+  pullIDs(ctx, "taylor", {postIDAt(109, "t"), postIDAt(113, "t"), postIDAt(115, "t"), postIDAt(121, "t")});
+  graph::celebrities_followed_by["alice"] = {"taylor"};
+  auto [page, next] = readTimeline(ctx, "alice", int64_t{115}, 3);
+  ctx.Equal(page, {postIDAt(114, "a"), postIDAt(113, "t"), postIDAt(112, "a")}, "with cursor 115 only ids created before 115 may appear (the bound is exclusive, from both sources)");
+  ctx.Equal(next, 112, "the next cursor");
+  std::tie(page, next) = readTimeline(ctx, "alice", next, 3);
+  ctx.Equal(page, {postIDAt(110, "a"), postIDAt(109, "t"), postIDAt(108, "a")}, "the next page must continue below the cursor without overlap");
+  ctx.Equal(next, 108, "the next cursor");
+  std::tie(page, next) = readTimeline(ctx, "alice", int64_t{100}, 3);
+  ctx.Assert(page.empty(), "nothing is older than 100: expected an empty page, got %q", page);
+  ctx.Equal(next, nullptr, "an empty page has no next cursor");
+}
+`,
   },
   debrief: `The read is where the hybrid pays off: one pipeline, a handful of replies, a sort of at most a few dozen ids — regardless of how many followers the celebrities have. Both sources answer the same question ("posts older than the cursor, newest first") and the merge hides which one each id came from. The honest limitation: a plain list cannot seek by time, so deep pagination over the pushed ids degrades — real feeds keep the timeline itself as a sorted set scored by \`created_at\` (or a time-sortable id such as a Snowflake), apply ranking after this candidate step, and cache the hydrated first page per user for a few seconds.`,
 };

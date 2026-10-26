@@ -737,7 +737,7 @@ std::unique_ptr<RdKafka::Producer> make_producer() {
 
 auto consumer = make_consumer();
 auto producer = make_producer();
-const std::regex kPageField(R"("page"\\s*:\\s*"([^"]+)")");
+const std::regex kPageField(R"re("page"\\s*:\\s*"([^"]+)")re");
 const std::regex kTsField(R"("ts"\\s*:\\s*(\\d+))");
 
 // window start → page → count
@@ -815,7 +815,7 @@ std::unique_ptr<RdKafka::Producer> make_producer() {
 
 auto consumer = make_consumer();
 auto producer = make_producer();
-const std::regex kPageField(R"("page"\\s*:\\s*"([^"]+)")");
+const std::regex kPageField(R"re("page"\\s*:\\s*"([^"]+)")re");
 const std::regex kTsField(R"("ts"\\s*:\\s*(\\d+))");
 
 // window start → page → count
@@ -1164,6 +1164,131 @@ func CheckCommitAfterEmit(ctx *harness.Ctx) {
 	ctx.Assert(first.waited >= 2000, "committed %d ms in: the output topic was stalled, the commit must wait for the ack (a synchronous WriteMessages) first", first.waited)
 	ctx.Equal(len(ctx.Kafka.EventsOf("auto-commit")), 0, "offsets were committed on a timer: auto-commits")
 	ctx.Equal(ctx.Kafka.Lag("windows", "clicks"), 0, "after the emit every consumed record must be committed: lag")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+namespace {
+
+using click = std::pair<std::string, int64_t>;
+
+std::string showStats(const Stats& s) { return harness::Sprintf("{Late:%d Open:%d}", s.late, s.open); }
+
+// seedClicks puts clicks on partition 0 of clicks, delivered in this order (event time is in the
+// value, not the log).
+void seedClicks(harness::Ctx& ctx, const std::vector<click>& events) {
+  for (const auto& [page, ts] : events)
+    ctx.Kafka.SeedPartition("clicks", 0, page, R"({"page":")" + page + R"(","ts":)" + std::to_string(ts) + "}");
+}
+
+// emittedCounts is page-counts as "page window_start count", sorted by page then window start.
+std::vector<std::string> emittedCounts(harness::Ctx& ctx) {
+  std::vector<std::tuple<std::string, int64_t, int64_t>> got;
+  for (const auto& r : ctx.Kafka.Records("page-counts")) {
+    const std::string value = r.Value.value_or("");
+    const auto v = nlohmann::json::parse(value, nullptr, false);
+    if (!v.is_object()) ctx.Fatalf("the page-counts value %q is not JSON", value);
+    got.emplace_back(v.value("page", std::string()), v.value("window_start", int64_t{0}), v.value("count", int64_t{0}));
+  }
+  std::sort(got.begin(), got.end());
+  std::vector<std::string> out;
+  for (const auto& [page, start, count] : got)
+    out.push_back(page + " " + std::to_string(start) + " " + std::to_string(count));
+  return out;
+}
+
+// drainWindows runs the aggregator until it waits for clicks that will not come.
+void drainWindows(harness::Ctx& ctx) { ctx.Drain([] { run(); }); }
+
+}  // namespace
+
+void CheckWindows(harness::Ctx& ctx) {
+  seedClicks(ctx, {{"home", 1000}, {"home", 2000}, {"about", 3000}, {"home", 61000}, {"about", 62000}, {"home", 125000}});
+  drainWindows(ctx);
+  const std::vector<std::string> expected = {"about 0 1", "about 60000 1", "home 0 2", "home 60000 1"};
+  ctx.Equal(emittedCounts(ctx), expected,
+            "after ts 125000 (watermark 120000) windows 0 and 60000 must be emitted as page window_start count");
+  ctx.Equal(stats().open, 1, "the window starting at 120000 must stay open: stats().open (stats() is %v)", showStats(stats()));
+  shutdown();
+  ctx.Settle();
+  ctx.Equal(emittedCounts(ctx), expected, "shutdown() must not emit open windows");
+}
+
+void CheckBoundary(harness::Ctx& ctx) {
+  seedClicks(ctx, {{"home", 59999}, {"home", 60000}, {"home", 60001}, {"home", 126000}});
+  drainWindows(ctx);
+  ctx.Equal(emittedCounts(ctx), {"home 0 1", "home 60000 2"}, "ts 59999 belongs to window 0, ts 60000 and 60001 to window 60000");
+}
+
+void CheckLate(harness::Ctx& ctx) {
+  seedClicks(ctx, {{"home", 1000}, {"home", 70000}, {"home", 50000}, {"home", 130000}});
+  drainWindows(ctx);
+  ctx.Equal(emittedCounts(ctx), {"home 0 1", "home 60000 1"},
+            "ts 50000 arrives behind the watermark 65000: it must neither reopen window 0 nor count");
+  ctx.Equal(stats().late, 1, "one late event must be counted: stats().late (stats() is %v)", showStats(stats()));
+}
+
+void CheckWithinLateness(harness::Ctx& ctx) {
+  seedClicks(ctx, {{"home", 61000}, {"home", 124000}, {"home", 119500}, {"home", 118000}, {"home", 126000}});
+  drainWindows(ctx);
+  ctx.Equal(emittedCounts(ctx), {"home 60000 2"},
+            "ts 119500 is 4500 ms behind 124000, inside the lateness: it counts in window 60000");
+  ctx.Equal(stats().late, 1, "ts 118000 is 6000 ms behind, late: stats().late (stats() is %v)", showStats(stats()));
+  ctx.Equal(stats().open, 1, "the window starting at 120000 must stay open: stats().open (stats() is %v)", showStats(stats()));
+}
+
+void CheckKeyed(harness::Ctx& ctx) {
+  seedClicks(ctx, {{"home", 1000}, {"about", 2000}, {"home", 3000}, {"pricing", 4000}, {"home", 70000}});
+  drainWindows(ctx);
+  const auto records = ctx.Kafka.Records("page-counts");
+  ctx.Equal(records.size(), 3, "window 0 has three pages: records on page-counts");
+  for (const auto& r : records) {
+    const std::string value = r.Value.value_or("");
+    const auto v = nlohmann::json::parse(value, nullptr, false);
+    if (!v.is_object()) ctx.Fatalf("the page-counts value %q is not JSON", value);
+    std::vector<std::string> fields;
+    for (const auto& [k, _] : v.items()) fields.push_back(k);
+    std::sort(fields.begin(), fields.end());
+    ctx.Equal(fields, {"count", "page", "window_start"}, "the value %s must have exactly page, window_start, count", value);
+    const std::optional<std::string> page =
+        v.contains("page") && v["page"].is_string() ? std::optional<std::string>(v["page"].get<std::string>()) : std::nullopt;
+    ctx.Equal(r.Key, page, "the key must be the page (value %s)", value);
+  }
+  auto keys = ctx.Kafka.Keys("page-counts");
+  std::sort(keys.begin(), keys.end());
+  ctx.Equal(keys, {"about", "home", "pricing"}, "the keys of page-counts");
+}
+
+void CheckCommitAfterEmit(harness::Ctx& ctx) {
+  seedClicks(ctx, {{"home", 1000}, {"home", 70000}});
+  ctx.Kafka.StallFor("page-counts", 2);  // the broker acknowledges page-counts 2 s later
+  const int64_t started = ctx.Clock.Now();
+  struct commitSeen {
+    std::string group;
+    int64_t waited;
+    std::vector<std::string> held;
+  };
+  std::vector<commitSeen> seen;
+  ctx.Kafka.OnCommit([&](const std::string& group, const harness::KafkaOffsets&) {
+    seen.push_back({group, ctx.Clock.Now() - started, emittedCounts(ctx)});
+  });
+  drainWindows(ctx);
+  ctx.Assert(!seen.empty(), "closing window 0 must commit the input offsets");
+  const auto& first = seen[0];
+  ctx.Equal(first.group, "windows", "the consumer must commit as group windows");
+  ctx.Equal(first.held, {"home 0 1"}, "at commit time page-counts must already hold window 0");
+  ctx.Assert(first.waited >= 2000,
+             "committed %d ms in: the output topic was stalled, the commit must wait for the ack (a flush) first", first.waited);
+  ctx.Equal(ctx.Kafka.EventsOf("auto-commit").size(), 0, "offsets were committed on a timer: auto-commits");
+  ctx.Equal(ctx.Kafka.Lag("windows", "clicks"), 0, "after the emit every consumed record must be committed: lag");
 }
 `,
   },

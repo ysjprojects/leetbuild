@@ -1183,6 +1183,301 @@ func CheckReply(ctx *harness.Ctx) {
 	ctx.Equal(len(reply.GetMessages()), 0, "an empty page is an empty GetMessagesReply")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <condition_variable>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "db.h"
+
+namespace {
+
+constexpr int64_t coEpoch = 1420070400000LL;
+constexpr int64_t coBucketMs = 10LL * 24 * 3600 * 1000;
+const std::string coInsert = "INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES ($1, $2, $3, $4, $5)";
+
+int64_t coSnowflake(int64_t bucket, int64_t offsetMs) { return ((bucket * coBucketMs + offsetMs) << 22) | (1 << 17); }
+
+// coRow is a stored message: its bucket, its offset in it, its content.
+struct coRow {
+  int64_t bucket, offsetMs;
+  std::string content;
+};
+
+// coGate is Go's gate channel: while a world holds one, page walks wait for it to open (Go: close(gate)).
+struct coGate {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool open = false;
+
+  void Wait() {
+    std::unique_lock<std::mutex> lock(mu);
+    cv.wait(lock, [this] { return open; });
+  }
+  void Open() {
+    {
+      std::lock_guard<std::mutex> guard(mu);
+      open = true;
+    }
+    cv.notify_all();
+  }
+};
+
+// What read_page stands for in this check (Go: readPage = w.walk).
+std::function<json(int64_t, int64_t, int)> coReadPage;
+
+// coErr is a failed call as Go's grpc error prints.
+std::string coErr(const grpc::Status& s) {
+  return harness::Sprintf("rpc error: code = %v desc = %s", s.error_code(), s.error_message());
+}
+
+// coNoError is Go's ctx.NoError for a call's status: the message gets ": <err>" appended.
+template <class... A>
+void coNoError(harness::Ctx& ctx, const grpc::Status& s, std::string_view format, const A&... args) {
+  if (!s.ok()) ctx.Fatalf("%s: %s", harness::Sprintf(format, args...), coErr(s));
+}
+
+// coResult is one GetMessages: Go's (reply, err).
+struct coResult {
+  grpc::Status status;
+  discord::GetMessagesReply reply;
+};
+
+int64_t coNowBucket(harness::Ctx& ctx) { return (ctx.Clock.Now() - coEpoch) / coBucketMs; }
+
+std::vector<coRow> coHotRows(int64_t nowB) { return {{nowB, 1000, "a"}, {nowB, 2000, "b"}, {nowB, 3000, "c"}}; }
+
+std::vector<std::string> coContents(const discord::GetMessagesReply& reply) {
+  std::vector<std::string> out;
+  for (const auto& m : reply.messages()) out.push_back(m.content());
+  return out;
+}
+
+std::string coJoin(const std::vector<std::string>& items) {
+  std::string out;
+  for (size_t i = 0; i < items.size(); i++) out += (i == 0 ? "" : ",") + items[i];
+  return out;
+}
+
+// coWorld is the learner's data service serving over the real page walk (step 2) on Postgres.
+struct coWorld {
+  harness::Ctx* ctx;
+  int64_t nowB;
+  int64_t channel;  // created last bucket: a page walk reads two buckets
+  int64_t hot;      // created this bucket: one page walk is exactly one query on Postgres
+  int64_t end;
+  std::unique_ptr<discord::MessageData::Stub> stub;
+  std::shared_ptr<coGate> gate;  // while set, page walks wait for it to open
+
+  void insert(int64_t ch, const coRow& row, int64_t author) {
+    ctx->DB.Exec(coInsert, ch, row.bucket, coSnowflake(row.bucket, row.offsetMs), author, row.content);
+  }
+
+  // walk is step 2's page walk: from the cursor's bucket down to the channel's, one query per bucket.
+  json walk(int64_t channelID, int64_t before, int limit) {
+    if (const auto g = gate) g->Wait();
+    json page = json::array();
+    for (int64_t bucket = (before >> 22) / coBucketMs;
+         static_cast<int>(page.size()) < limit && bucket >= (channelID >> 22) / coBucketMs; bucket--) {
+      const pqxx::result rows = db::exec(
+          "SELECT message_id, author_id, content FROM messages"
+          " WHERE channel_id = $1 AND bucket = $2 AND message_id < $3 ORDER BY message_id DESC LIMIT $4",
+          channelID, bucket, before, limit - static_cast<int>(page.size()));
+      for (const auto& row : rows) {
+        json message = json::object();
+        message["id"] = std::to_string(row[0].as<int64_t>());
+        message["author_id"] = std::to_string(row[1].as<int64_t>());
+        message["content"] = row[2].as<std::string>();
+        page.push_back(message);
+      }
+    }
+    return page;
+  }
+
+  discord::GetMessagesRequest req(int64_t ch, int64_t before, int limit) const {
+    discord::GetMessagesRequest r;
+    r.set_channel_id(static_cast<uint64_t>(ch));
+    r.set_before(static_cast<uint64_t>(before));
+    r.set_limit(static_cast<uint32_t>(limit));
+    return r;
+  }
+
+  coResult get(const discord::GetMessagesRequest& r) {
+    grpc::ClientContext c;
+    coResult out;
+    out.status = stub->GetMessages(&c, r, &out.reply);
+    return out;
+  }
+
+  // together sends reqs at once: every call is in before any page walk may start.
+  std::vector<coResult> together(const std::vector<discord::GetMessagesRequest>& reqs) {
+    std::vector<coResult> results(reqs.size());
+    gate = std::make_shared<coGate>();
+    std::vector<std::thread> callers;
+    for (size_t i = 0; i < reqs.size(); i++) {
+      callers.emplace_back([this, &results, &reqs, i] { results[i] = get(reqs[i]); });
+    }
+    ctx->Settle();
+    gate->Open();
+    for (auto& t : callers) t.join();
+    gate = nullptr;
+    return results;
+  }
+
+  // selects counts the reads of the messages table Postgres ran since the query log held since entries.
+  int selects(size_t since) const {
+    int n = 0;
+    const auto queries = ctx->DB.Queries();
+    for (size_t i = since; i < queries.size(); i++) {
+      std::istringstream words(queries[i].SQL);
+      std::string text, word;
+      while (words >> word) text += (text.empty() ? "" : " ") + word;
+      for (char& ch : text) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+      if (text.rfind("select", 0) == 0 && text.find("messages") != std::string::npos) n++;
+    }
+    return n;
+  }
+};
+
+// startCoalescer stores rows of the default channel (onHot: of the hot one) and starts the data service.
+std::unique_ptr<coWorld> startCoalescer(harness::Ctx& ctx, bool onHot, const std::vector<coRow>& rows) {
+  const int64_t nowB = coNowBucket(ctx);
+  auto w = std::make_unique<coWorld>(coWorld{&ctx, nowB, coSnowflake(nowB - 1, 5000), coSnowflake(nowB, 500),
+                                             coSnowflake(nowB, coBucketMs - 1), nullptr, nullptr});
+  const int64_t ch = onHot ? w->hot : w->channel;
+  ctx.DB.Reset(db::kSchema);
+  for (const auto& row : rows) w->insert(ch, row, 7);
+  coWorld* world = w.get();
+  coReadPage = [world](int64_t channelID, int64_t before, int limit) { return world->walk(channelID, before, limit); };
+  ctx.Main();
+  w->stub = discord::MessageData::NewStub(ctx.GRPC.Dial("data-1:9000"));
+  return w;
+}
+
+}  // namespace
+
+// Step 2's read_page (read_messages.cpp) is not linked into this step: the harness stands in with the page walk.
+json read_page(int64_t channel_id, int64_t before, int limit) { return coReadPage(channel_id, before, limit); }
+
+void CheckServicer(harness::Ctx& ctx) {
+  const int64_t nowB = coNowBucket(ctx);
+  auto w = startCoalescer(ctx, false, {{nowB, 1000, "a"}, {nowB, 2000, "b"}});
+  const auto r = w->get(w->req(w->channel, w->end, 50));
+  // Go also asserts the reply is not nil: a C++ reply always exists once the status is OK.
+  coNoError(ctx, r.status, "GetMessages must answer a GetMessagesReply");
+  ctx.Equal(r.reply.messages_size(), 2, "two stored messages must come back");
+}
+
+void CheckReadsPage(harness::Ctx& ctx) {
+  const int64_t nowB = coNowBucket(ctx);
+  auto w = startCoalescer(ctx, false, {{nowB - 1, 1000, "old"}, {nowB, 1000, "a"}, {nowB, 2000, "b"}, {nowB, 3000, "c"}});
+  w->insert(w->hot, {nowB, 2500, "another channel"}, 9);
+  auto r = w->get(w->req(w->channel, w->end, 2));
+  coNoError(ctx, r.status, "GetMessages(channel, end, 2)");
+  std::vector<std::vector<std::string>> got;
+  for (const auto& m : r.reply.messages()) got.push_back({std::to_string(m.id()), std::to_string(m.author_id()), m.content()});
+  const std::vector<std::vector<std::string>> want = {{std::to_string(coSnowflake(nowB, 3000)), "7", "c"},
+                                                      {std::to_string(coSnowflake(nowB, 2000)), "7", "b"}};
+  ctx.Equal(got, want, "limit=2 must return the two newest rows of the channel, ids as exact 64-bit integers");
+  r = w->get(w->req(w->channel, coSnowflake(nowB, 2000), 5));
+  coNoError(ctx, r.status, "GetMessages(channel, <id of b>, 5)");
+  ctx.Equal(coContents(r.reply), {"a", "old"}, "before=<id of b> must walk back to the channel's first bucket: expected a, old");
+  r = w->get(w->req(w->hot, w->end, 5));
+  coNoError(ctx, r.status, "GetMessages(other channel, end, 5)");
+  ctx.Equal(coContents(r.reply), {"another channel"}, "channel_id selects the channel: the other channel's page is its one message");
+}
+
+void CheckSingleFlight(harness::Ctx& ctx) {
+  auto w = startCoalescer(ctx, true, coHotRows(coNowBucket(ctx)));
+  size_t since = ctx.DB.Queries().size();
+  std::vector<discord::GetMessagesRequest> reqs;
+  for (int i = 0; i < 5; i++) reqs.push_back(w->req(w->hot, w->end, 50));
+  reqs.push_back(w->req(w->hot, w->end, 10));
+  const auto results = w->together(reqs);
+  for (const auto& r : results) coNoError(ctx, r.status, "a concurrent GetMessages failed");
+  const int reads = w->selects(since);
+  ctx.Assert(reads >= 1, "no database read happened for the concurrent requests");
+  ctx.Equal(reads, 2, "5 identical concurrent GetMessages plus one with another limit must cost Postgres 2 page reads (one query each here): identical requests in flight together must share one read, a different key reads on its own; queries");
+  for (const auto& r : results) ctx.Equal(coContents(r.reply), {"c", "b", "a"}, "every coalesced caller gets the full page");
+  // One impatient subscriber must not cancel the read for the others.
+  since = ctx.DB.Queries().size();
+  w->gate = std::make_shared<coGate>();
+  // Go cancels the first caller's context.Context; C++ cancels its ClientContext (TryCancel).
+  const auto firstCtx = std::make_shared<grpc::ClientContext>();
+  const auto firstReq = w->req(w->hot, w->end, 50);
+  std::thread first([&w, firstCtx, firstReq] {
+    discord::GetMessagesReply reply;
+    w->stub->GetMessages(firstCtx.get(), firstReq, &reply);
+  });
+  coResult got;
+  std::thread second([&w, &got] { got = w->get(w->req(w->hot, w->end, 50)); });
+  ctx.Settle();  // both callers are in and waiting on one read that has not finished
+  firstCtx->TryCancel();
+  w->gate->Open();
+  second.join();
+  first.join();  // Go leaves the hung-up goroutine running; a std::thread must be joined
+  w->gate = nullptr;
+  ctx.Assert(got.status.ok(), "a subscriber hung up and the other caller's request failed with %s: the shared read was cancelled with it — nobody owns the in-flight read", coErr(got.status));
+  ctx.Equal(coContents(got.reply), {"c", "b", "a"}, "the remaining subscriber must still get the full page");
+  ctx.Equal(w->selects(since), 1, "the two callers must have shared one read: queries Postgres ran");
+}
+
+void CheckSlotCleared(harness::Ctx& ctx) {
+  const int64_t nowB = coNowBucket(ctx);
+  auto w = startCoalescer(ctx, true, coHotRows(nowB));
+  auto r = w->get(w->req(w->hot, w->end, 50));
+  coNoError(ctx, r.status, "GetMessages");
+  ctx.Equal(coContents(r.reply), {"c", "b", "a"}, "expected the page c, b, a");
+  w->insert(w->hot, {nowB, 4000, "d"}, 7);
+  size_t since = ctx.DB.Queries().size();
+  r = w->get(w->req(w->hot, w->end, 50));
+  coNoError(ctx, r.status, "GetMessages after message d was stored");
+  const std::string fresh = coJoin(coContents(r.reply));
+  ctx.Assert(w->selects(since) == 1 && fresh == "d,c,b,a", "an identical request after the first completed must read again (no stale result): message d was stored since, the reply was %v and Postgres ran %d queries", coContents(r.reply), w->selects(since));
+  ctx.DB.Exec("ALTER TABLE messages RENAME TO messages_offline");  // the store goes away under the read
+  since = ctx.DB.Queries().size();
+  const auto results = w->together({w->req(w->hot, w->end, 50), w->req(w->hot, w->end, 50)});
+  for (const auto& failed : results) {
+    ctx.Assert(!failed.status.ok(), "a failed database read must fail the callers, one was answered %v", coContents(failed.reply));
+    ctx.Equal(failed.status.error_code(), grpc::StatusCode::UNAVAILABLE, "a failed read must surface as UNAVAILABLE");
+  }
+  ctx.Equal(w->selects(since), 1, "both callers must have shared the one failing read: times Postgres was asked");
+  ctx.DB.Exec("ALTER TABLE messages_offline RENAME TO messages");
+  since = ctx.DB.Queries().size();
+  r = w->get(w->req(w->hot, w->end, 50));
+  ctx.Assert(r.status.ok(), "the store is back, yet the next identical request failed with %v: the failed read was kept as the answer instead of leaving inflight", r.status.error_code());
+  ctx.Assert(coJoin(coContents(r.reply)) == "d,c,b,a" && w->selects(since) == 1, "after a failure the next request must read fresh and succeed, got %v from %d queries", coContents(r.reply), w->selects(since));
+}
+
+void CheckReply(harness::Ctx& ctx) {
+  const int64_t nowB = coNowBucket(ctx);
+  auto w = startCoalescer(ctx, false, {{nowB, 1000, "a"}, {nowB, 2000, "b"}});
+  auto r = w->get(w->req(w->channel, w->end, 50));
+  coNoError(ctx, r.status, "GetMessages");
+  ctx.Equal(r.reply.messages_size(), 2, "expected 2 messages");
+  std::vector<uint64_t> ids;
+  std::vector<std::vector<std::string>> pairs;
+  for (const auto& m : r.reply.messages()) {
+    ids.push_back(m.id());
+    pairs.push_back({std::to_string(m.author_id()), m.content()});
+  }
+  ctx.Equal(ids, std::vector<uint64_t>{static_cast<uint64_t>(coSnowflake(nowB, 2000)), static_cast<uint64_t>(coSnowflake(nowB, 1000))}, "Message.Id must carry the exact 64-bit snowflake, newest first");
+  for (const uint64_t id : ids) {
+    ctx.Assert(id > (1ULL << 53), "ids above 2**53 must survive: they are uint64 on the wire, not floats");
+  }
+  ctx.Equal(pairs, std::vector<std::vector<std::string>>{{"7", "b"}, {"7", "a"}}, "author_id and content must be copied into each Message");
+  r = w->get(w->req(w->channel, coSnowflake(nowB, 1000), 50));
+  coNoError(ctx, r.status, "an empty page is an empty GetMessagesReply, not an error");
+  ctx.Equal(r.reply.messages_size(), 0, "an empty page is an empty GetMessagesReply");
+}
+`,
   },
   debrief: `The data service does less than the API and that is its value: one endpoint per query, no business logic, and the single place where concurrency towards the database can be shaped. Coalescing is the shape that matters for a chat system, because the hot key is never a secret — it is the newest page of the channel everyone just opened — and because identical reads in flight at the same instant want the same answer, so sharing it costs no freshness. Discord's Rust services do exactly this: the first request spawns a worker task, later requests check for the task and subscribe, the worker queries once and fans the rows out. Removing the key on completion keeps the cache's lifetime at one request; shielding the task keeps one client's timeout from becoming everyone's error. Real deployments add a per-key concurrency limit for writes, hedge a slow read against a second replica, and export the coalescing ratio as the metric that tells you a partition is hot before the database does.`,
 };

@@ -1225,6 +1225,180 @@ func CheckAccepted(ctx *harness.Ctx) {
 	ctx.Equal(released, []string{downReserves[0].orderID}, "the hold must be released when the enqueue fails: release calls")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+#include <stdexcept>
+
+namespace {
+
+// checkoutBody is the valid request, with fields replaced (or removed, for null) by overrides.
+std::string checkoutBody(const nlohmann::json& overrides = nlohmann::json::object()) {
+  nlohmann::json body = {{"sku", "shoe-42"}, {"qty", 2}, {"user", "ada"}};
+  for (const auto& [k, v] : overrides.items()) {
+    if (v.is_null()) body.erase(k);
+    else body[k] = v;
+  }
+  return body.dump();
+}
+
+// serviceCall is one call the endpoint made to reserve, release or enqueue_order.
+struct serviceCall {
+  std::string kind;
+  std::string sku;
+  std::string orderID;
+  int qty = 0;
+  Order order{};
+};
+
+// serviceLog records the calls to the stand-ins for steps 1, 5 and 3.
+struct serviceLog {
+  std::vector<serviceCall> entries;
+  bool soldOut = false;
+  bool brokerDown = false;
+  std::vector<serviceCall> of(const std::string& kind) const {
+    std::vector<serviceCall> out;
+    for (const auto& e : entries) {
+      if (e.kind == kind) out.push_back(e);
+    }
+    return out;
+  }
+};
+
+serviceLog* services = nullptr;
+
+// standIns swaps steps 1, 5 and 3 for recording fakes: reserve answers !soldOut, enqueue_order
+// throws when brokerDown.
+serviceLog* standIns(bool soldOut, bool brokerDown) {
+  services = new serviceLog();
+  services->soldOut = soldOut;
+  services->brokerDown = brokerDown;
+  return services;
+}
+
+// checkoutServer is the learner's server with the provided services stood in for.
+std::pair<serviceLog*, harness::HTTP> checkoutServer(harness::Ctx& ctx, bool soldOut, bool brokerDown) {
+  serviceLog* l = standIns(soldOut, brokerDown);
+  return {l, ctx.Main().HTTP()};
+}
+
+harness::Response post(harness::HTTP& c, const std::string& body) {
+  return c.Post("/checkout", body, "Content-Type", "application/json");
+}
+
+harness::Any decode(const harness::Response& r) {
+  const auto doc = harness::ParseJSON(r.Text());
+  return doc ? *doc : harness::Any();
+}
+
+}  // namespace
+
+// The stand-ins for steps 1, 5 and 3.
+bool reserve(const std::string& sku, const std::string& order_id, int qty) {
+  services->entries.push_back({"reserve", sku, order_id, qty, {}});
+  return !services->soldOut;
+}
+void release(const std::string& order_id) { services->entries.push_back({"release", "", order_id, 0, {}}); }
+void enqueue_order(const Order& order) {
+  services->entries.push_back({"enqueue", "", "", 0, order});
+  if (services->brokerDown) throw std::runtime_error("no ack within 2s");
+}
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto [l, c] = checkoutServer(ctx, false, false);
+  const auto r = post(c, checkoutBody());
+  ctx.Assert(r.Status != 404, "no handler is registered for POST /checkout");
+  ctx.Equal(r.Status, 202, "POST /checkout with a valid body");
+}
+
+void CheckValidate(harness::Ctx& ctx) {
+  auto [l, c] = checkoutServer(ctx, false, false);
+  const std::vector<std::pair<std::string, std::string>> bad = {
+      {"a missing sku", checkoutBody({{"sku", nullptr}})},
+      {"a missing user", checkoutBody({{"user", nullptr}})},
+      {"qty 0", checkoutBody({{"qty", 0}})},
+      {"qty 6", checkoutBody({{"qty", 6}})},
+  };
+  for (const auto& [label, body] : bad) {
+    const auto r = post(c, body);
+    ctx.Equal(r.Status, 400, "%s", label);
+  }
+  ctx.Equal(l->of("reserve").size(), 0, "a 400 must be decided before stock is touched: reserve calls for a bad body");
+  ctx.Equal(ctx.Redis.Keys("attempts:*").size(), 0, "a 400 must be decided before the attempt counter is touched: attempts:* keys");
+  auto r = post(c, checkoutBody({{"qty", 5}}));
+  ctx.Equal(r.Status, 202, "qty 5 is the maximum and must be accepted");
+  r = post(c, checkoutBody({{"qty", 1}}));
+  ctx.Equal(r.Status, 202, "qty 1 is the minimum and must be accepted");
+}
+
+void CheckAttemptLimit(harness::Ctx& ctx) {
+  auto [l, c] = checkoutServer(ctx, false, false);
+  const std::string body = checkoutBody({{"user", "bot"}});
+  auto r = post(c, body);
+  ctx.Equal(r.Status, 202, "the first attempt");
+  ctx.Equal(ctx.Redis.Get("attempts:bot").value_or(""), "1", "attempts:bot after one request");
+  const long long ttl = ctx.Redis.TTL("attempts:bot");
+  ctx.Assert(0 < ttl && ttl <= 60, "attempts:bot has TTL %d; the window must be set to 60 s when the counter is created", ttl);
+  post(c, body);
+  ctx.Equal(ctx.Redis.Get("attempts:bot").value_or(""), "2", "every request must INCR attempts:{user}");
+  const size_t reserves = l->of("reserve").size();
+  ctx.Redis.Set("attempts:bot", 20, "KEEPTTL");
+  r = post(c, body);
+  ctx.Equal(r.Status, 429, "the 21st attempt in the window");
+  ctx.Equal(r.HeaderValue("Retry-After"), "60", "the Retry-After header");
+  ctx.Equal(l->of("reserve").size(), reserves, "a 429 must be decided before reserve is called (a bot must not cost a Lua call): reserve calls");
+  ctx.Clock.Advance(61);
+  r = post(c, body);
+  ctx.Equal(r.Status, 202, "after the 60 s window the counter must have expired");
+  r = post(c, checkoutBody({{"user", "grace"}}));
+  ctx.Equal(r.Status, 202, "the limit is per user: another user must not be throttled");
+}
+
+void CheckSoldOut(harness::Ctx& ctx) {
+  auto [l, c] = checkoutServer(ctx, true, false);
+  const auto r = post(c, checkoutBody());
+  ctx.Equal(r.Status, 409, "a reservation that returned false");
+  ctx.Equal(decode(r)["error"].String(), "SOLD_OUT", "the 409 body's error (body %s)", r.Text());
+  ctx.Equal(l->of("enqueue").size(), 0, "a sold-out order must not be enqueued: enqueue_order calls");
+  ctx.Equal(l->of("release").size(), 0, "nothing was reserved, so nothing must be released: release calls");
+}
+
+void CheckAccepted(harness::Ctx& ctx) {
+  auto [l, c] = checkoutServer(ctx, false, false);
+  auto r = post(c, checkoutBody());
+  ctx.Equal(r.Status, 202, "a reserved and enqueued order");
+  const auto reserves = l->of("reserve");
+  const auto enqueues = l->of("enqueue");
+  ctx.Equal(reserves.size(), 1, "reserve calls");
+  ctx.Equal(enqueues.size(), 1, "enqueue_order calls");
+  int reserveAt = -1, enqueueAt = -1;
+  for (size_t i = 0; i < l->entries.size(); i++) {
+    const auto& e = l->entries[i];
+    if (e.kind == "reserve" && reserveAt < 0) reserveAt = static_cast<int>(i);
+    if (e.kind == "enqueue" && enqueueAt < 0) enqueueAt = static_cast<int>(i);
+  }
+  ctx.Assert(reserveAt < enqueueAt, "reserve must run before enqueue_order");
+  const auto& first = reserves[0];
+  ctx.Equal(std::make_tuple(first.sku, first.qty), std::make_tuple(std::string("shoe-42"), 2), "reserve's sku and qty");
+  ctx.Assert(!first.orderID.empty(), "reserve must be called with a generated order id");
+  const Order& got = enqueues[0].order;
+  ctx.Equal(std::make_tuple(got.order_id, got.sku, got.qty, got.user), std::make_tuple(first.orderID, std::string("shoe-42"), 2, std::string("ada")),
+            "the order enqueue_order received {order_id sku qty user}");
+  const auto body = decode(r);
+  ctx.Equal(body["order_id"].String(), first.orderID, "the 202 body's order_id must be the id that was reserved (body %s)", r.Text());
+  ctx.Equal(body["status"].String(), "reserved", "the 202 body's status must be reserved, nothing is paid yet (body %s)", r.Text());
+  ctx.Equal(l->of("release").size(), 0, "a successful enqueue must not release the hold: release calls");
+
+  serviceLog* down = standIns(false, true);
+  r = post(c, checkoutBody());
+  ctx.Equal(r.Status, 503, "when enqueue_order fails the endpoint");
+  const auto downReserves = down->of("reserve");
+  ctx.Assert(!downReserves.empty(), "reserve was never called");
+  std::vector<std::string> released;
+  for (const auto& e : down->of("release")) released.push_back(e.orderID);
+  ctx.Equal(released, {downReserves[0].orderID}, "the hold must be released when the enqueue fails: release calls");
+}
+`,
   },
   debrief: `Every branch is ordered by what it costs: a 400 costs nothing, a 429 costs one INCR, a 409 costs the Lua script, and only a 202 pays for a Kafka round trip. The status codes carry meaning a client can act on — 429 says *wait*, 409 says *stop*, 503 says *try again* — and the 202 is honest: the order is accepted, not fulfilled. Real checkouts put a virtual waiting room in front of this endpoint, score requests for bot likelihood instead of counting them, and return a status URL the client polls.`,
 };

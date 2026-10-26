@@ -639,6 +639,85 @@ func CheckOverLimit(ctx *harness.Ctx) {
 	ctx.Equal(rlAllowed(ctx, "u42", "n-23"), true, "an hour later the user's budget is back")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <string>
+#include <vector>
+
+namespace {
+
+std::vector<std::string> rlMembers(harness::Ctx& ctx, const std::string& key) {
+  std::vector<std::string> members;
+  for (const auto& z : ctx.Redis.ZRangeWithScores(key, 0, -1)) members.push_back(z.Member);
+  return members;
+}
+
+}  // namespace
+
+void CheckZsetKey(harness::Ctx& ctx) {
+  const int64_t before = ctx.Clock.Now();
+  ctx.Equal(allowed("u42", "n-1"), true, "the first notification of the hour must be allowed");
+  const int64_t after = ctx.Clock.Now();
+  ctx.Equal(ctx.Redis.Type("rl:u42"), "zset", "rl:u42 must be a sorted set");
+  const auto score = ctx.Redis.ZScore("rl:u42", "n-1");
+  ctx.Assert(score.has_value(), "n-1 must be a member of rl:u42, members are %v", rlMembers(ctx, "rl:u42"));
+  ctx.Assert(static_cast<double>(before) <= *score && *score <= static_cast<double>(after),
+             "n-1 is scored %v, expected the current time in milliseconds (about %d)", *score, before);
+  allowed("u7", "n-2");
+  ctx.Assert(ctx.Redis.ZCard("rl:u42") == 1 && ctx.Redis.ZCard("rl:u7") == 1, "each user has their own rl:{user} set");
+}
+
+void CheckTrimWindow(harness::Ctx& ctx) {
+  allowed("u42", "n-1");
+  allowed("u42", "n-2");
+  ctx.Clock.Advance(1800);
+  allowed("u42", "n-3");
+  ctx.Equal(ctx.Redis.ZCard("rl:u42"), 3, "after 30 min all three events are still in the window: members of rl:u42");
+  ctx.Clock.Advance(1801);
+  ctx.Equal(allowed("u42", "n-4"), true, "allowed(u42, n-4)");
+  ctx.Equal(rlMembers(ctx, "rl:u42"), {"n-3", "n-4"}, "events older than an hour must be trimmed: rl:u42");
+}
+
+void CheckPipeline(harness::Ctx& ctx) {
+  ctx.Equal(allowed("u42", "n-1"), true, "the first notification of the hour must be allowed");
+  std::vector<std::vector<std::string>> trips;
+  for (const auto& trip : ctx.Redis.RoundTrips()) {
+    std::vector<std::string> commands;
+    for (const auto& c : trip)
+      if (c != "MULTI" && c != "EXEC") commands.push_back(c);
+    trips.push_back(commands);
+  }
+  const long long ttl = ctx.Redis.TTL("rl:u42");
+  ctx.Assert(ttl > 0, "rl:u42 has no expiry (TTL %d): an idle user would leave a sorted set behind forever", ttl);
+  ctx.Assert(3500 <= ttl && ttl <= 3600, "rl:u42 must expire after 3600 s, TTL is %d", ttl);
+  const bool four = std::any_of(trips.begin(), trips.end(), [](const std::vector<std::string>& trip) {
+    const auto has = [&](const char* c) { return std::find(trip.begin(), trip.end(), c) != trip.end(); };
+    return has("ZADD") && has("ZREMRANGEBYSCORE") && has("ZCARD") && has("EXPIRE");
+  });
+  ctx.Assert(four,
+             "an allowed check must cost one round trip carrying ZADD, ZREMRANGEBYSCORE, ZCARD and EXPIRE together; the "
+             "round trips were %v",
+             trips);
+  ctx.Equal(trips.size(), 1, "an allowed check must cost one round trip (%v): round trips", trips);
+  ctx.Clock.Advance(3601);
+  ctx.Equal(ctx.Redis.Exists("rl:u42"), 0, "an idle user's set must expire with the window");
+}
+
+void CheckOverLimit(harness::Ctx& ctx) {
+  for (int i = 0; i < 20; i++) {
+    ctx.Equal(allowed("u42", "n-" + std::to_string(i)), true, "notification %d of 20 must be allowed", i + 1);
+  }
+  ctx.Equal(ctx.Redis.Get("dropped:u42"), nullptr, "nothing was dropped yet: dropped:u42 must not exist");
+  ctx.Equal(allowed("u42", "n-20"), false, "the 21st notification of the hour must be dropped");
+  ctx.Equal(ctx.Redis.Get("dropped:u42"), "1", "dropped:u42");
+  ctx.Equal(allowed("u42", "n-21"), false, "the 22nd notification of the hour must be dropped");
+  ctx.Equal(ctx.Redis.Get("dropped:u42"), "2", "dropped:u42");
+  ctx.Equal(allowed("u7", "n-22"), true, "another user's budget is untouched");
+  ctx.Clock.Advance(3601);
+  ctx.Equal(allowed("u42", "n-23"), true, "an hour later the user's budget is back");
+}
+`,
   },
   debrief: `A sorted set scored by time is a sliding window with no bookkeeping: add, trim, count, and the TTL cleans up after idle users. The four commands travel together so the check costs one round trip, and because the whole thing is per user it shards trivially. Real systems wrap the same four commands in a Lua script so the add-trim-count is atomic against concurrent workers, remove the member again when the decision is "drop" (so dropped pings do not eat the budget), and prefer a cheaper approximation — sliding log with coarse buckets, or a token bucket — once the limit is thousands per window instead of twenty.`,
 };

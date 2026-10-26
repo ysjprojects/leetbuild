@@ -120,7 +120,7 @@ const makeBridge = (alive: () => boolean): {bridge: object; disable: () => Promi
       sleeps: (): number => CLOCK.sleeps,
       slept: (): number => CLOCK.slept,
       setSleepLimit: (n: number): void => {
-        CLOCK.sleepLimit = n;
+        CLOCK.setSleepLimit(n);
       },
     },
     redis: {

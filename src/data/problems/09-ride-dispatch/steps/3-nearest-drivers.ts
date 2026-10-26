@@ -841,6 +841,154 @@ func CheckTopK(ctx *harness.Ctx) {
 	ctx.Equal(ids, []string{"d-2", "d-9"}, "with d-7 on a trip the top 2 (filter first, then cut to k)")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cmath>
+#include <functional>
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+constexpr double pickupLat = 48.85, pickupLng = 2.35;
+
+struct seededDriver {
+  std::string id;
+  double lat, lng;
+};
+
+// seedDrivers writes the GEO member and, when seen, a live presence key for every driver.
+void seedDrivers(harness::Ctx& ctx, const std::string& city, bool seen, const std::vector<seededDriver>& drivers) {
+  for (const auto& d : drivers) {
+    ctx.Redis.Do("GEOADD", "drivers:" + city, d.lng, d.lat, d.id);
+    if (seen) ctx.Redis.Set("driver:" + d.id + ":seen", "1000", "EX", 30);
+  }
+}
+
+// storeCalls stands in for driver_store.h: it answers from statuses (default available) and
+// records the ids of every call.
+struct storeCalls {
+  std::map<std::string, std::string> statuses;
+  std::vector<std::vector<std::string>> calls;
+};
+
+storeCalls store;
+
+storeCalls& standInStore(std::map<std::string, std::string> statuses = {}) {
+  store = storeCalls{std::move(statuses), {}};
+  return store;
+}
+
+std::pair<std::vector<Candidate>, std::vector<std::string>> nearestIDs(harness::Ctx& ctx, const std::string& city, double lat, double lng, std::size_t k) {
+  std::vector<Candidate> found;
+  try {
+    found = nearest(city, lat, lng, k);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("nearest(%q, %v, %v, %d) threw: %s", city, lat, lng, k, std::string(e.what()));
+  }
+  std::vector<std::string> ids;
+  for (const auto& c : found) ids.push_back(c.driver_id);
+  return {found, ids};
+}
+
+}  // namespace
+
+std::map<std::string, std::string> driver_status(const std::vector<std::string>& ids) {
+  store.calls.push_back(ids);
+  std::map<std::string, std::string> out;
+  for (const auto& id : ids) {
+    const auto it = store.statuses.find(id);
+    out[id] = it == store.statuses.end() ? "available" : it->second;
+  }
+  return out;
+}
+
+void CheckGeosearch(harness::Ctx& ctx) {
+  seedDrivers(ctx, "paris", true, {{"d-7", 48.852, 2.352}, {"d-9", 48.86, 2.37}, {"d-far", 48.9, 2.35}});
+  seedDrivers(ctx, "lyon", true, {{"d-l", 45.76, 4.84}});
+  standInStore();
+  auto [found, ids] = nearestIDs(ctx, "paris", pickupLat, pickupLng, 10);
+  ctx.Equal(ids, {"d-7", "d-9"}, "nearest(paris): within 3 km of (lat 48.85, lng 2.35), lng before lat in the search");
+  for (const auto& id : ids) ctx.Assert(id != "d-far", "d-far is 5.6 km away and must be outside the 3 km radius");
+  ids = nearestIDs(ctx, "lyon", 45.76, 4.84, 10).second;
+  ctx.Equal(ids, {"d-l"}, "nearest(lyon): the search is on drivers:{city}");
+}
+
+void CheckSortedBounded(harness::Ctx& ctx) {
+  // ~0.111 km apart, 25 within 3 km, seeded in a fixed shuffled order.
+  std::vector<seededDriver> drivers;
+  for (int i = 0; i < 25; i++) drivers.push_back({"d-" + std::to_string(i + 1), 48.85 + (i + 1) / 1000.0, 2.35});
+  int64_t state = 7;
+  for (int64_t i = static_cast<int64_t>(drivers.size()) - 1; i > 0; i--) {
+    state = (state * 1103515245 + 12345) % 2147483648;
+    const int64_t j = state % (i + 1);
+    std::swap(drivers[static_cast<size_t>(i)], drivers[static_cast<size_t>(j)]);
+  }
+  seedDrivers(ctx, "paris", true, drivers);
+  standInStore();
+  auto [found, ids] = nearestIDs(ctx, "paris", pickupLat, pickupLng, 25);
+  ctx.Equal(found.size(), 20, "drivers for k=25 with 25 in range: the search must ask Redis for COUNT 20 candidates");
+  std::vector<double> dists;
+  for (const auto& c : found) dists.push_back(c.dist_km);
+  ctx.Assert(std::is_sorted(dists.begin(), dists.end()), "results must be nearest first: distances %v", dists);
+  ctx.Equal(std::vector<std::string>(ids.begin(), ids.begin() + 3), {"d-1", "d-2", "d-3"}, "the nearest three");
+  ctx.Assert(std::abs(dists[0] - 0.111) < 0.02, "distances must be in km from WITHDIST: d-1 is 0.11 km away, got %v", dists[0]);
+  ctx.Assert(std::abs(dists[9] - 1.112) < 0.03, "d-10 is 1.11 km away, got %v", dists[9]);
+}
+
+void CheckPresenceMget(harness::Ctx& ctx) {
+  seedDrivers(ctx, "paris", true, {{"d-2", 48.857, 2.35}});
+  ctx.Clock.Advance(31);  // d-2 went silent: its presence key expired
+  seedDrivers(ctx, "paris", true, {{"d-7", 48.852, 2.352}, {"d-9", 48.86, 2.37}});
+  seedDrivers(ctx, "paris", false, {{"d-5", 48.83, 2.35}});
+  const storeCalls& calls = standInStore();
+  const size_t before = ctx.Redis.RoundTrips().size();
+  const auto ids = nearestIDs(ctx, "paris", pickupLat, pickupLng, 10).second;
+  std::vector<std::string> commands;
+  const auto trips = ctx.Redis.RoundTrips();
+  for (size_t i = before; i < trips.size(); i++) commands.insert(commands.end(), trips[i].begin(), trips[i].end());
+  ctx.Equal(ids, {"d-7", "d-9"}, "nearest: d-2 and d-5 have no driver:{id}:seen key");
+  int mgets = 0, gets = 0;
+  for (const auto& c : commands) {
+    if (c == "MGET") mgets++;
+    if (c == "GET") gets++;
+  }
+  ctx.Equal(mgets, 1, "presence must be one MGET over every candidate's seen key: MGETs sent (commands: %v)", commands);
+  ctx.Equal(gets, 0, "no GET per driver: GETs sent (commands: %v)", commands);
+  for (const auto& call : calls.calls) {
+    for (const auto& id : call) {
+      ctx.Assert(id != "d-2" && id != "d-5", "silent drivers must be dropped before asking the driver store, which saw %v", calls.calls);
+    }
+  }
+}
+
+void CheckAvailableOnly(harness::Ctx& ctx) {
+  seedDrivers(ctx, "paris", true, {{"d-7", 48.852, 2.352}, {"d-2", 48.857, 2.35}, {"d-9", 48.86, 2.37}, {"d-5", 48.83, 2.35}});
+  const storeCalls& calls = standInStore({{"d-7", "on_trip"}, {"d-9", "offline"}});
+  const auto ids = nearestIDs(ctx, "paris", pickupLat, pickupLng, 10).second;
+  ctx.Equal(ids, {"d-2", "d-5"}, "nearest: d-7 is on_trip and d-9 offline");
+  ctx.Equal(calls.calls.size(), 1, "the driver store must be asked once with every live candidate (calls: %v)", calls.calls);
+  std::vector<std::string> asked = calls.calls[0];
+  std::sort(asked.begin(), asked.end());
+  ctx.Equal(asked, {"d-2", "d-5", "d-7", "d-9"}, "the driver store must be asked about the four live candidates");
+}
+
+void CheckTopK(harness::Ctx& ctx) {
+  seedDrivers(ctx, "paris", true, {{"d-7", 48.852, 2.352}, {"d-2", 48.857, 2.35}, {"d-9", 48.86, 2.37}, {"d-5", 48.83, 2.35}, {"d-3", 48.87, 2.36}});
+  standInStore();
+  auto [found, ids] = nearestIDs(ctx, "paris", pickupLat, pickupLng, 2);
+  ctx.Equal(found.size(), 2, "k=2: drivers returned (%v)", ids);
+  ctx.Equal(ids, {"d-7", "d-2"}, "the two nearest");
+  found = nearestIDs(ctx, "paris", pickupLat, pickupLng, 10).first;
+  ctx.Equal(found.size(), 5, "k=10 with five drivers in range must return all five");
+  standInStore({{"d-7", "on_trip"}});
+  ids = nearestIDs(ctx, "paris", pickupLat, pickupLng, 2).second;
+  ctx.Equal(ids, {"d-2", "d-9"}, "with d-7 on a trip the top 2 (filter first, then cut to k)");
+}
+`,
   },
   debrief: `Redis does the geometry — geohash-encoded sorted set, radius query, sort, distance — and the service does the two things Redis cannot know: who is still reporting and who is free. Asking for more candidates than you need (\`COUNT 20\` for \`k = 3\`) is what keeps the result full after the filters. Real dispatchers query several neighbouring cells instead of one radius, weight drivers by ETA rather than straight-line distance, include drivers about to finish a trip, and run the match as a batch over many riders instead of one at a time.`,
 };

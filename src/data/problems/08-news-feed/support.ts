@@ -356,3 +356,256 @@ var Read = func(ctx context.Context, userID string, cursor *int64, limit int) ([
 }
 `,
 };
+
+/**
+ * The same provided modules for the C++ runtime, as headers (`#include "feed/store.h"`): header-only,
+ * since a program compiles only its step's file.
+ */
+export const supportModulesCpp: Record<string, string> = {
+  'feed/graph.h': `// The follow graph (provided): in-memory tables the harness and your own experiments fill.
+#pragma once
+
+#include <map>
+#include <string>
+#include <vector>
+
+namespace graph {
+
+// followers_of maps an author id to the ids of every user following them.
+inline std::map<std::string, std::vector<std::string>> followers_of;
+
+// celebrities_followed_by maps a user id to the celebrity accounts they follow.
+inline std::map<std::string, std::vector<std::string>> celebrities_followed_by;
+
+// The ids of every user following author.
+inline std::vector<std::string> followers(const std::string& author) {
+  const auto it = followers_of.find(author);
+  return it == followers_of.end() ? std::vector<std::string>{} : it->second;
+}
+
+// The ids of the celebrity accounts user follows (their posts are pulled at read time, not pushed).
+inline std::vector<std::string> celebrities_followed(const std::string& user) {
+  const auto it = celebrities_followed_by.find(user);
+  return it == celebrities_followed_by.end() ? std::vector<std::string>{} : it->second;
+}
+
+}  // namespace graph
+`,
+  'feed/ids.h': `// Post ids carry their creation time: "<created_at ms>-<suffix>".
+#pragma once
+
+#include <cstdint>
+#include <cstdlib>
+#include <string>
+
+#include "feed/uuid.h"
+
+namespace ids {
+
+// A fresh id for a post created at created_at_ms.
+inline std::string new_id(int64_t created_at_ms) {
+  std::string suffix;
+  for (char c : uuid4())
+    if (c != '-' && suffix.size() < 8) suffix += c;
+  return std::to_string(created_at_ms) + "-" + suffix;
+}
+
+// The milliseconds since the epoch encoded in post_id (0 when it has no numeric prefix).
+inline int64_t created_at(const std::string& post_id) {
+  return std::strtoll(post_id.substr(0, post_id.find('-')).c_str(), nullptr, 10);
+}
+
+}  // namespace ids
+`,
+  'feed/uuid.h': `// uuid4() is a random (version 4) UUID, "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".
+#pragma once
+
+#include <random>
+#include <string>
+
+inline std::string uuid4() {
+  static std::mt19937_64 rng{std::random_device{}()};
+  static const char* hex = "0123456789abcdef";
+  std::uniform_int_distribution<int> nibble(0, 15);
+  std::string out;
+  for (int i = 0; i < 32; i++) {
+    if (i == 8 || i == 12 || i == 16 || i == 20) out += '-';
+    int n = nibble(rng);
+    if (i == 12) n = 4;            // version 4
+    if (i == 16) n = 8 | (n & 3);  // variant 10xx
+    out += hex[n];
+  }
+  return out;
+}
+`,
+  'feed/store.h': `// The post store (provided): each post as JSON at post:{id}, the posts:{author} index scored by
+// created_at, the Idempotency-Key dedupe, and the home-timeline facade.
+#pragma once
+
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
+
+// A post as it is stored and published.
+struct Post {
+  std::string id;
+  std::string author;
+  std::string text;
+  std::vector<std::string> media_ids;
+  int64_t created_at = 0;
+  std::string idempotency_key;
+};
+
+// The JSON of a post: {"post_id", "author", "text", "media_ids", "created_at"[, "idempotency_key"]}.
+inline void to_json(nlohmann::json& j, const Post& p) {
+  j = {{"post_id", p.id}, {"author", p.author}, {"text", p.text}, {"media_ids", p.media_ids}, {"created_at", p.created_at}};
+  if (!p.idempotency_key.empty()) j["idempotency_key"] = p.idempotency_key;
+}
+
+inline void from_json(const nlohmann::json& j, Post& p) {
+  p.id = j.value("post_id", "");
+  p.author = j.value("author", "");
+  p.text = j.value("text", "");
+  p.media_ids = j.contains("media_ids") && j["media_ids"].is_array() ? j["media_ids"].get<std::vector<std::string>>()
+                                                                       : std::vector<std::string>{};
+  p.created_at = j.value("created_at", int64_t{0});
+  p.idempotency_key = j.value("idempotency_key", "");
+}
+
+namespace posts {
+
+inline constexpr std::chrono::seconds kPostTtl{3600};
+inline constexpr std::chrono::seconds kIdempotencyTtl{24 * 3600};
+
+inline sw::redis::Redis& store() {
+  static sw::redis::Redis redis("tcp://redis:6379");
+  return redis;
+}
+
+// Store the post and index it under its author. A post whose idempotency key its author already
+// used is that earlier post: post is overwritten with it, and nothing new is stored.
+inline void save(Post& post) {
+  std::string idem;
+  if (!post.idempotency_key.empty()) {
+    idem = "idem:" + post.author + ":" + post.idempotency_key;
+    if (const auto existing = store().get(idem)) {
+      post = nlohmann::json::parse(*existing).get<Post>();
+      return;
+    }
+  }
+  const std::string doc = nlohmann::json(post).dump();
+  store().set("post:" + post.id, doc, kPostTtl);
+  store().zadd("posts:" + post.author, post.id, static_cast<double>(post.created_at));
+  if (!idem.empty()) store().set(idem, doc, kIdempotencyTtl);
+}
+
+// The post post_id, nullopt when there is none.
+inline std::optional<Post> get(const std::string& post_id) {
+  const auto raw = store().get("post:" + post_id);
+  if (!raw) return std::nullopt;
+  return nlohmann::json::parse(*raw).get<Post>();
+}
+
+}  // namespace posts
+
+namespace timeline {
+
+// A page of post ids, newest first, and the cursor of the next page (nullopt after the last).
+struct Page {
+  std::vector<std::string> items;
+  std::optional<int64_t> next_cursor;
+};
+
+// A page of user's home timeline created before cursor (nullopt: from the newest). A variable so
+// the read of step 3 can be plugged in; until then every page is empty.
+inline std::function<Page(const std::string& user, std::optional<int64_t> cursor, int limit)> read =
+    [](const std::string&, std::optional<int64_t>, int) { return Page{}; };
+
+}  // namespace timeline
+`,
+  'feed/events.h': `// Publisher of the "posts" topic (provided): one record per new post, keyed by the author id.
+#pragma once
+
+#include <memory>
+#include <stdexcept>
+#include <string>
+
+#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
+
+#include "feed/store.h"
+
+namespace events {
+
+inline const std::string kTopic = "posts";
+
+inline RdKafka::Producer& producer() {
+  static const std::unique_ptr<RdKafka::Producer> producer = [] {
+    std::string err;
+    const std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+    conf->set("bootstrap.servers", "kafka:9092", err);
+    conf->set("linger.ms", "5", err);
+    return std::unique_ptr<RdKafka::Producer>(RdKafka::Producer::create(conf.get(), err));
+  }();
+  return *producer;
+}
+
+// Produce post to kTopic and return once the broker acknowledged it.
+inline void publish(const Post& post) {
+  const std::string value = nlohmann::json(post).dump();
+  const RdKafka::ErrorCode err =
+      producer().produce(kTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, value.data(),
+                         value.size(), post.author.data(), post.author.size(), 0, nullptr);
+  if (err != RdKafka::ERR_NO_ERROR) throw std::runtime_error("publish: " + RdKafka::err2str(err));
+  producer().flush(10000);
+}
+
+}  // namespace events
+`,
+  'feed/post_json.h': `// A feed::Post as the JSON cached at post:{id}: {"id", "author", "text", "media_ids", "created_at"}.
+#pragma once
+
+#include <cstdint>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
+#include "post.pb.h"
+
+namespace post_json {
+
+inline std::string encode(const feed::Post& post) {
+  return nlohmann::json{{"id", post.id()},
+                        {"author", post.author()},
+                        {"text", post.text()},
+                        {"media_ids", std::vector<std::string>(post.media_ids().begin(), post.media_ids().end())},
+                        {"created_at", post.created_at()}}
+      .dump();
+}
+
+// The post the JSON holds, nullopt when it is not a post.
+inline std::optional<feed::Post> decode(const std::string& text) {
+  const auto j = nlohmann::json::parse(text, nullptr, false);
+  if (!j.is_object() || !j.contains("id") || !j["id"].is_string()) return std::nullopt;
+  feed::Post post;
+  post.set_id(j["id"].get<std::string>());
+  post.set_author(j.value("author", ""));
+  post.set_text(j.value("text", ""));
+  if (j.contains("media_ids") && j["media_ids"].is_array())
+    for (const auto& m : j["media_ids"])
+      if (m.is_string()) post.add_media_ids(m.get<std::string>());
+  post.set_created_at(j.value("created_at", int64_t{0}));
+  return post;
+}
+
+}  // namespace post_json
+`,
+};

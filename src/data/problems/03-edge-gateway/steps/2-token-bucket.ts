@@ -922,6 +922,139 @@ func CheckDeny429(ctx *harness.Ctx) {
 	ctx.Equal(r.Header.Get("X-RateLimit-Remaining"), "0", "X-RateLimit-Remaining on a 429")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <cmath>
+#include <cstdlib>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace {
+
+// rate_limit wrapped around a route the harness registers, counting what got through.
+struct BucketGateway {
+  std::vector<std::string> served;
+  httplib::Server svr;
+  harness::HTTP http;
+
+  explicit BucketGateway(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
+    svr.set_pre_routing_handler(rate_limit);
+    svr.Get(R"(/items/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
+      const std::string id = req.matches[1];
+      served.push_back(id);
+      res.set_content(R"({"id":")" + id + R"("})", "application/json");
+    });
+  }
+
+  std::vector<int> burst(int n, const std::string& key = "k1") {
+    std::vector<int> statuses;
+    for (int i = 0; i < n; i++) statuses.push_back(http.Get("/items/42", "X-API-Key", key).Status);
+    return statuses;
+  }
+};
+
+// n copies of status, then the tail.
+std::vector<int> bucketStatuses(int n, int status, std::vector<int> tail = {}) {
+  std::vector<int> out(static_cast<size_t>(n), status);
+  out.insert(out.end(), tail.begin(), tail.end());
+  return out;
+}
+
+// A token count as Redis holds it; NaN when it is not a number.
+double tokensOf(const std::optional<std::string>& tokens) {
+  if (!tokens) return std::nan("");
+  char* end = nullptr;
+  const double n = std::strtod(tokens->c_str(), &end);
+  return end != tokens->c_str() && *end == 0 ? n : std::nan("");
+}
+
+}  // namespace
+
+void CheckKey(harness::Ctx& ctx) {
+  BucketGateway g(ctx);
+  g.http.Get("/items/42", "X-API-Key", "k1");
+  g.http.Get("/items/42", "X-API-Key", "k2");
+  g.http.Get("/items/42");
+  for (const std::string key : {"bucket:k1", "bucket:k2", "bucket:anonymous"}) {
+    const std::string kind = ctx.Redis.Type(key);
+    ctx.Assert(kind == "hash", "%s is %q after a request (keys: %q), expected a hash with tokens and ts", key, kind,
+               ctx.Redis.Keys("*"));
+    const auto fields = ctx.Redis.HGetAll(key);
+    ctx.Assert(fields.count("tokens") > 0 && fields.count("ts") > 0, "%s has fields %v, expected tokens and ts", key,
+               fields);
+  }
+  const auto tokens = ctx.Redis.HGet("bucket:k1", "tokens");
+  ctx.Assert(tokensOf(tokens) == 9, "bucket:k1 holds %q tokens after one request, expected burst - 1 = 9", tokens);
+}
+
+void CheckAtomicLua(harness::Ctx& ctx) {
+  BucketGateway g(ctx);
+  // Another gateway replica lands right after the first command that touches the bucket — between a
+  // client-side read and its write-back — and spends the whole bucket.
+  ctx.Redis.After("bucket:k1", [&ctx] {
+    const auto ts = ctx.Redis.HGet("bucket:k1", "ts");
+    const std::string at = ts ? *ts : harness::Value(static_cast<double>(ctx.Clock.Now()) / 1000);
+    ctx.Redis.Do("HSET", "bucket:k1", "tokens", 0, "ts", at);
+  });
+  const auto first = g.http.Get("/items/42", "X-API-Key", "k1");
+  ctx.Equal(first.Status, 200, "the first request on a fresh key (%s)", first.Text());
+  ctx.Equal(ctx.Redis.Type("bucket:k1"), "hash", "the request wrote no bucket:k1 hash; its type");
+  const auto tokens = ctx.Redis.HGet("bucket:k1", "tokens");
+  ctx.Assert(tokensOf(tokens) == 0,
+             "bucket:k1 holds %q tokens after another replica emptied it between your read and your write: the "
+             "replica's update was lost. Refill and take must run inside one EVAL/EVALSHA script, not as HMGET … "
+             "HSET from the client",
+             tokens);
+  const auto second = g.http.Get("/items/42", "X-API-Key", "k1");
+  ctx.Equal(second.Status, 429,
+            "with the bucket emptied by another replica the next request (two gateways saw the same last token)");
+}
+
+void CheckRefillCapped(harness::Ctx& ctx) {
+  BucketGateway g(ctx);
+  ctx.Equal(g.burst(11), bucketStatuses(10, 200, {429}), "a fresh key gets a full burst of 10, then 429");
+  ctx.Clock.Advance(1.0);
+  ctx.Equal(g.burst(6), bucketStatuses(5, 200, {429}), "one second at rate 5 refills 5 tokens, so 5 allowed then 429");
+  ctx.Clock.Advance(100.0);
+  ctx.Equal(g.burst(11), bucketStatuses(10, 200, {429}),
+            "after 100 idle seconds the bucket is capped at burst (10), not 500");
+}
+
+void CheckTakeOne(harness::Ctx& ctx) {
+  BucketGateway g(ctx);
+  std::vector<std::string> remaining;
+  for (int i = 0; i < 3; i++) {
+    remaining.push_back(g.http.Get("/items/42", "X-API-Key", "k1").HeaderValue("X-RateLimit-Remaining"));
+  }
+  ctx.Equal(remaining, {"9", "8", "7"}, "X-RateLimit-Remaining over three requests (one token each)");
+  g.burst(7);
+  ctx.Equal(g.burst(5), bucketStatuses(5, 429), "with the bucket empty every request is denied");
+  const auto tokens = ctx.Redis.HGet("bucket:k1", "tokens");
+  const double n = tokensOf(tokens);
+  ctx.Assert(!std::isnan(n) && n >= 0, "bucket:k1 holds %q tokens after denied requests: a denial must not take a token",
+             tokens);
+  ctx.Clock.Advance(0.4);
+  ctx.Equal(g.burst(3), {200, 200, 429},
+            "0.4 s at rate 5 is exactly 2 tokens (a bucket pushed negative by denials would refill less)");
+}
+
+void CheckDeny429(harness::Ctx& ctx) {
+  BucketGateway g(ctx);
+  for (int i = 0; i < 10; i++) {
+    const auto r = g.http.Get("/items/42", "X-API-Key", "k1");
+    ctx.Equal(r.Status, 200, "a request within the burst");
+  }
+  const size_t before = g.served.size();
+  const auto r = g.http.Get("/items/42", "X-API-Key", "k1");
+  const auto other = g.http.Get("/items/42", "X-API-Key", "k2");
+  ctx.Equal(r.Status, 429, "the 11th request on an empty bucket");
+  ctx.Assert(g.served.size() == before + 1 && other.Status == 200,
+             "a denied request must not reach the route, and other keys must be unaffected");
+  ctx.Equal(r.HeaderValue("Retry-After"), "1", "Retry-After (ceil(1 / rate) seconds until one token refills)");
+  ctx.Equal(r.HeaderValue("X-RateLimit-Remaining"), "0", "X-RateLimit-Remaining on a 429");
+}
+`,
   },
   debrief: `A token bucket is two numbers and a clock, which is why it fits in a Redis hash and a dozen lines of Lua. Putting the refill and the take in the script is the whole point: Redis runs scripts one at a time, so every replica of the gateway shares one correct counter without a lock. The \`EXPIRE\` keeps idle keys from living forever, and \`Retry-After\` turns a rejection into advice. Real gateways add a per-route and a global bucket, fail open when Redis is unreachable, and pass \`now\` from the client (as here) rather than calling \`TIME\` inside the script so it stays deterministic under replication.`,
 };

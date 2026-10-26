@@ -530,7 +530,7 @@ Decision allow(const std::string& client_id, long long now_ms) {
   const std::string key = "sw:" + client_id;
   const std::string member = std::to_string(now_ms) + "-" + nonce();
   // TODO: this is four round trips and a race between instances — move it into kScript and evalsha once
-  redis.zremrangebyscore(key, sw::redis::UnboundedInterval<double>{}, sw::redis::LeftOpenInterval<double>{-1e18, static_cast<double>(now_ms - kWindowMs)});
+  redis.zremrangebyscore(key, sw::redis::RightBoundedInterval<double>(static_cast<double>(now_ms - kWindowMs), sw::redis::BoundType::CLOSED));
   if (redis.zcard(key) < kLimit) {
     redis.zadd(key, member, static_cast<double>(now_ms));
     redis.pexpire(key, std::chrono::milliseconds(kWindowMs));
@@ -997,6 +997,148 @@ func CheckUniqueMembers(ctx *harness.Ctx) {
 		ctx.Assert(strings.HasPrefix(z.Member, "5000-"), "members are %q, got %v", "{nowMs}-{nonce}", members)
 	}
 	ctx.Equal(swAllow(ctx, "burst", 5000), swVerdict{false, 1000}, "the 11th call in that millisecond is denied with the full window to wait")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <exception>
+#include <functional>
+#include <set>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+// swVerdict is what allow returned, so a call compares and prints as one value.
+using swVerdict = std::pair<bool, long long>;
+
+const swVerdict swAdmit{true, 0};
+
+swVerdict swAllow(const std::string& clientID, long long nowMs) {
+  const Decision d = allow(clientID, nowMs);
+  return {d.allowed, d.retry_after_ms};
+}
+
+// swAdmits is n admitted verdicts, then the tail.
+std::vector<swVerdict> swAdmits(long long n, std::vector<swVerdict> tail = {}) {
+  std::vector<swVerdict> out(static_cast<size_t>(n), swAdmit);
+  out.insert(out.end(), tail.begin(), tail.end());
+  return out;
+}
+
+}  // namespace
+
+void CheckOneScript(harness::Ctx& ctx) {
+  ctx.Equal(swAllow("c1", 0), swAdmit, "the first call of a fresh client is admitted with retryAfterMs 0");
+  const size_t before = ctx.Redis.RoundTrips().size();
+  for (long long i = 1; i < 12; i++) swAllow("c1", i);
+  const auto all = ctx.Redis.RoundTrips();
+  const std::vector<std::vector<std::string>> trips(all.begin() + static_cast<long>(before), all.end());
+  ctx.Assert(trips.size() == 11, "11 calls after the script is loaded took %d round trips, expected exactly 11: one EVALSHA/EVAL each", trips.size());
+  std::set<std::string> outside;
+  for (const auto& trip : trips) {
+    for (const auto& name : trip) {
+      if (name != "EVAL" && name != "EVALSHA") outside.insert(name);
+    }
+  }
+  ctx.Assert(outside.empty(), "the client sent %s besides EVAL/EVALSHA: trim, count and admit must run inside the script", harness::Value(std::vector<std::string>(outside.begin(), outside.end())));
+  ctx.Equal(ctx.Redis.Type("sw:c1"), "zset", "sw:c1 must be a sorted set: its type");
+}
+
+void CheckLimit(harness::Ctx& ctx) {
+  std::vector<swVerdict> first;
+  for (long long i = 0; i < kLimit; i++) first.push_back(swAllow("alice", 0));
+  ctx.Equal(first, swAdmits(kLimit), "10 calls at nowMs 0 must all be admitted with retry 0");
+  ctx.Equal(ctx.Redis.ZCard("sw:alice"), kLimit, "the members of sw:alice after 10 admits");
+  ctx.Equal(swAllow("alice", 0), swVerdict{false, 1000}, "the 11th call at 0 is denied with retryAfterMs 1000 (oldest at 0 leaves at 1000)");
+  ctx.Equal(swAllow("alice", 400), swVerdict{false, 600}, "at 400 the oldest member (scored 0) leaves in 600 ms");
+  ctx.Equal(swAllow("alice", 999), swVerdict{false, 1}, "at 999 the oldest member leaves in 1 ms");
+  ctx.Equal(ctx.Redis.ZCard("sw:alice"), kLimit, "a denied call must not add a member: the members of sw:alice");
+  ctx.Equal(swAllow("bob", 400), swAdmit, "clients are independent: bob's first call is admitted while alice is full");
+  ctx.Equal(swAllow("alice", 1000), swAdmit, "at 1000 the member scored 0 is out of the window (<= now - window) and one call is admitted");
+}
+
+void CheckSliding(harness::Ctx& ctx) {
+  for (int i = 0; i < 4; i++) ctx.Equal(swAllow("c", 0), swAdmit, "the first 4 calls at 0 are admitted");
+  for (int i = 0; i < 6; i++) ctx.Equal(swAllow("c", 300), swAdmit, "the next 6 calls at 300 are admitted");
+  ctx.Equal(swAllow("c", 300), swVerdict{false, 700}, "full at 300: denied, the oldest (scored 0) leaves at 1000, 700 ms away");
+  std::vector<swVerdict> at1000;
+  for (int i = 0; i < 5; i++) at1000.push_back(swAllow("c", 1000));
+  ctx.Equal(at1000, swAdmits(4, {{false, 300}}), "at 1000 exactly the 4 members scored 0 have left: 4 admits then a denial pointing at the member scored 300 (retry 300)");
+  ctx.Equal(ctx.Redis.ZCard("sw:c"), kLimit, "the members of sw:c: the 4 expired ones trimmed, 4 new ones added");
+  ctx.Equal(swAllow("c", 1299), swVerdict{false, 1}, "at 1299 the member scored 300 leaves in 1 ms");
+  std::vector<swVerdict> at1300;
+  for (int i = 0; i < 7; i++) at1300.push_back(swAllow("c", 1300));
+  ctx.Equal(at1300, swAdmits(6, {{false, 700}}), "at 1300 the 6 members scored 300 have left: 6 admits, then a denial pointing at the member scored 1000 (retry 700)");
+}
+
+void CheckTtl(harness::Ctx& ctx) {
+  ctx.Equal(swAllow("idle", ctx.Clock.Now()), swAdmit, "the first call of a fresh client is admitted");
+  long long pttl = ctx.Redis.PTTL("sw:idle");
+  ctx.Assert(950 <= pttl && pttl <= 1000, "PTTL sw:idle is %d right after an admit, expected windowMs (1000)", pttl);
+  ctx.Clock.Advance(0.3);
+  pttl = ctx.Redis.PTTL("sw:idle");
+  ctx.Assert(650 <= pttl && pttl <= 700, "PTTL sw:idle is %d 300 ms later, expected about 700: the TTL is set once per admit, not refreshed by the clock", pttl);
+  ctx.Equal(swAllow("idle", ctx.Clock.Now()), swAdmit, "the second call is admitted");
+  pttl = ctx.Redis.PTTL("sw:idle");
+  ctx.Assert(950 <= pttl && pttl <= 1000, "PTTL sw:idle is %d after a second admit, expected 1000 again: every admit re-arms PEXPIRE", pttl);
+  ctx.Clock.Advance(1.1);
+  ctx.Equal(ctx.Redis.Exists("sw:idle"), 0, "a client idle for a whole window must leave no key behind");
+  ctx.Equal(swAllow("idle", ctx.Clock.Now()), swAdmit, "after the key expired the client starts a fresh window");
+}
+
+void CheckAtomic(harness::Ctx& ctx) {
+  std::vector<swVerdict> mine;
+  for (int i = 0; i < 7; i++) mine.push_back(swAllow("racer", 0));
+  ctx.Equal(mine, swAdmits(7), "the first 7 calls are admitted");
+  // A second instance's two calls land right after each command of the first instance's that touches
+  // sw:racer, re-armed for its next one, until 40 have landed.
+  std::vector<swVerdict> theirs;
+  std::string theirErr;
+  bool fired = false;
+  std::function<void()> land = [&] {
+    fired = true;
+    for (int i = 0; i < 2; i++) {
+      try {
+        theirs.push_back(swAllow("racer", 0));
+      } catch (const std::exception& e) {
+        if (theirErr.empty()) theirErr = e.what();
+        theirs.push_back({false, 0});
+      }
+    }
+    if (theirs.size() < 40) ctx.Redis.After("sw:racer", land);
+  };
+  ctx.Redis.After("sw:racer", land);
+  for (int i = 0; i < 5; i++) mine.push_back(swAllow("racer", 0));
+  ctx.Assert(fired, "the first instance never touched sw:racer");
+  ctx.Assert(theirErr.empty(), "the second instance's allow returned an error while landing between commands: %s", theirErr);
+  long long admitted = 0;
+  for (const auto& v : mine) admitted += v.first ? 1 : 0;
+  for (const auto& v : theirs) admitted += v.first ? 1 : 0;
+  ctx.Assert(admitted <= kLimit, "two instances admitted %d calls for one client in one window: the second instance landed between the first's commands and both counted the same slot, so the decision must be one script", admitted);
+  ctx.Equal(admitted, kLimit, "the calls two instances together admitted");
+  ctx.Equal(ctx.Redis.ZCard("sw:racer"), kLimit, "the members of sw:racer");
+  ctx.Equal(swAllow("racer", 0), swVerdict{false, 1000}, "both instances deny once the window is full");
+  ctx.Equal(swAllow("racer", 0), swVerdict{false, 1000}, "both instances deny once the window is full");
+}
+
+void CheckUniqueMembers(harness::Ctx& ctx) {
+  std::vector<swVerdict> same;
+  for (int i = 0; i < 9; i++) same.push_back(swAllow("burst", 5000));
+  ctx.Equal(same, swAdmits(9), "9 calls in the same millisecond must all be admitted");
+  ctx.Equal(ctx.Redis.ZCard("sw:burst"), 9, "the members after 9 calls at nowMs 5000: each call must be its own member, not one member rewritten");
+  ctx.Equal(swAllow("burst", 5000), swAdmit, "a second instance's call in the same millisecond is the 10th member");
+  const auto members = ctx.Redis.ZRangeWithScores("sw:burst", 0, -1);
+  std::set<std::string> names;
+  for (const auto& z : members) names.insert(z.Member);
+  ctx.Assert(static_cast<long long>(members.size()) == kLimit && static_cast<long long>(names.size()) == kLimit, "expected 10 distinct members, got %v", members);
+  for (const auto& z : members) {
+    ctx.Assert(z.Score == 5000, "every member is scored by its nowMs (5000), got %v", members);
+    ctx.Assert(z.Member.rfind("5000-", 0) == 0, "members are %q, got %v", "{nowMs}-{nonce}", members);
+  }
+  ctx.Equal(swAllow("burst", 5000), swVerdict{false, 1000}, "the 11th call in that millisecond is denied with the full window to wait");
 }
 `,
   },

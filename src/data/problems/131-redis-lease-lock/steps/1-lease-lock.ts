@@ -969,6 +969,105 @@ func CheckReleaseAtomic(ctx *harness.Ctx) {
 	ctx.Assert(29_000 <= pttl && pttl <= 30_000, "B's fresh lease must be intact: PTTL is %d ms", pttl)
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string kLock = "lock:job";
+
+std::optional<std::string> holder(harness::Ctx& ctx) { return ctx.Redis.Get(kLock); }
+
+}  // namespace
+
+void CheckMutualExclusion(harness::Ctx& ctx) {
+  ctx.Equal(acquire("job", "owner-a", 30'000), true, "the first acquire of a free lock must return true");
+  ctx.Equal(holder(ctx), "owner-a", "lock:job must hold the owner string");
+  ctx.Equal(acquire("job", "owner-b", 30'000), false, "a second owner must be refused while the lock is held: acquire must return false");
+  ctx.Equal(holder(ctx), "owner-a", "a refused acquire must not overwrite the holder: SET needs NX");
+  ctx.Equal(acquire("job", "owner-a", 30'000), false, "the lock is not reentrant: the holder's own second acquire is refused too (NX sees a key)");
+  ctx.Equal(acquire("report", "owner-b", 30'000), true, "a different name is a different lock: lock:report is free");
+  ctx.Equal(ctx.Redis.Keys("*"), {"lock:job", "lock:report"}, "the keys in Redis");
+}
+
+void CheckLeaseTtl(harness::Ctx& ctx) {
+  ctx.Equal(acquire("job", "owner-a", 1500), true, "acquire of a free lock");
+  long long pttl = ctx.Redis.PTTL(kLock);
+  ctx.Assert(1400 <= pttl && pttl <= 1500, "lock:job has PTTL %d ms, expected PX 1500: the lease is ttlMs milliseconds, set in the same SET", pttl);
+  ctx.Clock.Advance(1.0);
+  ctx.Equal(acquire("job", "owner-b", 1500), false, "at 1.0 s the 1.5 s lease is still running: owner-b must be refused");
+  ctx.Equal(holder(ctx), "owner-a", "the holder at 1.0 s");
+  ctx.Clock.Advance(0.6);
+  ctx.Equal(acquire("job", "owner-b", 1500), true, "once the lease has elapsed the lock is free: owner-b must get it without anyone releasing");
+  ctx.Equal(holder(ctx), "owner-b", "lock:job must hold the new owner");
+  pttl = ctx.Redis.PTTL(kLock);
+  ctx.Assert(1400 <= pttl && pttl <= 1500, "the new holder gets a fresh lease: PTTL is %d ms, expected 1500", pttl);
+}
+
+void CheckReleaseOwnerOnly(harness::Ctx& ctx) {
+  ctx.Equal(acquire("job", "owner-a", 30'000), true, "acquire of a free lock");
+  ctx.Equal(release("job", "owner-b"), false, "owner-b never held lock:job: release must return false");
+  ctx.Equal(holder(ctx), "owner-a", "a non-owner's release must leave the lock exactly as it was (a plain DEL frees whoever holds it)");
+  long long pttl = ctx.Redis.PTTL(kLock);
+  ctx.Assert(29'000 <= pttl && pttl <= 30'000, "a non-owner's release must not touch the lease either: PTTL is %d ms, expected about 30000", pttl);
+  ctx.Equal(release("job", "owner-a"), true, "the owner's release must return true");
+  ctx.Equal(holder(ctx), nullptr, "after the owner's release lock:job must be gone");
+  ctx.Equal(release("job", "owner-a"), false, "releasing a lock you no longer hold returns false");
+  // The classic bug: A's lease ran out, B took the lock, and A's late release lands.
+  ctx.Equal(acquire("job", "owner-a", 1000), true, "acquire with a 1 s lease");
+  ctx.Clock.Advance(1.2);
+  ctx.Equal(acquire("job", "owner-b", 30'000), true, "A's lease ran out: B must get the lock");
+  ctx.Equal(release("job", "owner-a"), false, "A's lease ran out and B holds the lock: A's late release must return false");
+  ctx.Equal(holder(ctx), "owner-b", "A's late release must not delete B's lock: compare the value to the owner before deleting");
+  pttl = ctx.Redis.PTTL(kLock);
+  ctx.Assert(29'000 <= pttl && pttl <= 30'000, "B's lease must be intact after A's refused release: PTTL is %d ms", pttl);
+}
+
+void CheckExtendOwnerOnly(harness::Ctx& ctx) {
+  ctx.Equal(acquire("job", "owner-a", 2000), true, "acquire with a 2 s lease");
+  ctx.Clock.Advance(1.5);
+  ctx.Equal(extend("job", "owner-b", 10'000), false, "owner-b does not hold lock:job: extend must return false");
+  long long pttl = ctx.Redis.PTTL(kLock);
+  ctx.Assert(400 <= pttl && pttl <= 500, "a non-owner's extend must not move the lease: PTTL is %d ms, expected about 500 (2000 - 1500)", pttl);
+  ctx.Equal(holder(ctx), "owner-a", "a non-owner's extend must not change the holder");
+  ctx.Equal(extend("job", "owner-a", 10'000), true, "the owner's extend must return true");
+  pttl = ctx.Redis.PTTL(kLock);
+  ctx.Assert(9'900 <= pttl && pttl <= 10'000, "the owner's extend sets the lease to ttlMs from now: PTTL is %d ms, expected 10000 (PEXPIRE, not added to the remainder)", pttl);
+  ctx.Equal(holder(ctx), "owner-a", "extend must keep the holder");
+  ctx.Clock.Advance(1.0);
+  ctx.Equal(holder(ctx), "owner-a", "the extended lease carries past where the original 2 s one ended");
+  ctx.Equal(acquire("job", "owner-b", 1000), false, "owner-b is still refused: the lease was extended");
+  ctx.Equal(extend("ghost", "owner-a", 10'000), false, "extending a lock nobody holds returns false");
+  ctx.Equal(ctx.Redis.Exists("lock:ghost"), 0, "extend must never create a lock: lock:ghost exists");
+  ctx.Clock.Advance(10);
+  ctx.Equal(holder(ctx), nullptr, "the lease ran out");
+  ctx.Equal(extend("job", "owner-a", 10'000), false, "a lease that already ran out cannot be revived: extend must return false");
+  ctx.Equal(ctx.Redis.Exists(kLock), 0, "a refused extend must not recreate lock:job");
+}
+
+void CheckReleaseAtomic(harness::Ctx& ctx) {
+  ctx.Equal(acquire("job", "owner-a", 30'000), true, "acquire of a free lock");
+  // Right after release's first command on lock:job (the GET, if it is a separate command) A's
+  // lease lapses (a GC pause, a slow network) and owner-b takes the lock. A script runs GET and DEL
+  // as one unit, so the takeover lands after both; two commands leave a gap the takeover falls into.
+  bool fired = false;
+  bool result = false;
+  ctx.Redis.After(kLock, [&] {
+    fired = true;
+    ctx.Clock.Advance(31);
+    result = ctx.Redis.Set(kLock, "owner-b", "PX", 30'000, "NX");
+  });
+  release("job", "owner-a");
+  ctx.Assert(fired, "release never touched lock:job: the compare-and-delete must run against lock:{name}");
+  ctx.Equal(result, true, "owner-b's SET NX PX right after release's first command must have succeeded (the lock was free or deleted at that instant)");
+  ctx.Equal(holder(ctx), "owner-b", "owner-b took the lock after release's first command, so it must still hold it: a client-side GET then DEL deleted B's lock. Compare and delete in one Lua script");
+  const long long pttl = ctx.Redis.PTTL(kLock);
+  ctx.Assert(29'000 <= pttl && pttl <= 30'000, "B's fresh lease must be intact: PTTL is %d ms", pttl);
+}
+`,
   },
   debrief: `Three commands carry the whole contract. \`SET NX PX\` makes taking the lock and bounding it one write, so a worker that dies a microsecond later still leaves a key that frees itself — \`SETNX\` followed by \`PEXPIRE\` does not, and that gap is where "stuck forever" locks come from. The owner value turns every later write into a compare-and-write: \`release\` and \`extend\` read the key and act only if it still names the caller, and because Redis runs a Lua script without interleaving other clients, the read and the write see the same world. Done as two commands from the client, the lease can lapse between them and the \`DEL\` lands on the next owner's lock — the race the last check reproduces, and the reason a plain \`DEL\` is wrong even when "we only delete our own locks" is the policy. Real systems add a heartbeat that calls \`extend\` well before the lease ends, a fencing token (a counter handed out with the lock and checked by the resource the lock protects, since a paused holder may still act after its lease ran out), and, when a single Redis is not trustworthy enough, Redlock across several instances or a consensus store.`,
 };

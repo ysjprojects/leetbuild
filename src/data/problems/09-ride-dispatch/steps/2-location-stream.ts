@@ -997,6 +997,184 @@ func CheckCancel(ctx *harness.Ctx) {
 	ctx.Equal(ack.GetCount(), 1, "the server must keep serving new streams after a cancel")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <cmath>
+#include <cstdlib>
+#include <memory>
+#include <mutex>
+#include <streambuf>
+#include <string>
+#include <vector>
+
+namespace {
+
+LocationUpdate locUpdate(const std::string& driverID, double lat, double lng, int64_t ts, const std::string& city) {
+  LocationUpdate u;
+  u.set_driver_id(driverID);
+  u.set_city(city);
+  u.set_lat(lat);
+  u.set_lng(lng);
+  u.set_ts(ts);
+  return u;
+}
+
+// locClient runs the learner's main (it serves Locations on :9000) and dials it.
+std::unique_ptr<dispatch::Locations::Stub> locClient(harness::Ctx& ctx) {
+  ctx.Main();
+  return dispatch::Locations::NewStub(ctx.GRPC.Dial("location:9000"));
+}
+
+// pushUpdates is one client stream: send every update, half-close, wait for the single Ack.
+Ack pushUpdates(harness::Ctx& ctx, dispatch::Locations::Stub& client, const std::vector<LocationUpdate>& updates) {
+  grpc::ClientContext cctx;
+  Ack ack;
+  auto stream = client.UpdateLocations(&cctx, &ack);
+  for (const auto& u : updates) stream->Write(u);  // false once the server ended the call: Finish says why
+  stream->WritesDone();
+  const grpc::Status status = stream->Finish();
+  ctx.Assert(status.ok(), "the stream must end with an Ack: %v %s", status.error_code(), status.error_message());
+  return ack;
+}
+
+struct driverPos {
+  double lng = 0, lat = 0;
+  bool ok = false;
+};
+
+// posOf is the member's GEOPOS in drivers:{city}; ok is false when it is not a member.
+driverPos posOf(harness::Ctx& ctx, const std::string& city, const std::string& driverID) {
+  const harness::Reply found = ctx.Redis.Do("GEOPOS", "drivers:" + city, driverID);
+  if (!found.IsArray() || found.Array().empty()) return {};
+  const harness::Reply pair = found.Array()[0];
+  if (!pair.IsArray() || pair.Array().size() != 2) return {};
+  return {std::strtod(pair.Array()[0].String().c_str(), nullptr), std::strtod(pair.Array()[1].String().c_str(), nullptr), true};
+}
+
+// locLogs tees what the learner writes to std::cerr (Go: the log package's output) until it is
+// destroyed, which restores the previous buffer.
+class locLogs : public std::streambuf {
+ public:
+  locLogs() : previous_(std::cerr.rdbuf(this)) {}
+  ~locLogs() override { std::cerr.rdbuf(previous_); }
+  std::string text() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return text_;
+  }
+
+ protected:
+  int overflow(int c) override {
+    if (c == traits_type::eof()) return traits_type::not_eof(c);
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      text_ += static_cast<char>(c);
+    }
+    return previous_->sputc(static_cast<char>(c));
+  }
+  std::streamsize xsputn(const char* s, std::streamsize n) override {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      text_.append(s, static_cast<size_t>(n));
+    }
+    return previous_->sputn(s, n);
+  }
+  int sync() override { return previous_->pubsync(); }
+
+ private:
+  std::streambuf* previous_;
+  std::mutex mu_;
+  std::string text_;
+};
+
+}  // namespace
+
+void CheckGeoaddLngLat(harness::Ctx& ctx) {
+  auto client = locClient(ctx);
+  pushUpdates(ctx, *client, {locUpdate("d-7", 48.85, 2.35, 1000, "paris"), locUpdate("d-2", 48.86, 2.3, 1000, "paris"), locUpdate("d-l", 45.76, 4.84, 1000, "lyon")});
+  driverPos p = posOf(ctx, "paris", "d-7");
+  ctx.Assert(p.ok, "drivers:paris has no member d-7 after an update (members: %v)", ctx.Redis.Do("ZRANGE", "drivers:paris", 0, -1));
+  ctx.Assert(std::abs(p.lng - 2.35) < 1e-3 && std::abs(p.lat - 48.85) < 1e-3, "d-7 is stored at lng=%.4f lat=%.4f, expected lng=2.35 lat=48.85 (GEOADD takes longitude first)", p.lng, p.lat);
+  p = posOf(ctx, "paris", "d-2");
+  ctx.Assert(p.ok, "drivers:paris has no member d-2 after an update");
+  ctx.Assert(std::abs(p.lng - 2.3) < 1e-3 && std::abs(p.lat - 48.86) < 1e-3, "d-2 is stored at lng=%.4f lat=%.4f, expected lng=2.30 lat=48.86", p.lng, p.lat);
+  ctx.Assert(posOf(ctx, "lyon", "d-l").ok, "an update for city lyon must land in drivers:lyon");
+  ctx.Assert(!posOf(ctx, "paris", "d-l").ok, "a lyon driver must not be added to drivers:paris: the GEO key is per city");
+}
+
+void CheckPresenceTtl(harness::Ctx& ctx) {
+  auto client = locClient(ctx);
+  pushUpdates(ctx, *client, {locUpdate("d-7", 48.85, 2.35, 1000, "paris")});
+  auto seen = ctx.Redis.Get("driver:d-7:seen");
+  ctx.Assert(seen.has_value(), "driver:d-7:seen was not written");
+  ctx.Equal(*seen, "1000", "driver:d-7:seen must hold the update's ts");
+  long long ttl = ctx.Redis.TTL("driver:d-7:seen");
+  ctx.Assert(0 < ttl && ttl <= 30, "driver:d-7:seen has TTL %d, expected kSeenTtl (30 s)", ttl);
+  ctx.Clock.Advance(20);
+  pushUpdates(ctx, *client, {locUpdate("d-7", 48.851, 2.351, 1020, "paris")});
+  ttl = ctx.Redis.TTL("driver:d-7:seen");
+  ctx.Assert(ttl > 25, "a new update must refresh the presence key: TTL is %d after the second update", ttl);
+  ctx.Equal(ctx.Redis.Get("driver:d-7:seen").value_or(""), "1020", "the presence value must be the latest ts");
+  ctx.Clock.Advance(31);
+  ctx.Assert(!ctx.Redis.Get("driver:d-7:seen").has_value(), "31 s after the last update the presence key must have expired");
+  ctx.Assert(posOf(ctx, "paris", "d-7").ok, "the GEO member stays (only the presence key expires)");
+}
+
+void CheckPipelined(harness::Ctx& ctx) {
+  auto client = locClient(ctx);
+  const std::vector<LocationUpdate> updates = {locUpdate("d-7", 48.85, 2.35, 1000, "paris"), locUpdate("d-2", 48.86, 2.3, 1001, "paris"), locUpdate("d-9", 48.84, 2.37, 1002, "paris")};
+  const size_t before = ctx.Redis.RoundTrips().size();
+  pushUpdates(ctx, *client, updates);
+  const auto all = ctx.Redis.RoundTrips();
+  const std::vector<std::vector<std::string>> trips(all.begin() + static_cast<long>(before), all.end());
+  for (const auto& u : updates) {
+    ctx.Assert(posOf(ctx, "paris", u.driver_id()).ok, "%s was not GEOADDed (was the pipeline executed?)", u.driver_id());
+    ctx.Equal(ctx.Redis.Get("driver:" + u.driver_id() + ":seen").value_or(""), std::to_string(u.ts()), "driver:%s:seen", u.driver_id());
+  }
+  size_t direct = 0, pipelines = 0;
+  for (const auto& t : trips) {
+    if (t.size() == 1 && t[0] != "MULTI") direct++;
+    if (t.size() > 1) pipelines++;
+  }
+  ctx.Equal(direct, 0, "commands sent outside a pipeline: GEOADD and SET must travel together in one round trip (round trips: %v)", trips);
+  ctx.Assert(1 <= pipelines && pipelines <= updates.size(), "%d pipelines executed for %d updates; expected one per update (or per small batch)", pipelines, updates.size());
+}
+
+void CheckAckCount(harness::Ctx& ctx) {
+  auto client = locClient(ctx);
+  std::vector<LocationUpdate> four;
+  for (int i = 0; i < 4; i++) four.push_back(locUpdate("d-" + std::to_string(i), 48.85 + i / 1000.0, 2.35, 1000 + i, "paris"));
+  Ack ack = pushUpdates(ctx, *client, four);
+  ctx.Equal(ack.count(), 4, "Ack.count after 4 updates");
+  ack = pushUpdates(ctx, *client, {locUpdate("d-7", 48.85, 2.35, 2000, "paris"), locUpdate("d-7", 48.851, 2.35, 2004, "paris")});
+  ctx.Equal(ack.count(), 2, "a second stream of 2 updates: the count is per stream");
+  ack = pushUpdates(ctx, *client, {});
+  ctx.Equal(ack.count(), 0, "a stream that sent nothing must be acknowledged with count 0");
+}
+
+void CheckCancel(harness::Ctx& ctx) {
+  auto client = locClient(ctx);
+  {
+    locLogs logged;
+    // Go cancels the stream's context.Context; C++ cancels its ClientContext (TryCancel).
+    grpc::ClientContext cctx;
+    Ack ack;
+    auto stream = client->UpdateLocations(&cctx, &ack);
+    stream->Write(locUpdate("d-7", 48.85, 2.35, 1000, "paris"));
+    stream->Write(locUpdate("d-2", 48.86, 2.3, 1001, "paris"));
+    ctx.Settle();
+    ctx.Assert(posOf(ctx, "paris", "d-2").ok, "updates must be applied as they arrive, not only when the stream ends");
+    cctx.TryCancel();
+    ctx.Settle();
+    const grpc::Status status = stream->Finish();
+    ctx.Equal(status.error_code(), grpc::StatusCode::CANCELLED, "after a client cancel the call must end CANCELLED (no Ack)");
+    ctx.Equal(ctx.Redis.ZCard("drivers:paris"), 2, "the two updates before the cancel stay applied: ZCARD drivers:paris");
+    const std::string text = logged.text();
+    ctx.Assert(text.find('2') != std::string::npos, "a cancelled stream must log how many updates were applied (2); logged: %q", text);
+  }
+  const Ack ack = pushUpdates(ctx, *client, {locUpdate("d-9", 48.84, 2.37, 1002, "paris")});
+  ctx.Equal(ack.count(), 1, "the server must keep serving new streams after a cancel");
+}
+`,
   },
   debrief: `A client stream turns thousands of tiny unary calls into one long-lived HTTP/2 stream per driver: no per-message connection setup, back-pressure for free, and one place to notice the driver went away. The write path is deliberately two keys — a GEO set for *where* and a TTL key for *still here* — because a sorted set cannot expire its members. Real location services batch updates per pipeline, shard GEO sets per city cell to spread the write load, map-match the raw GPS onto roads before indexing, and keep a short history per driver to estimate heading and speed.`,
 };

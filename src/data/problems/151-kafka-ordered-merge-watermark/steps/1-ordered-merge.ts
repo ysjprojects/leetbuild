@@ -1002,7 +1002,7 @@ std::unique_ptr<RdKafka::KafkaConsumer> make_consumer() {
 }
 
 auto consumer = make_consumer();
-const std::regex kSensorField(R"("sensor"\\s*:\\s*"([^"]+)")");
+const std::regex kSensorField(R"re("sensor"\\s*:\\s*"([^"]+)")re");
 const std::regex kTsField(R"("ts"\\s*:\\s*(\\d+))");
 
 std::map<int, Partition> partitions;
@@ -1108,7 +1108,7 @@ std::unique_ptr<RdKafka::KafkaConsumer> make_consumer() {
 }
 
 auto consumer = make_consumer();
-const std::regex kSensorField(R"("sensor"\\s*:\\s*"([^"]+)")");
+const std::regex kSensorField(R"re("sensor"\\s*:\\s*"([^"]+)")re");
 const std::regex kTsField(R"("ts"\\s*:\\s*(\\d+))");
 
 std::map<int, Partition> partitions;
@@ -1766,6 +1766,208 @@ func CheckCommitAfterEmit(ctx *harness.Ctx) {
 	ctx.Equal(len(seen), 0, "a commit covered a reading that had not been emitted (partition, committed offset, unemitted offsets below it): %s — commit the lowest buffered offset, not the highest emitted + 1; violations", first)
 	ctx.Equal(ctx.Kafka.CommittedOffset(Group, Topic, 0), 2, "partition 0 must be committed at 2: 12000 at offset 2 is still buffered although offset 3 was emitted")
 	ctx.Equal(ctx.Kafka.CommittedOffset(Group, Topic, 1), 2, "partition 1 must be committed at 2 (11000 at offset 2 buffered)")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <set>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+std::string showStats(const Stats& s) {
+  return harness::Sprintf("{emitted:%d dropped:%d buffered:%d}", s.emitted, s.dropped, s.buffered);
+}
+
+void omReading(harness::Ctx& ctx, int part, int64_t ts) {
+  const std::string sensor = "s" + std::to_string(part);
+  ctx.Kafka.SeedPartition(kTopic, part, sensor, R"({"sensor":")" + sensor + R"(","ts":)" + std::to_string(ts) + "}");
+}
+
+// omSeed puts readings of sensor s{part} on that partition, in this order (6 partitions, like production).
+void omSeed(harness::Ctx& ctx, int part, const std::vector<int64_t>& stamps) {
+  ctx.Kafka.CreateTopic(kTopic, 6);
+  for (const int64_t ts : stamps) omReading(ctx, part, ts);
+}
+
+// omDrain runs the learner's loop with emit; the loop is stopped (its waits end for good) when stop
+// is called, a second of polling later, and by itself once it polled quietSeconds without
+// anything new when quietSeconds > 0 (the TypeScript consumer stops once the topic is drained).
+void omDrain(harness::Ctx& ctx, int quietSeconds, const std::function<void(const Reading&, const std::function<void()>&)>& emit) {
+  if (quietSeconds > 0) ctx.Clock.SetSleepLimit(ctx.Clock.Sleeps() + quietSeconds);
+  const std::function<void()> stop = [&ctx] { ctx.Clock.SetSleepLimit(ctx.Clock.Sleeps() + 2); };
+  ctx.Drain([&] { run([&](const Reading& r) { emit(r, stop); }); });
+}
+
+// omCollect drains the loop for 3 s of silence and returns what it emitted.
+std::vector<Reading> omCollect(harness::Ctx& ctx, const std::function<void(const Reading&)>& also) {
+  std::vector<Reading> emitted;
+  omDrain(ctx, 3, [&](const Reading& r, const std::function<void()>&) {
+    emitted.push_back(r);
+    if (also) also(r);
+  });
+  return emitted;
+}
+
+std::vector<int64_t> omStamps(const std::vector<Reading>& emitted) {
+  std::vector<int64_t> out;
+  for (const auto& r : emitted) out.push_back(r.ts);
+  return out;
+}
+
+}  // namespace
+
+void CheckInOrder(harness::Ctx& ctx) {
+  const std::vector<int64_t> order = {3, 0, 5, 1, 4, 2};
+  std::vector<std::array<int64_t, 3>> seeded;
+  for (int part = 0; part < 6; part++) {
+    std::vector<int64_t> series;
+    for (int64_t i = 0; i < 5; i++) series.push_back(1000 * (1 + order[part] + 6 * i));
+    if (part == 4) series[0] = 3000;  // a tie with partition 5's first reading
+    omSeed(ctx, part, series);
+    for (size_t i = 0; i < series.size(); i++) seeded.push_back({series[i], part, static_cast<int64_t>(i)});
+  }
+  const auto emitted = omCollect(ctx, nullptr);
+  std::vector<std::array<int64_t, 3>> got;
+  for (const auto& r : emitted) got.push_back({r.ts, r.partition, r.offset});
+  ctx.Assert(!got.empty(),
+             "nothing was emitted: 30 readings over six partitions, the slowest partition reaching 25000, must release everything up to 23000");
+  const auto ts = omStamps(emitted);
+  ctx.Assert(std::is_sorted(ts.begin(), ts.end()), "the emitted ts must be non-decreasing; got %v", ts);
+  // partition 1 tops out at 25000: watermark 25000, threshold 23000
+  std::vector<std::array<int64_t, 3>> want;
+  for (const auto& t : seeded)
+    if (t[0] <= 23000) want.push_back(t);
+  std::sort(want.begin(), want.end());
+  ctx.Equal(got, want, "emitted [ts, partition, offset] must be exactly the readings with ts <= 23000 in (ts, partition, offset) order");
+  for (const auto& r : emitted)
+    ctx.Assert(r.sensor == "s" + std::to_string(r.partition), "each emitted reading must carry the sensor from its payload");
+  const Stats s = stats();
+  ctx.Assert(s.emitted == 23 && s.buffered == 7 && s.dropped == 0, "stats() must report emitted 23, buffered 7, dropped 0; got %s",
+             showStats(s));
+}
+
+void CheckWatermarkGates(harness::Ctx& ctx) {
+  omSeed(ctx, 0, {1000, 5000, 9000});
+  omSeed(ctx, 1, {3000, 7000, 11000});
+  omSeed(ctx, 2, {20000});
+  const auto emitted = omCollect(ctx, nullptr);
+  ctx.Equal(omStamps(emitted), {1000, 3000, 5000, 7000},
+            "the watermark is 9000 (partition 0's newest; partition 2 at 20000 does not pull it up) and the threshold 7000: emitted ts");
+  const Stats s = stats();
+  ctx.Equal(s.buffered, 3, "9000, 11000 and 20000 must stay buffered until the slowest partition passes them: stats().buffered");
+  ctx.Assert(s.emitted == 4 && s.dropped == 0, "stats() must report emitted 4, dropped 0; got %s", showStats(s));
+}
+
+void CheckLateDropped(harness::Ctx& ctx) {
+  omSeed(ctx, 0, {1000, 5000, 9000});
+  omSeed(ctx, 1, {3000, 7000, 11000});
+  const auto emitted = omCollect(ctx, [&](const Reading& r) {
+    if (r.ts == 5000) omReading(ctx, 0, 2000);  // lands on partition 0 after the stream has passed 5000
+  });
+  for (const int64_t ts : omStamps(emitted))
+    ctx.Assert(ts != 2000, "a reading with ts 2000 arriving after the frontier reached 5000 must never be emitted; got %v", omStamps(emitted));
+  ctx.Equal(omStamps(emitted), {1000, 3000, 5000, 7000}, "emitted ts");
+  const Stats s = stats();
+  ctx.Equal(s.dropped, 1, "stats().dropped must count the late reading");
+  ctx.Assert(s.emitted == 4 && s.buffered == 2, "stats() must report emitted 4, buffered 2; got %s", showStats(s));
+}
+
+void CheckWithinLateness(harness::Ctx& ctx) {
+  omSeed(ctx, 0, {1000, 5000});
+  omSeed(ctx, 1, {1000, 3000});
+  const auto emitted = omCollect(ctx, [&](const Reading& r) {
+    if (r.ts == 1000 && r.partition == 1 && r.offset == 0) {
+      // frontier 1000, watermark 3000: 1000 equals the frontier and 4000 is behind partition 0
+      // (already at 5000) — both are still in time
+      omReading(ctx, 1, 1000);
+      omReading(ctx, 0, 4000);
+      omReading(ctx, 0, 9000);
+      omReading(ctx, 1, 11000);
+    }
+  });
+  const auto stamps = omStamps(emitted);
+  const bool saw4000 = std::find(stamps.begin(), stamps.end(), 4000) != stamps.end();
+  const auto at1000 = std::count(stamps.begin(), stamps.end(), 1000);
+  ctx.Assert(saw4000,
+             "a reading at 4000 arriving while the frontier is below it is within the lateness allowance and must be emitted, not dropped; got %v",
+             stamps);
+  ctx.Equal(at1000, 3, "a reading whose ts equals the frontier (1000) is not late and must be emitted (emitted %v); readings at 1000", stamps);
+  ctx.Equal(stamps, {1000, 1000, 1000, 3000, 4000, 5000}, "emitted ts (4000 slotted before 5000)");
+  const Stats s = stats();
+  ctx.Equal(s.dropped, 0, "nothing was late: stats().dropped");
+  ctx.Equal(s.buffered, 2, "9000 and 11000 must still be buffered: stats().buffered");
+}
+
+void CheckIdlePartition(harness::Ctx& ctx) {
+  omSeed(ctx, 0, {1000, 5000, 9000, 13000});
+  omSeed(ctx, 1, {3000});
+  std::vector<Reading> emitted;
+  std::map<int64_t, int64_t> at;
+  // the consumer keeps polling through the quiet period; it may stop once 13000 is out
+  omDrain(ctx, 0, [&](const Reading& r, const std::function<void()>& stop) {
+    emitted.push_back(r);
+    at[r.ts] = ctx.Clock.Now();
+    // partition 1 goes quiet; 6 s later (virtual) partition 0 delivers again
+    if (r.ts == 1000) {
+      std::thread([&ctx] {
+        std::this_thread::sleep_for(std::chrono::seconds(6));
+        omReading(ctx, 0, 17000);
+      }).detach();
+    }
+    if (r.ts == 13000) stop();  // the topic is drained again
+  });
+  const auto stamps = omStamps(emitted);
+  const std::vector<int64_t> first(stamps.begin(), stamps.begin() + std::min<size_t>(1, stamps.size()));
+  ctx.Equal(first, {1000}, "before any partition is idle only 1000 is below the threshold (emitted %v); first emit", stamps);
+  ctx.Equal(stamps, {1000, 3000, 5000, 9000, 13000},
+            "after partition 1 was quiet for kIdleMs while partition 0 kept delivering (newest 17000), 3000, 5000, 9000 and 13000 must be released; emitted ts");
+  const int64_t waited = at[3000] - at[1000];
+  ctx.Assert(waited >= 9500, "3000 was emitted %.1f s after 1000: an idle partition is released only after kIdleMs (10 s) without deliveries",
+             static_cast<double>(waited) / 1000);
+  ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, kTopic, 0), 4, "partition 0 must be committed at 4 (17000 at offset 4 still buffered)");
+  ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, kTopic, 1), 1, "partition 1 must be committed at 1 after 3000 was emitted");
+  ctx.Equal(stats().buffered, 1, "17000 (within kLatenessMs of the watermark) must still be buffered: stats().buffered");
+}
+
+void CheckCommitAfterEmit(harness::Ctx& ctx) {
+  omSeed(ctx, 0, {1000, 5000, 12000, 8000, 13000});
+  omSeed(ctx, 1, {3000, 7000, 11000});
+  std::set<std::pair<int, int64_t>> done;
+  std::vector<std::string> violations;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) {
+    for (const auto& [tp, offset] : offsets) {
+      std::vector<int64_t> missing;
+      for (int64_t o = 0; o < offset; o++)
+        if (!done.count({tp.Partition, o})) missing.push_back(o);
+      if (!missing.empty()) violations.push_back(harness::Sprintf("[%d, %d, %v]", tp.Partition, offset, missing));
+    }
+  });
+  const auto emitted = omCollect(ctx, [&](const Reading& r) { done.insert({r.partition, r.offset}); });
+  const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
+  bool joined = false;
+  if (!subscriptions.empty()) {
+    const auto& last = subscriptions.back();
+    joined = last.Group == kGroup && std::find(last.Topics.begin(), last.Topics.end(), kTopic) != last.Topics.end();
+  }
+  ctx.Assert(joined, "the consumer must join group %s on %s; got %v", kGroup, kTopic, subscriptions);
+  ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(), "auto-commit is on: offsets were committed on a timer, ahead of the output");
+  ctx.Assert(!ctx.Kafka.Commits(kGroup).empty(), "nothing was ever committed: commit after each flush that emitted");
+  ctx.Equal(omStamps(emitted), {1000, 3000, 5000, 7000, 8000}, "emitted ts (8000 at offset 3 emitted while 12000 at offset 2 waits)");
+  ctx.Equal(violations.size(), 0,
+            "a commit covered a reading that had not been emitted (partition, committed offset, unemitted offsets below it): %s — commit the lowest buffered offset, not the highest emitted + 1; violations",
+            violations.empty() ? std::string() : violations[0]);
+  ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, kTopic, 0), 2,
+            "partition 0 must be committed at 2: 12000 at offset 2 is still buffered although offset 3 was emitted");
+  ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, kTopic, 1), 2, "partition 1 must be committed at 2 (11000 at offset 2 buffered)");
 }
 `,
   },

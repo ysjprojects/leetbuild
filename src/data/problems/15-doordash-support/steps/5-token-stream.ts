@@ -2133,6 +2133,440 @@ func CheckFallbackDeadline(ctx *harness.Ctx) {
 	ctx.Equal(len(streamHistory(ctx)), before, "a stream that failed with a status answered nothing: conv:<session_id> must not change")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <pqxx/pqxx>
+
+#include <chrono>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <thread>
+
+#include "assistant/chunk.h"
+#include "assistant/config.h"
+#include "assistant/db.h"
+#include "assistant/embed.h"
+#include "assistant/kb.h"
+#include "assistant/model.h"
+#include "assistant/prompt.h"
+#include "guardrail.h"
+#include "kb_search.h"
+#include "support.grpc.pb.h"
+
+namespace {
+
+constexpr auto streamGap = std::chrono::milliseconds(40);  // virtual time between two tokens of the stand-in model: 48 tokens fit in the 2 s deadline
+const std::string streamMethod = "/support.Llm/Stream";    // the full path: the learner's Chat.Stream shares the short name
+const std::string streamSession = "s-7";
+const std::string streamQuestion = "My red card was declined at the restaurant, what do I do?";
+
+const std::vector<prompt::Turn> streamPast = {
+    {"dasher", "Hi, I am at the restaurant for order 4471."},
+    {"assistant", "Hello! What is happening with the order?"},
+};
+
+// streamLLM is the stand-in model server, streaming: one Token per word, streamGap of virtual time between two.
+class streamLLM final : public support::Llm::Service {
+ public:
+  explicit streamLLM(std::string mode) : mode_(std::move(mode)) {}
+
+  grpc::Status Generate(grpc::ServerContext*, const support::GenerateRequest* req, support::GenerateReply* reply) override {
+    const std::string text = model::complete(req->prompt(), req->max_tokens(), mode_);
+    reply->set_text(text);
+    reply->set_tokens(static_cast<int32_t>(model::fields(text).size()));
+    reply->set_model(req->model());
+    return grpc::Status::OK;
+  }
+
+  grpc::Status Stream(grpc::ServerContext* context, const support::GenerateRequest* req,
+                      grpc::ServerWriter<support::Token>* srv) override {
+    const auto tokens = model::tokens(model::complete(req->prompt(), req->max_tokens(), mode_));
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      produced_ = 0;
+      total_ = static_cast<int>(tokens.size());
+      cancelled_ = false;
+    }
+    for (size_t i = 0; i < tokens.size(); i++) {
+      if (context->IsCancelled()) {
+        std::lock_guard<std::mutex> lock(mu_);
+        cancelled_ = true;
+        return grpc::Status::CANCELLED;
+      }
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        produced_++;
+      }
+      support::Token t;
+      t.set_text(tokens[i]);
+      t.set_index(static_cast<int32_t>(i));
+      if (!srv->Write(t)) return grpc::Status::CANCELLED;  // Go: srv.Send's error
+      std::this_thread::sleep_for(streamGap);
+    }
+    return grpc::Status::OK;
+  }
+
+  struct State {
+    int produced, total;
+    bool cancelled;
+  };
+  // state is produced, total and cancelled, read together.
+  State state() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return {produced_, total_, cancelled_};
+  }
+
+ private:
+  std::string mode_;
+  std::mutex mu_;
+  int produced_ = 0;  // tokens handed to the client by the latest stream
+  int total_ = 0;
+  bool cancelled_ = false;
+};
+
+class streamJudge final : public support::Judge::Service {
+ public:
+  grpc::Status Evaluate(grpc::ServerContext*, const support::EvaluateRequest* req, support::Scores* reply) override {
+    const std::vector<std::string> ids(req->context_ids().begin(), req->context_ids().end());
+    const auto s = model::evaluate(req->question(), req->answer(), ids);
+    reply->set_groundedness(static_cast<float>(s.groundedness));
+    reply->set_coherence(static_cast<float>(s.coherence));
+    reply->set_compliance(static_cast<float>(s.compliance));
+    reply->set_pass(s.pass);
+    return grpc::Status::OK;
+  }
+};
+
+// streamWorld is the learner's Chat server in front of the stand-ins.
+struct streamWorld {
+  std::unique_ptr<streamLLM> large, small;
+  std::unique_ptr<support::Chat::Stub> chat;
+
+  int produced() { return large->state().produced + small->state().produced; }
+};
+
+// streamSentences splits an answer on . ! ? as step 4's guardrail does.
+std::vector<std::string> streamSentences(const std::string& text) {
+  std::vector<std::string> out;
+  std::string cur;
+  const auto flush = [&] {
+    const std::string s = model::trim(cur);
+    if (!s.empty()) out.push_back(s);
+    cur.clear();
+  };
+  for (char c : text) {
+    if (c == '.' || c == '!' || c == '?') flush();
+    else cur += c;
+  }
+  flush();
+  return out;
+}
+
+}  // namespace
+
+// The stand-ins for the earlier steps: search as step 2 built it (pgvector over kb_chunks), tier1 and
+// check as step 4 built them (cheap checks, then the judge). Go assigns them to package variables in
+// streamNeighbours; here the course headers declare them and the harness defines them.
+std::vector<Hit> search(const std::string& question, int k) {
+  pqxx::read_transaction tx(db::connection());
+  const auto rows = tx.exec_params(
+      "SELECT id, text, embedding <=> $1::vector AS distance FROM kb_chunks ORDER BY embedding <=> $1::vector LIMIT $2",
+      assistant::to_pgvector(assistant::embed(question)), k);
+  std::vector<Hit> out;
+  for (const auto& row : rows)
+    out.push_back({row["id"].as<std::string>(), row["text"].as<std::string>(), 1.0 - row["distance"].as<double>()});
+  return out;
+}
+
+std::vector<std::string> tier1(const std::string& answer, const std::vector<prompt::Chunk>& chunks) {
+  std::set<std::string> ids;
+  std::vector<std::vector<double>> vectors;
+  for (const auto& c : chunks) {
+    ids.insert(c.id);
+    vectors.push_back(assistant::embed(c.text));
+  }
+  std::vector<std::string> reasons;
+  for (const auto& id : prompt::cited_ids(answer))
+    if (!ids.count(id)) reasons.push_back(harness::Sprintf("cites [kb:%s], which was not retrieved", id));
+  for (const auto& s : streamSentences(answer)) {
+    const auto v = assistant::embed(s);
+    double best = 0.0;
+    for (const auto& w : vectors) best = std::max(best, assistant::cosine(v, w));
+    if (best < config::kMinSimilarity) reasons.push_back(harness::Sprintf("sentence unlike any retrieved chunk: %q", s));
+  }
+  return reasons;
+}
+
+Verdict check(const std::string& question, const std::string& answer, const std::vector<prompt::Chunk>& chunks) {
+  if (auto reasons = tier1(answer, chunks); !reasons.empty()) return Verdict{false, 0, reasons};
+  static auto judge = support::Judge::NewStub(grpc::CreateChannel(config::kJudge, grpc::InsecureChannelCredentials()));
+  support::EvaluateRequest req;
+  req.set_question(question);
+  req.set_answer(answer);
+  for (const auto& c : chunks) req.add_context_ids(c.id);
+  grpc::ClientContext callCtx;
+  callCtx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+  support::Scores scores;
+  const grpc::Status st = judge->Evaluate(&callCtx, req, &scores);
+  if (!st.ok()) return Verdict{false, 0, {"judge " + std::to_string(static_cast<int>(st.error_code()))}};  // Go: status.Code(err).String()
+  return Verdict{scores.pass(), static_cast<double>(scores.groundedness()), {}};
+}
+
+namespace {
+
+// streamStart indexes the KB, serves the model (in mode) and the judge, seeds a history and starts the learner's server.
+std::unique_ptr<streamWorld> streamStart(harness::Ctx& ctx, const std::string& mode) {
+  ctx.DB.Reset(db::kSchema);
+  for (const auto& a : assistant::articles()) {
+    const auto pieces = assistant::chunk(a.body);
+    for (size_t position = 0; position < pieces.size(); position++) {
+      ctx.DB.Exec("INSERT INTO kb_chunks (id, article, position, text, embedding) VALUES ($1, $2, $3, $4, $5::vector)",
+                  harness::Sprintf("%s-%d", a.id, position), a.id, static_cast<int>(position), pieces[position],
+                  assistant::to_pgvector(assistant::embed(pieces[position])));
+    }
+  }
+  for (const auto& t : streamPast) {
+    ctx.Redis.Do("RPUSH", "conv:" + streamSession, nlohmann::json{{"role", t.role}, {"text", t.text}}.dump());
+  }
+  auto w = std::make_unique<streamWorld>();
+  w->large = std::make_unique<streamLLM>(mode);
+  w->small = std::make_unique<streamLLM>(mode);
+  static streamJudge judge;
+  ctx.GRPC.Server(config::kLlmLarge)->RegisterService(w->large.get());
+  ctx.GRPC.Server(config::kLlmSmall)->RegisterService(w->small.get());
+  ctx.GRPC.Server(config::kJudge)->RegisterService(&judge);
+  ctx.Main();
+  w->chat = support::Chat::NewStub(ctx.GRPC.Dial("chat:9000"));
+  return w;
+}
+
+// streamSeen is one ChatEvent, the model's token count and the virtual time when it arrived.
+struct streamSeen {
+  support::ChatEvent event;
+  int produced;
+  int64_t at;
+};
+
+// streamOutcome is every event of one Chat.Stream call and the status it failed with, if any.
+struct streamOutcome {
+  std::vector<streamSeen> seen;
+  grpc::Status err;
+};
+
+std::string codeName(grpc::StatusCode code) {
+  switch (code) {
+    case grpc::StatusCode::OK: return "OK";
+    case grpc::StatusCode::CANCELLED: return "Canceled";
+    case grpc::StatusCode::UNKNOWN: return "Unknown";
+    case grpc::StatusCode::INVALID_ARGUMENT: return "InvalidArgument";
+    case grpc::StatusCode::DEADLINE_EXCEEDED: return "DeadlineExceeded";
+    case grpc::StatusCode::NOT_FOUND: return "NotFound";
+    case grpc::StatusCode::FAILED_PRECONDITION: return "FailedPrecondition";
+    case grpc::StatusCode::UNIMPLEMENTED: return "Unimplemented";
+    case grpc::StatusCode::INTERNAL: return "Internal";
+    case grpc::StatusCode::UNAVAILABLE: return "Unavailable";
+    default: return "Code(" + std::to_string(static_cast<int>(code)) + ")";
+  }
+}
+
+// showEvent is a ChatEvent the way Go's %v prints the message.
+std::string showEvent(const support::ChatEvent& e) {
+  std::string out;
+  const auto add = [&](const std::string& s) { out += (out.empty() ? "" : " ") + s; };
+  if (!e.token().empty()) add(harness::Sprintf("token:%q", e.token()));
+  if (e.done()) add("done:true");
+  for (const auto& s : e.sources()) add(harness::Sprintf("sources:%q", s));
+  if (e.escalated()) add("escalated:true");
+  if (!e.model().empty()) add(harness::Sprintf("model:%q", e.model()));
+  return out;
+}
+
+streamOutcome streamRun(harness::Ctx& ctx, streamWorld& w, const std::string& message, const std::string& session) {
+  streamOutcome out;
+  grpc::ClientContext call;
+  support::ChatRequest req;
+  req.set_session_id(session);
+  req.set_dasher_id("d-9");
+  req.set_message(message);
+  auto reader = w.chat->Stream(&call, req);
+  support::ChatEvent event;
+  while (reader->Read(&event)) out.seen.push_back({event, w.produced(), ctx.Clock.Now()});
+  out.err = reader->Finish();
+  return out;
+}
+
+struct streamSplitResult {
+  std::vector<support::ChatEvent> tokens;
+  support::ChatEvent done;
+  std::string joined;
+};
+
+// streamSplit is the token events and the done event, checked for shape.
+streamSplitResult streamSplit(harness::Ctx& ctx, const streamOutcome& o) {
+  if (!o.err.ok()) {
+    ctx.Fatalf("Chat.Stream failed with %v (%s) after %d event(s)", codeName(o.err.error_code()), o.err.error_message(), o.seen.size());
+  }
+  ctx.Assert(!o.seen.empty(), "Chat.Stream ended without a single event");
+  streamSplitResult r;
+  r.done = o.seen.back().event;
+  ctx.Assert(r.done.done(), "the last event must be the done event, got %v", showEvent(r.done));
+  for (size_t i = 0; i + 1 < o.seen.size(); i++) {
+    const auto& e = o.seen[i].event;
+    ctx.Assert(!e.done() && !e.token().empty(), "every event before the last one carries a token and Done: false");
+    r.tokens.push_back(e);
+    r.joined += e.token();
+  }
+  return r;
+}
+
+// Turns are compared as their "{role text}" forms (Go's %v of a prompt.Turn).
+std::vector<std::string> showTurns(const std::vector<prompt::Turn>& turns) {
+  std::vector<std::string> out;
+  for (const auto& t : turns) out.push_back("{" + t.role + " " + t.text + "}");
+  return out;
+}
+
+std::vector<prompt::Turn> streamHistory(harness::Ctx& ctx) {
+  std::vector<prompt::Turn> turns;
+  for (const auto& raw : ctx.Redis.LRange("conv:" + streamSession, 0, -1)) {
+    prompt::Turn t;
+    const auto j = nlohmann::json::parse(raw, nullptr, false);
+    if (j.is_object()) {
+      if (j.contains("role") && j["role"].is_string()) t.role = j["role"].get<std::string>();
+      if (j.contains("text") && j["text"].is_string()) t.text = j["text"].get<std::string>();
+    }
+    turns.push_back(t);
+  }
+  return turns;
+}
+
+void streamAssertHistory(harness::Ctx& ctx, const std::string& answer) {
+  auto want = streamPast;
+  want.push_back({"dasher", streamQuestion});
+  want.push_back({"assistant", answer});
+  ctx.Equal(showTurns(streamHistory(ctx)), showTurns(want), "conv:%s must hold the two seeded turns, then the dasher's question and the assistant's turn", streamSession);
+  const long long ttl = ctx.Redis.TTL("conv:" + streamSession);
+  ctx.Assert(0 < ttl && ttl <= config::kHistoryTtlS, "conv:%s must expire in config.HistoryTTL (%d) seconds, its TTL is %d", streamSession, config::kHistoryTtlS, ttl);
+}
+
+std::vector<harness::Call> streamCalls(harness::Ctx& ctx, const std::string& target) {
+  return ctx.GRPC.CallsTo(streamMethod, target);
+}
+
+support::GenerateRequest streamRequest(const harness::Call& call) { return call.Request<support::GenerateRequest>(); }
+
+int streamEvaluations(harness::Ctx& ctx) {
+  return static_cast<int>(ctx.GRPC.CallsTo("/support.Judge/Evaluate", config::kJudge).size());
+}
+
+}  // namespace
+
+void CheckTokensStream(harness::Ctx& ctx) {
+  auto w = streamStart(ctx, "faithful");
+  const int64_t started = ctx.Clock.Now();
+  const auto outcome = streamRun(ctx, *w, streamQuestion, streamSession);
+  const auto [tokens, done, joined] = streamSplit(ctx, outcome);
+  const auto large = streamCalls(ctx, config::kLlmLarge);
+  ctx.Equal(large.size(), 1, "a healthy large model is streamed from exactly once: Llm.Stream calls to %s", config::kLlmLarge);
+  const std::string expected = model::complete(streamRequest(large[0]).prompt(), config::kMaxTokens, "faithful");
+  ctx.Equal(joined, expected, "the tokens joined must be the model's text");
+  const int total = w->large->state().total;
+  ctx.Assert(static_cast<int>(tokens.size()) == total, "one ChatEvent per Token: the model produced %d, the app saw %d", total, tokens.size());
+  const auto& first = outcome.seen[0];
+  ctx.Assert(first.produced < total, "the first token reached the app only after the model had produced all %d tokens: relay each Token as it arrives, do not collect the answer first", total);
+  ctx.Assert(first.at - started <= 3 * streamGap.count(), "the first token arrived %d ms (virtual) after the request; the model pauses %v per token, so a relayed first token is there within about a hundred ms", first.at - started, "40ms");
+  const std::vector<std::string> sources(done.sources().begin(), done.sources().end());
+  ctx.Equal(sources, std::vector<std::string>{"red-card-0", "red-card-1"}, "the done event's Sources are the chunk ids the answer cites, in order");
+  ctx.Assert(!done.escalated() && done.model() == "large", "a grounded answer from the large model ends with Escalated: false, Model: \\"large\\", got %v", showEvent(done));
+  ctx.Equal(streamEvaluations(ctx), 1, "the full guardrail check runs once when the stream ends: Evaluate calls");
+  streamAssertHistory(ctx, expected);
+}
+
+void CheckPrompt(harness::Ctx& ctx) {
+  auto w = streamStart(ctx, "faithful");
+  streamSplit(ctx, streamRun(ctx, *w, streamQuestion, streamSession));
+  const auto large = streamCalls(ctx, config::kLlmLarge);
+  ctx.Equal(large.size(), 1, "Llm.Stream calls to %s", config::kLlmLarge);
+  const auto request = streamRequest(large[0]);
+  ctx.Equal(request.model(), std::string("large"), "the request to %s must say Model: \\"large\\"", config::kLlmLarge);
+  ctx.Equal(static_cast<int>(request.max_tokens()), config::kMaxTokens, "the request must carry MaxTokens: config.MaxTokens");
+  // The nearest chunks straight from the database, as search would rank them.
+  const std::string q = assistant::to_pgvector(assistant::embed(streamQuestion));
+  std::vector<prompt::Chunk> ranked;
+  for (auto& r : ctx.DB.Query("SELECT id, text FROM kb_chunks ORDER BY embedding <=> $1::vector LIMIT $2", q, config::kTopK)) {
+    ranked.push_back({r["id"].String(), r["text"].String()});
+  }
+  for (const auto& c : ranked) {
+    ctx.Assert(request.prompt().find("[kb:" + c.id + "] " + c.text) != std::string::npos, "the prompt has no '[kb:%s] <text>' line, one of the %d nearest chunks: the context is search(message) through prompt.Build", c.id, config::kTopK);
+  }
+  for (const auto& t : streamPast) {
+    ctx.Assert(request.prompt().find(t.role + ": " + t.text) != std::string::npos, "the prompt is missing the history turn %s: %q from conv:%s", t.role, t.text, streamSession);
+  }
+  ctx.Equal(request.prompt(), prompt::build_prompt(streamQuestion, ranked, streamPast), "the prompt must be exactly prompt.Build(message, chunks, history): the model parses that format");
+}
+
+void CheckGuardMidStream(harness::Ctx& ctx) {
+  auto w = streamStart(ctx, "verbose");
+  const auto [tokens, done, joined] = streamSplit(ctx, streamRun(ctx, *w, streamQuestion, streamSession));
+  const size_t n = tokens.size();
+  ctx.Assert(n > 40, "the app saw %d tokens: tier 1 fired on an unfinished sentence ('Additionally, please note that this may vary by' alone looks unlike every chunk) — judge complete sentences only", n);
+  ctx.Assert(n <= 48, "the app saw %d tokens: the filler sentence completes at token 44, so the guard at token 48 must stop the stream", n);
+  ctx.Assert(done.escalated() && done.sources().empty(), "a failed tier 1 ends with Escalated: true and no Sources, got %v", showEvent(done));
+  ctx.Equal(done.model(), std::string("large"), "the done event names the model that was streaming");
+  std::this_thread::sleep_for(5 * streamGap);
+  const auto s = w->large->state();
+  ctx.Assert(s.cancelled, "the guard fired but the model stream was not cancelled: the model kept generating tokens nobody will read");
+  ctx.Assert(s.produced < s.total, "after the cancel the model must stop: it produced %d of %d tokens", s.produced, s.total);
+  ctx.Equal(streamEvaluations(ctx), 0, "tier 1 failed mid-stream: the judge is not consulted");
+  streamAssertHistory(ctx, config::kHandoffText);
+}
+
+void CheckGuardAtEnd(harness::Ctx& ctx) {
+  auto w = streamStart(ctx, "hallucinate");
+  const auto [tokens, done, joined] = streamSplit(ctx, streamRun(ctx, *w, streamQuestion, streamSession));
+  const std::string invented = model::complete(streamRequest(streamCalls(ctx, config::kLlmLarge)[0]).prompt(), config::kMaxTokens, "hallucinate");
+  const auto s = w->large->state();
+  ctx.Assert(joined == invented, "the invented sentence completes only at its last token, so all %d tokens are relayed before the guard can see it; the app saw %d", s.total, tokens.size());
+  ctx.Assert(!s.cancelled && s.produced == s.total, "the model's stream ended by itself: nothing to cancel");
+  ctx.Assert(done.escalated() && done.sources().empty(), "the full check fails on [kb:policy-404]: the done event must say Escalated: true with no Sources, got %v", showEvent(done));
+  ctx.Equal(done.model(), std::string("large"), "the done event names the model that was streaming");
+  ctx.Equal(streamEvaluations(ctx), 0, "a tier-1 failure (a citation that was never retrieved) never reaches the judge");
+  streamAssertHistory(ctx, config::kHandoffText);
+}
+
+void CheckFallbackDeadline(harness::Ctx& ctx) {
+  auto w = streamStart(ctx, "faithful");
+  ctx.GRPC.Fail(streamMethod, grpc::StatusCode::UNAVAILABLE, "", 1, config::kLlmLarge);
+  const auto outcome = streamRun(ctx, *w, streamQuestion, streamSession);
+  const auto [tokens, done, joined] = streamSplit(ctx, outcome);
+  ctx.Equal(streamCalls(ctx, config::kLlmLarge).size(), 1, "UNAVAILABLE on a stream is a fallback, not a retry: Llm.Stream calls to %s", config::kLlmLarge);
+  const auto small = streamCalls(ctx, config::kLlmSmall);
+  ctx.Equal(small.size(), 1, "the large model UNAVAILABLE must mean one Llm.Stream call to %s", config::kLlmSmall);
+  ctx.Assert(streamRequest(small[0]).model() == "small" && streamRequest(small[0]).prompt() == streamRequest(streamCalls(ctx, config::kLlmLarge)[0]).prompt(), "the fallback sends the same prompt with Model: \\"small\\"");
+  const std::string expected = model::complete(streamRequest(small[0]).prompt(), config::kMaxTokens, "faithful");
+  ctx.Equal(joined, expected, "the small model's tokens must reach the app");
+  ctx.Assert(done.model() == "small" && !done.escalated(), "the done event must say Model: \\"small\\", Escalated: false, got %v", showEvent(done));
+  const int smallTotal = w->small->state().total;
+  ctx.Assert(outcome.seen[0].produced < smallTotal, "the small model's tokens must be relayed as they arrive too");
+  streamAssertHistory(ctx, expected);
+  // A large model that is silent for 3 s: the deadline on the call ends the wait at config.DeadlineS.
+  ctx.GRPC.SetLatency(streamMethod, 3.0, config::kLlmLarge);
+  const size_t before = streamHistory(ctx).size();
+  const int64_t started = ctx.Clock.Now();
+  const auto stalled = streamRun(ctx, *w, streamQuestion, "s-8");
+  const int64_t elapsed = ctx.Clock.Now() - started;
+  ctx.Assert(!stalled.err.ok(), "a large model silent past config.DeadlineS must end the chat stream with DEADLINE_EXCEEDED; it answered %d event(s) instead", stalled.seen.size());
+  ctx.Equal(codeName(stalled.err.error_code()), codeName(grpc::StatusCode::DEADLINE_EXCEEDED), "the chat stream must end with DEADLINE_EXCEEDED");
+  const auto calls = streamCalls(ctx, config::kLlmLarge);
+  const auto& call = calls.back();
+  ctx.Assert(call.HasDeadline() && 1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.0, "the Llm.Stream call must carry a deadline of config.DeadlineS (%v s), got %vs", 2, call.TimeoutSeconds());
+  ctx.Assert(elapsed <= 2500, "the deadline must end the wait at %v s of virtual time, the stream waited %d ms (3000 means the model's stall was waited out)", 2, elapsed);
+  ctx.Equal(streamCalls(ctx, config::kLlmSmall).size(), 1, "a deadline is not a fallback: the budget is spent, the small model must not be called");
+  ctx.Equal(streamHistory(ctx).size(), before, "a stream that failed with a status answered nothing: conv:<session_id> must not change");
+}
+`,
   },
   debrief: `Streaming changes what "fast" means. A unary answer is judged by one number — time to the reply — while a stream is judged by two: time to the first token, which is what the Dasher feels as responsiveness, and time between tokens, which is what they feel as the answer being typed. LinkedIn's platform post makes those the metrics the serving layer is held to, and they are why a relay that collects the whole answer before writing anything is wrong even though it sends the same bytes: it turns the stream back into a unary call with extra steps. The deadline does not move — gRPC bounds the whole call, so the answer has to stream within it and a model slow to start spends the answer's time — but the fallback moves with the metric: \`UNAVAILABLE\` before the first token is cheap to redirect to a smaller model, while a model that dies mid-answer has already shown the Dasher half a sentence, and the honest outcome is a status the app can act on. The guard moves too, and loses something on the way. Tier 1 needs a complete sentence to compare against the chunks, so it runs on a trailing window and sees an invented sentence only at its full stop: the hallucinating model's one sentence reaches the app before the handoff does, which a unary guardrail would never have allowed. What the incremental guard buys is the cancel. A model that has gone off the rails will happily produce a hundred more tokens, each one a slice of GPU time that nobody will read; cancelling the upstream stream the moment tier 1 fails is how the server stops paying for them, and in production the cancellation has to propagate all the way to the inference engine, which is why serving stacks treat client disconnects and cancellations as first-class events rather than letting the request run to completion. Production adds what this step leaves out: a first-token timer and an idle timeout between tokens inside the call's deadline, a client that reconnects with the tokens it already has, and the offline judge of the next step scoring every streamed turn — including the ones the Dasher saw half of.`,
 };

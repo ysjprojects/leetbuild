@@ -1141,6 +1141,150 @@ func CheckTopEndpoint(ctx *harness.Ctx) {
 	ctx.Equal(todayCodes, []string{"today2", "today1"}, "without ?day the endpoint reads today's set (%s)", today)
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+#include <nlohmann/json.hpp>
+
+#include <cstdio>
+#include <ctime>
+#include <initializer_list>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string clickDay = "2026-10-05";
+constexpr double clickTs = 1791201600;  // 2026-10-05 12:00:00 UTC
+constexpr double nextClickTs = clickTs + 86400;
+const std::string dayZKey = "top:" + clickDay;
+
+void seedClickAt(harness::Ctx& ctx, const std::string& code, double ts) {
+  ctx.Kafka.Seed("clicks", code, nlohmann::json{{"code", code}, {"ts", ts}, {"referrer", nullptr}, {"ua", nullptr}});
+}
+
+// seedClicks puts one click per code on clicks, on clickDay; seedClickAt picks the timestamp.
+void seedClicks(harness::Ctx& ctx, std::initializer_list<std::string> codes) {
+  for (const auto& code : codes) seedClickAt(ctx, code, clickTs);
+}
+
+// drainWorker runs the consume loop until it waits for clicks. Its consume(1000) idles in 1 s polls
+// of virtual time (Go's ReadMessage blocks instead), so a few of them end the drain and the clock
+// stays where the clicks were counted.
+void drainWorker(harness::Ctx& ctx) {
+  ctx.Clock.SetSleepLimit(ctx.Clock.Sleeps() + 5);
+  ctx.Drain([] { run(); });
+}
+
+// The JSON array a response carries (an empty one when it is not an array).
+nlohmann::json rowsOf(const harness::Response& r) {
+  const auto rows = nlohmann::json::parse(r.Text(), nullptr, false);
+  return rows.is_array() ? rows : nlohmann::json::array();
+}
+
+std::string codeOf(const nlohmann::json& row) {
+  return row.is_object() && row.contains("code") && row["code"].is_string() ? row["code"].get<std::string>() : "";
+}
+
+}  // namespace
+
+void CheckConsumer(harness::Ctx& ctx) {
+  seedClicks(ctx, {"g9Xc"});
+  drainWorker(ctx);
+  const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
+  ctx.Assert(!subscriptions.empty(), "the consumer must subscribe to a topic");
+  const auto& last = subscriptions.back();
+  ctx.Equal(last.Group, "top-links", "group.id must be top-links");
+  bool subscribed = false;
+  for (const auto& t : last.Topics) subscribed = subscribed || t == "clicks";
+  ctx.Assert(subscribed, "the consumer must subscribe to clicks, got %q", last.Topics);
+  const auto consumers = ctx.Kafka.Consumers();
+  ctx.Assert(!consumers.empty(), "the consumer must subscribe to a topic");
+  ctx.Equal(consumers.back().AutoCommit, false, "auto-commit is on: offsets would be acknowledged on a timer, before the click is counted");
+  ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(), "offsets were auto-committed");
+  ctx.Assert(!ctx.Kafka.EventsOf("manual-commit").empty(), "no explicit commit happened after processing");
+  ctx.Equal(ctx.Kafka.Lag("top-links", "clicks"), 0, "every processed record must be committed; lag");
+}
+
+void CheckZincrby(harness::Ctx& ctx) {
+  seedClicks(ctx, {"g9Xc", "zz12", "g9Xc"});
+  seedClickAt(ctx, "g9Xc", nextClickTs);
+  seedClicks(ctx, {"g9Xc"});
+  drainWorker(ctx);
+  ctx.Equal(ctx.Redis.Type(dayZKey), "zset", "the type of %s (keys: %q)", dayZKey, ctx.Redis.Keys("*"));
+  ctx.Equal(ctx.Redis.ZScore(dayZKey, "g9Xc").value_or(0), 3, "the score of g9Xc in %s", dayZKey);
+  ctx.Equal(ctx.Redis.ZScore(dayZKey, "zz12").value_or(0), 1, "the score of zz12 in %s", dayZKey);
+  const std::string nextKey = day_key(nextClickTs);
+  ctx.Equal(ctx.Redis.ZScore(nextKey, "g9Xc").value_or(0), 1, "a click on the next day counts in %s: the score of g9Xc", nextKey);
+}
+
+void CheckExpire(harness::Ctx& ctx) {
+  seedClicks(ctx, {"g9Xc"});
+  drainWorker(ctx);
+  const long long ttl = ctx.Redis.TTL(dayZKey);
+  ctx.Assert(ttl > 0, "%s has no expiry (TTL %d): day leaderboards would accumulate forever", dayZKey, ttl);
+  ctx.Assert(604800 - 60 <= ttl && ttl <= 604800, "%s expires in %d s, expected 7 days (604800)", dayZKey, ttl);
+  ctx.Clock.Advance(604801);
+  ctx.Equal(ctx.Redis.Exists(dayZKey), 0, "%s must be gone after 7 days", dayZKey);
+}
+
+void CheckCommitAfter(harness::Ctx& ctx) {
+  seedClicks(ctx, {"g9Xc"});
+  ctx.Kafka.Seed("clicks", "bad", "not json");
+  ctx.Kafka.Seed("clicks", "bad", R"({"referrer":null})");
+  const auto click = ctx.Kafka.Records("clicks")[0];
+  struct commitSnapshot {
+    harness::KafkaOffsets offsets;
+    double score;  // 0 while g9Xc is not in the set
+  };
+  std::vector<commitSnapshot> atCommit;
+  ctx.Kafka.OnCommit([&ctx, &atCommit](const std::string&, const harness::KafkaOffsets& offsets) {
+    atCommit.push_back({offsets, ctx.Redis.ZScore(dayZKey, "g9Xc").value_or(0)});
+  });
+  drainWorker(ctx);
+  ctx.Assert(!atCommit.empty(), "no offset was ever committed");
+  std::vector<double> covering;
+  for (const auto& snap : atCommit) {
+    const auto at = snap.offsets.find(harness::KafkaTopicPartition{"clicks", click.Partition});
+    if (at != snap.offsets.end() && at->second > click.Offset) covering.push_back(snap.score);
+  }
+  ctx.Assert(!covering.empty(), "the g9Xc click was never committed");
+  ctx.Equal(covering[0], 1, "the commit must come after ZINCRBY: the score of g9Xc when its click was committed");
+  ctx.Equal(ctx.Kafka.Lag("top-links", "clicks"), 0, "malformed records must be skipped and committed, not left to replay forever; lag");
+  ctx.Equal(ctx.Redis.ZCard(dayZKey), 1, "malformed records must not be counted (%v); members of %s", ctx.Redis.ZRangeWithScores(dayZKey, 0, -1), dayZKey);
+}
+
+void CheckTopEndpoint(harness::Ctx& ctx) {
+  std::vector<std::string> codes;
+  for (int i = 0; i < 12; i++) {
+    char code[8];
+    std::snprintf(code, sizeof code, "code%02d", i);
+    codes.push_back(code);
+    ctx.Redis.Do("ZADD", dayZKey, 100 - i, code);
+  }
+  auto c = ctx.Main().HTTP();
+  auto r = c.Get("/top?day=" + clickDay);
+  ctx.Equal(r.Status, 200, "GET /top?day=%s", clickDay);
+  const auto rows = rowsOf(r);
+  ctx.Assert(rows.size() == 10, "expected the 10 top codes, got %s", r.Text());
+  std::vector<std::string> gotCodes;
+  std::vector<double> gotClicks, wantClicks;
+  for (size_t i = 0; i < rows.size(); i++) {
+    gotCodes.push_back(codeOf(rows[i]));
+    gotClicks.push_back(rows[i].is_object() && rows[i].contains("clicks") && rows[i]["clicks"].is_number() ? rows[i]["clicks"].get<double>() : 0);
+    wantClicks.push_back(100 - static_cast<double>(i));
+  }
+  ctx.Equal(gotCodes, std::vector<std::string>(codes.begin(), codes.begin() + 10), "rows must be in descending score order");
+  ctx.Equal(gotClicks, wantClicks, "each row carries the click count (%s)", r.Text());
+  const std::time_t now = static_cast<std::time_t>(ctx.Clock.Now() / 1000);
+  char date[16];
+  std::strftime(date, sizeof date, "%Y-%m-%d", std::gmtime(&now));
+  const std::string today = std::string("top:") + date;
+  ctx.Redis.Do("ZADD", today, 2, "today1", 5, "today2");
+  r = c.Get("/top");
+  std::vector<std::string> todayCodes;
+  for (const auto& row : rowsOf(r)) todayCodes.push_back(codeOf(row));
+  ctx.Equal(todayCodes, std::vector<std::string>{"today2", "today1"}, "without ?day the endpoint reads today's set (%s)", today);
+}
+`,
   },
   debrief: `A sorted set is the leaderboard data structure: ZINCRBY keeps it ordered on every write, and the top 10 is one O(log n + 10) read — no scan, no sort at query time. Keying by day gives a natural partition and a natural expiry; a 7-day TTL bounds memory without any cleanup job. Where the commit sits relative to the increment decides the guarantee: process-then-commit is at-least-once, and a leaderboard can afford a rare duplicate. Real analytics pipelines also keep a hourly set, merge days with ZUNIONSTORE for "this week", and write the raw clicks to a warehouse for the questions a sorted set cannot answer (clicks by country, by referrer).`,
 };

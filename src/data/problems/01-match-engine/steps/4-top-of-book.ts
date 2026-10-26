@@ -557,6 +557,119 @@ func CheckAtomic(ctx *harness.Ctx) {
 	ctx.Assert((*received)[0] != "reader saw the hash", "a reader saw the new book:ACME before any tick announced it: without MULTI/EXEC (TxPipelined) a reader can see one command without the other")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <exception>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace {
+
+// strconv.ParseFloat: the whole text as a number, nullopt otherwise.
+std::optional<double> parseFloat(const std::string& text) {
+  char* end = nullptr;
+  const double n = std::strtod(text.c_str(), &end);
+  if (text.empty() || end != text.c_str() + text.size()) return std::nullopt;
+  return n;
+}
+
+void publishTop(harness::Ctx& ctx, const std::string& symbol, double bid, double ask, double last) {
+  try {
+    publish_top_of_book(symbol, bid, ask, last);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("publish_top_of_book(%q, %v, %v, %v) threw: %s", symbol, bid, ask, last, e.what());
+  }
+}
+
+// tickListener is another connection subscribed to ticks:{symbol}: every message it received, in order.
+std::shared_ptr<std::vector<std::string>> tickListener(harness::Ctx& ctx, const std::string& symbol) {
+  auto received = std::make_shared<std::vector<std::string>>();
+  ctx.Redis.Subscribe("ticks:" + symbol, [received](const std::string&, const std::string& message) { received->push_back(message); });
+  return received;
+}
+
+// numericHash is the hash with every value read as a number.
+std::map<std::string, double> numericHash(harness::Ctx& ctx, const std::string& key) {
+  std::map<std::string, double> out;
+  for (const auto& [k, v] : ctx.Redis.HGetAll(key)) {
+    const auto n = parseFloat(v);
+    ctx.Assert(n.has_value(), "%s field %s holds %q, not a number", key, k, v);
+    out[k] = *n;
+  }
+  return out;
+}
+
+// asNumber is the TypeScript Number(v ?? -1): a JSON number, or a string holding one.
+harness::Any asNumber(const harness::Any& v) {
+  if (v.IsNil()) return harness::Any(-1.0);
+  if (v.IsString()) {
+    if (const auto n = parseFloat(v.String())) return harness::Any(*n);
+  }
+  return v;
+}
+
+}  // namespace
+
+void CheckHash(harness::Ctx& ctx) {
+  publishTop(ctx, "ACME", 10.05, 10.06, 10.05);
+  ctx.Equal(ctx.Redis.Type("book:ACME"), "hash", "the type of book:ACME");
+  const long long ttl = ctx.Redis.TTL("book:ACME");
+  ctx.Equal(ttl, -1, "book:ACME has a TTL of %d s; the top of book is state, not a cache entry; TTL", ttl);
+  publishTop(ctx, "ACME", 10.07, 10.08, 10.07);
+  ctx.Equal(numericHash(ctx, "book:ACME")["bid"], 10.07, "a second update must overwrite the hash with the current top of book; bid");
+}
+
+void CheckFields(harness::Ctx& ctx) {
+  publishTop(ctx, "ACME", 10.05, 10.06, 10.0);
+  std::vector<std::string> fields;
+  for (const auto& [k, v] : ctx.Redis.HGetAll("book:ACME")) fields.push_back(k);
+  std::sort(fields.begin(), fields.end());
+  ctx.Equal(fields, {"ask", "bid", "last"}, "book:ACME must have exactly the fields bid, ask, last");
+  ctx.Equal(numericHash(ctx, "book:ACME"), std::map<std::string, double>{{"bid", 10.05}, {"ask", 10.06}, {"last", 10.0}},
+            "book:ACME must hold bid 10.05, ask 10.06, last 10.0");
+  publishTop(ctx, "NEW", 0, 10.5, 0);
+  ctx.Equal(numericHash(ctx, "book:NEW"), std::map<std::string, double>{{"bid", 0}, {"ask", 10.5}, {"last", 0}},
+            "an empty side (0) must still be stored as 0");
+}
+
+void CheckPublish(harness::Ctx& ctx) {
+  const auto received = tickListener(ctx, "ACME");
+  const auto other = tickListener(ctx, "BETA");
+  publishTop(ctx, "ACME", 10.05, 10.06, 10.05);
+  ctx.Settle();
+  ctx.Assert(!received->empty(), "nothing was published on ticks:ACME");
+  const std::string first = (*received)[0];
+  const auto parsed = harness::ParseJSON(first);
+  ctx.Assert(parsed.has_value(), "the tick must be JSON, got %q", first);
+  const harness::Any& tick = *parsed;
+  ctx.Equal(tick["symbol"], "ACME", "the tick must name the symbol, got %s; symbol", first);
+  ctx.Equal(std::vector<harness::Any>{asNumber(tick["bid"]), asNumber(tick["ask"]), asNumber(tick["last"])}, {10.05, 10.06, 10.05},
+            "the tick must repeat bid/ask/last, got %s", first);
+  ctx.Equal(other->size(), 0, "the tick for ACME leaked onto ticks:BETA; messages there");
+}
+
+void CheckAtomic(harness::Ctx& ctx) {
+  ctx.Redis.Do("HSET", "book:ACME", "bid", "1", "ask", "2", "last", "1");
+  const auto received = tickListener(ctx, "ACME");
+  // Two readers that land between the commands, as another connection's request would: one reads
+  // the hash the moment a tick is out, the other announces itself the moment the hash changed.
+  std::optional<std::string> bidWhenTickOut;
+  ctx.Redis.After("ticks:ACME", [&] { bidWhenTickOut = ctx.Redis.HGet("book:ACME", "bid"); });
+  ctx.Redis.After("book:ACME", [&] { ctx.Redis.Publish("ticks:ACME", "reader saw the hash"); });
+  publishTop(ctx, "ACME", 10.05, 10.06, 10.05);
+  ctx.Settle();
+  ctx.Assert(!ctx.Redis.HGetAll("book:ACME").empty() && !received->empty(), "the hash and the tick must both be produced");
+  ctx.Equal(asNumber(harness::Any::Of(bidWhenTickOut)), 10.05,
+            "the tick was published while book:ACME still held an older bid: a reader woken by the tick would read a stale hash. hset and publish belong in one redis.transaction(); bid when the tick was out");
+  ctx.Assert((*received)[0] != "reader saw the hash",
+             "a reader saw the new book:ACME before any tick announced it: without MULTI/EXEC (redis.transaction()) a reader can see one command without the other");
+}
+`,
   },
   debrief: `Two commands, one unit: the transaction is what lets the next step trust a subscriber's tick without re-reading the hash, and lets the snapshot endpoint trust the hash without a tick. The hash has no TTL because expiring it would turn "stale" into "absent", which is a worse lie. A single writer per key (thanks to the partition key) keeps the transaction simple — no WATCH, no Lua. Real market-data feeds add a sequence number to every tick so subscribers can detect gaps, keep the full depth (\`ZADD\` per price level, or a proper feed handler), and multicast at the network layer instead of Pub/Sub, which drops messages for slow subscribers.`,
 };

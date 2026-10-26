@@ -739,6 +739,127 @@ func CheckFlush(ctx *harness.Ctx) {
 	ctx.Equal(len(ctx.Kafka.Records("clicks")), 1, "shutdown() must flush the buffered clicks to the broker")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+#include <nlohmann/json.hpp>
+
+#include <iostream>
+#include <mutex>
+#include <streambuf>
+#include <string>
+#include <vector>
+
+namespace {
+
+// clickWarnings collects what the learner writes to std::cerr (Go: the log package's output), still
+// passing it on to the original output, until it is destroyed.
+class clickWarnings : public std::streambuf {
+ public:
+  clickWarnings() : previous_(std::cerr.rdbuf(this)) {}
+  ~clickWarnings() override { std::cerr.rdbuf(previous_); }
+
+  // How many bytes were written so far.
+  int written() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return static_cast<int>(text_.size());
+  }
+
+ protected:
+  int overflow(int c) override {
+    if (c == traits_type::eof()) return traits_type::not_eof(c);
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      text_ += static_cast<char>(c);
+    }
+    return previous_->sputc(static_cast<char>(c));
+  }
+  std::streamsize xsputn(const char* s, std::streamsize n) override {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      text_.append(s, static_cast<size_t>(n));
+    }
+    return previous_->sputn(s, n);
+  }
+  int sync() override { return previous_->pubsync(); }
+
+ private:
+  std::streambuf* previous_;
+  std::mutex mu_;
+  std::string text_;
+};
+
+// settleClicks lets the producer's linger pass and its deliveries settle. librdkafka writes a record
+// the broker sat on from its own threads once the broker answers; the model writes it at the
+// producer's next call, so the harness makes one (poll(0)) once a 2 s stall is over (Go's Settle
+// jumps the clock to the stall's end, where its producer goroutine waits).
+void settleClicks(harness::Ctx& ctx) {
+  ctx.Clock.Advance(2);
+  ctx.Settle();
+  producer->poll(0);
+}
+
+// clickWhileStalled is record_click while the broker sits on its acknowledgements for 2 s: it must not sit with it.
+void clickWhileStalled(harness::Ctx& ctx) {
+  ctx.Kafka.StallFor("clicks", 2);
+  const int64_t before = ctx.Clock.Now();
+  record_click("g9Xc", "", "");
+  const int64_t waited = ctx.Clock.Now() - before;
+  ctx.Assert(waited < 1000, "record_click took %d ms while the broker was not acknowledging: the redirect would wait for the broker", waited);
+}
+
+}  // namespace
+
+void CheckTopic(harness::Ctx& ctx) {
+  record_click("g9Xc", "https://news.example/", "Mozilla/5.0");
+  settleClicks(ctx);
+  const auto produced = ctx.Kafka.Records("clicks");
+  ctx.Assert(produced.size() == 1, "expected one record on clicks, found %d (topics: %q)", produced.size(), ctx.Kafka.Topics());
+  const std::string value = produced[0].Value.value_or("");
+  const auto event = nlohmann::json::parse(value, nullptr, false);
+  ctx.Assert(event.is_object(), "the value must be JSON: %q", value);
+  const auto text = [&event](const char* key) {
+    return event.contains(key) && event[key].is_string() ? event[key].get<std::string>() : std::string("<nil>");
+  };
+  ctx.Equal(text("code"), "g9Xc", "the value must be JSON carrying the code (%s)", value);
+  ctx.Assert(text("referrer") == "https://news.example/" && text("ua") == "Mozilla/5.0", "the value must carry referrer and ua: %s", value);
+  ctx.Assert(event.contains("ts"), "the event must carry a timestamp");
+}
+
+void CheckKeyed(harness::Ctx& ctx) {
+  record_click("g9Xc", "", "");
+  record_click("g9Xc", "https://other.example/", "");
+  record_click("zz12", "", "");
+  settleClicks(ctx);
+  ctx.Equal(ctx.Kafka.Keys("clicks"), std::vector<std::string>{"g9Xc", "g9Xc", "zz12"}, "records must be keyed by the code");
+  const auto produced = ctx.Kafka.Records("clicks");
+  ctx.Equal(produced[0].Partition, produced[1].Partition, "the same code must land on the same partition");
+}
+
+void CheckNonBlocking(harness::Ctx& ctx) {
+  clickWhileStalled(ctx);
+  settleClicks(ctx);
+  ctx.Equal(ctx.Kafka.Records("clicks").size(), 1, "the click must still be handed to the producer");
+  clickWhileStalled(ctx);
+  settleClicks(ctx);
+  ctx.Equal(ctx.Kafka.Records("clicks").size(), 2, "records on clicks after the second click");
+}
+
+void CheckCallback(harness::Ctx& ctx) {
+  clickWarnings warnings;
+  ctx.Kafka.FailNext("clicks", 1);
+  record_click("g9Xc", "", "");  // the failure arrives through the delivery report callback, not as an error
+  settleClicks(ctx);
+  record_click("g9Xc", "", "");
+  shutdown();
+  ctx.Assert(warnings.written() > 0, "a failed delivery must be logged by the delivery report callback");
+  ctx.Equal(ctx.Kafka.Records("clicks").size(), 1, "the second click must still be produced after the first one failed");
+}
+
+void CheckFlush(harness::Ctx& ctx) {
+  record_click("g9Xc", "", "");
+  shutdown();
+  ctx.Equal(ctx.Kafka.Records("clicks").size(), 1, "shutdown() must flush the buffered clicks to the broker");
+}
+`,
   },
   debrief: `A Kafka producer is a buffer with a background thread: \`produce\`/\`send\` costs microseconds, the network happens later in batches. That is what makes "one event per redirect" free — as long as nobody blocks on the acknowledgement. The key is the ordering and the partitioning contract at once: same code → same partition → the next step's consumer sees every click of a link in order, on one consumer. Real pipelines put the referrer through a domain allow-list before it reaches analytics, enrich the event with a geo lookup, and enable idempotent producers so their own retries cannot double-count a click.`,
 };

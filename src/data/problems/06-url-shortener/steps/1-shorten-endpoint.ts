@@ -1022,6 +1022,155 @@ func CheckCreated(ctx *harness.Ctx) {
 	ctx.Equal(r.Header.Get("Location"), body.ShortURL, "Location must point at the short url")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+#include <nlohmann/json.hpp>
+
+#include <array>
+#include <initializer_list>
+#include <optional>
+#include <set>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string longURL = "https://example.com/launch";
+
+// fakeStore is the links table: what was saved, which names are taken, which were asked about. It
+// takes the place of links::table, which every Store goes through (Go swaps the store variable).
+class fakeStore : public links::Table {
+ public:
+  std::set<std::string> taken;
+  std::vector<std::array<std::string, 2>> saved;
+  std::vector<std::string> existsCalls;
+
+  bool exists(const std::string& code) override {
+    existsCalls.push_back(code);
+    return taken.count(code) > 0;
+  }
+
+  void save(const std::string& code, const std::string& url) override {
+    saved.push_back({code, url});
+    taken.insert(code);
+  }
+
+  std::optional<std::string> lookup(const std::string& code) override {
+    for (const auto& pair : saved) {
+      if (pair[0] == code) return pair[1];
+    }
+    return std::nullopt;
+  }
+
+  bool has(const std::string& code, const std::string& url) const {
+    for (const auto& pair : saved) {
+      if (pair[0] == code && pair[1] == url) return true;
+    }
+    return false;
+  }
+};
+
+// The codes the key service stand-in handed out in this check.
+std::vector<std::string>* mintedCodes = nullptr;
+
+harness::HTTP standIn(harness::Ctx& ctx, fakeStore& store, std::vector<std::string>& codes) {
+  links::table = &store;
+  mintedCodes = &codes;
+  return ctx.Main().HTTP();
+}
+
+// api is the learner's server with the links table and the key service stood in for.
+struct api {
+  fakeStore store;
+  std::vector<std::string> codes;
+  harness::HTTP http;
+
+  explicit api(harness::Ctx& ctx, std::initializer_list<std::string> taken = {}) : http(standIn(ctx, store, codes)) {
+    store.taken.insert(taken.begin(), taken.end());
+  }
+  api(const api&) = delete;
+
+  harness::Response shorten(const nlohmann::json& body) {
+    return http.Post("/shorten", body.dump(), "Content-Type", "application/json");
+  }
+};
+
+// The string field of a JSON response body ("" when it has none: Go's decoding into a struct).
+std::string field(const harness::Response& r, const std::string& name) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  if (!body.is_object() || !body.contains(name) || !body[name].is_string()) return "";
+  return body[name].get<std::string>();
+}
+
+}  // namespace
+
+// The key service step 2 builds, stood in for (Go swaps the nextCode variable instead).
+std::string next_code() {
+  if (mintedCodes) mintedCodes->push_back("g9Xc");
+  return "g9Xc";
+}
+
+void CheckRoute(harness::Ctx& ctx) {
+  api a(ctx);
+  const auto r = a.shorten({{"url", longURL}});
+  ctx.Assert(r.Status != 404 && r.Status != 405, "POST /shorten answered %d: no handler is registered for it", r.Status);
+  ctx.Equal(r.Status, 201, "POST /shorten with a valid url");
+}
+
+void CheckValidateUrl(harness::Ctx& ctx) {
+  api a(ctx);
+  for (const std::string bad : {"ftp://example.com/file", "example.com/no-scheme", "javascript:alert(1)", ""}) {
+    const auto r = a.shorten({{"url", bad}});
+    ctx.Equal(r.Status, 400, "url %q is not http(s)", bad);
+  }
+  const std::string prefix = "https://example.com/";
+  const std::string tooLong = prefix + std::string(2049 - prefix.size(), 'a');
+  auto r = a.shorten({{"url", tooLong}});
+  ctx.Equal(r.Status, 400, "a %d-character url is over kMaxUrlLen", tooLong.size());
+  ctx.Assert(a.store.saved.empty() && a.codes.empty(), "a rejected url must be refused before any code is taken or anything is saved");
+  const std::string limit = prefix + std::string(2048 - prefix.size(), 'a');
+  r = a.shorten({{"url", limit}});
+  ctx.Equal(r.Status, 201, "a url of exactly 2048 characters is allowed");
+  r = a.shorten({{"url", "http://example.com/plain"}});
+  ctx.Equal(r.Status, 201, "plain http is allowed");
+}
+
+void CheckAliasFormat(harness::Ctx& ctx) {
+  api a(ctx);
+  for (const std::string bad : {std::string("abc"), std::string("has space"), std::string(33, 'a'), std::string("dots.are.out"), std::string("sl/ash")}) {
+    const auto r = a.shorten({{"url", longURL}, {"alias", bad}});
+    ctx.Equal(r.Status, 400, "alias %q does not match kAliasRe", bad);
+  }
+  ctx.Equal(a.store.existsCalls, std::vector<std::string>{}, "a malformed alias is rejected before the store is asked whether it exists");
+  ctx.Equal(a.store.saved.size(), 0, "a malformed alias must not be saved");
+  const auto r = a.shorten({{"url", longURL}, {"alias", "launch_2026-v1"}});
+  ctx.Equal(r.Status, 201, R"(alias "launch_2026-v1" is valid)");
+  ctx.Equal(field(r, "code"), "launch_2026-v1", "the custom alias must become the code");
+}
+
+void CheckAliasTaken(harness::Ctx& ctx) {
+  api a(ctx, {"launch"});
+  auto r = a.shorten({{"url", longURL}, {"alias", "launch"}});
+  ctx.Equal(r.Status, 409, R"(alias "launch" already exists)");
+  ctx.Equal(a.store.saved.size(), 0, "a taken alias must not be overwritten");
+  ctx.Equal(a.codes.size(), 0, "a taken alias is a client error: no code from next_code is spent on it");
+  r = a.shorten({{"url", longURL}, {"alias", "launch2"}});
+  ctx.Equal(r.Status, 201, "a free alias must be accepted");
+  ctx.Assert(a.store.has("launch2", longURL), R"(expected store.save("launch2", url), saved: %v)", a.store.saved);
+}
+
+void CheckCreated(harness::Ctx& ctx) {
+  api a(ctx);
+  const auto r = a.shorten({{"url", longURL}});
+  ctx.Equal(r.Status, 201, "a valid url without an alias");
+  ctx.Equal(a.codes, std::vector<std::string>{"g9Xc"}, "without an alias the code must come from next_code");
+  ctx.Assert(a.store.saved.size() == 1 && a.store.has("g9Xc", longURL), R"(expected one store.save("g9Xc", url), saved: %v)", a.store.saved);
+  const std::string code = field(r, "code");
+  const std::string shortURL = field(r, "short_url");
+  ctx.Equal(code, "g9Xc", "the body must carry the code");
+  ctx.Equal(shortURL, kBaseUrl + "g9Xc", "short_url must be kBaseUrl + code");
+  ctx.Equal(r.HeaderValue("Location"), shortURL, "Location must point at the short url");
+}
+`,
   },
   debrief: `The endpoint is a funnel: free checks first (scheme, length, alias format), then one store lookup, then — only for the requests that earned it — a code and a write. The two alias failures get different codes because the client can act on them differently: a 400 means "never send that", a 409 means "pick another". Real shorteners add authentication and per-user quotas, screen the target against malware lists before saving, and return the same short link for the same URL from the same user instead of minting a new one.`,
 };

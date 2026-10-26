@@ -1465,6 +1465,213 @@ func CheckEscalateAfterRetry(ctx *harness.Ctx) {
 	ctx.Assert(len(generations(ctx)) == 5, "the judge down still earns one more generation before the handoff: expected 2 Generate calls, saw %d", len(generations(ctx))-3)
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <cmath>
+
+#include "assistant/chunk.h"
+#include "assistant/kb.h"
+#include "assistant/model.h"
+
+namespace {
+
+const std::string guardQuestion = "My payout has not arrived, when is it paid?";
+
+const std::vector<assistant::Turn> guardHistory = {{"dasher", "Hi, I dashed all of last week."}};
+
+// guardLLM is the stand-in model server at both addresses; the check may switch its mode.
+class guardLLM final : public support::Llm::Service {
+ public:
+  std::string mode;
+  grpc::Status Generate(grpc::ServerContext*, const support::GenerateRequest* req, support::GenerateReply* reply) override {
+    const std::string text = model::complete(req->prompt(), req->max_tokens(), mode);
+    reply->set_text(text);
+    reply->set_tokens(static_cast<int>(model::fields(text).size()));
+    reply->set_model(req->model());
+    return grpc::Status::OK;
+  }
+};
+
+// guardJudge is the stand-in judge: the deterministic rubric of assistant/model.h.
+class guardJudge final : public support::Judge::Service {
+ public:
+  grpc::Status Evaluate(grpc::ServerContext*, const support::EvaluateRequest* req, support::Scores* reply) override {
+    const auto s = model::evaluate(req->question(), req->answer(), {req->context_ids().begin(), req->context_ids().end()});
+    reply->set_groundedness(static_cast<float>(s.groundedness));
+    reply->set_coherence(static_cast<float>(s.coherence));
+    reply->set_compliance(static_cast<float>(s.compliance));
+    reply->set_pass(s.pass);
+    return grpc::Status::OK;
+  }
+};
+
+// guardWorld is the real KB chunks the checks retrieve and the answers they send.
+struct guardWorld {
+  guardLLM llm;
+  guardJudge judge;
+  std::vector<assistant::Chunk> chunks;
+  std::vector<std::string> ids;
+  std::string prompt;
+  std::string faithful;  // "Based on [kb:pay-0][kb:pay-1]: Dasher earnings … depending on the bank."
+  std::string stray;     // the same sentence, one citation swapped for a chunk that was never retrieved
+  std::string offTopic;  // the faithful answer plus a sentence of words the knowledge base never uses
+  std::string risky;     // the faithful sentence with a promise in it: tier 1 cannot see it, the judge's compliance rule can
+};
+
+std::unique_ptr<guardWorld> world;
+
+// kbChunk is a real KB chunk, as kb_search would have returned it.
+assistant::Chunk kbChunk(const std::string& id) {
+  const size_t at = id.rfind('-');
+  const auto a = assistant::find_article(id.substr(0, at));
+  const int position = std::stoi(id.substr(at + 1));
+  return assistant::Chunk{id, assistant::chunk(a->body)[static_cast<size_t>(position)], 0.5};
+}
+
+// serveGuard serves both model addresses and the judge; generate (step 3) is stood in for below
+// with one Generate on the large model.
+guardWorld& serveGuard(harness::Ctx& ctx, const std::string& mode) {
+  world = std::make_unique<guardWorld>();
+  guardWorld& w = *world;
+  w.llm.mode = mode;
+  w.ids = {"pay-0", "pay-1", "tips-0", "referrals-1"};
+  for (const auto& id : w.ids) w.chunks.push_back(kbChunk(id));
+  w.prompt = assistant::build_prompt(guardQuestion, w.chunks, guardHistory);
+  w.faithful = model::complete(w.prompt, config::kMaxTokens, "faithful");
+  w.stray = w.faithful;
+  w.stray.replace(w.stray.find("[kb:pay-1]"), 10, "[kb:policy-404]");
+  w.offTopic = w.faithful + " Reboot the router and reinstall the firmware.";
+  w.risky = w.faithful.substr(0, w.faithful.size() - 1) + ", which we guarantee.";
+  ctx.GRPC.Server(config::kLlmLarge)->RegisterService(&w.llm);
+  ctx.GRPC.Server(config::kLlmSmall)->RegisterService(&w.llm);
+  ctx.GRPC.Server(config::kJudge)->RegisterService(&w.judge);
+  return w;
+}
+
+std::vector<harness::Call> evaluations(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Evaluate", config::kJudge); }
+
+std::vector<harness::Call> generations(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Generate", ""); }
+
+// showVerdict and showOutcome print a result the way Go's %+v prints the struct.
+std::string showVerdict(const Verdict& v) {
+  return harness::Sprintf("{OK:%v Groundedness:%v Reasons:%v}", v.ok, v.groundedness, v.reasons);
+}
+
+std::string showOutcome(const Outcome& o) {
+  return harness::Sprintf("{Answer:%s Sources:%v Escalated:%v Model:%s Tokens:%d}", o.answer, o.sources, o.escalated, o.model, o.tokens);
+}
+
+Verdict verdict(harness::Ctx& ctx, const std::string& answer) {
+  try {
+    return check(guardQuestion, answer, world->chunks);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("check(question, answer, chunks) crashed: %v", std::string(e.what()));
+  }
+}
+
+Outcome outcome(harness::Ctx& ctx) {
+  try {
+    return answer_or_escalate(guardQuestion, world->chunks, guardHistory);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("answerOrEscalate must return {Answer, Sources, Escalated, Model}: %v", std::string(e.what()));
+  }
+}
+
+}  // namespace
+
+// The previous step stood in for: one Generate on the large model with a 2 s deadline.
+Generated generate(const std::string& question, const std::vector<prompt::Chunk>& chunks, const std::vector<prompt::Turn>& history) {
+  static auto llm = support::Llm::NewStub(grpc::CreateChannel(config::kLlmLarge, grpc::InsecureChannelCredentials()));
+  support::GenerateRequest request;
+  request.set_model("large");
+  request.set_prompt(assistant::build_prompt(question, chunks, history));
+  request.set_max_tokens(config::kMaxTokens);
+  grpc::ClientContext call;
+  call.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
+  support::GenerateReply reply;
+  const grpc::Status status = llm->Generate(&call, request, &reply);
+  if (!status.ok()) throw std::runtime_error("llm: " + status.error_message());
+  return Generated{reply.text(), reply.model(), reply.tokens()};
+}
+
+void CheckCitedChunksOnly(harness::Ctx& ctx) {
+  auto& w = serveGuard(ctx, "faithful");
+  const Verdict v = verdict(ctx, w.stray);
+  ctx.Assert(!v.ok, "an answer citing [kb:policy-404], which was never retrieved, must fail: got %s", showVerdict(v));
+  ctx.Assert(!v.reasons.empty(), "a failed check must say why: Reasons is empty");
+  bool named = false;
+  for (const auto& r : v.reasons) named = named || r.find("policy-404") != std::string::npos;
+  ctx.Assert(named, "a reason must name the stray chunk id policy-404, got %q", v.reasons);
+  ctx.Assert(evaluations(ctx).empty(), "tier 1 failed, so the judge must not be called — it was called %d time(s)", evaluations(ctx).size());
+}
+
+void CheckSentenceSimilarity(harness::Ctx& ctx) {
+  auto& w = serveGuard(ctx, "faithful");
+  Verdict v = verdict(ctx, w.offTopic);
+  ctx.Assert(!v.ok, "a sentence unlike every retrieved chunk (cosine 0.00 < %v) must fail tier 1: got %s", config::kMinSimilarity, showVerdict(v));
+  ctx.Assert(!v.reasons.empty(), "a failed check must say why: Reasons is empty");
+  ctx.Assert(evaluations(ctx).empty(), "tier 1 failed, so the judge must not be called — it was called %d time(s)", evaluations(ctx).size());
+  v = verdict(ctx, w.faithful);
+  ctx.Assert(v.ok, "the faithful answer cites retrieved chunks and its one sentence is the top chunk's (cosine 0.58): it must pass, got %s", showVerdict(v));
+}
+
+void CheckJudgeVerdict(harness::Ctx& ctx) {
+  auto& w = serveGuard(ctx, "faithful");
+  const Verdict v = verdict(ctx, w.faithful);
+  const auto calls = evaluations(ctx);
+  ctx.Equal(calls.size(), 1, "an answer that clears tier 1 goes to the judge exactly once: Evaluate calls to %s", config::kJudge);
+  const auto request = calls[0].Request<support::EvaluateRequest>();
+  ctx.Equal(request.question(), guardQuestion, "Evaluate must carry the question");
+  ctx.Equal(request.answer(), w.faithful, "Evaluate must carry the answer as generated");
+  ctx.Equal(std::vector<std::string>(request.context_ids().begin(), request.context_ids().end()), w.ids, "ContextIds must be the retrieved chunk ids");
+  ctx.Assert(calls[0].HasDeadline(), "the Evaluate call carries no deadline: a stalled judge would hold the chat open forever");
+  const double deadlineS = config::kDeadline.count() / 1000.0;
+  ctx.Assert(1.5 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 2.0, "the deadline must be config.DeadlineS = %v s, got %v s", deadlineS, calls[0].TimeoutSeconds());
+  ctx.Assert(v.ok, "the judge passed this answer (groundedness 1.0, compliance 1.0): OK must be true, got %s", showVerdict(v));
+  ctx.Assert(std::fabs(v.groundedness - 1) < 1e-6, "Groundedness must be the judge's score 1.0, got %v", v.groundedness);
+  ctx.Equal(v.reasons.size(), 0, "a passing verdict has no reasons, got %q: len(Reasons)", v.reasons);
+}
+
+void CheckJudgeFailsClosed(harness::Ctx& ctx) {
+  auto& w = serveGuard(ctx, "faithful");
+  Verdict v = verdict(ctx, w.risky);
+  ctx.Equal(evaluations(ctx).size(), 1, "the promise is invisible to tier 1 (same citations, cosine 0.56): the judge must be asked once");
+  ctx.Assert(!v.ok, "the judge scores 'guarantee' as compliance 0.0 and does not pass it: OK must be false, got %s", showVerdict(v));
+  ctx.Assert(std::fabs(v.groundedness - 1) < 1e-6, "Groundedness is the judge's score (1.0: every citation is in context), got %v", v.groundedness);
+  ctx.Assert(!v.reasons.empty(), "a failed check must say why: Reasons is empty");
+  ctx.GRPC.Stop(config::kJudge);
+  v = verdict(ctx, w.faithful);
+  ctx.Assert(!v.ok, "with the judge unreachable (UNAVAILABLE) nothing vouched for the answer: OK must be false, got %s", showVerdict(v));
+  const auto calls = evaluations(ctx);
+  ctx.Equal(calls.size(), 2, "the judge must still be asked when it is down (that is how the call fails): Evaluate calls");
+  ctx.Assert(calls.back().Code == grpc::StatusCode::UNAVAILABLE, "the last Evaluate call's status must be UNAVAILABLE, got code %d", static_cast<int>(calls.back().Code));
+}
+
+void CheckEscalateAfterRetry(harness::Ctx& ctx) {
+  auto& w = serveGuard(ctx, "hallucinate");
+  Outcome result = outcome(ctx);
+  ctx.Equal(generations(ctx).size(), 2, "a failed check earns the model one more try: Generate calls");
+  ctx.Equal(evaluations(ctx).size(), 0, "the invented answer fails tier 1 both times: the judge must never be called");
+  ctx.Assert(result.escalated, "two rejected answers must escalate, got %s", showOutcome(result));
+  ctx.Equal(result.answer, config::kHandoffText, "an escalated turn answers with config.HandoffText");
+  ctx.Assert(result.answer.find("policy-404") == std::string::npos && result.answer.find("resolved within 7 days") == std::string::npos, "the rejected answer must never leave answerOrEscalate");
+  ctx.Equal(result.sources.size(), 0, "an escalated turn has no sources, got %q: len(Sources)", result.sources);
+  ctx.Equal(result.model, "large", "Model must be the one that answered");
+  ctx.Equal(result.tokens, 0, "an escalated turn has no answer to count: Tokens");
+  w.llm.mode = "faithful";
+  result = outcome(ctx);
+  ctx.Assert(generations(ctx).size() == 3, "a passing answer needs one Generate call, saw %d", generations(ctx).size() - 2);
+  ctx.Equal(evaluations(ctx).size(), 1, "a passing answer is judged exactly once: Evaluate calls");
+  const auto last = generations(ctx).back().Request<support::GenerateRequest>();
+  ctx.Assert(last.prompt() == w.prompt, "generate must be given the question, chunks and history: the prompt differs from prompt.Build(question, chunks, history)");
+  ctx.Assert(result.answer == w.faithful && result.sources == std::vector<std::string>{"pay-0", "pay-1"} && !result.escalated && result.model == "large", "a passing answer comes back as generated with its cited ids as Sources (pay-0, pay-1), not escalated, model large; got %s", showOutcome(result));
+  ctx.Equal(result.tokens, static_cast<int>(model::fields(w.faithful).size()), "Tokens must be the count generate reported");
+  ctx.GRPC.Stop(config::kJudge);
+  result = outcome(ctx);
+  ctx.Assert(result.escalated && result.answer == config::kHandoffText && result.sources.empty(), "with the judge down an unjudged answer must not reach the Dasher: expected the handoff, got %s", showOutcome(result));
+  ctx.Assert(generations(ctx).size() == 5, "the judge down still earns one more generation before the handoff: expected 2 Generate calls, saw %d", generations(ctx).size() - 3);
+}
+`,
   },
   debrief: `The cheap tier runs first because it is free and it is where most of the damage is: a citation outside the retrieved chunks and a sentence that resembles none of them are the two shapes a hallucination takes in a retrieval system, and both are string operations — no RPC, no tokens, no latency added to the turn. In this course's stand-in embedding the margin is wide: the faithful answer scores 0.58 against its chunk and the invented one 0.08, so \`MIN_SIMILARITY = 0.3\` sits comfortably between them; a short paraphrase ("Check the bank details on file.") can still fall under it, which is why the threshold is a tunable and the judge, not the cosine, has the last word on a grounded answer. The judge is a second model rather than a regex because the failures that survive tier 1 are semantic: the "which we guarantee" answer cites the right chunks and matches the right text, and only a reader of the sentence can tell that it promises something the policy does not. DoorDash's post describes exactly these two layers — a cheap lexical and similarity layer, then an LLM judge grading groundedness, coherence and compliance — and credits them with a 90% drop in hallucinations and a 99% drop in compliance failures. The judge fails closed on purpose: \`UNAVAILABLE\` or a deadline is not a verdict, and the one thing a support assistant must never do is read an unjudged answer to a Dasher because the judge was busy. One more generation before giving up is cheap and often enough; after that, the hand-off is the floor — a person sees the question, the Dasher sees an honest sentence, and the rejected text sees nobody. Production adds what this step leaves out: a judge that reads the question too (relevance, not only groundedness), a sampled judge on the request path with the full one offline (step 6), per-reason metrics so a prompt change that starts failing compliance is a graph before it is a complaint, and a feedback loop from the hand-off queue back into the knowledge base, since a question that keeps escalating is usually an article that is missing.`,
 };

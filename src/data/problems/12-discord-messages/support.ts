@@ -144,3 +144,48 @@ func Query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
 }
 `,
 };
+
+/**
+ * The C++ twin: `db.h`, the runtime's Postgres through libpqxx, with the schema beside it.
+ * Snowflakes are int64_t in C++; the numeric id columns read with as<int64_t>().
+ */
+export const supportModulesCpp: Record<string, string> = {
+  'db.h': `// The messages table (provided): the runtime's Postgres through libpqxx. $1…$n placeholders.
+//
+// Ids are 64-bit snowflakes: pass them as int64_t and read the numeric id columns with as<int64_t>().
+#pragma once
+
+#include <pqxx/pqxx>
+
+#include <string>
+
+namespace db {
+
+// The messages table: one partition per (channel_id, bucket), rows in message_id order.
+inline const std::string kSchema = R"(
+CREATE TABLE messages (
+    channel_id numeric(20, 0) NOT NULL,
+    bucket integer NOT NULL,
+    message_id numeric(20, 0) NOT NULL,
+    author_id numeric(20, 0) NOT NULL,
+    content text NOT NULL,
+    PRIMARY KEY (channel_id, bucket, message_id)
+);
+)";
+
+// The service's connection.
+inline pqxx::connection& connection() {
+  static pqxx::connection conn{"postgresql://app@db:5432/app"};
+  return conn;
+}
+
+// Runs one statement (autocommit) and returns its rows.
+template <class... Args>
+pqxx::result exec(const std::string& sql, const Args&... params) {
+  pqxx::nontransaction tx(connection());
+  return tx.exec_params(sql, params...);
+}
+
+}  // namespace db
+`,
+};

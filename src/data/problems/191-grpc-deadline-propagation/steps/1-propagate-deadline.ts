@@ -1127,6 +1127,188 @@ func CheckValidatesFirst(ctx *harness.Ctx) {
 	ctx.Equal(q.GetTotalCents(), 3499, "GetQuote(kettle, 1) must still succeed: total_cents")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <chrono>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <string>
+#include <tuple>
+#include <vector>
+
+namespace {
+
+using QuotesStub = quotes::v1::Quotes::Stub;
+
+const std::string kPricingPeerTarget = "pricing:50051";
+constexpr std::chrono::milliseconds kTimeoutTolerance{10};  // slack on every recorded timeout
+constexpr double kNoDeadline = -1.0;                       // a GetQuote without any deadline
+
+const std::map<std::string, int32_t> kUnitPrices = {{"kettle", 3499}, {"mug", 799}};
+
+// Pricing served at pricing:50051.
+class PricingPeer final : public quotes::v1::Pricing::Service {
+ public:
+  grpc::Status GetPrice(grpc::ServerContext*, const quotes::v1::PriceRequest* request, quotes::v1::Price* reply) override {
+    const auto unit = kUnitPrices.find(request->sku());
+    if (unit == kUnitPrices.end()) return grpc::Status(grpc::StatusCode::NOT_FOUND, "no price for " + request->sku());
+    reply->set_unit_cents(unit->second);
+    return grpc::Status::OK;
+  }
+};
+
+std::string ShowDuration(std::chrono::milliseconds d) { return std::to_string(d.count()) + "ms"; }
+
+// Serves pricing, runs the learner's server, and returns a Quotes client on it.
+std::unique_ptr<QuotesStub> StartQuotes(harness::Ctx& ctx) {
+  ctx.GRPC.Server(kPricingPeerTarget)->RegisterService(new PricingPeer());
+  ctx.Main();
+  return quotes::v1::Quotes::NewStub(ctx.GRPC.Dial("quotes:50050"));
+}
+
+struct QuoteResult {
+  grpc::Status status;
+  quotes::v1::Quote quote;
+};
+
+// GetQuote with an incoming deadline of deadline seconds (kNoDeadline: none at all).
+QuoteResult CallQuote(QuotesStub& client, const std::string& sku, int32_t qty, double deadline) {
+  grpc::ClientContext c;
+  if (deadline != kNoDeadline)
+    c.set_deadline(std::chrono::system_clock::now() +
+                   std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::duration<double>(deadline)));
+  quotes::v1::QuoteRequest request;
+  request.set_sku(sku);
+  request.set_qty(qty);
+  QuoteResult r;
+  r.status = client.GetQuote(&c, request, &r.quote);
+  return r;
+}
+
+quotes::v1::Quote MustQuote(harness::Ctx& ctx, QuotesStub& client, const std::string& sku, int32_t qty, double deadline) {
+  QuoteResult r = CallQuote(client, sku, qty, deadline);
+  if (!r.status.ok()) {
+    const std::string within =
+        deadline == kNoDeadline ? "without a deadline" : harness::Sprintf("with deadline %v s", deadline);
+    ctx.Fatalf("GetQuote(%s, %d) %s failed with %v: %s", sku, qty, within, r.status.error_code(), r.status.error_message());
+  }
+  return r.quote;
+}
+
+grpc::StatusCode QuoteCode(QuotesStub& client, const std::string& sku, int32_t qty, double deadline) {
+  return CallQuote(client, sku, qty, deadline).status.error_code();
+}
+
+std::vector<harness::Call> PriceCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("GetPrice"); }
+
+void AssertPriceTimeout(harness::Ctx& ctx, const harness::Call& c, std::chrono::milliseconds expected, const std::string& why) {
+  ctx.Assert(c.HasDeadline(), "the GetPrice call carries no deadline (%s): pricing could outlive the caller", why);
+  const auto off = c.Timeout - expected;
+  ctx.Assert(-kTimeoutTolerance <= off && off <= kTimeoutTolerance, "the GetPrice timeout was %.3f s, expected %v ± %v (%s)",
+             c.TimeoutSeconds(), ShowDuration(expected), ShowDuration(kTimeoutTolerance), why);
+}
+
+}  // namespace
+
+void CheckPropagatesDeadline(harness::Ctx& ctx) {
+  auto client = StartQuotes(ctx);
+  quotes::v1::Quote q = MustQuote(ctx, *client, "kettle", 2, 0.8);
+  ctx.Equal(std::make_tuple(q.sku(), q.qty(), q.total_cents()), std::make_tuple("kettle", 2, 6998),
+            "GetQuote(kettle, 2): sku, qty and total_cents 3499 * 2 = 6998");
+  auto calls = PriceCalls(ctx);
+  ctx.Equal(calls.size(), 1, "the GetPrice calls one quote made");
+  ctx.Equal(calls[0].Target, kPricingPeerTarget, "where GetPrice went");
+  ctx.Equal(calls[0].Request<quotes::v1::PriceRequest>().sku(), "kettle", "the sku GetPrice was asked for");
+  AssertPriceTimeout(ctx, calls[0], std::chrono::milliseconds(750), "0.8 s incoming minus reserve 50 ms");
+  quotes::v1::Quote mug = MustQuote(ctx, *client, "mug", 3, 0.3);
+  ctx.Equal(mug.total_cents(), 2397, "GetQuote(mug, 3)'s total_cents (799 * 3)");
+  calls = PriceCalls(ctx);
+  AssertPriceTimeout(ctx, calls.back(), std::chrono::milliseconds(250),
+                     "0.3 s incoming minus reserve 50 ms: the timeout follows the caller, it is not a constant");
+}
+
+void CheckDefaultBudget(harness::Ctx& ctx) {
+  auto client = StartQuotes(ctx);
+  MustQuote(ctx, *client, "kettle", 2, kNoDeadline);
+  auto calls = PriceCalls(ctx);
+  ctx.Equal(calls.size(), 1, "the GetPrice calls one quote made");
+  AssertPriceTimeout(ctx, calls[0], std::chrono::milliseconds(950), "no incoming deadline: kDefaultBudget 1 s minus reserve 50 ms");
+  ctx.Clock.Advance(30);
+  MustQuote(ctx, *client, "kettle", 2, kNoDeadline);
+  calls = PriceCalls(ctx);
+  AssertPriceTimeout(ctx, calls.back(), std::chrono::milliseconds(950),
+                     "a second call 30 s later: the default is per request, not a deadline fixed at start-up");
+}
+
+void CheckBudgetExhausted(harness::Ctx& ctx) {
+  auto client = StartQuotes(ctx);
+  for (const double deadline : {0.04, 0.0}) {
+    const grpc::StatusCode got = QuoteCode(*client, "kettle", 2, deadline);
+    ctx.Equal(got, grpc::StatusCode::DEADLINE_EXCEEDED, "an incoming deadline of %v s (the budget is under reserve 50 ms)", deadline);
+    ctx.Equal(PriceCalls(ctx).size(), 0,
+              "with %v s left pricing was called: a call that cannot finish must not be started; GetPrice calls", deadline);
+  }
+  MustQuote(ctx, *client, "kettle", 2, 0.1);
+  auto calls = PriceCalls(ctx);
+  ctx.Equal(calls.size(), 1, "an incoming deadline of 0.1 s must still call pricing once: GetPrice calls");
+  AssertPriceTimeout(ctx, calls[0], std::chrono::milliseconds(50), "0.1 s incoming minus reserve 50 ms");
+}
+
+void CheckSlowPricing(harness::Ctx& ctx) {
+  auto client = StartQuotes(ctx);
+  ctx.GRPC.SetLatency("GetPrice", 0.9, kPricingPeerTarget);
+  const int64_t started = ctx.Clock.Now();
+  const grpc::StatusCode got = QuoteCode(*client, "kettle", 2, 0.8);
+  const double elapsed = static_cast<double>(ctx.Clock.Now() - started) / 1000;
+  ctx.Equal(got, grpc::StatusCode::DEADLINE_EXCEEDED, "pricing takes 0.9 s and the caller allows 0.8 s: GetQuote's status");
+  auto calls = PriceCalls(ctx);
+  ctx.Equal(calls.size(), 1, "the times a timed-out pricing call was made: the budget is spent, never retry");
+  AssertPriceTimeout(ctx, calls[0], std::chrono::milliseconds(750), "0.8 s incoming minus reserve 50 ms");
+  ctx.Assert(elapsed <= 0.8 + 0.01, "the failure took %.3f s, after the caller's 0.8 s deadline: nobody was waiting for it", elapsed);
+  quotes::v1::Quote q = MustQuote(ctx, *client, "kettle", 2, kNoDeadline);
+  ctx.Equal(q.total_cents(), 6998, "with no incoming deadline the 0.9 s pricing call fits the 0.95 s default: total_cents");
+  ctx.Equal(PriceCalls(ctx).size(), 2, "the GetPrice calls in total");
+}
+
+void CheckStatusMapping(harness::Ctx& ctx) {
+  auto client = StartQuotes(ctx);
+  grpc::StatusCode got = QuoteCode(*client, "ghost", 2, 0.8);
+  ctx.Equal(got, grpc::StatusCode::NOT_FOUND, "pricing answered NOT_FOUND for ghost: GetQuote's status");
+  const std::vector<std::pair<grpc::StatusCode, grpc::StatusCode>> cases = {
+      {grpc::StatusCode::UNAVAILABLE, grpc::StatusCode::UNAVAILABLE},
+      {grpc::StatusCode::DEADLINE_EXCEEDED, grpc::StatusCode::DEADLINE_EXCEEDED},
+      {grpc::StatusCode::INVALID_ARGUMENT, grpc::StatusCode::INTERNAL},
+      {grpc::StatusCode::PERMISSION_DENIED, grpc::StatusCode::INTERNAL},
+      {grpc::StatusCode::RESOURCE_EXHAUSTED, grpc::StatusCode::INTERNAL},
+  };
+  for (const auto& [pricing, want] : cases) {
+    ctx.GRPC.Fail("GetPrice", pricing, "pricing broke", 1, "");
+    got = QuoteCode(*client, "kettle", 2, 0.8);
+    ctx.Equal(got, want, "pricing failed with %v: GetQuote's status", pricing);
+  }
+  ctx.Equal(PriceCalls(ctx).size(), 6, "the GetPrice calls six failing quotes made: never retry, not even UNAVAILABLE");
+  quotes::v1::Quote q = MustQuote(ctx, *client, "kettle", 2, 0.8);
+  ctx.Equal(q.total_cents(), 6998, "after the failures a healthy pricing must give total_cents 6998");
+}
+
+void CheckValidatesFirst(harness::Ctx& ctx) {
+  auto client = StartQuotes(ctx);
+  struct Case {
+    std::string sku;
+    int32_t qty;
+    double deadline;
+  };
+  for (const Case& c : std::vector<Case>{{"", 2, 0.8}, {"kettle", 0, 0.8}, {"kettle", -3, 0.8}, {"", 2, 0.04}}) {
+    const grpc::StatusCode got = QuoteCode(*client, c.sku, c.qty, c.deadline);
+    ctx.Equal(got, grpc::StatusCode::INVALID_ARGUMENT, "GetQuote(sku=%q, qty=%d) with deadline %v s (validation comes first)",
+              c.sku, c.qty, c.deadline);
+  }
+  ctx.Equal(PriceCalls(ctx).size(), 0, "the GetPrice calls invalid requests made");
+  quotes::v1::Quote q = MustQuote(ctx, *client, "kettle", 1, 0.8);
+  ctx.Equal(q.total_cents(), 3499, "GetQuote(kettle, 1) must still succeed: total_cents");
+}
+`,
   },
   debrief: `A deadline is a property of the request: the moment after which the original caller stops caring. Each hop reads what is left, keeps a little back, and hands the rest down, so the whole tree of calls gives up together instead of the leaves working on for a caller that has already timed out. The reserve exists because a server that spends its entire budget downstream has no time left to report the failure; with 50 ms held back it answers DEADLINE_EXCEEDED itself, inside the caller's window, rather than having the caller's own timer fire on a silent connection. "No deadline" and "zero left" are opposites, which is why the test is \`is None\` and not truthiness. The call is never retried because a retry inside a spent budget only adds load at the moment a dependency is slowest. Statuses are translated rather than relayed: NOT_FOUND, UNAVAILABLE and DEADLINE_EXCEEDED mean something the caller can act on, while a downstream INVALID_ARGUMENT or PERMISSION_DENIED is this server's bug and becomes INTERNAL. Go and grpc-java do most of this implicitly (an outgoing call made with the incoming \`ctx\` or \`Context\` inherits its deadline, and grpc-js has the \`parent\` call option); production servers add the reserve on top, propagate cancellation as well as the deadline, export the remaining budget as a metric, and shed work early when the budget left is smaller than the dependency's p99.`,
 };

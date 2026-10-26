@@ -769,6 +769,117 @@ func CheckNotDurableRaises(ctx *harness.Ctx) {
 	ctx.Assert(!returned, "the broker did not acknowledge the record within the flush (it is still pending) but appendEvent returned nil: the API would answer 202 for an event that may never be written")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <cmath>
+
+#include <nlohmann/json.hpp>
+
+namespace {
+
+const std::string ceTopic = "counter-events";
+constexpr double ceFlushTimeout = 1.0;  // seconds
+
+// ceAttempt is whether append_event returned, or the EventNotDurable it threw; anything else it throws fails the check.
+std::pair<bool, std::string> ceAttempt(harness::Ctx& ctx, const std::string& ns, const std::string& name, long long delta, const std::string& token) {
+  try {
+    append_event(ns, name, delta, token);
+    return {true, ""};
+  } catch (const EventNotDurable& e) {
+    return {false, e.what()};
+  } catch (const std::exception& e) {
+    ctx.Fatalf("append_event threw %s: a failed append must throw EventNotDurable", e.what());
+  }
+}
+
+void ceAppend(harness::Ctx& ctx, const std::string& ns, const std::string& name, long long delta, const std::string& token) {
+  try {
+    append_event(ns, name, delta, token);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("append_event(%q, %q, %d, %q) threw: %s", ns, name, delta, token, e.what());
+  }
+}
+
+nlohmann::json ceParse(harness::Ctx& ctx, const std::string& v) {
+  auto event = nlohmann::json::parse(v, nullptr, false);
+  ctx.Assert(event.is_object(), "the value must be JSON: %s", v);
+  return event;
+}
+
+}  // namespace
+
+void CheckTopicKey(harness::Ctx& ctx) {
+  ceAppend(ctx, "plays", "stranger-things", 1, "t-9f3");
+  ceAppend(ctx, "plays", "stranger-things", 2, "t-9f4");
+  ceAppend(ctx, "plays", "the-crown", 1, "t-9f5");
+  const auto produced = ctx.Kafka.Records(ceTopic);
+  ctx.Assert(produced.size() == 3, "expected three records on %s, found %d (topics: %q)", ceTopic, produced.size(), ctx.Kafka.Topics());
+  ctx.Equal(ctx.Kafka.Keys(ceTopic), std::vector<std::string>{"plays:stranger-things", "plays:stranger-things", "plays:the-crown"}, "records must be keyed by ns:name");
+  ctx.Equal(produced[0].Partition, produced[1].Partition, "the same counter must land on the same partition");
+}
+
+void CheckEventShape(harness::Ctx& ctx) {
+  ceAppend(ctx, "plays", "stranger-things", -2, "t-9f3");
+  const auto produced = ctx.Kafka.Values(ceTopic);
+  ctx.Equal(produced.size(), 1, "the number of records on %s", ceTopic);
+  const auto event = ceParse(ctx, produced[0]);
+  ctx.Assert(event.value("ns", nlohmann::json()) == "plays" && event.value("name", nlohmann::json()) == "stranger-things", "the value must carry ns and name: %s", produced[0]);
+  ctx.Assert(event.value("delta", nlohmann::json()) == -2, "the value must carry the delta as an integer: %s", produced[0]);
+  ctx.Equal(event.value("token", nlohmann::json()), "t-9f3", "the value must carry the client's token unchanged (the rollup dedupes on it): %s", produced[0]);
+  const bool isNumber = event.contains("ts") && event["ts"].is_number();
+  ctx.Assert(isNumber && std::abs(event["ts"].get<double>() - static_cast<double>(ctx.Clock.Now()) / 1000) < 60, "the value must carry a current timestamp in seconds: %s", produced[0]);
+}
+
+void CheckAcksAll(harness::Ctx& ctx) {
+  // The partition leader fails right after acknowledging: only an event every in-sync replica has survives.
+  ceAppend(ctx, "plays", "stranger-things", 1, "t-9f3");
+  ctx.Kafka.Failover(ceTopic);
+  const size_t held = ctx.Kafka.Records(ceTopic).size();
+  ctx.Assert(held == 1, "append_event returned (the API would answer 202), then the partition leader failed and %s holds %d record(s) instead of the event: it had been acknowledged by the leader alone. A durability promise needs acks=all", ceTopic, held);
+  // The broker writes the next event but its acknowledgement is lost: the producer retries it.
+  ctx.Kafka.LoseAcks(ceTopic, 1);
+  ceAppend(ctx, "plays", "stranger-things", 2, "t-9f4");
+  // At least once: any copies the retry wrote must be identical (an idempotent producer writes one).
+  const auto all = ctx.Kafka.Records(ceTopic);
+  const std::vector<harness::KafkaRecord> copies(all.begin() + 1, all.end());
+  ctx.Assert(!copies.empty(), "the broker wrote the second event and its acknowledgement was lost, yet %s does not hold it", ceTopic);
+  for (const auto& c : copies) {
+    ctx.Assert(c.Key == copies[0].Key && c.Value == copies[0].Value, "the producer's retry after a lost ack must be an identical copy (same key and value, the same token) so the rollup can drop it: got %s %s and %s %s", copies[0].Key, copies[0].Value, c.Key, c.Value);
+  }
+}
+
+void CheckBoundedFlush(harness::Ctx& ctx) {
+  // The broker is slow but answers within kFlushTimeoutMs: the add waits for the ack and succeeds.
+  ctx.Kafka.StallFor(ceTopic, 0.8);
+  auto [returned, err] = ceAttempt(ctx, "plays", "stranger-things", 1, "t-9f3");
+  ctx.Assert(returned, "the broker acknowledged after 0.8 s, within kFlushTimeoutMs (1 s), but append_event threw %s: it must wait for the acknowledgement up to the bound", err);
+  size_t held = ctx.Kafka.Records(ceTopic).size();
+  ctx.Assert(held == 1, "append_event returned while the event was still unacknowledged (%s holds %d record(s)): it must not return (and the API must not answer 202) before the broker has the event, exactly once", ceTopic, held);
+  // The broker is down: the add gives up after kFlushTimeoutMs instead of hanging the request.
+  ctx.Kafka.Stall(ceTopic);
+  const int64_t start = ctx.Clock.Now();
+  returned = ceAttempt(ctx, "plays", "stranger-things", 1, "t-9f4").first;
+  const double waited = static_cast<double>(ctx.Clock.Now() - start) / 1000;
+  ctx.Assert(waited <= ceFlushTimeout + 0.05, "with the broker down append_event waited %.0f s before giving up (an unbounded flush waits for the whole message timeout while the client's request hangs): bound it with flush(kFlushTimeoutMs)", waited);
+  ctx.Assert(!returned, "with the broker down append_event returned after %.1f s without an acknowledgement: the API would answer 202 for an event that may never be written", waited);
+  held = ctx.Kafka.Records(ceTopic).size();
+  ctx.Assert(held == 1, "nothing can be written while the broker is down, yet %s holds %d record(s)", ceTopic, held);
+}
+
+void CheckNotDurableRaises(harness::Ctx& ctx) {
+  ctx.Kafka.FailNext(ceTopic, 1);
+  bool returned = ceAttempt(ctx, "plays", "stranger-things", 1, "t-9f3").first;
+  ctx.Assert(!returned, "the broker refused the record (delivery error) but append_event returned: the API would answer 202 for an event that was lost");
+  ctx.Equal(ctx.Kafka.Records(ceTopic).size(), 0, "records on %s after the refused produce", ceTopic);
+  ceAppend(ctx, "plays", "stranger-things", 1, "t-9f3");  // the client's retry, same token
+  nlohmann::json tokens = nlohmann::json::array();
+  for (const auto& v : ctx.Kafka.Values(ceTopic)) tokens.push_back(ceParse(ctx, v).value("token", nlohmann::json()));
+  ctx.Equal(tokens, nlohmann::json::array({"t-9f3"}), "after the failure the retry must be produced normally, carrying the same token, which is what makes it safe: the tokens on %s", ceTopic);
+  ctx.Kafka.Stall(ceTopic);
+  returned = ceAttempt(ctx, "plays", "stranger-things", 1, "t-9f4").first;
+  ctx.Assert(!returned, "the broker did not acknowledge the record within the flush (it is still pending) but append_event returned: the API would answer 202 for an event that may never be written");
+}
+`,
   },
   debrief: `The eventually consistent counter does not exist as a number at write time; it exists as a durable fact — "add 1 to plays/stranger-things, token t-9f3, at this time" — and that fact is what the 202 vouches for. Everything about the producer follows from that: acks=all because a leader-only ack can vanish with the leader, idempotence because the producer's own retries must not double a fact, a bounded flush because a promise you cannot keep in a second is better refused than kept late. The token is the other half of the design: the API cannot know whether a 503 was returned before or after the record landed, so instead of guessing it lets the client retry and the rollup dedupe. Netflix logs these events to its TimeSeries abstraction with the same idea — write durably, dedupe downstream — and partitions them by time bucket as well as by counter.`,
 };

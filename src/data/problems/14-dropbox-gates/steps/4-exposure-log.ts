@@ -1,5 +1,7 @@
 import type {Step} from '@/lib/types';
 
+import {gatesStandInCpp} from '../support';
+
 export const exposureLogStep: Step = {
   id: 'exposure-log',
   title: 'Exposure events: logged, never awaited',
@@ -1387,6 +1389,235 @@ func CheckFlush(ctx *harness.Ctx) {
 	took = secondsSince(ctx, before)
 	ctx.Assert(took <= 6, "with the broker down, shutdown() took %.0f s: flush with a 5 s bound so a stop is not held for the producer's whole write timeout", took)
 	ctx.Equal(len(ctx.Kafka.Records(exposureTopic)), 3, "nothing can reach the topic while the broker is down; records")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <cmath>
+#include <iostream>
+#include <map>
+#include <sstream>
+#include <string>
+#include <vector>
+
+// Step 2's gates.cpp, which this file builds on.
+${gatesStandInCpp}
+// The checks.
+
+namespace {
+
+const std::string exposureTopic = "gate-exposures";
+using Attrs = std::map<std::string, std::string>;
+
+// publishExposureGates leaves what step 1 leaves behind: button_color and dark_mode in the hash, and the global version.
+void publishExposureGates(harness::Ctx& ctx, int version) {
+  const auto share = [](const std::string& variant, int pct) { return nlohmann::json{{"variant", variant}, {"pct", pct}}; };
+  const std::vector<nlohmann::json> gates = {
+      {{"name", "button_color"}, {"seed", "button_color"}, {"default", "OFF"}, {"overrides", nlohmann::json::array()}, {"version", 1},
+       {"populations",
+        nlohmann::json::array(
+            {{{"match", {{"locale", "de"}}},
+              {"mix", nlohmann::json::array({share("RED_BUTTON", 33), share("BLUE_BUTTON", 33), share("CONTROL", 34)})}},
+             {{"match", nlohmann::json::object()}, {"mix", nlohmann::json::array({share("BLUE_BUTTON", 100)})}}})}},
+      {{"name", "dark_mode"}, {"seed", "dark_mode"}, {"default", "OFF"}, {"overrides", nlohmann::json::array()}, {"version", 1},
+       {"populations",
+        nlohmann::json::array({{{"match", nlohmann::json::object()}, {"mix", nlohmann::json::array({share("ON", 100)})}}})}},
+  };
+  for (const auto& g : gates) ctx.Redis.Do("HSET", "gates", g["name"].get<std::string>(), g.dump());
+  ctx.Redis.Set("gates:version", version);
+}
+
+// ExposureLog collects what the learner logs to std::cerr while it lives, then passes it on to the original output.
+struct ExposureLog {
+  std::ostringstream lines;
+  std::streambuf* original = std::cerr.rdbuf(lines.rdbuf());
+  ~ExposureLog() {
+    std::cerr.rdbuf(original);
+    std::cerr << lines.str();
+  }
+};
+
+// loadExposures publishes the gates and loads step 2's snapshot.
+void loadExposures(harness::Ctx& ctx, int version) {
+  publishExposureGates(ctx, version);
+  refresh();
+}
+
+Attrs deAttrs(int i) { return {{"user_id", "u" + std::to_string(i)}, {"locale", "de"}}; }
+
+std::vector<std::string> exposureUsers(harness::Ctx& ctx) {
+  std::vector<std::string> users;
+  for (const auto& raw : ctx.Kafka.Values(exposureTopic)) {
+    const auto event = nlohmann::json::parse(raw, nullptr, false);
+    users.push_back(event.is_object() ? event.value("user_id", "") : "");
+  }
+  return users;
+}
+
+double secondsSince(harness::Ctx& ctx, int64_t before) { return static_cast<double>(ctx.Clock.Now() - before) / 1000; }
+
+}  // namespace
+
+void CheckTopicKeyed(harness::Ctx& ctx) {
+  loadExposures(ctx, 7);
+  const std::vector<std::pair<std::string, Attrs>> calls = {
+      {"button_color", deAttrs(1)},
+      {"button_color", {{"user_id", "bo"}, {"locale", "en"}}},
+      {"dark_mode", {{"user_id", "cy"}}},
+      {"button_color", deAttrs(2)},
+  };
+  for (const auto& [name, attrs] : calls) {
+    const std::string want = get_variant(name, attrs);
+    const std::string got = get_exposed_variant(name, attrs);
+    ctx.Assert(got == want,
+               "get_exposed_variant(%q, %s) answered %q but step 2's get_variant says %q: the decision is get_variant's, "
+               "the exposure is a side effect",
+               name, attrs.at("user_id"), got, want);
+  }
+  ctx.Settle();
+  const auto records = ctx.Kafka.Records(exposureTopic);
+  ctx.Equal(records.size(), 4,
+            "four decisions must produce four records on %s: every decision is one exposure; records", exposureTopic);
+  // each record is matched to its call by user_id (one per call); one gate's records must keep the call order.
+  std::vector<harness::KafkaRecord> inCallOrder(calls.size());
+  std::vector<int> position(calls.size(), -1);
+  for (size_t i = 0; i < calls.size(); i++) {
+    for (size_t j = 0; j < records.size(); j++) {
+      const auto event = nlohmann::json::parse(records[j].Value.value_or(""), nullptr, false);
+      if (event.is_object() && event.value("user_id", "") == calls[i].second.at("user_id")) {
+        inCallOrder[i] = records[j];
+        position[i] = static_cast<int>(j);
+      }
+    }
+    ctx.Assert(position[i] >= 0, "no exposure on %s carries user_id %q: every decision is one exposure for its user",
+               exposureTopic, calls[i].second.at("user_id"));
+  }
+  std::vector<std::string> keys;
+  for (const auto& r : inCallOrder) keys.push_back(r.Key.value_or(""));
+  ctx.Equal(keys, {"button_color", "button_color", "dark_mode", "button_color"}, "records must be keyed by the gate name");
+  ctx.Assert(inCallOrder[0].Partition == inCallOrder[1].Partition && inCallOrder[1].Partition == inCallOrder[3].Partition &&
+                 position[0] < position[1] && position[1] < position[3],
+             "the same gate must land on the same partition so its exposures stay in order");
+  const double now = static_cast<double>(ctx.Clock.Now()) / 1000;
+  for (size_t i = 0; i < calls.size(); i++) {
+    const auto& [name, attrs] = calls[i];
+    const std::string raw = inCallOrder[i].Value.value_or("");
+    const auto parsed = harness::ParseJSON(raw);
+    ctx.Assert(parsed && parsed->IsObject(), "the value must be JSON with feature, variant, version, user_id, ts: %s", raw);
+    const harness::Any& event = *parsed;
+    ctx.Equal(event["feature"], name, "the feature of the exposure for a %q decision (%s)", name, raw);
+    ctx.Equal(event["variant"], get_variant(name, attrs), "the variant of the exposure for %s: the decision's", attrs.at("user_id"));
+    ctx.Equal(event["version"], 7, "the exposure must carry the snapshot version that made the assignment");
+    ctx.Equal(event["user_id"], attrs.at("user_id"), "the exposure must carry the user it was made for");
+    ctx.Assert(event["ts"].IsNumber() && std::abs(event["ts"].Float() - now) < 5, "ts must be the current time in seconds, got %v",
+               event["ts"]);
+  }
+  publishExposureGates(ctx, 8);
+  refresh();
+  get_exposed_variant("button_color", deAttrs(3));
+  ctx.Settle();
+  const auto values = ctx.Kafka.Values(exposureTopic);
+  const auto last = harness::ParseJSON(values.back()).value_or(harness::Any());
+  ctx.Equal(last["version"], 8,
+            "after the snapshot moved to version 8 the next exposure must say so (the graphs are annotated per edit)");
+}
+
+void CheckNonBlocking(harness::Ctx& ctx) {
+  loadExposures(ctx, 7);
+  ctx.Kafka.StallFor(exposureTopic, 2);  // the broker answers 2 s later
+  const int64_t before = ctx.Clock.Now();
+  const std::string got = get_exposed_variant("button_color", deAttrs(1));
+  const double waited = secondsSince(ctx, before);
+  ctx.Assert(waited < 0.5,
+             "get_exposed_variant waited %.1f s for a stalled broker's acknowledgement: hand the record to the producer "
+             "and return, the request path never waits for Kafka",
+             waited);
+  ctx.Equal(got, get_variant("button_color", deAttrs(1)), "with the broker stalled the decision must still be get_variant's");
+  ctx.Equal(ctx.Kafka.Records(exposureTopic).size(), 0,
+            "get_exposed_variant returned only after the broker acknowledged the record: hand it to the producer and "
+            "return; records");
+  for (int i = 2; i < 4; i++) get_exposed_variant("button_color", deAttrs(i));
+  const double total = secondsSince(ctx, before);
+  ctx.Assert(total < 0.5, "three decisions on a stalled broker took %.1f s of virtual time: none of them may wait", total);
+  ctx.Clock.Advance(2000);  // the broker is back
+  ctx.Settle();
+  get_exposed_variant("button_color", deAttrs(4));
+  ctx.Settle();
+  ctx.Equal(exposureUsers(ctx), {"u1", "u2", "u3", "u4"},
+            "the exposures handed to the producer while the broker was away must arrive once it answers: the users on %s",
+            exposureTopic);
+}
+
+void CheckBounded(harness::Ctx& ctx) {
+  loadExposures(ctx, 7);
+  int stalledDrops = 0;
+  {
+    ExposureLog logged;
+    ctx.Kafka.Stall(exposureTopic);  // the broker stops acknowledging: nothing handed to the producer leaves the queue
+    const int64_t before = ctx.Clock.Now();
+    bool sameDecisions = true;
+    for (int i = 0; i < 1200; i++) {
+      sameDecisions = get_exposed_variant("button_color", deAttrs(i)) == get_variant("button_color", deAttrs(i)) && sameDecisions;
+    }
+    ctx.Assert(sameDecisions, "a dropped exposure must not change the decision: every call still answers get_variant's variant");
+    ctx.Assert(dropped.load() > 0,
+               "1200 decisions on a stalled broker and nothing was dropped: the queue is unbounded, a broker that is not "
+               "answering grows it until the server runs out of memory");
+    // The C++ step bounds the exposures in flight (pending, freed by delivery reports), so exactly kMaxPending are accepted.
+    stalledDrops = static_cast<int>(dropped.load());
+    ctx.Equal(stalledDrops + kMaxPending, 1200,
+              "dropped + kMaxPending (%d) must account for the 1200 exposures on a stalled broker: pending counts every "
+              "exposure handed to the producer and not yet acknowledged",
+              kMaxPending);
+    ctx.Assert(!logged.lines.str().empty(), "dropping exposures must be logged: a rising dropped counter is the alarm");
+    const double took = secondsSince(ctx, before);
+    ctx.Assert(took < 0.5, "1200 decisions on a stalled broker took %.1f s of virtual time: dropping must not wait either", took);
+  }
+  ctx.Equal(ctx.Kafka.Records(exposureTopic).size(), 0, "nothing can reach the topic while the broker is stalled; records");
+  ctx.Kafka.Resume(exposureTopic);
+  ctx.Clock.Advance(31000);  // the broker is back: the pending exposures are delivered
+  ctx.Settle();
+  get_exposed_variant("button_color", deAttrs(1200));
+  ctx.Settle();
+  ctx.Equal(static_cast<int>(ctx.Kafka.Records(exposureTopic).size()), kMaxPending + 1,
+            "once the broker answers again the pending exposures (%d) must be delivered; records on the topic", kMaxPending);
+  ctx.Equal(static_cast<int>(dropped.load()), stalledDrops, "dropped after the pending exposures were delivered must stay");
+  for (int i = 0; i < 1000; i++) get_exposed_variant("button_color", deAttrs(i));
+  ctx.Settle();
+  ctx.Assert(static_cast<int>(dropped.load()) == stalledDrops,
+             "after the pending exposures were delivered their slots must be free again, yet %d of the next 1000 decisions "
+             "were dropped: the queue must drain",
+             static_cast<int>(dropped.load()) - stalledDrops);
+  ctx.Equal(static_cast<int>(ctx.Kafka.Records(exposureTopic).size()), kMaxPending + 1 + 1000,
+            "with the broker back every decision is one exposure again; records on the topic");
+}
+
+void CheckFlush(harness::Ctx& ctx) {
+  loadExposures(ctx, 7);
+  ctx.Kafka.StallFor(exposureTopic, 2);  // the broker is slow to answer at the moment of the stop
+  for (int i = 0; i < 3; i++) get_exposed_variant("button_color", deAttrs(i));
+  int64_t before = ctx.Clock.Now();
+  shutdown();
+  double took = secondsSince(ctx, before);
+  ctx.Equal(exposureUsers(ctx), {"u0", "u1", "u2"},
+            "shutdown() returned with exposures still queued (the broker answered after 2 s): flush so a clean stop loses "
+            "nothing; the users on %s",
+            exposureTopic);
+  ctx.Assert(took <= 5.5,
+             "the broker answered after 2 s yet shutdown() took %.0f s: wait for the pending deliveries, not for the whole "
+             "timeout",
+             took);
+  // The librdkafka producer outlives a flush, so the second stop needs no restart (Go re-initialises its writer).
+  ctx.Kafka.Stall(exposureTopic);  // now the broker is down for good
+  for (int i = 3; i < 6; i++) get_exposed_variant("button_color", deAttrs(i));
+  before = ctx.Clock.Now();
+  shutdown();
+  took = secondsSince(ctx, before);
+  ctx.Assert(took <= 6,
+             "with the broker down, shutdown() took %.0f s: flush with a 5 s bound so a stop is not held for the producer's "
+             "whole write timeout",
+             took);
+  ctx.Equal(ctx.Kafka.Records(exposureTopic).size(), 3, "nothing can reach the topic while the broker is down; records");
 }
 `,
   },

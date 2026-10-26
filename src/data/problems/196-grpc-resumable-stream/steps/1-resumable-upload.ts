@@ -1303,6 +1303,341 @@ func CheckReturnsAttempts(ctx *harness.Ctx) {
 	}
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <chrono>
+#include <cmath>
+#include <deque>
+#include <exception>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+constexpr int32_t kUpLast = 7;
+
+std::vector<std::string> UpChunks() {
+  std::vector<std::string> chunks;
+  for (int i = 0; i < 8; ++i) chunks.push_back("chunk-" + std::to_string(i));
+  return chunks;
+}
+
+int64_t UpNowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// How one Upload stream ends early: after that many fresh commits, with code; drop_ack loses that commit's Ack.
+struct UpFault {
+  grpc::StatusCode code;
+  int after;
+  bool drop_ack = false;
+  std::string details;
+};
+
+UpFault UpFaultOf(grpc::StatusCode code) { return UpFault{code, 1}; }
+
+// The details a fault's status carries.
+std::string UpDetails(const UpFault& f) { return f.details.empty() ? std::string("injected ") + grpc::EnumName(f.code) : f.details; }
+
+struct UpChunk {
+  std::string upload_id;
+  int32_t seq;
+  std::string data;
+};
+
+struct UpStatusCall {
+  std::string upload_id;
+  int64_t at;  // ms
+};
+
+// The ingest server: a committed point per upload, when each GetStatus and stream came, every chunk each stream delivered.
+struct UpPeer {
+  std::mutex mu;
+  std::map<std::string, int32_t> committed;
+  std::vector<UpStatusCall> status_calls;
+  std::vector<int64_t> opened;
+  std::vector<std::vector<UpChunk>> streams;
+  std::vector<bool> closed;
+  std::deque<UpFault> plan;
+  bool final_acked = false;
+  bool hold_final_ack = false;
+
+  grpc::Status GetStatus(const ingest::v1::StatusRequest* request, ingest::v1::StatusResponse* reply) {
+    std::lock_guard<std::mutex> lock(mu);
+    status_calls.push_back({request->upload_id(), UpNowMs()});
+    reply->set_next_seq(committed[request->upload_id()]);
+    return grpc::Status::OK;
+  }
+
+  grpc::Status Upload(grpc::ServerContext* context, grpc::ServerReaderWriter<ingest::v1::Ack, ingest::v1::Chunk>* stream) {
+    std::unique_lock<std::mutex> lock(mu);
+    const size_t n = streams.size();
+    opened.push_back(UpNowMs());
+    streams.emplace_back();
+    closed.push_back(false);
+    std::optional<UpFault> fault;
+    if (!plan.empty()) {
+      fault = plan.front();
+      plan.pop_front();
+    }
+    lock.unlock();
+    int commits = 0;
+    ingest::v1::Chunk chunk;
+    for (;;) {
+      if (!stream->Read(&chunk)) {
+        if (context->IsCancelled()) return grpc::Status::CANCELLED;
+        lock.lock();
+        closed[n] = true;
+        lock.unlock();
+        return grpc::Status::OK;
+      }
+      const std::string id = chunk.upload_id();
+      const int32_t seq = chunk.seq();
+      lock.lock();
+      streams[n].push_back({id, seq, chunk.data()});
+      const int32_t expected = committed[id];
+      lock.unlock();
+      if (seq > expected)
+        return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                            harness::Sprintf("gap: expected seq %d, got %d", expected, seq));
+      if (seq == expected) {
+        if (hold_final_ack && seq == kUpLast)
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));  // a slow final commit: the Ack for seq 7 comes later
+        lock.lock();
+        committed[id] = expected + 1;
+        lock.unlock();
+        ++commits;
+      }
+      ingest::v1::Ack ack;
+      lock.lock();
+      ack.set_seq(committed[id] - 1);
+      lock.unlock();
+      if (fault && commits == fault->after) {
+        if (!fault->drop_ack) stream->Write(ack);
+        return grpc::Status(fault->code, UpDetails(*fault));
+      }
+      if (ack.seq() == kUpLast) {
+        lock.lock();
+        final_acked = true;
+        lock.unlock();
+      }
+      if (!stream->Write(ack)) return grpc::Status(grpc::StatusCode::CANCELLED, "the stream is gone");
+    }
+  }
+};
+
+// The one Ingest service at ingest:9000; it forwards to the server of the latest UpStart.
+class UpFront final : public ingest::v1::Ingest::Service {
+ public:
+  UpPeer* cur = nullptr;
+
+  grpc::Status GetStatus(grpc::ServerContext*, const ingest::v1::StatusRequest* request, ingest::v1::StatusResponse* reply) override {
+    return cur->GetStatus(request, reply);
+  }
+  grpc::Status Upload(grpc::ServerContext* context, grpc::ServerReaderWriter<ingest::v1::Ack, ingest::v1::Chunk>* stream) override {
+    return cur->Upload(context, stream);
+  }
+};
+
+UpFront* up_serving = nullptr;
+
+struct UpStarted {
+  UpPeer* peer;
+  std::unique_ptr<ingest::v1::Ingest::Stub> client;
+};
+
+// A fresh ingest server with the given stream faults, and a client for it.
+UpStarted UpStart(harness::Ctx& ctx, std::deque<UpFault> plan, bool hold_final_ack) {
+  auto* p = new UpPeer();
+  p->plan = std::move(plan);
+  p->hold_final_ack = hold_final_ack;
+  if (up_serving == nullptr) {
+    up_serving = new UpFront();
+    ctx.GRPC.Server("ingest:9000")->RegisterService(up_serving);
+  }
+  up_serving->cur = p;
+  return {p, ingest::v1::Ingest::NewStub(grpc::CreateChannel("ingest:9000", grpc::InsecureChannelCredentials()))};
+}
+
+// How upload(client, "up-1", chunks, max_attempts) ended.
+struct UpResult {
+  int returned = 0;
+  bool failed = false;
+  std::string error;  // what() of the exception it threw
+  int64_t finished = 0;
+};
+
+UpResult UpRun(ingest::v1::Ingest::Stub& client, int max_attempts) {
+  UpResult r;
+  try {
+    r.returned = upload(client, "up-1", UpChunks(), max_attempts);
+  } catch (const std::exception& e) {
+    r.failed = true;
+    r.error = e.what();
+  }
+  r.finished = UpNowMs();
+  return r;
+}
+
+// The seqs each stream delivered: [[0 1 2 3 4] [5 6 7]].
+std::vector<std::vector<int32_t>> UpSent(UpPeer& p) {
+  std::lock_guard<std::mutex> lock(p.mu);
+  std::vector<std::vector<int32_t>> out;
+  for (const auto& s : p.streams) {
+    std::vector<int32_t> seqs;
+    for (const auto& c : s) seqs.push_back(c.seq);
+    out.push_back(seqs);
+  }
+  return out;
+}
+
+void UpOK(harness::Ctx& ctx, const UpResult& r, const std::string& what) {
+  ctx.Assert(!r.failed, "%s: upload() threw %q", what, r.error);
+}
+
+// upload() must have thrown the failed stream's error: its message carries the status's details.
+void UpRPCError(harness::Ctx& ctx, const UpResult& r, grpc::StatusCode code, const std::string& details, const std::string& what) {
+  ctx.Assert(r.failed, "%s: upload() returned %d instead of throwing the %v error", what, r.returned, code);
+  ctx.Assert(r.error.find(details) != std::string::npos, "%s: upload() threw %q, expected the %v stream's error (%q)", what, r.error,
+             code, details);
+}
+
+}  // namespace
+
+void CheckCleanUpload(harness::Ctx& ctx) {
+  auto [p, client] = UpStart(ctx, {}, true);
+  const UpResult r = UpRun(*client, 4);
+  bool acked_on_return;
+  {
+    std::lock_guard<std::mutex> lock(p->mu);
+    acked_on_return = p->final_acked;
+  }
+  UpOK(ctx, r, "a clean upload");
+  ctx.Equal(p->status_calls.size(), 1, "a clean upload must call GetStatus once, before the stream: GetStatus calls");
+  ctx.Equal(p->status_calls[0].upload_id, "up-1", "GetStatus must ask for the upload: its upload_id");
+  ctx.Equal(p->streams.size(), 1, "a clean upload must open one stream: Upload streams");
+  ctx.Equal(UpSent(*p), std::vector<std::vector<int32_t>>{{0, 1, 2, 3, 4, 5, 6, 7}},
+            "the stream must deliver each chunk once, in order: seqs per stream");
+  for (const auto& c : p->streams[0]) {
+    ctx.Equal(c.upload_id, "up-1", "Chunk seq %d must carry the upload_id", c.seq);
+    ctx.Equal(c.data, "chunk-" + std::to_string(c.seq), "Chunk seq %d must carry chunks[%d]", c.seq, c.seq);
+  }
+  ctx.Assert(acked_on_return,
+             "upload() returned before the server sent Ack{seq: 7}: the last Write is not the end, the Ack for the last seq is");
+  ctx.Settle();
+  bool closed;
+  {
+    std::lock_guard<std::mutex> lock(p->mu);
+    closed = p->closed[0];
+  }
+  ctx.Assert(closed, "upload() returned with the stream's send side still open: WritesDone after the last chunk");
+}
+
+void CheckResumeFromStatus(harness::Ctx& ctx) {
+  auto [p, client] = UpStart(ctx, {}, false);
+  p->committed["up-1"] = 3;
+  UpResult r = UpRun(*client, 4);
+  UpOK(ctx, r, "an upload the server already holds seqs 0 to 2 of");
+  ctx.Equal(UpSent(*p), std::vector<std::vector<int32_t>>{{3, 4, 5, 6, 7}},
+            "with GetStatus at next_seq 3 the streams must start at next_seq, not at 0: seqs per stream");
+
+  auto second = UpStart(ctx, {UpFault{grpc::StatusCode::UNAVAILABLE, 5, true}}, false);
+  r = UpRun(*second.client, 4);
+  UpOK(ctx, r, "an upload whose stream died after seq 4 was committed");
+  const auto streams = UpSent(*second.peer);
+  ctx.Assert(streams.size() == 2 && streams[1] == std::vector<int32_t>{5, 6, 7},
+             "seqs 0 to 4 were committed, the Ack for 4 was lost, then UNAVAILABLE; the streams delivered %v, expected [[0 1 2 3 4] [5 6 7]]: ask GetStatus (next_seq 5) and resend nothing below it",
+             streams);
+
+  auto third = UpStart(ctx, {UpFault{grpc::StatusCode::UNAVAILABLE, 8, true}}, false);
+  r = UpRun(*third.client, 4);
+  UpOK(ctx, r, "an upload whose final Ack was lost");
+  ctx.Equal(UpSent(*third.peer), std::vector<std::vector<int32_t>>{{0, 1, 2, 3, 4, 5, 6, 7}},
+            "every chunk was committed and only the final Ack lost: GetStatus says next_seq 8, so there is nothing to send. Seqs per stream");
+}
+
+void CheckBackoff(harness::Ctx& ctx) {
+  auto [p, client] = UpStart(
+      ctx, {UpFaultOf(grpc::StatusCode::UNAVAILABLE), UpFaultOf(grpc::StatusCode::ABORTED), UpFaultOf(grpc::StatusCode::UNAVAILABLE)}, false);
+  const int64_t started = UpNowMs();
+  const UpResult r = UpRun(*client, 4);
+  UpOK(ctx, r, "three failed streams, then a clean one");
+  std::vector<double> times;
+  for (const auto& c : p->status_calls) times.push_back(static_cast<double>(c.at - started) / 1000);
+  ctx.Equal(times.size(), 4, "three failed streams then a clean one must call GetStatus once per attempt: GetStatus calls");
+  ctx.Assert(times[0] < 0.05, "the first GetStatus came %.2f s in; the first attempt does not wait", times[0]);
+  std::vector<double> gaps;
+  for (size_t i = 1; i < times.size(); ++i) gaps.push_back(std::round((times[i] - times[i - 1]) * 100) / 100);
+  const double want[] = {0.1, 0.2, 0.4};
+  for (size_t i = 0; i < 3; ++i) {
+    ctx.Assert(std::abs(gaps[i] - want[i]) < 0.05,
+               "the GetStatus calls were %v s apart, expected [0.1 0.2 0.4]: wait kBaseBackoff * (1 << (attempt - 1)) after attempt number attempt fails",
+               gaps);
+  }
+  ctx.Equal(UpSent(*p), std::vector<std::vector<int32_t>>{{0}, {1}, {2}, {3, 4, 5, 6, 7}}, "seqs per stream");
+}
+
+void CheckGivesUp(harness::Ctx& ctx) {
+  std::deque<UpFault> plan;
+  for (int i = 0; i < 10; ++i) plan.push_back(UpFault{grpc::StatusCode::UNAVAILABLE, 1, false, harness::Sprintf("ingest restarting (%d)", i + 1)});
+  auto [p, client] = UpStart(ctx, plan, false);
+  UpResult r = UpRun(*client, 3);
+  UpRPCError(ctx, r, grpc::StatusCode::UNAVAILABLE, "ingest restarting (3)", "a server that drops every stream, max_attempts 3");
+  ctx.Equal(p->streams.size(), 3, "with max_attempts 3 upload() must open 3 streams: streams");
+  ctx.Assert(r.error.find("ingest restarting (3)") != std::string::npos && r.error.find("ingest restarting (2)") == std::string::npos,
+             "upload() must throw the last error, the third stream's (ingest restarting (3)): it threw %q", r.error);
+  const double waited = static_cast<double>(r.finished - p->opened.back()) / 1000;
+  ctx.Assert(waited < 0.05, "upload() returned %.2f s after its last stream opened: after the last attempt there is nothing to wait for", waited);
+
+  plan.clear();
+  for (int i = 0; i < 10; ++i) plan.push_back(UpFaultOf(grpc::StatusCode::UNAVAILABLE));
+  auto second = UpStart(ctx, plan, false);
+  r = UpRun(*second.client, 4);
+  UpRPCError(ctx, r, grpc::StatusCode::UNAVAILABLE, UpDetails(plan.front()), "a server that drops every stream, max_attempts 4");
+  ctx.Equal(second.peer->streams.size(), 4, "with max_attempts 4 upload() must open 4 streams: streams");
+}
+
+void CheckOtherCodes(harness::Ctx& ctx) {
+  for (const grpc::StatusCode code : {grpc::StatusCode::INVALID_ARGUMENT, grpc::StatusCode::PERMISSION_DENIED}) {
+    const UpFault fault{code, 2};
+    auto [p, client] = UpStart(ctx, {fault}, false);
+    const int64_t started = UpNowMs();
+    const UpResult r = UpRun(*client, 4);
+    UpRPCError(ctx, r, code, UpDetails(fault), std::string("a stream that ends with ") + grpc::EnumName(code));
+    ctx.Assert(p->status_calls.size() == 1 && p->streams.size() == 1,
+               "%v was retried (%d GetStatus calls, %d streams): only UNAVAILABLE and ABORTED are", code, p->status_calls.size(),
+               p->streams.size());
+    const double waited = static_cast<double>(r.finished - started) / 1000;
+    ctx.Assert(waited < 0.05, "upload() waited %.2f s before throwing %v: throw it at once", waited, code);
+  }
+}
+
+void CheckReturnsAttempts(harness::Ctx& ctx) {
+  struct Case {
+    std::deque<UpFault> plan;
+    int max_attempts;
+    int want;
+    std::string what;
+  };
+  const std::vector<Case> cases = {
+      {{}, 4, 1, "a clean upload"},
+      {{UpFault{grpc::StatusCode::ABORTED, 3}}, 4, 2, "one ABORTED stream"},
+      {{UpFault{grpc::StatusCode::UNAVAILABLE, 8, true}}, 4, 2, "a stream that lost only the final Ack"},
+      {{UpFaultOf(grpc::StatusCode::UNAVAILABLE), UpFaultOf(grpc::StatusCode::ABORTED)}, 3, 3, "two failed streams with max_attempts 3"},
+  };
+  for (const Case& tc : cases) {
+    auto started = UpStart(ctx, tc.plan, false);
+    const UpResult r = UpRun(*started.client, tc.max_attempts);
+    UpOK(ctx, r, tc.what);
+    ctx.Equal(r.returned, tc.want, "%s: upload() must return the attempts it used", tc.what);
+  }
+}
+`,
   },
   debrief: `A resumable upload is at-least-once delivery that the server turns into exactly-once storage. The seq is the idempotency key: the server commits seq \`n\` only when its committed point is \`n\`, ignores anything below and refuses anything above. The committed point lives on the server because only the server knows it: a stream can die after a commit and before the Ack crosses the wire, so the client's last Ack is a lower bound. Trusting it resends committed chunks (harmless here, wasted bandwidth, a bug wherever the server is not idempotent); restarting from 0 resends all of them, and a large upload on a flaky link may never finish. Asking \`GetStatus\` costs one round trip per attempt and is always right.
 

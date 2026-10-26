@@ -715,5 +715,92 @@ func CheckNotModified(ctx *harness.Ctx) {
 	ctx.Equal(other.Status, 200, "a stale If-None-Match must get the full 200")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+// One get_thumb call the stand-in saw: (id, width).
+using ThumbCall = std::pair<std::string, int>;
+std::vector<ThumbCall>* thumbCalls = nullptr;
+
+// thumbServer runs the learner's server with get_thumb stood in for by the thumbnail cache (built in
+// the next steps): it knows cat and records every call.
+harness::HTTP thumbServer(harness::Ctx& ctx, std::vector<ThumbCall>& calls) {
+  thumbCalls = &calls;
+  return ctx.Main().HTTP();
+}
+
+}  // namespace
+
+// The thumbnail cache the next steps build, stood in for (Go swaps the getThumb variable instead).
+std::optional<std::string> get_thumb(const std::string& id, int width) {
+  if (thumbCalls) thumbCalls->push_back({id, width});
+  if (id != "cat") return std::nullopt;
+  return "JPEG-" + id + "-" + std::to_string(width);
+}
+
+void CheckRoute(harness::Ctx& ctx) {
+  std::vector<ThumbCall> calls;
+  auto c = thumbServer(ctx, calls);
+  const auto r = c.Get("/img/cat?w=256");
+  ctx.Equal(r.Status, 200, "GET /img/cat?w=256");
+  ctx.Equal(r.Text(), "JPEG-cat-256", "the body must be exactly the bytes getThumb returned");
+  const std::string type = r.HeaderValue("Content-Type");
+  ctx.Assert(type.rfind("image/jpeg", 0) == 0, "Content-Type was %q, not image/jpeg", type);
+  ctx.Equal(calls, std::vector<ThumbCall>{{"cat", 256}}, "getThumb must be called once with (%q, 256)", "cat");
+}
+
+void CheckValidate(harness::Ctx& ctx) {
+  std::vector<ThumbCall> calls;
+  auto c = thumbServer(ctx, calls);
+  ctx.Equal(c.Get("/img/cat?w=8").Status, 400, "w=8 is below 16");
+  ctx.Equal(c.Get("/img/cat?w=4096").Status, 400, "w=4096 is above 2048");
+  ctx.Equal(calls.size(), 0, "a rejected width must not reach getThumb");
+  ctx.Equal(c.Get("/img/cat?w=16").Status, 200, "w=16 is the lower bound and valid");
+  ctx.Equal(c.Get("/img/cat").Status, 200, "without w the default width (256) applies");
+  bool defaulted = false;
+  for (const auto& call : calls) defaulted = defaulted || call == ThumbCall{"cat", 256};
+  ctx.Assert(defaulted, "the default width is 256: getThumb was called with %v", calls);
+}
+
+void CheckNotFound(harness::Ctx& ctx) {
+  std::vector<ThumbCall> calls;
+  auto c = thumbServer(ctx, calls);
+  ctx.Equal(c.Get("/img/ghost?w=256").Status, 404, "an image getThumb does not know");
+}
+
+void CheckCacheHeaders(harness::Ctx& ctx) {
+  std::vector<ThumbCall> calls;
+  auto c = thumbServer(ctx, calls);
+  const auto r1 = c.Get("/img/cat?w=256");
+  const auto r2 = c.Get("/img/cat?w=256");
+  const auto r3 = c.Get("/img/cat?w=128");
+  const std::string cacheControl = r1.HeaderValue("Cache-Control");
+  ctx.Assert(cacheControl.find("public") != std::string::npos && cacheControl.find("max-age=86400") != std::string::npos,
+             "Cache-Control was %q", cacheControl);
+  const std::string etag = r1.HeaderValue("ETag");
+  ctx.Assert(etag != "", "the 200 response carries no ETag");
+  ctx.Equal(r2.HeaderValue("ETag"), etag, "the same bytes must get the same ETag");
+  ctx.Assert(r3.HeaderValue("ETag") != etag, "different bytes must get a different ETag, both got %q", etag);
+}
+
+void CheckNotModified(harness::Ctx& ctx) {
+  std::vector<ThumbCall> calls;
+  auto c = thumbServer(ctx, calls);
+  const auto first = c.Get("/img/cat?w=256");
+  const std::string etag = first.HeaderValue("ETag");
+  ctx.Assert(etag != "", "no ETag to revalidate against");
+  const auto same = c.Get("/img/cat?w=256", "If-None-Match", etag);
+  const auto other = c.Get("/img/cat?w=256", "If-None-Match", R"("stale")");
+  ctx.Equal(same.Status, 304, "If-None-Match with the current ETag");
+  ctx.Equal(same.Text(), "", "a 304 must carry no body");
+  ctx.Equal(same.HeaderValue("ETag"), etag, "the 304 repeats the ETag so the client keeps its copy");
+  ctx.Equal(other.Status, 200, "a stale If-None-Match must get the full 200");
+}
+`,
   },
 };

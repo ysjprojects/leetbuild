@@ -1333,6 +1333,205 @@ func CheckFastWorker(ctx *harness.Ctx) {
 	ctx.Assert(peak < highWater, "the queue reached %d with a worker that returns at once; the drain loop must run between deliveries", peak)
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <exception>
+#include <mutex>
+#include <set>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+
+const int seededJobs = 200;
+
+// jobTrace is what the harness's worker saw: stats() per job and every 10 ms, every job, and the
+// finished jobs per partition.
+struct jobTrace {
+  std::mutex mu;
+  std::vector<Status> samples;
+  std::vector<Job> jobs;
+  int64_t done[3] = {0, 0, 0};
+
+  void sample() {
+    const Status s = stats();
+    std::lock_guard<std::mutex> lock(mu);
+    samples.push_back(s);
+  }
+
+  int64_t finished(int partition) {
+    std::lock_guard<std::mutex> lock(mu);
+    return done[partition];
+  }
+};
+
+void seedJobs(harness::Ctx& ctx) {
+  for (int i = 0; i < seededJobs; i++) {
+    const std::string job = "job-" + std::to_string(i);
+    ctx.Kafka.SeedPartition("jobs", i % 3, job, job);
+  }
+}
+
+// runJobs runs run with the harness's worker until every job is committed (or the sleep budget
+// ends the run), then stops it.
+void runJobs(harness::Ctx& ctx, bool slow, jobTrace& t) {
+  // consume(10 ms) while paused and the 10 ms sampler each jump the clock: 200 jobs need far more than 500 jumps.
+  ctx.Clock.SetSleepLimit(5000);
+  auto worker = [&t, slow](const Job& job) {
+    t.sample();
+    {
+      std::lock_guard<std::mutex> lock(t.mu);
+      t.jobs.push_back(job);
+    }
+    if (slow) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::lock_guard<std::mutex> lock(t.mu);
+    t.done[job.partition]++;
+  };
+  std::mutex m;
+  std::condition_variable cv;
+  bool allCommitted = false;
+  bool returned = false;
+  std::string runError;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) {
+    if (ctx.Kafka.Lag("workers", "jobs") != 0) return;
+    std::lock_guard<std::mutex> lock(m);
+    allCommitted = true;
+    cv.notify_all();
+  });
+  std::atomic<bool> sampling{true};
+  std::thread sampler([&] {
+    while (sampling) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      if (sampling) t.sample();
+    }
+  });
+  std::thread runner([&] {
+    try {
+      run(worker);
+    } catch (const std::exception& e) {
+      runError = e.what();
+    } catch (...) {
+      runError = harness::CurrentExceptionType();
+    }
+    std::lock_guard<std::mutex> lock(m);
+    returned = true;
+    cv.notify_all();
+  });
+  ctx.Drain([&] {
+    std::unique_lock<std::mutex> lock(m);
+    cv.wait(lock, [&] { return allCommitted || returned; });
+  });
+  sampling = false;
+  stop();
+  if (!ctx.Drain([&] {
+        runner.join();
+        sampler.join();
+      })) {
+    runner.detach();
+    sampler.detach();
+  }
+  ctx.Assert(runError.empty(), "run threw: %v", runError);
+  ctx.Equal(stats().processed, seededJobs, "processed jobs");
+}
+
+}  // namespace
+
+void CheckBounded(harness::Ctx& ctx) {
+  seedJobs(ctx);
+  jobTrace t;
+  runJobs(ctx, true, t);
+  size_t peak = 0;
+  for (const auto& s : t.samples) peak = std::max(peak, s.queued);
+  ctx.Assert(peak <= kHigh, "the queue held %d jobs at one point; it must never exceed kHigh = 20", peak);
+  ctx.Equal(stats().queued, 0, "once every job is processed the queue must be empty: stats().queued");
+}
+
+void CheckPauseResume(harness::Ctx& ctx) {
+  seedJobs(ctx);
+  jobTrace t;
+  runJobs(ctx, true, t);
+  int first = -1;
+  for (size_t i = 0; i < t.samples.size(); i++) {
+    if (t.samples[i].paused) {
+      first = static_cast<int>(i);
+      break;
+    }
+  }
+  ctx.Assert(first >= 0,
+             "with a worker ten times slower than the fetcher the consumer was never paused: pause the topic when the queue reaches kHigh");
+  ctx.Assert(t.samples[first].queued >= kHigh - 1, "the consumer paused with only %d queued; the pause belongs at kHigh = 20",
+             t.samples[first].queued);
+  std::vector<size_t> resumes;
+  for (size_t i = 1; i < t.samples.size(); i++)
+    if (t.samples[i - 1].paused && !t.samples[i].paused) resumes.push_back(i);
+  ctx.Assert(!resumes.empty(), "the consumer paused but never resumed");
+  for (const size_t i : resumes)
+    ctx.Assert(t.samples[i].queued <= kLow, "resumed with %d still queued; resume only once the queue is down to kLow = 5",
+               t.samples[i].queued);
+  ctx.Assert(resumes.size() >= 2, "paused and resumed %d time(s) over 200 jobs; the cycle should repeat as the slow worker drains",
+             resumes.size());
+  ctx.Assert(!stats().paused, "once every job is processed the consumer must not be left paused");
+}
+
+void CheckInOrder(harness::Ctx& ctx) {
+  seedJobs(ctx);
+  jobTrace t;
+  runJobs(ctx, true, t);
+  ctx.Equal(t.jobs.size(), seededJobs, "worker calls for 200 jobs");
+  std::set<std::string> seen;
+  for (const auto& j : t.jobs) seen.insert(std::to_string(j.partition) + "@" + std::to_string(j.offset));
+  ctx.Equal(seen.size(), seededJobs, "some job reached the worker more than once: distinct jobs");
+  for (int p = 0; p < 3; p++) {
+    std::vector<int64_t> offsets;
+    for (const auto& j : t.jobs)
+      if (j.partition == p) offsets.push_back(j.offset);
+    for (size_t i = 0; i < offsets.size(); i++)
+      ctx.Assert(offsets[i] == static_cast<int64_t>(i), "partition %d was processed out of order: offsets %v…", p,
+                 std::vector<int64_t>(offsets.begin(), offsets.begin() + std::min<size_t>(8, offsets.size())));
+  }
+  for (const auto& j : t.jobs)
+    ctx.Equal(j.value, "job-" + std::to_string(3 * j.offset + j.partition), "the job at %d@%d carried the wrong value", j.partition,
+              j.offset);
+}
+
+void CheckCommitAfter(harness::Ctx& ctx) {
+  seedJobs(ctx);
+  jobTrace t;
+  std::vector<std::string> violations;
+  ctx.Kafka.OnCommit([&](const std::string& g, const harness::KafkaOffsets& offsets) {
+    for (const auto& [tp, o] : offsets) {
+      if (g != "workers" || tp.Topic != "jobs")
+        violations.push_back(harness::Sprintf("a commit for %s/%s: the group is workers, the topic jobs", g, tp.Topic));
+      else if (o > t.finished(tp.Partition))
+        violations.push_back(harness::Sprintf("partition %d: committed offset %d while the worker had finished %d of its jobs",
+                                              tp.Partition, o, t.finished(tp.Partition)));
+    }
+  });
+  runJobs(ctx, true, t);
+  ctx.Equal(ctx.Kafka.EventsOf("auto-commit").size(), 0,
+            "auto-commit is on (offsets were committed on a timer, before the worker ran): auto-commit events");
+  ctx.Assert(violations.empty(), "%v", violations);
+  ctx.Equal(ctx.Kafka.Lag("workers", "jobs"), 0, "processed jobs never committed");
+}
+
+void CheckFastWorker(harness::Ctx& ctx) {
+  seedJobs(ctx);
+  jobTrace t;
+  runJobs(ctx, false, t);
+  size_t peak = 0;
+  for (const auto& s : t.samples) {
+    ctx.Assert(!s.paused, "the worker kept up, yet the consumer was paused: pause only when the queue reaches kHigh");
+    peak = std::max(peak, s.queued);
+  }
+  ctx.Assert(peak < kHigh, "the queue reached %d with a worker that returns at once; the drain loop must run between deliveries", peak);
+}
+`,
   },
   debrief: `Backpressure in a Kafka consumer is a hysteresis loop over a bounded queue: fetch until HIGH, pause, drain until LOW, resume. The gap between the two marks is what stops the consumer from flapping pause/resume on every record; the queue bound is what keeps memory flat no matter how far the topic runs ahead. Pausing keeps the consumer in the group — it still polls, heartbeats and serves rebalance callbacks — where simply blocking in the poll loop would trip \`max.poll.interval.ms\` and hand the partitions to someone else. Committing from the drain loop after the worker returns keeps the delivery guarantee at-least-once: nothing in the queue is committed, so a crash replays it rather than losing it. Real consumers bound the queue in bytes as well as records, pause partitions individually when one key runs hot, and (with the Java client, which is single-threaded) route the commits back to the poll thread and cap \`max.poll.records\` so a single poll cannot overshoot the high-water mark.`,
 };

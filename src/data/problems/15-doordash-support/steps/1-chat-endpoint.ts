@@ -1311,7 +1311,7 @@ void answer_json(httplib::Response& res, int status, const json& body) {
 }
 
 static bool non_empty_string(const json& body, const char* field) {
-  return body.contains(field) && body[field].is_string() && !body[field].get<std::string>().empty();
+  return body.contains(field) && body[field].is_string() && body[field].get<std::string>().find_first_not_of(" \\t\\r\\n") != std::string::npos;
 }
 
 // The request's three strings, or nullopt when any is missing or empty.
@@ -2274,6 +2274,474 @@ func CheckRecorded(ctx *harness.Ctx) {
 	}
 	sort.Strings(turns)
 	ctx.Equal(turns, []string{"s1:1", "s1:2", "s1:3", "s2:1", "s2:2"}, "every turn once, numbered within its session")
+}
+`,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <map>
+#include <mutex>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+
+#include <grpcpp/grpcpp.h>
+
+#include "assistant/chunk.h"
+#include "assistant/config.h"
+#include "assistant/db.h"
+#include "assistant/embed.h"
+#include "assistant/kb.h"
+#include "assistant/model.h"
+#include "assistant/prompt.h"
+#include "digest.h"
+#include "guardrail.h"
+#include "kb_search.h"
+#include "support.grpc.pb.h"
+
+using harness::Any;
+
+namespace {
+
+const std::string apiLoginQ = "I forgot my password and cannot sign in";
+const std::string apiRedCardQ = "My red card was declined at checkout";
+const std::string apiReferralQ = "Can I get a referral bonus for a friend";
+
+// The check running now: the stand-ins for the later steps reach Redis through it.
+harness::Ctx* apiCtx = nullptr;
+
+// apiLLM is the stand-in model at both addresses: faithful unless the check flips mode; every reply it gave.
+class apiLLM final : public support::Llm::Service {
+ public:
+  grpc::Status Generate(grpc::ServerContext*, const support::GenerateRequest* req, support::GenerateReply* reply) override {
+    std::lock_guard<std::mutex> lock(mu_);
+    const std::string text = model::complete(req->prompt(), req->max_tokens(), mode_);
+    replies_.push_back(text);
+    reply->set_text(text);
+    reply->set_tokens(static_cast<int32_t>(model::tokens(text).size()));
+    reply->set_model(req->model());
+    return grpc::Status::OK;
+  }
+  void setMode(const std::string& mode) {
+    std::lock_guard<std::mutex> lock(mu_);
+    mode_ = mode;
+  }
+  std::pair<std::string, int> lastReply() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (replies_.empty()) return {"", 0};
+    return {replies_.back(), static_cast<int>(replies_.size())};
+  }
+
+ private:
+  std::mutex mu_;
+  std::string mode_ = "faithful";
+  std::vector<std::string> replies_;
+};
+
+class apiJudge final : public support::Judge::Service {
+ public:
+  grpc::Status Evaluate(grpc::ServerContext*, const support::EvaluateRequest* req, support::Scores* out) override {
+    const std::vector<std::string> ids(req->context_ids().begin(), req->context_ids().end());
+    const auto s = model::evaluate(req->question(), req->answer(), ids);
+    out->set_groundedness(static_cast<float>(s.groundedness));
+    out->set_coherence(static_cast<float>(s.coherence));
+    out->set_compliance(static_cast<float>(s.compliance));
+    out->set_pass(s.pass);
+    return grpc::Status::OK;
+  }
+};
+
+std::string trim(const std::string& s) {
+  const size_t a = s.find_first_not_of(" \\t\\r\\n");
+  if (a == std::string::npos) return "";
+  return s.substr(a, s.find_last_not_of(" \\t\\r\\n") - a + 1);
+}
+
+std::vector<std::string> fields(const std::string& s) {
+  std::istringstream in(s);
+  std::vector<std::string> out;
+  for (std::string w; in >> w;) out.push_back(w);
+  return out;
+}
+
+std::string join(const std::vector<std::string>& items, const std::string& sep) {
+  std::string out;
+  for (size_t i = 0; i < items.size(); i++) out += (i == 0 ? "" : sep) + items[i];
+  return out;
+}
+
+std::string lower(const std::string& s) {
+  std::string out;
+  for (unsigned char c : s) out += static_cast<char>(std::tolower(c));
+  return out;
+}
+
+std::vector<std::string> apiSentences(const std::string& text) {
+  std::vector<std::string> out;
+  std::string cur;
+  for (char c : text + ".") {
+    if (c == '.' || c == '!' || c == '?') {
+      if (const std::string s = trim(cur); !s.empty()) out.push_back(s);
+      cur.clear();
+    } else {
+      cur += c;
+    }
+  }
+  return out;
+}
+
+// apiPasses is step 4's check: every citation retrieved, every sentence like some chunk, then the judge's pass.
+bool apiPasses(support::Judge::Stub& judge, const std::string& question, const std::string& answer, const std::vector<prompt::Chunk>& chunks) {
+  std::set<std::string> ids;
+  std::vector<std::vector<double>> vectors;
+  support::EvaluateRequest req;
+  req.set_question(question);
+  req.set_answer(answer);
+  for (const auto& c : chunks) {
+    ids.insert(c.id);
+    req.add_context_ids(c.id);
+    vectors.push_back(assistant::embed(c.text));
+  }
+  for (const auto& id : prompt::cited_ids(answer))
+    if (!ids.count(id)) return false;
+  for (const auto& s : apiSentences(answer)) {
+    const auto v = assistant::embed(s);
+    double best = 0.0;
+    for (const auto& w : vectors) best = std::max(best, assistant::cosine(v, w));
+    if (best < config::kMinSimilarity) return false;
+  }
+  grpc::ClientContext call;
+  call.set_deadline(std::chrono::system_clock::now() + config::kDeadline);
+  support::Scores scores;
+  return judge.Evaluate(&call, req, &scores).ok() && scores.pass();
+}
+
+std::string apiKey(const std::string& question) { return "answer:" + sha256_hex(join(fields(lower(question)), " ")); }
+
+}  // namespace
+
+// The stand-ins for the later steps as the course builds them (Go's apiNeighbours): kb_search (step 2:
+// pgvector over kb_chunks, the answer cache in Redis) and the guardrail (step 4) over the model call (step 3).
+// C++ links one definition per declaration, so they are defined here rather than assigned per check.
+std::optional<CachedAnswer> cached_answer(const std::string& question) {
+  const auto raw = apiCtx->Redis.Get(apiKey(question));
+  if (!raw) return std::nullopt;
+  const auto v = harness::ParseJSON(*raw);
+  if (!v) throw std::runtime_error("cached answer is not JSON: " + *raw);
+  CachedAnswer out{(*v)["answer"].String(), {}};
+  for (const auto& s : (*v)["sources"].Items()) out.sources.push_back(s.String());
+  return out;
+}
+
+void remember_answer(const std::string& question, const std::string& answer, const std::vector<std::string>& sources) {
+  lb::Json list = lb::Json::array();
+  for (const auto& s : sources) list.push(s);
+  lb::Json value = lb::Json::object();
+  value.set("answer", answer);
+  value.set("sources", list);
+  apiCtx->Redis.Set(apiKey(question), value.dump(), "EX", config::kCacheTtlS);
+}
+
+std::vector<Hit> search(const std::string& question, int k) {
+  const std::string q = assistant::to_pgvector(assistant::embed(question));
+  pqxx::read_transaction tx(assistant::db());
+  const auto rows = tx.exec_params(
+      "SELECT id, text, embedding <=> $1::vector AS distance FROM kb_chunks ORDER BY embedding <=> $1::vector LIMIT $2", q, k);
+  std::vector<Hit> out;
+  for (const auto& row : rows) out.push_back({row["id"].as<std::string>(), row["text"].as<std::string>(), 1.0 - row["distance"].as<double>()});
+  return out;
+}
+
+Outcome answer_or_escalate(const std::string& question, const std::vector<prompt::Chunk>& chunks, const std::vector<prompt::Turn>& history) {
+  auto llm = support::Llm::NewStub(grpc::CreateChannel(config::kLlmLarge, grpc::InsecureChannelCredentials()));
+  auto judge = support::Judge::NewStub(grpc::CreateChannel(config::kJudge, grpc::InsecureChannelCredentials()));
+  std::string modelName;
+  for (int attempt = 0; attempt < 2; attempt++) {
+    grpc::ClientContext call;
+    call.set_deadline(std::chrono::system_clock::now() + config::kDeadline);
+    support::GenerateRequest req;
+    req.set_model("large");
+    req.set_prompt(prompt::build_prompt(question, chunks, history));
+    req.set_max_tokens(config::kMaxTokens);
+    support::GenerateReply reply;
+    const grpc::Status status = llm->Generate(&call, req, &reply);
+    if (!status.ok()) throw std::runtime_error("Generate: " + status.error_message());
+    modelName = reply.model();
+    if (apiPasses(*judge, question, reply.text(), chunks)) {
+      return Outcome{reply.text(), prompt::cited_ids(reply.text()), false, modelName, reply.tokens()};
+    }
+  }
+  return Outcome{config::kHandoffText, {}, true, modelName, 0};
+}
+
+namespace {
+
+// apiWorld is the learner's app over an indexed knowledge base, with the model and the judge served.
+struct apiWorld {
+  apiLLM llm;
+  apiJudge judge;
+  harness::HTTP* http = nullptr;
+};
+
+apiWorld& apiServe(harness::Ctx& ctx) {
+  static apiWorld* w = nullptr;
+  static harness::HTTP* http = nullptr;
+  delete w;
+  delete http;
+  ctx.DB.Reset(db::kSchema);
+  for (const auto& a : assistant::articles()) {
+    const auto chunks = assistant::chunk(a.body);
+    for (size_t position = 0; position < chunks.size(); position++) {
+      ctx.DB.Exec("INSERT INTO kb_chunks (id, article, position, text, embedding) VALUES ($1, $2, $3, $4, $5::vector)",
+                  harness::Sprintf("%s-%d", a.id, position), a.id, static_cast<int>(position), chunks[position],
+                  assistant::to_pgvector(assistant::embed(chunks[position])));
+    }
+  }
+  w = new apiWorld;
+  ctx.GRPC.Server(config::kLlmLarge)->RegisterService(&w->llm);
+  ctx.GRPC.Server(config::kLlmSmall)->RegisterService(&w->llm);
+  ctx.GRPC.Server(config::kJudge)->RegisterService(&w->judge);
+  apiCtx = &ctx;
+  http = new harness::HTTP(ctx.Main().HTTP());
+  w->http = http;
+  return *w;
+}
+
+std::vector<harness::Call> apiGenerates(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Generate", ""); }
+
+std::vector<prompt::Turn> apiHistory(harness::Ctx& ctx, const std::string& sessionID) {
+  std::vector<prompt::Turn> turns;
+  for (const auto& raw : ctx.Redis.LRange("conv:" + sessionID, 0, -1)) {
+    prompt::Turn t;
+    if (const auto v = harness::ParseJSON(raw)) {
+      if ((*v)["role"].IsString()) t.role = (*v)["role"].String();
+      if ((*v)["text"].IsString()) t.text = (*v)["text"].String();
+    }
+    turns.push_back(t);
+  }
+  return turns;
+}
+
+std::string showTurns(const std::vector<prompt::Turn>& turns) {
+  std::string out = "[";
+  for (size_t i = 0; i < turns.size(); i++) out += (i == 0 ? "{" : " {") + harness::Sprintf("Role:%s Text:%s", turns[i].role, turns[i].text) + "}";
+  return out + "]";
+}
+
+// apiRecord is one record of the topic: its key and its JSON value.
+struct apiRecord {
+  std::string key;
+  Any value;
+};
+
+std::vector<apiRecord> apiRecords(harness::Ctx& ctx) {
+  std::vector<apiRecord> out;
+  for (const auto& r : ctx.Kafka.Records(config::kTopic)) {
+    const auto v = harness::ParseJSON(r.Value.value_or(""));
+    out.push_back({r.Key.value_or(""), v ? *v : Any()});
+  }
+  return out;
+}
+
+std::vector<std::string> apiStrings(const Any& v) {
+  std::vector<std::string> out;
+  if (v.IsArray())
+    for (const auto& x : v.Items()) out.push_back(x.Format());
+  return out;
+}
+
+// apiShow is Go's json.Marshal of a decoded value; %v-style text stands in for it here.
+std::string apiShow(const Any& v) { return v.Format(true); }
+
+bool apiNonEmpty(const Any& v) { return !v.IsNil() && !(v == ""); }
+
+std::string body(const std::string& sessionID, const std::string& dasherID, const std::string& message) {
+  lb::Json b = lb::Json::object();
+  b.set("session_id", sessionID);
+  b.set("dasher_id", dasherID);
+  b.set("message", message);
+  return b.dump();
+}
+
+Any chat(harness::Ctx& ctx, apiWorld& w, const std::string& sessionID, const std::string& dasherID, const std::string& message, int expect) {
+  const auto r = w.http->Post("/chat", body(sessionID, dasherID, message));
+  ctx.Assert(r.Status == expect, "POST /chat (%q from %s in %s) answered %d %s, expected %d", message, dasherID, sessionID, r.Status, r.Text(), expect);
+  const auto data = harness::ParseJSON(r.Text());
+  ctx.Assert(data.has_value() && data->IsObject(), "POST /chat must answer a JSON object, got %s", r.Text());
+  return *data;
+}
+
+}  // namespace
+
+void CheckValidate(harness::Ctx& ctx) {
+  auto& w = apiServe(ctx);
+  const std::vector<std::pair<std::string, std::string>> bad = {
+      {"no session_id", R"({"dasher_id": "d1", "message": "hi"})"},
+      {"an empty session_id", R"({"session_id": "", "dasher_id": "d1", "message": "hi"})"},
+      {"no dasher_id", R"({"session_id": "s1", "message": "hi"})"},
+      {"an empty dasher_id", R"({"session_id": "s1", "dasher_id": "   ", "message": "hi"})"},
+      {"no message", R"({"session_id": "s1", "dasher_id": "d1"})"},
+      {"an empty message", R"({"session_id": "s1", "dasher_id": "d1", "message": ""})"},
+      {"a message that is not a string", R"({"session_id": "s1", "dasher_id": "d1", "message": 7})"},
+      {"a body that is not an object", R"(["s1", "d1", "hi"])"},
+  };
+  for (const auto& [what, b] : bad) {
+    const auto r = w.http->Post("/chat", b);
+    ctx.Assert(r.Status == 400, "POST /chat with %s answered %d %s, expected 400", what, r.Status, r.Text());
+    ctx.Equal(r.JSON(), harness::ParseJSON(R"({"error":"invalid_request"})"), "the 400 for %s must be {\\"error\\": \\"invalid_request\\"}", what);
+  }
+  ctx.Assert(ctx.Redis.Keys("*").empty(), "a rejected request must touch nothing, Redis holds %q", ctx.Redis.Keys("*"));
+  ctx.Equal(apiGenerates(ctx).size(), 0, "a rejected request must not reach the model");
+  ctx.Equal(ctx.Kafka.Records(config::kTopic).size(), 0, "a rejected request must not be recorded");
+  const Any data = chat(ctx, w, "s1", "d1", apiLoginQ, 200);
+  ctx.Assert(apiNonEmpty(data["answer"]), "a valid request must be answered, got %s", apiShow(data));
+}
+
+void CheckAnswerAndHistory(harness::Ctx& ctx) {
+  auto& w = apiServe(ctx);
+  Any data = chat(ctx, w, "s1", "d1", apiLoginQ, 200);
+  const auto [answer, replies] = w.llm.lastReply();
+  ctx.Assert(replies >= 1, "the first question of a session must reach the model (no cache, no history)");
+  ctx.Equal(data["answer"], answer, "answer must be what the guardrail passed on — the model's reply");
+  ctx.Assert(answer.rfind("Based on [kb:login-", 0) == 0, "the question about signing in must be answered from the login article's chunks (search → the prompt), the model answered %q", answer);
+  ctx.Equal(apiStrings(data["sources"]), prompt::cited_ids(answer), "sources must be the chunk ids the answer cites, in order");
+  ctx.Assert(data["escalated"] == false && data["model"] == "large" && data["cached"] == false, "a grounded first answer is escalated: false, model: \\"large\\", cached: false; got %s", apiShow(data));
+  ctx.Equal(data["turn"], 1, "the first Dasher turn of a session is turn 1");
+  auto turns = apiHistory(ctx, "s1");
+  const std::vector<prompt::Turn> want = {{"dasher", apiLoginQ}, {"assistant", answer}};
+  ctx.Assert(turns == want, "conv:s1 must hold the Dasher's turn then the assistant's as JSON {role, text}: got %s, want %s", showTurns(turns), showTurns(want));
+  const long long ttl = ctx.Redis.TTL("conv:s1");
+  ctx.Assert(config::kHistoryTtlS - 5 <= ttl && ttl <= config::kHistoryTtlS, "conv:s1 must expire after config.HistoryTTL = %d s, its TTL is %d", config::kHistoryTtlS, ttl);
+  const size_t callsBefore = apiGenerates(ctx).size();
+  data = chat(ctx, w, "s1", "d1", apiRedCardQ, 200);
+  ctx.Assert(apiGenerates(ctx).size() > callsBefore, "a new question in the session must reach the model");
+  const std::string text = apiGenerates(ctx)[callsBefore].Request<support::GenerateRequest>().prompt();
+  ctx.Assert(text.find("dasher: " + apiLoginQ) != std::string::npos && text.find("assistant: " + answer) != std::string::npos, "the second question's prompt must carry the first exchange as history (load conv:<session_id> and pass it to answerOrEscalate); the prompt has no such lines");
+  ctx.Equal(data["turn"], 2, "the second Dasher turn of the session is turn 2");
+  turns = apiHistory(ctx, "s1");
+  std::vector<std::string> roles;
+  for (const auto& t : turns) roles.push_back(t.role);
+  ctx.Assert(turns.size() == 4 && join(roles, ",") == "dasher,assistant,dasher,assistant", "after two exchanges conv:s1 holds four turns, dasher and assistant alternating; it holds %s", showTurns(turns));
+  ctx.Assert(turns[2].text == apiRedCardQ && data["answer"] == turns[3].text, "the second exchange must be appended after the first (RPUSH)");
+  const Any other = chat(ctx, w, "s2", "d1", apiReferralQ, 200);
+  ctx.Assert(other["turn"].Format() == "1" && apiHistory(ctx, "s2").size() == 2, "another session starts at turn 1 with its own conv:<session_id>");
+}
+
+void CheckAnswerCache(harness::Ctx& ctx) {
+  auto& w = apiServe(ctx);
+  const Any first = chat(ctx, w, "s1", "d1", apiLoginQ, 200);
+  size_t calls = apiGenerates(ctx).size();
+  const size_t queries = ctx.DB.Queries().size();
+  const Any again = chat(ctx, w, "s2", "d2", "  i FORGOT my   password and cannot SIGN in ", 200);
+  ctx.Assert(again["cached"] == true, "the same question in different casing and spacing must be answered from the cache (cached: true), got %s", apiShow(again));
+  ctx.Equal(again["model"], "cache", "a cached answer reports model \\"cache\\"");
+  ctx.Assert(again["answer"] == first["answer"] && apiShow(again["sources"]) == apiShow(first["sources"]), "the cached answer must be the remembered answer and sources, got %s", apiShow(again));
+  ctx.Assert(again["escalated"] == false && again["turn"].Format() == "1", "a cached answer is escalated: false and still counts as a turn (turn 1 of s2), got %s", apiShow(again));
+  ctx.Assert(apiGenerates(ctx).size() == calls, "a cache hit must not call the model, yet %d Generate call(s) were made", apiGenerates(ctx).size() - calls);
+  std::vector<std::string> searched;
+  const auto all = ctx.DB.Queries();
+  for (size_t i = queries; i < all.size(); i++)
+    if (lower(all[i].SQL).find("kb_chunks") != std::string::npos) searched.push_back(all[i].SQL);
+  ctx.Assert(searched.empty(), "a cache hit must not search kb_chunks, yet the request ran %q", searched);
+  ctx.Equal(apiHistory(ctx, "s2").size(), 2, "a cached exchange is still appended to the session's history");
+  w.llm.setMode("hallucinate");
+  calls = apiGenerates(ctx).size();
+  const Any bad = chat(ctx, w, "s3", "d3", apiRedCardQ, 200);
+  ctx.Assert(apiGenerates(ctx).size() > calls, "a new question must reach the model");
+  ctx.Assert(bad["escalated"] == true, "a hallucinated answer ([kb:policy-404] was never retrieved) must be escalated by the guardrail: escalated true, got %s", apiShow(bad));
+  ctx.Assert(bad["answer"] == config::kHandoffText && bad["sources"].IsArray() && bad["sources"].Len() == 0, "an escalated turn answers config.HandoffText with no sources, got %s", apiShow(bad));
+  ctx.Assert(bad["cached"] == false && (bad["model"] == "large" || bad["model"] == "small"), "an escalated turn is not cached and reports the model that answered, got %s", apiShow(bad));
+  for (const auto& k : ctx.Redis.Keys("answer:*")) {
+    const std::string v = ctx.Redis.Get(k).value_or("");
+    ctx.Assert(v.find("policy-404") == std::string::npos, "the hallucinated answer must never be remembered");
+  }
+  const auto turns = apiHistory(ctx, "s3");
+  ctx.Assert(!turns.empty() && turns.back() == prompt::Turn{"assistant", config::kHandoffText}, "the hand-off is what the Dasher saw, so it is the assistant turn in conv:s3; the history holds %s", showTurns(turns));
+  calls = apiGenerates(ctx).size();
+  const Any twice = chat(ctx, w, "s4", "d4", apiRedCardQ, 200);
+  ctx.Assert(apiGenerates(ctx).size() > calls, "an escalation is never cached: the same question from another session must call the model again, it was answered without a call");
+  ctx.Assert(twice["escalated"] == true && twice["cached"] == false, "still hallucinating, still escalated and uncached; got %s", apiShow(twice));
+  ctx.Settle();
+  std::vector<Any> recorded;
+  for (const auto& r : apiRecords(ctx))
+    if (r.value["session_id"] == "s3") recorded.push_back(r.value);
+  ctx.Assert(recorded.size() == 1 && recorded[0]["escalated"] == true && recorded[0]["answer"] == config::kHandoffText, "an escalated turn is still recorded on %s with escalated true; found %s", config::kTopic, apiShow(Any(recorded)));
+}
+
+void CheckRateLimit(harness::Ctx& ctx) {
+  auto& w = apiServe(ctx);
+  const int limit = config::kRateLimitPerMinute;
+  for (int i = 0; i < limit; i++) {
+    const Any data = chat(ctx, w, "s1", "d1", apiLoginQ, 200);
+    ctx.Equal(data["turn"], i + 1, "turn");
+  }
+  const int64_t minute = ctx.Clock.Now() / 60000;
+  const std::string key = harness::Sprintf("rl:d1:%d", minute);
+  const std::string count = ctx.Redis.Get(key).value_or("");
+  ctx.Assert(count == std::to_string(limit), "the counter %s must be INCRed once per request (%d), Redis holds %q under %q", key, limit, count, ctx.Redis.Keys("rl:*"));
+  const long long ttl = ctx.Redis.TTL(key);
+  ctx.Assert(0 < ttl && ttl <= 60, "%s must EXPIRE within 60 s, its TTL is %d", key, ttl);
+  const auto r = w.http->Post("/chat", body("s1", "d1", apiLoginQ));
+  ctx.Assert(r.Status == 429, "request %d of d1 within the minute answered %d %s, expected 429", limit + 1, r.Status, r.Text());
+  ctx.Equal(r.JSON(), harness::ParseJSON(R"({"error":"rate_limited"})"), "the 429 body must be {\\"error\\": \\"rate_limited\\"}");
+  ctx.Equal(apiHistory(ctx, "s1").size(), 2 * limit, "a limited request must not be appended to the history");
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Records(config::kTopic).size(), limit, "a limited request must not be recorded");
+  const Any other = chat(ctx, w, "s2", "d2", apiLoginQ, 200);
+  ctx.Assert(apiNonEmpty(other["answer"]), "the limit is per Dasher: d2 must still be answered");
+  ctx.Clock.Advance(60);
+  const Any data = chat(ctx, w, "s1", "d1", apiLoginQ, 200);
+  ctx.Assert(data["turn"].Format() == std::to_string(limit + 1), "the first request of the next minute must be answered (turn %d), got %s", limit + 1, apiShow(data));
+  ctx.Assert(!ctx.Redis.Get(key).has_value(), "the previous minute's counter %s must have expired", key);
+}
+
+void CheckRecorded(harness::Ctx& ctx) {
+  auto& w = apiServe(ctx);
+  const Any a = chat(ctx, w, "s1", "d1", apiLoginQ, 200);
+  const Any b = chat(ctx, w, "s1", "d1", apiRedCardQ, 200);
+  const Any c2 = chat(ctx, w, "s2", "d2", apiLoginQ, 200);
+  ctx.Settle();
+  auto recs = apiRecords(ctx);
+  ctx.Assert(recs.size() == 3, "three answered turns must leave three records on %s, found %d", config::kTopic, recs.size());
+  std::vector<std::string> keys;
+  for (const auto& r : recs) keys.push_back(r.key);
+  ctx.Equal(keys, {"s1", "s1", "s2"}, "records must be keyed by the session id");
+  const std::vector<std::string> want = {"session_id", "turn", "dasher_id", "question", "answer", "sources", "escalated", "model", "tokens"};
+  for (const auto& r : recs) {
+    std::vector<std::string> missing;
+    for (const auto& f : want)
+      if (!r.value.IsObject() || !r.value.Fields().count(f)) missing.push_back(f);
+    ctx.Assert(missing.empty(), "a record must carry %q, this one lacks %q", want, missing);
+  }
+  const Any first = recs[0].value, second = recs[1].value, third = recs[2].value;
+  ctx.Assert(first["session_id"] == "s1" && first["turn"].Format() == "1" && first["dasher_id"] == "d1" && first["question"] == apiLoginQ, "the first record is s1 turn 1 by d1 asking %q, got %s", apiLoginQ, apiShow(first));
+  ctx.Assert(first["answer"] == a["answer"] && apiShow(first["sources"]) == apiShow(a["sources"]) && first["escalated"] == false && first["model"] == "large", "the record carries what the Dasher was answered: %s; got %s", apiShow(a), apiShow(first));
+  const std::string answerText = a["answer"].IsString() ? a["answer"].String() : "";
+  ctx.Equal(first["tokens"], fields(answerText).size(), "tokens is the generate result's token count");
+  ctx.Assert(second["turn"].Format() == "2" && second["question"] == apiRedCardQ && second["answer"] == b["answer"], "the second record of s1 is turn 2, got %s", apiShow(second));
+  ctx.Assert(third["session_id"] == "s2" && third["turn"].Format() == "1" && third["model"] == "cache" && third["tokens"].Format() == "0", "s2's first turn was a cache hit: turn 1, model \\"cache\\", tokens 0; got %s", apiShow(third));
+  ctx.Assert(third["answer"] == c2["answer"] && third["escalated"] == false, "s2's cached turn carries the cached answer, escalated false; got %s", apiShow(third));
+  ctx.Kafka.Stall(config::kTopic);  // the broker stops acknowledging
+  const int64_t before = ctx.Clock.Now();
+  const Any d = chat(ctx, w, "s2", "d2", apiReferralQ, 200);
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited < 0.5, "with the broker stalled the reply took %.1f s of virtual time: hand the record to the writer in a goroutine and answer, never wait for the write on the request path", waited);
+  ctx.Assert(d["turn"].Format() == "2" && apiNonEmpty(d["answer"]), "the reply must not depend on the broker, got %s", apiShow(d));
+  ctx.Equal(apiRecords(ctx).size(), 3, "nothing can reach the topic while the broker is stalled: records");
+  ctx.Kafka.Resume(config::kTopic);
+  ctx.Clock.Advance(30);  // the producer's next attempt finds the broker back
+  ctx.Settle();
+  const Any e = chat(ctx, w, "s1", "d1", apiReferralQ, 200);
+  ctx.Equal(e["turn"], 3, "turn");
+  ctx.Settle();
+  recs = apiRecords(ctx);
+  ctx.Assert(recs.size() == 5, "once the broker answers, the record handed to the writer during the stall must arrive: %s holds %d records, expected 5", config::kTopic, recs.size());
+  std::vector<std::string> turns;
+  for (const auto& r : recs) turns.push_back(r.value["session_id"].Format() + ":" + r.value["turn"].Format());
+  std::sort(turns.begin(), turns.end());
+  ctx.Equal(turns, {"s1:1", "s1:2", "s1:3", "s2:1", "s2:2"}, "every turn once, numbered within its session");
 }
 `,
   },

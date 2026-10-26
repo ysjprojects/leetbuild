@@ -908,6 +908,153 @@ func CheckCommitAfterPost(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Kafka.Lag("ledger", "payments"), 0, "records not committed after the restart")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <stdexcept>
+
+namespace {
+
+const std::string errLedgerDown = "ledger database down";
+
+void seedCaptured(harness::Ctx& ctx, const std::vector<std::string>& eventIDs) {
+  for (const auto& id : eventIDs) {
+    ctx.Kafka.Seed("payments", "m-42",
+                   R"({"amount_cents":4999,"currency":"EUR","event_id":")" + id + R"(","merchant_id":"m-42","order_id":"o-)" + id +
+                       R"(","type":"payment.captured"})");
+  }
+}
+
+// The learner's consume loop, on a thread of its own: run() takes no context to cancel (Go's run(ctx)
+// does), so one loop keeps reading across the check's drains until it returns, throws or is abandoned.
+struct runner {
+  bool done = false;
+  std::optional<std::string> err;
+};
+std::shared_ptr<runner> active;
+
+// consumeLedger runs the learner's loop until it waits for records that will not come; what it threw
+// when it ended by itself.
+std::optional<std::string> consumeLedger(harness::Ctx& ctx) {
+  if (!active || active->done) {
+    auto r = active = std::make_shared<runner>();
+    lb::spawn([r] {
+      try {
+        run();
+      } catch (const std::exception& e) {
+        r->err = std::string(e.what());
+      } catch (...) {
+        r->err = harness::CurrentExceptionType();
+      }
+      r->done = true;
+    });
+  }
+  ctx.Settle();
+  return active->done ? active->err : std::nullopt;
+}
+
+void mustConsume(harness::Ctx& ctx) {
+  if (const auto err = consumeLedger(ctx)) ctx.Fatalf("run returned an error: %v", *err);
+}
+
+std::vector<std::string> postedIDs() {
+  std::vector<std::string> ids;
+  for (const auto& e : ledger::posted) ids.push_back(e.event_id);
+  return ids;
+}
+
+}  // namespace
+
+void CheckGroupManualCommit(harness::Ctx& ctx) {
+  seedCaptured(ctx, {"e1"});
+  mustConsume(ctx);
+  const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
+  ctx.Assert(!subscriptions.empty(), "the consumer must subscribe to a topic");
+  const auto& last = subscriptions.back();
+  ctx.Equal(last.Group, "ledger", "group.id");
+  bool subscribed = false;
+  for (const auto& t : last.Topics) subscribed = subscribed || t == "payments";
+  ctx.Assert(subscribed, "the consumer must subscribe to payments, got %v", last.Topics);
+  const auto consumers = ctx.Kafka.Consumers();
+  ctx.Equal(consumers.back().AutoCommit, false, "auto-commit is on: offsets would be acknowledged before the post; enable.auto.commit");
+  ctx.Equal(ctx.Kafka.EventsOf("auto-commit").size(), 0, "offsets were auto-committed: auto-commit events");
+  ctx.Assert(!ctx.Kafka.EventsOf("manual-commit").empty(), "no explicit commit happened");
+  ctx.Equal(ctx.Kafka.Lag("ledger", "payments"), 0, "every processed record must be committed: lag");
+}
+
+void CheckDedupeNx(harness::Ctx& ctx) {
+  ctx.Redis.Set("applied:e2", "1", "EX", 600000);  // applied by an earlier run of the ledger
+  seedCaptured(ctx, {"e1", "e2", "e3"});
+  // Another ledger replica claims e3 right after the first command that touches its key.
+  bool claimedByReplica = false;
+  ctx.Redis.After("applied:e3", [&] { claimedByReplica = ctx.Redis.Set("applied:e3", "1", "EX", 604800, "NX"); });
+  mustConsume(ctx);
+  ctx.Equal(ctx.Redis.Exists("applied:e1"), 1, "after posting e1 the claim applied:e1 must exist");
+  const long long ttl = ctx.Redis.TTL("applied:e1");
+  ctx.Assert(604000 <= ttl && ttl <= 604800, "applied:e1 has TTL %d, expected 604800 s (7 days)", ttl);
+  std::vector<std::string> withoutE3;
+  for (const auto& id : postedIDs()) {
+    if (id != "e3") withoutE3.push_back(id);
+  }
+  ctx.Equal(withoutE3, {"e1"}, "e2 was already applied and must be skipped, e1 must be posted once; the ledger posted %v", postedIDs());
+  ctx.Assert(ctx.Redis.TTL("applied:e2") <= 600000, "the claim of an already applied event must not be overwritten (SET NX, not SET)");
+  if (claimedByReplica) {
+    for (const auto& id : postedIDs()) {
+      ctx.Assert(id != "e3", "another replica claimed applied:e3 between your read and your write and both posted e3: the claim must be one atomic SET NX");
+    }
+  } else {
+    const auto posted = postedIDs();
+    ctx.Assert(!posted.empty(), "the ledger posted nothing");
+    ctx.Equal(std::vector<std::string>(posted.begin() + 1, posted.end()), {"e3"}, "the replica that won the SET NX must post e3; the ledger posted after e1");
+  }
+}
+
+void CheckDedupeBeforePost(harness::Ctx& ctx) {
+  seedCaptured(ctx, {"e1"});
+  std::vector<long long> claimedAtPost;
+  const auto realPost = ledger::post;
+  ledger::post = [&ctx, &claimedAtPost, realPost](const ledger::Event& event) {
+    claimedAtPost.push_back(ctx.Redis.Exists("applied:" + event.event_id));
+    realPost(event);
+  };
+  mustConsume(ctx);
+  ctx.Assert(!claimedAtPost.empty(), "ledger::post never ran for e1");
+  ctx.Equal(claimedAtPost, {1LL}, "when ledger::post ran, applied:e1 must already be claimed (SET NX before the post): EXISTS at each post");
+}
+
+void CheckSkipStillCommits(harness::Ctx& ctx) {
+  seedCaptured(ctx, {"e1", "e2", "e1"});  // the relay replayed e1: a duplicate with a new offset
+  mustConsume(ctx);
+  ctx.Equal(postedIDs(), {"e1", "e2"}, "each event exactly once, the replayed e1 skipped; the ledger posted");
+  ctx.Equal(ctx.Kafka.Lag("ledger", "payments"), 0, "the skipped duplicate's offset must be committed too, or it is redelivered forever: records not committed");
+}
+
+void CheckCommitAfterPost(harness::Ctx& ctx) {
+  seedCaptured(ctx, {"e1"});
+  std::vector<size_t> atCommit;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(ledger::posted.size()); });
+  mustConsume(ctx);
+  ctx.Assert(!atCommit.empty(), "the offset of e1 was never committed");
+  ctx.Equal(atCommit[0], 1, "the commit must come after ledger::post: posts at commit time");
+  seedCaptured(ctx, {"e2"});
+  const auto realPost = ledger::post;
+  ledger::post = [](const ledger::Event&) { throw std::runtime_error(errLedgerDown); };
+  if (const auto err = consumeLedger(ctx); err && err->find(errLedgerDown) == std::string::npos) {
+    ctx.Fatalf("run returned an error: %v", *err);
+  }
+  ctx.Assert(!ctx.Redis.Get("applied:e2").has_value(), "when the post fails the claim applied:e2 must be released (DEL), or no retry will ever post it");
+  ctx.Equal(ctx.Kafka.Lag("ledger", "payments"), 1, "a record whose post failed must not be committed (it has to come back): records not committed");
+  // restart the consumer (a fresh replica; the ledger is back): e1 is deduped by its claim, e2 is redelivered and posted this time
+  ledger::post = realPost;
+  const size_t before = ledger::posted.size();
+  consumer->close();
+  consumer = make_consumer();  // a loop still reading the old consumer waits on it for good
+  active.reset();
+  mustConsume(ctx);
+  const auto posted = postedIDs();
+  ctx.Equal(std::vector<std::string>(posted.begin() + static_cast<long>(before), posted.end()), {"e2"}, "after a restart only the retried e2 must be posted; the ledger posted");
+  ctx.Equal(ctx.Kafka.Lag("ledger", "payments"), 0, "records not committed after the restart");
+}
+`,
   },
   debrief: `The consumer owns its delivery guarantee: at-least-once from the broker (commit after the work) plus a claim keyed by the event's own id turns duplicates into no-ops. The claim is in Redis for speed, but notice its weak spot — a crash between the SET and the post leaves a claimed, unposted event until the TTL. Real ledgers close that gap by making the post itself idempotent (a unique index on \`event_id\` in the journal, insert-or-ignore) so the Redis claim is only a fast path, and they commit offsets in batches once the whole poll was applied.`,
 };

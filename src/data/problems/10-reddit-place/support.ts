@@ -135,3 +135,112 @@ export async function pump(consumer: Consumer): Promise<void> {
 }
 `,
 };
+
+/** The same bus for the C++ starters: `#include "tile_bus.h"`. */
+export const supportModulesCpp: Record<string, string> = {
+  'tile_bus.h': `// Provided: the fan-out bus of one tile-stream instance. Every open StreamTiles call owns one
+// TileQueue; \`publish\` hands a placement to all of them. Each stream server runs \`pump\` on a
+// consumer of \`placements\` in its own group, so every instance sees every tile.
+#pragma once
+
+#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "place.pb.h"
+
+// An unbounded FIFO with a blocking \`pop\`: what one open stream reads from.
+class TileQueue {
+ public:
+  void push(const place::Tile& tile) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      items_.push_back(tile);
+    }
+    ready_.notify_one();
+  }
+
+  // The next tile into \`out\`, waiting up to \`timeout\` for one; false if none came.
+  template <class Rep, class Period>
+  bool pop(place::Tile& out, std::chrono::duration<Rep, Period> timeout) {
+    std::unique_lock<std::mutex> lock(mu_);
+    if (!ready_.wait_for(lock, timeout, [this] { return !items_.empty(); })) return false;
+    out = std::move(items_.front());
+    items_.pop_front();
+    return true;
+  }
+
+  // Tiles published for this stream and not yet popped: the client's backlog.
+  std::size_t size() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return items_.size();
+  }
+
+ private:
+  mutable std::mutex mu_;
+  std::condition_variable ready_;
+  std::deque<place::Tile> items_;
+};
+
+using Subscription = std::shared_ptr<TileQueue>;
+
+namespace tile_bus_detail {
+inline std::mutex mu;
+inline std::vector<Subscription> queues;
+}  // namespace tile_bus_detail
+
+// A fresh queue that receives every placement published on this instance from now on.
+inline Subscription subscribe() {
+  auto queue = std::make_shared<TileQueue>();
+  std::lock_guard<std::mutex> lock(tile_bus_detail::mu);
+  tile_bus_detail::queues.push_back(queue);
+  return queue;
+}
+
+inline void unsubscribe(const Subscription& queue) {
+  std::lock_guard<std::mutex> lock(tile_bus_detail::mu);
+  auto& queues = tile_bus_detail::queues;
+  queues.erase(std::remove(queues.begin(), queues.end(), queue), queues.end());
+}
+
+// Hand a placement to every open stream on this instance.
+inline void publish(const place::Tile& tile) {
+  std::lock_guard<std::mutex> lock(tile_bus_detail::mu);
+  for (const auto& queue : tile_bus_detail::queues) queue->push(tile);
+}
+
+// How many streams are open on this instance.
+inline std::size_t subscribers() {
+  std::lock_guard<std::mutex> lock(tile_bus_detail::mu);
+  return tile_bus_detail::queues.size();
+}
+
+// Feed every record of \`placements\` ({"user", "x", "y", "color", "ts"}) to publish; one consumer
+// group per stream server.
+inline void pump(RdKafka::KafkaConsumer& consumer) {
+  while (true) {
+    std::unique_ptr<RdKafka::Message> msg(consumer.consume(1000));
+    if (msg->err() != RdKafka::ERR_NO_ERROR) continue;
+    const auto event = nlohmann::json::parse(static_cast<const char*>(msg->payload()),
+                                             static_cast<const char*>(msg->payload()) + msg->len(), nullptr, false);
+    if (!event.is_object()) continue;  // malformed: not a tile
+    place::Tile tile;
+    tile.set_user(event.value("user", ""));
+    tile.set_x(event.value("x", 0u));
+    tile.set_y(event.value("y", 0u));
+    tile.set_color(event.value("color", 0u));
+    tile.set_ts(event.value("ts", int64_t{0}));
+    publish(tile);
+  }
+}
+`,
+};

@@ -8,7 +8,7 @@ import {outboxWriteStep} from './steps/3-outbox-write';
 import {outboxRelayStep} from './steps/4-outbox-relay';
 import {ledgerConsumerStep} from './steps/5-ledger-consumer';
 import {merchantRateLimitStep} from './steps/6-merchant-rate-limit';
-import {supportModules, supportModulesGo, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
 
 /**
  * Online merchant transaction system: the money path of a payments platform. Idempotent HTTPS
@@ -87,6 +87,7 @@ system that moves money ends up with.`,
     python: {...protoModules, ...supportModules},
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
+    cpp: {...protoFiles, ...supportModulesCpp},
   },
   learn,
 };

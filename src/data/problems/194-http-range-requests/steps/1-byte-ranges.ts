@@ -1117,6 +1117,156 @@ func CheckIgnoredRanges(ctx *harness.Ctx) {
 	}
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <optional>
+#include <regex>
+#include <string>
+
+namespace {
+
+// rangeBytes is 1000 bytes, byte i being (i*mul + add) % 256.
+std::string rangeBytes(int mul, int add) {
+  std::string data(1000, '\\0');
+  for (int i = 0; i < 1000; i++) data[i] = static_cast<char>((i * mul + add) % 256);
+  return data;
+}
+
+const std::string rangeClip = rangeBytes(7, 3);
+const std::string rangeClipV2 = rangeBytes(11, 5);
+const std::string rangeEmpty;
+const std::regex rangeStrong(R"(^"[0-9a-f]{8,64}"$)");
+
+// rangeAPI seeds files with clip.bin and empty.bin and returns a client of the learner's server.
+harness::HTTP rangeAPI(harness::Ctx& ctx) {
+  files = {{"clip.bin", rangeClip}, {"empty.bin", rangeEmpty}};
+  return ctx.Main().HTTP();
+}
+
+// rangeHeader is a header's value, or nullopt when the response does not carry it.
+std::optional<std::string> rangeHeader(const harness::Response& r, const std::string& name) {
+  if (r.Header.find(name) == r.Header.end()) return std::nullopt;
+  return r.HeaderValue(name);
+}
+
+std::string rangeCommon(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
+  ctx.Equal(rangeHeader(r, "Accept-Ranges"), "bytes", "%s: Accept-Ranges", what);
+  const std::string etag = r.HeaderValue("ETag");
+  ctx.Assert(std::regex_match(etag, rangeStrong), R"(%s: ETag was %q, expected a strong quoted hex sha256 prefix such as '"9f2c01d4e5b6a7c8"')", what, etag);
+  return etag;
+}
+
+std::string rangePartial(harness::Ctx& ctx, const harness::Response& r, int start, int end, const std::string& data,
+                         const std::string& what) {
+  ctx.Equal(r.Status, 206, "%s: the status", what);
+  ctx.Equal(rangeHeader(r, "Content-Range"), harness::Sprintf("bytes %d-%d/%d", start, end, data.size()),
+            "%s: Content-Range", what);
+  const int length = end - start + 1;
+  ctx.Equal(rangeHeader(r, "Content-Length"), std::to_string(length), "%s: Content-Length", what);
+  ctx.Assert(r.Body == data.substr(start, length), "%s: the body must be exactly bytes %d to %d (%d bytes), got %d bytes that differ", what, start, end, length, r.Body.size());
+  const std::string ctype = r.HeaderValue("Content-Type");
+  ctx.Assert(ctype.rfind("application/octet-stream", 0) == 0, "%s: Content-Type was %q, expected application/octet-stream", what, ctype);
+  return rangeCommon(ctx, r, what);
+}
+
+std::string rangeFull(harness::Ctx& ctx, const harness::Response& r, const std::string& data, const std::string& what) {
+  ctx.Equal(r.Status, 200, "%s: the status (200 with the whole file)", what);
+  ctx.Assert(r.Body == data, "%s: the body must be the whole file (%d bytes), got %d bytes", what, data.size(), r.Body.size());
+  ctx.Equal(rangeHeader(r, "Content-Range"), nullptr, "%s: a 200 carries no Content-Range", what);
+  return rangeCommon(ctx, r, what);
+}
+
+std::string rangeUnsatisfiable(harness::Ctx& ctx, const harness::Response& r, int size, const std::string& what) {
+  ctx.Equal(r.Status, 416, "%s: the status", what);
+  ctx.Equal(rangeHeader(r, "Content-Range"), harness::Sprintf("bytes */%d", size), "%s: Content-Range", what);
+  ctx.Equal(r.Body.size(), 0, "%s: a 416 carries no body; its length", what);
+  return rangeCommon(ctx, r, what);
+}
+
+struct RangeCase {
+  std::string spec;
+  int start, end;
+};
+
+}  // namespace
+
+void CheckPartialContent(harness::Ctx& ctx) {
+  auto c = rangeAPI(ctx);
+  auto whole = c.Get("/files/clip.bin");
+  const std::string etag = rangeFull(ctx, whole, rangeClip, "GET /files/clip.bin without Range");
+  const std::string ctype = whole.HeaderValue("Content-Type");
+  ctx.Assert(ctype.rfind("application/octet-stream", 0) == 0, "the 200 Content-Type was %q, expected application/octet-stream", ctype);
+  auto head = c.Get("/files/clip.bin", "Range", "bytes=0-99");
+  ctx.Equal(rangePartial(ctx, head, 0, 99, rangeClip, "Range: bytes=0-99"), etag, "the 206 must carry the same ETag as the 200");
+  rangePartial(ctx, c.Get("/files/clip.bin", "Range", "bytes=100-199"), 100, 199, rangeClip, "Range: bytes=100-199");
+  auto missing = c.Get("/files/ghost.bin", "Range", "bytes=0-99");
+  ctx.Equal(missing.Status, 404, "GET /files/ghost.bin");
+}
+
+void CheckSuffixAndOpen(harness::Ctx& ctx) {
+  auto c = rangeAPI(ctx);
+  for (const RangeCase& tc : std::initializer_list<RangeCase>{
+           {"bytes=-100", 900, 999},
+           {"bytes=900-", 900, 999},
+           {"bytes=-1", 999, 999},
+           {"bytes=0-", 0, 999},
+           {"bytes=-1000", 0, 999},
+           {"bytes=-5000", 0, 999},
+       }) {
+    rangePartial(ctx, c.Get("/files/clip.bin", "Range", tc.spec), tc.start, tc.end, rangeClip, "Range: " + tc.spec + " on 1000 bytes");
+  }
+}
+
+void CheckClampEnd(harness::Ctx& ctx) {
+  auto c = rangeAPI(ctx);
+  for (const RangeCase& tc : std::initializer_list<RangeCase>{
+           {"bytes=950-5000", 950, 999},
+           {"bytes=500-1000", 500, 999},
+           {"bytes=999-999", 999, 999},
+           {"bytes=0-999", 0, 999},
+       }) {
+    rangePartial(ctx, c.Get("/files/clip.bin", "Range", tc.spec), tc.start, tc.end, rangeClip, "Range: " + tc.spec + " on 1000 bytes");
+  }
+}
+
+void CheckUnsatisfiable(harness::Ctx& ctx) {
+  auto c = rangeAPI(ctx);
+  for (const std::string spec : {"bytes=1000-", "bytes=1000-1999", "bytes=5000-6000", "bytes=-0"}) {
+    rangeUnsatisfiable(ctx, c.Get("/files/clip.bin", "Range", spec), 1000, "Range: " + spec + " on 1000 bytes");
+  }
+  for (const std::string spec : {"bytes=0-", "bytes=-10"}) {
+    rangeUnsatisfiable(ctx, c.Get("/files/empty.bin", "Range", spec), 0, "Range: " + spec + " on an empty file");
+  }
+  rangeFull(ctx, c.Get("/files/empty.bin"), rangeEmpty, "GET /files/empty.bin without Range");
+  rangePartial(ctx, c.Get("/files/clip.bin", "Range", "bytes=999-"), 999, 999, rangeClip, "Range: bytes=999- (the last byte exists)");
+}
+
+void CheckIfRange(harness::Ctx& ctx) {
+  auto c = rangeAPI(ctx);
+  const std::string old = rangePartial(ctx, c.Get("/files/clip.bin", "Range", "bytes=0-499"), 0, 499, rangeClip, "Range: bytes=0-499");
+  auto same = c.Get("/files/clip.bin", "Range", "bytes=500-", "If-Range", old);
+  rangePartial(ctx, same, 500, 999, rangeClip, "Range: bytes=500- with If-Range equal to the current ETag");
+  files["clip.bin"] = rangeClipV2;
+  auto resumed = c.Get("/files/clip.bin", "Range", "bytes=500-", "If-Range", old);
+  const std::string fresh = rangeFull(ctx, resumed, rangeClipV2, "after the file changed, Range: bytes=500- with the old ETag in If-Range");
+  ctx.Assert(fresh != old, "the file changed but its ETag stayed %s", old);
+  auto current = c.Get("/files/clip.bin", "Range", "bytes=500-", "If-Range", fresh);
+  rangePartial(ctx, current, 500, 999, rangeClipV2, "Range: bytes=500- with If-Range equal to the new ETag");
+  auto dated = c.Get("/files/clip.bin", "Range", "bytes=500-", "If-Range", "Wed, 21 Oct 2026 07:28:00 GMT");
+  rangeFull(ctx, dated, rangeClipV2, "If-Range carrying an HTTP date");
+  auto weak = c.Get("/files/clip.bin", "Range", "bytes=500-", "If-Range", "W/" + fresh);
+  rangeFull(ctx, weak, rangeClipV2, "If-Range: W/" + fresh + " (a weak tag never matches strongly)");
+  auto stale416 = c.Get("/files/clip.bin", "Range", "bytes=5000-", "If-Range", old);
+  rangeFull(ctx, stale416, rangeClipV2, "a stale If-Range with an unsatisfiable Range: the Range is ignored, so not 416");
+}
+
+void CheckIgnoredRanges(harness::Ctx& ctx) {
+  auto c = rangeAPI(ctx);
+  for (const std::string spec : {"bytes=0-9,20-29", "bytes=50-10", "bytes=abc-def", "bytes=-", "bytes=1-2-3", "items=0-9", "0-9"}) {
+    rangeFull(ctx, c.Get("/files/clip.bin", "Range", spec), rangeClip, "Range: " + spec);
+  }
+}
+`,
   },
   debrief: `The handler is a decision in a fixed order: 404, then no \`Range\`, then \`If-Range\`, then the parse. The
 order matters at one place: a stale \`If-Range\` with an unsatisfiable range answers 200, not 416, because RFC

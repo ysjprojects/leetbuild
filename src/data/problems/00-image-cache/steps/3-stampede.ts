@@ -770,6 +770,145 @@ func CheckBoundedWait(ctx *harness.Ctx) {
 	ctx.Assert(50 <= sleeps && sleeps <= 200, "waited through %d polls; a 50 ms poll over a 5 s lock TTL is about 100", sleeps)
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <exception>
+#include <functional>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::string spMissing = "__missing__";
+
+// spJPEG is fake JPEG bytes: the real SOI marker (FF D8 FF, not valid UTF-8) and a label.
+std::string spJPEG(const std::string& label) { return "\\xff\\xd8\\xff" + label; }
+
+// spHex shows bytes as hex, nullopt as nil.
+std::string spHex(const std::optional<std::string>& b) {
+  if (!b) return "nil";
+  static const char* digits = "0123456789abcdef";
+  std::string out;
+  for (unsigned char c : *b) {
+    out += digits[c >> 4];
+    out += digits[c & 15];
+  }
+  return out;
+}
+
+// What the render and store stand-ins do (Go reassigns the render and store variables).
+std::function<std::optional<std::string>(const std::string&, int)> spRender;
+harness::Ctx* spCtx = nullptr;
+
+// spStandIns stands in for the resizer's render (step 4), answering JPEG bytes, and the cache's
+// store (step 2), writing the value (the sentinel for nullopt) with a day's TTL.
+void spStandIns(harness::Ctx& ctx) {
+  spCtx = &ctx;
+  spRender = [](const std::string&, int) { return std::optional<std::string>(spJPEG("JPEG")); };
+}
+
+// spRecorder stands in for render with one that records the image ids it is asked for and answers reply.
+std::vector<std::string>& spRecorder(const std::string& reply) {
+  static std::vector<std::string> calls;
+  calls.clear();
+  spRender = [reply](const std::string& id, int) {
+    calls.push_back(id);
+    return std::optional<std::string>(reply);
+  };
+  return calls;
+}
+
+// fill, failing the check when it throws (Go's ctx.NoError on the returned error).
+std::optional<std::string> spFill(harness::Ctx& ctx, const std::string& key, const std::string& id, int width) {
+  try {
+    return fill(key, id, width);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("fill(%q, %q, %d) threw: %s", key, id, width, e.what());
+  }
+}
+
+}  // namespace
+
+std::optional<std::string> render(const std::string& id, int width) { return spRender(id, width); }
+
+void store(const std::string& key, const std::optional<std::string>& data) {
+  spCtx->Redis.Set(key, data ? *data : spMissing, "EX", 86400);
+}
+
+void CheckLockNx(harness::Ctx& ctx) {
+  spStandIns(ctx);
+  long long held = 0, ttl = 0;
+  spRender = [&](const std::string&, int) {
+    held = ctx.Redis.Exists("lock:thumb:cat:256");
+    ttl = ctx.Redis.TTL("lock:thumb:cat:256");
+    return std::optional<std::string>(spJPEG("JPEG"));
+  };
+  const auto won = spFill(ctx, "thumb:cat:256", "cat", 256);
+  ctx.Assert(won == spJPEG("JPEG"), "the winner returns the rendered bytes: got %s", spHex(won));
+  ctx.Equal(held, 1, "lock:thumb:cat:256 must be held while the winner renders");
+  ctx.Assert(0 < ttl && ttl <= 5, "the lock must expire within 5 s (TTL %d)", ttl);
+  // Someone else holds the lock: NX must fail and this caller must not render.
+  ctx.Redis.Set("lock:thumb:dog:256", "1", "EX", 5);
+  ctx.Redis.Set("thumb:dog:256", spJPEG("LEADER"));
+  auto& calls = spRecorder("X");
+  const auto followed = spFill(ctx, "thumb:dog:256", "dog", 256);
+  ctx.Assert(followed == spJPEG("LEADER"),
+             "a caller that did not win the lock returns the leader's value verbatim: got %s, expected %s",
+             spHex(followed), spHex(spJPEG("LEADER")));
+  ctx.Equal(calls.size(), 0, "a caller that did not win the lock must not render");
+}
+
+void CheckRelease(harness::Ctx& ctx) {
+  spStandIns(ctx);
+  const auto won = spFill(ctx, "thumb:cat:256", "cat", 256);
+  ctx.Assert(won == spJPEG("JPEG"), "the winner returns the rendered bytes: got %s", spHex(won));
+  const auto stored = ctx.Redis.Get("thumb:cat:256");
+  ctx.Assert(stored == spJPEG("JPEG"), "the winner must store() the rendered value: stored %s", spHex(stored));
+  ctx.Equal(ctx.Redis.Exists("lock:thumb:cat:256"), 0, "the lock must be released once the value is stored");
+  // Go's render returns an error; here it throws, and fill must let the exception through.
+  spRender = [](const std::string&, int) -> std::optional<std::string> { throw std::runtime_error("origin down"); };
+  std::string err = "<nil>";
+  try {
+    fill("thumb:bad:256", "bad", 256);
+  } catch (const std::exception& e) {
+    err = e.what();
+  }
+  ctx.Assert(err.find("origin down") != std::string::npos, "a failing render must propagate: fill threw %v", err);
+  ctx.Equal(ctx.Redis.Exists("lock:thumb:bad:256"), 0, "the lock must be released even when render fails");
+}
+
+void CheckWaitRecheck(harness::Ctx& ctx) {
+  spStandIns(ctx);
+  ctx.Redis.Set("lock:thumb:cat:256", "1", "EX", 5);
+  // The leader finishes right after the follower's first read of the key.
+  ctx.Redis.After("thumb:cat:256", [&ctx] { ctx.Redis.Set("thumb:cat:256", spJPEG("LEADER")); });
+  auto& calls = spRecorder("X");
+  const auto followed = spFill(ctx, "thumb:cat:256", "cat", 256);
+  ctx.Assert(followed == spJPEG("LEADER"),
+             "the follower must return the value the leader stored, verbatim: got %s, expected %s", spHex(followed),
+             spHex(spJPEG("LEADER")));
+  ctx.Equal(calls.size(), 0, "the follower must not render while the lock is held");
+  ctx.Assert(ctx.Clock.Sleeps() >= 1, "poll by sleeping briefly between reads, not in a tight loop");
+}
+
+void CheckBoundedWait(harness::Ctx& ctx) {
+  spStandIns(ctx);
+  ctx.Redis.Set("lock:thumb:cat:256", "1", "EX", 5);  // the leader died holding the lock
+  auto& calls = spRecorder("MINE");
+  std::optional<std::string> result;
+  const bool returned = ctx.Drain([&] { result = spFill(ctx, "thumb:cat:256", "cat", 256); });
+  ctx.Assert(returned,
+             "waited through %d polls and never rendered: once the lock TTL passes the follower must render itself",
+             ctx.Clock.Sleeps());
+  ctx.Equal(result.value_or(""), "MINE", "once the lock TTL passes the follower must render itself");
+  ctx.Equal(calls, {"cat"}, "render calls once the lock TTL passed");
+  const int sleeps = ctx.Clock.Sleeps();
+  ctx.Assert(50 <= sleeps && sleeps <= 200, "waited through %d polls; a 50 ms poll over a 5 s lock TTL is about 100",
+             sleeps);
+}
+`,
   },
   debrief: `This is a per-key mutex made of one Redis key: \`NX\` for exclusion, \`EX\` for liveness. Followers trade a few polls for one shared render — the "single flight" pattern. Production variants avoid polling (Pub/Sub on the key, or in-process single-flight so one machine only ever makes one call), and serve the *stale* value while one request refreshes it in the background (stale-while-revalidate), which removes the wait entirely.`,
 };

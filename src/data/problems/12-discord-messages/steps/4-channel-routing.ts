@@ -1447,6 +1447,301 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Assert(waited <= 0.5, "the API waited %.1f s for a stalled instance, the deadline is 300 ms", waited)
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <map>
+#include <optional>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "db.h"
+
+namespace {
+
+constexpr int64_t rtBucketMs = 10LL * 24 * 3600 * 1000;
+const std::string rtInsert = "INSERT INTO messages (channel_id, bucket, message_id, author_id, content) VALUES ($1, $2, $3, $4, $5)";
+constexpr int64_t rtB = 430;
+
+int64_t rtSnowflake(int64_t bucket, int64_t offsetMs) { return ((bucket * rtBucketMs + offsetMs) << 22) | (1 << 17); }
+
+const int64_t rtEnd = rtSnowflake(rtB + 1, rtBucketMs - 1);
+
+// rtChannels are twelve channels created in bucket rtB.
+const std::vector<int64_t> rtChannels = [] {
+  std::vector<int64_t> out;
+  for (int64_t i = 0; i < 12; i++) out.push_back(rtSnowflake(rtB, 1000 * i + 1));
+  return out;
+}();
+
+// rtPage is what Postgres holds for rtChannels[i], newest first.
+std::vector<std::string> rtPage(int i) {
+  return {harness::Sprintf("%d:2", i), harness::Sprintf("%d:1", i), harness::Sprintf("%d:0", i)};
+}
+
+std::vector<int64_t> rtKeys(int n) {
+  std::vector<int64_t> out;
+  for (int64_t i = 0; i < n; i++) out.push_back(rtSnowflake(425, i * 4096 * 7919));
+  return out;
+}
+
+std::string rtKey(int64_t channel) { return std::to_string(channel); }
+
+// RtPeer is step 3's data service: the page walk over Postgres behind MessageData.GetMessages.
+class RtPeer final : public discord::MessageData::Service {
+ public:
+  grpc::Status GetMessages(grpc::ServerContext*, const discord::GetMessagesRequest* req, discord::GetMessagesReply* reply) override {
+    const auto channel = static_cast<int64_t>(req->channel_id());
+    const auto before = static_cast<int64_t>(req->before());
+    const int limit = static_cast<int>(req->limit());
+    for (int64_t bucket = (before >> 22) / rtBucketMs; reply->messages_size() < limit && bucket >= (channel >> 22) / rtBucketMs; bucket--) {
+      pqxx::result rows;
+      try {
+        rows = db::exec("SELECT message_id, author_id, content FROM messages"
+                        " WHERE channel_id = $1 AND bucket = $2 AND message_id < $3 ORDER BY message_id DESC LIMIT $4",
+                        channel, bucket, before, limit - reply->messages_size());
+      } catch (const std::exception& e) {
+        return grpc::Status(grpc::StatusCode::UNAVAILABLE, std::string("messages store: ") + e.what());
+      }
+      for (const auto& row : rows) {
+        auto* m = reply->add_messages();
+        m->set_id(static_cast<uint64_t>(row[0].as<int64_t>()));
+        m->set_author_id(static_cast<uint64_t>(row[1].as<int64_t>()));
+        m->set_content(row[2].as<std::string>());
+      }
+    }
+    return grpc::Status::OK;
+  }
+};
+
+// rtCluster fills Postgres and serves the data service at every one of the learner's instances.
+void rtCluster(harness::Ctx& ctx) {
+  ctx.DB.Reset(db::kSchema);
+  for (size_t i = 0; i < rtChannels.size(); i++) {
+    for (int64_t j = 0; j < 3; j++) {
+      ctx.DB.Exec(rtInsert, rtChannels[i], rtB, rtSnowflake(rtB, 1000 * static_cast<int64_t>(i) + 10 + j), 7, harness::Sprintf("%d:%d", i, j));
+    }
+  }
+  for (const auto& node : kInstances) ctx.GRPC.Server(node)->RegisterService(new RtPeer());
+}
+
+// rtFetched is one fetch_messages for one channel: the contents it returned and the one GetMessages
+// call it made, or what it threw (Go's err).
+struct rtFetched {
+  std::vector<std::string> page;
+  harness::Call call;
+  std::optional<std::string> err;
+};
+
+rtFetched rtFetch(harness::Ctx& ctx, int64_t channel) {
+  const size_t n = ctx.GRPC.CallsTo("GetMessages").size();
+  std::vector<discord::Message> rows;
+  try {
+    rows = fetch_messages(channel, rtEnd, 50);
+  } catch (const std::exception& e) {
+    // Go's error carries the gRPC status; the C++ solution throws it as an exception, so report
+    // the code of the call it made (if any) beside the exception's text.
+    const auto calls = ctx.GRPC.CallsTo("GetMessages");
+    std::string what = e.what();
+    if (calls.size() > n) what = harness::Sprintf("%v (%s)", calls.back().Code, e.what());
+    return {{}, {}, what};
+  }
+  auto calls = ctx.GRPC.CallsTo("GetMessages");
+  calls.erase(calls.begin(), calls.begin() + static_cast<std::ptrdiff_t>(n));
+  ctx.Equal(calls.size(), 1, "fetch_messages for channel %d must make one GetMessages call; calls", channel);
+  rtFetched out{{}, calls[0], std::nullopt};
+  for (const auto& m : rows) out.page.push_back(m.content());
+  return out;
+}
+
+// rtPoint is one virtual node of the ring the harness rebuilds by hand.
+struct rtPoint {
+  uint64_t pos;
+  std::string node;
+};
+
+// rtPoints are the kVNodes points hashed from node#i for every node, sorted by position.
+std::vector<rtPoint> rtPoints(const std::vector<std::string>& nodes) {
+  std::vector<rtPoint> points;
+  for (const auto& node : nodes) {
+    for (int i = 0; i < kVNodes; i++) points.push_back({hash_key(node + "#" + std::to_string(i)), node});
+  }
+  std::stable_sort(points.begin(), points.end(), [](const rtPoint& a, const rtPoint& b) { return a.pos < b.pos; });
+  return points;
+}
+
+// rtExpected is the clockwise rule applied by hand: the first point at or after hash_key(key), wrapping.
+std::string rtExpected(const std::vector<rtPoint>& points, int64_t key) {
+  const uint64_t h = hash_key(rtKey(key));
+  const auto it = std::partition_point(points.begin(), points.end(), [&](const rtPoint& p) { return p.pos < h; });
+  return it == points.end() ? points[0].node : it->node;
+}
+
+std::string rtPick(harness::Ctx& ctx, Ring& r, int64_t key) {
+  try {
+    return r.pick(rtKey(key));
+  } catch (const std::exception& e) {
+    ctx.Fatalf("Pick(%d): unexpected error: %s", key, e.what());
+  }
+}
+
+}  // namespace
+
+void CheckVirtualNodes(harness::Ctx& ctx) {
+  ctx.Assert(kVNodes >= 50, "kVNodes is %d: a handful of points per instance cannot split the ring evenly", kVNodes);
+  Ring r(kInstances);
+  const auto keys = rtKeys(3000);
+  std::map<std::string, int> shares;
+  for (const int64_t k : keys) shares[rtPick(ctx, r, k)]++;
+  std::vector<std::string> owners;
+  for (const auto& [node, n] : shares) owners.push_back(node);
+  std::vector<std::string> want = kInstances;
+  std::sort(want.begin(), want.end());
+  ctx.Equal(owners, want, "every instance must own part of the ring: instances the picks landed on");
+  for (const auto& [node, n] : shares) {
+    const double share = static_cast<double>(n) / static_cast<double>(keys.size());
+    ctx.Assert(0.2 <= share && share <= 0.5, "%s receives %.0f%% of 3000 channels; with kVNodes points per instance the split should be close to a third each: %v", node, 100 * share, shares);
+  }
+  Ring only(std::vector<std::string>{"data-9:9000"});
+  for (size_t i = 0; i < 50; i++) ctx.Equal(rtPick(ctx, only, keys[i]), "data-9:9000", "a ring with one instance picks it for every key");
+  Ring empty(std::vector<std::string>{});
+  bool threw = false;
+  try {
+    empty.pick(rtKey(rtChannels[0]));
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  ctx.Assert(threw, "pick on an empty ring must throw: there is no instance to route to");
+}
+
+void CheckClockwisePick(harness::Ctx& ctx) {
+  const std::vector<std::vector<std::string>> rings = {
+      kInstances, {kInstances[0], kInstances[1]}, {"data-7:9000", "data-8:9000", "data-9:9000", "data-10:9000"}};
+  for (const auto& nodes : rings) {
+    Ring r(nodes);
+    const auto points = rtPoints(nodes);
+    for (const int64_t key : rtKeys(400)) {
+      const std::string want = rtExpected(points, key);
+      ctx.Equal(rtPick(ctx, r, key), want, "Pick(%d) on %v: the first point at or after hash_key(key) among the kVNodes points hashed from node#i, wrapping to the first point", key, nodes);
+    }
+  }
+  const std::vector<std::string> reversed(kInstances.rbegin(), kInstances.rend());
+  Ring a(kInstances), b(reversed);
+  for (const int64_t k : rtChannels) {
+    ctx.Assert(rtPick(ctx, a, k) == rtPick(ctx, b, k), "the mapping must not depend on the order instances were added");
+  }
+}
+
+void CheckRemoveMinimal(harness::Ctx& ctx) {
+  Ring r(kInstances);
+  const auto keys = rtKeys(1500);
+  std::map<int64_t, std::string> before;
+  for (const int64_t k : keys) before[k] = rtPick(ctx, r, k);
+  r.remove("data-2:9000");
+  std::map<int64_t, std::string> after;
+  for (const int64_t k : keys) {
+    after[k] = rtPick(ctx, r, k);
+    ctx.Assert(after[k] != "data-2:9000", "a removed instance must receive nothing");
+  }
+  int stayed = 0, moved = 0;
+  std::set<std::string> homes;
+  for (const int64_t k : keys) {
+    if (before[k] != "data-2:9000") {
+      stayed++;
+      if (after[k] != before[k]) moved++;
+    } else {
+      homes.insert(after[k]);
+    }
+  }
+  ctx.Equal(moved, 0, "of %d channels that did not live on data-2, some changed instance when data-2 left: removing a node must drop only its own points; moved", stayed);
+  const std::vector<std::string> got(homes.begin(), homes.end());
+  ctx.Equal(got, {"data-1:9000", "data-3:9000"}, "data-2's channels must spread over both survivors");
+  r.add("data-2:9000");
+  for (const int64_t k : keys) {
+    ctx.Assert(rtPick(ctx, r, k) == before[k], "adding the instance back must restore the exact previous mapping");
+  }
+  r.remove("data-1:9000");
+  r.remove("data-3:9000");
+  for (size_t i = 0; i < 20; i++) {
+    ctx.Assert(rtPick(ctx, r, keys[i]) == "data-2:9000", "with one instance left every key goes to it");
+  }
+}
+
+void CheckRouteByChannel(harness::Ctx& ctx) {
+  rtCluster(ctx);
+  std::map<int64_t, std::string> homes;
+  std::map<std::string, bool> targets;
+  for (size_t i = 0; i < rtChannels.size(); i++) {
+    const int64_t channel = rtChannels[i];
+    const auto f = rtFetch(ctx, channel);
+    if (f.err) ctx.Fatalf("fetch_messages for channel %d: unexpected error: %s", channel, *f.err);
+    const std::string owner = rtPick(ctx, ring, channel);
+    ctx.Equal(f.call.Target, owner, "fetch_messages for channel %d must reach the instance ring.pick names: a channel's reads must go to the instance that owns it on the ring", channel);
+    const auto req = f.call.Request<discord::GetMessagesRequest>();
+    ctx.Assert(f.call.HasRequest() && req.channel_id() == static_cast<uint64_t>(channel) && req.before() == static_cast<uint64_t>(rtEnd) && req.limit() == 50,
+               "the request must carry channel_id %d, before %d and limit 50 as given, the data service received %v", channel, rtEnd, req.ShortDebugString());
+    ctx.Equal(f.page, rtPage(static_cast<int>(i)), "fetch_messages must return the data service's page for channel %d", channel);
+    homes[channel] = f.call.Target;
+    targets[f.call.Target] = true;
+  }
+  ctx.Assert(targets.size() >= 2, "twelve channels all reached %v: the ring must spread channels over the instances", targets);
+  for (int n = 0; n < 3; n++) {
+    const auto f = rtFetch(ctx, rtChannels[0]);
+    if (f.err) ctx.Fatalf("fetch_messages for channel %d: unexpected error: %s", rtChannels[0], *f.err);
+    ctx.Equal(f.call.Target, homes[rtChannels[0]], "repeated reads of one channel must all reach the same instance");
+  }
+  const std::string gone = homes[rtChannels[0]];
+  ctx.GRPC.Stop(gone);  // the instance goes down; service discovery drops it from the ring
+  ring.remove(gone);
+  for (size_t i = 0; i < rtChannels.size(); i++) {
+    const int64_t channel = rtChannels[i];
+    const auto f = rtFetch(ctx, channel);
+    if (f.err) {
+      ctx.Fatalf("after %s went down and left the ring, channel %d failed with %s: its reads must follow the ring to a live instance", gone, channel, *f.err);
+    }
+    ctx.Assert(f.call.Target != gone, "channel %d still dialled %s after it left the ring", channel, gone);
+    if (homes[channel] != gone) {
+      ctx.Equal(f.call.Target, homes[channel], "channel %d lived on %s, which is still up, yet moved when %s left", channel, homes[channel], gone);
+    }
+    ctx.Equal(f.call.Target, rtPick(ctx, ring, channel), "channel %d must reach the instance the ring now names", channel);
+    ctx.Equal(f.page, rtPage(static_cast<int>(i)), "the new owner must answer channel %d's real page", channel);
+  }
+}
+
+void CheckDeadline(harness::Ctx& ctx) {
+  rtCluster(ctx);
+  const int64_t channel = rtChannels[1];
+  const auto f = rtFetch(ctx, channel);
+  if (f.err) ctx.Fatalf("fetch_messages for channel %d: unexpected error: %s", channel, *f.err);
+  ctx.Equal(f.page, rtPage(1), "expected channel %d's page", channel);
+  ctx.Assert(f.call.HasDeadline(), "GetMessages carries no deadline: a stalled data service would hold the API request forever");
+  const double timeout = f.call.TimeoutSeconds();
+  ctx.Assert(0.25 <= timeout && timeout <= 0.35, "the deadline must be 300 ms, the call carried %.3f s", timeout);
+  const std::string owner = f.call.Target;
+  ctx.GRPC.SetLatency("GetMessages", 2.0, owner);  // that instance stalls for 2 s
+  const size_t n = ctx.GRPC.CallsTo("GetMessages").size();
+  const int64_t started = ctx.Clock.Now();
+  bool failed = false;
+  size_t got = 0;
+  try {
+    got = fetch_messages(channel, rtEnd, 50).size();
+  } catch (const std::exception&) {
+    failed = true;
+  }
+  if (failed) {
+    // Go reads the code off the returned error; the C++ solution throws, so read the code the
+    // GetMessages call it made ended with.
+    const auto calls = ctx.GRPC.CallsTo("GetMessages");
+    ctx.Assert(calls.size() > n, "fetch_messages threw before calling GetMessages");
+    ctx.Equal(calls.back().Code, grpc::StatusCode::DEADLINE_EXCEEDED, "expected DEADLINE_EXCEEDED from the stalled instance");
+  }
+  const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
+  ctx.Assert(failed, "%s took 2 s to answer and fetch_messages waited %.1f s for %d messages: a data service slower than the deadline must surface DEADLINE_EXCEEDED", owner, waited, got);
+  ctx.Assert(waited <= 0.5, "the API waited %.1f s for a stalled instance, the deadline is 300 ms", waited);
+}
+`,
   },
   debrief: `Consistent hashing is the routing policy that makes coalescing worth having: the hash of the channel, not of the request, decides the instance, so the thousand clients opening one channel meet in one process and one of them pays for the database. Virtual nodes fix the two problems of a naive ring — three points split a circle very unevenly, and when one leaves its whole arc lands on a single neighbour; a hundred points per instance make the shares close to equal and spread a departure over every survivor. The guarantee that matters operationally is the minimal move: adding or losing an instance changes homes for only that instance's share of channels, so a deploy is a small cold spot rather than a cluster-wide one. Discord routes on the channel id for messages and on other keys for other services, each one chosen so that the requests that would coalesce share a key. Real routers get the instance list from service discovery, weight points by instance capacity, and hedge: when the owner fails fast with UNAVAILABLE, the next point clockwise is already the right fallback.`,
 };

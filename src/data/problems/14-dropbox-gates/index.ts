@@ -7,6 +7,7 @@ import {gateApiStep} from './steps/1-gate-api';
 import {gateSnapshotStep} from './steps/2-gate-snapshot';
 import {gatesRpcStep} from './steps/3-gates-rpc';
 import {exposureLogStep} from './steps/4-exposure-log';
+import {supportModulesCpp} from './support';
 
 /**
  * Dropbox's Stormcrow, rebuilt as the four pieces every feature-gating system is made of: an API
@@ -109,6 +110,6 @@ dependency on the critical path of every request.`,
     ],
   },
   steps: [gateApiStep, gateSnapshotStep, gatesRpcStep, exposureLogStep],
-  support: {python: protoModules, typescript: protoFiles, go: protoFiles},
+  support: {python: protoModules, typescript: protoFiles, go: protoFiles, cpp: {...protoFiles, ...supportModulesCpp}},
   learn,
 };

@@ -43,7 +43,22 @@ jobs:
           cache: yarn
       - run: yarn install --frozen-lockfile
       # Boots Pyodide in Node; its packages (fastapi, protobuf, …) come from jsDelivr at run time.
-      - run: yarn verify
+      - run: yarn verify --runtime python,typescript,go
+
+  verify-cpp:
+    name: Verify courses in C++
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: yarn
+      - run: yarn install --frozen-lockfile
+      # Fetches the WASI sysroot (wasi-sdk's release, pinned by digest), then compiles every C++ step with the
+      # clang the browser runs, in parallel across the runner's cores, and runs its harness.
+      - run: yarn verify --runtime cpp
 
   build:
     name: Build
@@ -62,7 +77,7 @@ jobs:
     name: CI
     # Runs even when a job above fails or is cancelled: a skipped required check counts as passing.
     if: always()
-    needs: [lint, verify, build]
+    needs: [lint, verify, verify-cpp, build]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

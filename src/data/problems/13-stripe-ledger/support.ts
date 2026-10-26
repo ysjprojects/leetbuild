@@ -2,6 +2,8 @@
  * Hand-written support module the ledger steps import but no step builds: `ledger.db`, the
  * runtime's Postgres handle holding the `transactions` and `entries` tables.
  */
+import {CPP_DIGEST_H, CPP_IDS_H, cppTransactionDbH} from '../cpp-support';
+
 export const supportModules: Record<string, string> = {
   'ledger/db.py': `"""The ledger database: \`async with db.transaction() as cur:\` begins, runs the block, commits
 (rolls back when the block raises). \`await cur.execute(sql, params)\` with %s placeholders;
@@ -89,4 +91,11 @@ func QueryRow(ctx context.Context, query string, args ...any) *sql.Row {
 	return pool.QueryRowContext(ctx, query, args...)
 }
 `,
+};
+
+/** The C++ twins: `db.h` (libpqxx on the runtime's Postgres), `ids.h` (UUIDs), `digest.h` (SHA-256). */
+export const supportModulesCpp: Record<string, string> = {
+  'db.h': cppTransactionDbH('The ledger database', 'postgresql://ledger@db:5432/ledger'),
+  'ids.h': CPP_IDS_H,
+  'digest.h': CPP_DIGEST_H,
 };

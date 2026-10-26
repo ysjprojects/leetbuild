@@ -922,6 +922,157 @@ func CheckFlush(ctx *harness.Ctx) {
 	ctx.Assert(took <= 10, "with the broker down, shutdown() took %.0f s: flush with a timeout so a stop is not held for the writer's whole write timeout", took)
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cmath>
+#include <sstream>
+
+#include <nlohmann/json.hpp>
+
+namespace {
+
+// peLogged collects what the program writes to std::cerr from now on; the destructor restores it.
+// (Go's harness swaps the log package's writer; the C++ step logs to std::cerr.)
+struct peLogged {
+  std::ostringstream lines;
+  std::streambuf* previous = std::cerr.rdbuf(lines.rdbuf());
+  ~peLogged() { std::cerr.rdbuf(previous); }
+  size_t Len() const { return lines.str().size(); }
+  void Reset() { lines.str(""); }
+};
+
+int pePixel(harness::Ctx& ctx, int x, int y) {
+  const std::string board = ctx.Redis.Get("board").value_or("");
+  const size_t off = static_cast<size_t>(y * 100 + x);
+  return off < board.size() ? static_cast<unsigned char>(board[off]) : 0;
+}
+
+std::vector<nlohmann::json> pePlacements(harness::Ctx& ctx) {
+  std::vector<nlohmann::json> out;
+  for (const auto& v : ctx.Kafka.Values("placements")) {
+    auto e = nlohmann::json::parse(v, nullptr, false);
+    ctx.Assert(e.is_object(), "a placements record is not a JSON object: %q", v);
+    out.push_back(std::move(e));
+  }
+  return out;
+}
+
+std::vector<std::string> peUsers(harness::Ctx& ctx) {
+  std::vector<std::string> users;
+  for (const auto& e : pePlacements(ctx)) users.push_back(e.contains("user") && e["user"].is_string() ? e["user"].get<std::string>() : "");
+  return users;
+}
+
+// peAPI is POST /place as step 1 deploys it: step 2's cooldown and paint, then this record_placement.
+httplib::Server peServer;
+
+harness::HTTP peAPI(harness::Ctx& ctx) {
+  peServer.Post("/place", [&ctx](const httplib::Request& req, httplib::Response& res) {
+    const auto body = nlohmann::json::parse(req.body, nullptr, false);
+    if (!body.is_object()) {
+      res.status = 400;
+      return;
+    }
+    const int x = body.value("x", 0), y = body.value("y", 0), color = body.value("color", 0);
+    const std::string user = body.value("user", "");
+    const std::string key = "cooldown:" + user;
+    if (!ctx.Redis.Set(key, "1", "NX", "EX", 300)) {
+      res.set_header("Retry-After", std::to_string(std::max(1LL, ctx.Redis.TTL(key))));
+      res.status = 429;
+      return;
+    }
+    ctx.Redis.Do("SETRANGE", "board", y * 100 + x, std::string(1, static_cast<char>(color)));
+    record_placement(user, x, y, color);
+    res.set_content(nlohmann::json{{"x", x}, {"y", y}, {"color", color}, {"user", user}}.dump(), "application/json");
+  });
+  return ctx.HTTP(peServer);
+}
+
+harness::Response pePost(harness::HTTP& api, const nlohmann::json& tile) {
+  return api.Post("/place", tile.dump(), "Content-Type", "application/json");
+}
+
+const nlohmann::json peTile = {{"x", 3}, {"y", 7}, {"color", 12}, {"user", "ana"}};
+
+}  // namespace
+
+void CheckTopic(harness::Ctx& ctx) {
+  record_placement("ana", 3, 7, 12);
+  ctx.Settle();
+  const auto produced = pePlacements(ctx);
+  ctx.Equal(produced.size(), 1, "the records on placements");
+  const auto& event = produced[0];
+  const nlohmann::json got = {{"user", event.value("user", nlohmann::json())}, {"x", event.value("x", nlohmann::json())}, {"y", event.value("y", nlohmann::json())}, {"color", event.value("color", nlohmann::json())}};
+  ctx.Equal(got, nlohmann::json{{"user", "ana"}, {"x", 3}, {"y", 7}, {"color", 12}}, "the value must be JSON carrying user, x, y and color: %s", event.dump());
+  const bool ok = event.contains("ts") && event["ts"].is_number_integer() && std::abs(event["ts"].get<double>() - static_cast<double>(ctx.Clock.Now())) < 60000;
+  ctx.Assert(ok, "ts must be the current time in epoch milliseconds, got %s", event.value("ts", nlohmann::json()).dump());
+}
+
+void CheckKeyedByTile(harness::Ctx& ctx) {
+  record_placement("ana", 3, 7, 12);
+  record_placement("bo", 3, 7, 5);
+  record_placement("ana", 7, 3, 12);
+  ctx.Settle();
+  ctx.Equal(ctx.Kafka.Keys("placements"), std::vector<std::string>{"3:7", "3:7", "7:3"}, "records must be keyed by the tile %q", "x:y");
+  const auto records = ctx.Kafka.Records("placements");
+  ctx.Equal(records[0].Partition, records[1].Partition, "two placements on the same pixel must land on the same partition, in order");
+}
+
+void CheckNonBlocking(harness::Ctx& ctx) {
+  auto api = peAPI(ctx);
+  ctx.Kafka.Stall("");  // the brokers stop answering
+  int64_t start = ctx.Clock.Now();
+  const auto r = pePost(api, peTile);
+  double took = static_cast<double>(ctx.Clock.Now() - start) / 1000;
+  ctx.Assert(took < 0.5, "with the broker not answering, POST /place took %.1f s: record_placement must hand the record to the producer and return, not wait for the acknowledgement", took);
+  ctx.Equal(r.Status, 200, "with the broker not answering, POST /place must still answer 200: the tile is painted, the event follows when the broker is back");
+  ctx.Equal(pePixel(ctx, 3, 7), 12, "the tile must be on the board while its event waits for the broker");
+  start = ctx.Clock.Now();
+  record_placement("bo", 4, 7, 1);
+  took = static_cast<double>(ctx.Clock.Now() - start) / 1000;
+  ctx.Assert(took < 0.5, "record_placement waited %.1f s for a broker that does not answer: enqueue and return", took);
+  ctx.Kafka.Resume("");
+  record_placement("cy", 5, 7, 2);  // the producer's retries get served again
+  ctx.Settle();
+  auto users = peUsers(ctx);
+  std::sort(users.begin(), users.end());
+  ctx.Equal(users, std::vector<std::string>{"ana", "bo", "cy"}, "once the broker answered again every placement handed to the producer must be delivered: the users of the tiles on placements");
+}
+
+void CheckCallback(harness::Ctx& ctx) {
+  peLogged records;
+  ctx.Kafka.FailNext("placements", 1);
+  record_placement("ana", 3, 7, 12);  // the failure arrives through the delivery report callback, not as an error
+  record_placement("ana", 4, 7, 12);
+  shutdown();
+  ctx.Assert(records.Len() > 0, "a failed delivery must be logged by the delivery report callback");
+  ctx.Equal(ctx.Kafka.Records("placements").size(), 1, "the second placement must still be produced after the first one failed: the records on placements");
+  // Through the API: a broker failure must not undo a painted tile.
+  records.Reset();
+  ctx.Kafka.FailNext("placements", 1);
+  auto api = peAPI(ctx);
+  const auto r = pePost(api, {{"x", 5}, {"y", 7}, {"color", 9}, {"user", "cy"}});
+  ctx.Equal(r.Status, 200, "with the broker failing, POST /place must still answer 200: the tile is painted, the event is best effort");
+  ctx.Equal(pePixel(ctx, 5, 7), 9, "the tile must stay on the board even though its event was not delivered");
+  shutdown();
+  ctx.Assert(records.Len() > 0, "the failed delivery of cy's placement must be logged");
+}
+
+void CheckFlush(harness::Ctx& ctx) {
+  ctx.Kafka.StallFor("", 2);  // the broker is slow to answer at the moment of the stop
+  record_placement("ana", 3, 7, 12);
+  shutdown();
+  ctx.Equal(peUsers(ctx), std::vector<std::string>{"ana"}, "shutdown() returned with ana's placement still in the producer's queue (the broker answered after 2 s): flush so a clean stop loses nothing. The users of the tiles on placements");
+  ctx.Kafka.Stall("");  // now the broker is down for good
+  record_placement("bo", 4, 7, 1);
+  const int64_t start = ctx.Clock.Now();
+  peLogged quiet;  // what shutdown reports about the undelivered record is not this check's concern
+  shutdown();
+  const double took = static_cast<double>(ctx.Clock.Now() - start) / 1000;
+  ctx.Assert(took <= 10, "with the broker down, shutdown() took %.0f s: flush with a timeout so a stop is not held for the producer's whole message timeout", took);
+}
+`,
   },
   debrief: `A Kafka producer is a buffer with a background thread: \`produce\` costs microseconds and the network happens later in batches, which is what makes "one event per tile" free on the request path — as long as nobody blocks on the acknowledgement. The key is the ordering contract: the only consumer that needs order is the per-pixel history, so the pixel is the key, and the leaderboard, which only sums, rides along. Decoupling the write from its consumers is also the operational lesson of the original: Reddit's write path called the websocket fan-out directly, and when the message bus behind it buckled under the burst, the fix was to lengthen the cooldown for everyone. With a log in between, a slow consumer falls behind on its own; the board keeps taking tiles.`,
 };

@@ -731,6 +731,100 @@ func CheckDrainBound(ctx *harness.Ctx) {
 	ctx.Assert(!p.Running(), "11 s after SIGTERM the process is still alive with a connection held open: bound the drain to drainTimeout (10 s) with context.WithTimeout")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <csignal>
+#include <string>
+
+namespace {
+
+std::string withoutSpaces(std::string s) {
+  std::string out;
+  for (char c : s)
+    if (c != ' ') out += c;
+  return out;
+}
+
+}  // namespace
+
+void CheckHealthz(harness::Ctx& ctx) {
+  auto r = ctx.Main().HTTP().Get("/healthz");
+  ctx.Equal(r.Status, 200, "GET /healthz");
+  const std::string ctype = r.HeaderValue("Content-Type");
+  ctx.Assert(ctype.rfind("application/json", 0) == 0, "GET /healthz must answer JSON, got Content-Type %q", ctype);
+  ctx.Equal(r.JSON(), harness::ParseJSON(R"({"ok":true})"), "GET /healthz body");
+}
+
+void CheckTlsMin(harness::Ctx& ctx) {
+  auto p = ctx.Main();
+  const auto servers = p.Servers();
+  ctx.Assert(!servers.empty(), "main() never started listening: nothing is serving");
+  httplib::Server* s = servers.back();
+  ctx.Assert(s->port() == 8443, "the listener is configured on port %d, expected 8443", s->port());
+  // Go inspects http.Server's TLSConfig; here the server is an httplib::SSLServer and its SSL_CTX.
+  auto* tls = dynamic_cast<httplib::SSLServer*>(s);
+  ctx.Assert(tls != nullptr && s->is_ssl(),
+             "the server listens without TLS: serve it with httplib::SSLServer(%q, %q) so it terminates TLS", "cert.pem",
+             "key.pem");
+  ctx.Assert(!tls->cert_path().empty() && !tls->key_path().empty(), "the listener must be configured with cert.pem and key.pem");
+  const int floor = SSL_CTX_get_min_proto_version(tls->ssl_context());
+  ctx.Assert(floor != 0,
+             "the TLS context has no minimum protocol version: the floor must be TLS1_2_VERSION, set with "
+             "SSL_CTX_set_min_proto_version(svr.ssl_context(), TLS1_2_VERSION)");
+  ctx.Equal(floor, TLS1_2_VERSION, "the minimum protocol version (the floor must be TLS1_2_VERSION)");
+}
+
+void CheckHsts(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  const auto ok = c.Get("/healthz");
+  const auto missing = c.Get("/no-such-route");
+  for (const auto& [name, r] : {std::pair<std::string, const harness::Response*>{"/healthz", &ok},
+                                {"/no-such-route", &missing}}) {
+    ctx.Assert(r->Header.count("Strict-Transport-Security") > 0,
+               "%s (%d) carries no Strict-Transport-Security header: add it in a post-routing handler so every "
+               "response has it",
+               name, r->Status);
+    const std::string value = r->HeaderValue("Strict-Transport-Security");
+    ctx.Assert(withoutSpaces(value).find("max-age=63072000") != std::string::npos,
+               "%s: Strict-Transport-Security is %q, expected max-age=63072000", name, value);
+  }
+}
+
+void CheckSigterm(harness::Ctx& ctx) {
+  auto p = ctx.Main();
+  auto release = p.HTTP().Hold("GET", "/healthz", "");  // a request in flight when the signal lands
+  ctx.Assert(p.Listening(), "the server must keep serving until SIGTERM arrives");
+  ctx.Assert(p.Signal(SIGTERM) > 0,
+             "main() handles no SIGTERM (sigwait or a handler): the process would die mid-request when the "
+             "orchestrator stops it");
+  ctx.Tick();
+  ctx.Assert(!p.Listening(),
+             "SIGTERM arrived but the server was not told to stop: call svr.stop() so the listener closes and "
+             "in-flight requests drain");
+  ctx.Assert(p.Running(),
+             "the process ended while a request was still in flight: wait for the serving thread before main returns");
+  release();
+  ctx.Tick();
+  ctx.Assert(!p.Running(), "the drain finished but the process is still running: return from main once listen() has returned");
+}
+
+void CheckDrainBound(harness::Ctx& ctx) {
+  auto p = ctx.Main();
+  p.HTTP().Hold("GET", "/healthz", "");  // a client holding its request open through the drain
+  ctx.Assert(p.Signal(SIGTERM) > 0, "main() handles no SIGTERM (sigwait or a handler)");
+  ctx.Tick();
+  ctx.Clock.Advance(9);
+  ctx.Tick();
+  ctx.Assert(p.Running(),
+             "9 s into the drain, with a request still in flight, the process already ended: give open connections "
+             "the full 10 s");
+  ctx.Clock.Advance(2);
+  ctx.Tick();
+  ctx.Assert(!p.Running(),
+             "11 s after SIGTERM the process is still alive with a connection held open: bound the drain to "
+             "kDrainTimeout (10 s) with served.wait_for");
+}
+`,
   },
   debrief: `The listener is where three cross-cutting policies live, because it is the one place every request passes: the TLS floor (a property of the context, checked once per handshake), HSTS (a middleware, so a new route cannot forget it) and graceful shutdown (close the accept socket first, then wait with a deadline). Real gateways add OCSP stapling, certificate hot-reload, ALPN for HTTP/2, and health checks that go *unhealthy* a few seconds before the drain starts so the load balancer stops sending traffic first.`,
 };

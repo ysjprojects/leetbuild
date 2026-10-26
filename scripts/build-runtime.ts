@@ -1,11 +1,12 @@
 /**
  * Bundles the runtimes' workers — src/lib/runtime/worker.ts (Python) into `public/py/worker.js`,
- * src/lib/runtime/tsWorker.ts (TypeScript) into `public/ts/worker.js` and src/lib/runtime/goWorker.ts
- * (Go) into `public/go/worker.js` — as ES-module workers served as static assets. They are built
- * outside webpack on purpose: Pyodide only runs in module workers, and webpack emits classic workers
- * unless the whole app is built as ESM. Runs before `next dev` / `next build` (`predev`, `prebuild`);
- * `yarn build:runtime` rebuilds them. The Go interpreter itself (public/go/runtime.wasm.gz) is built
- * from goruntime/ by `yarn build:go`.
+ * src/lib/runtime/tsWorker.ts (TypeScript) into `public/ts/worker.js`, src/lib/runtime/goWorker.ts
+ * (Go) into `public/go/worker.js` and src/lib/runtime/cppWorker.ts (C++) into `public/cpp/worker.js`
+ * — as ES-module workers served as static assets. They are built outside webpack on purpose:
+ * Pyodide only runs in module workers, and webpack emits classic workers unless the whole app is
+ * built as ESM. Runs before `next dev` / `next build` (`predev`, `prebuild`); `yarn build:runtime`
+ * rebuilds them. The Go interpreter itself (public/go/runtime.wasm.gz) is built from goruntime/ by
+ * `yarn build:go`, the C++ runtime's pack (public/cpp/runtime.pack.gz) from cppruntime/ by `yarn build:cpp`.
  */
 import {build} from 'esbuild';
 import {resolve} from 'node:path';
@@ -16,6 +17,7 @@ const WORKERS: [entry: string, outfile: string][] = [
   ['src/lib/runtime/worker.ts', 'public/py/worker.js'],
   ['src/lib/runtime/tsWorker.ts', 'public/ts/worker.js'],
   ['src/lib/runtime/goWorker.ts', 'public/go/worker.js'],
+  ['src/lib/runtime/cppWorker.ts', 'public/cpp/worker.js'],
 ];
 
 async function main(): Promise<void> {

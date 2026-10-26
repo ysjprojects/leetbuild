@@ -1,7 +1,9 @@
+import {CPP_IDS_H} from '../cpp-support';
+
 /**
  * Runtime support modules for the match-engine course: the provided price-time `Book` that step 3
- * (`from book import Book, Order` / `import {Book} from 'book'` / `import "exchange/book"`) matches orders
- * against.
+ * (`from book import Book, Order` / `import {Book} from 'book'` / `import "exchange/book"` /
+ * `#include "book.h"`) matches orders against.
  */
 export const supportModules: Record<string, string> = {
   'book.py': `"""
@@ -301,5 +303,160 @@ func (b *Book) rest(order Order) {
 	copy((*side)[index+1:], (*side)[index:])
 	(*side)[index] = order
 }
+`,
+};
+
+/**
+ * The C++ course headers: ids.h (step 1's new_uuid()), order_gateway.h (step 1's Order and PublishFailed,
+ * which step 2's publisher includes), and the same `Book` as book.h (step 3: `books[symbol].match(order)`).
+ */
+export const supportModulesCpp: Record<string, string> = {
+  'ids.h': CPP_IDS_H,
+  'order_gateway.h': `// The order gateway's types (step 1, provided): Order, PublishFailed, and to_json(order), the order as JSON.
+#pragma once
+
+#include <nlohmann/json.hpp>
+#include <stdexcept>
+#include <string>
+
+struct Order {
+  std::string order_id, symbol, side, client_order_id;
+  double price;
+  long qty;
+};
+
+// Thrown by publish_order when Kafka does not acknowledge the order.
+struct PublishFailed : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
+// Hands the order to the engine: returns once Kafka acknowledged it, throws PublishFailed otherwise.
+void publish_order(const Order& order);
+
+// The order as the orders topic carries it: {"order_id", "symbol", "side", "price", "qty", "client_order_id"}.
+inline std::string to_json(const Order& order) {
+  return nlohmann::json{{"order_id", order.order_id}, {"symbol", order.symbol}, {"side", order.side},
+                        {"price", order.price}, {"qty", order.qty}, {"client_order_id", order.client_order_id}}
+      .dump();
+}
+`,
+  'book.h': `// The provided limit order book: price-time priority.
+//
+// Book::match(order) crosses the incoming order against the resting orders of the opposite side,
+// best price first and oldest first at one price, fills at the resting order's price, and rests any
+// remainder. It returns one Fill per resting order it traded against, in matching order.
+#pragma once
+
+#include <algorithm>
+#include <cstddef>
+#include <nlohmann/json.hpp>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <vector>
+
+// A limit order, as the gateway publishes it on the orders topic.
+struct Order {
+  std::string order_id, symbol, side, client_order_id;
+  double price = 0;
+  long qty = 0;
+
+  // The order a record's value holds; nullopt unless it is a JSON object of an order with a symbol.
+  static std::optional<Order> parse(const std::string& value) {
+    const auto j = nlohmann::json::parse(value, nullptr, false);
+    if (!j.is_object()) return std::nullopt;
+    Order order;
+    try {
+      order.order_id = j.value("order_id", "");
+      order.symbol = j.value("symbol", "");
+      order.side = j.value("side", "");
+      order.client_order_id = j.value("client_order_id", "");
+      order.price = j.value("price", 0.0);
+      order.qty = j.value("qty", 0L);
+    } catch (const nlohmann::json::exception&) {
+      return std::nullopt;  // a field of the wrong type
+    }
+    if (order.symbol.empty()) return std::nullopt;
+    return order;
+  }
+};
+
+// One trade: the incoming order (the taker) against one resting order.
+struct Fill {
+  std::string symbol;
+  double price = 0;
+  long qty = 0;
+  std::string buy_order_id, sell_order_id, taker_side;
+
+  // The trade as the trades topic carries it: {"symbol", "price", "qty", "buy_order_id", "sell_order_id", "taker_side"}.
+  std::string to_json() const {
+    return nlohmann::json{{"symbol", symbol},
+                          {"price", price},
+                          {"qty", qty},
+                          {"buy_order_id", buy_order_id},
+                          {"sell_order_id", sell_order_id},
+                          {"taker_side", taker_side}}
+        .dump();
+  }
+};
+
+// One symbol's order book.
+class Book {
+ public:
+  std::vector<Order> bids;  // best (highest) price first, oldest first within a price
+  std::vector<Order> asks;  // best (lowest) price first, oldest first within a price
+  double last = 0;          // the price of the last fill, 0 before the first
+
+  // The best bid, 0 when there is none.
+  double bid() const { return bids.empty() ? 0 : bids.front().price; }
+  // The best ask, 0 when there is none.
+  double ask() const { return asks.empty() ? 0 : asks.front().price; }
+  // (bid, ask, last) as the engine publishes them; 0 for an empty side or no trade yet.
+  std::tuple<double, double, double> top() const { return {bid(), ask(), last}; }
+
+  // Cross order against the book and rest what is left of it. Throws std::invalid_argument on a side
+  // other than BUY or SELL.
+  std::vector<Fill> match(const Order& order) {
+    if (order.side != "BUY" && order.side != "SELL") throw std::invalid_argument("book: unknown side \\"" + order.side + "\\"");
+    const bool buying = order.side == "BUY";
+    std::vector<Order>& resting = buying ? asks : bids;
+    long remaining = order.qty;
+    std::vector<Fill> fills;
+    while (remaining > 0 && !resting.empty()) {
+      Order& best = resting.front();
+      const bool crosses = buying ? order.price >= best.price : order.price <= best.price;
+      if (!crosses) break;
+      const long qty = std::min(remaining, best.qty);
+      fills.push_back(Fill{order.symbol, best.price, qty, buying ? order.order_id : best.order_id,
+                           buying ? best.order_id : order.order_id, order.side});
+      last = best.price;
+      remaining -= qty;
+      best.qty -= qty;
+      if (best.qty == 0) resting.erase(resting.begin());
+    }
+    if (remaining > 0) {
+      Order rest = order;
+      rest.qty = remaining;
+      rest_order(rest);
+    }
+    return fills;
+  }
+
+ private:
+  // Insert order behind every resting order at its price or better.
+  void rest_order(const Order& order) {
+    const bool buying = order.side == "BUY";
+    std::vector<Order>& side = buying ? bids : asks;
+    std::size_t index = side.size();
+    for (std::size_t i = 0; i < side.size(); i++) {
+      if (buying ? order.price > side[i].price : order.price < side[i].price) {
+        index = i;
+        break;
+      }
+    }
+    side.insert(side.begin() + static_cast<std::ptrdiff_t>(index), order);
+  }
+};
 `,
 };

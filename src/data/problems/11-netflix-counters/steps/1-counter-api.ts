@@ -1532,6 +1532,236 @@ func CheckReadClearDispatch(ctx *harness.Ctx) {
 	ctx.Equal(a.count(ctx, "plays", "trailer-7"), 0, "after the clear plays/trailer-7 reads 0")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
+
+namespace {
+
+const std::string caTopic = "counter-events";
+
+harness::Ctx* caCtx = nullptr;
+std::unique_ptr<RdKafka::Producer> caEvents;
+
+std::string caPathEscape(const std::string& s) {
+  std::string out;
+  for (const unsigned char c : s) {
+    if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += static_cast<char>(c);
+    } else {
+      out += harness::Sprintf("%%%02X", static_cast<int>(c));
+    }
+  }
+  return out;
+}
+
+// caAPI is the learner's API as it runs: on the best-effort counters (step 2), the event log (step 3)
+// and the rollup (step 4), which the stand-ins below main's file reproduce.
+struct caAPI {
+  harness::HTTP http;
+  size_t folded = 0;  // the records of counter-events the rollup has folded so far
+
+  // rollup folds the events not folded yet into their minute buckets, once per token (step 4).
+  void rollup(harness::Ctx& ctx) {
+    const auto records = ctx.Kafka.Records(caTopic);
+    for (size_t i = folded; i < records.size(); i++) {
+      const auto e = nlohmann::json::parse(records[i].Value.value_or(""), nullptr, false);
+      if (!e.is_object()) continue;
+      const std::string token = e.value("token", "");
+      if (ctx.Redis.Set("seen:" + token, 1, "NX", "EX", 86400)) {
+        const auto ts = static_cast<int64_t>(e.value("ts", 0.0));
+        ctx.Redis.Do("HINCRBY", "rollup:" + e.value("ns", "") + ":" + e.value("name", ""), std::to_string(ts / 60 * 60), e.value("delta", int64_t{0}));
+      }
+    }
+    folded = records.size();
+  }
+
+  // call is the status the API answered and its body; the body is null when it is not a JSON object.
+  std::pair<int, nlohmann::json> call(const std::string& method, const std::string& path, const nlohmann::json& body = nullptr) {
+    const auto r = body.is_null() ? http.Do(method, path, "") : http.Do(method, path, body.dump(), "Content-Type", "application/json");
+    auto decoded = nlohmann::json::parse(r.Body, nullptr, false);
+    if (!decoded.is_object()) decoded = nullptr;
+    return {r.Status, decoded};
+  }
+
+  nlohmann::json count(harness::Ctx& ctx, const std::string& ns, const std::string& name) {
+    const auto [status, body] = call("GET", "/counters/" + ns + "/" + name);
+    ctx.Equal(status, 200, "GET /counters/%s/%s must answer 200 with the count", ns, name);
+    return body.is_object() ? body.value("count", nlohmann::json()) : nlohmann::json();
+  }
+};
+
+caAPI caStart(harness::Ctx& ctx) {
+  caCtx = &ctx;
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("acks", "all", err);
+  conf->set("linger.ms", "5", err);
+  caEvents.reset(RdKafka::Producer::create(conf.get(), err));
+  return caAPI{ctx.Main().HTTP()};
+}
+
+nlohmann::json field(const nlohmann::json& body, const char* key) {
+  return body.is_object() ? body.value(key, nlohmann::json()) : nlohmann::json();
+}
+
+void caUntouched(harness::Ctx& ctx, const std::string& what) {
+  const auto keys = ctx.Redis.Keys("*");
+  const auto events = ctx.Kafka.Records(caTopic);
+  ctx.Assert(keys.empty() && events.empty(), "%s must be refused before any store is touched, yet Redis holds %q and %s holds %d event(s)", what, keys, caTopic, events.size());
+}
+
+}  // namespace
+
+// The stand-ins for steps 2-4, as the Go harness swaps in its function variables.
+long long add_best_effort(const std::string& ns, const std::string& name, long long delta) {
+  const std::string key = "counter:" + ns + ":" + name;
+  caCtx->Redis.Set(key, 0, "NX", "EX", 3600);
+  return caCtx->Redis.Do("INCRBY", key, delta).Int();
+}
+
+long long get_best_effort(const std::string& ns, const std::string& name) {
+  const auto v = caCtx->Redis.Get("counter:" + ns + ":" + name);
+  return v ? std::stoll(*v) : 0;
+}
+
+void clear_best_effort(const std::string& ns, const std::string& name) { caCtx->Redis.Del("counter:" + ns + ":" + name); }
+
+void append_event(const std::string& ns, const std::string& name, long long delta, const std::string& token) {
+  const std::string value = nlohmann::json{{"ns", ns}, {"name", name}, {"delta", delta}, {"token", token}, {"ts", static_cast<double>(caCtx->Clock.Now()) / 1000}}.dump();
+  const std::string key = ns + ":" + name;
+  caEvents->produce(caTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(value.data()), value.size(), key.data(), key.size(), 0, nullptr);
+  // Go's writer gives up after a 1 s context timeout: not acknowledged by then, not durable.
+  if (caEvents->flush(1000) != RdKafka::ERR_NO_ERROR) throw EventNotDurable("the broker did not acknowledge the event within 1 s");
+}
+
+long long get_rolled_up(const std::string& ns, const std::string& name) {
+  long long sum = 0;
+  for (const auto& [bucket, v] : caCtx->Redis.HGetAll("rollup:" + ns + ":" + name)) sum += std::stoll(v);
+  return sum;
+}
+
+void clear_rolled_up(const std::string& ns, const std::string& name) { caCtx->Redis.Del("rollup:" + ns + ":" + name); }
+
+void CheckRoutes(harness::Ctx& ctx) {
+  auto a = caStart(ctx);
+  auto [status, _] = a.call("POST", "/counters/views/trailer-7/add", {{"delta", 1}, {"token", "t-1"}});
+  ctx.Assert(status != 404 && status != 405, "POST /counters/views/trailer-7/add answered %d: no handler is registered for it", status);
+  ctx.Equal(status, 200, "a best-effort add");
+  status = a.call("GET", "/counters/views/trailer-7").first;
+  ctx.Assert(status != 404 && status != 405, "GET /counters/views/trailer-7 answered %d: no handler is registered for it", status);
+  ctx.Equal(status, 200, "GET on a configured namespace");
+  status = a.call("DELETE", "/counters/views/trailer-7").first;
+  ctx.Assert(status != 404 && status != 405, "DELETE /counters/views/trailer-7 answered %d: no handler is registered for it", status);
+  ctx.Equal(status, 204, "DELETE /counters/views/trailer-7");
+  status = a.call("POST", "/counters/plays/stranger-things/add", {{"delta", 1}, {"token", "t-2"}}).first;
+  ctx.Equal(status, 202, "POST /counters/plays/stranger-things/add");
+  status = a.call("GET", "/counters/plays/stranger-things").first;
+  ctx.Equal(status, 200, "GET /counters/plays/stranger-things");
+  status = a.call("DELETE", "/counters/plays/stranger-things").first;
+  ctx.Equal(status, 204, "DELETE /counters/plays/stranger-things");
+}
+
+void CheckUnknownNamespace(harness::Ctx& ctx) {
+  auto a = caStart(ctx);
+  int status = a.call("POST", "/counters/likes/trailer-7/add", {{"delta", 1}, {"token", "t-1"}}).first;
+  ctx.Equal(status, 404, "namespace 'likes' is not configured");
+  status = a.call("GET", "/counters/likes/trailer-7").first;
+  ctx.Equal(status, 404, "GET on an unknown namespace");
+  status = a.call("DELETE", "/counters/likes/trailer-7").first;
+  ctx.Equal(status, 404, "DELETE on an unknown namespace");
+  status = a.call("POST", "/counters/likes/bad%20name/add", {{"delta", 0}}).first;
+  ctx.Equal(status, 404, "the namespace is checked first: an unknown namespace with a bad name and a bad delta is still a 404");
+  caUntouched(ctx, "an add to an unknown namespace");
+}
+
+void CheckValidate(harness::Ctx& ctx) {
+  auto a = caStart(ctx);
+  for (const std::string bad : {std::string("bad name"), std::string("dots.are.out"), std::string(65, 'a'), std::string("café")}) {
+    const std::string path = caPathEscape(bad);
+    int status = a.call("POST", "/counters/views/" + path + "/add", {{"delta", 1}, {"token", "t-1"}}).first;
+    ctx.Equal(status, 400, "name %q does not match kNameRe", bad);
+    status = a.call("POST", "/counters/plays/" + path + "/add", {{"delta", 1}, {"token", "t-1"}}).first;
+    ctx.Equal(status, 400, "name %q does not match kNameRe: an eventually-consistent add", bad);
+    status = a.call("GET", "/counters/views/" + path).first;
+    ctx.Equal(status, 400, "GET with name %q", bad);
+  }
+  for (const int delta : {0, 1000001, -1000001}) {
+    int status = a.call("POST", "/counters/views/trailer-7/add", {{"delta", delta}, {"token", "t-1"}}).first;
+    ctx.Equal(status, 400, "delta %d is zero or beyond ±kMaxDelta", delta);
+    status = a.call("POST", "/counters/plays/stranger-things/add", {{"delta", delta}, {"token", "t-1"}}).first;
+    ctx.Equal(status, 400, "delta %d is zero or beyond ±kMaxDelta: an eventually-consistent add", delta);
+  }
+  int status = a.call("POST", "/counters/plays/stranger-things/add", {{"delta", 1}}).first;
+  ctx.Equal(status, 400, "an eventually-consistent add without a token (the token is the idempotency key)");
+  status = a.call("POST", "/counters/plays/stranger-things/add", {{"delta", 1}, {"token", ""}}).first;
+  ctx.Equal(status, 400, "an empty token is no token");
+  caUntouched(ctx, "a request with a bad name, delta or token");
+  status = a.call("POST", "/counters/views/trailer-7/add", {{"delta", -1000000}}).first;
+  ctx.Equal(status, 200, "a best-effort add of exactly -kMaxDelta without a token is valid");
+  status = a.call("POST", "/counters/views/trailer_7-v2/add", {{"delta", 1000000}, {"token", "t-1"}}).first;
+  ctx.Equal(status, 200, "name 'trailer_7-v2' and delta kMaxDelta are valid");
+}
+
+void CheckAddDispatch(harness::Ctx& ctx) {
+  auto a = caStart(ctx);
+  auto [status, body] = a.call("POST", "/counters/views/trailer-7/add", {{"delta", 3}, {"token", "t-1"}});
+  ctx.Equal(status, 200, "a best-effort add");
+  ctx.Equal(field(body, "count"), 3, "the 200 body must carry the new count of the best-effort counter (body %s)", body.dump());
+  std::tie(status, body) = a.call("POST", "/counters/views/trailer-7/add", {{"delta", 4}});
+  ctx.Equal(field(body, "count"), 7, "the second add must return the running count 7 (status %d, body %s)", status, body.dump());
+  ctx.Equal(ctx.Redis.Get("counter:views:trailer-7").value_or(""), "7", "best-effort adds move the cached counter counter:views:trailer-7 at once");
+  ctx.Equal(ctx.Kafka.Records(caTopic).size(), 0, "a best-effort add is not logged as an event, yet %s holds %q", caTopic, ctx.Kafka.Values(caTopic));
+
+  std::tie(status, body) = a.call("POST", "/counters/plays/stranger-things/add", {{"delta", 1}, {"token", "t-9f3"}});
+  ctx.Equal(status, 202, "an eventually-consistent add (the count is not visible yet)");
+  ctx.Assert(!(body.is_object() && body.contains("count")), "a 202 must not claim a count the rollup has not computed, got %s", body.dump());
+  nlohmann::json seen = nlohmann::json::array();
+  for (const auto& v : ctx.Kafka.Values(caTopic)) {
+    const auto e = nlohmann::json::parse(v, nullptr, false);
+    seen.push_back({field(e, "ns"), field(e, "name"), field(e, "delta"), field(e, "token")});
+  }
+  ctx.Equal(seen, nlohmann::json::array({nlohmann::json::array({"plays", "stranger-things", 1, "t-9f3"})}), "an eventually-consistent add is one event on %s carrying the delta and the client's token", caTopic);
+  ctx.Equal(ctx.Redis.Keys("counter:*"), std::vector<std::string>{"counter:views:trailer-7"}, "an eventually-consistent add must not touch a best-effort counter: the counter:* keys");
+  ctx.Equal(a.count(ctx, "plays", "stranger-things"), 0, "before the rollup has folded the event the count is not visible yet");
+  a.rollup(ctx);
+  ctx.Equal(a.count(ctx, "plays", "stranger-things"), 1, "once the rollup has folded the event GET must show it");
+
+  ctx.Kafka.Stall(caTopic);  // the cluster stops acknowledging
+  const int64_t start = ctx.Clock.Now();
+  status = a.call("POST", "/counters/plays/stranger-things/add", {{"delta", 2}, {"token", "t-a1"}}).first;
+  const double waited = static_cast<double>(ctx.Clock.Now() - start) / 1000;
+  ctx.Assert(status != 202, "with the broker down the event could not be made durable, yet the add answered 202: the client was promised a count that may never arrive");
+  ctx.Equal(status, 503, "with the broker down an event that is not durable (EventNotDurable) is a 503, which tells the client to retry with the same token");
+  ctx.Assert(waited <= 1.5, "with the broker down the add took %.0f s to answer 503: it must fail as fast as append_event gives up (about 1 s)", waited);
+  ctx.Kafka.Resume(caTopic);
+  status = a.call("POST", "/counters/plays/stranger-things/add", {{"delta", 2}, {"token", "t-a1"}}).first;
+  ctx.Equal(status, 202, "the client's retry with the same token, once the broker is back");
+  a.rollup(ctx);
+  ctx.Equal(a.count(ctx, "plays", "stranger-things"), 3, "the failed add and its retry carry the client's token t-a1, so the rollup counts the 2 once: expected 1 + 2 = 3");
+}
+
+void CheckReadClearDispatch(harness::Ctx& ctx) {
+  auto a = caStart(ctx);
+  a.call("POST", "/counters/views/trailer-7/add", {{"delta", 5}});
+  a.call("POST", "/counters/plays/trailer-7/add", {{"delta", 1200}, {"token", "t-1"}});
+  a.call("POST", "/counters/plays/trailer-7/add", {{"delta", 7}, {"token", "t-2"}});
+  a.rollup(ctx);
+  ctx.Equal(a.count(ctx, "views", "trailer-7"), 5, "GET on the best-effort views/trailer-7 must answer its cached count");
+  ctx.Equal(a.count(ctx, "plays", "trailer-7"), 1207, "GET on the eventually-consistent plays/trailer-7 must answer the rolled-up total");
+  int status = a.call("DELETE", "/counters/views/trailer-7").first;
+  ctx.Equal(status, 204, "DELETE on a best-effort counter");
+  ctx.Equal(ctx.Redis.Exists("counter:views:trailer-7"), 0, "DELETE /counters/views/trailer-7 must clear the cached counter counter:views:trailer-7: EXISTS");
+  ctx.Equal(a.count(ctx, "views", "trailer-7"), 0, "after the clear views/trailer-7 reads 0");
+  ctx.Equal(a.count(ctx, "plays", "trailer-7"), 1207, "clearing views/trailer-7 must leave plays/trailer-7 alone");
+  status = a.call("DELETE", "/counters/plays/trailer-7").first;
+  ctx.Equal(status, 204, "DELETE on an eventually-consistent counter");
+  ctx.Equal(ctx.Redis.Exists("rollup:plays:trailer-7"), 0, "DELETE /counters/plays/trailer-7 must clear the rolled-up buckets rollup:plays:trailer-7: EXISTS");
+  ctx.Equal(a.count(ctx, "plays", "trailer-7"), 0, "after the clear plays/trailer-7 reads 0");
+}
+`,
   },
   debrief: `The API is the whole abstraction: callers see AddCount, GetCount and ClearCount, and the namespace — not the request — decides which machinery runs. That is why the namespace is checked first and why the two adds answer differently: a 200 with a count is a promise that the number moved, a 202 is a promise that it will, and the second promise is the only one a durable log can make synchronously. The token is required only where it has a consumer; asking a cache to honour it would be a lie. Netflix's real control plane also configures cardinality and TTL per namespace, offers AddAndGetCount, and treats a clear as just another event in the log rather than a direct delete.`,
 };

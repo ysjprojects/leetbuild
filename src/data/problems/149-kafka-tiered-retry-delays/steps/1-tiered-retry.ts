@@ -1565,6 +1565,251 @@ func CheckRetrySucceeds(ctx *harness.Ctx) {
 	allCommitted(ctx)
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <exception>
+#include <map>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+const std::vector<int64_t> checkTiers = {5000, 30000, 300000};
+const std::vector<std::string> checkRetryTopics = {"tasks.retry.5s", "tasks.retry.30s", "tasks.retry.5m"};
+const std::string checkGroup = "tasks-workers";
+
+struct taskCall {
+  std::string key, value;
+  int64_t at;
+};
+
+bool epochMillis(const std::optional<std::string>& s) {
+  return s && !s->empty() && std::all_of(s->begin(), s->end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+// seedTask puts a record on partition 0 of topic, with the attempt and not_before headers when >= 0.
+void seedTask(harness::Ctx& ctx, const std::string& topic, const std::string& key, const std::string& value, int64_t attempt,
+              int64_t notBefore) {
+  std::vector<harness::KafkaHeader> headers;
+  if (attempt >= 0) headers.push_back({"attempt", std::to_string(attempt)});
+  if (notBefore >= 0) headers.push_back({"not_before", std::to_string(notBefore)});
+  ctx.Kafka.SeedPartition(topic, 0, key, value, headers);
+}
+
+// taskWorker runs the learner's loop with a handler that records (key, value, clock ms), moves the
+// clock by advance[key] seconds, and throws "boom" for keys in fails.
+std::vector<taskCall> taskWorker(harness::Ctx& ctx, const std::vector<std::string>& fails,
+                                 const std::map<std::string, double>& advance) {
+  std::vector<taskCall> calls;
+  const auto handler = [&](const std::string& key, const std::string& value) {
+    calls.push_back({key, value, ctx.Clock.Now()});
+    const auto it = advance.find(key);
+    if (it != advance.end()) ctx.Clock.Advance(it->second);
+    if (std::find(fails.begin(), fails.end(), key) != fails.end()) throw std::runtime_error("boom");
+  };
+  try {
+    ctx.Drain([&] { run(handler); });
+  } catch (const std::exception&) {
+  }
+  return calls;
+}
+
+std::vector<taskCall> callsOf(const std::vector<taskCall>& calls, const std::string& key) {
+  std::vector<taskCall> out;
+  for (const auto& c : calls)
+    if (c.key == key) out.push_back(c);
+  return out;
+}
+
+bool touches(const harness::KafkaOffsets& offsets, const std::string& topic) {
+  return std::any_of(offsets.begin(), offsets.end(), [&](const auto& o) { return o.first.Topic == topic; });
+}
+
+void allCommitted(harness::Ctx& ctx) {
+  std::vector<std::string> topics = {"tasks"};
+  topics.insert(topics.end(), checkRetryTopics.begin(), checkRetryTopics.end());
+  for (const auto& topic : topics)
+    ctx.Equal(ctx.Kafka.Lag(checkGroup, topic), 0, "%s: handled record(s) left uncommitted", topic);
+}
+
+struct waiting {
+  int64_t t0;
+  std::vector<std::string> fillers;
+  std::map<std::string, double> advance;
+};
+
+// waitingWorld seeds one retry record due in 5 s on tasks.retry.5s and six tasks records whose
+// handlers each move the clock 1 s.
+waiting waitingWorld(harness::Ctx& ctx) {
+  waiting w;
+  w.t0 = ctx.Clock.Now();
+  seedTask(ctx, "tasks.retry.5s", "x", "job-x", 1, w.t0 + 5000);
+  for (int i = 1; i <= 6; i++) {
+    const std::string key = "f" + std::to_string(i);
+    w.fillers.push_back(key);
+    seedTask(ctx, "tasks", key, "job-" + key, -1, -1);
+    w.advance[key] = 1;
+  }
+  return w;
+}
+
+}  // namespace
+
+void CheckGroup(harness::Ctx& ctx) {
+  seedTask(ctx, "tasks", "a", "job-a", -1, -1);
+  const auto calls = taskWorker(ctx, {}, {});
+  const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
+  ctx.Assert(!subscriptions.empty(), "the consumer must subscribe to the topics");
+  const auto& last = subscriptions.back();
+  ctx.Equal(last.Group, checkGroup, "group.id");
+  std::vector<std::string> topics = {"tasks"};
+  topics.insert(topics.end(), checkRetryTopics.begin(), checkRetryTopics.end());
+  for (const auto& topic : topics)
+    ctx.Assert(std::find(last.Topics.begin(), last.Topics.end(), topic) != last.Topics.end(),
+               "the consumer must subscribe to %s as well; it subscribed to %v", topic, last.Topics);
+  ctx.Equal(ctx.Kafka.EventsOf("auto-commit").size(), 0, "auto-commit is on: offsets were committed on a timer, before processing");
+  ctx.Assert(!ctx.Kafka.EventsOf("manual-commit").empty(), "no explicit commit happened");
+  std::vector<std::string> seen;
+  for (const auto& c : calls) seen.push_back(c.key + "=" + c.value);
+  ctx.Equal(seen, {"a=job-a"}, "the handler must see (key, value) once per record: key=value handled");
+  allCommitted(ctx);
+}
+
+void CheckEscalates(harness::Ctx& ctx) {
+  seedTask(ctx, "tasks", "a", "job-a", -1, -1);
+  for (const std::string key : {"f1", "f2", "f3"}) seedTask(ctx, "tasks", key, "job-" + key, -1, -1);
+  const auto calls = taskWorker(ctx, {"a"}, {{"f1", 6}, {"f2", 40}, {"f3", 400}});
+  const auto tries = callsOf(calls, "a");
+  ctx.Equal(tries.size(), 4, "a record that always fails is tried once on tasks and once per tier: the handler's calls for it");
+  for (const auto& c : tries) ctx.Equal(c.value, "job-a", "every retry must hand the handler the original value");
+  for (size_t i = 0; i < checkRetryTopics.size(); i++) {
+    const std::string& topic = checkRetryTopics[i];
+    const auto records = ctx.Kafka.Records(topic);
+    ctx.Equal(records.size(), 1, "%s must hold the failed record exactly once: records", topic);
+    ctx.Equal(std::vector<std::string>{records[0].Key.value_or(""), records[0].Value.value_or("")}, {"a", "job-a"},
+              "%s: the hand-off must keep key a and value job-a", topic);
+    ctx.Equal(records[0].Header("attempt"), std::to_string(i + 1), "%s: the attempt header", topic);
+    const auto raw = records[0].Header("not_before");
+    ctx.Assert(epochMillis(raw), "%s: the hand-off needs a not_before header in epoch milliseconds, got %q", topic, raw);
+    const int64_t notBefore = std::stoll(*raw);
+    const int64_t gap = notBefore - tries[i].at;
+    ctx.Assert(gap >= checkTiers[i] - 5 && gap <= checkTiers[i] + 2000,
+               "%s: not_before must be the failure time + %d ms, it is %d ms after the handler failed", topic, checkTiers[i], gap);
+    ctx.Assert(tries[i + 1].at >= notBefore - 5, "%s: the record was handled %d ms before its not_before", topic,
+               notBefore - tries[i + 1].at);
+  }
+  const auto dlq = ctx.Kafka.Records("tasks.dlq");
+  ctx.Equal(dlq.size(), 1, "after the last tier the record is dead-lettered once: records on tasks.dlq");
+  ctx.Assert(dlq[0].Key == "a" && dlq[0].Value == "job-a", "the dead letter must keep the key and value");
+  ctx.Equal(dlq[0].Header("attempt"), "4", "the dead letter's attempt header");
+  ctx.Equal(dlq[0].Header("error"), "boom", "the dead letter's error header must carry the handler error's message");
+  std::vector<std::string> others;
+  for (const auto& c : calls)
+    if (c.key != "a") others.push_back(c.key);
+  std::sort(others.begin(), others.end());
+  ctx.Equal(others, {"f1", "f2", "f3"}, "the other tasks records must each be handled once");
+  allCommitted(ctx);
+}
+
+void CheckNotBefore(harness::Ctx& ctx) {
+  const waiting w = waitingWorld(ctx);
+  struct commitAt {
+    harness::KafkaOffsets offsets;
+    int64_t at;
+  };
+  std::vector<commitAt> commits;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) { commits.push_back({offsets, ctx.Clock.Now()}); });
+  const auto calls = taskWorker(ctx, {}, w.advance);
+  const auto xs = callsOf(calls, "x");
+  ctx.Equal(xs.size(), 1, "the retry record must be handled exactly once: the handler's calls for it");
+  ctx.Assert(xs[0].at >= w.t0 + 5000 - 5,
+             "the retry record was handled %d ms before its not_before: a record that is not due is paused, not processed",
+             w.t0 + 5000 - xs[0].at);
+  for (const auto& c : commits)
+    ctx.Assert(!(touches(c.offsets, "tasks.retry.5s") && c.at < xs[0].at),
+               "tasks.retry.5s was committed before its record was handled: a record that is not due must not be skipped");
+  ctx.Assert(ctx.Kafka.Records("tasks.retry.30s").empty() && ctx.Kafka.Records("tasks.dlq").empty(),
+             "a retry that succeeds is not forwarded");
+  allCommitted(ctx);
+}
+
+void CheckNonBlocking(harness::Ctx& ctx) {
+  const waiting w = waitingWorld(ctx);
+  const auto calls = taskWorker(ctx, {}, w.advance);
+  const auto xs = callsOf(calls, "x");
+  ctx.Assert(xs.size() == 1 && xs[0].at >= w.t0 + 5000 - 5, "the retry record must be handled exactly once, no earlier than its not_before");
+  std::vector<std::string> handled;
+  int before = 0;
+  for (const auto& c : calls) {
+    if (c.key == "x") continue;
+    handled.push_back(c.key);
+    if (c.at < w.t0 + 5000) before++;
+  }
+  std::sort(handled.begin(), handled.end());
+  ctx.Equal(handled, w.fillers, "every tasks record must be handled once");
+  ctx.Assert(before >= 3,
+             "only %d of the 6 tasks records were handled before the retry record was due: a paused retry partition must not block tasks",
+             before);
+  // The clock when the last handler returned: a consume(timeout) loop keeps waiting (and moving the
+  // clock) after the work is done.
+  int64_t finished = 0;
+  for (const auto& c : calls) {
+    const auto it = w.advance.find(c.key);
+    finished = std::max(finished, c.at + static_cast<int64_t>((it == w.advance.end() ? 0 : it->second) * 1000));
+  }
+  const int64_t moved = finished - w.t0;
+  ctx.Assert(moved <= 6000 + 2000,
+             "the clock moved %d ms while the handlers moved it 6000 ms: the worker slept the delay away instead of pausing the partition",
+             moved);
+  allCommitted(ctx);
+}
+
+void CheckFlushBeforeCommit(harness::Ctx& ctx) {
+  const int64_t t0 = ctx.Clock.Now();
+  seedTask(ctx, "tasks", "a", "job-a", -1, -1);
+  ctx.Kafka.StallFor("tasks.retry.5s", 2);
+  struct commitAt {
+    harness::KafkaOffsets offsets;
+    size_t n;
+    int64_t at;
+  };
+  std::vector<commitAt> commits;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) {
+    commits.push_back({offsets, ctx.Kafka.Records("tasks.retry.5s").size(), ctx.Clock.Now()});
+  });
+  taskWorker(ctx, {"a"}, {});
+  bool stalled = false;
+  for (const auto& e : ctx.Kafka.EventsOf("produce-stalled")) stalled = stalled || e.Topic == "tasks.retry.5s";
+  ctx.Assert(stalled, "the failure must be produced to tasks.retry.5s (it was stalled)");
+  std::vector<commitAt> source;
+  for (const auto& c : commits)
+    if (touches(c.offsets, "tasks")) source.push_back(c);
+  ctx.Assert(!source.empty(), "the tasks offset was never committed");
+  ctx.Equal(source[0].n, 1,
+            "the tasks offset was committed while the hand-off was still in flight (flush and check the delivery report first): records on tasks.retry.5s at the commit");
+  ctx.Assert(source[0].at >= t0 + 2000, "the commit must wait out the stall (2 s of virtual time) for the broker's acknowledgement");
+  ctx.Equal(ctx.Kafka.Lag(checkGroup, "tasks"), 0,
+            "the failed record's offset must be committed once the hand-off is acknowledged: lag on tasks");
+}
+
+void CheckRetrySucceeds(harness::Ctx& ctx) {
+  seedTask(ctx, "tasks.retry.5s", "b", "job-b", 1, 0);
+  seedTask(ctx, "tasks", "c", "job-c", -1, -1);
+  const auto calls = taskWorker(ctx, {}, {});
+  std::vector<std::string> seen;
+  for (const auto& c : calls) seen.push_back(c.key + "=" + c.value);
+  std::sort(seen.begin(), seen.end());
+  ctx.Equal(seen, {"b=job-b", "c=job-c"}, "a due retry record and a tasks record are each handled once: key=value handled");
+  for (const std::string topic : {"tasks.retry.30s", "tasks.retry.5m", "tasks.dlq"})
+    ctx.Equal(ctx.Kafka.Records(topic).size(), 0, "a record whose handler succeeds is not forwarded: records on %s", topic);
+  ctx.Equal(ctx.Kafka.Records("tasks.retry.5s").size(), 1, "a record whose handler succeeds is not re-produced: records on tasks.retry.5s");
+  allCommitted(ctx);
+}
+`,
   },
   debrief: `Two decisions carry the whole design. First, the delay is **data, not control flow**: a \`not_before\` header on a record in a topic named for its tier, so the delay survives a restart, is visible to anyone reading the topic, and costs the consumer no thread. Second, a record that is not due is handled by **\`pause\` + \`seek\`, never by \`sleep\` and never by committing past it**: pausing a partition tells the fetcher to stop asking for it while every other partition — the main topic above all — keeps flowing, and seeking back puts the record under the cursor so that \`resume\` delivers exactly it. Since the record is not committed while it waits, a crash replays it, which is correct — nothing was done. The tiers are the reason there is one topic per delay: a single retry topic with mixed \`not_before\` values would have a 5-minute record block a 5-second one behind it (head-of-line blocking inside the retry topic itself), whereas within one tier every record waits the same time, so the head is always the first due. Real systems add rebalance handling (a paused partition that is revoked must be forgotten, and the new owner pauses it again from the committed offset), a cap on how long a pause may last before the record is moved on anyway, per-tier consumer groups so a slow tier cannot starve the main loop's poll interval, and a dead-letter replayer that puts \`tasks.dlq\` records back on \`tasks\` once the dependency is healthy.`,
 };

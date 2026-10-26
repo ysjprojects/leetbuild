@@ -1,5 +1,6 @@
 import type {Problem} from '@/lib/types';
 
+import {CPP_DIGEST_H} from '../cpp-support';
 import {learn} from './learn';
 import {preconditionsStep} from './steps/1-preconditions';
 
@@ -58,5 +59,6 @@ holds the store, so check and write cannot interleave).`,
     edges: [{from: 'client', to: 'service', kind: 'http', label: 'GET / PUT / DELETE /docs/{id}'}],
   },
   steps: [preconditionsStep],
+  support: {cpp: {'sha256.h': CPP_DIGEST_H}},
   learn,
 };

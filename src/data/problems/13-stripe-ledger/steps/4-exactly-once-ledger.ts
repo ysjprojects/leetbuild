@@ -1302,6 +1302,284 @@ func CheckAfterCommitHooks(ctx *harness.Ctx) {
 	ctx.Assert(ctx.Redis.Exists("bal:cash:acquirer:EUR") == 1, "a skipped duplicate changed no balance, yet the cached cash:acquirer EUR balance was dropped")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+#include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
+#include <sw/redis++/redis++.h>
+
+#include <algorithm>
+#include <memory>
+#include <regex>
+
+namespace {
+
+const std::string eoSchema = R"(
+CREATE TABLE transactions (
+    id text PRIMARY KEY,
+    event_id text UNIQUE,
+    description text NOT NULL,
+    settles text,
+    posted_at bigint NOT NULL
+);
+CREATE TABLE entries (
+    transaction_id text NOT NULL,
+    account text NOT NULL,
+    currency text NOT NULL,
+    amount bigint NOT NULL CHECK (amount <> 0),
+    posted_at bigint NOT NULL
+);
+)";
+
+constexpr int64_t eoT0 = 1700000000000LL;
+
+const std::vector<Entry> eoEntries = {{"cash:acquirer", "EUR", 4999}, {"clearing:payments", "EUR", -4999}};
+const std::vector<Entry> eoPayout = {{"clearing:payments", "EUR", 4999}, {"cash:bank", "EUR", -4999}};
+const std::regex eoUUID("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", std::regex::icase);
+
+// eoRedis is the connection of the real clearing tracker (step 5) and balance service (step 6).
+sw::redis::Redis& eoRedis() {
+  static sw::redis::Redis redis("tcp://redis:6379");
+  return redis;
+}
+
+}  // namespace
+
+// Step 5's track (clearing_tracker.cpp): a settling transaction closes the item it names; otherwise a
+// transaction touching a clearing account opens one at its own time.
+void track(const std::string& transaction_id, int64_t posted_at, const std::vector<Entry>& entries, std::optional<std::string> settles) {
+  if (settles) {
+    eoRedis().zrem("clearing:open", *settles);
+    return;
+  }
+  for (const auto& e : entries) {
+    if (e.account.rfind("clearing:", 0) == 0) {
+      eoRedis().zadd("clearing:open", transaction_id, static_cast<double>(posted_at));
+      return;
+    }
+  }
+}
+
+// Step 6's invalidate (balance_service.cpp): the cached current balance is stale.
+void invalidate(const std::string& account, const std::string& currency) { eoRedis().del("bal:" + account + ":" + currency); }
+
+namespace {
+
+// eoBalance is the real balance service (step 6) answering GetBalance(account, currency, as_of 0):
+// bal:{account}:{currency} when cached, else the sum of the entries up to now, cached for 5 s.
+int64_t eoBalance(harness::Ctx& ctx, const std::string& account, const std::string& currency) {
+  const std::string key = "bal:" + account + ":" + currency;
+  if (const auto cached = eoRedis().get(key)) return std::stoll(*cached);
+  auto row = ctx.DB.Query("SELECT COALESCE(SUM(amount) FILTER (WHERE currency = $1 AND posted_at <= $2), 0)::bigint AS amount, COUNT(*) AS n FROM entries WHERE account = $3",
+                          currency, ctx.Clock.Now(), account)[0];
+  ctx.Assert(row["n"] != 0, "GetBalance(%s, %s) answered NOT_FOUND: the journal holds no entries for the account", account, currency);
+  const int64_t amount = row["amount"].Int();
+  eoRedis().set(key, std::to_string(amount), std::chrono::seconds(5));
+  return amount;
+}
+
+// eoWriter is the learner's writer on an empty ledger; its track (step 5) and invalidate (step 6)
+// are the real ones (defined above).
+void eoWriter(harness::Ctx& ctx) { ctx.DB.Reset(eoSchema); }
+
+// eoWrite calls write_transaction ("" for no event id, 0 for no posted_at, "" for no settles) and
+// returns the id ("" when it was already recorded); an exception fails the check.
+std::string eoWrite(harness::Ctx& ctx, const std::vector<Entry>& entries, const std::string& description, const std::string& eventID,
+                    int64_t postedAt, const std::string& settles) {
+  std::optional<std::string> event, settled;
+  if (!eventID.empty()) event = eventID;
+  if (!settles.empty()) settled = settles;
+  try {
+    return write_transaction(entries, description, event, postedAt, settled).value_or("");
+  } catch (const std::exception& e) {
+    ctx.Fatalf("writeTransaction(%s, event %q) failed: %v", description, eventID, std::string(e.what()));
+  }
+}
+
+std::vector<harness::Row> eoRows(harness::Ctx& ctx, const std::string& table) {
+  const std::string order = table == "entries" ? "posted_at, account, amount" : "posted_at, id";
+  return ctx.DB.Query("SELECT * FROM " + table + " ORDER BY " + order);
+}
+
+std::map<std::string, double> eoOpen(harness::Ctx& ctx) {
+  std::map<std::string, double> out;
+  for (const auto& z : ctx.Redis.ZRangeWithScores("clearing:open", 0, -1)) out[z.Member] = z.Score;
+  return out;
+}
+
+// eoIngest is the real step 3 consumer (event_consumer.cpp) in group ledger, run until it waits for
+// more: each event becomes a balanced transaction through write_transaction, then its offset is
+// committed.
+void eoIngest(harness::Ctx& ctx) {
+  const std::map<std::string, std::pair<std::string, std::string>> mapping = {
+      {"payment.captured", {"cash:acquirer", "clearing:payments"}},
+      {"payout.sent", {"clearing:payouts", "cash:bank"}},
+      {"refund.issued", {"clearing:payments", "cash:acquirer"}},
+  };
+  std::string err;
+  auto conf = std::unique_ptr<RdKafka::Conf>(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
+  conf->set("bootstrap.servers", "kafka:9092", err);
+  conf->set("group.id", "ledger", err);
+  conf->set("auto.offset.reset", "earliest", err);
+  conf->set("enable.auto.commit", "false", err);
+  auto consumer = std::unique_ptr<RdKafka::KafkaConsumer>(RdKafka::KafkaConsumer::create(conf.get(), err));
+  consumer->subscribe({"money-events"});
+  ctx.Drain([&] {
+    while (true) {
+      std::unique_ptr<RdKafka::Message> msg(consumer->consume(1000));
+      if (msg->err() == RdKafka::ERR__TIMED_OUT) continue;
+      if (msg->err() != RdKafka::ERR_NO_ERROR) return;
+      const auto event = harness::ParseJSON(std::string(static_cast<const char*>(msg->payload()), msg->len())).value_or(harness::Any());
+      const std::string kind = event["type"].String();
+      const std::string eventID = event["event_id"].String();
+      const std::string currency = event["currency"].String();
+      const int64_t amount = event["amount"].Int();
+      const int64_t occurredAt = event["occurred_at"].Int();
+      const auto accounts = mapping.count(kind) != 0 ? mapping.at(kind) : std::pair<std::string, std::string>{};
+      const std::vector<Entry> entries = {{accounts.first, currency, amount}, {accounts.second, currency, -amount}};
+      try {
+        write_transaction(entries, kind, eventID, occurredAt, std::nullopt);
+      } catch (const std::exception&) {
+        return;
+      }
+      if (consumer->commitSync(msg.get()) != RdKafka::ERR_NO_ERROR) return;
+    }
+  });
+  consumer->close();
+}
+
+}  // namespace
+
+void CheckUniqueEventId(harness::Ctx& ctx) {
+  eoWriter(ctx);
+  const std::string first = eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "");
+  ctx.Assert(!first.empty(), "the first write must return the new transaction id, got %q", first);
+  ctx.Assert(std::regex_match(first, eoUUID), "the transaction id must be a UUID, got %q", first);
+  const std::string again = eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "");
+  ctx.Equal(again, "", "a second write of evt_01 must return an empty id (already recorded)");
+  auto transactions = eoRows(ctx, "transactions");
+  ctx.Equal(transactions.size(), 1, "two writes of one event must leave one transactions row");
+  ctx.Assert(transactions[0]["id"] == first && transactions[0]["event_id"] == "evt_01", "the row must be the first write's, got %v", transactions[0]);
+  const std::string api1 = eoWrite(ctx, eoEntries, "manual adjustment", "", 0, "");
+  const std::string api2 = eoWrite(ctx, eoEntries, "manual adjustment", "", 0, "");
+  ctx.Assert(!api1.empty() && !api2.empty() && api1 != api2, "API-originated transactions have no event id and never conflict: both must be written");
+  ctx.Equal(eoRows(ctx, "transactions").size(), 3, "transactions rows after evt_01 and two API writes");
+}
+
+void CheckNoDoubleEntries(harness::Ctx& ctx) {
+  eoWriter(ctx);
+  for (int i = 0; i < 3; i++) eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "");
+  auto entries = eoRows(ctx, "entries");
+  ctx.Equal(entries.size(), 2, "three deliveries of one event must leave exactly two entries: the duplicate must return before the entries loop");
+  // End to end: the real step 3 consumer meets evt_02 twice (a producer retry: a second record with a new offset).
+  for (const std::string eventID : {"evt_02", "evt_03", "evt_02"}) {
+    const std::string event = nlohmann::json{{"event_id", eventID}, {"type", "payout.sent"}, {"amount", 120000}, {"currency", "USD"}, {"occurred_at", eoT0 + 10}}.dump();
+    ctx.Kafka.Seed("money-events", eventID, event);
+  }
+  eoIngest(ctx);
+  auto transactions = eoRows(ctx, "transactions");
+  entries = eoRows(ctx, "entries");
+  std::vector<std::string> eventIDs;
+  for (auto& t : transactions) eventIDs.push_back(t["event_id"].String());
+  std::sort(eventIDs.begin(), eventIDs.end());
+  ctx.Equal(eventIDs, {"evt_01", "evt_02", "evt_03"}, "expected evt_01, evt_02, evt_03 once each");
+  ctx.Equal(entries.size(), 6, "three events must leave six entries however often they are delivered");
+  int64_t total = 0;
+  for (auto& e : entries) total += e["amount"].Int();
+  ctx.Equal(total, 0, "the journal must balance: the entries' sum");
+  ctx.Equal(ctx.Kafka.Lag("ledger", "money-events"), 0, "the redelivered record must still be committed: it was handled (skipped)");
+}
+
+void CheckEventTime(harness::Ctx& ctx) {
+  eoWriter(ctx);
+  const int64_t yesterday = ctx.Clock.Now() - 86400000;
+  const std::string late = eoWrite(ctx, eoEntries, "payment.captured", "evt_late", yesterday, "");
+  const std::string nowID = eoWrite(ctx, eoEntries, "manual adjustment", "", 0, "");
+  std::map<std::string, harness::Row> transactions;
+  for (auto& t : eoRows(ctx, "transactions")) transactions[t["id"].String()] = t;
+  ctx.Equal(transactions[late]["posted_at"], yesterday, "a late event's transaction must carry its own occurred_at");
+  auto entries = eoRows(ctx, "entries");
+  std::vector<harness::Any> lateAts;
+  for (auto& e : entries) {
+    if (e["transaction_id"] == late) lateAts.push_back(e["posted_at"]);
+  }
+  bool lateOK = lateAts.size() == 2;
+  for (const auto& at : lateAts) lateOK = lateOK && at == yesterday;
+  ctx.Assert(lateOK, "the late event's entries must carry its occurred_at too, got %v", lateAts);
+  const int64_t now = ctx.Clock.Now();
+  const int64_t at = transactions[nowID]["posted_at"].Int();
+  ctx.Assert(at - now < 5000 && now - at < 5000, "a write without postedAt is the API path: posted now (%d), got %d", now, at);
+  bool same = true;
+  for (auto& e : entries) {
+    if (e["transaction_id"] == nowID) same = same && e["posted_at"] == at;
+  }
+  ctx.Assert(same, "the entries must carry the same posted_at as their transaction");
+}
+
+void CheckAtomic(harness::Ctx& ctx) {
+  eoWriter(ctx);
+  const std::string first = eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "");
+  ctx.Equal(ctx.DB.Events(), {"BEGIN", "COMMIT"}, "the transaction row and its entries must be written in one database transaction; the database saw");
+  ctx.Equal(eoBalance(ctx, "cash:acquirer", "EUR"), 4999, "the balance service's cash:acquirer EUR");  // now cached by the balance service
+  ctx.Assert(ctx.Redis.Exists("bal:cash:acquirer:EUR") == 1, "the balance service must have cached cash:acquirer EUR");
+  // The second entry violates entries.amount <> 0: the transaction row must roll back with it.
+  const std::vector<Entry> broken = {{"cash:acquirer", "EUR", 4999}, {"clearing:payments", "EUR", 0}};
+  bool failed = false;
+  try {
+    write_transaction(broken, "payment.captured", std::string("evt_02"), eoT0 + 1, std::nullopt);
+  } catch (const std::exception&) {
+    failed = true;
+  }
+  ctx.Assert(failed, "a failed entry insert must propagate (the transaction rolls back), not be swallowed");
+  const auto events = ctx.DB.Events();
+  ctx.Equal(events.back(), "ROLLBACK", "the failed write must roll back (the database saw %q)", events);
+  std::vector<harness::Any> eventIDs;
+  for (auto& t : eoRows(ctx, "transactions")) eventIDs.push_back(t["event_id"]);
+  ctx.Equal(eventIDs, {"evt_01"}, "evt_02's entry failed but its transactions row was committed: the two inserts are not in one transaction");
+  ctx.Equal(eoRows(ctx, "entries").size(), 2, "no entry of the failed transaction may survive");
+  ctx.Equal(eoOpen(ctx), std::map<std::string, double>{{first, static_cast<double>(eoT0)}}, "only evt_01 is in the journal, so only it may be open in clearing — a rolled-back transaction must not be tracked; clearing:open");
+  ctx.Assert(ctx.Redis.Exists("bal:cash:acquirer:EUR") == 1, "the rolled-back write changed no balance, yet the cached cash:acquirer EUR balance was dropped: the hooks must run only after a commit");
+}
+
+void CheckAfterCommitHooks(harness::Ctx& ctx) {
+  eoWriter(ctx);
+  eoWrite(ctx, eoEntries, "payment.captured", "evt_00", eoT0 - 1000, "");
+  ctx.Equal(eoBalance(ctx, "cash:acquirer", "EUR"), 4999, "the balance service's cash:acquirer EUR");
+  ctx.Equal(eoBalance(ctx, "clearing:payments", "EUR"), -4999, "the balance service's clearing:payments EUR");
+  const size_t before = ctx.DB.Events().size();
+  // Snapshots of what the database had been through at the moment each Redis side effect happened.
+  std::vector<std::string> tracked, dropped;
+  bool trackedSeen = false, droppedSeen = false;
+  ctx.Redis.After("clearing:open", [&] {
+    const auto events = ctx.DB.Events();
+    tracked.assign(events.begin() + static_cast<long>(before), events.end());
+    trackedSeen = true;
+  });
+  ctx.Redis.After("bal:clearing:payments:EUR", [&] {
+    const auto events = ctx.DB.Events();
+    dropped.assign(events.begin() + static_cast<long>(before), events.end());
+    droppedSeen = true;
+  });
+  const std::string tx = eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "");
+  ctx.Assert(trackedSeen, "the written transaction touches clearing:payments but clearing:open was never updated: call track after the commit");
+  ctx.Equal(tracked, {"BEGIN", "COMMIT"}, "track must run after the commit; clearing:open was updated when the database had seen");
+  ctx.Assert(droppedSeen && ctx.Redis.Exists("bal:clearing:payments:EUR") == 0, "the cached clearing:payments EUR balance survived the write: invalidate(ctx, account, currency) for every entry");
+  ctx.Equal(dropped, {"BEGIN", "COMMIT"}, "invalidate must run after the commit; the cached balance was dropped when the database had seen");
+  ctx.Assert(ctx.Redis.Exists("bal:cash:acquirer:EUR") == 0, "the cached cash:acquirer EUR balance survived the write: invalidate every entry's account");
+  ctx.Equal(eoBalance(ctx, "cash:acquirer", "EUR"), 9998, "right after the write the balance service must answer the new cash:acquirer balance");
+  auto opened = eoOpen(ctx);
+  ctx.Assert(opened.count(tx) == 1 && opened[tx] == eoT0, "the transaction must be open in clearing:open at its posted_at %d, clearing:open holds %v", eoT0, opened);
+  const std::string payout = eoWrite(ctx, eoPayout, "payout.sent", "evt_02", eoT0 + 5000, tx);
+  opened = eoOpen(ctx);
+  ctx.Assert(opened.count(tx) == 0 && opened.count(payout) == 0, "the payout settles %s: track must get settles, close that item and open none, clearing:open holds %v", tx, opened);
+  // A redelivery of evt_01 is skipped: nothing changed, so nothing may be tracked or invalidated.
+  ctx.Equal(eoBalance(ctx, "cash:acquirer", "EUR"), 9998, "the balance service's cash:acquirer EUR");
+  const auto openBefore = eoOpen(ctx);
+  const std::string again = eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "");
+  ctx.Equal(again, "", "the duplicate must return an empty id");
+  ctx.Equal(eoOpen(ctx), openBefore, "a skipped duplicate must not be tracked: clearing:open");
+  ctx.Assert(ctx.Redis.Exists("bal:cash:acquirer:EUR") == 1, "a skipped duplicate changed no balance, yet the cached cash:acquirer EUR balance was dropped");
+}
+`,
   },
   debrief: `The unique index on \`event_id\` is the only exactly-once mechanism that survives everything: the consumer may crash after writing and before committing, two consumers may briefly own the same partition during a rebalance, a producer may publish twice — and the journal still holds one row per event, because the database refuses the second. Reading the affected row count turns that refusal into a decision instead of an error. The hooks run after the commit because Redis is not part of the transaction: a tracked clearing item for a rolled-back transaction would be a phantom the sweeper could never settle. Stripe's post describes Ledger as immutable — nothing is updated or deleted, corrections are new transactions — and the shape here is the same: the only write is an insert, and the only conflict resolution is "already there".`,
 };

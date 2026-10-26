@@ -1008,6 +1008,188 @@ func CheckOrderKept(ctx *harness.Ctx) {
 	ctx.Assert(len(hydrateIDs(ctx)) == 0 && len(peer.calls) == 2, "an empty id list must not call the post service")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+#include <nlohmann/json.hpp>
+
+#include <exception>
+#include <functional>
+#include <set>
+#include <string>
+#include <tuple>
+#include <vector>
+
+namespace {
+
+// A post as the checks compare it: id, author, text, media ids, created_at.
+using postView = std::tuple<std::string, std::string, std::string, std::vector<std::string>, int64_t>;
+
+postView samplePost(const std::string& id) {
+  return {id, "ann", "post " + id, {"m-" + id}, 1700000000000 + static_cast<int64_t>(id[0])};
+}
+
+nlohmann::json sampleJSON(const std::string& id) {
+  const auto [pid, author, text, media, createdAt] = samplePost(id);
+  return {{"id", pid}, {"author", author}, {"text", text}, {"media_ids", media}, {"created_at", createdAt}};
+}
+
+std::vector<postView> views(const std::vector<feed::Post>& posts) {
+  std::vector<postView> out;
+  for (const auto& p : posts)
+    out.emplace_back(p.id(), p.author(), p.text(), std::vector<std::string>(p.media_ids().begin(), p.media_ids().end()), p.created_at());
+  return out;
+}
+
+std::vector<postView> samples(const std::vector<std::string>& ids) {
+  std::vector<postView> out;
+  for (const auto& id : ids) out.push_back(samplePost(id));
+  return out;
+}
+
+// PostPeer is the post service: knows its posts, records the ids of every request; onCall runs as a request arrives.
+class PostPeer final : public feed::PostService::Service {
+ public:
+  std::set<std::string> known;
+  std::vector<std::vector<std::string>> calls;
+  std::function<void()> onCall;
+
+  grpc::Status GetPosts(grpc::ServerContext*, const feed::GetPostsRequest* req, feed::GetPostsReply* reply) override {
+    const std::vector<std::string> ids(req->ids().begin(), req->ids().end());
+    calls.push_back(ids);
+    if (onCall) onCall();
+    for (const auto& id : ids) {
+      if (!known.count(id)) continue;
+      const auto [pid, author, text, media, createdAt] = samplePost(id);
+      feed::Post* post = reply->add_posts();
+      post->set_id(pid);
+      post->set_author(author);
+      post->set_text(text);
+      for (const auto& m : media) post->add_media_ids(m);
+      post->set_created_at(createdAt);
+    }
+    return grpc::Status::OK;
+  }
+};
+
+PostPeer* servePosts(harness::Ctx& ctx, const std::vector<std::string>& served) {
+  auto* peer = new PostPeer();
+  peer->known.insert(served.begin(), served.end());
+  ctx.GRPC.Server("")->RegisterService(peer);
+  return peer;
+}
+
+void cacheIDs(harness::Ctx& ctx, const std::vector<std::string>& ids) {
+  for (const auto& id : ids) ctx.Redis.Set("post:" + id, sampleJSON(id).dump());
+}
+
+// hydrateIDs is the learner's hydrate; what it throws fails the check (Go's ctx.NoError on the error).
+std::vector<postView> hydrateIDs(harness::Ctx& ctx, const std::vector<std::string>& ids) {
+  try {
+    return views(hydrate(ids));
+  } catch (const std::exception& e) {
+    ctx.Fatalf("hydrate(%q) threw: %s", ids, e.what());
+  }
+}
+
+}  // namespace
+
+void CheckMgetFirst(harness::Ctx& ctx) {
+  std::vector<std::vector<std::string>> tripsAtRPC;
+  bool rpcSeen = false;
+  auto* peer = servePosts(ctx, {"a", "b"});
+  peer->onCall = [&] {
+    if (!rpcSeen) {
+      rpcSeen = true;
+      tripsAtRPC = ctx.Redis.RoundTrips();
+    }
+  };
+  cacheIDs(ctx, {"a"});
+  auto posts = hydrateIDs(ctx, {"a", "b"});
+  ctx.Equal(posts, samples({"a", "b"}), "hydrate must return the cached post a and the fetched post b");
+  ctx.Equal(peer->calls, std::vector<std::vector<std::string>>{{"b"}}, "the cached post a must not be requested from the post service: GetPosts requests");
+  bool mget = false;
+  for (const auto& trip : tripsAtRPC)
+    for (const auto& command : trip) mget = mget || command == "MGET";
+  ctx.Assert(rpcSeen && mget, "the cache must be read with one mget before GetPosts is called");
+  int gets = 0;
+  for (const auto& trip : ctx.Redis.RoundTrips()) {
+    for (const auto& command : trip) {
+      if (command == "GET") {
+        gets++;
+        break;
+      }
+    }
+  }
+  ctx.Assert(gets == 0, "read the cache with one mget, not %d GETs", gets);
+  posts = hydrateIDs(ctx, {"a"});
+  ctx.Assert(posts == samples({"a"}) && peer->calls.size() == 1, "when every id is cached GetPosts must not be called at all");
+}
+
+void CheckSingleRpc(harness::Ctx& ctx) {
+  servePosts(ctx, {"b", "c", "d"});
+  const auto posts = hydrateIDs(ctx, {"b", "c", "d"});
+  ctx.Equal(posts, samples({"b", "c", "d"}), "unexpected posts");
+  const auto calls = ctx.GRPC.CallsTo("GetPosts", "");
+  ctx.Equal(calls.size(), 1, "3 cache misses must be fetched with one GetPosts call");
+  const auto req = calls[0].Request<feed::GetPostsRequest>();
+  ctx.Equal(std::vector<std::string>(req.ids().begin(), req.ids().end()), {"b", "c", "d"}, "the request must carry every missed id");
+}
+
+void CheckDeadline(harness::Ctx& ctx) {
+  servePosts(ctx, {"b", "c"});
+  ctx.Equal(hydrateIDs(ctx, {"b"}), samples({"b"}), "hydrate([b])");
+  const auto calls = ctx.GRPC.CallsTo("GetPosts", "");
+  const auto& call = calls.back();
+  ctx.Assert(call.HasDeadline(), "the RPC carries no deadline");
+  ctx.Assert(0.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 1.0, "the deadline must be about 800 ms, got %vs", call.TimeoutSeconds());
+  ctx.GRPC.SetLatency("GetPosts", 3.0, "");
+  bool threw = false;
+  try {
+    hydrate({"c"});
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  ctx.Assert(threw, "a post service slower than the deadline must surface DEADLINE_EXCEEDED");
+  // The C++ hydrate reports a failed RPC by throwing; Go reads the code off the returned error. Here
+  // the code is the one the last GetPosts call ended with.
+  ctx.Equal(ctx.GRPC.CallsTo("GetPosts", "").back().Code, grpc::StatusCode::DEADLINE_EXCEEDED, "the status a slow post service surfaces");
+}
+
+void CheckWriteBack(harness::Ctx& ctx) {
+  auto* peer = servePosts(ctx, {"b", "c"});
+  hydrateIDs(ctx, {"b", "c"});
+  for (const std::string id : {"b", "c"}) {
+    const auto raw = ctx.Redis.Get("post:" + id);
+    ctx.Assert(raw.has_value(), "post:%s must be cached after it was fetched", id);
+    const auto cached = nlohmann::json::parse(*raw, nullptr, false);
+    ctx.Assert(!cached.is_discarded(), "post:%s must hold the post as JSON, got %q", id, *raw);
+    ctx.Equal(harness::ParseJSON(*raw), harness::ParseJSON(sampleJSON(id).dump()), "post:%s must hold the post as JSON", id);
+    const auto ttl = ctx.Redis.TTL("post:" + id);
+    ctx.Assert(3000 < ttl && ttl <= 3600, "post:%s must expire after an hour (EX 3600), its TTL is %d", id, ttl);
+  }
+  int sets = 0;
+  std::vector<int> sizes;
+  for (const auto& trip : ctx.Redis.RoundTrips()) {
+    if (trip.size() == 1 && (trip[0] == "SET" || trip[0] == "SETEX")) sets++;
+    else if (trip.size() > 1) sizes.push_back(static_cast<int>(trip.size()));
+  }
+  ctx.Assert(sets == 0, "%d SET(s) were sent one by one: write the fetched posts back through one pipeline", sets);
+  ctx.Equal(sizes, {2}, "expected one pipeline carrying the 2 SETs: pipeline command counts");
+  hydrateIDs(ctx, {"b", "c"});
+  ctx.Equal(peer->calls.size(), 1, "once written back, the next hydration of the same ids must not call GetPosts");
+  ctx.Clock.Advance(3601);
+  ctx.Assert(!ctx.Redis.Get("post:b").has_value(), "the cache entry must be gone an hour later");
+}
+
+void CheckOrderKept(harness::Ctx& ctx) {
+  auto* peer = servePosts(ctx, {"b"});
+  cacheIDs(ctx, {"a", "c"});
+  std::vector<std::string> ids;
+  for (const auto& p : hydrateIDs(ctx, {"d", "c", "b", "a"})) ids.push_back(std::get<0>(p));
+  ctx.Equal(ids, {"c", "b", "a"}, "posts must come back in the input order with the deleted post d skipped");
+  ctx.Assert(hydrateIDs(ctx, {"d"}).empty(), "a page of only deleted posts is an empty list, not an error");
+  ctx.Assert(hydrateIDs(ctx, {}).empty() && peer->calls.size() == 2, "an empty id list must not call the post service");
+}
+`,
   },
   debrief: `Hydration is where a feed's latency budget is really spent, and two decisions keep it flat: the cache is read with one \`MGET\` instead of N \`GET\`s, and the misses are fetched with one RPC instead of N. The write-back makes the cache fill itself from the long tail of pages, and the TTL bounds memory for posts nobody will ask for again. Returning in input order with missing ids skipped is what lets the timeline keep ids of deleted posts for a while without the client ever seeing a hole. Real hydrators add a per-request dedupe (the same id on two pages), negative caching for ids that keep missing, and a hedge: if the RPC exceeds a soft deadline, serve the page with the cached posts only.`,
 };

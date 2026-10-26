@@ -682,6 +682,97 @@ export class RedisServer {
         if (z.size === 0) this.data.delete(a[0]);
         return victims.length;
       }
+      case 'zpopmin':
+      case 'zpopmax': {
+        // Lowest (highest) scores first, flat member/score pairs; an empty array when there is none.
+        const count = a[1] === undefined ? 1 : int(a[1]);
+        const z = this.zset(a[0], false);
+        if (z === null || count <= 0) return [];
+        const popped = this.sortedMembers(a[0], name === 'zpopmax').slice(0, count);
+        for (const [m] of popped) z.delete(m);
+        if (z.size === 0) this.data.delete(a[0]);
+        return popped.flatMap(([m, s]) => [m, String(s)]);
+      }
+      // ---- keyspace: SCAN, RENAME, EXPIREAT ------------------------------------------------------
+      case 'scan': {
+        // The cursor is a position in the sorted live keys; MATCH filters each batch, as in Redis.
+        const all = this.keys('*');
+        const start = int(a[0]);
+        let count = 10;
+        let pattern = '*';
+        let type: string | null = null;
+        for (let i = 1; i + 1 < a.length; i += 2) {
+          const o = a[i].toUpperCase();
+          if (o === 'COUNT') count = int(a[i + 1]);
+          else if (o === 'MATCH') pattern = a[i + 1];
+          else if (o === 'TYPE') type = a[i + 1].toLowerCase();
+          else throw new ReplyError('ERR syntax error');
+        }
+        if (count < 1) throw new ReplyError('ERR syntax error');
+        const batch = all.slice(start, start + count);
+        const next = start + count >= all.length ? 0 : start + count;
+        const re = globToRegExp(pattern);
+        return [String(next), batch.filter(k => re.test(k) && (type === null || this.data.get(k)?.kind === type))];
+      }
+      case 'rename':
+      case 'renamenx': {
+        const v = this.data.get(a[0]);
+        if (v === undefined) throw new ReplyError('ERR no such key');
+        if (name === 'renamenx' && a[0] !== a[1] && this.data.has(a[1])) return 0;
+        const at = this.expires.get(a[0]);
+        this.data.delete(a[0]);
+        this.expires.delete(a[0]);
+        this.data.set(a[1], v);
+        if (at === undefined) this.expires.delete(a[1]);
+        else this.expires.set(a[1], at);
+        return name === 'renamenx' ? 1 : 'OK';
+      }
+      case 'expireat':
+      case 'pexpireat': {
+        // A deadline on the virtual clock (seconds or milliseconds since the epoch); a past one deletes.
+        if (!this.data.has(a[0])) return 0;
+        const at = int(a[1]) * (name === 'expireat' ? 1000 : 1);
+        if (at <= CLOCK.now()) {
+          this.data.delete(a[0]);
+          this.expires.delete(a[0]);
+        } else this.expires.set(a[0], at);
+        return 1;
+      }
+      // ---- SPOP; HyperLogLog ---------------------------------------------------------------------
+      case 'spop': {
+        // Members leave in sorted order (Redis picks at random; a fixed order keeps checks repeatable).
+        const s = this.set(a[0], false);
+        const many = a[1] !== undefined;
+        const count = many ? int(a[1]) : 1;
+        if (s === null) return many ? [] : null;
+        const popped = [...s].sort().slice(0, Math.max(0, count));
+        for (const m of popped) s.delete(m);
+        if (s.size === 0) this.data.delete(a[0]);
+        return many ? popped : popped[0] ?? null;
+      }
+      case 'pfadd':
+      case 'pfcount': {
+        // A HyperLogLog is a string (as in Redis) holding its distinct elements here: counts are exact.
+        const read = (key: string): Set<string> | null => {
+          const raw = this.string(key);
+          if (raw === null) return null;
+          if (!raw.startsWith('HYLL')) throw new ReplyError('WRONGTYPE Key is not a valid HyperLogLog string value.');
+          return new Set(JSON.parse(raw.slice(4)) as string[]);
+        };
+        if (name === 'pfcount') {
+          const union = new Set<string>();
+          for (const k of a) for (const m of read(k) ?? []) union.add(m);
+          return union.size;
+        }
+        const existing = read(a[0]);
+        const hll = existing ?? new Set<string>();
+        const before = hll.size;
+        for (const m of a.slice(1)) hll.add(m);
+        const at = this.expires.get(a[0]);
+        this.data.set(a[0], {kind: 'string', value: 'HYLL' + JSON.stringify([...hll].sort())});
+        if (at !== undefined) this.expires.set(a[0], at);
+        return existing === null || hll.size !== before ? 1 : 0;
+      }
       // ---- scripting -----------------------------------------------------------------------------
       case 'eval':
       case 'evalsha': {

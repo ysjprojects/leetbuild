@@ -835,6 +835,117 @@ func CheckFallback502(ctx *harness.Ctx) {
 	ctx.Equal(ok.Status, 200, "after the failures a healthy catalog")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace {
+
+// The internal catalog: knows every id but ghost (NOT_FOUND) and bad (INVALID_ARGUMENT).
+class CatalogPeer final : public gateway::Catalog::Service {
+ public:
+  grpc::Status GetItem(grpc::ServerContext*, const gateway::GetItemRequest* req, gateway::Item* item) override {
+    if (req->id() == "ghost") return grpc::Status(grpc::StatusCode::NOT_FOUND, "no item ghost");
+    if (req->id() == "bad") return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "ids are numeric");
+    item->set_id(req->id());
+    item->set_name("Kettle");
+    item->set_price_cents(3499);
+    return grpc::Status::OK;
+  }
+};
+
+struct CatalogProxy {
+  CatalogPeer peer;
+  httplib::Server svr;
+};
+
+harness::HTTP catalogProxy(harness::Ctx& ctx) {
+  static CatalogProxy* proxy = nullptr;
+  delete proxy;
+  proxy = new CatalogProxy;
+  ctx.GRPC.Server("")->RegisterService(&proxy->peer);
+  register_routes(proxy->svr);
+  return ctx.HTTP(proxy->svr);
+}
+
+}  // namespace
+
+void CheckRouteCall(harness::Ctx& ctx) {
+  auto c = catalogProxy(ctx);
+  auto r = c.Get("/items/42");
+  ctx.Equal(r.Status, 200, "GET /items/42 (%s)", r.Text());
+  const auto calls = ctx.GRPC.CallsTo("GetItem");
+  ctx.Equal(calls.size(), 1, "GET /items/42 must make exactly one GetItem call; the calls made");
+  ctx.Equal(calls[0].Request<gateway::GetItemRequest>().id(), "42", "GetItem must be called with the path id");
+  const std::string ctype = r.HeaderValue("Content-Type");
+  ctx.Assert(ctype.rfind("application/json", 0) == 0, "the answer must be JSON, got Content-Type %q", ctype);
+  ctx.Equal(r.JSON(), harness::ParseJSON(R"({"id":"42","name":"Kettle","price_cents":3499})"),
+            "GET /items/42 must answer the item as id, name, price_cents (price_cents is a number)");
+}
+
+void CheckDeadline(harness::Ctx& ctx) {
+  auto c = catalogProxy(ctx);
+  auto r = c.Get("/items/42");
+  ctx.Equal(r.Status, 200, "GET /items/42 (%s)", r.Text());
+  const auto calls = ctx.GRPC.CallsTo("GetItem");
+  const auto& call = calls.back();
+  ctx.Assert(call.HasDeadline(), "the GetItem call carries no deadline: a stalled catalog would hold the gateway open forever");
+  ctx.Assert(1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.5, "the deadline must be about 2 s, got %vs",
+             call.TimeoutSeconds());
+  ctx.GRPC.SetLatency("GetItem", 5.0);
+  auto slow = c.Get("/items/42");
+  ctx.Equal(slow.Status, 504, "a catalog slower than the deadline (DEADLINE_EXCEEDED)");
+  ctx.Equal(ctx.GRPC.CallsTo("GetItem").size(), 2,
+            "a timed-out call must not be retried (the client decides); GetItem calls");
+}
+
+void CheckRequestId(harness::Ctx& ctx) {
+  auto c = catalogProxy(ctx);
+  auto r = c.Get("/items/42", "X-Request-Id", "r-9");
+  ctx.Equal(r.Status, 200, "GET /items/42 (%s)", r.Text());
+  const auto md = ctx.GRPC.CallsTo("GetItem").back().Metadata;
+  std::vector<std::string> ids;
+  for (auto [it, end] = md.equal_range("x-request-id"); it != end; ++it) ids.push_back(it->second);
+  ctx.Assert(!ids.empty(),
+             "the GetItem call carried metadata %v, expected x-request-id: r-9 (metadata keys are lowercase on the wire)", md);
+  ctx.Equal(ids, {"r-9"}, "x-request-id metadata must be the incoming X-Request-Id");
+  auto plain = c.Get("/items/42");
+  ctx.Equal(plain.Status, 200, "a request without X-Request-Id");
+}
+
+void CheckStatusMap(harness::Ctx& ctx) {
+  auto c = catalogProxy(ctx);
+  auto r = c.Get("/items/ghost");
+  ctx.Equal(r.Status, 404, "NOT_FOUND from the catalog");
+  r = c.Get("/items/bad");
+  ctx.Equal(r.Status, 400, "INVALID_ARGUMENT from the catalog");
+  ctx.GRPC.Fail("GetItem", grpc::StatusCode::UNAVAILABLE, "catalog restarting", 1);
+  r = c.Get("/items/42");
+  ctx.Equal(r.Status, 503, "UNAVAILABLE from the catalog");
+  ctx.GRPC.SetLatency("GetItem", 5.0);
+  r = c.Get("/items/42");
+  ctx.Equal(r.Status, 504, "DEADLINE_EXCEEDED");
+  ctx.Equal(ctx.GRPC.CallsTo("GetItem").size(), 4,
+            "the four failing requests' GetItem calls (the gateway must not retry on the client's behalf)");
+}
+
+void CheckFallback502(harness::Ctx& ctx) {
+  auto c = catalogProxy(ctx);
+  const std::vector<std::pair<grpc::StatusCode, std::string>> codes = {
+      {grpc::StatusCode::INTERNAL, "Internal"},
+      {grpc::StatusCode::PERMISSION_DENIED, "PermissionDenied"},
+      {grpc::StatusCode::UNKNOWN, "Unknown"}};
+  for (const auto& [code, name] : codes) {
+    ctx.GRPC.Fail("GetItem", code, "upstream broke", 1);
+    auto r = c.Get("/items/42");
+    ctx.Equal(r.Status, 502, "%s from the catalog (502 Bad Gateway)", name);
+  }
+  auto ok = c.Get("/items/42");
+  ctx.Equal(ok.Status, 200, "after the failures a healthy catalog");
+}
+`,
   },
   debrief: `The proxy is a translation layer and nothing more: it turns a path into a request message, a header into metadata, and a status code into another status code. The deadline is what makes it safe to sit in front of a service you do not control, and the 502 default is what keeps upstream internals from leaking to clients. Real gateways generate this code from the proto (grpc-gateway, Envoy's gRPC-JSON transcoder), propagate the *caller's* remaining deadline instead of a fixed 2 s, and copy a whole allow-list of headers (trace context, tenant) into metadata.`,
 };

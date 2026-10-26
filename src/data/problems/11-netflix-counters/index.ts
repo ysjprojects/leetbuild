@@ -103,6 +103,6 @@ and the one API over them the same.`,
     ],
   },
   steps: [counterApiStep, bestEffortStep, countEventsStep, rollupStep, countServiceStep],
-  support: {python: protoModules, typescript: protoFiles, go: protoFiles},
+  support: {python: protoModules, typescript: protoFiles, go: protoFiles, cpp: protoFiles},
   learn,
 };

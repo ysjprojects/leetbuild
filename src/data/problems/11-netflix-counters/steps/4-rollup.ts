@@ -1305,6 +1305,215 @@ func CheckGetClear(ctx *harness.Ctx) {
 	ctx.Equal(count, 0, "a cleared counter reads as 0")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <set>
+
+#include <nlohmann/json.hpp>
+
+namespace {
+
+const std::string ruTopic = "counter-events";
+const std::string ruKey = "rollup:plays:stranger-things";
+constexpr double ruTs = 1760616030;  // inside the minute bucket starting at 1760616000
+constexpr double ruNextMinuteTs = ruTs + 60;
+
+// ruEvent is an event other producers put on the topic for plays/stranger-things.
+struct ruEvent {
+  std::string token;
+  long long delta;
+  double ts;
+};
+
+void ruSeed(harness::Ctx& ctx, const std::vector<ruEvent>& events) {
+  for (const auto& e : events) {
+    const nlohmann::json value = {{"ns", "plays"}, {"name", "stranger-things"}, {"delta", e.delta}, {"token", e.token}, {"ts", e.ts}};
+    ctx.Kafka.Seed(ruTopic, "plays:stranger-things", value.dump());
+  }
+}
+
+long long ruTotal(harness::Ctx& ctx, const std::string& key) {
+  long long sum = 0;
+  for (const auto& [field, v] : ctx.Redis.HGetAll(key)) sum += std::atoll(v.c_str());
+  return sum;
+}
+
+// ruCommit is a commit of group rollup: the committed offsets (by "topic|partition") and the total the hash held at that instant.
+struct ruCommit {
+  std::map<std::string, int64_t> offsets;
+  long long total;
+};
+
+std::shared_ptr<std::vector<ruCommit>> ruFoldedAtCommits(harness::Ctx& ctx) {
+  auto seen = std::make_shared<std::vector<ruCommit>>();
+  ctx.Kafka.OnCommit([&ctx, seen](const std::string& group, const harness::KafkaOffsets& offsets) {
+    if (group != "rollup") return;
+    std::map<std::string, int64_t> byKey;
+    for (const auto& [tp, o] : offsets) byKey[tp.String()] = o;
+    seen->push_back({byKey, ruTotal(ctx, ruKey)});
+  });
+  return seen;
+}
+
+// ruRun drains the learner's worker and returns what run threw (Go's run returns an error).
+std::optional<std::string> ruRun(harness::Ctx& ctx) {
+  // The worker polls with consume(1000): a few idle seconds, then it counts as waiting (Go's reader
+  // blocks without a clock).
+  ctx.Clock.SetSleepLimit(ctx.Clock.Sleeps() + 5);
+  std::optional<std::string> err;
+  ctx.Drain([&err] {
+    try {
+      run();
+    } catch (const std::exception& e) {
+      err = e.what();
+    }
+  });
+  return err;
+}
+
+}  // namespace
+
+void CheckConsumerGroup(harness::Ctx& ctx) {
+  ruSeed(ctx, {{"t-1", 1, ruTs}, {"t-2", 2, ruTs}, {"t-3", 4, ruTs}});  // produced before the worker started
+  std::vector<long long> deltas;
+  for (const auto& v : ctx.Kafka.Values(ruTopic)) deltas.push_back(nlohmann::json::parse(v).value("delta", 0LL));
+  const int partition = ctx.Kafka.Records(ruTopic)[0].Partition;
+  auto atCommit = ruFoldedAtCommits(ctx);
+  ruRun(ctx);
+  std::set<std::string> groups;
+  for (const auto& c : ctx.Kafka.Consumers()) {
+    if (c.Group != "rollup") groups.insert(c.Group);
+  }
+  const std::vector<std::string> others(groups.begin(), groups.end());
+  const bool committed = ctx.Kafka.Committed("rollup", ruTopic, partition).has_value();
+  ctx.Assert(committed, "consumer group rollup never committed an offset on %s (other groups: %q): the worker must join group rollup and subscribe to %s", ruTopic, others, ruTopic);
+  const int64_t lag = ctx.Kafka.Lag("rollup", ruTopic);
+  ctx.Assert(lag == 0, "group rollup left %d event(s) of %s uncommitted: events produced before the worker started must be read from the earliest offset, folded and committed", lag, ruTopic);
+  ctx.Equal(ruTotal(ctx, ruKey), 7, "the three events (+1, +2, +4) must fold to 7: the total of %v", ctx.Redis.HGetAll(ruKey));
+  for (const auto& c : *atCommit) {
+    const auto it = c.offsets.find(ruTopic + "|" + std::to_string(partition));
+    if (it == c.offsets.end()) continue;
+    const int64_t upto = it->second;
+    long long expected = 0, last = 0;
+    for (size_t i = 0; i < deltas.size(); i++) {
+      if (static_cast<int64_t>(i) < upto) {
+        expected += deltas[i];
+        last = deltas[i];
+      }
+    }
+    ctx.Assert(c.total >= expected, "group rollup committed offset %d (events up to +%d) while the hash held %d, less than the %d those events add up to: an offset is committed only once its event has been folded, never ahead of the work", upto, last, c.total, expected);
+  }
+  // The worker stalls 6 s right after claiming an event (longer than an auto-commit interval), then its
+  // fold fails for real: rollup:plays:broken is not a hash, so HINCRBY fails and the worker dies.
+  ctx.Redis.Set("rollup:plays:broken", "not a hash");
+  const nlohmann::json broken = {{"ns", "plays"}, {"name", "broken"}, {"delta", 1}, {"token", "t-x"}, {"ts", ruTs}};
+  const auto failed = ctx.Kafka.Seed(ruTopic, "plays:broken", broken.dump());
+  bool fired = false;
+  ctx.Redis.After("seen:t-x", [&] {
+    fired = true;
+    ctx.Clock.Advance(6);
+  });
+  ruRun(ctx);  // the worker died on the failed fold, as it should: the event is not lost, it is redelivered
+  ctx.Assert(fired, "the worker never claimed seen:t-x before folding the event");
+  const int64_t offset = ctx.Kafka.Committed("rollup", ruTopic, failed.Partition).value_or(0);
+  ctx.Assert(offset <= failed.Offset, "the fold of t-x failed and the worker died, yet group rollup has committed past it (offset %d): the event was committed while it was still being processed, so it is never redelivered. Commit only after the fold (consume, fold, then commitSync)", offset);
+}
+
+void CheckDedupeFirst(harness::Ctx& ctx) {
+  ruSeed(ctx, {{"t-1", 1, ruTs}, {"t-1", 1, ruTs}, {"t-2", 5, ruTs}, {"t-1", 1, ruTs}});
+  ruRun(ctx);
+  ctx.Equal(ruTotal(ctx, ruKey), 6, "tokens t-1 (+1, redelivered twice) and t-2 (+5) must fold to 6: the total of %v", ctx.Redis.HGetAll(ruKey));
+  ctx.Equal(ctx.Kafka.Lag("rollup", ruTopic), 0, "a skipped duplicate must still be committed, or it is redelivered forever: the lag of group rollup");
+  long long ttl = ctx.Redis.TTL("seen:t-1");
+  ctx.Assert(86400 - 60 <= ttl && ttl <= 86400, "seen:t-1 expires in %d s, expected kSeenTtl (86400): the claim must outlive any client retry, and not live forever", ttl);
+  // A redelivery 1000 s later is dropped, and does not extend the claim.
+  ctx.Clock.Advance(1000);
+  ruSeed(ctx, {{"t-1", 1, ruTs}});
+  ruRun(ctx);
+  ctx.Equal(ruTotal(ctx, ruKey), 6, "a redelivery of t-1 1000 s later must be dropped: the total of %v", ctx.Redis.HGetAll(ruKey));
+  ttl = ctx.Redis.TTL("seen:t-1");
+  ctx.Assert(ttl <= 86400 - 1000 + 5, "a redelivery of t-1 re-armed its claim to %d s: the claim lives kSeenTtl from the first time the token was seen", ttl);
+  ctx.Clock.Advance(86400 - 1000);
+  ctx.Equal(ctx.Redis.Exists("seen:t-1"), 0, "seen:t-1 must be gone kSeenTtl after it was claimed: EXISTS");
+  // Another rollup replica takes over the partition while this one is mid-event (its session timed out):
+  // it processes the uncommitted t-9 (claim, then fold) at the first moment this worker touches seen:t-9.
+  ruSeed(ctx, {{"t-9", 10, ruTs}});
+  bool fired = false;
+  ctx.Redis.After("seen:t-9", [&] {
+    fired = true;
+    if (ctx.Redis.Set("seen:t-9", 1, "EX", 86400, "NX")) ctx.Redis.Do("HINCRBY", ruKey, std::to_string(window(ruTs)), 10);
+  });
+  ruRun(ctx);
+  ctx.Assert(fired, "the worker never touched seen:t-9: every event must be claimed under seen:{token} before it is folded");
+  const long long got = ruTotal(ctx, ruKey);
+  ctx.Assert(got == 16, "t-9 (+10) was redelivered to a second replica right after this worker first touched seen:t-9, and the hash now holds %d for it instead of 10: claim the token atomically (SET NX) before folding, so whoever loses the claim skips the event", got - 6);
+}
+
+void CheckHincrbyWindow(harness::Ctx& ctx) {
+  ruSeed(ctx, {{"t-1", 1, ruTs}, {"t-2", 2, ruTs}, {"t-3", 4, ruNextMinuteTs}, {"t-4", -1, ruNextMinuteTs}});
+  const nlohmann::json crown = {{"ns", "plays"}, {"name", "the-crown"}, {"delta", 7}, {"token", "t-5"}, {"ts", ruTs}};
+  ctx.Kafka.Seed(ruTopic, "plays:the-crown", crown.dump());
+  ruRun(ctx);
+  const std::string kind = ctx.Redis.Type(ruKey);
+  ctx.Assert(kind == "hash", "%s is %q, expected a hash (keys: %q)", ruKey, kind, ctx.Redis.Keys("*"));
+  const std::string first = std::to_string(window(ruTs));
+  const std::string second = std::to_string(window(ruNextMinuteTs));
+  ctx.Equal(ctx.Redis.HGetAll(ruKey), std::map<std::string, std::string>{{first, "3"}, {second, "3"}}, "expected one field per minute bucket");
+  ctx.Equal(ctx.Redis.HGetAll("rollup:plays:the-crown"), std::map<std::string, std::string>{{first, "7"}}, "each counter has its own hash: rollup:plays:the-crown");
+}
+
+void CheckCommitAfter(harness::Ctx& ctx) {
+  ruSeed(ctx, {{"t-1", 1, ruTs}, {"t-2", 2, ruTs}});
+  const auto records = ctx.Kafka.Records(ruTopic);
+  auto atCommit = ruFoldedAtCommits(ctx);
+  ruRun(ctx);
+  ctx.Assert(!atCommit->empty(), "no offset was ever committed by group rollup");
+  const std::vector<std::pair<long long, std::string>> wants = {{1, "t-1 (+1)"}, {3, "t-2 (+2)"}};
+  for (size_t i = 0; i < wants.size(); i++) {
+    const auto& [expected, label] = wants[i];
+    const auto& record = records[i];
+    std::vector<long long> covering;
+    for (const auto& c : *atCommit) {
+      const auto it = c.offsets.find(ruTopic + "|" + std::to_string(record.Partition));
+      if (it != c.offsets.end() && it->second > record.Offset) covering.push_back(c.total);
+    }
+    ctx.Assert(!covering.empty(), "the %s event was never committed", label);
+    ctx.Equal(covering[0], expected, "the commit must come after the fold: when %s was committed the hash held", label);
+  }
+  // Records the worker skips are committed too, even when nothing follows them to commit past them.
+  ctx.Kafka.Seed(ruTopic, "plays:stranger-things", "not json");
+  ctx.Kafka.Seed(ruTopic, "plays:stranger-things", R"({"name":"stranger-things","ns":"plays"})");
+  ruRun(ctx);
+  int64_t lag = ctx.Kafka.Lag("rollup", ruTopic);
+  ctx.Assert(lag == 0, "%d malformed record(s) left uncommitted: skip them (log) and commit, or they are redelivered forever", lag);
+  ruSeed(ctx, {{"t-1", 1, ruTs}});
+  ruRun(ctx);
+  lag = ctx.Kafka.Lag("rollup", ruTopic);
+  ctx.Assert(lag == 0, "the redelivered t-1 was skipped but left uncommitted (%d record(s) of lag): a duplicate is committed too, or it is redelivered forever", lag);
+  ctx.Equal(ruTotal(ctx, ruKey), 3, "malformed records must not be folded and the duplicate t-1 only once: the total of %v", ctx.Redis.HGetAll(ruKey));
+}
+
+void CheckGetClear(harness::Ctx& ctx) {
+  const auto count = [&ctx] {
+    try {
+      return get_count("plays", "stranger-things");
+    } catch (const std::exception& e) {
+      ctx.Fatalf("get_count threw: %s", e.what());
+    }
+  };
+  ctx.Equal(count(), 0, "a counter without events reads as 0");
+  ruSeed(ctx, {{"t-1", 3, ruTs}, {"t-2", 4, ruNextMinuteTs}, {"t-3", -1, ruNextMinuteTs + 60}});
+  ruRun(ctx);
+  ctx.Equal(count(), 6, "get_count must sum every minute bucket (3 + 4 - 1 = 6) of %v", ctx.Redis.HGetAll(ruKey));
+  try {
+    clear_count("plays", "stranger-things");
+  } catch (const std::exception& e) {
+    ctx.Fatalf("clear_count threw: %s", e.what());
+  }
+  ctx.Equal(ctx.Redis.Exists(ruKey), 0, "clear_count must DEL %s: EXISTS", ruKey);
+  ctx.Equal(count(), 0, "a cleared counter reads as 0");
+}
+`,
   },
   debrief: `The rollup is where an event log becomes a number, and the two decisions that matter are both about duplicates. The claim comes first because the fold is not idempotent: HINCRBY twice is twice the delta, so the only safe order is claim, fold, commit — at-least-once delivery turned effectively once by a key in Redis. And the hash is bucketed by minute rather than kept as one total because a closed minute is immutable: Netflix's rollup aggregates in time windows for exactly that reason, so it can batch the work of a hot counter, store closed windows durably and cache them, and recompute only the window that is still open. This course keeps every window in one hash; the real pipeline queues counters that changed, aggregates them in a dedicated rollup tier, and persists the result to a rollup store before anyone reads it.`,
 };

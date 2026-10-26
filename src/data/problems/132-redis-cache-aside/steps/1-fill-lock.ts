@@ -1269,6 +1269,233 @@ func CheckStaleLock(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "no lock may remain after the fill")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <atomic>
+#include <exception>
+#include <map>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+
+namespace {
+
+const json caProduct = {{"id", "42"}, {"name", "Espresso machine"}, {"price_cents", 24900}, {"tags", {"kitchen", "coffee"}}};
+
+// caJSON is a product as its canonical JSON text, so a product compares the same whether load
+// returned it or the cache decoded it; no product is nullopt.
+std::optional<std::string> caJSON(const std::optional<json>& product) {
+  if (!product) return std::nullopt;
+  return product->dump();
+}
+
+// caStored is the JSON value at key, as canonical JSON text.
+std::string caStored(harness::Ctx& ctx, const std::string& key) {
+  const auto raw = ctx.Redis.Get(key);
+  ctx.Assert(raw.has_value(), "%s must hold the product's JSON, it does not exist", key);
+  const json out = json::parse(*raw, nullptr, false);
+  ctx.Assert(!out.is_discarded(), "%s must hold the product as JSON, it holds %q", key, *raw);
+  return out.dump();
+}
+
+// caField is one numeric field of a product as canonical JSON text (nullopt when there is none).
+std::optional<double> caField(const std::optional<std::string>& product, const std::string& field) {
+  if (!product) return std::nullopt;
+  const json fields = json::parse(*product);
+  if (!fields.is_object() || !fields.contains(field) || !fields[field].is_number()) return std::nullopt;
+  return fields[field].get<double>();
+}
+
+// caSource is a slow source the harness can count: returns catalogue[id] (nullopt when absent);
+// asserts the fill lock is held while it runs.
+struct caSource {
+  harness::Ctx& ctx;
+  std::map<std::string, json> catalogue;
+  std::vector<std::string> calls;
+
+  Load load() {
+    return [this](const std::string& productID) -> std::optional<json> {
+      calls.push_back(productID);
+      const long long ttl = ctx.Redis.TTL("lock:product:" + productID);
+      ctx.Assert(0 < ttl && ttl <= 5, "load must run under lock:product:%s with SET NX EX 5; its TTL is %d (-2 = no lock, -1 = no expiry)", productID, ttl);
+      const auto it = catalogue.find(productID);
+      if (it == catalogue.end()) return std::nullopt;
+      return it->second;
+    };
+  }
+};
+
+// caCall is a get_product running on its own thread, as a second worker's request.
+struct caCall {
+  std::string productID;
+  std::atomic<bool> done{false};
+  std::optional<json> product;
+  std::exception_ptr failure;
+
+  // result lets the call finish and returns what it returned, as canonical JSON text.
+  std::optional<std::string> result(harness::Ctx& ctx) {
+    ctx.Settle();
+    if (!done) ctx.Fatalf("the concurrent getProduct(%q) never returned", productID);
+    if (failure) std::rethrow_exception(failure);
+    return caJSON(product);
+  }
+};
+
+std::shared_ptr<caCall> caGo(const std::string& productID, Load load) {
+  auto call = std::make_shared<caCall>();
+  call->productID = productID;
+  std::thread([call, load] {
+    try {
+      call->product = get_product(call->productID, load);
+    } catch (...) {
+      call->failure = std::current_exception();
+    }
+    call->done = true;
+  }).detach();
+  return call;
+}
+
+}  // namespace
+
+void CheckMissThenHit(harness::Ctx& ctx) {
+  caSource src{ctx, {{"42", caProduct}}};
+  const auto want = caJSON(caProduct);
+  ctx.Equal(caJSON(get_product("42", src.load())), want, "a miss must return what load returned");
+  ctx.Equal(src.calls, {"42"}, "a miss calls load once with the product id: the load calls");
+  ctx.Assert(ctx.Redis.Exists("product:42") == 1, "the product must be written to product:42");
+  ctx.Equal(caStored(ctx, "product:42"), want, "product:42 must hold exactly the JSON load returned");
+  const long long ttl = ctx.Redis.TTL("product:42");
+  ctx.Assert(3590 < ttl && ttl <= 3600, "product:42 must expire in 3600 s (ttl); its TTL is %d", ttl);
+  ctx.Equal(caJSON(get_product("42", src.load())), want, "a hit must return the cached product");
+  ctx.Equal(src.calls.size(), 1, "a hit must not call load: the number of load calls");
+  ctx.Equal(caJSON(get_product("42", src.load())), want, "the second hit");
+  ctx.Equal(src.calls.size(), 1, "the number of load calls after two hits");
+  ctx.Clock.Advance(3601);
+  ctx.Equal(ctx.Redis.Get("product:42"), nullptr, "after 3600 s the key must have expired");
+  ctx.Equal(caJSON(get_product("42", src.load())), want, "the call after the TTL");
+  ctx.Equal(src.calls, {"42", "42"}, "once the TTL has passed the next call must load again: the load calls");
+  ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "no lock may remain after a fill");
+}
+
+void CheckNegativeCache(harness::Ctx& ctx) {
+  caSource src{ctx, {}};
+  ctx.Equal(caJSON(get_product("7", src.load())), nullptr, "a product the source does not have is nil");
+  ctx.Equal(src.calls, {"7"}, "the load calls");
+  ctx.Equal(ctx.Redis.Get("product:7"), "__missing__", "a missing product must be cached as the sentinel %q: product:7", "__missing__");
+  const long long ttl = ctx.Redis.TTL("product:7");
+  ctx.Assert(50 < ttl && ttl <= 60, "the sentinel must expire in 60 s (missingTTL); its TTL is %d", ttl);
+  ctx.Equal(caJSON(get_product("7", src.load())), nullptr, "the sentinel must be served as nil");
+  ctx.Equal(caJSON(get_product("7", src.load())), nullptr, "the sentinel served a second time");
+  ctx.Equal(src.calls.size(), 1, "the sentinel must answer without calling load: the number of load calls");
+  const json grinderProduct = {{"id", "7"}, {"name", "Grinder"}};
+  src.catalogue["7"] = grinderProduct;
+  ctx.Equal(caJSON(get_product("7", src.load())), nullptr, "while the sentinel lives a product that appeared in the source is still unseen");
+  ctx.Clock.Advance(61);
+  const auto grinder = caJSON(grinderProduct);
+  ctx.Equal(caJSON(get_product("7", src.load())), grinder, "after 60 s the source is asked again");
+  ctx.Equal(src.calls, {"7", "7"}, "the load calls");
+  ctx.Equal(caStored(ctx, "product:7"), grinder, "product:7 must hold the product loaded after the sentinel expired");
+}
+
+void CheckInvalidate(harness::Ctx& ctx) {
+  caSource src{ctx, {{"42", caProduct}}};
+  ctx.Equal(caJSON(get_product("42", src.load())), caJSON(caProduct), "the first call returns the product");
+  src.catalogue["42"] = json{{"id", "42"}, {"name", "Espresso machine"}, {"price_cents", 19900}, {"tags", {"kitchen", "coffee"}}};
+  ctx.Equal(caField(caJSON(get_product("42", src.load())), "price_cents"), 24900, "until invalidated, the cached price is served");
+  invalidate("42");
+  ctx.Equal(ctx.Redis.Get("product:42"), nullptr, "invalidate must delete product:42");
+  ctx.Equal(caField(caJSON(get_product("42", src.load())), "price_cents"), 19900, "after invalidate the next call must load the new product");
+  ctx.Equal(src.calls, {"42", "42"}, "invalidate then get must load exactly once more: the load calls");
+  ctx.Equal(caField(caStored(ctx, "product:42"), "price_cents"), 19900, "the reloaded product must be cached");
+  ctx.Equal(caJSON(get_product("9", src.load())), nullptr, "an unknown product is nil");
+  ctx.Equal(ctx.Redis.Get("product:9"), "__missing__", "product:9 must hold the sentinel");
+  src.catalogue["9"] = json{{"id", "9"}};
+  invalidate("9");
+  ctx.Equal(caJSON(get_product("9", src.load())), caJSON(json{{"id", "9"}}), "invalidate must also clear a sentinel: a product created after a miss becomes visible");
+  invalidate("never-cached");
+  ctx.Equal(ctx.Redis.Keys("*"), {"product:42", "product:9"}, "invalidating an unknown id must touch nothing else: the keys");
+}
+
+void CheckSingleFlight(harness::Ctx& ctx) {
+  caSource src{ctx, {{"42", caProduct}}};
+  const auto want = caJSON(caProduct);
+  // The second worker's request lands the instant the first one has taken the lock, before it has loaded anything.
+  std::shared_ptr<caCall> second;
+  ctx.Redis.After("lock:product:42", [&] { second = caGo("42", src.load()); });
+  const auto first = caJSON(get_product("42", src.load()));
+  ctx.Assert(second != nullptr, "a miss must take lock:product:42");
+  ctx.Equal(first, want, "the first caller must return the product");
+  ctx.Equal(second->result(ctx), want, "the caller that lost the lock must return what the winner wrote");
+  ctx.Assert(src.calls.size() == 1, "two concurrent misses must call load once, it was called %d times: the loser polls product:42 every 50 ms instead of loading", src.calls.size());
+  ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "lock:product:42 must be deleted once the fill is done");
+  ctx.Equal(caStored(ctx, "product:42"), want, "product:42 must hold the product");
+  // The other order: the second request lands between the first one's miss and its lock, fills, and releases.
+  caSource src2{ctx, {{"43", json{{"id", "43"}}}}};
+  const auto want2 = caJSON(json{{"id", "43"}});
+  std::optional<std::string> third;
+  std::exception_ptr thirdFailure;
+  ctx.Redis.After("product:43", [&] {
+    try {
+      third = caJSON(get_product("43", src2.load()));
+    } catch (...) {
+      thirdFailure = std::current_exception();
+    }
+  });
+  ctx.Equal(caJSON(get_product("43", src2.load())), want2, "the first caller must return product 43");
+  if (thirdFailure) std::rethrow_exception(thirdFailure);
+  ctx.Equal(third, want2, "the concurrent caller must return product 43");
+  ctx.Assert(src2.calls.size() == 1, "when the other request fills the key between this one's miss and its lock, load must still run once (it ran %d times): GET the key again after winning the lock", src2.calls.size());
+  ctx.Equal(ctx.Redis.Exists("lock:product:43"), 0, "lock:product:43 must be deleted once the fill is done");
+}
+
+void CheckLockReleased(harness::Ctx& ctx) {
+  std::vector<std::string> attempts;
+  const Load failing = [&attempts](const std::string& productID) -> std::optional<json> {
+    attempts.push_back(productID);
+    throw std::runtime_error("catalogue unreachable");
+  };
+  std::string err = "<nil>";
+  try {
+    get_product("42", failing);
+  } catch (const std::exception& e) {
+    err = e.what();
+  }
+  ctx.Assert(err.find("catalogue unreachable") != std::string::npos, "when load fails, getProduct must return that error, not swallow it or cache anything: it returned %v", err);
+  ctx.Equal(attempts, {"42"}, "the load attempts");
+  ctx.Equal(ctx.Redis.Get("product:42"), nullptr, "a failed load must cache nothing, not the sentinel either");
+  ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "a failed fill must delete lock:product:42: otherwise every caller waits 5 s for a fill that will never come");
+  caSource src{ctx, {{"42", caProduct}}};
+  const int sleeps = ctx.Clock.Sleeps();
+  ctx.Equal(caJSON(get_product("42", src.load())), caJSON(caProduct), "the next call after a failure must take the lock and load");
+  ctx.Equal(src.calls, {"42"}, "the load calls");
+  ctx.Equal(ctx.Clock.Sleeps(), sleeps, "the next call after a failure must not have to wait: the lock was released, so it wins it at once (sleeps)");
+  ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "no lock may remain after the fill");
+}
+
+void CheckStaleLock(harness::Ctx& ctx) {
+  ctx.Redis.Set("lock:product:42", "stale", "EX", 5);  // a worker took the lock and died
+  std::vector<std::string> calls;
+  const Load load = [&](const std::string& productID) -> std::optional<json> {
+    calls.push_back(productID);
+    const auto held = ctx.Redis.Get("lock:product:42");
+    ctx.Assert(held != "stale", "load ran while another worker's lock was still alive: a loser must wait for the lock's TTL, not load on its own");
+    return caProduct;
+  };
+  const int64_t started = ctx.Clock.Now();
+  ctx.Equal(caJSON(get_product("42", load)), caJSON(caProduct), "once the stale lock has expired the caller must load and return the product");
+  const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
+  ctx.Assert(waited >= 4.9, "the caller must poll every 50 ms for the lock's TTL (5 s) before giving up on the holder; it waited %.2f s", waited);
+  ctx.Assert(waited < 12, "the wait is bounded by the lock's TTL; this took %.2f s of virtual time", waited);
+  ctx.Assert(calls.size() == 1, "the stale lock must cost exactly one load; load was called %d times", calls.size());
+  ctx.Equal(caStored(ctx, "product:42"), caJSON(caProduct), "product:42 must hold the product");
+  ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "no lock may remain after the fill");
+}
+`,
   },
   debrief: `Three decisions carry this file. The lock is \`SET NX EX\`, one command, because the election and its safety net must be atomic: a holder that dies leaves a lock that expires on its own, and nobody has to detect the death — the losers' bounded wait is sized by that same TTL, which is why \`LOCK_TTL_S\` appears in both places. The winner reads the key **again** after winning, because "miss, then lock" is not atomic: between the two, another request may have finished the whole fill and released, and without the re-read the lock serialises the loads instead of collapsing them. And the sentinel is a value with its own, shorter TTL rather than an absence, because an absence is indistinguishable from a miss — a product page for an id that was deleted or never existed would otherwise cost a database query per request, forever. The \`finally\` around the fill is what makes a failing database a slow minute rather than a stuck hour: with the lock released, the next caller retries at once instead of polling a key nobody will write. Real systems add jitter to the TTL so a batch import does not expire everything in the same second, refresh hot keys ahead of expiry so the lock is rarely contended, coalesce identical requests inside one process before they reach Redis, and push \`invalidate\` through a change stream rather than trusting every writer to call it.`,
 };

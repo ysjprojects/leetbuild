@@ -844,6 +844,106 @@ func CheckHeaders(ctx *harness.Ctx) {
 	ctx.Assert(fresh.Status == 200 && fresh.Header.Get("X-RateLimit-Remaining") == "99", "a merchant's first request leaves 99, got X-RateLimit-Remaining %q", fresh.Header.Get("X-RateLimit-Remaining"))
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <cmath>
+
+namespace {
+
+// The step's own stand-in checkout (inside main, where the harness cannot swap it as Go's does for a
+// plain 200) answers 201: an allowed request is a 201 here.
+constexpr int allowed = 201;
+
+// minuteAt moves the clock so the current minute is at :second (plus half a second); returns the integer seconds now.
+int64_t minuteAt(harness::Ctx& ctx, double second) {
+  const double now = static_cast<double>(ctx.Clock.Now()) / 1000;
+  double target = std::floor(now) - std::fmod(std::floor(now), 60) + second + 0.5;
+  if (target < now) target += 60;
+  ctx.Clock.Advance(target - now);
+  return ctx.Clock.Now() / 1000;
+}
+
+harness::Response merchantPost(harness::HTTP& c, const std::string& merchant) { return c.Post("/checkout", "", "X-Merchant", merchant); }
+
+std::optional<std::string> counter(harness::Ctx& ctx, const std::string& key) { return ctx.Redis.Get(key); }
+
+std::string rlKey(const std::string& merchant, int64_t minute) { return "rl:" + merchant + ":" + std::to_string(minute); }
+
+}  // namespace
+
+// The provided authentication, swapped for the X-Merchant header.
+std::string merchant_of(const httplib::Request& req) {
+  const std::string m = req.get_header_value("X-Merchant");
+  return m.empty() ? "m42" : m;
+}
+
+void CheckWindowKey(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  const int64_t now = minuteAt(ctx, 5);
+  const int64_t minute = now / 60;
+  const auto r = merchantPost(c, "m42");
+  ctx.Equal(r.Status, allowed, "the first request of the minute");
+  const std::string key = rlKey("m42", minute);
+  ctx.Equal(counter(ctx, key), "1", "after one request %s (keys: %v)", key, ctx.Redis.Keys("rl:*"));
+  merchantPost(c, "m7");
+  ctx.Equal(counter(ctx, rlKey("m7", minute)), "1", "each merchant has its own counter");
+  ctx.Equal(counter(ctx, key), "1", "another merchant's request must not count against m42");
+  ctx.Clock.Advance(60);
+  merchantPost(c, "m42");
+  ctx.Equal(counter(ctx, rlKey("m42", minute + 1)), "1", "a minute later the counter must live under rl:m42:%d (keys: %v)", minute + 1, ctx.Redis.Keys("rl:*"));
+  ctx.Equal(counter(ctx, key), "1", "the previous window's counter is left alone: the key name is the window");
+}
+
+void CheckIncrExpire(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  const int64_t now = minuteAt(ctx, 5);
+  const std::string key = rlKey("m42", now / 60);
+  for (int i = 0; i < 3; i++) merchantPost(c, "m42");
+  ctx.Equal(counter(ctx, key), "3", "after three requests %s", key);
+  long long ttl = ctx.Redis.TTL(key);
+  ctx.Assert(110 <= ttl && ttl <= 120, "%s has TTL %d, expected 120 s set when the key was created", key, ttl);
+  ctx.Clock.Advance(30);
+  merchantPost(c, "m42");
+  ttl = ctx.Redis.TTL(key);
+  ctx.Assert(80 <= ttl && ttl <= 90, "30 s later %s has TTL %d: the expiry is set once, when INCR returns 1, not on every request", key, ttl);
+  ctx.Clock.Advance(100);
+  ctx.Equal(ctx.Redis.Exists(key), 0, "%s must have expired 120 s after it was created", key);
+}
+
+void CheckTooMany(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  const int64_t now = minuteAt(ctx, 5);
+  ctx.Redis.Set(rlKey("m42", now / 60), 98);  // 98 checkouts already this minute
+  const auto r99 = merchantPost(c, "m42");
+  const auto r100 = merchantPost(c, "m42");
+  const auto r101 = merchantPost(c, "m42");
+  const auto r102 = merchantPost(c, "m42");
+  const auto other = merchantPost(c, "m7");
+  ctx.Clock.Advance(60);
+  const auto later = merchantPost(c, "m42");
+  ctx.Assert(r99.Status == allowed && r100.Status == allowed, "requests 99 and 100 are within the limit, got %d and %d", r99.Status, r100.Status);
+  ctx.Equal(r101.Status, 429, "the 101st request of the minute");
+  ctx.Equal(r102.Status, 429, "the 102nd request, for the rest of the window,");
+  ctx.Equal(other.Status, allowed, "one merchant over its limit must not block another");
+  ctx.Equal(later.Status, allowed, "in the next minute the merchant is allowed again");
+}
+
+void CheckHeaders(harness::Ctx& ctx) {
+  auto c = ctx.Main().HTTP();
+  const int64_t now = minuteAt(ctx, 43);
+  ctx.Redis.Set(rlKey("m42", now / 60), 99);
+  const auto lastOk = merchantPost(c, "m42");
+  const auto over = merchantPost(c, "m42");
+  const auto fresh = merchantPost(c, "m7");
+  ctx.Equal(over.Status, 429, "the 101st request");
+  ctx.Equal(over.HeaderValue("Retry-After"), "17", "at :43 the 429 must say Retry-After: 17 (seconds left in the window)");
+  ctx.Equal(over.HeaderValue("X-RateLimit-Remaining"), "0", "the 429 must carry X-RateLimit-Remaining: 0");
+  ctx.Assert(lastOk.Status == allowed && lastOk.HeaderValue("X-RateLimit-Remaining") == "0",
+             "the 100th request is allowed with X-RateLimit-Remaining: 0, got %d / %q", lastOk.Status, lastOk.HeaderValue("X-RateLimit-Remaining"));
+  ctx.Assert(fresh.Status == allowed && fresh.HeaderValue("X-RateLimit-Remaining") == "99",
+             "a merchant's first request leaves 99, got X-RateLimit-Remaining %q", fresh.HeaderValue("X-RateLimit-Remaining"));
+}
+`,
   },
   debrief: `One atomic \`INCR\` per request is the whole limiter: no read-modify-write race, no Lua, and the window boundary is encoded in the key name so nothing ever has to be reset. The \`EXPIRE\` on the first hit is what keeps Redis from filling with dead windows. Real gateways run the limiter at the edge, size the limit per plan, use a sliding window or a token bucket when the double-burst at the boundary matters, and — as the Go solution does — fail open when Redis is unreachable, because a limiter that turns a cache outage into a checkout outage is worse than no limiter at all.`,
 };

@@ -1430,6 +1430,313 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 	ctx.Assert(ctx.Kafka.Lag("delivery", "notifications") == 0 && ctx.Kafka.Lag("delivery", "notifications-retry") == 0, "every record must end up committed")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <grpcpp/grpcpp.h>
+#include <sw/redis++/redis++.h>
+
+#include <algorithm>
+#include <chrono>
+#include <ctime>
+#include <map>
+#include <mutex>
+#include <random>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "db.h"
+#include "devices.h"
+#include "push.grpc.pb.h"
+
+namespace {
+
+// A notification on topic from another producer, with an attempt header unless attempt < 0; the value.
+std::string seedDelivery(harness::Ctx& ctx, const std::string& nid, const std::string& user_id,
+                         const std::string& priority, const std::string& topic, int attempt) {
+  const std::string value = nlohmann::json{{"id", nid},          {"user_id", user_id}, {"channel", "push"},
+                                           {"title", "Shipped"}, {"body", "On its way"}, {"priority", priority}}
+                                .dump();
+  std::vector<harness::KafkaHeader> headers;
+  if (attempt >= 0) headers.push_back({"attempt", std::to_string(attempt)});
+  ctx.Kafka.Seed(topic, user_id, value, headers);
+  return value;
+}
+
+// What the push gateway saw: the notification ids it delivered, and the DEADLINE_EXCEEDED answers
+// it still owes each notification id.
+struct DeliveryWorld {
+  std::mutex mu;
+  std::vector<std::string> sent;
+  std::map<std::string, int> failures;
+  int hour = 0;
+  Prefs awake;
+
+  std::vector<std::string> delivered() {
+    std::lock_guard<std::mutex> lock(mu);
+    return sent;
+  }
+};
+
+// Delivers (recording the notification id) or answers DEADLINE_EXCEEDED while a notification has failures left.
+class DeliveryGateway final : public notify::PushGateway::Service {
+ public:
+  explicit DeliveryGateway(DeliveryWorld& w) : w_(w) {}
+  grpc::Status Send(grpc::ServerContext*, const notify::SendRequest* req, notify::SendReply* reply) override {
+    std::lock_guard<std::mutex> lock(w_.mu);
+    std::string id = req->collapse_key();
+    for (const std::string& v : {req->collapse_key(), req->title(), req->body(), req->device_token()}) {
+      if (w_.failures.count(v)) {
+        id = v;
+        break;
+      }
+    }
+    if (w_.failures[id] > 0) {
+      w_.failures[id]--;
+      return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED, "deadline exceeded");
+    }
+    w_.sent.push_back(id);
+    reply->set_message_id("m-" + std::to_string(w_.sent.size()));
+    return grpc::Status::OK;
+  }
+
+ private:
+  DeliveryWorld& w_;
+};
+
+sw::redis::Redis& deliveryRedis() {
+  static sw::redis::Redis redis("tcp://redis:6379");
+  return redis;
+}
+
+DeliveryWorld world;
+DeliveryGateway gateway{world};
+
+int currentHour() {
+  const std::time_t now = std::time(nullptr);
+  return std::localtime(&now)->tm_hour;
+}
+
+// The worker with the real rate limit, preferences and push client of the previous steps behind it
+// (defined below); preferences rows are seeded so no user is in quiet hours unless a check says so.
+DeliveryWorld& startDelivery(harness::Ctx& ctx) {
+  ctx.GRPC.Server("")->RegisterService(&gateway);
+  world.hour = currentHour();
+  world.awake = Prefs{true, (world.hour + 2) % 24, (world.hour + 3) % 24};  // never quiet right now
+  for (const std::string user : {"u1", "u2", "u-ok", "u-limited", "u-off"}) db::rows[user] = world.awake;
+  return world;
+}
+
+void drainDelivery(harness::Ctx& ctx) {
+  ctx.Drain([] { run(); });
+}
+
+bool contains(const std::vector<std::string>& items, const std::string& item) {
+  return std::find(items.begin(), items.end(), item) != items.end();
+}
+
+}  // namespace
+
+// The steps before this one, as the Go harness stands them in.
+// Step 3: a sliding window of 20 an hour in rl:{user}.
+bool allowed(const std::string& user_id, const std::string& notification_id) {
+  const long long now_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+  const std::string key = "rl:" + user_id;
+  auto tx = deliveryRedis().transaction();
+  tx.zadd(key, notification_id, static_cast<double>(now_ms))
+      .zremrangebyscore(key, sw::redis::RightBoundedInterval<double>(now_ms - 3'600'000, sw::redis::BoundType::CLOSED))
+      .zcard(key)
+      .expire(key, std::chrono::seconds(3600));
+  auto replies = tx.exec();
+  if (replies.get<long long>(2) > 20) {
+    deliveryRedis().incr("dropped:" + user_id);
+    return false;
+  }
+  return true;
+}
+
+// Step 4: cache-aside in prefs:{user} over the provided database.
+Prefs get_prefs(const std::string& user_id) {
+  const std::string key = "prefs:" + user_id;
+  if (const auto cached = deliveryRedis().get(key)) return nlohmann::json::parse(*cached).get<Prefs>();
+  const Prefs prefs = db::load_prefs(user_id);
+  deliveryRedis().set(key, nlohmann::json(prefs).dump(), std::chrono::seconds(600));
+  return prefs;
+}
+
+// Step 5: one device per user (the token is the user id, the collapse key the notification id), a
+// 3 s deadline, three attempts with jittered backoff.
+void send_push(const Notification& n) {
+  static auto stub =
+      notify::PushGateway::NewStub(grpc::CreateChannel("push-gateway:9000", grpc::InsecureChannelCredentials()));
+  static std::mt19937_64 rng{std::random_device{}()};
+  notify::SendRequest req;
+  req.set_device_token(n.user_id);
+  req.set_title(n.title);
+  req.set_body(n.body);
+  req.set_collapse_key(n.id);
+  std::string last;
+  for (int attempt = 0; attempt < 3; attempt++) {
+    grpc::ClientContext call;
+    call.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(3));
+    notify::SendReply reply;
+    const grpc::Status status = stub->Send(&call, req, &reply);
+    if (status.ok()) return;
+    switch (status.error_code()) {
+      case grpc::StatusCode::INVALID_ARGUMENT:
+      case grpc::StatusCode::NOT_FOUND:
+        devices::disable(n.user_id);
+        return;
+      case grpc::StatusCode::DEADLINE_EXCEEDED:
+        throw Retryable("push gateway: " + status.error_message());
+      case grpc::StatusCode::UNAVAILABLE:
+      case grpc::StatusCode::RESOURCE_EXHAUSTED: {
+        last = status.error_message();
+        std::uniform_int_distribution<int> jitter(0, 200);
+        std::this_thread::sleep_for(std::chrono::milliseconds((200 << attempt) + jitter(rng)));
+        break;
+      }
+      default:
+        throw std::runtime_error("push gateway: " + status.error_message());
+    }
+  }
+  throw Retryable("push gateway: 3 attempts: " + last);
+}
+
+void CheckGroupTopics(harness::Ctx& ctx) {
+  seedDelivery(ctx, "n1", "u1", "normal", "notifications", -1);
+  seedDelivery(ctx, "n2", "u1", "normal", "notifications-retry", 1);
+  DeliveryWorld& w = startDelivery(ctx);
+  drainDelivery(ctx);
+  const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
+  ctx.Assert(!subscriptions.empty(), "the consumer must subscribe to its topics");
+  const auto& last = subscriptions.back();
+  ctx.Equal(last.Group, "delivery", "group.id must be delivery");
+  ctx.Assert(contains(last.Topics, "notifications") && contains(last.Topics, "notifications-retry"),
+             "the consumer must subscribe to notifications and notifications-retry, got %v", last.Topics);
+  auto sent = w.delivered();
+  std::sort(sent.begin(), sent.end());
+  ctx.Equal(sent, {"n1", "n2"}, "records from both topics must be delivered: sent");
+}
+
+void CheckManualCommit(harness::Ctx& ctx) {
+  seedDelivery(ctx, "n1", "u1", "normal", "notifications", -1);
+  seedDelivery(ctx, "n2", "u2", "normal", "notifications", -1);
+  startDelivery(ctx);
+  drainDelivery(ctx);
+  const auto consumers = ctx.Kafka.Consumers();
+  ctx.Assert(!consumers.empty() && !consumers.back().AutoCommit,
+             "the consumer commits on its own (enable.auto.commit): offsets would be committed before the outcome, not "
+             "after it");
+  ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(),
+             "auto-commit is on: offsets were committed on their own, before the outcome");
+  ctx.Assert(!ctx.Kafka.EventsOf("manual-commit").empty(), "no explicit commit happened");
+  ctx.Equal(ctx.Kafka.Lag("delivery", "notifications"), 0, "every processed record must be committed: lag of notifications");
+}
+
+void CheckGate(harness::Ctx& ctx) {
+  seedDelivery(ctx, "n-ok", "u-ok", "normal", "notifications", -1);
+  seedDelivery(ctx, "n-limited", "u-limited", "normal", "notifications", -1);
+  seedDelivery(ctx, "n-off", "u-off", "normal", "notifications", -1);
+  seedDelivery(ctx, "n-quiet", "u-quiet", "normal", "notifications", -1);
+  seedDelivery(ctx, "n-urgent", "u-quiet", "high", "notifications", -1);
+  DeliveryWorld& w = startDelivery(ctx);
+  for (int i = 0; i < 20; i++) {
+    ctx.Redis.Do("ZADD", "rl:u-limited", ctx.Clock.Now(), "earlier-" + std::to_string(i));  // the hourly budget is spent
+  }
+  Prefs off = w.awake;
+  off.push = false;
+  db::rows["u-off"] = off;
+  db::rows["u-quiet"] = Prefs{true, w.hour, w.hour + 1};  // quiet hours right now
+  drainDelivery(ctx);
+  ctx.Assert(ctx.Redis.ZScore("rl:u-ok", "n-ok").has_value(),
+             "allowed(user_id, id) must be consulted for every record: rl:u-ok holds %v, expected n-ok",
+             ctx.Redis.ZRangeWithScores("rl:u-ok", 0, -1));
+  ctx.Assert(ctx.Redis.Get("prefs:u-ok").has_value(),
+             "get_prefs(user_id) must be consulted: prefs:u-ok was never cached, keys are %v", ctx.Redis.Keys("prefs:*"));
+  const auto sent = w.delivered();
+  ctx.Assert(contains(sent, "n-ok"), "an allowed notification with push on outside quiet hours must be sent, sent %v", sent);
+  ctx.Assert(!contains(sent, "n-limited"), "a rate-limited notification must not be sent");
+  ctx.Assert(!contains(sent, "n-off"), "a user with push off must not get a notification");
+  ctx.Assert(!contains(sent, "n-quiet"),
+             "a normal notification in quiet hours must not be sent: u-quiet's quiet window is the current hour (%d), "
+             "pass quiet(prefs, hour) the current hour (0-23)",
+             w.hour);
+  ctx.Assert(contains(sent, "n-urgent"), "a high-priority notification ignores quiet hours, sent %v", sent);
+  ctx.Equal(ctx.Kafka.Lag("delivery", "notifications"), 0,
+            "skipped notifications are an outcome too (they must be committed): lag of notifications");
+}
+
+void CheckRetryTopic(harness::Ctx& ctx) {
+  const std::string original = seedDelivery(ctx, "n1", "u1", "normal", "notifications", -1);
+  seedDelivery(ctx, "n2", "u2", "normal", "notifications-retry", 4);
+  DeliveryWorld& w = startDelivery(ctx);
+  w.failures["n1"] = 1;
+  w.failures["n2"] = 1;
+  drainDelivery(ctx);
+  const auto retried = ctx.Kafka.Records("notifications-retry");
+  const auto keys = ctx.Kafka.Keys("notifications-retry");
+  std::vector<harness::KafkaRecord> requeued;
+  for (size_t i = 0; i < retried.size(); i++)
+    if (keys[i] == "u1") requeued.push_back(retried[i]);
+  ctx.Assert(!requeued.empty(), "n1 failed once: it must be re-queued on notifications-retry, found keys %v", keys);
+  ctx.Equal(requeued.size(), 1, "n1 failed once: times it was re-queued");
+  ctx.Equal(requeued[0].Value, original, "the re-queued value must be the original record");
+  ctx.Equal(requeued[0].Header("attempt"), "1", "the re-queued record must carry attempt=1");
+  const auto sent = w.delivered();
+  ctx.Equal(std::count(sent.begin(), sent.end(), "n1"), 1,
+            "the re-queued n1 must be delivered when it comes back (sent %v): deliveries of n1", sent);
+  const auto dead = ctx.Kafka.Records("notifications-dlq");
+  const auto deadKeys = ctx.Kafka.Keys("notifications-dlq");
+  ctx.Assert(dead.size() == 1 && deadKeys[0] == "u2", "n2 failing on attempt 4 must land on notifications-dlq, found keys %v",
+             deadKeys);
+  ctx.Equal(dead[0].Header("attempt"), "5", "the dead-lettered record must carry attempt=5");
+  ctx.Equal(std::count(keys.begin(), keys.end(), "u2"), 1,
+            "a record on its fifth attempt goes to the DLQ, not back to the retry topic: u2 records on notifications-retry");
+  ctx.Assert(!contains(sent, "n2"), "a dead-lettered notification is not delivered");
+}
+
+// The world at one commit: the topics committed, the records on the retry topic, the deliveries.
+struct DeliveryCommit {
+  std::vector<std::string> topics;
+  size_t retried = 0;
+  std::vector<std::string> sent;
+  friend std::ostream& operator<<(std::ostream& out, const DeliveryCommit& c) {
+    return out << "{topics:" << harness::Value(c.topics) << " retried:" << c.retried << " sent:" << harness::Value(c.sent)
+               << "}";
+  }
+};
+
+void CheckCommitAfter(harness::Ctx& ctx) {
+  seedDelivery(ctx, "n1", "u1", "normal", "notifications", -1);
+  DeliveryWorld& w = startDelivery(ctx);
+  w.failures["n1"] = 1;
+  ctx.Kafka.StallFor("notifications-retry", 1);  // the retry topic's leader acknowledges after 1 s
+  std::vector<DeliveryCommit> atCommit;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) {
+    std::vector<std::string> topics;
+    for (const auto& [tp, _] : offsets) topics.push_back(tp.Topic);
+    std::sort(topics.begin(), topics.end());
+    atCommit.push_back({topics, ctx.Kafka.Records("notifications-retry").size(), w.delivered()});
+  });
+  drainDelivery(ctx);
+  ctx.Assert(!atCommit.empty(), "the offset was never committed");
+  std::vector<DeliveryCommit> first, second;
+  for (const auto& c : atCommit) {
+    if (contains(c.topics, "notifications")) first.push_back(c);
+    if (contains(c.topics, "notifications-retry")) second.push_back(c);
+  }
+  ctx.Assert(!first.empty(), "the record on notifications was never committed, commits were %v", atCommit);
+  ctx.Equal(first[0].retried, 1,
+            "the commit of the failed record came before its re-queue was acknowledged (at commit time nothing was on "
+            "notifications-retry): wait for the producer before you commit. Records on notifications-retry");
+  ctx.Assert(!second.empty(), "the re-queued record on notifications-retry was never committed, commits were %v", atCommit);
+  ctx.Equal(second[0].sent, {"n1"}, "the commit of the retried record came before send_push delivered it: sent at that commit");
+  ctx.Assert(ctx.Kafka.Lag("delivery", "notifications") == 0 && ctx.Kafka.Lag("delivery", "notifications-retry") == 0,
+             "every record must end up committed");
+}
+`,
   },
   debrief: `A retry topic turns "this one failed" into a record like any other: the partition moves on, the failed notification comes back a little later with its attempt count in a header, and after five tries it lands in the DLQ where a human — or a replay tool — can look at it. The commit after the re-queue acknowledgement is what makes the whole thing at-least-once end to end. Real workers run several retry topics with growing delays (\`retry-1m\`, \`retry-10m\`), pause a partition instead of sleeping in it, honour the \`priority\` header with a separate high-priority group, and alert on the DLQ's depth.`,
 };

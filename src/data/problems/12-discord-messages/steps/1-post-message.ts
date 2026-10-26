@@ -1258,6 +1258,121 @@ func CheckInsertCreated(ctx *harness.Ctx) {
 	ctx.Equal(len(postedRows(ctx)), 2, "every accepted message is one row")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <regex>
+
+namespace {
+
+constexpr int64_t sfEpoch = 1420070400000LL;
+constexpr int64_t sfBucketMs = 10LL * 24 * 3600 * 1000;
+constexpr int64_t postChannel = ((400 * sfBucketMs + 123456) << 22) | (1 << 17);  // a channel created in bucket 400
+
+const std::string postPath = "/channels/" + std::to_string(postChannel) + "/messages";
+const std::regex digitsOnly("^[0-9]+$");
+
+// postAPI empties the messages table and starts the learner's server.
+harness::HTTP postAPI(harness::Ctx& ctx) {
+  ctx.DB.Reset(db::kSchema);
+  return ctx.Main().HTTP();
+}
+
+std::vector<harness::Row> postedRows(harness::Ctx& ctx) {
+  return ctx.DB.Query("SELECT channel_id, bucket, message_id, author_id, content FROM messages ORDER BY message_id");
+}
+
+harness::Response postMessage(harness::HTTP& c, int64_t author, const std::string& content) {
+  return c.Post(postPath, nlohmann::json{{"author_id", author}, {"content", content}}.dump(), "Content-Type", "application/json");
+}
+
+harness::Any decodeBody(harness::Ctx& ctx, const harness::Response& r) {
+  const auto body = harness::ParseJSON(r.Text());
+  if (!body) ctx.Fatalf("the response body is not JSON: %q", r.Text().substr(0, 200));
+  return *body;
+}
+
+}  // namespace
+
+void CheckRoute(harness::Ctx& ctx) {
+  auto c = postAPI(ctx);
+  const auto r = postMessage(c, 42, "hello");
+  ctx.Assert(r.Status != 404 && r.Status != 405, "POST /channels/{id}/messages answered %d: no handler is registered for it", r.Status);
+  ctx.Equal(r.Status, 201, "a valid message");
+}
+
+void CheckValidateContent(harness::Ctx& ctx) {
+  auto c = postAPI(ctx);
+  for (const std::string bad : {std::string(""), std::string("   "), std::string("\\n\\t"), std::string(2001, 'a')}) {
+    const auto r = postMessage(c, 42, bad);
+    const std::string shown = bad.substr(0, 12);
+    ctx.Equal(r.Status, 400, "content %q (%d chars) is not 1..2000 characters", shown, bad.size());
+  }
+  ctx.Equal(postedRows(ctx).size(), 0, "a rejected message must not reach the table: rows in messages");
+  auto r = postMessage(c, 42, std::string(2000, 'a'));
+  ctx.Equal(r.Status, 201, "exactly 2000 characters is allowed");
+  r = postMessage(c, 42, "x");
+  ctx.Equal(r.Status, 201, "one character is allowed");
+}
+
+void CheckSnowflake(harness::Ctx& ctx) {
+  const int64_t ms = sfEpoch + 430 * sfBucketMs + 5000;
+  const int64_t first = next_id(ms);
+  ctx.Equal((first >> 22) + sfEpoch, ms, "the high bits must be nowMs - discordEpochMs: %d decodes to", first);
+  ctx.Equal((first >> 17) & 0x1F, kWorkerId, "bits 17..21 must carry workerID");
+  ctx.Equal(first & 0xFFF, 0, "the first id of a millisecond has sequence 0");
+  const int64_t second = next_id(ms);
+  ctx.Assert(second >> 22 == first >> 22 && (second & 0xFFF) == 1, "a second id in the same millisecond keeps the timestamp and takes sequence 1: %d then %d", first, second);
+  const int64_t later = next_id(ms + 7);
+  ctx.Assert((later >> 22) + sfEpoch == ms + 7 && (later & 0xFFF) == 0, "a later millisecond restarts the sequence at 0");
+  const int64_t steppedBack = next_id(ms + 3);
+  ctx.Assert(steppedBack > later, "the clock stepped back (ms + 3 after ms + 7) and nextID issued a lower id: %d <= %d", steppedBack, later);
+  const int64_t burstMs = ms + 1000;
+  std::vector<int64_t> ids(4097);
+  for (auto& id : ids) id = next_id(burstMs);
+  bool increasing = true;
+  for (size_t i = 1; i < ids.size(); i++) increasing = increasing && ids[i] > ids[i - 1];
+  ctx.Assert(increasing, "ids minted within one millisecond must strictly increase");
+  ctx.Assert((ids[4095] >> 22) + sfEpoch == burstMs && (ids[4095] & 0xFFF) == 4095, "the 4096th id of a millisecond has sequence 4095");
+  ctx.Assert((ids[4096] >> 22) + sfEpoch == burstMs + 1 && (ids[4096] & 0xFFF) == 0, "the 4097th id in one millisecond must move to the next millisecond with sequence 0, got ms %+d seq %d", (ids[4096] >> 22) + sfEpoch - burstMs, ids[4096] & 0xFFF);
+}
+
+void CheckBucket(harness::Ctx& ctx) {
+  const std::vector<std::pair<int64_t, int64_t>> cases = {{426 * sfBucketMs, 426}, {426 * sfBucketMs + 9LL * 24 * 3600 * 1000, 426}, {427 * sfBucketMs, 427}, {0, 0}};
+  for (const auto& [at, want] : cases) {
+    const int64_t snowflake = (at << 22) | (1 << 17) | 7;
+    ctx.Equal(bucket_of(snowflake), want, "bucketOf(%d): (id >> 22) / bucketMs counts 10-day windows from the Discord epoch", snowflake);
+  }
+  ctx.Equal(bucket_of(postChannel), 400, "a channel id is a snowflake too: bucketOf(channelID) is the window the channel was created in");
+  ctx.Equal(kBucketMs, 864000000, "bucketMs must be 10 days in milliseconds");
+}
+
+void CheckInsertCreated(harness::Ctx& ctx) {
+  auto c = postAPI(ctx);
+  const auto r = postMessage(c, 42, "hello");
+  ctx.Equal(r.Status, 201, "a valid message must be 201 Created");
+  const harness::Any body = decodeBody(ctx, r);
+  const std::string idText = body["id"].String();
+  ctx.Assert(body["id"].IsString() && std::regex_match(idText, digitsOnly), "the id must be a string of digits (64 bits do not fit a JSON number), got %s", harness::ShowValue(body["id"]));
+  const int64_t messageID = std::strtoll(idText.c_str(), nullptr, 10);
+  ctx.Assert(messageID > (1LL << 53), "the id %d is too small for a snowflake minted now: the timestamp must sit above bit 22", messageID);
+  const int64_t drift = (messageID >> 22) + sfEpoch - ctx.Clock.Now();
+  ctx.Assert(-60000 < drift && drift < 60000, "the id's timestamp must be the current time in milliseconds");
+  ctx.Equal(body["bucket"], bucket_of(messageID), "the body must carry the bucket of the id");
+  ctx.Assert(body["content"] == "hello" && harness::Sprintf("%v", body["author_id"]) == "42", "the body must echo author_id and content: %s", r.Text());
+  const auto stored = postedRows(ctx);
+  ctx.Equal(stored.size(), 1, "expected one row in messages");
+  auto row = stored[0];
+  ctx.Equal(harness::Sprintf("%v", row["channel_id"]), std::to_string(postChannel), "channel_id must be the path parameter");
+  ctx.Equal(harness::Sprintf("%v", row["message_id"]), idText, "message_id must be the minted id");
+  ctx.Equal(row["bucket"], bucket_of(messageID), "bucket must be bucketOf(messageID)");
+  ctx.Assert(harness::Sprintf("%v", row["author_id"]) == "42" && row["content"] == "hello", "author_id and content must be stored as sent, got %v", row);
+  const auto r2 = postMessage(c, 7, "second");
+  const harness::Any second = decodeBody(ctx, r2);
+  const int64_t secondID = std::strtoll(second["id"].String().c_str(), nullptr, 10);
+  ctx.Assert(secondID > messageID, "ids must increase from one message to the next");
+  ctx.Equal(postedRows(ctx).size(), 2, "every accepted message is one row");
+}
+`,
   },
   debrief: `A snowflake is an id and a clock in one 64-bit word: the timestamp in the high bits makes ids sort by time, the worker and sequence bits make them unique without a central counter, and the 12-bit sequence lets one process mint 4,096 ids per millisecond before it has to borrow the next one. Discord's 2017 schema leaned on exactly that: the primary key became (channel_id, bucket, message_id), with the bucket derived from the id, so every message of a channel from one 10-day window lands in one partition and a page of recent history is one contiguous range scan. The epoch is chosen so the timestamp fits in 42 bits for 139 years, and ids go out as strings because the languages reading the JSON cannot hold 64 bits in a number. Real services allocate worker ids from a registry so two instances can never agree on one, and refuse to mint when the clock steps back by more than a few milliseconds instead of silently reusing the last one.`,
 };

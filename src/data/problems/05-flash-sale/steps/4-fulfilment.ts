@@ -1414,6 +1414,228 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 	ctx.Assert(!slices.Contains(l.ids("confirm"), "o2") && !slices.Contains(l.ids("release"), "o2"), "an unexpected status must neither confirm nor release the hold")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <algorithm>
+#include <functional>
+#include <nlohmann/json.hpp>
+
+namespace {
+
+const std::string phantomSKU = "phantom-9";
+
+// allocation is what the warehouse peer was asked to allocate.
+using allocation = std::tuple<std::string, std::string, uint32_t>;
+
+// warehousePeer has no physical stock for phantom-9 and allocates everything else.
+class warehousePeer final : public flashsale::Warehouse::Service {
+ public:
+  std::vector<allocation> allocated;
+
+  grpc::Status Allocate(grpc::ServerContext*, const flashsale::AllocateRequest* req, flashsale::AllocateReply* reply) override {
+    if (req->sku() == phantomSKU) return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "no physical stock");
+    allocated.emplace_back(req->order_id(), req->sku(), req->qty());
+    reply->set_shipment_id("ship-" + req->order_id());
+    return grpc::Status::OK;
+  }
+};
+
+// outcome is one call the consumer made to confirm, release or publish_failed.
+struct outcome {
+  std::string kind;
+  std::string orderID;
+  Order order;
+};
+
+// fulfilmentLog records the calls to the stand-ins for confirm, release (step 5) and publish_failed.
+struct fulfilmentLog {
+  std::vector<outcome> entries;
+  std::vector<std::string> ids(const std::string& kind) const {
+    std::vector<std::string> out;
+    for (const auto& e : entries) {
+      if (e.kind == kind) out.push_back(e.orderID);
+    }
+    return out;
+  }
+};
+
+fulfilmentLog* activeLog = nullptr;
+
+Order orderFor(const std::string& orderID, const std::string& sku) { return Order{orderID, sku, 2}; }
+
+std::tuple<std::string, std::string, int> orderFields(const Order& o) { return {o.order_id, o.sku, o.qty}; }
+
+// seedOrders puts orders on the orders topic as the checkout API writes them: keyed by sku.
+void seedOrders(harness::Ctx& ctx, const std::vector<Order>& orders) {
+  for (const auto& o : orders) {
+    ctx.Kafka.Seed("orders", o.sku, nlohmann::json{{"order_id", o.order_id}, {"sku", o.sku}, {"qty", o.qty}, {"user", "ada"}}.dump());
+  }
+}
+
+// fulfilment seeds orders, serves the warehouse peer and records the provided services.
+std::pair<warehousePeer*, fulfilmentLog*> fulfilment(harness::Ctx& ctx, const std::vector<Order>& orders) {
+  seedOrders(ctx, orders);
+  auto* peer = new warehousePeer();  // the harness owns the implementation for the rest of the check
+  ctx.GRPC.Server("")->RegisterService(peer);
+  activeLog = new fulfilmentLog();
+  return {peer, activeLog};
+}
+
+// drainRun runs the consume loop until it returns or waits for records that will not come, then
+// stops it so a later run is the only one reading. It returns what run threw when run ended by itself.
+// run() takes no context to cancel (Go's run(ctx) does): destroying the consumer stops the loop for
+// good inside its consume, and the next drain reads with a fresh consumer of the group, from the
+// committed offsets.
+std::optional<std::string> drainRun(harness::Ctx& ctx) {
+  if (!consumer) consumer = make_consumer();
+  bool returned = false;
+  std::optional<std::string> err;
+  try {
+    returned = ctx.Drain([] { run(); });
+  } catch (const std::exception& e) {
+    returned = true;
+    err = std::string(e.what());
+  }
+  consumer.reset();
+  ctx.Settle();
+  // Waiting for records that never came spent the loop's sleep budget: the check's own waits (a
+  // deadline passing) get a fresh one.
+  ctx.Clock.SetSleepLimit(ctx.Clock.Sleeps() + 500);
+  return returned ? err : std::nullopt;
+}
+
+// allocate's outcome: whether it allocated, or what it threw (Go's (bool, error)).
+struct allocated {
+  bool ok = false;
+  std::optional<std::string> err;
+};
+
+allocated allocateOrder(const Order& order) {
+  try {
+    return {allocate(order), std::nullopt};
+  } catch (const std::exception& e) {
+    return {false, std::string(e.what())};
+  }
+}
+
+// The status the last Allocate call ended with: allocate throws a plain exception, so the code Go
+// reads with status.Code(err) is read off the call itself.
+grpc::StatusCode lastAllocateCode(harness::Ctx& ctx) {
+  const auto calls = ctx.GRPC.CallsTo("Allocate", "");
+  return calls.empty() ? grpc::StatusCode::OK : calls.back().Code;
+}
+
+bool contains(const std::vector<std::string>& items, const std::string& item) {
+  return std::find(items.begin(), items.end(), item) != items.end();
+}
+
+}  // namespace
+
+// The provided services, stood in for by the check.
+void confirm(const std::string& order_id) { activeLog->entries.push_back({"confirm", order_id, {}}); }
+void release(const std::string& order_id) { activeLog->entries.push_back({"release", order_id, {}}); }
+void publish_failed(const Order& order) { activeLog->entries.push_back({"failed", order.order_id, order}); }
+Order parse_order(const RdKafka::Message& msg) {
+  const auto doc = nlohmann::json::parse(std::string(static_cast<const char*>(msg.payload()), msg.len()));
+  return Order{doc.value("order_id", ""), doc.value("sku", ""), doc.value("qty", 0)};
+}
+
+void CheckGroupManualCommit(harness::Ctx& ctx) {
+  fulfilment(ctx, {orderFor("o1", "shoe-42")});
+  drainRun(ctx);
+  const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
+  ctx.Assert(!subscriptions.empty(), "the consumer must subscribe to a topic");
+  const auto& last = subscriptions.back();
+  ctx.Equal(last.Group, "fulfilment", "group.id");
+  ctx.Assert(contains(last.Topics, "orders"), "the consumer must read orders, got %q", last.Topics);
+  ctx.Equal(ctx.Kafka.EventsOf("auto-commit").size(), 0, "offsets were committed on a timer, before the outcome is handled: auto-commits");
+  ctx.Assert(!ctx.Kafka.EventsOf("manual-commit").empty(), "the consumer never committed an offset itself");
+  ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 0, "the handled record must be committed: lag");
+}
+
+void CheckDeadline(harness::Ctx& ctx) {
+  fulfilment(ctx, {orderFor("o1", "shoe-42")});
+  drainRun(ctx);
+  const auto calls = ctx.GRPC.CallsTo("Allocate", "");
+  ctx.Assert(!calls.empty(), "no Allocate RPC reached the warehouse");
+  const auto& last = calls.back();
+  ctx.Assert(last.HasDeadline(), "the Allocate RPC carries no deadline: a hung warehouse would stall the partition forever");
+  const double timeout = last.TimeoutSeconds();
+  ctx.Assert(4 < timeout && timeout <= 5, "the deadline is %v s, expected 5 s", timeout);
+  ctx.GRPC.SetLatency("Allocate", 30, "");
+  const size_t before = calls.size();
+  const auto got = allocateOrder(orderFor("o2", "shoe-42"));
+  ctx.Assert(got.err.has_value(), "a warehouse slower than the deadline must fail with DEADLINE_EXCEEDED, not succeed");
+  ctx.Equal(lastAllocateCode(ctx), grpc::StatusCode::DEADLINE_EXCEEDED, "the code a slow warehouse failed with");
+  ctx.Equal(ctx.GRPC.CallsTo("Allocate", "").size(), before + 1, "DEADLINE_EXCEEDED must not be retried: Allocate calls");
+}
+
+void CheckBackoffBounded(harness::Ctx& ctx) {
+  auto [peer, log] = fulfilment(ctx, {});
+  ctx.GRPC.Fail("Allocate", grpc::StatusCode::UNAVAILABLE, "", 2, "");
+  int64_t started = ctx.Clock.Now();
+  auto got = allocateOrder(orderFor("o1", "shoe-42"));
+  if (got.err) ctx.Fatalf("two UNAVAILABLE answers followed by success must end as allocated: %v", *got.err);
+  ctx.Equal(got.ok, true, "two UNAVAILABLE answers followed by success must end as allocated");
+  ctx.Equal(ctx.GRPC.CallsTo("Allocate", "").size(), 3, "Allocate calls (two UNAVAILABLE, then success)");
+  ctx.Equal(ctx.Clock.Sleeps(), 2, "sleeps before the retries (never before the first call)");
+  int64_t waited = ctx.Clock.Now() - started;
+  ctx.Assert(740 <= waited && waited <= 900, "waited %d ms across two retries, expected 250 + 500 = 750 ms (kBackoff << (attempt-1))", waited);
+  ctx.Equal(peer->allocated, std::vector<allocation>{{"o1", "shoe-42", 2}}, "the warehouse must see the order's id, sku and qty");
+
+  ctx.GRPC.Fail("Allocate", grpc::StatusCode::INVALID_ARGUMENT, "qty", 1, "");
+  got = allocateOrder(orderFor("o2", "shoe-42"));
+  ctx.Assert(got.err.has_value(), "INVALID_ARGUMENT must propagate, not be retried or swallowed");
+  ctx.Equal(lastAllocateCode(ctx), grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT must propagate unchanged: the code");
+  ctx.Equal(ctx.GRPC.CallsTo("Allocate", "").size(), 4, "INVALID_ARGUMENT must not be retried: Allocate calls");
+
+  ctx.GRPC.Fail("Allocate", grpc::StatusCode::UNAVAILABLE, "", 50, "");
+  started = ctx.Clock.Now();
+  got = allocateOrder(orderFor("o3", "shoe-42"));
+  ctx.Assert(got.err.has_value(), "a warehouse that stays UNAVAILABLE must fail after kMaxAttempts, not succeed");
+  ctx.Equal(static_cast<int>(ctx.GRPC.CallsTo("Allocate", "").size()) - 4, 4, "attempts against a down warehouse");
+  waited = ctx.Clock.Now() - started;
+  ctx.Assert(1740 <= waited && waited <= 1900, "waited %d ms across three retries, expected 250 + 500 + 1000 = 1750 ms", waited);
+  (void)log;
+}
+
+void CheckNoStock(harness::Ctx& ctx) {
+  const Order ghost = orderFor("o2", phantomSKU);
+  auto [peer, l] = fulfilment(ctx, {orderFor("o1", "shoe-42"), ghost});
+  drainRun(ctx);
+  ctx.Equal(l->ids("release"), {"o2"}, "release calls (only the order without physical stock)");
+  std::vector<std::tuple<std::string, std::string, int>> failed;
+  for (const auto& e : l->entries) {
+    if (e.kind == "failed") failed.push_back(orderFields(e.order));
+  }
+  ctx.Equal(failed, std::vector<std::tuple<std::string, std::string, int>>{orderFields(ghost)}, "publish_failed calls (the whole order o2)");
+  ctx.Equal(l->ids("confirm"), {"o1"}, "confirm calls");
+  ctx.Equal(ctx.GRPC.CallsTo("Allocate", "").size(), 2, "FAILED_PRECONDITION is final, it must not be retried: Allocate calls");
+  ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 0, "a no-stock order is handled (released and dead-lettered) and must be committed: lag");
+  (void)peer;
+}
+
+void CheckCommitAfter(harness::Ctx& ctx) {
+  auto [peer, l] = fulfilment(ctx, {orderFor("o1", "shoe-42")});
+  std::vector<std::vector<outcome>> atCommit;
+  ctx.Kafka.OnCommit([&atCommit, l = l](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(l->entries); });
+  drainRun(ctx);
+  ctx.Equal(l->ids("confirm"), {"o1"}, "a successful allocation must confirm the sale: confirm calls");
+  ctx.Assert(!atCommit.empty(), "the offset was never committed");
+  bool confirmedFirst = false;
+  for (const auto& e : atCommit[0]) confirmedFirst = confirmedFirst || (e.kind == "confirm" && e.orderID == "o1");
+  ctx.Assert(confirmedFirst, "the commit came before confirm(o1): a crash in between would lose the sale");
+  ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 0, "the handled record must be committed: lag");
+
+  ctx.GRPC.Fail("Allocate", grpc::StatusCode::INTERNAL, "warehouse bug", 1, "");
+  seedOrders(ctx, {orderFor("o2", "shoe-42")});
+  const auto err = drainRun(ctx);
+  ctx.Assert(err.has_value(), "an unexpected status must propagate out of the loop, not be swallowed");
+  ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 1, "a record whose outcome is unknown must stay uncommitted so it is redelivered after a restart: lag");
+  ctx.Assert(!contains(l->ids("confirm"), "o2") && !contains(l->ids("release"), "o2"), "an unexpected status must neither confirm nor release the hold");
+  (void)peer;
+}
+`,
   },
   debrief: `The consumer is a state machine per record: allocate → (sale | no stock) → commit, and the commit is last so a crash anywhere before it replays the record instead of losing it. The gRPC side does what every good client does — a deadline on each call, backoff only for the one status that means "try later", a hard cap on attempts — and the order id in the request is what makes that replay safe on the warehouse side. Real fulfilment services process partitions with a small worker pool per partition, pause the partition (not the whole consumer) while a warehouse is down, and put the Redis \`confirm\` behind the warehouse's own transactional record so the two never disagree.`,
 };

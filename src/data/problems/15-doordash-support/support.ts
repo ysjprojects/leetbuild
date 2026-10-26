@@ -6,6 +6,7 @@
  * (`config`). The Python and TypeScript versions compute the same numbers from the same text, so a
  * nearest neighbour or a judge score is the same in both runtimes.
  */
+import {CPP_DIGEST_H} from '../cpp-support';
 
 const ARTICLES: {id: string; title: string; body: string}[] = [
   {
@@ -1104,4 +1105,622 @@ CREATE TABLE quality_scores (
 );
 \`
 `,
+};
+
+const articlesCpp = ARTICLES.map(
+  a => `      {${JSON.stringify(a.id)}, ${JSON.stringify(a.title)}, ${JSON.stringify(a.body)}},`,
+).join('\n');
+
+/**
+ * The C++ twins: the same `assistant` modules as headers (assistant/*.h), computing the same numbers
+ * from the same text; the earlier steps' interfaces later steps call (kb_search.h, generate.h,
+ * guardrail.h — declarations the harness stands in for); and digest.h (SHA-256).
+ */
+export const supportModulesCpp: Record<string, string> = {
+  'assistant/config.h': `// The addresses, topics and limits every step of the assistant agrees on, as config::k… (also
+// reachable as assistant::k…).
+#pragma once
+
+#include <chrono>
+
+namespace config {
+
+// The stand-in model server (served by the harness) at two addresses, and the LLM judge.
+inline constexpr const char* kLlmLarge = "llm-large:50051";
+inline constexpr const char* kLlmSmall = "llm-small:50051";
+inline constexpr const char* kJudge = "judge:50051";
+
+// Kafka: one record per answered turn, keyed by session; the offline judge's consumer group.
+inline constexpr const char* kTopic = "support-conversations";
+inline constexpr const char* kGroup = "quality-judge";
+
+// Redis. The TTLs are in seconds.
+inline constexpr int kHistoryTtlS = 86400;
+inline constexpr int kCacheTtlS = 3600;
+inline constexpr int kRateLimitPerMinute = 20;
+
+// Retrieval and generation.
+inline constexpr int kTopK = 4;
+inline constexpr int kMaxTokens = 120;
+inline constexpr std::chrono::milliseconds kDeadline{2000};
+inline constexpr double kMinSimilarity = 0.3;
+inline constexpr const char* kHandoffText = "I've passed this to a support agent, who will follow up with you shortly.";
+
+}  // namespace config
+
+namespace assistant {
+using namespace config;
+}
+`,
+  'assistant/chunk.h': `// Fixed-size word windows with overlap: the chunking every step and the harness agree on.
+#pragma once
+
+#include <algorithm>
+#include <cctype>
+#include <string>
+#include <vector>
+
+namespace assistant {
+
+// A chunk is kChunkWords words; consecutive chunks share kOverlapWords of them.
+inline constexpr int kChunkWords = 48;
+inline constexpr int kOverlapWords = 12;
+
+// text's windows of kChunkWords words, each starting kChunkWords - kOverlapWords after the previous; none for an empty text.
+inline std::vector<std::string> chunk(const std::string& text) {
+  std::vector<std::string> words;
+  std::string word;
+  for (unsigned char c : text) {
+    if (std::isspace(c)) {
+      if (!word.empty()) words.push_back(word);
+      word.clear();
+    } else {
+      word += static_cast<char>(c);
+    }
+  }
+  if (!word.empty()) words.push_back(word);
+  std::vector<std::string> out;
+  if (words.empty()) return out;
+  for (size_t start = 0;; start += kChunkWords - kOverlapWords) {
+    const size_t end = std::min(words.size(), start + kChunkWords);
+    std::string piece;
+    for (size_t i = start; i < end; i++) piece += (i == start ? "" : " ") + words[i];
+    out.push_back(piece);
+    if (start + kChunkWords >= words.size()) return out;
+  }
+}
+
+}  // namespace assistant
+`,
+  'assistant/kb.h': `// The support knowledge base: ten short articles. Chunk ids are "<article>-<position>".
+#pragma once
+
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace assistant {
+
+// One page of the knowledge base.
+struct Article {
+  std::string id;
+  std::string title;
+  std::string body;
+};
+
+// The whole knowledge base.
+inline const std::vector<Article>& articles() {
+  static const std::vector<Article> all = {
+${articlesCpp}
+  };
+  return all;
+}
+
+// The article with this id, if there is one.
+inline std::optional<Article> find_article(const std::string& id) {
+  for (const auto& a : articles())
+    if (a.id == id) return a;
+  return std::nullopt;
+}
+
+}  // namespace assistant
+`,
+  'assistant/embed.h': `// Deterministic text embeddings for the course: a TF-IDF vector over the knowledge base's vocabulary
+// (each word a dimension, weighted by how rare it is across the KB's chunks; words the KB never saw
+// share a hashed band at the end), L2-normalised, 512 dimensions. Not a language model — a stand-in
+// with the properties retrieval relies on: the same text always gives the same vector, texts sharing
+// rare words land close together (cosine), and function words count for nothing. to_pgvector writes
+// a vector the way pgvector reads it: "[0.100000,0.200000,...]". The same numbers as the Python,
+// TypeScript and Go modules.
+#pragma once
+
+#include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <set>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "assistant/chunk.h"
+#include "assistant/kb.h"
+
+namespace assistant {
+
+// The length of every vector.
+inline constexpr int kDim = 512;
+
+// Stop words carry no topic; without them a question's vector points at its subject, as a real embedding's would.
+inline const std::set<std::string>& stop_words() {
+  static const std::set<std::string> words = [] {
+    std::set<std::string> out;
+    std::istringstream in(
+        "a an and are as at be been but by can could did do does for from get got had has have he her his how i if in is it its me my "
+        "no not of on or our she so that the their them they this to up us was we were what when where which who will with would you your");
+    for (std::string w; in >> w;) out.insert(w);
+    return out;
+  }();
+  return words;
+}
+
+// The text's lower-cased words ([a-z0-9]+), stop words left out.
+inline std::vector<std::string> tokenize(const std::string& text) {
+  std::vector<std::string> out;
+  std::string word;
+  const auto flush = [&] {
+    if (!word.empty() && stop_words().count(word) == 0) out.push_back(word);
+    word.clear();
+  };
+  for (unsigned char c : text) {
+    const char lower = static_cast<char>(std::tolower(c));
+    if ((lower >= 'a' && lower <= 'z') || (lower >= '0' && lower <= '9')) word += lower;
+    else flush();
+  }
+  flush();
+  return out;
+}
+
+inline int count_tokens(const std::string& text) { return static_cast<int>(tokenize(text).size()); }
+
+namespace embedding {
+
+// The vocabulary and document frequencies come from the KB's chunks, so every process computes the same vector.
+struct Model {
+  std::map<std::string, int> df;
+  std::map<std::string, int> index;
+  std::vector<std::string> vocab;
+  int n = 0;
+};
+
+inline const Model& model() {
+  static const Model m = [] {
+    Model out;
+    for (const auto& a : articles()) {
+      for (const auto& text : chunk(a.body)) {
+        out.n++;
+        std::set<std::string> seen;
+        for (const auto& w : tokenize(text))
+          if (seen.insert(w).second) out.df[w]++;
+      }
+    }
+    for (const auto& [w, count] : out.df) out.vocab.push_back(w);  // a std::map iterates sorted
+    for (size_t i = 0; i < out.vocab.size(); i++) out.index[out.vocab[i]] = static_cast<int>(i);
+    return out;
+  }();
+  return m;
+}
+
+inline uint32_t fnv1a(const std::string& s) {
+  uint32_t h = 0x811c9dc5u;
+  for (unsigned char b : s) {
+    h ^= b;
+    h *= 0x01000193u;
+  }
+  return h;
+}
+
+inline int slot(const std::string& w) {
+  const Model& m = model();
+  const auto it = m.index.find(w);
+  if (it != m.index.end()) return it->second;
+  return static_cast<int>(m.vocab.size()) + static_cast<int>(fnv1a(w) % static_cast<uint32_t>(kDim - m.vocab.size()));
+}
+
+}  // namespace embedding
+
+// Every word of the KB's chunks, sorted: the first vocab().size() dimensions.
+inline const std::vector<std::string>& vocab() { return embedding::model().vocab; }
+
+// log(1 + N/df): a word in every chunk weighs little, a word in one weighs most; an unseen word most of all.
+inline double idf(const std::string& w) {
+  const auto& m = embedding::model();
+  const auto it = m.df.find(w);
+  const double d = it == m.df.end() ? 0.5 : it->second;
+  return std::log(1 + m.n / d);
+}
+
+// The text's unit vector, each component rounded to 6 decimals (all zeros for a text of stop words).
+inline std::vector<double> embed(const std::string& text) {
+  std::vector<double> v(kDim, 0.0);
+  for (const auto& tok : tokenize(text)) v[embedding::slot(tok)] += idf(tok);
+  double norm = 0;
+  for (double x : v) norm += x * x;
+  norm = std::sqrt(norm);
+  if (norm == 0) return v;
+  for (double& x : v) x = std::round(x / norm * 1e6) / 1e6;
+  return v;
+}
+
+// The cosine similarity of a and b, 0 when either is all zeros.
+inline double cosine(const std::vector<double>& a, const std::vector<double>& b) {
+  double dot = 0, na = 0, nb = 0;
+  for (size_t i = 0; i < a.size() && i < b.size(); i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (na == 0 || nb == 0) return 0;
+  return dot / (std::sqrt(na) * std::sqrt(nb));
+}
+
+// v as pgvector's text form, "[0.100000,0.200000,...]"; cast it with ::vector.
+inline std::string to_pgvector(const std::vector<double>& v) {
+  std::string out = "[";
+  char buf[32];
+  for (size_t i = 0; i < v.size(); i++) {
+    std::snprintf(buf, sizeof buf, "%.6f", v[i]);
+    if (i > 0) out += ',';
+    out += buf;
+  }
+  return out + "]";
+}
+
+// pgvector's text form read back.
+inline std::vector<double> from_pgvector(const std::string& s) {
+  std::vector<double> out;
+  std::string item;
+  for (char c : s) {
+    if (c == '[' || c == ']' || c == ' ') continue;
+    if (c == ',') {
+      if (!item.empty()) out.push_back(std::strtod(item.c_str(), nullptr));
+      item.clear();
+    } else {
+      item += c;
+    }
+  }
+  if (!item.empty()) out.push_back(std::strtod(item.c_str(), nullptr));
+  return out;
+}
+
+}  // namespace assistant
+`,
+  'assistant/db.h': `// The assistant's Postgres (with pgvector), through libpqxx: assistant::db() (also db::connection())
+// is the connection; pqxx::work tx(assistant::db()) a transaction, tx.commit() ends it. Statements
+// use $1…$n placeholders. db::kSchema is what the harness applies before a check.
+//
+// Tables:
+//
+//   kb_chunks      (id text primary key, article text, position int, text text, embedding vector(512))
+//   quality_scores (session_id text, turn int, groundedness real, coherence real, compliance real, pass boolean,
+//                   primary key (session_id, turn))
+#pragma once
+
+#include <pqxx/pqxx>
+
+#include <string>
+
+namespace db {
+
+// The assistant's connection.
+inline pqxx::connection& connection() {
+  static pqxx::connection conn{"postgresql://assistant@db/assistant"};
+  return conn;
+}
+
+// The assistant's tables.
+inline const std::string kSchema = R"(
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE TABLE kb_chunks (
+  id text PRIMARY KEY,
+  article text NOT NULL,
+  position int NOT NULL,
+  text text NOT NULL,
+  embedding vector(512) NOT NULL
+);
+CREATE TABLE quality_scores (
+  session_id text NOT NULL,
+  turn int NOT NULL,
+  groundedness real NOT NULL,
+  coherence real NOT NULL,
+  compliance real NOT NULL,
+  pass boolean NOT NULL,
+  PRIMARY KEY (session_id, turn)
+);
+)";
+
+}  // namespace db
+
+namespace assistant {
+
+inline pqxx::connection& db() { return db::connection(); }
+
+}  // namespace assistant
+`,
+  'assistant/prompt.h': `// The one prompt format: instructions, the retrieved chunks as "[kb:<id>] <text>" lines, the
+// conversation so far, then the question. The stand-in model reads chunk ids from these lines, which
+// is what lets a check tell a grounded answer from an invented one. Also reachable as assistant::….
+#pragma once
+
+#include <set>
+#include <string>
+#include <vector>
+
+namespace prompt {
+
+// A retrieved piece of the knowledge base: its id, its text and how close it was to the question.
+struct Chunk {
+  std::string id;
+  std::string text;
+  double score = 0;
+  bool operator==(const Chunk&) const = default;
+};
+
+// One message of a conversation; role is "dasher" or "assistant".
+struct Turn {
+  std::string role;
+  std::string text;
+  bool operator==(const Turn&) const = default;
+};
+
+// Instructions open every prompt.
+inline constexpr const char* kInstructions =
+    "You are a Dasher support assistant. Answer only from the context below and cite the chunks you "
+    "use as [kb:<id>]. If the context does not answer the question, say so.";
+
+// The prompt for question, grounded in chunks, after history.
+inline std::string build_prompt(const std::string& question, const std::vector<Chunk>& chunks, const std::vector<Turn>& history) {
+  std::string out = std::string(kInstructions) + "\\n\\nContext:";
+  for (const auto& c : chunks) out += "\\n[kb:" + c.id + "] " + c.text;
+  out += "\\n\\nHistory:";
+  for (const auto& t : history) out += "\\n" + t.role + ": " + t.text;
+  return out + "\\n\\nQuestion: " + question + "\\nAnswer:";
+}
+
+// The chunk ids an answer cites as [kb:<id>], in order, without duplicates.
+inline std::vector<std::string> cited_ids(const std::string& answer) {
+  std::vector<std::string> out;
+  std::set<std::string> seen;
+  size_t at = 0;
+  while ((at = answer.find("[kb:", at)) != std::string::npos) {
+    const size_t start = at + 4;
+    const size_t end = answer.find(']', start);
+    if (end == std::string::npos) break;
+    if (end == start) {
+      at = start;
+      continue;
+    }
+    const std::string id = answer.substr(start, end - start);
+    if (seen.insert(id).second) out.push_back(id);
+    at = end + 1;
+  }
+  return out;
+}
+
+}  // namespace prompt
+
+namespace assistant {
+using namespace prompt;
+}
+`,
+  'assistant/model.h': `// The stand-in for the model server and the LLM judge. The harness serves these over gRPC (Llm at
+// llm-large:50051 / llm-small:50051, Judge at judge:50051); the learner's code never calls them
+// directly. Deterministic on purpose: the course grades what the system around a model does —
+// grounds it, bounds it, times it out, judges it, escalates — never the prose.
+//
+// complete(prompt, max_tokens, mode):
+//   "faithful"     cites the first two context chunks and answers with the first sentence of the top one
+//   "hallucinate"  invents a policy and cites a chunk that was never retrieved ([kb:policy-404])
+//   "verbose"      the faithful answer followed by filler, so max_tokens has to cut it
+// With no context chunks in the prompt the model says the documentation does not cover it (no citation).
+#pragma once
+
+#include <cctype>
+#include <cmath>
+#include <set>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace model {
+
+// The answer to a prompt without context chunks.
+inline constexpr const char* kNoContextText = "The documentation available to me does not cover this; a support agent can help.";
+
+inline std::vector<std::string> fields(const std::string& text) {
+  std::istringstream in(text);
+  std::vector<std::string> out;
+  for (std::string w; in >> w;) out.push_back(w);
+  return out;
+}
+
+inline std::string trim(const std::string& s) {
+  const size_t start = s.find_first_not_of(" \\t\\r\\n\\v\\f");
+  if (start == std::string::npos) return "";
+  return s.substr(start, s.find_last_not_of(" \\t\\r\\n\\v\\f") - start + 1);
+}
+
+// The prompt's context lines, "[kb:<id>] <text>", as (id, text).
+inline std::vector<std::pair<std::string, std::string>> context_chunks(const std::string& prompt) {
+  std::vector<std::pair<std::string, std::string>> out;
+  std::istringstream in(prompt);
+  for (std::string line; std::getline(in, line);) {
+    if (line.rfind("[kb:", 0) != 0) continue;
+    const size_t end = line.find(']', 4);
+    if (end == std::string::npos || end == 4) continue;
+    size_t text = end + 1;
+    while (text < line.size() && std::isspace(static_cast<unsigned char>(line[text]))) text++;
+    out.emplace_back(line.substr(4, end - 4), line.substr(text));
+  }
+  return out;
+}
+
+inline std::string first_sentence(const std::string& text) {
+  const size_t end = text.find_first_of(".!?");
+  return trim(end == std::string::npos ? text : text.substr(0, end + 1));
+}
+
+// The text as the model streams it: words, each but the last carrying its trailing space.
+inline std::vector<std::string> tokens(const std::string& text) {
+  auto words = fields(text);
+  for (size_t i = 0; i + 1 < words.size(); i++) words[i] += " ";
+  return words;
+}
+
+// The first max_tokens words of text.
+inline std::string truncate(const std::string& text, int max_tokens) {
+  if (max_tokens <= 0) return "";
+  const auto words = fields(text);
+  std::string out;
+  for (size_t i = 0; i < words.size() && i < static_cast<size_t>(max_tokens); i++) out += (i == 0 ? "" : " ") + words[i];
+  return out;
+}
+
+// The model's answer to prompt, at most max_tokens words.
+inline std::string complete(const std::string& prompt, int max_tokens, const std::string& mode) {
+  const auto chunks = context_chunks(prompt);
+  std::string text;
+  if (mode == "hallucinate") {
+    text = "Your issue will be resolved within 7 days, guaranteed [kb:policy-404].";
+  } else if (chunks.empty()) {
+    text = kNoContextText;
+  } else {
+    std::string cites;
+    for (size_t i = 0; i < chunks.size() && i < 2; i++) cites += "[kb:" + chunks[i].first + "]";
+    text = "Based on " + cites + ": " + first_sentence(chunks[0].second);
+    if (mode == "verbose")
+      for (int i = 0; i < 40; i++) text += " Additionally, please note that this may vary by market and over time.";
+  }
+  return truncate(text, max_tokens);
+}
+
+// The judge's verdict.
+struct Scores {
+  double groundedness;
+  double coherence;
+  double compliance;
+  bool pass;
+};
+
+// The judge's rubric: groundedness (citations within the context), coherence (length), compliance (no promises).
+inline Scores evaluate(const std::string& question, const std::string& answer, const std::vector<std::string>& context_ids) {
+  (void)question;
+  const std::set<std::string> allowed(context_ids.begin(), context_ids.end());
+  int cited = 0, in = 0;
+  for (size_t at = 0; (at = answer.find("[kb:", at)) != std::string::npos;) {
+    const size_t end = answer.find(']', at + 4);
+    if (end == std::string::npos) break;
+    if (end == at + 4) {
+      at += 4;
+      continue;
+    }
+    cited++;
+    if (allowed.count(answer.substr(at + 4, end - at - 4))) in++;
+    at = end + 1;
+  }
+  const double groundedness = cited > 0 ? std::round(static_cast<double>(in) / cited * 1000) / 1000 : 0.0;
+  const size_t words = fields(answer).size();
+  const double coherence = words >= 3 && words <= 160 ? 1.0 : 0.4;
+  std::string lower;
+  for (unsigned char c : answer) lower += static_cast<char>(std::tolower(c));
+  bool risky = false;
+  for (const char* w : {"guarantee", "promise", "lawsuit", "legal action"}) risky = risky || lower.find(w) != std::string::npos;
+  const double compliance = risky ? 0.0 : 1.0;
+  return Scores{groundedness, coherence, compliance, groundedness >= 0.8 && coherence >= 0.8 && compliance >= 0.8};
+}
+
+}  // namespace model
+`,
+  'kb_search.h': `// Step 2's knowledge base as later steps call it: the nearest chunks and the answer cache.
+#pragma once
+
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "assistant/config.h"
+#include "assistant/prompt.h"
+
+// A retrieved chunk: id, text and score (1 - cosine distance).
+using Hit = prompt::Chunk;
+
+// A remembered answer and the chunk ids it cites.
+struct CachedAnswer {
+  std::string answer;
+  std::vector<std::string> sources;
+};
+
+// The k chunks nearest to the question, best first.
+std::vector<Hit> search(const std::string& question, int k = config::kTopK);
+
+// The {answer, sources} remembered for this question, or nullopt.
+std::optional<CachedAnswer> cached_answer(const std::string& question);
+
+// Remember the answer under the normalised question, for config::kCacheTtlS.
+void remember_answer(const std::string& question, const std::string& answer, const std::vector<std::string>& sources);
+`,
+  'generate.h': `// Step 3's model call as later steps call it: the answer, which model gave it and its token count.
+#pragma once
+
+#include <string>
+#include <vector>
+
+#include "assistant/prompt.h"
+
+struct Generated {
+  std::string answer;
+  std::string model;
+  int tokens;
+};
+
+// The model's answer: the large model with a deadline and one retry, then the small one.
+Generated generate(const std::string& question, const std::vector<prompt::Chunk>& chunks, const std::vector<prompt::Turn>& history);
+`,
+  'guardrail.h': `// Step 4's guardrail as later steps call it: tier 1, the judge, and the answer or the handoff.
+#pragma once
+
+#include <string>
+#include <vector>
+
+#include "assistant/prompt.h"
+
+// What check returns: tier 1's reasons, or the judge's.
+struct Verdict {
+  bool ok;
+  double groundedness;
+  std::vector<std::string> reasons;
+};
+
+// What the Dasher may see: the answer or the handoff.
+struct Outcome {
+  std::string answer;
+  std::vector<std::string> sources;
+  bool escalated;
+  std::string model;
+  int tokens;
+};
+
+// Why the answer fails the cheap checks (empty when it passes).
+std::vector<std::string> tier1(const std::string& answer, const std::vector<prompt::Chunk>& chunks);
+
+// Tier 1 without an RPC, then the judge.
+Verdict check(const std::string& question, const std::string& answer, const std::vector<prompt::Chunk>& chunks);
+
+// The answer the Dasher may see: generated, checked, generated once more on failure, then the handoff.
+Outcome answer_or_escalate(const std::string& question, const std::vector<prompt::Chunk>& chunks, const std::vector<prompt::Turn>& history);
+`,
+  'digest.h': CPP_DIGEST_H,
 };

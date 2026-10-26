@@ -1021,6 +1021,207 @@ func CheckSlowClient(ctx *harness.Ctx) {
 	ctx.Assert(n == 0, "a dropped client must be unsubscribed, the bus still has %d subscription(s)", n)
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <nlohmann/json.hpp>
+
+namespace {
+
+// stEvent is a placements event, and the five fields of a Tile.
+struct stEvent {
+  std::string User;
+  int X = 0, Y = 0, Color = 0;
+  int64_t Ts = 0;
+  bool operator==(const stEvent& o) const { return User == o.User && X == o.X && Y == o.Y && Color == o.Color && Ts == o.Ts; }
+  friend std::ostream& operator<<(std::ostream& out, const stEvent& e) {
+    return out << "{User:" << e.User << " X:" << e.X << " Y:" << e.Y << " Color:" << e.Color << " Ts:" << e.Ts << "}";
+  }
+};
+
+// stSettle lets the world settle with a few seconds of virtual time at most: the stream handler
+// polls its subscription every second (Go's handler blocks on a channel and the call's context, with
+// no clock involved), so an unbounded settle would spend the check's whole sleep budget.
+void stSettle(harness::Ctx& ctx) {
+  ctx.Clock.SetSleepLimit(ctx.Clock.Sleeps() + 3);
+  ctx.Settle();
+}
+
+// stCall is an open StreamTiles call: what it received so far and how it ended. A thread of its
+// own reads the stream (Go's receiving goroutine).
+struct stCall {
+  grpc::ClientContext context;
+  std::unique_ptr<grpc::ClientReader<place::Tile>> stream;
+  std::mutex mu;
+  std::vector<stEvent> got;
+  std::optional<grpc::StatusCode> code;  // set once the call ended
+
+  std::vector<stEvent> received() {
+    std::lock_guard<std::mutex> lock(mu);
+    return got;
+  }
+  // How the call ended, nullopt while it is open.
+  std::optional<grpc::StatusCode> end() {
+    std::lock_guard<std::mutex> lock(mu);
+    return code;
+  }
+  void cancel() { context.TryCancel(); }
+};
+
+// stPlace is one tile-stream instance as deployed: the learner's server, its bus (tile_bus.h) fed
+// from placements, and step 3's producer upstream.
+struct stPlace {
+  harness::Ctx& ctx;
+  std::unique_ptr<place::Place::Stub> client;
+  size_t published = 0;  // records of placements already pumped onto the bus
+
+  // record_placement is step 3's producer: one JSON record on placements, keyed by the tile.
+  void recordPlacement(const std::string& user, int x, int y, int color) {
+    const nlohmann::json value = {{"user", user}, {"x", x}, {"y", y}, {"color", color}, {"ts", ctx.Clock.Now()}};
+    ctx.Kafka.Seed("placements", std::to_string(x) + ":" + std::to_string(y), value.dump());
+  }
+
+  // placed is every event on placements.
+  std::vector<stEvent> placed() {
+    std::vector<stEvent> out;
+    for (const auto& v : ctx.Kafka.Values("placements")) {
+      const auto e = nlohmann::json::parse(v, nullptr, false);
+      ctx.Assert(e.is_object(), "a placements record is not JSON: %q", v);
+      out.push_back({e.value("user", ""), e.value("x", 0), e.value("y", 0), e.value("color", 0), e.value("ts", int64_t{0})});
+    }
+    return out;
+  }
+
+  // pump: the instance consumes what is new on placements, publishes it on its bus, and the streams forward it.
+  void pump() {
+    const auto events = placed();
+    for (size_t i = published; i < events.size(); i++) publish(stTile(events[i]));
+    published = events.size();
+    stSettle(ctx);
+  }
+
+  static place::Tile stTile(const stEvent& e) {
+    place::Tile t;
+    t.set_user(e.User);
+    t.set_x(e.X);
+    t.set_y(e.Y);
+    t.set_color(e.Color);
+    t.set_ts(e.Ts);
+    return t;
+  }
+
+  std::shared_ptr<stCall> open(const std::string& name) {
+    auto call = std::make_shared<stCall>();
+    place::Subscribe req;
+    req.set_client(name);
+    call->stream = client->StreamTiles(&call->context, req);
+    std::thread([call] {
+      place::Tile t;
+      while (call->stream->Read(&t)) {
+        std::lock_guard<std::mutex> lock(call->mu);
+        call->got.push_back({t.user(), static_cast<int>(t.x()), static_cast<int>(t.y()), static_cast<int>(t.color()), t.ts()});
+      }
+      const grpc::Status st = call->stream->Finish();
+      std::lock_guard<std::mutex> lock(call->mu);
+      call->code = st.error_code();
+    }).detach();
+    stSettle(ctx);
+    const auto code = call->end();
+    ctx.Assert(!code || *code != grpc::StatusCode::UNAVAILABLE, "main serves no StreamTiles handler on :9000");
+    return call;
+  }
+};
+
+stPlace stStart(harness::Ctx& ctx) {
+  ctx.Main();
+  return stPlace{ctx, place::Place::NewStub(ctx.GRPC.Dial("tile-stream:9000"))};
+}
+
+place::Tile stMake(const std::string& user, int x, int y, int color, int64_t ts) {
+  return stPlace::stTile({user, x, y, color, ts});
+}
+
+}  // namespace
+
+void CheckServeStream(harness::Ctx& ctx) {
+  auto place = stStart(ctx);
+  auto call = place.open("web");
+  const auto code = call->end();
+  ctx.Assert(!code, "a fresh StreamTiles call must stay open waiting for tiles, but it ended with %v", code);
+  place.recordPlacement("ana", 3, 7, 12);
+  place.pump();
+  const stEvent want = place.placed()[0];
+  const auto got = call->received();
+  ctx.Equal(got.size(), 1, "the client must receive the one placement published: the Tiles received");
+  ctx.Equal(got[0], stEvent{"ana", 3, 7, 12, want.Ts}, "the Tile");
+}
+
+void CheckForwardOrder(harness::Ctx& ctx) {
+  auto place = stStart(ctx);
+  auto call = place.open("web");
+  ctx.Equal(subscribers(), 1, "one open call must mean one subscription: the subscriptions");
+  auto other = place.open("mobile");
+  ctx.Equal(subscribers(), 2, "two open calls must mean two subscriptions: the subscriptions");
+  const std::vector<std::string> names = {"ana", "bo", "cy"};
+  for (size_t i = 0; i < names.size(); i++) {
+    // three tiles on one pixel: one partition, one order
+    place.recordPlacement(names[i], 3, 7, static_cast<int>(i) + 1);
+    ctx.Clock.Advance(1);
+  }
+  place.pump();
+  const auto want = place.placed();
+  for (const auto& [stream, label] : std::vector<std::pair<std::shared_ptr<stCall>, std::string>>{{call, "web"}, {other, "mobile"}}) {
+    const auto got = stream->received();
+    std::vector<std::string> users;
+    for (const auto& t : got) users.push_back(t.User);
+    ctx.Equal(users, names, "client %s must receive ana, bo, cy in publish order", label);
+    ctx.Equal(got, want, "client %s: every field of every tile must be forwarded", label);
+  }
+  ctx.Equal(subscribers(), 2, "after forwarding three tiles the bus must still have 2 subscriptions: subscribe once per call, not per tile");
+}
+
+void CheckCancelCleanup(harness::Ctx& ctx) {
+  auto place = stStart(ctx);
+  auto call = place.open("web");
+  ctx.Equal(subscribers(), 1, "after the call opened the bus must have 1 subscription (subscribe())");
+  call->cancel();
+  stSettle(ctx);
+  const size_t n = subscribers();
+  ctx.Assert(n == 0, "the client hung up but the bus still has %d subscription(s): unsubscribe when the call is cancelled", n);
+  place.recordPlacement("ana", 3, 7, 12);
+  place.pump();  // must not reach anyone, must not fail
+  auto second = place.open("mobile");
+  ctx.Equal(subscribers(), 1, "a new call after a cancelled one subscribes afresh: the subscriptions");
+  place.recordPlacement("bo", 4, 7, 1);
+  place.pump();
+  const auto got = second->received();
+  ctx.Equal(got.size(), 1, "the new client must receive bo's tile: the Tiles received");
+  ctx.Equal(got[0].User, "bo", "the new client must only see tiles published after it subscribed: the user of its Tile");
+}
+
+void CheckSlowClient(harness::Ctx& ctx) {
+  auto place = stStart(ctx);
+  auto call = place.open("web");
+  const int lag = static_cast<int>(kMaxLag);
+  // Tiles from the other place-api instances arrive in one burst while the stream server is busy.
+  for (int i = 0; i < lag; i++) publish(stMake("ana", 3, 7, i % 16, 1700000000000LL + i));
+  stSettle(ctx);
+  std::vector<int64_t> want(lag);
+  for (int i = 0; i < lag; i++) want[i] = 1700000000000LL + i;
+  std::vector<int64_t> got;
+  for (const auto& t : call->received()) got.push_back(t.Ts);
+  ctx.Assert(got == want, "a backlog of exactly kMaxLag tiles must still be delivered in order: received %d Tiles", got.size());
+  auto code = call->end();
+  ctx.Assert(!code, "a client that caught up stays connected, but the call ended with %v", code);
+  for (int i = 0; i < lag + 2; i++) publish(stMake("ana", 3, 7, 12, 1800000000000LL + i));
+  stSettle(ctx);
+  code = call->end();
+  ctx.Assert(code.has_value(), "a client more than kMaxLag tiles behind must be dropped with RESOURCE_EXHAUSTED, but the stream stayed open");
+  ctx.Equal(*code, grpc::StatusCode::RESOURCE_EXHAUSTED, "the status of a client more than kMaxLag tiles behind");
+  stSettle(ctx);
+  const size_t n = subscribers();
+  ctx.Assert(n == 0, "a dropped client must be unsubscribed, the bus still has %d subscription(s)", n);
+}
+`,
   },
   debrief: `A server stream is the gRPC shape of "tell me everything from now on": one request, an open HTTP/2 stream, messages pushed as they happen. The handler is a loop around a queue, and the two rules around it are what make it survive at 80 000 clients: the done callback guarantees every subscription dies with its call, whatever killed it, and the lag cap turns a slow reader from a memory leak into a reconnect — cheap, because the catch-up path is a single cached \`GET /board\`. That is also why the client opens the stream before it fetches the board: a snapshot plus every change since before the snapshot is consistent, and nothing is lost in between. Reddit ran 24 websocket instances pushing 4 Gbps of tiny messages and found the boxes CPU-bound, not network-bound — per-message work, not bytes, is the cost of fan-out; real deployments batch tiles per 50 ms frame, exactly as the browser batched draws per animation frame.`,
 };

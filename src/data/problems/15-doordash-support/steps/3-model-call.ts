@@ -1117,6 +1117,179 @@ func CheckMaxTokens(ctx *harness.Ctx) {
 	ctx.Equal(result.Tokens, config.MaxTokens, "Tokens must be the reply's count")
 }
 `,
+    cpp: `#include <leetbuild/harness.h>
+
+#include <sstream>
+
+#include "assistant/model.h"
+
+namespace {
+
+const std::string modelQuestion = "My payout has not arrived, when is it paid?";
+
+const std::vector<assistant::Chunk> modelChunks = {
+    {"pay-0", "Dasher earnings for a week are paid out every Monday by direct deposit and usually arrive within two to three business days, depending on the bank.", 0.71},
+    {"tips-0", "Tips are included in the weekly payout and in Fast Pay.", 0.52},
+    {"undeliverable-0", "If the timer runs out, the app allows the order to be marked as undeliverable and the Dasher is still paid in full for the delivery.", 0.33},
+};
+
+const std::vector<assistant::Turn> modelHistory = {
+    {"dasher", "Hi, I dashed all of last week."},
+    {"assistant", "Hello! What can I help you with about last week's dashes?"},
+};
+
+int replyWords(const std::string& text) { return static_cast<int>(model::fields(text).size()); }
+
+// llmPeer is the stand-in model server, answering in mode.
+class llmPeer final : public support::Llm::Service {
+ public:
+  explicit llmPeer(std::string mode) : mode_(std::move(mode)) {}
+  grpc::Status Generate(grpc::ServerContext*, const support::GenerateRequest* req, support::GenerateReply* reply) override {
+    const std::string text = model::complete(req->prompt(), req->max_tokens(), mode_);
+    reply->set_text(text);
+    reply->set_tokens(replyWords(text));
+    reply->set_model(req->model());
+    return grpc::Status::OK;
+  }
+
+ private:
+  std::string mode_;
+};
+
+// modelWorld is what a check compares against: the one prompt and the faithful model's answer to it.
+struct modelWorld {
+  std::string prompt;
+  std::string expected;
+};
+
+// serveModels serves both model addresses with the stand-in model in mode.
+modelWorld serveModels(harness::Ctx& ctx, const std::string& mode) {
+  static std::unique_ptr<llmPeer> peer;
+  peer = std::make_unique<llmPeer>(mode);
+  ctx.GRPC.Server(config::kLlmLarge)->RegisterService(peer.get());
+  ctx.GRPC.Server(config::kLlmSmall)->RegisterService(peer.get());
+  const std::string p = assistant::build_prompt(modelQuestion, modelChunks, modelHistory);
+  return modelWorld{p, model::complete(p, config::kMaxTokens, "faithful")};
+}
+
+// generateOK calls generate and requires a result.
+Generated generateOK(harness::Ctx& ctx) {
+  try {
+    return generate(modelQuestion, modelChunks, modelHistory);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("generate(question, chunks, history) must return {Answer, Model, Tokens}: %v", std::string(e.what()));
+  }
+}
+
+std::vector<harness::Call> generateCalls(harness::Ctx& ctx, const std::string& target) { return ctx.GRPC.CallsTo("Generate", target); }
+
+// generateFails calls generate, requires it to throw and returns the status code it failed with.
+// Go reads the code off the returned error; the C++ step throws a std::runtime_error carrying the
+// status message, so the code is the last model call's, and the exception must carry its message.
+grpc::StatusCode generateFails(harness::Ctx& ctx, const std::string& what) {
+  try {
+    const Generated result = generate(modelQuestion, modelChunks, modelHistory);
+    ctx.Fatalf("%s must fail, generate returned &{Answer:%s Model:%s Tokens:%d}", what, result.answer, result.model, result.tokens);
+  } catch (const std::exception& e) {
+    const auto calls = generateCalls(ctx, "");
+    ctx.Assert(!calls.empty(), "%s must fail after calling the model, no Generate call was made", what);
+    const harness::Call& last = calls.back();
+    ctx.Assert(std::string(e.what()).find(last.Message) != std::string::npos, "%s: the error must carry the model's status (%q), it was %q", what, last.Message, std::string(e.what()));
+    return last.Code;
+  }
+}
+
+}  // namespace
+
+void CheckPrompt(harness::Ctx& ctx) {
+  const auto w = serveModels(ctx, "faithful");
+  const Generated result = generateOK(ctx);
+  const auto calls = generateCalls(ctx, config::kLlmLarge);
+  ctx.Equal(calls.size(), 1, "a healthy large model must be called exactly once: calls to %s", config::kLlmLarge);
+  ctx.Equal(generateCalls(ctx, config::kLlmSmall).size(), 0, "the small model must not be called while the large one answers");
+  const auto request = calls[0].Request<support::GenerateRequest>();
+  ctx.Equal(request.model(), "large", "the request to %s must say Model: \\"large\\"", config::kLlmLarge);
+  for (const auto& c : modelChunks) {
+    ctx.Assert(request.prompt().find("[kb:" + c.id + "] " + c.text) != std::string::npos, "the prompt has no '[kb:%s] <text>' line for a retrieved chunk; use prompt.Build", c.id);
+  }
+  for (const auto& turn : modelHistory) {
+    ctx.Assert(request.prompt().find(turn.role + ": " + turn.text) != std::string::npos, "the prompt is missing the history turn %s: %q", turn.role, turn.text);
+  }
+  ctx.Assert(request.prompt().find("Question: " + modelQuestion) != std::string::npos, "the prompt is missing the 'Question: …' line");
+  ctx.Equal(request.prompt(), w.prompt, "the prompt must be exactly prompt.Build(question, chunks, history): the model parses that format");
+  ctx.Equal(result.answer, w.expected, "Answer must be the reply's text");
+  ctx.Equal(result.model, "large", "Model must be the reply's model");
+  ctx.Equal(result.tokens, replyWords(w.expected), "Tokens must be the reply's token count");
+}
+
+void CheckDeadline(harness::Ctx& ctx) {
+  serveModels(ctx, "faithful");
+  generateOK(ctx);
+  const auto calls = generateCalls(ctx, config::kLlmLarge);
+  const harness::Call& call = calls.back();
+  ctx.Assert(call.HasDeadline(), "the Generate call carries no deadline: a stalled model would hold the chat open forever");
+  const double deadlineS = config::kDeadline.count() / 1000.0;
+  ctx.Assert(1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.0, "the deadline must be config.DeadlineS = %v s, got %v s", deadlineS, call.TimeoutSeconds());
+  ctx.GRPC.SetLatency("Generate", 3.0, config::kLlmLarge);
+  const int64_t started = ctx.Clock.Now();
+  const Generated result = generateOK(ctx);
+  const int64_t elapsed = ctx.Clock.Now() - started;
+  const auto all = generateCalls(ctx, config::kLlmLarge);
+  const std::vector<harness::Call> slow(all.begin() + 1, all.end());
+  for (const auto& c : slow) {
+    ctx.Assert(c.Code == grpc::StatusCode::DEADLINE_EXCEEDED, "a large model slower than the deadline must be abandoned with DEADLINE_EXCEEDED, not waited for");
+  }
+  ctx.Equal(slow.size(), 2, "a large model past its deadline earns one retry: calls to %s", config::kLlmLarge);
+  ctx.Equal(result.model, "small", "after two deadlines the small model must answer");
+  ctx.Equal(generateCalls(ctx, config::kLlmSmall).size(), 1, "calls to %s", config::kLlmSmall);
+  ctx.Assert(4000 <= elapsed && elapsed <= 4800, "two attempts of %v s plus one 200 ms backoff should take about 4200 ms of virtual time, took %d ms (6000 means the deadline was not attached to the call)", deadlineS, elapsed);
+}
+
+void CheckRetryTransient(harness::Ctx& ctx) {
+  const auto w = serveModels(ctx, "faithful");
+  ctx.GRPC.Fail("Generate", grpc::StatusCode::UNAVAILABLE, "", 1, config::kLlmLarge);
+  const int64_t started = ctx.Clock.Now();
+  const Generated result = generateOK(ctx);
+  const int64_t elapsed = ctx.Clock.Now() - started;
+  ctx.Equal(generateCalls(ctx, config::kLlmLarge).size(), 2, "one UNAVAILABLE must be retried against the large model: calls to %s", config::kLlmLarge);
+  ctx.Equal(generateCalls(ctx, config::kLlmSmall).size(), 0, "one UNAVAILABLE is a retry, not a fallback: the small model must not be called");
+  ctx.Equal(result.model, "large", "the retry must be answered by the large model");
+  ctx.Equal(result.answer, w.expected, "the retried answer must be the reply's text");
+  ctx.Assert(150 <= elapsed && elapsed <= 500, "the retry must wait a 200 ms backoff (virtual), it waited %d ms", elapsed);
+  ctx.GRPC.Fail("Generate", grpc::StatusCode::INVALID_ARGUMENT, "prompt too long", 1, config::kLlmLarge);
+  const auto code = generateFails(ctx, "INVALID_ARGUMENT is not transient: it");
+  ctx.Assert(code == grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT must propagate as is, got code %d", static_cast<int>(code));
+  ctx.Equal(generateCalls(ctx, config::kLlmLarge).size(), 3, "INVALID_ARGUMENT must not be retried: it will fail the same way");
+  ctx.Equal(generateCalls(ctx, config::kLlmSmall).size(), 0, "INVALID_ARGUMENT must not fall back: the small model gets the same bad request");
+}
+
+void CheckFallbackSmall(harness::Ctx& ctx) {
+  const auto w = serveModels(ctx, "faithful");
+  ctx.GRPC.Stop(config::kLlmLarge);
+  const Generated result = generateOK(ctx);
+  ctx.Equal(result.model, "small", "with the large model down the small one must answer");
+  ctx.Equal(result.answer, w.expected, "the small model's reply must come back as the answer");
+  ctx.Equal(generateCalls(ctx, config::kLlmLarge).size(), 2, "a large model that is down earns exactly one retry: calls to %s", config::kLlmLarge);
+  ctx.Equal(generateCalls(ctx, config::kLlmSmall).size(), 1, "calls to %s", config::kLlmSmall);
+  const auto request = generateCalls(ctx, config::kLlmSmall)[0].Request<support::GenerateRequest>();
+  ctx.Assert(request.model() == "small" && request.prompt() == w.prompt && request.max_tokens() == config::kMaxTokens, "the fallback must send the same prompt and MaxTokens with Model: \\"small\\"");
+  ctx.GRPC.Stop(config::kLlmSmall);
+  const auto code = generateFails(ctx, "both models down");
+  ctx.Assert(code == grpc::StatusCode::UNAVAILABLE, "both models down must surface UNAVAILABLE, got code %d", static_cast<int>(code));
+  const size_t total = generateCalls(ctx, "").size();
+  ctx.Assert(total == 6, "never more than three model calls per generate: the second generate made %d", total - 3);
+}
+
+void CheckMaxTokens(harness::Ctx& ctx) {
+  serveModels(ctx, "verbose");
+  const Generated result = generateOK(ctx);
+  const auto request = generateCalls(ctx, config::kLlmLarge)[0].Request<support::GenerateRequest>();
+  ctx.Equal(request.max_tokens(), config::kMaxTokens, "the request must carry MaxTokens: config.MaxTokens");
+  ctx.Equal(result.model, "large", "Model");
+  ctx.Equal(replyWords(result.answer), config::kMaxTokens, "a verbose model is cut at max_tokens by the server: words in the answer");
+  ctx.Equal(result.tokens, config::kMaxTokens, "Tokens must be the reply's count");
+}
+`,
   },
   debrief: `A deadline is a budget, not a timeout: the Dasher is owed an answer within a few seconds, and every call the assistant makes spends from that. Attaching \`DEADLINE_S\` to the call itself is what lets a slow model be abandoned at 2 s instead of 3 — a sleep around the call would still wait for the reply. Retrying only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`, once, after a short backoff, is the difference between a retry and a retry storm: those statuses mean "not right now", while an \`INVALID_ARGUMENT\` fails identically twice. The fallback is the part a model service adds: when the large model fails twice, a smaller one with the same prompt and the same citations is a better outcome than an error page — the guardrail (next step) judges its answer on the same terms, and the hand-off to a person is reserved for answers that fail *that*, not for a model that was slow. LinkedIn's platform post frames the same budget in streaming terms: time to first token and time between tokens are what the user feels, so the model sits behind an interface that can swap in a smaller one when the large one cannot meet them (step 5 streams, and the deadline becomes a budget for the first token). Grab's AI Gateway makes the fallback a property of the gateway rather than of each caller — dynamic routing to another model or provider when one fails, with every request and its outcome recorded. Production clients also propagate the caller's remaining deadline instead of picking a fresh one per hop, add jitter to the backoff, hedge a slow request against a second replica, and open a circuit to the large model once its error rate stays high so the fallback stops paying for two failed calls first.`,
 };
