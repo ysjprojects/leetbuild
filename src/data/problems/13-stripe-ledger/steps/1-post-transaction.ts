@@ -126,9 +126,12 @@ Implement \`validate(body)\` — the reason the body is not a double-entry trans
         },
         scala: {
           all: [/(?<!def )writeTransaction\(/, /Location/],
-          order: [/writeTransaction\(/, /StatusCodes\.Created|\b201\b/],
+          order: [/(?<!def )writeTransaction\(/, /StatusCodes\.Created|\b201\b/],
         },
-        cpp: {all: [/(?<!string )write_transaction\(/, /Location/], order: [/write_transaction\(/, /\b201\b/]},
+        cpp: {
+          all: [/(?<![\w>] )write_transaction\(/, /Location/],
+          order: [/(?<![\w>] )write_transaction\(/, /\b201\b/],
+        },
       },
     },
   ],
@@ -538,8 +541,8 @@ final case class Entry(account: String, currency: String, amount: Long)
 object LedgerApi {
   val CurrencyRe = "^[A-Z]{3}$".r
 
-  /** Writes the rows and returns the transaction id (built in step 4, LedgerWriter). */
-  def writeTransaction(entries: Seq[Entry], description: String, eventId: Option[String], postedAt: Long, settles: Option[String]): String = ???
+  /** Writes the rows and returns the new transaction id, None for an event already journaled (built in step 4, LedgerWriter). */
+  def writeTransaction(entries: Seq[Entry], description: String, eventId: Option[String], postedAt: Long, settles: Option[String]): Option[String] = ???
 
   def nowMs(): Long = System.currentTimeMillis()
 
@@ -594,8 +597,8 @@ final case class Entry(account: String, currency: String, amount: Long)
 object LedgerApi {
   val CurrencyRe = "^[A-Z]{3}$".r
 
-  /** Writes the rows and returns the transaction id (built in step 4, LedgerWriter). */
-  def writeTransaction(entries: Seq[Entry], description: String, eventId: Option[String], postedAt: Long, settles: Option[String]): String = ???
+  /** Writes the rows and returns the new transaction id, None for an event already journaled (built in step 4, LedgerWriter). */
+  def writeTransaction(entries: Seq[Entry], description: String, eventId: Option[String], postedAt: Long, settles: Option[String]): Option[String] = ???
 
   def nowMs(): Long = System.currentTimeMillis()
 
@@ -639,7 +642,8 @@ object LedgerApi {
         val description = body.fields.get("description").collect { case JsString(s) => s }.getOrElse("")
         val settles = body.fields.get("settles").collect { case JsString(s) => s }
         val postedAt = nowMs()
-        val id = writeTransaction(entries, description, None, postedAt, settles)
+        // An API post has no event id, so it is never a duplicate: there is always an id.
+        val id = writeTransaction(entries, description, None, postedAt, settles).get
         (StatusCodes.Created,
          JsObject("transaction_id" -> JsString(id), "posted_at" -> JsNumber(postedAt), "entries" -> JsArray(entries.map(entryJson).toVector)))
     }
@@ -690,9 +694,11 @@ struct Entry {
   int64_t amount;
 };
 
-// Writes the rows and returns the transaction id (built in step 4, ledger_writer.cpp).
-std::string write_transaction(const std::vector<Entry>& entries, const std::string& description,
-                              std::optional<std::string> event_id, int64_t posted_at, std::optional<std::string> settles);
+// Writes the rows and returns the new transaction id, std::nullopt for an event already journaled
+// (built in step 4, ledger_writer.cpp).
+std::optional<std::string> write_transaction(const std::vector<Entry>& entries, const std::string& description,
+                                             std::optional<std::string> event_id, int64_t posted_at,
+                                             std::optional<std::string> settles);
 
 int64_t now_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -711,7 +717,7 @@ std::string validate(const json& body, std::vector<Entry>& out) {
 // The outcome of posting body: {status, payload}. Step 2 wraps this in an idempotency key.
 std::pair<int, json> handle(const json& body) {
   // TODO: validate → 422 {"error": reason}
-  // TODO: write_transaction(entries, description, std::nullopt, now_ms(), settles)
+  // TODO: write_transaction(entries, description, std::nullopt, now_ms(), settles).value()
   // TODO: 201 {transaction_id, posted_at, entries}
   return {501, json{{"error", "not implemented"}}};
 }
@@ -754,9 +760,11 @@ struct Entry {
   int64_t amount;
 };
 
-// Writes the rows and returns the transaction id (built in step 4, ledger_writer.cpp).
-std::string write_transaction(const std::vector<Entry>& entries, const std::string& description,
-                              std::optional<std::string> event_id, int64_t posted_at, std::optional<std::string> settles);
+// Writes the rows and returns the new transaction id, std::nullopt for an event already journaled
+// (built in step 4, ledger_writer.cpp).
+std::optional<std::string> write_transaction(const std::vector<Entry>& entries, const std::string& description,
+                                             std::optional<std::string> event_id, int64_t posted_at,
+                                             std::optional<std::string> settles);
 
 int64_t now_ms() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -794,7 +802,8 @@ std::pair<int, json> handle(const json& body) {
   std::optional<std::string> settles;
   if (body.contains("settles") && body["settles"].is_string()) settles = body["settles"].get<std::string>();
   const int64_t posted_at = now_ms();
-  const std::string id = write_transaction(entries, body.value("description", ""), std::nullopt, posted_at, settles);
+  // An API post has no event id, so it is never a duplicate: there is always an id.
+  const std::string id = write_transaction(entries, body.value("description", ""), std::nullopt, posted_at, settles).value();
   json cleaned = json::array();
   for (const auto& e : entries) cleaned.push_back({{"account", e.account}, {"currency", e.currency}, {"amount", e.amount}});
   return {201, json{{"transaction_id", id}, {"posted_at", posted_at}, {"entries", cleaned}}};
@@ -1464,10 +1473,11 @@ nlohmann::json ledgerEntriesOf(const std::string& currency, std::initializer_lis
 }  // namespace
 
 // The journal writer of step 4 (ledger_writer.cpp): one database transaction, insert-or-skip on the
-// event id, the entries at the transaction's posted_at. Step 1 declares it returning the id ("" for
-// an already recorded event, which the API path, without event id, never meets).
-std::string write_transaction(const std::vector<Entry>& entries, const std::string& description, std::optional<std::string> event_id,
-                              int64_t posted_at, std::optional<std::string> settles) {
+// event id, the entries at the transaction's posted_at; std::nullopt for an already recorded event,
+// which the API path, without event id, never meets.
+std::optional<std::string> write_transaction(const std::vector<Entry>& entries, const std::string& description,
+                                             std::optional<std::string> event_id, int64_t posted_at,
+                                             std::optional<std::string> settles) {
   const std::string transaction_id = new_uuid();
   if (posted_at == 0) posted_at = now_ms();
   bool duplicate = false;
@@ -1483,7 +1493,8 @@ std::string write_transaction(const std::vector<Entry>& entries, const std::stri
       tx.exec_params("INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES ($1, $2, $3, $4, $5)",
                      transaction_id, e.account, e.currency, e.amount, posted_at);
   });
-  return duplicate ? "" : transaction_id;
+  if (duplicate) return std::nullopt;
+  return transaction_id;
 }
 
 namespace {

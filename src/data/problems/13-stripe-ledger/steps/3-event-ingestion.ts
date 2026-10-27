@@ -118,7 +118,7 @@ Implement \`to_entries(event)\` and the consumer loop \`run()\` in group **\`led
           all: [
             /kMapping\.find\(/,
             /-amount\b|-\s*event\.amount\b/,
-            /(?<!string )write_transaction\(/,
+            /(?<![\w>] )write_transaction\(/,
             /event(->|\.)occurred_at/,
           ],
         },
@@ -166,7 +166,7 @@ Implement \`to_entries(event)\` and the consumer loop \`run()\` in group **\`led
           order: [/ProducerRecord\[[^\]]*\]\(\s*DeadTopic/, /commit\(\s*record\s*\)/, /(?<!def )writeTransaction\(/],
         },
         cpp: {
-          order: [/produce\(\s*kDeadTopic/, /consumer->commitSync\(/, /continue/, /(?<!string )write_transaction\(/],
+          order: [/produce\(\s*kDeadTopic/, /consumer->commitSync\(/, /continue/, /(?<![\w>] )write_transaction\(/],
         },
       },
     },
@@ -180,7 +180,7 @@ Implement \`to_entries(event)\` and the consumer loop \`run()\` in group **\`led
         typescript: {order: [/await writeTransaction\(/, /await commit\(\)|\.commitOffsets\(/]},
         go: {order: [/(?<!func )writeTransaction\(/, /reader\.CommitMessages\(/]},
         scala: {order: [/(?<!def )writeTransaction\(/, /commit\(\s*record\s*\)/]},
-        cpp: {order: [/(?<!string )write_transaction\(/, /consumer->commitSync\(/]},
+        cpp: {order: [/(?<![\w>] )write_transaction\(/, /consumer->commitSync\(/]},
       },
     },
   ],
