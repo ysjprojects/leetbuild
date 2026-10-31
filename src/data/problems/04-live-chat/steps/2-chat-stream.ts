@@ -423,7 +423,7 @@ func main() {
 `,
     },
     scala: {
-      starter: `import chat.chat.{ChatGrpc, ClientMsg, ServerMsg}
+      starter: `import livechat.chat.{ChatGrpc, ClientMsg, ServerMsg}
 import io.grpc.{ServerBuilder, Status}
 import io.grpc.stub.{ServerCallStreamObserver, StreamObserver}
 import scala.concurrent.ExecutionContext
@@ -451,7 +451,7 @@ object ChatService extends ChatGrpc.Chat {
     ServerBuilder.forPort(9000).addService(ChatGrpc.bindService(this, ExecutionContext.global)).build().start().awaitTermination()
 }
 `,
-      solution: `import chat.chat.{ChatGrpc, ClientMsg, ServerMsg}
+      solution: `import livechat.chat.{ChatGrpc, ClientMsg, ServerMsg}
 import io.grpc.{ServerBuilder, Status}
 import io.grpc.stub.{ServerCallStreamObserver, StreamObserver}
 import scala.concurrent.ExecutionContext

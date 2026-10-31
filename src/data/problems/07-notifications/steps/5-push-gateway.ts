@@ -476,8 +476,8 @@ func sendPush(ctx context.Context, token, title, body, collapseKey string) (stri
       starter: `import java.util.concurrent.TimeUnit
 
 import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import notify.Devices // Devices.disable(token): marks a device token stale — provided
-import notify.push.{PushGatewayGrpc, SendRequest}
+import notifications.Devices // Devices.disable(token): marks a device token stale — provided
+import notifications.push.{PushGatewayGrpc, SendRequest}
 import scala.util.Random
 
 object PushClient {
@@ -505,8 +505,8 @@ object PushClient {
       solution: `import java.util.concurrent.TimeUnit
 
 import io.grpc.{ManagedChannelBuilder, Status, StatusRuntimeException}
-import notify.Devices // Devices.disable(token): marks a device token stale — provided
-import notify.push.{PushGatewayGrpc, SendRequest}
+import notifications.Devices // Devices.disable(token): marks a device token stale — provided
+import notifications.push.{PushGatewayGrpc, SendRequest}
 import scala.util.Random
 
 object PushClient {

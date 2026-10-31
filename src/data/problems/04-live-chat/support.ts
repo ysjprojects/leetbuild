@@ -1,3 +1,5 @@
+import {scalaTls} from '../scala-support';
+
 /**
  * Hand-written Python modules the live-chat starters import but no step builds: the per-instance
  * subscription table shared by the chat stream (step 2: `subscribe` / `unsubscribe`) and the room
@@ -265,5 +267,26 @@ int subscribers(const std::string& room) {
   auto it = subscriptions_by_room.find(room);
   return it == subscriptions_by_room.end() ? 0 : static_cast<int>(it->second.size());
 }
+`,
+};
+
+/**
+ * Scala: the TLS helper the history endpoint (step 4) serves HTTPS with, and ScalaPB's package option
+ * for chat.proto.
+ */
+export const supportModulesScala: Record<string, string> = {
+  ...scalaTls('livechat'),
+  'src/main/protobuf/chat/package.proto': `syntax = "proto3";
+
+package chat;
+
+import "scalapb/scalapb.proto";
+
+// ScalaPB puts package chat's classes in livechat.chat: in the generated service trait, rpc Chat's
+// method \`chat\` would hide a package named chat.
+option (scalapb.options) = {
+  scope: PACKAGE
+  package_name: "livechat"
+};
 `,
 };

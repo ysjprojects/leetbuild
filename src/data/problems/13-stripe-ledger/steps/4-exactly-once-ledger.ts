@@ -483,7 +483,7 @@ func writeTransaction(ctx context.Context, entries []Entry, description string, 
 
 import ledger.Db // Db.transaction { conn => ... } begins, runs the block, commits (rolls back on exception)
 
-final case class Entry(account: String, currency: String, amount: Long)
+// Entry is defined in step 1 (LedgerApi).
 
 object LedgerWriter {
   /** Built in step 5 (ClearingTracker) and step 6 (BalanceService). */
@@ -507,7 +507,7 @@ object LedgerWriter {
 
 import ledger.Db // Db.transaction { conn => ... } begins, runs the block, commits (rolls back on exception)
 
-final case class Entry(account: String, currency: String, amount: Long)
+// Entry is defined in step 1 (LedgerApi).
 
 object LedgerWriter {
   /** Built in step 5 (ClearingTracker) and step 6 (BalanceService). */

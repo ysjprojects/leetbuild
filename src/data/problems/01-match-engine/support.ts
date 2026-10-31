@@ -1,4 +1,5 @@
 import {CPP_IDS_H} from '../cpp-support';
+import {scalaPath, scalaTls} from '../scala-support';
 
 /**
  * Runtime support modules for the match-engine course: the provided price-time `Book` that step 3
@@ -458,5 +459,94 @@ class Book {
     side.insert(side.begin() + static_cast<std::ptrdiff_t>(index), order);
   }
 };
+`,
+};
+
+/** The same `Book`, for the Scala runtime: `import exchange.book.{Book, Order}`, then `new Book().matchOrder(order)`; and `exchange.Tls`. */
+export const supportModulesScala: Record<string, string> = {
+  ...scalaTls('exchange'),
+  [scalaPath('exchange.book', 'Book')]: `package exchange.book
+
+import scala.collection.mutable.ArrayBuffer
+import scala.util.Try
+
+import spray.json._
+import spray.json.DefaultJsonProtocol._
+
+/** A limit order, as the gateway publishes it on the orders topic. */
+final case class Order(orderId: String, symbol: String, side: String, price: Double, qty: Long, clientOrderId: String)
+
+/** Reads an order from the orders topic's JSON. */
+object Order {
+  implicit val format: RootJsonFormat[Order] =
+    jsonFormat(Order.apply, "order_id", "symbol", "side", "price", "qty", "client_order_id")
+
+  /** The order in json, or None when it is not a well-formed order. */
+  def parse(json: String): Option[Order] = Try(json.parseJson.convertTo[Order]).toOption
+}
+
+/** One trade: the incoming order (the taker) against one resting order. */
+final case class Fill(symbol: String, price: Double, qty: Long, buyOrderId: String, sellOrderId: String, takerSide: String) {
+  def toJson: String = Fill.format.write(this).compactPrint
+}
+
+/** Writes a fill as the trades topic's JSON. */
+object Fill {
+  implicit val format: RootJsonFormat[Fill] =
+    jsonFormat(Fill.apply, "symbol", "price", "qty", "buy_order_id", "sell_order_id", "taker_side")
+}
+
+/**
+ * The provided limit order book of one symbol: price-time priority.
+ *
+ * matchOrder(order) crosses the incoming order against the resting orders of the opposite side, best
+ * price first and oldest first at one price, fills at the resting order's price, and rests any remainder.
+ * It returns one Fill per resting order it traded against, in matching order.
+ */
+final class Book {
+  /** Best (highest) price first, oldest first within a price. */
+  val bids: ArrayBuffer[Order] = ArrayBuffer.empty
+  /** Best (lowest) price first, oldest first within a price. */
+  val asks: ArrayBuffer[Order] = ArrayBuffer.empty
+  /** The price of the last fill, 0 before the first. */
+  var last: Double = 0
+
+  /** The best bid, 0 when there is none. */
+  def bid: Double = bids.headOption.fold(0.0)(_.price)
+
+  /** The best ask, 0 when there is none. */
+  def ask: Double = asks.headOption.fold(0.0)(_.price)
+
+  /** (bid, ask, last) as the engine publishes them; 0 for an empty side or no trade yet. */
+  def top: (Double, Double, Double) = (bid, ask, last)
+
+  /** Crosses order against the book and rests what is left of it; throws on a side other than BUY or SELL. */
+  def matchOrder(order: Order): Seq[Fill] = {
+    require(order.side == "BUY" || order.side == "SELL", s"book: unknown side \${order.side}")
+    val buying = order.side == "BUY"
+    val resting = if (buying) asks else bids
+    var remaining = order.qty
+    val fills = Seq.newBuilder[Fill]
+    while (remaining > 0 && resting.nonEmpty && (if (buying) order.price >= resting.head.price else order.price <= resting.head.price)) {
+      val best = resting.head
+      val qty = math.min(remaining, best.qty)
+      val (buyId, sellId) = if (buying) (order.orderId, best.orderId) else (best.orderId, order.orderId)
+      fills += Fill(order.symbol, best.price, qty, buyId, sellId, order.side)
+      last = best.price
+      remaining -= qty
+      if (best.qty == qty) resting.remove(0) else resting(0) = best.copy(qty = best.qty - qty)
+    }
+    if (remaining > 0) rest(order.copy(qty = remaining))
+    fills.result()
+  }
+
+  /** Inserts order behind every resting order at its price or better. */
+  private def rest(order: Order): Unit = {
+    val (side, better) =
+      if (order.side == "BUY") (bids, (p: Double, q: Double) => p > q) else (asks, (p: Double, q: Double) => p < q)
+    val index = side.indexWhere(resting => better(order.price, resting.price))
+    side.insert(if (index < 0) side.length else index, order)
+  }
+}
 `,
 };

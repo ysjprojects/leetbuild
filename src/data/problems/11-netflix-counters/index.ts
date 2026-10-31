@@ -8,6 +8,7 @@ import {bestEffortStep} from './steps/2-best-effort';
 import {countEventsStep} from './steps/3-count-events';
 import {rollupStep} from './steps/4-rollup';
 import {countServiceStep} from './steps/5-count-service';
+import {supportModulesScala} from './support';
 
 /**
  * Netflix's distributed counter abstraction, rebuilt as its two halves behind one API. HTTPS
@@ -103,6 +104,12 @@ and the one API over them the same.`,
     ],
   },
   steps: [counterApiStep, bestEffortStep, countEventsStep, rollupStep, countServiceStep],
-  support: {python: protoModules, typescript: protoFiles, go: protoFiles, cpp: protoFiles},
+  support: {
+    python: protoModules,
+    typescript: protoFiles,
+    go: protoFiles,
+    cpp: protoFiles,
+    scala: {...protoFiles, ...supportModulesScala},
+  },
   learn,
 };

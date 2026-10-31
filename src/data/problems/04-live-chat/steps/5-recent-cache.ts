@@ -323,7 +323,7 @@ func recent(ctx context.Context, room string) ([]*pb.ServerMsg, error) {
 `,
     },
     scala: {
-      starter: `import chat.chat.ServerMsg
+      starter: `import livechat.chat.ServerMsg
 import redis.clients.jedis.JedisPooled
 import scala.jdk.CollectionConverters._
 import scalapb.json4s.JsonFormat
@@ -348,7 +348,7 @@ object RecentMessages {
   }
 }
 `,
-      solution: `import chat.chat.ServerMsg
+      solution: `import livechat.chat.ServerMsg
 import redis.clients.jedis.JedisPooled
 import scala.jdk.CollectionConverters._
 import scalapb.json4s.JsonFormat

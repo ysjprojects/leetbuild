@@ -493,7 +493,7 @@ import redis.clients.jedis.JedisPooled
 import redis.clients.jedis.params.SetParams
 import spray.json.DefaultJsonProtocol._
 import spray.json.RootJsonFormat
-import notify.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
+import notifications.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
 
 object NotifyApi {
   val jedis = new JedisPooled("redis", 6379)
@@ -542,7 +542,7 @@ import redis.clients.jedis.JedisPooled
 import redis.clients.jedis.params.SetParams
 import spray.json.DefaultJsonProtocol._
 import spray.json.RootJsonFormat
-import notify.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
+import notifications.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
 
 object NotifyApi {
   val jedis = new JedisPooled("redis", 6379)

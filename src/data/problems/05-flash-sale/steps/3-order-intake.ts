@@ -355,7 +355,7 @@ import java.util.concurrent.TimeUnit
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
 import org.apache.kafka.common.serialization.StringSerializer
 
-final case class Order(orderId: String, sku: String, qty: Int, user: String)
+// Order comes from the checkout endpoint (step 2).
 
 /** The broker did not confirm the order in time; the caller must release the hold. */
 final class OrderNotAcknowledged(orderId: String, cause: Throwable)
@@ -386,7 +386,7 @@ import java.util.concurrent.TimeUnit
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
 import org.apache.kafka.common.serialization.StringSerializer
 
-final case class Order(orderId: String, sku: String, qty: Int, user: String)
+// Order comes from the checkout endpoint (step 2).
 
 /** The broker did not confirm the order in time; the caller must release the hold. */
 final class OrderNotAcknowledged(orderId: String, cause: Throwable)

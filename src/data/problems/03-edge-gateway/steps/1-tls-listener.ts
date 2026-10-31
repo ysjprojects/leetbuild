@@ -339,7 +339,8 @@ func main() {
 `,
     },
     scala: {
-      starter: `import javax.net.ssl.SSLContext
+      starter: `import gateway.Tls
+import javax.net.ssl.SSLContext
 
 import scala.concurrent.duration._
 
@@ -374,7 +375,8 @@ object GatewayServer {
   }
 }
 `,
-      solution: `import javax.net.ssl.SSLContext
+      solution: `import gateway.Tls
+import javax.net.ssl.SSLContext
 
 import scala.concurrent.duration._
 

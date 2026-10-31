@@ -3,6 +3,7 @@
  * runtime's Postgres handle holding the `transactions` and `entries` tables.
  */
 import {CPP_DIGEST_H, CPP_IDS_H, cppTransactionDbH} from '../cpp-support';
+import {scalaPath, scalaTls} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'ledger/db.py': `"""The ledger database: \`async with db.transaction() as cur:\` begins, runs the block, commits
@@ -98,4 +99,45 @@ export const supportModulesCpp: Record<string, string> = {
   'db.h': cppTransactionDbH('The ledger database', 'postgresql://ledger@db:5432/ledger'),
   'ids.h': CPP_IDS_H,
   'digest.h': CPP_DIGEST_H,
+};
+
+/** The same handle for Scala: `ledger.Db`, JDBC on the runtime's Postgres, and the shared `ledger.Tls`. */
+export const supportModulesScala: Record<string, string> = {
+  ...scalaTls('ledger'),
+  [scalaPath('ledger', 'Db')]: `package ledger
+
+import java.sql.{Connection, DriverManager}
+
+/**
+ * The ledger database: Postgres through JDBC, ? placeholders.
+ *
+ * Tables:
+ *     transactions (id text primary key, event_id text unique, description text, settles text, posted_at bigint)
+ *     entries      (transaction_id text, account text, currency text, amount bigint, posted_at bigint)
+ */
+object Db {
+  private val Url = "jdbc:postgresql://db:5432/ledger?user=ledger"
+
+  /** Opens a connection (autocommit), runs \`f\` with it and closes it. */
+  def withConnection[T](f: Connection => T): T = {
+    val conn = DriverManager.getConnection(Url)
+    try f(conn)
+    finally conn.close()
+  }
+
+  /** Begins a transaction, runs \`f\` in it and commits; rolls back and rethrows when \`f\` throws. */
+  def transaction[T](f: Connection => T): T = withConnection { conn =>
+    conn.setAutoCommit(false)
+    try {
+      val result = f(conn)
+      conn.commit()
+      result
+    } catch {
+      case e: Throwable =>
+        conn.rollback()
+        throw e
+    }
+  }
+}
+`,
 };

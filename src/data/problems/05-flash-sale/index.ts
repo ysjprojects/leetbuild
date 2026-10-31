@@ -7,7 +7,7 @@ import {checkoutEndpointStep} from './steps/2-checkout-endpoint';
 import {orderIntakeStep} from './steps/3-order-intake';
 import {fulfilmentStep} from './steps/4-fulfilment';
 import {releaseExpiredStep} from './steps/5-release-expired';
-import {supportModulesCpp} from './support';
+import {supportModulesCpp, supportModulesScala} from './support';
 
 /**
  * Flash-sale inventory: a product drop where demand exceeds stock by orders of magnitude. Atomic
@@ -78,6 +78,12 @@ and the exact places where each one can lie to the others.`,
     ],
   },
   steps: [reserveStockStep, checkoutEndpointStep, orderIntakeStep, fulfilmentStep, releaseExpiredStep],
-  support: {python: protoModules, typescript: protoFiles, go: protoFiles, cpp: {...protoFiles, ...supportModulesCpp}},
+  support: {
+    python: protoModules,
+    typescript: protoFiles,
+    go: protoFiles,
+    cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
+  },
   learn,
 };

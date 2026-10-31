@@ -624,8 +624,7 @@ import scala.jdk.CollectionConverters._
 import scala.util.Try
 import spray.json._
 
-/** What step 1's storeMessage returns. */
-final case class StoredMessage(id: String, channelId: String, authorId: String, content: String, bucket: Int)
+// StoredMessage (what step 1's storeMessage returns) is defined in step 1 (PostMessage).
 
 object MessageEvents {
   val Topic = "message-events"
@@ -692,8 +691,7 @@ import scala.jdk.CollectionConverters._
 import scala.util.Try
 import spray.json._
 
-/** What step 1's storeMessage returns. */
-final case class StoredMessage(id: String, channelId: String, authorId: String, content: String, bucket: Int)
+// StoredMessage (what step 1's storeMessage returns) is defined in step 1 (PostMessage).
 
 object MessageEvents {
   val Topic = "message-events"

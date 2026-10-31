@@ -400,7 +400,7 @@ object Timeline {
     val pushed = p.lrange(s"timeline:$userId", 0, 2 * limit - 1)
     val pulled = celebrities.map(c => p.zrevrangeByScore(s"posts:$c", maxScore, "-inf", 0, limit))
     p.sync()
-    val fromList = pushed.get.asScala.filter(id => cursor.forall(c => Ids.createdAt(id) < c))
+    val fromList = pushed.get.asScala.toSeq.filter(id => cursor.forall(c => Ids.createdAt(id) < c))
     val candidates = (fromList ++ pulled.flatMap(_.get.asScala)).distinct
     val page = candidates.sortBy(id => -Ids.createdAt(id)).take(limit)
     (page, page.lastOption.map(Ids.createdAt))

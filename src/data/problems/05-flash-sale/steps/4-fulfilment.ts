@@ -653,7 +653,7 @@ import org.apache.kafka.clients.consumer.KafkaConsumer
 import org.apache.kafka.common.serialization.StringDeserializer
 import scala.jdk.CollectionConverters._
 
-final case class Order(orderId: String, sku: String, qty: Int)
+// Order(orderId, sku, qty, user) comes from the checkout endpoint (step 2).
 
 object FulfilmentConsumer {
   val DeadlineMillis = 5000L
@@ -709,7 +709,7 @@ import org.apache.kafka.clients.consumer.KafkaConsumer
 import org.apache.kafka.common.serialization.StringDeserializer
 import scala.jdk.CollectionConverters._
 
-final case class Order(orderId: String, sku: String, qty: Int)
+// Order(orderId, sku, qty, user) comes from the checkout endpoint (step 2).
 
 object FulfilmentConsumer {
   val DeadlineMillis = 5000L

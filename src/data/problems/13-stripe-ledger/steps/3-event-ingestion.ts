@@ -674,9 +674,10 @@ import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
 import spray.json._
+import spray.json.DefaultJsonProtocol._
 import scala.jdk.CollectionConverters._
 
-final case class Entry(account: String, currency: String, amount: Long)
+// Entry is defined in step 1 (LedgerApi).
 final case class Event(eventId: String, \`type\`: String, amount: Long, currency: String, occurredAt: Long)
 
 object EventConsumer {
@@ -741,9 +742,10 @@ import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
 import spray.json._
+import spray.json.DefaultJsonProtocol._
 import scala.jdk.CollectionConverters._
 
-final case class Entry(account: String, currency: String, amount: Long)
+// Entry is defined in step 1 (LedgerApi).
 final case class Event(eventId: String, \`type\`: String, amount: Long, currency: String, occurredAt: Long)
 
 object EventConsumer {

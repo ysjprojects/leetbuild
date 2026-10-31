@@ -1,4 +1,36 @@
+import {scalaPath, scalaTls} from '../scala-support';
 import {protoFiles} from './proto';
+
+/**
+ * Scala support of the url-shortener starters: `shortener.LinkStore`, the links table (code → long URL),
+ * and the shared `shortener.Tls` helper.
+ */
+export const supportModulesScala: Record<string, string> = {
+  ...scalaTls('shortener'),
+  [scalaPath('shortener', 'LinkStore')]: `package shortener
+
+import scala.collection.concurrent.TrieMap
+
+/** The links table (provided): short code → long URL, kept in memory in the browser runtime. */
+final class LinkStore private () {
+  private val urls = TrieMap.empty[String, String]
+
+  /** Whether code is taken. */
+  def exists(code: String): Boolean = urls.contains(code)
+
+  /** Stores code → url. */
+  def save(code: String, url: String): Unit = urls.update(code, url)
+
+  /** The URL saved for code, if any. */
+  def lookup(code: String): Option[String] = urls.get(code)
+}
+
+/** Opens the links table. */
+object LinkStore {
+  def open(): LinkStore = new LinkStore()
+}
+`,
+};
 
 /**
  * Hand-written Go packages the url-shortener starters import but no step builds: `shortener/links`,

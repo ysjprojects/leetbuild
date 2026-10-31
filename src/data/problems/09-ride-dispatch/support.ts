@@ -1,4 +1,5 @@
 import {CPP_IDS_H} from '../cpp-support';
+import {scalaPath, scalaTls} from '../scala-support';
 
 /**
  * Runtime support modules for the Python steps: the "provided" pieces the starters import but no
@@ -241,6 +242,38 @@ inline double haversine_km(const dispatch::LatLng& a, const dispatch::LatLng& b)
   const double d_lng = b.lng() * rad - a.lng() * rad;
   const double h = std::pow(std::sin(d_lat / 2), 2) + std::cos(lat1) * std::cos(lat2) * std::pow(std::sin(d_lng / 2), 2);
   return 2 * kEarthRadiusKm * std::asin(std::sqrt(h));
+}
+`,
+};
+
+/** The Scala twins: the TLS context for the ride API and Geo (step 6), the grid cell and the great-circle distance. */
+export const supportModulesScala: Record<string, string> = {
+  ...scalaTls('dispatch'),
+  [scalaPath('dispatch', 'Geo')]: `package dispatch
+
+import dispatch.routing.LatLng
+
+/** Geo helpers (provided): a ~1 km grid id for cache keys and the great-circle distance. */
+object Geo {
+  val EarthRadiusKm = 6371.0088
+  /** ~1.1 km of latitude. */
+  val CellDeg = 0.01
+
+  /** A ~1 km grid id: both coordinates floored to 0.01 degrees, as 8 hex digits. */
+  def cell(lat: Double, lng: Double): String = {
+    def part(deg: Double): String = f"\${math.floor(deg / CellDeg).toInt & 0xffff}%04x"
+    part(lat) + part(lng)
+  }
+
+  /** Great-circle distance between a and b, in km. */
+  def haversineKm(a: LatLng, b: LatLng): Double = {
+    val lat1 = math.toRadians(a.lat)
+    val lat2 = math.toRadians(b.lat)
+    val dLat = lat2 - lat1
+    val dLng = math.toRadians(b.lng) - math.toRadians(a.lng)
+    val h = math.pow(math.sin(dLat / 2), 2) + math.cos(lat1) * math.cos(lat2) * math.pow(math.sin(dLng / 2), 2)
+    2 * EarthRadiusKm * math.asin(math.sqrt(h))
+  }
 }
 `,
 };

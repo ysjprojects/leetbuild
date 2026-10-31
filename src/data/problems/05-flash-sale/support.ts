@@ -1,5 +1,6 @@
-/** Hand-written C++ support the flash-sale starters include but no step builds: `ids.h` (order ids). */
+/** Hand-written support the flash-sale starters include but no step builds: C++ `ids.h` (order ids), Scala `flashsale.Tls`. */
 import {CPP_IDS_H} from '../cpp-support';
+import {scalaTls} from '../scala-support';
 
 export const supportModulesCpp: Record<string, string> = {
   'ids.h': `${CPP_IDS_H}
@@ -11,4 +12,8 @@ inline std::string new_order_id() {
   return id;
 }
 `,
+};
+
+export const supportModulesScala: Record<string, string> = {
+  ...scalaTls('flashsale'),
 };

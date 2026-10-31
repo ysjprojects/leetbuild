@@ -4,6 +4,7 @@
  * step 5 dedupes in front of).
  */
 import {CPP_IDS_H, cppTransactionDbH} from '../cpp-support';
+import {scalaPath, scalaTls} from '../scala-support';
 
 export const supportModules: Record<string, string> = {
   'payments/db.py': `"""The order database: \`async with db.transaction() as cur:\` begins, runs the block, commits
@@ -201,5 +202,74 @@ inline std::vector<Event> posted;
 inline std::function<void(const Event&)> post = [](const Event& event) { posted.push_back(event); };
 
 }  // namespace ledger
+`,
+};
+
+/** The Scala twins: `payments.Db` (JDBC on the runtime's Postgres), `payments.Ledger` (the journal), `payments.Tls`. */
+export const supportModulesScala: Record<string, string> = {
+  ...scalaTls('payments'),
+  [scalaPath('payments', 'Db')]: `package payments
+
+import java.sql.{Connection, DriverManager}
+
+/** The order database: Postgres over JDBC. \`transaction\` begins, runs the block, commits (rolls back on exception). */
+object Db {
+  private val Url = "jdbc:postgresql://db:5432/app?user=app"
+
+  def transaction[A](block: Connection => A): A = {
+    val conn = DriverManager.getConnection(Url)
+    try {
+      conn.setAutoCommit(false)
+      try {
+        val result = block(conn)
+        conn.commit()
+        result
+      } catch {
+        case e: Throwable => conn.rollback(); throw e
+      }
+    } finally conn.close()
+  }
+}
+`,
+  [scalaPath('payments', 'Ledger')]: `package payments
+
+import scala.collection.mutable.ArrayBuffer
+
+/**
+ * The ledger: \`post(event)\` books one payment.captured event as double-entry rows.
+ * NOT idempotent: posting the same event twice books the money twice. \`posted\` is the journal.
+ */
+object Ledger {
+  /** One payment.captured event, as the outbox relay publishes it. */
+  final case class Event(
+      eventId: String,
+      \`type\`: String,
+      merchantId: String,
+      orderId: String,
+      amountCents: Long,
+      currency: String,
+      capturedAt: String)
+
+  object Event {
+    /** Parses the relay's JSON payload. */
+    def fromJson(json: String): Event = {
+      val o = ujson.read(json).obj
+      Event(
+        eventId = o("event_id").str,
+        \`type\` = o("type").str,
+        merchantId = o("merchant_id").str,
+        orderId = o("order_id").str,
+        amountCents = o("amount_cents").num.toLong,
+        currency = o("currency").str,
+        capturedAt = o("captured_at").str)
+    }
+  }
+
+  /** The journal: every event \`post\` booked, duplicates included. */
+  val posted: ArrayBuffer[Event] = ArrayBuffer.empty
+
+  /** Books the event; every call appends a journal entry, duplicates included. */
+  def post(event: Event): Unit = synchronized { posted += event }
+}
 `,
 };

@@ -574,6 +574,7 @@ import discord.Tls // Tls.serverContext — provided
 import redis.clients.jedis.JedisPooled
 import scala.jdk.CollectionConverters._
 import spray.json._
+import spray.json.DefaultJsonProtocol._
 
 // Built in step 1 (PostMessage: NewMessage, StoredMessage, validContent, storeMessage), step 2 (ReadMessages.latestSnowflake),
 // step 4 (ChannelRouting.fetchMessages) and step 5 (MessageEvents.publish).
@@ -629,6 +630,7 @@ import discord.Tls // Tls.serverContext — provided
 import redis.clients.jedis.JedisPooled
 import scala.jdk.CollectionConverters._
 import spray.json._
+import spray.json.DefaultJsonProtocol._
 
 // Built in step 1 (PostMessage: NewMessage, StoredMessage, validContent, storeMessage), step 2 (ReadMessages.latestSnowflake),
 // step 4 (ChannelRouting.fetchMessages) and step 5 (MessageEvents.publish).

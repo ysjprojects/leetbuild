@@ -8,7 +8,7 @@ import {matchConsumerStep} from './steps/3-match-consumer';
 import {topOfBookStep} from './steps/4-top-of-book';
 import {streamTicksStep} from './steps/5-stream-ticks';
 import {bookSnapshotStep} from './steps/6-book-snapshot';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * Match engine: an exchange in miniature. HTTPS order gateway with auth, validation and an
@@ -80,6 +80,7 @@ order matters.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
   },
   learn,
 };

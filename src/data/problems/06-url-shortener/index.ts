@@ -7,7 +7,7 @@ import {keyServiceStep} from './steps/2-key-service';
 import {redirectCacheStep} from './steps/3-redirect-cache';
 import {clickEventsStep} from './steps/4-click-events';
 import {topLinksStep} from './steps/5-top-links';
-import {supportModulesCpp, supportModulesGo} from './support';
+import {supportModulesCpp, supportModulesGo, supportModulesScala} from './support';
 
 /**
  * URL shortener: the classic interview warm-up, built as the four pieces that actually matter.
@@ -79,6 +79,7 @@ services — are made of.`,
     typescript: protoFiles,
     go: {...protoFiles, ...supportModulesGo},
     cpp: supportModulesCpp,
+    scala: {...protoFiles, ...supportModulesScala},
   },
   learn,
 };

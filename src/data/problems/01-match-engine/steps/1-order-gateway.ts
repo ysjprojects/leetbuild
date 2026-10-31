@@ -482,6 +482,8 @@ import org.apache.pekko.http.scaladsl.server.Route
 import spray.json.DefaultJsonProtocol._
 import spray.json.RootJsonFormat
 
+import exchange.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
+
 object OrderGateway {
   val Sides = Set("BUY", "SELL")
   val ApiKeys = Map("k-1f9c" -> "desk-a", "k-77b2" -> "desk-b")
@@ -528,6 +530,8 @@ import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json.DefaultJsonProtocol._
 import spray.json.RootJsonFormat
+
+import exchange.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
 
 object OrderGateway {
   val Sides = Set("BUY", "SELL")

@@ -1,3 +1,5 @@
+import {scalaPath, scalaTls} from '../scala-support';
+
 /**
  * Hand-written support module the discord-messages starters import but no step builds:
  * `messages.db`, the runtime's Postgres handle with the `messages` schema beside it. Snowflakes are
@@ -187,5 +189,45 @@ pqxx::result exec(const std::string& sql, const Args&... params) {
 }
 
 }  // namespace db
+`,
+};
+
+/**
+ * The Scala twin: `discord.Db`, the runtime's Postgres through JDBC, with the schema beside it.
+ * Snowflakes are Long in Scala; the numeric id columns read with getLong.
+ */
+export const supportModulesScala: Record<string, string> = {
+  ...scalaTls('discord'),
+  [scalaPath('discord', 'Db')]: `package discord
+
+import java.sql.{Connection, DriverManager}
+
+/**
+ * The messages table (provided): the runtime's Postgres through JDBC. ? placeholders.
+ *
+ * Ids are 64-bit snowflakes: bind them with setLong and read the numeric id columns with getLong.
+ */
+object Db {
+  /** The messages table: one partition per (channel_id, bucket), rows in message_id order. */
+  val Schema: String = """
+CREATE TABLE messages (
+    channel_id numeric(20, 0) NOT NULL,
+    bucket integer NOT NULL,
+    message_id numeric(20, 0) NOT NULL,
+    author_id numeric(20, 0) NOT NULL,
+    content text NOT NULL,
+    PRIMARY KEY (channel_id, bucket, message_id)
+);
+"""
+
+  private val Url = "jdbc:postgresql://db:5432/app?user=app"
+
+  /** Opens a connection (autocommit), runs \`f\` with it and closes it. */
+  def withConnection[T](f: Connection => T): T = {
+    val conn = DriverManager.getConnection(Url)
+    try f(conn)
+    finally conn.close()
+  }
+}
 `,
 };

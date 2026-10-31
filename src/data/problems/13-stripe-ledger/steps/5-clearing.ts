@@ -487,7 +487,7 @@ import redis.clients.jedis.JedisPooled
 import spray.json._
 import scala.jdk.CollectionConverters._
 
-final case class Entry(account: String, currency: String, amount: Long)
+// Entry is defined in step 1 (LedgerApi).
 final case class StuckItem(transactionId: String, openedAt: Long, ageS: Long)
 
 object ClearingTracker {
@@ -536,7 +536,7 @@ import redis.clients.jedis.JedisPooled
 import spray.json._
 import scala.jdk.CollectionConverters._
 
-final case class Entry(account: String, currency: String, amount: Long)
+// Entry is defined in step 1 (LedgerApi).
 final case class StuckItem(transactionId: String, openedAt: Long, ageS: Long)
 
 object ClearingTracker {

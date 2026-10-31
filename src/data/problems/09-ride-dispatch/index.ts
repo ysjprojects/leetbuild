@@ -8,7 +8,7 @@ import {nearestDriversStep} from './steps/3-nearest-drivers';
 import {offerLockStep} from './steps/4-offer-lock';
 import {tripEventsStep} from './steps/5-trip-events';
 import {etaStep} from './steps/6-eta';
-import {supportModules, supportModulesCpp, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * Ride dispatch: an idempotent ride request API → driver positions streamed over gRPC into Redis
@@ -81,6 +81,7 @@ you must not let take you down.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: protoFiles,
     cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
   },
   learn,
 };

@@ -965,8 +965,10 @@ import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecor
 import org.apache.kafka.common.serialization.StringSerializer
 import redis.clients.jedis.JedisPooled
 import spray.json._
+import spray.json.DefaultJsonProtocol._
 
 import assistant.Config // Config.Topic, Config.HistoryTtlS, Config.RateLimitPerMinute
+import assistant.Prompt // Prompt.Chunk(id, text, score)
 import assistant.Prompt.Turn // Turn(role, text)
 
 final case class ChatRequest(sessionId: String, dasherId: String, message: String)
@@ -1042,8 +1044,10 @@ import org.apache.kafka.clients.producer.{Callback, KafkaProducer, ProducerRecor
 import org.apache.kafka.common.serialization.StringSerializer
 import redis.clients.jedis.JedisPooled
 import spray.json._
+import spray.json.DefaultJsonProtocol._
 
 import assistant.Config // Config.Topic, Config.HistoryTtlS, Config.RateLimitPerMinute
+import assistant.Prompt // Prompt.Chunk(id, text, score)
 import assistant.Prompt.Turn // Turn(role, text)
 
 final case class ChatRequest(sessionId: String, dasherId: String, message: String)
@@ -1129,7 +1133,7 @@ object SupportApi {
             val (answer, sources, escalated, model, tokens, cached) = KbSearch.cachedAnswer(req.message) match {
               case Some(hit) => (hit.answer, hit.sources, false, "cache", 0, true)
               case None =>
-                val chunks = KbSearch.search(req.message)
+                val chunks = KbSearch.search(req.message).map(h => Prompt.Chunk(h.id, h.text, h.score))
                 val out = Guardrail.answerOrEscalate(req.message, chunks, history)
                 if (!out.escalated) KbSearch.rememberAnswer(req.message, out.answer, out.sources)
                 (out.answer, out.sources, out.escalated, out.model, out.tokens, false)

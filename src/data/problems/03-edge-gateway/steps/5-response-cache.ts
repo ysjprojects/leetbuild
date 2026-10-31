@@ -393,7 +393,7 @@ object ResponseCache {
 
   private def respond(status: StatusCode, contentType: String, body: String, cache: String): Route = {
     val ct = ContentType.parse(contentType).getOrElse(ContentTypes.\`application/json\`)
-    complete(HttpResponse(status, headers = List(RawHeader("X-Cache", cache)), entity = HttpEntity(ct, body)))
+    complete(HttpResponse(status, headers = List(RawHeader("X-Cache", cache)), entity = HttpEntity(ct, body.getBytes("UTF-8"))))
   }
 
   private def cacheKey(request: HttpRequest): String = {
@@ -428,7 +428,7 @@ object ResponseCache {
 
   private def respond(status: StatusCode, contentType: String, body: String, cache: String): Route = {
     val ct = ContentType.parse(contentType).getOrElse(ContentTypes.\`application/json\`)
-    complete(HttpResponse(status, headers = List(RawHeader("X-Cache", cache)), entity = HttpEntity(ct, body)))
+    complete(HttpResponse(status, headers = List(RawHeader("X-Cache", cache)), entity = HttpEntity(ct, body.getBytes("UTF-8"))))
   }
 
   private def cacheKey(request: HttpRequest): String = {

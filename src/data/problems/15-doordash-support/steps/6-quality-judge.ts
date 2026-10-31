@@ -703,6 +703,7 @@ import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetA
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.serialization.StringDeserializer
 import spray.json._
+import spray.json.DefaultJsonProtocol._
 import scala.jdk.CollectionConverters._
 
 import assistant.{Config, Db} // Db.connection: the assistant's JDBC connection (autocommit)
@@ -770,6 +771,7 @@ import org.apache.kafka.clients.consumer.{ConsumerRecord, KafkaConsumer, OffsetA
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.serialization.StringDeserializer
 import spray.json._
+import spray.json.DefaultJsonProtocol._
 import scala.jdk.CollectionConverters._
 
 import assistant.{Config, Db} // Db.connection: the assistant's JDBC connection (autocommit)

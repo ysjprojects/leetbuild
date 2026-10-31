@@ -9,7 +9,7 @@ import {dataServiceStep} from './steps/3-data-service';
 import {channelRoutingStep} from './steps/4-channel-routing';
 import {messageEventsStep} from './steps/5-message-events';
 import {hotChannelsStep} from './steps/6-hot-channels';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * Discord's message store, from the two posts that describe it: snowflake ids and (channel, bucket)
@@ -128,6 +128,7 @@ channel.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
   },
   learn,
 };

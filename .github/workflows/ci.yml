@@ -67,6 +67,22 @@ jobs:
       # in parallel across the runner's cores, and runs their harnesses.
       - run: yarn verify --runtime cpp --shard ${{ matrix.shard }}/8
 
+  scala:
+    name: Compile Scala
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: yarn
+      - run: yarn install --frozen-lockfile
+      # Scala is judged statically in the browser, so this is what keeps it compiling: scala-cli (pinned by
+      # digest) brings the JVM, Scala 2.13 and the libraries the courses use, and compiles each course's
+      # solutions as one project, then each starter in its solution's place.
+      - run: yarn check:scala
+
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -84,7 +100,7 @@ jobs:
     name: CI
     # Runs even when a job above fails or is cancelled: a skipped required check counts as passing.
     if: always()
-    needs: [lint, verify, verify-cpp, build]
+    needs: [lint, verify, verify-cpp, scala, build]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

@@ -863,7 +863,7 @@ object Gates {
         val now = System.currentTimeMillis() / 1000
         val userId = attrs.getOrElse("user_id", "")
         gate.overrides.find(o => o.userId == userId && o.expiresAt > now) match {
-          case Some(override) => override.variant
+          case Some(o) => o.variant
           case None =>
             gate.populations
               .find(p => p.\`match\`.forall { case (key, value) => attrs.get(key).contains(value) })

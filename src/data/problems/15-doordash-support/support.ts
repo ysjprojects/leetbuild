@@ -7,6 +7,7 @@
  * nearest neighbour or a judge score is the same in both runtimes.
  */
 import {CPP_DIGEST_H} from '../cpp-support';
+import {scalaPath} from '../scala-support';
 
 const ARTICLES: {id: string; title: string; body: string}[] = [
   {
@@ -1723,4 +1724,228 @@ Verdict check(const std::string& question, const std::string& answer, const std:
 Outcome answer_or_escalate(const std::string& question, const std::vector<prompt::Chunk>& chunks, const std::vector<prompt::Turn>& history);
 `,
   'digest.h': CPP_DIGEST_H,
+};
+
+const articlesScala = ARTICLES.map(
+  a => `    Article(${JSON.stringify(a.id)}, ${JSON.stringify(a.title)}, ${JSON.stringify(a.body)}),`,
+).join('\n');
+
+/** The Scala twins: the same `assistant` objects, computing the same numbers from the same text. */
+export const supportModulesScala: Record<string, string> = {
+  [scalaPath('assistant', 'Config')]: `package assistant
+
+/** The addresses, topics and limits every step of the assistant agrees on. */
+object Config {
+  // The stand-in model server (served by the harness) at two addresses, and the LLM judge.
+  val LlmLarge = "llm-large:50051"
+  val LlmSmall = "llm-small:50051"
+  val Judge = "judge:50051"
+
+  // Kafka: one record per answered turn, keyed by session; the offline judge's consumer group.
+  val Topic = "support-conversations"
+  val Group = "quality-judge"
+
+  // Redis. The TTLs are in seconds.
+  val HistoryTtlS = 86400
+  val CacheTtlS = 3600
+  val RateLimitPerMinute = 20
+
+  // Retrieval and generation.
+  val TopK = 4
+  val MaxTokens = 120
+  val DeadlineS = 2.0
+  val MinSimilarity = 0.3
+  val HandoffText = "I've passed this to a support agent, who will follow up with you shortly."
+}
+`,
+  [scalaPath('assistant', 'Chunk')]: `package assistant
+
+/** Fixed-size word windows with overlap: the chunking every step and the harness agree on. */
+object Chunk {
+  /** A chunk is ChunkWords words; consecutive chunks share OverlapWords of them. */
+  val ChunkWords = 48
+  val OverlapWords = 12
+
+  /** The text's windows of ChunkWords words, each starting ChunkWords - OverlapWords after the previous; none for an empty text. */
+  def chunk(text: String): Seq[String] = {
+    val words = text.split("\\\\s+").filter(_.nonEmpty).toSeq
+    if (words.isEmpty) Seq.empty
+    else
+      Iterator
+        .iterate(0)(_ + ChunkWords - OverlapWords)
+        .takeWhile(start => start == 0 || start + OverlapWords < words.length)
+        .map(start => words.slice(start, start + ChunkWords).mkString(" "))
+        .toSeq
+  }
+}
+`,
+  [scalaPath('assistant', 'Kb')]: `package assistant
+
+/** The support knowledge base: ten short articles. Chunk ids are "<article>-<position>". */
+object Kb {
+  /** One page of the knowledge base. */
+  final case class Article(id: String, title: String, body: String)
+
+  /** The whole knowledge base. */
+  val articles: Seq[Article] = Seq(
+${articlesScala}
+  )
+
+  /** The article with this id, if there is one. */
+  def find(id: String): Option[Article] = articles.find(_.id == id)
+}
+`,
+  [scalaPath('assistant', 'Embed')]: `package assistant
+
+import java.util.Locale
+
+/**
+ * Deterministic text embeddings for the course: a TF-IDF vector over the knowledge base's vocabulary
+ * (each word a dimension, weighted by how rare it is across the KB's chunks; words the KB never saw
+ * share a hashed band at the end), L2-normalised, 512 dimensions. Not a language model — a stand-in
+ * with the properties retrieval relies on: the same text always gives the same vector, texts sharing
+ * rare words land close together (cosine), and function words count for nothing. toPgvector writes a
+ * vector the way pgvector reads it: "[0.1,0.2,...]". The same numbers as the other languages' modules.
+ */
+object Embed {
+  /** The length of every vector. */
+  val Dim = 512
+
+  /** Words that carry no topic; without them a question's vector points at its subject, as a real embedding's would. */
+  val StopWords: Set[String] =
+    ("a an and are as at be been but by can could did do does for from get got had has have he her his how i if in is it its " +
+      "me my no not of on or our she so that the their them they this to up us was we were what when where which who will with would you your")
+      .split(" ")
+      .toSet
+
+  private val Word = "[a-z0-9]+".r
+
+  /** The text's lower-cased words, stop words left out. */
+  def tokenize(text: String): Seq[String] =
+    Word.findAllIn(text.toLowerCase(Locale.ROOT)).filterNot(StopWords).toSeq
+
+  /** tokenize(text).length. */
+  def countTokens(text: String): Int = tokenize(text).length
+
+  // The vocabulary and document frequencies come from the KB's chunks, so every process computes the same vector.
+  private val chunks: Seq[String] = Kb.articles.flatMap(a => Chunk.chunk(a.body))
+  private val df: Map[String, Int] = chunks.flatMap(c => tokenize(c).distinct).groupMapReduce(identity)(_ => 1)(_ + _)
+
+  /** Every word of the KB's chunks, sorted: the first vocab.length dimensions. */
+  val vocab: IndexedSeq[String] = df.keys.toIndexedSeq.sorted
+  private val index: Map[String, Int] = vocab.zipWithIndex.toMap
+
+  /** log(1 + N/df): a word in every chunk weighs little, a word in one weighs most; an unseen word most of all. */
+  def idf(word: String): Double = math.log(1 + chunks.length / df.get(word).fold(0.5)(_.toDouble))
+
+  private def fnv1a(s: String): Long =
+    s.getBytes("UTF-8").foldLeft(0x811c9dc5L)((h, b) => ((h ^ (b & 0xff)) * 0x01000193L) & 0xffffffffL)
+
+  private def slot(word: String): Int =
+    index.getOrElse(word, vocab.length + (fnv1a(word) % (Dim - vocab.length)).toInt)
+
+  /** The text's unit vector, each component rounded to 6 decimals (all zeros for a text of stop words). */
+  def embed(text: String): Array[Double] = {
+    val v = new Array[Double](Dim)
+    tokenize(text).foreach(tok => v(slot(tok)) += idf(tok))
+    val norm = math.sqrt(v.map(x => x * x).sum)
+    if (norm == 0) v else v.map(x => math.rint(x / norm * 1e6) / 1e6)
+  }
+
+  /** The cosine similarity of a and b, 0 when either is all zeros. */
+  def cosine(a: Array[Double], b: Array[Double]): Double = {
+    val pairs = a.zip(b)
+    val na = pairs.map { case (x, _) => x * x }.sum
+    val nb = pairs.map { case (_, y) => y * y }.sum
+    if (na == 0 || nb == 0) 0.0 else pairs.map { case (x, y) => x * y }.sum / (math.sqrt(na) * math.sqrt(nb))
+  }
+
+  /** v as pgvector's text form, "[0.100000,0.200000,...]"; cast it with CAST(? AS vector). */
+  def toPgvector(v: Array[Double]): String = v.map(x => String.format(Locale.ROOT, "%.6f", Double.box(x))).mkString("[", ",", "]")
+
+  /** Reads pgvector's text form back. */
+  def fromPgvector(s: String): Array[Double] =
+    s.stripPrefix("[").stripSuffix("]").split(",").map(_.trim).filter(_.nonEmpty).map(_.toDouble)
+}
+`,
+  [scalaPath('assistant', 'Prompt')]: `package assistant
+
+/**
+ * The one prompt format: instructions, the retrieved chunks as "[kb:<id>] <text>" lines, the
+ * conversation so far, then the question. The stand-in model reads chunk ids from these lines,
+ * which is what lets a check tell a grounded answer from an invented one.
+ */
+object Prompt {
+  /** A retrieved piece of the knowledge base: its id, its text and how close it was to the question. */
+  final case class Chunk(id: String, text: String, score: Double = 0)
+
+  /** One message of a conversation; role is "dasher" or "assistant". */
+  final case class Turn(role: String, text: String)
+
+  /** Opens every prompt. */
+  val Instructions: String =
+    "You are a Dasher support assistant. Answer only from the context below and cite the chunks you " +
+      "use as [kb:<id>]. If the context does not answer the question, say so."
+
+  /** The prompt for question, grounded in chunks, after history. */
+  def build(question: String, chunks: Seq[Chunk], history: Seq[Turn] = Seq.empty): String =
+    (Seq(Instructions, "", "Context:") ++
+      chunks.map(c => s"[kb:\${c.id}] \${c.text}") ++
+      Seq("", "History:") ++
+      history.map(t => s"\${t.role}: \${t.text}") ++
+      Seq("", s"Question: $question", "Answer:")).mkString("\\n")
+
+  private val Cite = """\\[kb:([^\\]]+)\\]""".r
+
+  /** The chunk ids an answer cites, in order, without duplicates. */
+  def citedIds(answer: String): Seq[String] = Cite.findAllMatchIn(answer).map(_.group(1)).toSeq.distinct
+}
+`,
+  [scalaPath('assistant', 'Db')]: `package assistant
+
+import java.sql.{Connection, DriverManager}
+import scala.util.Using
+
+/**
+ * The assistant's Postgres (with pgvector), through JDBC: Db.connection is a shared connection in
+ * autocommit mode for one statement at a time; Db.withConnection { conn => ... } opens a connection
+ * of its own for a transaction (setAutoCommit(false), then commit()) and closes it afterwards.
+ * Statements use ? placeholders. Schema is what the harness applies before a check.
+ *
+ * Tables:
+ *   kb_chunks      (id text primary key, article text, position int, text text, embedding vector(512))
+ *   quality_scores (session_id text, turn int, groundedness real, coherence real, compliance real, pass boolean,
+ *                   primary key (session_id, turn))
+ */
+object Db {
+  val Url = "jdbc:postgresql://db/assistant?user=assistant"
+
+  /** The shared connection, autocommit. */
+  lazy val connection: Connection = DriverManager.getConnection(Url)
+
+  /** Runs f on a connection of its own, closed afterwards. */
+  def withConnection[A](f: Connection => A): A = Using.resource(DriverManager.getConnection(Url))(f)
+
+  /** Creates the assistant's tables. */
+  val Schema: String =
+    """CREATE EXTENSION IF NOT EXISTS vector;
+      |CREATE TABLE kb_chunks (
+      |  id text PRIMARY KEY,
+      |  article text NOT NULL,
+      |  position int NOT NULL,
+      |  text text NOT NULL,
+      |  embedding vector(512) NOT NULL
+      |);
+      |CREATE TABLE quality_scores (
+      |  session_id text NOT NULL,
+      |  turn int NOT NULL,
+      |  groundedness real NOT NULL,
+      |  coherence real NOT NULL,
+      |  compliance real NOT NULL,
+      |  pass boolean NOT NULL,
+      |  PRIMARY KEY (session_id, turn)
+      |);
+      |""".stripMargin
+}
+`,
 };

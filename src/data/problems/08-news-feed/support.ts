@@ -1,3 +1,5 @@
+import {scalaPath, scalaTls} from '../scala-support';
+
 /**
  * Provided runtime modules the news-feed starters import but no step builds: the follow graph,
  * the post store, the `posts` topic publisher and the id ↔ timestamp helper.
@@ -607,5 +609,209 @@ inline std::optional<feed::Post> decode(const std::string& text) {
 }
 
 }  // namespace post_json
+`,
+};
+
+/** The same provided modules for the Scala runtime, one object per package (`import feed.store.{Post, Posts}`). */
+export const supportModulesScala: Record<string, string> = {
+  ...scalaTls('feed'),
+  [scalaPath('feed.graph', 'Graph')]: `package feed.graph
+
+import scala.collection.concurrent.TrieMap
+
+/** The follow graph (provided): in-memory tables the harness and your own experiments fill. */
+object Graph {
+  /** Author id → the ids of every user following them. */
+  val followersOf: TrieMap[String, Seq[String]] = TrieMap.empty
+  /** User id → the celebrity accounts they follow. */
+  val celebritiesFollowedBy: TrieMap[String, Seq[String]] = TrieMap.empty
+
+  /** Ids of every user following authorId. */
+  def followers(authorId: String): Seq[String] = followersOf.getOrElse(authorId, Nil)
+
+  /** Ids of the celebrity accounts userId follows (their posts are pulled at read time, not pushed). */
+  def celebritiesFollowed(userId: String): Seq[String] = celebritiesFollowedBy.getOrElse(userId, Nil)
+}
+`,
+  [scalaPath('feed.ids', 'Ids')]: `package feed.ids
+
+import java.util.UUID
+
+/** Post ids carry their creation time: "<created_at ms>-<suffix>". */
+object Ids {
+  /** A fresh id for a post created at createdAtMs. */
+  def newId(createdAtMs: Long): String = createdAtMs.toString + "-" + UUID.randomUUID().toString.replace("-", "").take(8)
+
+  /** Milliseconds since the epoch encoded in postId. */
+  def createdAt(postId: String): Long = postId.takeWhile(_ != '-').toLongOption.getOrElse(0L)
+}
+`,
+  [scalaPath('feed.store', 'Store')]: `package feed.store
+
+import redis.clients.jedis.JedisPooled
+import redis.clients.jedis.params.SetParams
+
+/** A post as it is stored and published. */
+final case class Post(id: String, author: String, text: String, mediaIds: Seq[String], createdAt: Long, idempotencyKey: String = "") {
+  /** The post as JSON: {"post_id", "author", "text", "media_ids", "created_at", "idempotency_key"?}. */
+  def toJson: String = {
+    val doc = ujson.Obj("post_id" -> id, "author" -> author, "text" -> text, "media_ids" -> mediaIds, "created_at" -> createdAt)
+    if (idempotencyKey.nonEmpty) doc("idempotency_key") = idempotencyKey
+    ujson.write(doc)
+  }
+}
+
+object Post {
+  /** The post encoded by Post.toJson. */
+  def fromJson(json: String): Post = {
+    val doc = ujson.read(json)
+    Post(
+      doc("post_id").str,
+      doc("author").str,
+      doc("text").str,
+      doc.obj.get("media_ids").map(_.arr.map(_.str).toSeq).getOrElse(Nil),
+      doc("created_at").num.toLong,
+      doc.obj.get("idempotency_key").map(_.str).getOrElse(""),
+    )
+  }
+}
+
+/** The post store (provided): each post as JSON at post:{id}, the posts:{author} index scored by created_at, and the Idempotency-Key dedupe. */
+object Posts {
+  val PostTtlSeconds = 3600L
+  val IdempotencyTtlSeconds = 24L * 3600
+
+  private val redis = new JedisPooled("redis", 6379)
+
+  /** Stores the post and indexes it under its author; a post whose idempotency key its author already used is that earlier post, returned instead. */
+  def save(post: Post): Post = {
+    val idem = if (post.idempotencyKey.nonEmpty) Some("idem:" + post.author + ":" + post.idempotencyKey) else None
+    idem.flatMap(key => Option(redis.get(key))) match {
+      case Some(existing) => Post.fromJson(existing)
+      case None =>
+        val doc = post.toJson
+        redis.set("post:" + post.id, doc, SetParams.setParams().ex(PostTtlSeconds))
+        redis.zadd("posts:" + post.author, post.createdAt.toDouble, post.id)
+        idem.foreach(key => redis.set(key, doc, SetParams.setParams().ex(IdempotencyTtlSeconds)))
+        post
+    }
+  }
+
+  /** The post postId, if there is one. */
+  def get(postId: String): Option[Post] = Option(redis.get("post:" + postId)).map(Post.fromJson)
+}
+
+/** The home-timeline read (provided as a facade): step 3 builds the real one and plugs it in as reader. */
+object Timeline {
+  /** userId, cursor, limit → a page of post ids, newest first, and the next cursor; an empty page until step 3. */
+  @volatile var reader: (String, Option[Long], Int) => (Seq[String], Option[Long]) = (_, _, _) => (Nil, None)
+
+  /** A page of post ids for userId's home timeline created before cursor (None: from the newest), and the next cursor (None after the last). */
+  def read(userId: String, cursor: Option[Long], limit: Int): (Seq[String], Option[Long]) = reader(userId, cursor, limit)
+}
+`,
+  [scalaPath('feed.events', 'Events')]: `package feed.events
+
+import java.util.Properties
+
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.kafka.common.serialization.StringSerializer
+
+import feed.store.Post
+
+/** Publisher of the "posts" topic (provided): one record per new post, keyed by the author id. */
+object Events {
+  val Topic = "posts"
+
+  private val props = new Properties()
+  props.put("bootstrap.servers", "kafka:9092")
+  props.put("linger.ms", "5")
+  private val producer = new KafkaProducer[String, String](props, new StringSerializer, new StringSerializer)
+
+  /** Produces post to Topic and returns once the broker acknowledged it. */
+  def publish(post: Post): Unit = {
+    producer.send(new ProducerRecord[String, String](Topic, post.author, post.toJson)).get()
+    ()
+  }
+}
+`,
+  [scalaPath('feed.json', 'package')]: `package feed
+
+import org.apache.pekko.http.scaladsl.model.ContentTypes
+import org.apache.pekko.http.scaladsl.unmarshalling.{FromEntityUnmarshaller, Unmarshaller}
+
+import scala.util.Try
+
+/** The JSON the feed services read and write (provided). */
+package object json {
+  /** The body of POST /posts: {"text", "media_ids"?}. */
+  final case class NewPost(text: String, mediaIds: Seq[String])
+
+  /** Reads a NewPost from an application/json request body. */
+  implicit val newPostUnmarshaller: FromEntityUnmarshaller[NewPost] =
+    Unmarshaller.stringUnmarshaller.forContentTypes(ContentTypes.\`application/json\`).map { body =>
+      val doc = ujson.read(body)
+      NewPost(doc("text").str, doc.obj.get("media_ids").map(_.arr.map(_.str).toSeq).getOrElse(Nil))
+    }
+
+  /** A map of strings, numbers, booleans, sequences, options (None is null) and nested maps as a JSON object. */
+  def toJson(body: Map[String, Any]): String = ujson.write(value(body))
+
+  private def value(v: Any): ujson.Value = v match {
+    case null | None => ujson.Null
+    case Some(x) => value(x)
+    case s: String => ujson.Str(s)
+    case b: Boolean => ujson.Bool(b)
+    case n: Int => ujson.Num(n.toDouble)
+    case n: Long => ujson.Num(n.toDouble)
+    case n: Double => ujson.Num(n)
+    case m: Map[_, _] => ujson.Obj.from(m.map { case (k, x) => k.toString -> value(x) })
+    case xs: Iterable[_] => ujson.Arr.from(xs.map(value))
+    case other => throw new IllegalArgumentException("not JSON-encodable: " + other)
+  }
+
+  /** A record of the "posts" topic, as much of it as the fan-out reads. */
+  final case class PostEvent(postId: String, author: String)
+
+  object PostEvent {
+    /** The event in json, None when it is malformed. */
+    def parse(json: String): Option[PostEvent] =
+      Try {
+        val doc = ujson.read(json)
+        PostEvent(doc("post_id").str, doc("author").str)
+      }.toOption
+  }
+
+  /** A record of the "engagement" topic: kind is its "type" (like, unlike, comment, share). */
+  final case class EngagementEvent(eventId: String, kind: String, postId: String)
+
+  object EngagementEvent {
+    /** The event in json, None when it is malformed. */
+    def parse(json: String): Option[EngagementEvent] =
+      Try {
+        val doc = ujson.read(json)
+        EngagementEvent(doc("event_id").str, doc("type").str, doc("post_id").str)
+      }.toOption
+  }
+
+  /** A feed.post.Post as the JSON cached at post:{id}: {"id", "author", "text", "media_ids", "created_at"}. */
+  object PostJson {
+    def encode(post: feed.post.Post): String =
+      ujson.write(ujson.Obj("id" -> post.id, "author" -> post.author, "text" -> post.text, "media_ids" -> post.mediaIds, "created_at" -> post.createdAt))
+
+    /** The post in json, None when it is malformed. */
+    def decode(json: String): Option[feed.post.Post] =
+      Try {
+        val doc = ujson.read(json)
+        feed.post.Post(
+          id = doc("id").str,
+          author = doc("author").str,
+          text = doc("text").str,
+          mediaIds = doc.obj.get("media_ids").map(_.arr.map(_.str).toSeq).getOrElse(Nil),
+          createdAt = doc("created_at").num.toLong,
+        )
+      }.toOption
+  }
+}
 `,
 };

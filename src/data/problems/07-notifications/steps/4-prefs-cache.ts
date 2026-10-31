@@ -399,7 +399,7 @@ import org.apache.pekko.http.scaladsl.server.Route
 import redis.clients.jedis.JedisPooled
 import spray.json._
 import spray.json.DefaultJsonProtocol._
-import notify.{Db, Prefs, Tls} // Prefs(push, quietStart, quietEnd) · Db.loadPrefs(userId) · Db.savePrefs(userId, prefs) — provided
+import notifications.{Db, Prefs, Tls} // Prefs(push, quietStart, quietEnd) · Db.loadPrefs(userId) · Db.savePrefs(userId, prefs) — provided
 
 object Preferences {
   val jedis = new JedisPooled("redis", 6379)
@@ -445,7 +445,7 @@ import org.apache.pekko.http.scaladsl.server.Route
 import redis.clients.jedis.JedisPooled
 import spray.json._
 import spray.json.DefaultJsonProtocol._
-import notify.{Db, Prefs, Tls} // Prefs(push, quietStart, quietEnd) · Db.loadPrefs(userId) · Db.savePrefs(userId, prefs) — provided
+import notifications.{Db, Prefs, Tls} // Prefs(push, quietStart, quietEnd) · Db.loadPrefs(userId) · Db.savePrefs(userId, prefs) — provided
 
 object Preferences {
   val jedis = new JedisPooled("redis", 6379)

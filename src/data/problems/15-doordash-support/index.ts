@@ -9,7 +9,7 @@ import {modelCallStep} from './steps/3-model-call';
 import {guardrailsStep} from './steps/4-guardrails';
 import {tokenStreamStep} from './steps/5-token-stream';
 import {qualityJudgeStep} from './steps/6-quality-judge';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * DoorDash's LLM-based Dasher support, rebuilt as the system around a model: a chat endpoint with
@@ -145,6 +145,7 @@ channel a company can put its name on.`,
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
   },
   learn,
 };

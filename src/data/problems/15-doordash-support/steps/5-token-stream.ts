@@ -930,7 +930,7 @@ object Stream {
   }
 
   /** One Llm.Stream inside a cancellable context, the deadline on the call: cancelling the context stops the model. */
-  private def open(stub: LlmGrpc.LlmBlockingStub, model: String, prompt: String): (Context.CancellableContext, java.util.Iterator[Token]) = {
+  private def open(stub: LlmGrpc.LlmBlockingStub, model: String, prompt: String): (Context.CancellableContext, Iterator[Token]) = {
     // TODO: Context.current().withCancellation(); inside it, GenerateRequest(model, prompt, Config.MaxTokens) with withDeadlineAfter(Config.DeadlineS)
     ???
   }
@@ -999,7 +999,7 @@ object Stream {
   }
 
   /** One Llm.Stream inside a cancellable context, the deadline on the call: cancelling the context stops the model. */
-  private def open(stub: LlmGrpc.LlmBlockingStub, model: String, prompt: String): (Context.CancellableContext, java.util.Iterator[Token]) = {
+  private def open(stub: LlmGrpc.LlmBlockingStub, model: String, prompt: String): (Context.CancellableContext, Iterator[Token]) = {
     val cancellable = Context.current().withCancellation()
     val tokens = cancellable.call { () =>
       stub

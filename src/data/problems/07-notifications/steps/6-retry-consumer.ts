@@ -593,7 +593,7 @@ import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
 import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
 import scala.jdk.CollectionConverters._
 
-import notify.{Json, Notification, Preferences, PushClient, RateLimit} // steps 3–5 and Json.notification(value) — provided
+import notifications.{Json, Notification} // Json.notification(value) — provided; RateLimit, Preferences, PushClient are steps 3–5
 
 object DeliveryWorker {
   val Topic = "notifications"
@@ -630,7 +630,7 @@ object DeliveryWorker {
       records.asScala.foreach { record =>
         val n: Notification = Json.notification(record.value())
         // TODO: deliver only if RateLimit.allowed, prefs.push, and (priority high or !Preferences.quiet(prefs, hour))
-        // TODO: PushClient.sendPush(n); Retryable → requeue(record, attemptOf(record))
+        // TODO: PushClient.sendPush(n.userId, n.title, n.body, n.id); Retryable → requeue(record, attemptOf(record))
       }
       // TODO: commitSync after every record of the batch has its outcome recorded
     }
@@ -644,7 +644,7 @@ import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
 import org.apache.kafka.common.serialization.{StringDeserializer, StringSerializer}
 import scala.jdk.CollectionConverters._
 
-import notify.{Json, Notification, Preferences, PushClient, RateLimit} // steps 3–5 and Json.notification(value) — provided
+import notifications.{Json, Notification} // Json.notification(value) — provided; RateLimit, Preferences, PushClient are steps 3–5
 
 object DeliveryWorker {
   val Topic = "notifications"
@@ -687,7 +687,7 @@ object DeliveryWorker {
         val deliver = RateLimit.allowed(n.userId, n.id) && prefs.push &&
           (n.priority == "high" || !Preferences.quiet(prefs, LocalTime.now().getHour))
         if (deliver)
-          try PushClient.sendPush(n)
+          try PushClient.sendPush(n.userId, n.title, n.body, n.id) // one device per user: the token is the user id
           catch {
             case e: PushClient.Retryable =>
               System.err.println(s"\${n.id}: \${e.getMessage}, re-queueing")

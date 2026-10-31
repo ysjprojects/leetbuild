@@ -550,7 +550,7 @@ import org.apache.pekko.http.scaladsl.server.Route
 import feed.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
 import feed.events.Events // Events.publish(post): Unit — provided (Kafka topic "posts")
 import feed.json.{NewPost, newPostUnmarshaller, toJson} // provided: NewPost(text, mediaIds), toJson(Map): String
-import feed.store.{Post, Posts, Timeline} // provided: Posts.save(post), Timeline.read(userId, cursor, limit): (Seq[String], Option[Long])
+import feed.store.{Post, Posts, Timeline} // provided: Posts.save(post): Post (a reused Idempotency-Key returns the earlier post), Timeline.read(userId, cursor, limit): (Seq[String], Option[Long])
 
 object PostApi {
   val MaxText = 280
@@ -602,7 +602,7 @@ import org.apache.pekko.http.scaladsl.server.Route
 import feed.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
 import feed.events.Events // Events.publish(post): Unit — provided (Kafka topic "posts")
 import feed.json.{NewPost, newPostUnmarshaller, toJson} // provided: NewPost(text, mediaIds), toJson(Map): String
-import feed.store.{Post, Posts, Timeline} // provided: Posts.save(post), Timeline.read(userId, cursor, limit): (Seq[String], Option[Long])
+import feed.store.{Post, Posts, Timeline} // provided: Posts.save(post): Post (a reused Idempotency-Key returns the earlier post), Timeline.read(userId, cursor, limit): (Seq[String], Option[Long])
 
 object PostApi {
   val MaxText = 280
@@ -627,8 +627,8 @@ object PostApi {
                 key match {
                   case None => complete(StatusCodes.BadRequest -> "Idempotency-Key header required")
                   case Some(k) =>
-                    val post = Post(UUID.randomUUID().toString, userId, body.text, body.mediaIds, System.currentTimeMillis(), k)
-                    Posts.save(post)
+                    // A reused Idempotency-Key gives back the post stored the first time: publish and answer with it.
+                    val post = Posts.save(Post(UUID.randomUUID().toString, userId, body.text, body.mediaIds, System.currentTimeMillis(), k))
                     Events.publish(post)
                     complete(json(StatusCodes.Created, Map("post_id" -> post.id, "created_at" -> post.createdAt)))
                 }

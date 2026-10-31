@@ -1,3 +1,5 @@
+import {scalaTls} from '../scala-support';
+
 /**
  * Hand-written Python module the r/place starters import but no step builds: the per-instance
  * fan-out bus the tile stream (step 4) subscribes to. In production every stream server consumes
@@ -244,3 +246,6 @@ inline void pump(RdKafka::KafkaConsumer& consumer) {
 }
 `,
 };
+
+/** The Scala support: the shared TLS helper the HTTP steps import as `place.Tls`. */
+export const supportModulesScala: Record<string, string> = {...scalaTls('place')};

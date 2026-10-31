@@ -8,7 +8,7 @@ import {userRateLimitStep} from './steps/3-user-rate-limit';
 import {prefsCacheStep} from './steps/4-prefs-cache';
 import {pushGatewayStep} from './steps/5-push-gateway';
 import {retryConsumerStep} from './steps/6-retry-consumer';
-import {supportModules, supportModulesCpp, supportModulesGo, supportModulesTs} from './support';
+import {supportModules, supportModulesCpp, supportModulesGo, supportModulesScala, supportModulesTs} from './support';
 
 /**
  * Notification service: an idempotent intake API → a per-user ordered Kafka topic → a sliding-window
@@ -83,6 +83,7 @@ guarded RPC, and a consumer that never loses a record it has not finished with.`
     typescript: {...protoFiles, ...supportModulesTs},
     go: {...protoFiles, ...supportModulesGo},
     cpp: {...protoFiles, ...supportModulesCpp},
+    scala: {...protoFiles, ...supportModulesScala},
   },
   learn,
 };

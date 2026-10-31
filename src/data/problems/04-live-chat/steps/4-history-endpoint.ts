@@ -483,6 +483,8 @@ import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
 import spray.json.DefaultJsonProtocol._
 
+import livechat.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
+
 final case class Message(user: String, text: String, ts: Long)
 final case class Page(messages: Seq[Message], next_before: Option[Long])
 
@@ -532,6 +534,8 @@ import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import spray.json._
 import spray.json.DefaultJsonProtocol._
+
+import livechat.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
 
 final case class Message(user: String, text: String, ts: Long)
 final case class Page(messages: Seq[Message], next_before: Option[Long])

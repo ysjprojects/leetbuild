@@ -276,6 +276,8 @@ import scala.jdk.CollectionConverters._
 import spray.json._
 import spray.json.DefaultJsonProtocol._
 
+import exchange.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
+
 object BookEndpoint {
   val jedis = new JedisPooled("redis", 6379)
   val SymbolRe = "^[A-Z]{1,6}$".r
@@ -309,6 +311,8 @@ import redis.clients.jedis.JedisPooled
 import scala.jdk.CollectionConverters._
 import spray.json._
 import spray.json.DefaultJsonProtocol._
+
+import exchange.Tls // Tls.serverContext(certPem, keyPem): SSLContext — provided
 
 object BookEndpoint {
   val jedis = new JedisPooled("redis", 6379)

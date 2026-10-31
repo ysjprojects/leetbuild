@@ -535,6 +535,7 @@ import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import ledger.Tls // Tls.serverContext — provided
 import spray.json._
+import spray.json.DefaultJsonProtocol._
 
 final case class Entry(account: String, currency: String, amount: Long)
 
@@ -591,6 +592,7 @@ import org.apache.pekko.http.scaladsl.server.Directives._
 import org.apache.pekko.http.scaladsl.server.Route
 import ledger.Tls // Tls.serverContext — provided
 import spray.json._
+import spray.json.DefaultJsonProtocol._
 
 final case class Entry(account: String, currency: String, amount: Long)
 

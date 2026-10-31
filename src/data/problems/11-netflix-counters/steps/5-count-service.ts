@@ -565,6 +565,7 @@ import io.grpc.{ServerBuilder, Status}
 import redis.clients.jedis.JedisPooled
 import scala.concurrent.{ExecutionContext, Future}
 import spray.json._
+import spray.json.DefaultJsonProtocol._
 
 object CountService extends CounterServiceGrpc.CounterService {
   val jedis = new JedisPooled("redis", 6379)
@@ -601,6 +602,7 @@ import io.grpc.{ServerBuilder, Status}
 import redis.clients.jedis.JedisPooled
 import scala.concurrent.{ExecutionContext, Future}
 import spray.json._
+import spray.json.DefaultJsonProtocol._
 
 object CountService extends CounterServiceGrpc.CounterService {
   val jedis = new JedisPooled("redis", 6379)

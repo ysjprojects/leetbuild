@@ -395,7 +395,7 @@ func runConsumer(ctx context.Context) {
 import java.time.Duration
 import java.util.{Properties, UUID}
 
-import chat.chat.ServerMsg
+import livechat.chat.ServerMsg
 import org.apache.kafka.clients.consumer.KafkaConsumer
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
 import org.apache.kafka.common.serialization.{ByteArrayDeserializer, ByteArraySerializer, StringDeserializer, StringSerializer}
@@ -435,7 +435,7 @@ object RoomBus {
 import java.time.Duration
 import java.util.{Properties, UUID}
 
-import chat.chat.ServerMsg
+import livechat.chat.ServerMsg
 import org.apache.kafka.clients.consumer.KafkaConsumer
 import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
 import org.apache.kafka.common.serialization.{ByteArrayDeserializer, ByteArraySerializer, StringDeserializer, StringSerializer}

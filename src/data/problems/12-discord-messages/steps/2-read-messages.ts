@@ -626,9 +626,9 @@ import scala.collection.mutable
 import spray.json.DefaultJsonProtocol._
 import spray.json.RootJsonFormat
 
-final case class StoredMessage(id: String, authorId: String, content: String)
-
 object ReadMessages {
+  final case class StoredMessage(id: String, authorId: String, content: String)
+
   val DefaultLimit = 50
   val MaxLimit = 100
   val DiscordEpochMs = 1420070400000L
@@ -692,9 +692,9 @@ import scala.collection.mutable
 import spray.json.DefaultJsonProtocol._
 import spray.json.RootJsonFormat
 
-final case class StoredMessage(id: String, authorId: String, content: String)
-
 object ReadMessages {
+  final case class StoredMessage(id: String, authorId: String, content: String)
+
   val DefaultLimit = 50
   val MaxLimit = 100
   val DiscordEpochMs = 1420070400000L

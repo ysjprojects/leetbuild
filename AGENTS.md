@@ -27,6 +27,7 @@ npx next dev                      # or: yarn dev
 npx next build                    # or: yarn build
 npx tsx scripts/verify.ts         # all content + Python, TypeScript, Go and C++ harnesses
 npx tsx scripts/verify.ts --no-runtime
+npx tsx scripts/check-scala.ts    # every harnessed course's Scala, compiled with scalac + the real libraries
 npx tsc --noEmit
 npm run lint                      # prettier --check + eslint, what CI runs
 npm run format                    # prettier --write + eslint --fix
@@ -101,8 +102,9 @@ protection or the workflow to get a PR through.
 **Before opening.** Branch from a current `main`; one change per PR — one course, one fix, one
 feature. Run the whole gate and open the PR only when it is green: `npm run lint`,
 `npx tsc --noEmit`, `npx tsx scripts/verify.ts` (the full run, harnesses included — not only
-`--file … --no-runtime`) and `npx next build`. CI runs the same four on every push and the `CI`
-check is required, so a red PR cannot be merged. Formatting failures: `npm run format`, commit.
+`--file … --no-runtime`), `npx next build`, and `npx tsx scripts/check-scala.ts` when the PR changes
+Scala. CI runs them all on every push and the `CI` check is required, so a red PR cannot be merged.
+Formatting failures: `npm run format`, commit.
 Never make the gate pass by weakening it — no `eslint-disable`, `@ts-ignore`,
 `@ts-expect-error`, no edits to `.eslintrc`, `.prettierrc`, `tsconfig.json` or
 `.github/workflows/` inside a content or feature PR; a rule that is wrong is its own PR with the

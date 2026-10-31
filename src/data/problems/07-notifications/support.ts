@@ -1,4 +1,5 @@
 import {CPP_IDS_H} from '../cpp-support';
+import {scalaPath, scalaTls} from '../scala-support';
 
 /**
  * Runtime support modules the Python starters import but no step builds: the preferences
@@ -308,5 +309,104 @@ struct Retryable : std::runtime_error {
 };
 
 void send_push(const Notification& n);
+`,
+};
+
+/**
+ * The same modules for the Scala starters, in the package `notifications` (after a wildcard import
+ * such as \`Directives._\`, a package named `notify` is shadowed by the inherited `notify()` method):
+ * the notification record and its JSON (`Notification`, `Json`), the preferences row and database
+ * (`Prefs`, `Db`), the device registry (`Devices`) and the TLS helper. Their state lives in the
+ * objects so a harness can seed rows and read the call log.
+ */
+export const supportModulesScala: Record<string, string> = {
+  [scalaPath('notifications', 'Notification')]: `package notifications
+
+/** The notification (provided): what the API accepts and the bus carries, as a JSON object. */
+final case class Notification(id: String, userId: String, channel: String, title: String, body: String, priority: String)
+`,
+  [scalaPath('notifications', 'Json')]: `package notifications
+
+import spray.json._
+
+/** Reads the JSON a bus record's value holds (provided). */
+object Json {
+  /** The notification in text; missing fields are empty (priority: "normal"). */
+  def notification(text: String): Notification = {
+    val fields = text.parseJson.asJsObject.fields
+    def field(name: String, default: String = ""): String =
+      fields.get(name).collect { case JsString(value) => value }.getOrElse(default)
+    Notification(
+      id = field("id"),
+      userId = field("user_id"),
+      channel = field("channel"),
+      title = field("title"),
+      body = field("body"),
+      priority = field("priority", "normal"),
+    )
+  }
+}
+`,
+  [scalaPath('notifications', 'Prefs')]: `package notifications
+
+/** A user's preferences row (provided), as JSON {"push":true,"quiet_start":22,"quiet_end":7}. */
+final case class Prefs(push: Boolean, quietStart: Int, quietEnd: Int)
+`,
+  [scalaPath('notifications', 'Db')]: `package notifications
+
+import scala.collection.mutable
+
+/** The preferences database (provided): one row per user. \`rows\` is the table, \`calls\` logs every loadPrefs and savePrefs in call order. */
+object Db {
+  /** One database call: op is "load" or "save"; prefs is the row a save wrote. */
+  final case class Call(op: String, userId: String, prefs: Option[Prefs] = None)
+
+  /** The row of a user who never saved one. */
+  val DefaultPrefs: Prefs = Prefs(push = true, quietStart = 22, quietEnd = 7)
+
+  val rows: mutable.Map[String, Prefs] = mutable.Map.empty
+  val calls: mutable.Buffer[Call] = mutable.ArrayBuffer.empty
+
+  /** The user's preferences row (DefaultPrefs for users who never saved one). */
+  def loadPrefs(userId: String): Prefs = synchronized {
+    calls += Call("load", userId)
+    rows.getOrElse(userId, DefaultPrefs)
+  }
+
+  /** Writes the user's preferences row. */
+  def savePrefs(userId: String, prefs: Prefs): Unit = synchronized {
+    calls += Call("save", userId, Some(prefs))
+    rows(userId) = prefs
+  }
+}
+`,
+  [scalaPath('notifications', 'Devices')]: `package notifications
+
+import scala.collection.mutable
+
+/** The device registry (provided): marks tokens the push gateway rejected as stale. */
+object Devices {
+  /** The disabled tokens, in the order they were disabled. */
+  val disabled: mutable.Buffer[String] = mutable.ArrayBuffer.empty
+
+  /** No further sends go to this token. */
+  def disable(token: String): Unit = synchronized {
+    disabled += token
+  }
+}
+`,
+  ...scalaTls('notifications'),
+  'src/main/protobuf/notify/package.proto': `syntax = "proto3";
+
+package notify;
+
+import "scalapb/scalapb.proto";
+
+// ScalaPB puts package notify's classes in notifications.push: inside every generated object the
+// inherited method \`notify()\` would hide a package named notify.
+option (scalapb.options) = {
+  scope: PACKAGE
+  package_name: "notifications"
+};
 `,
 };
