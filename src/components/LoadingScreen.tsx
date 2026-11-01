@@ -60,10 +60,11 @@ export const LandingIntro: FC<{stats?: readonly string[]}> = memo(
           </span>
         </div>
         <h1 className="text-ink-50 mt-7 max-w-3xl text-3xl font-extrabold leading-[1.1] tracking-tight sm:text-4xl">
-          Build systems. <span className="text-iris-300">Prove you can use AI.</span>
+          Practice system design <span className="text-iris-300">by building it.</span>
         </h1>
         <p className="text-ink-200 mt-4 max-w-2xl text-[14px] leading-7">
-          Real services, one file at a time. Classic systems and AI-era review problems, judged in five languages.
+          Real services, from a URL shortener to a payment ledger, built one file at a time in the language you
+          interview in, with checks at every step.
         </p>
         <div className="mt-5 flex flex-wrap gap-2">
           {stats.map(stat => (
